@@ -1,6 +1,7 @@
 //! Comparison benchmark: structured-zstd (pure Rust) vs zstd (C FFI).
 //!
-//! Four variations: compress/decompress × pure Rust/C FFI.
+//! Five variations: decompress (pure Rust/C FFI), compress (pure Rust/C FFI L1/L3).
+//! Both decompress benchmarks allocate per-iteration for symmetric comparison.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -10,21 +11,20 @@ const COMPRESSED_CORPUS: &[u8] = include_bytes!("../decodecorpus_files/z000033.z
 fn bench_decompress(c: &mut Criterion) {
     let mut group = c.benchmark_group("decompress");
 
-    // Pure Rust decompression
-    let mut fr = structured_zstd::decoding::FrameDecoder::new();
-    let target = &mut vec![0u8; 1024 * 1024 * 200];
+    // Pre-compute expected output length for assertions.
+    let expected_len = zstd::decode_all(COMPRESSED_CORPUS).unwrap().len();
 
+    // Pure Rust decompression — allocate per-iteration (symmetric with C FFI).
     group.bench_function("pure_rust", |b| {
         b.iter(|| {
-            fr.decode_all(COMPRESSED_CORPUS, target).unwrap();
+            let mut fr = structured_zstd::decoding::FrameDecoder::new();
+            let mut target = vec![0u8; expected_len];
+            let written = fr.decode_all(COMPRESSED_CORPUS, &mut target).unwrap();
+            assert_eq!(written, expected_len);
         })
     });
 
-    // C FFI decompression
-    let decompressed = zstd::decode_all(COMPRESSED_CORPUS).unwrap();
-    let expected_len = decompressed.len();
-    drop(decompressed);
-
+    // C FFI decompression — allocates per-iteration via decode_all.
     group.bench_function("c_ffi", |b| {
         b.iter(|| {
             let out = zstd::decode_all(COMPRESSED_CORPUS).unwrap();
@@ -36,7 +36,7 @@ fn bench_decompress(c: &mut Criterion) {
 }
 
 fn bench_compress(c: &mut Criterion) {
-    // Get raw data by decompressing the corpus
+    // Get raw data by decompressing the corpus.
     let raw_data = zstd::decode_all(COMPRESSED_CORPUS).unwrap();
 
     let mut group = c.benchmark_group("compress");
