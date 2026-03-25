@@ -16,7 +16,7 @@
 // This segment scoring algorithm operates as follows:
 // For a given epoch:
 //  - Run a reservoir sampler over the entire epoch, creating a
-//    reservoir of n/t, where `t` is the desired number of occurances
+//    reservoir of n/t, where `t` is the desired number of occurrences
 //    we want the most common k-mers to have
 //  - Have the ability to estimate
 //    the frequency of a given k-mer: `f(w: k-mer)` calculates

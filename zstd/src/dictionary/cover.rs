@@ -28,7 +28,7 @@ pub struct Segment {
     /// A measure of how "ideal" a given segment would be to include in the dictionary
     ///
     /// Higher is better, there's no upper limit. This number is determined by
-    /// estimating the number of occurances in a given epoch
+    /// estimating the number of occurrences in a given epoch
     pub score: usize,
 }
 
@@ -56,7 +56,7 @@ impl Ord for Segment {
 /// A re-usable allocation containing large allocations
 /// that are used multiple times during dictionary construction (once per epoch)
 pub struct Context {
-    /// Keeps track of the number of occurances of a particular k-mer within an epoch.
+    /// Keeps track of the number of occurrences of a particular k-mer within an epoch.
     ///
     /// Reset for each epoch.
     pub frequencies: HashMap<KMer, usize>,

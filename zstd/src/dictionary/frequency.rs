@@ -30,10 +30,10 @@ pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
         window_hash = (ALPHABET_SIZE * window_hash + body[i] as i64) % PRIME;
     }
 
-    let mut num_occurances = 0;
+    let mut num_occurrences = 0;
     for i in 0..=body.len() - pattern.len() {
         if pattern_hash == window_hash {
-            num_occurances += 1;
+            num_occurrences += 1;
         }
 
         // Compute hash for next window using rolling hash
@@ -48,7 +48,7 @@ pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
         }
     }
 
-    num_occurances
+    num_occurrences
 }
 
 #[cfg(test)]
