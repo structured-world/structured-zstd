@@ -9,14 +9,15 @@ Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/Ki
 
 ## Managed Fork
 
-This is a **maintained fork** of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Structured World Foundation](https://sw.foundation). We maintain additional features and hardening for the [CoordiNode](https://github.com/structured-world/coordinode) database engine while contributing patches upstream.
+This is a **maintained fork** of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Structured World Foundation](https://sw.foundation). We maintain additional features and hardening for the [CoordiNode](https://github.com/structured-world/coordinode) database engine.
 
 **Fork goals:**
 - Dictionary compression improvements (critical for per-label trained dictionaries in LSM-tree)
 - Performance parity with C zstd for decompression (currently 1.4-3.5x slower)
+- Additional compression levels (Default/Better/Best — currently only Fastest is implemented)
 - No FFI — pure `cargo build`, no cmake/system libraries (ADR-013 compliance)
 
-**Upstream sync:** We regularly rebase on upstream and contribute improvements back.
+**Upstream relationship:** We periodically sync with upstream but maintain an independent development trajectory focused on CoordiNode requirements.
 
 ## What is this
 
