@@ -1,16 +1,19 @@
 [package]
-name = "ruzstd"
-version = "0.8.3"
+name = "structured-zstd"
+version = "0.0.1"
 rust-version = "1.87"
-authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
+authors = [
+    "Moritz Borcherding <moritz.borcherding@web.de>",
+    "Structured World Foundation <foundation@sw.foundation>",
+]
 edition = "2018"
 license = "MIT"
-homepage = "https://github.com/KillingSpark/zstd-rs"
-repository = "https://github.com/KillingSpark/zstd-rs"
-description = "A decoder for the zstd compression format"
+homepage = "https://github.com/structured-world/structured-zstd"
+repository = "https://github.com/structured-world/structured-zstd"
+description = "Pure Rust zstd implementation — managed fork of ruzstd. Dictionary compression, no FFI."
 exclude = ["decodecorpus_files/*", "dict_tests/*", "fuzz_decodecorpus/*"]
-readme = "Readme.md"
-keywords = ["zstd", "zstandard", "decompression"]
+readme = "../README.md"
+keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
 categories = ["compression"]
 
 [dependencies]
