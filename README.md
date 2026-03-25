@@ -49,7 +49,7 @@ When the `dict_builder` feature is enabled, the `dictionary` module can create r
 ### Compression
 
 ```rust
-use ruzstd::encoding::{compress, compress_to_vec, CompressionLevel};
+use structured_zstd::encoding::{compress, compress_to_vec, CompressionLevel};
 
 let data: &[u8] = b"hello world";
 let compressed = compress_to_vec(data, CompressionLevel::Fastest);
@@ -58,8 +58,8 @@ let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 ### Decompression
 
 ```rust
-use ruzstd::decoding::StreamingDecoder;
-use ruzstd::io::Read;
+use structured_zstd::decoding::StreamingDecoder;
+use structured_zstd::io::Read;
 
 let mut source: &[u8] = &compressed_data;
 let mut decoder = StreamingDecoder::new(&mut source).unwrap();
@@ -72,7 +72,7 @@ decoder.read_to_end(&mut result).unwrap();
 
 <div align="center">
 
-![USDT TRC-20 Donation QR Code](assets/usdt-qr.svg)
+![USDT TRC-20 Donation QR Code](https://raw.githubusercontent.com/structured-world/structured-zstd/HEAD/assets/usdt-qr.svg)
 
 USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
