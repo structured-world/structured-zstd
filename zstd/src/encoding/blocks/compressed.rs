@@ -349,8 +349,10 @@ fn compress_literals(
     // (smaller literals use raw_literals), so only formats 0b10 and 0b11 are
     // reachable in practice. The 0b00/0b01 arms are kept for completeness.
     //
-    // Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit format.
+    // Compile-time: MAX_BLOCK_SIZE fits in the 18-bit format.
+    // Runtime (debug): guard against custom Matchers exceeding the limit.
     const { assert!(crate::common::MAX_BLOCK_SIZE <= 262143) };
+    debug_assert!(literals.len() < 262144);
     let (size_format, size_bits) = match literals.len() {
         0..6 => (0b00u8, 10),
         6..1024 => (0b01, 10),
