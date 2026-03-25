@@ -8,6 +8,9 @@ use crate::{
     huff0::huff0_encoder,
 };
 
+/// Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit size format.
+const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
+
 /// A block of [`crate::common::BlockType::Compressed`]
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
@@ -341,12 +344,25 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
+    // RFC 8878 §3.1.1.3.1.1 Size_Format (spec limits):
+    //   0b00: single stream, 10-bit (≤ 1023)  |  0b01: 4 streams, 10-bit (≤ 1023)
+    //   0b10: 4 streams, 14-bit (≤ 16383)     |  0b11: 4 streams, 18-bit (≤ 262143)
+    //
+    // The encoder currently only calls this function for literals > 1024 bytes
+    // (smaller literals use raw_literals), so only formats 0b10 and 0b11 are
+    // reachable in practice. The 0b00/0b01 arms are kept for completeness.
+    //
+    // Runtime: hard guard — truncated 18-bit writes produce corrupt streams.
+    // Note: format args omitted intentionally to avoid uncoverable dead code in coverage.
+    assert!(
+        literals.len() <= 262_143,
+        "literals exceed RFC 8878 18-bit size limit (262143)"
+    );
     let (size_format, size_bits) = match literals.len() {
         0..6 => (0b00u8, 10),
         6..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
-        16384..262144 => (0b11, 18),
-        _ => unimplemented!("too many literals"),
+        _ => (0b11, 18),
     };
 
     writer.write_bits(size_format, 2);
