@@ -1,7 +1,7 @@
 [package]
 name = "structured-zstd"
 version = "0.0.2"
-rust-version = "1.87"
+rust-version = "1.92"
 authors = [
     "Moritz Borcherding <moritz.borcherding@web.de>",
     "Structured World Foundation <foundation@sw.foundation>",

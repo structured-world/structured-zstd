@@ -2,7 +2,7 @@
 [package]
 name = "structured-zstd-cli"
 version = "0.8.2"
-rust-version = "1.87.0"
+rust-version = "1.92"
 authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
 edition = "2018"
 license = "Apache-2.0"
