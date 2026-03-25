@@ -47,9 +47,10 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
       - name: Test
+        working-directory: ruzstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
       - name: Doc tests
-        run: cargo test --doc
+        run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
 
   cross-i686:
     needs: lint
@@ -67,6 +68,7 @@ jobs:
         with:
           prefix-key: cross-i686
       - name: Test (i686)
+        working-directory: ruzstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder --target i686-unknown-linux-gnu
 
   msrv:
@@ -83,6 +85,7 @@ jobs:
         with:
           prefix-key: msrv
       - name: Test (MSRV)
+        working-directory: ruzstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
 
   codecov:
@@ -97,9 +100,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov -p structured-zstd --features hash,std,dict_builder --lcov --output-path lcov.info
+        working-directory: ruzstd
       - uses: codecov/codecov-action@v5
         with:
-          files: lcov.info
+          files: ruzstd/lcov.info
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
