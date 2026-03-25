@@ -8,23 +8,23 @@
 pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
     assert!(body.len() >= pattern.len());
     // A prime number for modulo operations to reduce collisions (q)
-    const PRIME: isize = 2654435761;
+    const PRIME: i64 = 2654435761;
     // Number of characters in the input alphabet (d)
-    const ALPHABET_SIZE: isize = 256;
+    const ALPHABET_SIZE: i64 = 256;
     // Hash of input pattern (p)
-    let mut pattern_hash: isize = 0;
+    let mut pattern_hash: i64 = 0;
     // Hash of the current window of text (t)
-    let mut window_hash: isize = 0;
+    let mut window_hash: i64 = 0;
     // High-order digit multiplier (h)
-    let mut h: isize = 1;
+    let mut h: i64 = 1;
 
     // Precompute h (?)
     h = (h * ALPHABET_SIZE) % PRIME;
 
     // Compute initial hash values
     for i in 0..pattern.len() {
-        pattern_hash = (ALPHABET_SIZE * pattern_hash + pattern[i] as isize) % PRIME;
-        window_hash = (ALPHABET_SIZE * window_hash + body[i] as isize) % PRIME;
+        pattern_hash = (ALPHABET_SIZE * pattern_hash + pattern[i] as i64) % PRIME;
+        window_hash = (ALPHABET_SIZE * window_hash + body[i] as i64) % PRIME;
     }
 
     let mut num_occurances = 0;
@@ -36,8 +36,8 @@ pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
 
         // Compute hash values for next window
         if i < body.len() - pattern.len() {
-            window_hash = (ALPHABET_SIZE * (window_hash - body[i] as isize * h)
-                + body[i + pattern.len()] as isize)
+            window_hash = (ALPHABET_SIZE * (window_hash - body[i] as i64 * h)
+                + body[i + pattern.len()] as i64)
                 % PRIME;
         }
     }
