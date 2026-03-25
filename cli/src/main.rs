@@ -1,4 +1,3 @@
-extern crate ruzstd;
 mod progress;
 use progress::ProgressMonitor;
 
@@ -11,7 +10,7 @@ use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{ContextCompat, WrapErr};
-use ruzstd::encoding::CompressionLevel;
+use structured_zstd::encoding::CompressionLevel;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -103,7 +102,7 @@ fn main() -> color_eyre::Result<()> {
 
 fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: ruzstd::encoding::CompressionLevel = match level {
+    let compression_level: structured_zstd::encoding::CompressionLevel = match level {
         0 => CompressionLevel::Uncompressed,
         1 => CompressionLevel::Fastest,
         2 => CompressionLevel::Default,
@@ -119,7 +118,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let encoder_input = ProgressMonitor::new(buffered_source, source_size);
     let output: File = File::create(output).wrap_err("failed to open output file for writing")?;
 
-    ruzstd::encoding::compress(encoder_input, &output, compression_level);
+    structured_zstd::encoding::compress(encoder_input, &output, compression_level);
     let compressed_size = output.metadata()?.len();
     let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
     info!(
@@ -139,7 +138,7 @@ fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
     let mut output: File =
         File::create(output).wrap_err("failed to open output file for writing")?;
 
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(decoder_input)?;
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(decoder_input)?;
 
     std::io::copy(&mut decoder, &mut output)?;
 

@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-plz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token (SW Release Bot)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create release PR
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+          config: .release-plz.toml
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Create GitHub Release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+          config: .release-plz.toml
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

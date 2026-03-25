@@ -1,48 +1,149 @@
-on: [push, pull_request]
-
 name: CI
 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  tests:
-      name: stable lint, test, build
-      runs-on: ubuntu-latest
-      steps:
-        - name: Checkout sources
-          uses: actions/checkout@v4
-
-        - name: Install stable toolchain
-          uses: dtolnay/rust-toolchain@stable
-          with:
-            components: clippy
-        - name: Install cargo-hack and cargo-msrv
-          uses: taiki-e/install-action@v2
-          with:
-            tool: cargo-hack, cargo-msrv
-        - name: check
-          run: cargo hack check --workspace --feature-powerset --exclude-features rustc-dep-of-std
-        - name: cargo hack clippy
-          run: cargo hack clippy --workspace --feature-powerset --exclude-features rustc-dep-of-std
-        - name: cargo hack test
-          run: cargo hack test --workspace --feature-powerset --exclude-features rustc-dep-of-std
-        - name: Verify MSRV (cli)
-          run: cargo msrv verify --path cli/
-        - name: Verify MSRV (lib)
-          run: cargo msrv verify --path ruzstd/
-
-  nightly-stuff:
-    name: nightly lint, miri
+  lint:
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, miri
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
 
-      - run: cargo +nightly fmt --all -- --check
-      - run: cargo +nightly clippy --workspace --no-default-features -- -D warnings
-      - run: cargo +nightly clippy --workspace -- -D warnings
-      - run: cargo +nightly miri test ringbuffer
-      - run: cargo +nightly miri test short_Writer
+  test:
+    needs: lint
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+      - name: Test
+        working-directory: zstd
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+      - name: Doc tests
+        run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
+
+  cross-i686:
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: taiki-e/install-action@nextest
+      - name: Install 32-bit libs
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cross-i686
+      - name: Test (i686)
+        working-directory: zstd
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder --target i686-unknown-linux-gnu
+
+  msrv:
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87"
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: msrv
+      - name: Test (MSRV)
+        working-directory: zstd
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+
+  codecov:
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov -p structured-zstd --features hash,std,dict_builder --lcov --output-path lcov.info
+        working-directory: zstd
+      - uses: codecov/codecov-action@v5
+        with:
+          files: zstd/lcov.info
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  benchmark:
+    name: Performance regression check
+    needs: lint
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench
+
+      - name: Run benchmarks
+        run: bash .github/scripts/run-benchmarks.sh
+
+      - name: Store benchmark results
+        if: steps.bot-token.outputs.token != ''
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "structured-zstd vs C FFI"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.json
+          github-token: ${{ steps.bot-token.outputs.token }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          alert-comment-cc-users: "@polaz"
+          alert-threshold: "115%"
+          fail-threshold: "125%"
+          fail-on-alert: ${{ github.event_name == 'pull_request' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          benchmark-data-dir-path: dev/bench

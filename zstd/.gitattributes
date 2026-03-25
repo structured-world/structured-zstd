@@ -1,0 +1,5 @@
+# Corpus files are binary — never convert line endings.
+# Without this, git autocrlf on Windows converts LF→CRLF in .txt files,
+# causing size mismatches against their .zst compressed counterparts.
+decodecorpus_files/** binary
+dict_tests/** binary

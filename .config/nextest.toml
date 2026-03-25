@@ -1,0 +1,10 @@
+[store]
+dir = "target/nextest"
+
+[profile.ci]
+retries = 2
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[profile.ci.junit]
+path = "junit.xml"

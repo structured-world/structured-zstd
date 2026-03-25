@@ -1,15 +1,15 @@
 
 [package]
-name = "ruzstd-cli"
+name = "structured-zstd-cli"
 version = "0.8.2"
 rust-version = "1.87.0"
 authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
 edition = "2018"
-license = "MIT"
-homepage = "https://github.com/KillingSpark/zstd-rs"
-repository = "https://github.com/KillingSpark/zstd-rs"
-description = "A command line interface for the `ruzstd` zstd implementation"
-readme = "../Readme.md"
+license = "Apache-2.0"
+homepage = "https://github.com/structured-world/structured-zstd"
+repository = "https://github.com/structured-world/structured-zstd"
+description = "A command line interface for the `structured-zstd` zstd implementation"
+readme = "../README.md"
 keywords = ["zstd", "zstandard", "decompression"]
 categories = ["compression"]
 
@@ -22,7 +22,7 @@ indicatif = { version = "0.18.0" }
 tracing-indicatif = { version = "0.3.13" }
 console = { version = "0.16.1" }
 tracing-subscriber = { version = "0.3.20" }
-ruzstd = { path = "../ruzstd", features = ["std"] }
+structured-zstd = { path = "../zstd", features = ["std"] }
 
 [dev-dependencies]
 criterion = "0.5"
