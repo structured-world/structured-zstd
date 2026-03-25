@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/KillingSpark/zstd-rs). Focus: dictionary compression improvements and performance parity with C zstd for CoordiNode LSM-tree.
+Pure Rust zstd implementation — managed fork of [ruzstd (KillingSpark/zstd-rs)](https://github.com/KillingSpark/zstd-rs). Focus: dictionary compression improvements and performance parity with C zstd for CoordiNode LSM-tree.
 
 ## Review Scope Rules
 

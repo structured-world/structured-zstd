@@ -435,14 +435,14 @@ mod tests {
     #[test]
     fn fuzz_targets() {
         use std::io::Read;
-        fn decode_ruzstd(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn decode_szstd(data: &mut dyn std::io::Read) -> Vec<u8> {
             let mut decoder = crate::decoding::StreamingDecoder::new(data).unwrap();
             let mut result: Vec<u8> = Vec::new();
             decoder.read_to_end(&mut result).expect("Decoding failed");
             result
         }
 
-        fn decode_ruzstd_writer(mut data: impl Read) -> Vec<u8> {
+        fn decode_szstd_writer(mut data: impl Read) -> Vec<u8> {
             let mut decoder = crate::decoding::FrameDecoder::new();
             decoder.reset(&mut data).unwrap();
             let mut result = vec![];
@@ -462,7 +462,7 @@ mod tests {
             zstd::stream::encode_all(std::io::Cursor::new(data), 3)
         }
 
-        fn encode_ruzstd_uncompressed(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn encode_szstd_uncompressed(data: &mut dyn std::io::Read) -> Vec<u8> {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
@@ -472,7 +472,7 @@ mod tests {
             )
         }
 
-        fn encode_ruzstd_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
+        fn encode_szstd_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
             let mut input = Vec::new();
             data.read_to_end(&mut input).unwrap();
 
@@ -494,8 +494,8 @@ mod tests {
                     let data = data.as_slice();
                     // Decoding
                     let compressed = encode_zstd(data).unwrap();
-                    let decoded = decode_ruzstd(&mut compressed.as_slice());
-                    let decoded2 = decode_ruzstd_writer(&mut compressed.as_slice());
+                    let decoded = decode_szstd(&mut compressed.as_slice());
+                    let decoded2 = decode_szstd_writer(&mut compressed.as_slice());
                     assert!(
                         decoded == data,
                         "Decoded data did not match the original input during decompression"
@@ -508,7 +508,7 @@ mod tests {
                     // Encoding
                     // Uncompressed encoding
                     let mut input = data;
-                    let compressed = encode_ruzstd_uncompressed(&mut input);
+                    let compressed = encode_szstd_uncompressed(&mut input);
                     let decoded = decode_zstd(&compressed).unwrap();
                     assert_eq!(
                         decoded, data,
@@ -516,7 +516,7 @@ mod tests {
                     );
                     // Compressed encoding
                     let mut input = data;
-                    let compressed = encode_ruzstd_compressed(&mut input);
+                    let compressed = encode_szstd_compressed(&mut input);
                     let decoded = decode_zstd(&compressed).unwrap();
                     assert_eq!(
                         decoded, data,
