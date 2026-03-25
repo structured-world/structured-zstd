@@ -29,18 +29,18 @@ const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
 ///
 /// Workflow is as follows:
 /// ```
-/// use ruzstd::decoding::BlockDecodingStrategy;
+/// use structured_zstd::decoding::BlockDecodingStrategy;
 ///
 /// # #[cfg(feature = "std")]
 /// use std::io::{Read, Write};
 ///
 /// // no_std environments can use the crate's own Read traits
 /// # #[cfg(not(feature = "std"))]
-/// use ruzstd::io::{Read, Write};
+/// use structured_zstd::io::{Read, Write};
 ///
 /// fn decode_this(mut file: impl Read) {
 ///     //Create a new decoder
-///     let mut frame_dec = ruzstd::decoding::FrameDecoder::new();
+///     let mut frame_dec = structured_zstd::decoding::FrameDecoder::new();
 ///     let mut result = Vec::new();
 ///
 ///     // Use reset or init to make the decoder ready to decode the frame from the io::Read

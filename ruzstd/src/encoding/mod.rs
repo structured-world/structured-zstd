@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress, CompressionLevel};
+/// use structured_zstd::encoding::{compress, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let mut target = Vec::new();
 /// compress(data, &mut target, CompressionLevel::Fastest);
@@ -30,7 +30,7 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 
 /// Convenience function to compress some source into a Vec without reusing any resources of the compressor
 /// ```rust
-/// use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+/// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
 /// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 /// ```

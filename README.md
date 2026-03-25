@@ -57,10 +57,11 @@ let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 
 ### Decompression
 
-```rust
+```rust,no_run
 use structured_zstd::decoding::StreamingDecoder;
 use structured_zstd::io::Read;
 
+let compressed_data: Vec<u8> = vec![];
 let mut source: &[u8] = &compressed_data;
 let mut decoder = StreamingDecoder::new(&mut source).unwrap();
 
