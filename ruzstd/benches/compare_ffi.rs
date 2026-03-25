@@ -2,7 +2,7 @@
 //!
 //! Four variations: compress/decompress × pure Rust/C FFI.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 /// Compressed corpus for decompression benchmarks.
 const COMPRESSED_CORPUS: &[u8] = include_bytes!("../decodecorpus_files/z000033.zst");
@@ -47,22 +47,22 @@ fn bench_compress(c: &mut Criterion) {
         &raw_data,
         |b, data| {
             b.iter(|| {
-                structured_zstd::encoding::compress_to_vec(
+                black_box(structured_zstd::encoding::compress_to_vec(
                     &data[..],
                     structured_zstd::encoding::CompressionLevel::Fastest,
-                )
+                ))
             })
         },
     );
 
     // C FFI compression (level 1 ≈ fastest)
     group.bench_with_input(BenchmarkId::new("c_ffi", "level1"), &raw_data, |b, data| {
-        b.iter(|| zstd::encode_all(&data[..], 1).unwrap())
+        b.iter(|| black_box(zstd::encode_all(&data[..], 1).unwrap()))
     });
 
     // C FFI compression (level 3 ≈ default)
     group.bench_with_input(BenchmarkId::new("c_ffi", "level3"), &raw_data, |b, data| {
-        b.iter(|| zstd::encode_all(&data[..], 3).unwrap())
+        b.iter(|| black_box(zstd::encode_all(&data[..], 3).unwrap()))
     });
 
     group.finish();

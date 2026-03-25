@@ -9,7 +9,7 @@ license = "MIT"
 homepage = "https://github.com/KillingSpark/zstd-rs"
 repository = "https://github.com/KillingSpark/zstd-rs"
 description = "A command line interface for the `ruzstd` zstd implementation"
-readme = "../Readme.md"
+readme = "../README.md"
 keywords = ["zstd", "zstandard", "decompression"]
 categories = ["compression"]
 

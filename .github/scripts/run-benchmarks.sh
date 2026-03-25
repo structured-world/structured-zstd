@@ -1,12 +1,12 @@
 #!/bin/bash
 # Run compare_ffi benchmarks and produce github-action-benchmark JSON.
 # Output: benchmark-results.json (customSmallerIsBetter format — lower time = better)
-set -e
+set -eo pipefail
 
 echo "Running benchmarks..." >&2
 
 # Run criterion benchmarks, capture output
-cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher 2>/dev/null | tee /tmp/bench-raw.txt
+cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher | tee /tmp/bench-raw.txt
 
 echo "Parsing results..." >&2
 
@@ -31,9 +31,8 @@ with open("/tmp/bench-raw.txt") as f:
             })
 
 if not results:
-    print("WARNING: No benchmark results parsed!", file=sys.stderr)
-    # Write empty array so CI doesn't fail
-    results = [{"name": "no_results", "unit": "ms", "value": 0}]
+    print("ERROR: No benchmark results parsed!", file=sys.stderr)
+    sys.exit(1)
 
 with open("benchmark-results.json", "w") as f:
     json.dump(results, f, indent=2)
