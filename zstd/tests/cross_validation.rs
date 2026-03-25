@@ -66,15 +66,12 @@ fn cross_ffi_compress_rust_decompress_1000() {
     }
 }
 
-/// Cross-validate large blocks (>16KB up to 128KB) that exercise the 18-bit
-/// size format (0b11) with 4-stream Huffman encoding.
+/// Cross-validate large inputs (1KB–512KB) that produce large literal sections,
+/// verifying C zstd can decompress what our encoder produces.
 #[test]
 fn cross_rust_compress_ffi_decompress_large_blocks() {
-    // Sizes targeting each compressed literals size format boundary:
-    // 1025 (14-bit), 16384 (18-bit), 65536 (18-bit), 128*1024 (18-bit max)
     let sizes = [1025, 16384, 65536, 128 * 1024];
     for (i, &size) in sizes.iter().enumerate() {
-        // Huffman-friendly data ensures compressed path is taken (not raw fallback)
         let data = generate_huffman_friendly(i as u64 + 200, size, 48);
 
         let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);

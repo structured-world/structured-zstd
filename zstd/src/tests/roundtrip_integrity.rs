@@ -145,34 +145,32 @@ fn roundtrip_edge_cases() {
     assert_eq!(roundtrip_simple(&rle), rle);
 }
 
-/// Tests that exercise all 4 compressed literals size format paths:
-/// - Size format 0b00: single stream, 10-bit (regenerated_size < 6)
-/// - Size format 0b01: 4 streams,     10-bit (6 ≤ regenerated_size < 1024)
-/// - Size format 0b10: 4 streams,     14-bit (1024 ≤ regenerated_size < 16384)
-/// - Size format 0b11: 4 streams,     18-bit (16384 ≤ regenerated_size < 262144)
+/// Roundtrip tests with large inputs that produce large literal sections.
+///
+/// The encoder uses `compress_literals` (Huffman) for literals > 1024 bytes,
+/// so these inputs exercise the 14-bit (0b10) and 18-bit (0b11) size formats.
+/// The exact literals size depends on how many matches the encoder finds,
+/// so we verify roundtrip correctness rather than specific format selection.
 #[test]
-fn roundtrip_literals_size_format_boundaries() {
-    // Size format 0b10 boundary: data just over 1KB forces 14-bit path.
-    // Uses limited alphabet so Huffman encoding is used (not raw fallback).
+fn roundtrip_large_literals() {
+    // ~1KB input — just above the raw→Huffman threshold.
     let data_1025 = generate_huffman_friendly(42, 1025, 16);
     assert_eq!(roundtrip_simple(&data_1025), data_1025);
     assert_eq!(roundtrip_streaming(&data_1025), data_1025);
 
-    // Size format 0b10 upper boundary: just under 16KB.
+    // ~16KB input — near the 14-bit/18-bit boundary.
     let data_16383 = generate_huffman_friendly(43, 16383, 32);
     assert_eq!(roundtrip_simple(&data_16383), data_16383);
 
-    // Size format 0b11 boundary: data at exactly 16384 forces 18-bit path.
     let data_16384 = generate_huffman_friendly(44, 16384, 32);
     assert_eq!(roundtrip_simple(&data_16384), data_16384);
     assert_eq!(roundtrip_streaming(&data_16384), data_16384);
 
-    // Size format 0b11: data at 64KB (well within 18-bit range).
+    // 64KB input — well within the 18-bit range.
     let data_64k = generate_huffman_friendly(45, 65536, 64);
     assert_eq!(roundtrip_simple(&data_64k), data_64k);
 
-    // Size format 0b11: data at MAX_BLOCK_SIZE (128KB) — maximum valid literal size.
-    // This is the largest possible literal section in a single block.
+    // 128KB input — MAX_BLOCK_SIZE, the largest single block.
     let data_128k = generate_huffman_friendly(46, 128 * 1024, 64);
     assert_eq!(roundtrip_simple(&data_128k), data_128k);
     assert_eq!(roundtrip_streaming(&data_128k), data_128k);
