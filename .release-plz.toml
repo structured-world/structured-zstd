@@ -3,6 +3,7 @@ semver_check = false
 git_release_enable = true
 changelog_update = true
 git_tag_name = "v{{ version }}"
+publish = false
 
 [[package]]
 name = "structured-zstd-cli"
