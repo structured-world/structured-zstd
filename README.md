@@ -5,7 +5,7 @@ Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/Ki
 [![CI](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/structured-zstd.svg)](https://crates.io/crates/structured-zstd)
 [![docs.rs](https://docs.rs/structured-zstd/badge.svg)](https://docs.rs/structured-zstd)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ## Managed Fork
 
@@ -80,6 +80,6 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 ## License
 
-MIT — same as upstream ruzstd.
+Apache License 2.0
 
-Contributions will be published under the same MIT license.
+Contributions will be published under the same Apache 2.0 license.
