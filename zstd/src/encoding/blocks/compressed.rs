@@ -316,6 +316,15 @@ fn compress_literals(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
 ) -> Option<huff0_encoder::HuffmanTable> {
+    // The 18-bit size format supports up to 262143 bytes, which covers MAX_BLOCK_SIZE (128KB).
+    // Literals within a single block cannot exceed the block's content size.
+    debug_assert!(
+        literals.len() <= crate::common::MAX_BLOCK_SIZE as usize,
+        "literals size {} exceeds MAX_BLOCK_SIZE ({})",
+        literals.len(),
+        crate::common::MAX_BLOCK_SIZE,
+    );
+
     let reset_idx = writer.index();
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
@@ -341,12 +350,23 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
+    // RFC 8878 §3.1.1.3.1.1: Size_Format determines header size and stream count.
+    // - 0b00: single stream, 10-bit sizes (regenerated ≤ 1023)
+    // - 0b01: 4 streams,     10-bit sizes (regenerated ≤ 1023)
+    // - 0b10: 4 streams,     14-bit sizes (regenerated ≤ 16383)
+    // - 0b11: 4 streams,     18-bit sizes (regenerated ≤ 262143)
+    // MAX_BLOCK_SIZE (128KB = 131072) fits within the 18-bit format.
     let (size_format, size_bits) = match literals.len() {
         0..6 => (0b00u8, 10),
         6..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
-        _ => unimplemented!("too many literals"),
+        _ => unreachable!(
+            "literals size {} exceeds 18-bit maximum (262143); \
+             blocks are limited to MAX_BLOCK_SIZE ({}) which always fits",
+            literals.len(),
+            crate::common::MAX_BLOCK_SIZE,
+        ),
     };
 
     writer.write_bits(size_format, 2);

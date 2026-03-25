@@ -60,6 +60,20 @@ fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Generate data with limited alphabet for better Huffman compressibility
+/// but enough variety to avoid RLE path.
+fn generate_huffman_friendly(seed: u64, len: usize, alphabet_size: u8) -> Vec<u8> {
+    let mut state = seed;
+    let mut data = Vec::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push(((state >> 33) as u8) % alphabet_size);
+    }
+    data
+}
+
 // Cross-validation tests (pure Rust ↔ C FFI) are in tests/cross_validation.rs
 // because dev-dependencies (zstd) aren't available in library test modules.
 
@@ -129,4 +143,48 @@ fn roundtrip_edge_cases() {
     // 1 byte repeated (RLE-like)
     let rle = vec![0xABu8; 1_000_000];
     assert_eq!(roundtrip_simple(&rle), rle);
+}
+
+/// Tests that exercise all 4 compressed literals size format paths:
+/// - Size format 0b00: single stream, 10-bit (regenerated_size < 6)
+/// - Size format 0b01: 4 streams,     10-bit (6 ≤ regenerated_size < 1024)
+/// - Size format 0b10: 4 streams,     14-bit (1024 ≤ regenerated_size < 16384)
+/// - Size format 0b11: 4 streams,     18-bit (16384 ≤ regenerated_size < 262144)
+#[test]
+fn roundtrip_literals_size_format_boundaries() {
+    // Size format 0b10 boundary: data just over 1KB forces 14-bit path.
+    // Uses limited alphabet so Huffman encoding is used (not raw fallback).
+    let data_1025 = generate_huffman_friendly(42, 1025, 16);
+    assert_eq!(roundtrip_simple(&data_1025), data_1025);
+    assert_eq!(roundtrip_streaming(&data_1025), data_1025);
+
+    // Size format 0b10 upper boundary: just under 16KB.
+    let data_16383 = generate_huffman_friendly(43, 16383, 32);
+    assert_eq!(roundtrip_simple(&data_16383), data_16383);
+
+    // Size format 0b11 boundary: data at exactly 16384 forces 18-bit path.
+    let data_16384 = generate_huffman_friendly(44, 16384, 32);
+    assert_eq!(roundtrip_simple(&data_16384), data_16384);
+    assert_eq!(roundtrip_streaming(&data_16384), data_16384);
+
+    // Size format 0b11: data at 64KB (well within 18-bit range).
+    let data_64k = generate_huffman_friendly(45, 65536, 64);
+    assert_eq!(roundtrip_simple(&data_64k), data_64k);
+
+    // Size format 0b11: data at MAX_BLOCK_SIZE (128KB) — maximum valid literal size.
+    // This is the largest possible literal section in a single block.
+    let data_128k = generate_huffman_friendly(46, 128 * 1024, 64);
+    assert_eq!(roundtrip_simple(&data_128k), data_128k);
+    assert_eq!(roundtrip_streaming(&data_128k), data_128k);
+}
+
+/// Multi-block data larger than MAX_BLOCK_SIZE that exercises the 4-stream
+/// Huffman encoding across multiple blocks, each with large literal sections.
+#[test]
+fn roundtrip_multi_block_large_literals() {
+    // 512KB of Huffman-friendly data — will be split into multiple 128KB blocks,
+    // each exercising the 18-bit (0b11) size format with 4-stream encoding.
+    let data = generate_huffman_friendly(100, 512 * 1024, 48);
+    assert_eq!(roundtrip_simple(&data), data);
+    assert_eq!(roundtrip_streaming(&data), data);
 }
