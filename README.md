@@ -73,7 +73,7 @@ decoder.read_to_end(&mut result).unwrap();
 
 <div align="center">
 
-![USDT TRC-20 Donation QR Code](https://raw.githubusercontent.com/structured-world/structured-zstd/HEAD/assets/usdt-qr.svg)
+![USDT TRC-20 Donation QR Code](https://raw.githubusercontent.com/structured-world/structured-zstd/main/assets/usdt-qr.svg)
 
 USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 

@@ -6,6 +6,9 @@
 /// Computes a best effort guess as to how many times `pattern` occurs within
 /// `body`. While not 100% accurate, it will be accurate the vast majority of time
 pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
+    if pattern.is_empty() {
+        return 0;
+    }
     assert!(body.len() >= pattern.len());
     // A prime number for modulo operations to reduce collisions (q)
     const PRIME: i64 = 2654435761;
