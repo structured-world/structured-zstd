@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774460580265,
+  "lastUpdate": 1774462612331,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -293,6 +293,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.012,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "90378eba02e39add0c20161b0a09b7d9b163c19e",
+          "message": "chore: bump MSRV to 1.92, ignore dtolnay/rust-toolchain in dependabot (#32)\n\n- Update rust-version in zstd/Cargo.toml and cli/Cargo.toml to 1.92\n- Update MSRV CI job toolchain from 1.87 to 1.92\n- Exclude dtolnay/rust-toolchain from dependabot updates\n\nCloses #31",
+          "timestamp": "2026-03-25T20:14:26+02:00",
+          "tree_id": "1c64a43ae32f06767608f0c92298bfd54ec22455",
+          "url": "https://github.com/structured-world/structured-zstd/commit/90378eba02e39add0c20161b0a09b7d9b163c19e"
+        },
+        "date": 1774462611744,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 8.491,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.871,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 15.82,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 2.597,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 4.258,
             "unit": "ms"
           }
         ]
