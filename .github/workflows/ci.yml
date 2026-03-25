@@ -103,22 +103,43 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  bench:
+  benchmark:
+    name: Performance regression check
     needs: lint
-    timeout-minutes: 15
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: bench
+
       - name: Run benchmarks
-        run: cargo bench --all-features -- --output-format bencher | tee bench-output.txt
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        run: bash .github/scripts/run-benchmarks.sh
+
+      - name: Store benchmark results
+        if: steps.bot-token.outputs.token != ''
+        uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: benchmark-results
-          path: |
-            bench-output.txt
-            target/criterion/
+          name: "structured-zstd vs C FFI"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.json
+          github-token: ${{ steps.bot-token.outputs.token }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          alert-comment-cc-users: "@polaz"
+          alert-threshold: "115%"
+          fail-threshold: "125%"
+          fail-on-alert: ${{ github.event_name == 'pull_request' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          benchmark-data-dir-path: dev/bench
