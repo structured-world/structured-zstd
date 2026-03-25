@@ -15,21 +15,23 @@ const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    let offset_hist = &mut state.offset_hist;
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            let ll = literals.len() as u32;
+            literals_vec.extend_from_slice(literals);
+            let actual_offset = offset as u32;
+            let of = encode_offset_with_history(actual_offset, ll, offset_hist);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll,
+                ml: match_len as u32,
+                of,
+            });
         }
     });
 
@@ -54,7 +56,6 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         encode_seqnum(sequences.len(), &mut writer);
 
         // Choose the tables
-        // TODO store previously used tables
         let ll_mode = choose_table(
             state.fse_tables.ll_previous.as_ref(),
             &state.fse_tables.ll_default,
@@ -119,21 +120,94 @@ impl FseTableMode<'_> {
     }
 }
 
+/// Estimate the encoding cost (in bits) of the given symbol distribution using a table.
+/// Returns `None` if the table cannot encode all symbols present in the data.
+fn estimate_encoding_cost(counts: &[usize; 256], total: usize, table: &FSETable) -> Option<usize> {
+    if total == 0 {
+        return Some(0);
+    }
+    let table_size = table.table_size as f64;
+    let mut cost_bits = 0.0f64;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let prob = table.symbol_probability(symbol as u8);
+        if prob == 0 {
+            // Table cannot encode this symbol
+            return None;
+        }
+        let effective_prob = if prob == -1 { 1 } else { prob as usize };
+        // Bits per symbol ≈ log2(table_size / probability)
+        let bits_per_symbol = (table_size / effective_prob as f64).log2();
+        cost_bits += count as f64 * bits_per_symbol;
+    }
+    Some(cost_bits as usize)
+}
+
+/// Estimate the serialized size of an FSE table header in bits.
+fn estimate_table_header_cost(table: &FSETable) -> usize {
+    // 4 bits for accuracy log + variable bits per probability.
+    // Approximate: each symbol with prob>0 costs ~(acc_log+1) bits on average,
+    // zero-run encoding saves some. Use a rough estimate.
+    let acc_log = table.acc_log();
+    let num_symbols = table.num_symbols();
+    // Conservative estimate: 4 bits header + ~(log2(table_size)+1) bits per non-zero symbol
+    let bits_per_prob = (acc_log as usize) + 1;
+    4 + num_symbols * bits_per_prob
+}
+
 fn choose_table<'a>(
     previous: Option<&'a FSETable>,
     default_table: &'a FSETable,
     data: impl Iterator<Item = u8>,
     max_log: u8,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
+    // Collect symbol distribution
+    let mut counts = [0usize; 256];
+    let mut total = 0usize;
+    for symbol in data {
+        counts[symbol as usize] += 1;
+        total += 1;
+    }
+
+    if total == 0 {
+        return FseTableMode::Predefined(default_table);
+    }
+
+    // Build a new table from the actual data distribution
+    let new_table = build_table_from_data(
+        counts
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(sym, count)| core::iter::repeat_n(sym as u8, count)),
+        max_log,
+        true,
+    );
+
+    // Estimate costs: encoding cost + table header cost
+    let new_encoding_cost =
+        estimate_encoding_cost(&counts, total, &new_table).unwrap_or(usize::MAX);
+    let new_header_cost = estimate_table_header_cost(&new_table);
+    let new_total_cost = new_encoding_cost.saturating_add(new_header_cost);
+
+    // Predefined table: zero header cost
+    let predefined_cost =
+        estimate_encoding_cost(&counts, total, default_table).unwrap_or(usize::MAX);
+
+    // Previous table: zero header cost (repeat mode)
+    let previous_cost = previous
+        .and_then(|t| estimate_encoding_cost(&counts, total, t))
+        .unwrap_or(usize::MAX);
+
+    // Pick the cheapest option
+    if previous_cost <= predefined_cost && previous_cost <= new_total_cost {
         FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
+    } else if predefined_cost <= new_total_cost {
         FseTableMode::Predefined(default_table)
+    } else {
+        FseTableMode::Encoded(new_table)
     }
 }
 
@@ -299,6 +373,71 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
         65539..=131074 => (52, len - 32771, 16),
         131075.. => unreachable!(),
     }
+}
+
+/// Convert an actual byte offset into the encoded offset code, using repeat offset
+/// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
+///
+/// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
+fn encode_offset_with_history(actual_offset: u32, lit_len: u32, offset_hist: &mut [u32; 3]) -> u32 {
+    let encoded = if lit_len > 0 {
+        if actual_offset == offset_hist[0] {
+            1
+        } else if actual_offset == offset_hist[1] {
+            2
+        } else if actual_offset == offset_hist[2] {
+            3
+        } else {
+            actual_offset + 3
+        }
+    } else {
+        // When lit_len == 0, repeat offset mapping shifts per RFC 8878:
+        // code 1 → rep[1], code 2 → rep[2], code 3 → rep[0]-1
+        if actual_offset == offset_hist[1] {
+            1
+        } else if actual_offset == offset_hist[2] {
+            2
+        } else if actual_offset == offset_hist[0].wrapping_sub(1) && offset_hist[0] > 1 {
+            3
+        } else {
+            actual_offset + 3
+        }
+    };
+
+    // Update history (same rules as decoder)
+    if lit_len > 0 {
+        match encoded {
+            1 => { /* rep[0] stays the same */ }
+            2 => {
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            _ => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+        }
+    } else {
+        match encoded {
+            1 => {
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            2 => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            _ => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+        }
+    }
+
+    encoded
 }
 
 fn encode_offset(len: u32) -> (u8, u32, usize) {

@@ -144,6 +144,16 @@ impl FSETable {
         self.table_size.ilog2() as u8
     }
 
+    /// Get the probability assigned to a symbol (0 means absent, -1 means less-than-1).
+    pub(crate) fn symbol_probability(&self, symbol: u8) -> i32 {
+        self.states[symbol as usize].probability
+    }
+
+    /// Count symbols with non-zero probability (present in the table).
+    pub(crate) fn num_symbols(&self) -> usize {
+        self.states.iter().filter(|s| s.probability != 0).count()
+    }
+
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
         writer.write_bits(self.acc_log() - 5, 4);
         let mut probability_counter = 0usize;

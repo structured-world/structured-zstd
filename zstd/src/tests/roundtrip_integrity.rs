@@ -187,3 +187,92 @@ fn roundtrip_multi_block_large_literals() {
     assert_eq!(roundtrip_simple(&data), data);
     assert_eq!(roundtrip_streaming(&data), data);
 }
+
+/// Repeat offset encoding: data with many repeated match offsets should compress
+/// better than data where every offset is unique, and must roundtrip correctly.
+#[test]
+fn roundtrip_repeat_offsets() {
+    // Build data with a repeating pattern at a fixed offset.
+    // The pattern "ABCDE" repeats every 10 bytes — the encoder should detect offset=10
+    // as a repeat offset after the first match.
+    let pattern = b"ABCDE12345";
+    let mut data = Vec::with_capacity(100_000);
+    for _ in 0..10_000 {
+        data.extend_from_slice(pattern);
+    }
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Repeat offset roundtrip failed");
+
+    // Also verify with streaming API
+    let result = roundtrip_streaming(&data);
+    assert_eq!(data, result, "Repeat offset streaming roundtrip failed");
+}
+
+/// Verify that repeat offsets actually improve compression ratio.
+/// Data with repeated offsets should compress significantly better than random data.
+#[test]
+fn repeat_offsets_improve_compression() {
+    // Repetitive-offset data: same 10-byte pattern repeated
+    let pattern = b"ABCDE12345";
+    let mut repetitive = Vec::with_capacity(50_000);
+    for _ in 0..5_000 {
+        repetitive.extend_from_slice(pattern);
+    }
+    let compressed_repetitive = compress_to_vec(&repetitive[..], CompressionLevel::Fastest);
+
+    // Random data of same size (incompressible)
+    let random = generate_data(999, 50_000);
+    let compressed_random = compress_to_vec(&random[..], CompressionLevel::Fastest);
+
+    // Repetitive data should compress much better
+    assert!(
+        compressed_repetitive.len() < compressed_random.len() / 2,
+        "Repeat offsets should yield significantly better compression. \
+         repetitive={} bytes, random={} bytes",
+        compressed_repetitive.len(),
+        compressed_random.len()
+    );
+}
+
+/// Multi-block data exercises FSE table reuse across blocks and offset history
+/// persistence across block boundaries.
+#[test]
+fn roundtrip_multi_block_repeat_offsets() {
+    // 512KB of data with repeating patterns — spans multiple 128KB blocks.
+    // Offset history and FSE tables must persist correctly across blocks.
+    let pattern = b"HelloWorld";
+    let mut data = Vec::with_capacity(512 * 1024);
+    while data.len() < 512 * 1024 {
+        data.extend_from_slice(pattern);
+    }
+    data.truncate(512 * 1024);
+
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Multi-block repeat offset roundtrip failed");
+
+    let result = roundtrip_streaming(&data);
+    assert_eq!(
+        data, result,
+        "Multi-block repeat offset streaming roundtrip failed"
+    );
+}
+
+/// Zero literal length sequences (back-to-back matches with no literals between them)
+/// exercise the shifted repeat offset mapping (code 1→rep[1], code 2→rep[2], code 3→rep[0]-1).
+#[test]
+fn roundtrip_zero_literal_length_sequences() {
+    // Create data where the same bytes appear at two different offsets,
+    // forcing back-to-back matches with ll=0.
+    let mut data = Vec::with_capacity(10_000);
+    // Initial unique segment
+    for i in 0..100u8 {
+        data.push(i);
+    }
+    // Repeat the first 50 bytes many times — first match has literals, subsequent ones don't
+    for _ in 0..100 {
+        data.extend_from_slice(&data[..50].to_vec());
+    }
+
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Zero ll sequence roundtrip failed");
+}

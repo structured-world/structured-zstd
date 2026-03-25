@@ -70,6 +70,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
+    /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
+    pub(crate) offset_hist: [u32; 3],
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -83,6 +86,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -100,6 +104,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             compression_level,
             #[cfg(feature = "hash")]
@@ -132,6 +137,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
+        self.state.offset_hist = [1, 4, 8];
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
