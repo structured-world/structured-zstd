@@ -1,0 +1,54 @@
+//! Cross-validation: structured-zstd ↔ C FFI zstd roundtrip integrity.
+//!
+//! Tests 1000 iterations in both directions:
+//! - Pure Rust compress → C FFI decompress
+//! - C FFI compress → Pure Rust decompress
+
+use structured_zstd::decoding::StreamingDecoder;
+use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+use structured_zstd::io::Read;
+
+/// Generate deterministic pseudo-random data using a simple LCG.
+fn generate_data(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    let mut data = Vec::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((state >> 33) as u8);
+    }
+    data
+}
+
+#[test]
+fn cross_rust_compress_ffi_decompress_1000() {
+    for i in 0..1000u64 {
+        let len = (i * 89 % 16384) as usize;
+        let data = generate_data(i, len);
+
+        let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);
+        let result = zstd::decode_all(compressed.as_slice()).unwrap();
+        assert_eq!(
+            data, result,
+            "rust→ffi roundtrip failed at iteration {i}, len={len}"
+        );
+    }
+}
+
+#[test]
+fn cross_ffi_compress_rust_decompress_1000() {
+    for i in 0..1000u64 {
+        let len = (i * 89 % 16384) as usize;
+        let data = generate_data(i.wrapping_add(0xBEEF), len);
+
+        let compressed = zstd::encode_all(&data[..], 1).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "ffi→rust roundtrip failed at iteration {i}, len={len}"
+        );
+    }
+}
