@@ -1,4 +1,4 @@
-extern crate ruzstd;
+extern crate structured_zstd as ruzstd;
 mod progress;
 use progress::ProgressMonitor;
 

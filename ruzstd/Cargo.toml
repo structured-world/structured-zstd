@@ -46,3 +46,7 @@ rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
 [[bench]]
 name = "decode_all"
 harness = false
+
+[[bench]]
+name = "compare_ffi"
+harness = false
