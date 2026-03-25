@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774462612331,
+  "lastUpdate": 1774476016527,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -342,6 +342,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 4.258,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1c9c616fea994ca4a257d48cfb28c798a5284b7d",
+          "message": "feat: large literals block support (>262KB) (#30)\n\n* feat: replace unimplemented! panic with proper error handling for large literals\n\n- Replace `unimplemented!(\"too many literals\")` with `unreachable!` and\n  descriptive message explaining the MAX_BLOCK_SIZE invariant\n- Add debug_assert validating literals never exceed MAX_BLOCK_SIZE (128KB)\n- Add RFC 8878 §3.1.1.3.1.1 size format documentation comments\n- Add roundtrip tests exercising all 4 size format boundaries (0b00–0b11)\n- Add cross-validation tests (Rust ↔ C FFI) for large blocks up to 128KB\n\nCloses #15\n\n* docs: clarify reachable size formats in encoder and test docs\n\n- Remove redundant debug_assert (unreachable! already guards the invariant)\n- Clarify RFC comment: only formats 0b10/0b11 are reachable in encoder\n- Fix test docs: roundtrip tests verify correctness, not specific format selection\n- Rename test to roundtrip_large_literals (accurate scope)\n\n* fix(encoding): replace runtime unreachable with compile-time const assert\n\n- Use `const { assert!(MAX_BLOCK_SIZE <= 262143) }` for compile-time safety\n- Replace `_ => unreachable!()` with `_ => (0b11, 18)` wildcard arm\n- Add assert for alphabet_size > 0 in test helpers\n\nEliminates uncoverable dead code that caused 0% patch coverage.\n\n* fix(encoding): add runtime debug_assert for literals size invariant\n\nGuard against custom Matcher implementations that might produce\nliterals exceeding the 18-bit size format limit (262143 bytes).\n\n* fix(encoding): use release-mode assert for literals size guard\n\nUpgrade debug_assert! to assert! — truncated 18-bit writes in release\nbuilds would produce corrupt streams silently. The assert fires in all\nbuild profiles, preventing invalid output from custom Matcher impls.\n\n* refactor(encoding): move const assert to module scope, add assert message\n\n- Move compile-time MAX_BLOCK_SIZE check to idiomatic `const _: () = assert!(...)`\n  at module scope instead of inline `const { ... }` expression\n- Add static panic message to runtime assert (format args omitted to avoid\n  uncoverable dead code in coverage instrumentation)",
+          "timestamp": "2026-03-25T23:58:37+02:00",
+          "tree_id": "747d0da8c7a878ee8b94d143fcf834e77c63915a",
+          "url": "https://github.com/structured-world/structured-zstd/commit/1c9c616fea994ca4a257d48cfb28c798a5284b7d"
+        },
+        "date": 1774476016158,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 8.973,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.931,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 18.129,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 3.376,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.074,
             "unit": "ms"
           }
         ]
