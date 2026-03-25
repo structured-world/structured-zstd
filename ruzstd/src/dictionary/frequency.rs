@@ -15,11 +15,11 @@ pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
     let mut pattern_hash: i64 = 0;
     // Hash of the current window of text (t)
     let mut window_hash: i64 = 0;
-    // High-order digit multiplier (h)
+    // High-order digit multiplier: h = ALPHABET_SIZE^(pattern.len()-1) mod PRIME
     let mut h: i64 = 1;
-
-    // Precompute h (?)
-    h = (h * ALPHABET_SIZE) % PRIME;
+    for _ in 0..pattern.len().saturating_sub(1) {
+        h = (h * ALPHABET_SIZE) % PRIME;
+    }
 
     // Compute initial hash values
     for i in 0..pattern.len() {
@@ -29,16 +29,19 @@ pub fn estimate_frequency(pattern: &[u8], body: &[u8]) -> usize {
 
     let mut num_occurances = 0;
     for i in 0..=body.len() - pattern.len() {
-        // There's *probably* a match if these two match
         if pattern_hash == window_hash {
             num_occurances += 1;
         }
 
-        // Compute hash values for next window
+        // Compute hash for next window using rolling hash
         if i < body.len() - pattern.len() {
             window_hash = (ALPHABET_SIZE * (window_hash - body[i] as i64 * h)
                 + body[i + pattern.len()] as i64)
                 % PRIME;
+            // Ensure non-negative (Euclidean modulo)
+            if window_hash < 0 {
+                window_hash += PRIME;
+            }
         }
     }
 
