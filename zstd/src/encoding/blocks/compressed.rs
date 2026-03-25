@@ -348,18 +348,14 @@ fn compress_literals(
     // The encoder currently only calls this function for literals > 1024 bytes
     // (smaller literals use raw_literals), so only formats 0b10 and 0b11 are
     // reachable in practice. The 0b00/0b01 arms are kept for completeness.
-    // MAX_BLOCK_SIZE (128KB = 131072) fits within the 18-bit format.
+    //
+    // Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit format.
+    const { assert!(crate::common::MAX_BLOCK_SIZE <= 262143) };
     let (size_format, size_bits) = match literals.len() {
         0..6 => (0b00u8, 10),
         6..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
-        16384..262144 => (0b11, 18),
-        _ => unreachable!(
-            "literals size {} exceeds 18-bit maximum (262143); \
-             blocks are limited to MAX_BLOCK_SIZE ({}) which always fits",
-            literals.len(),
-            crate::common::MAX_BLOCK_SIZE,
-        ),
+        _ => (0b11, 18),
     };
 
     writer.write_bits(size_format, 2);

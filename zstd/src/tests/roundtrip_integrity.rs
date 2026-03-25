@@ -63,6 +63,7 @@ fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
 /// Generate data with limited alphabet for better Huffman compressibility
 /// but enough variety to avoid RLE path.
 fn generate_huffman_friendly(seed: u64, len: usize, alphabet_size: u8) -> Vec<u8> {
+    assert!(alphabet_size > 0, "alphabet_size must be non-zero");
     let mut state = seed;
     let mut data = Vec::with_capacity(len);
     for _ in 0..len {
