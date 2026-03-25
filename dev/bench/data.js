@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774413075371,
+  "lastUpdate": 1774433360553,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48,6 +48,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.085,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "distinct": true,
+          "id": "43e2112072edb05483e7254554a16f6cc0933993",
+          "message": "fix(ci): fix TOML syntax error in release-plz config",
+          "timestamp": "2026-03-25T12:07:35+02:00",
+          "tree_id": "78ed0ad83abf80d54d6f9b1d4979d182accdf7a9",
+          "url": "https://github.com/structured-world/structured-zstd/commit/43e2112072edb05483e7254554a16f6cc0933993"
+        },
+        "date": 1774433359995,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 9.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.922,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 15.845,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 2.78,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 4.977,
             "unit": "ms"
           }
         ]
