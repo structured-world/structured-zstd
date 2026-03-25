@@ -5,6 +5,7 @@
 
 extern crate std;
 
+#[allow(unused_imports)]
 use alloc::vec;
 use alloc::vec::Vec;
 
