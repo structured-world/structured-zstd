@@ -518,9 +518,39 @@ impl MatchGenerator {
             return None;
         }
 
-        let offset = self.offset_hist[1] as usize;
-        let match_len = self.offset_match_len(offset, data_slice)?;
-        (match_len >= MIN_MATCH_LEN).then_some((offset, match_len))
+        let reps = [
+            Some(self.offset_hist[1] as usize),
+            Some(self.offset_hist[2] as usize),
+            (self.offset_hist[0] > 1).then_some((self.offset_hist[0] - 1) as usize),
+        ];
+
+        let mut best: Option<(usize, usize)> = None;
+        let mut seen = [0usize; 3];
+        let mut seen_len = 0usize;
+        for offset in reps.into_iter().flatten() {
+            if offset == 0 {
+                continue;
+            }
+            if seen[..seen_len].contains(&offset) {
+                continue;
+            }
+            seen[seen_len] = offset;
+            seen_len += 1;
+
+            let Some(match_len) = self.offset_match_len(offset, data_slice) else {
+                continue;
+            };
+            if match_len < MIN_MATCH_LEN {
+                continue;
+            }
+
+            if best.is_none_or(|(old_offset, old_len)| {
+                match_len > old_len || (match_len == old_len && offset < old_offset)
+            }) {
+                best = Some((offset, match_len));
+            }
+        }
+        best
     }
 
     fn offset_match_len(&self, offset: usize, data_slice: &[u8]) -> Option<usize> {
@@ -1273,6 +1303,23 @@ fn simple_matcher_repcode_can_target_previous_window_entry() {
     matcher.offset_hist = [99, 10, 4];
 
     let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data, 0);
+    assert_eq!(candidate, Some((10, 10)));
+}
+
+#[test]
+fn simple_matcher_zero_literal_repcode_checks_rep2_and_rep0_minus1() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.add_data(
+        b"abcdefghijabcdefghij".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.suffix_idx = 10;
+    matcher.last_idx_in_sequence = 10;
+    // rep1=4 does not match at idx 10, rep2=10 does.
+    matcher.offset_hist = [99, 4, 10];
+
+    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
     assert_eq!(candidate, Some((10, 10)));
 }
 
