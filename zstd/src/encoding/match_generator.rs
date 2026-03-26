@@ -18,6 +18,8 @@ use super::blocks::encode_offset_with_history;
 const MIN_MATCH_LEN: usize = 5;
 const DFAST_MIN_MATCH_LEN: usize = 6;
 const DFAST_TARGET_LEN: usize = 48;
+// Keep these aligned with the issue's zstd level-3/dfast target unless ratio
+// measurements show we can shrink them without regressing acceptance tests.
 const DFAST_HASH_BITS: usize = 20;
 const DFAST_SEARCH_DEPTH: usize = 4;
 const DFAST_DEFAULT_WINDOW_SIZE: usize = 1 << 22;
@@ -540,6 +542,8 @@ struct DfastMatchGenerator {
     max_window_size: usize,
     window: VecDeque<Vec<u8>>,
     window_size: usize,
+    // We keep a contiguous searchable history to avoid rebuilding and reseeding
+    // the matcher state from disjoint block buffers on every block.
     history: Vec<u8>,
     history_start: usize,
     history_abs_start: usize,
@@ -1240,4 +1244,39 @@ fn dfast_skip_matching_handles_window_eviction() {
     });
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
+}
+
+#[test]
+fn dfast_inserts_tail_positions_for_next_block_matching() {
+    let mut matcher = DfastMatchGenerator::new(DFAST_DEFAULT_WINDOW_SIZE);
+
+    matcher.add_data(b"012345bcdea".to_vec(), |_| {});
+    let mut history = Vec::new();
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => history.extend_from_slice(literals),
+        Sequence::Triple { .. } => unreachable!("first block should not match history"),
+    });
+    assert_eq!(history, b"012345bcdea");
+
+    matcher.add_data(b"bcdeabcdeab".to_vec(), |_| {});
+    let mut saw_triple = false;
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => history.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            saw_triple = true;
+            history.extend_from_slice(literals);
+            let start = history.len() - offset;
+            for i in 0..match_len {
+                let byte = history[start + i];
+                history.push(byte);
+            }
+        }
+    });
+
+    assert!(saw_triple, "expected tail-anchored cross-block match");
+    assert_eq!(history, b"012345bcdeabcdeabcdeab");
 }
