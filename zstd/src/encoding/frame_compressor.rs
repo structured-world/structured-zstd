@@ -222,7 +222,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     header.serialize(output);
                     output.extend_from_slice(&uncompressed_data);
                 }
-                CompressionLevel::Fastest => {
+                CompressionLevel::Fastest | CompressionLevel::Default => {
                     compress_fastest(&mut self.state, last_block, uncompressed_data, output)
                 }
                 _ => {

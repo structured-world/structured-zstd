@@ -64,6 +64,15 @@ fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Roundtrip using compress_to_vec with the default compression level.
+fn roundtrip_default(data: &[u8]) -> Vec<u8> {
+    let compressed = compress_to_vec(data, CompressionLevel::Default);
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    result
+}
+
 /// Generate data with limited alphabet for better Huffman compressibility
 /// but enough variety to avoid RLE path.
 fn generate_huffman_friendly(seed: u64, len: usize, alphabet_size: u8) -> Vec<u8> {
@@ -336,4 +345,10 @@ fn roundtrip_reused_frame_compressor_across_frames() {
         second, second_roundtrip,
         "Second reused-frame roundtrip failed"
     );
+}
+
+#[test]
+fn roundtrip_default_level_regression() {
+    let data = generate_compressible(777, 64 * 1024);
+    assert_eq!(roundtrip_default(&data), data);
 }

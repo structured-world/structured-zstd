@@ -13,6 +13,8 @@ use super::Matcher;
 use super::Sequence;
 
 const MIN_MATCH_LEN: usize = 5;
+const DEFAULT_SLICE_SIZE: usize = 1024 * 128;
+const DEFAULT_LEVEL_WINDOW_SIZE: usize = 1024 * 128 * 32;
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
@@ -33,10 +35,19 @@ impl MatchGeneratorDriver {
             slice_size,
         }
     }
+
+    fn configure_for_level(&mut self, level: CompressionLevel) {
+        self.slice_size = DEFAULT_SLICE_SIZE;
+        self.match_generator.max_window_size = match level {
+            CompressionLevel::Default => DEFAULT_LEVEL_WINDOW_SIZE,
+            _ => self.slice_size,
+        };
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
-    fn reset(&mut self, _level: CompressionLevel) {
+    fn reset(&mut self, level: CompressionLevel) {
+        self.configure_for_level(level);
         let vec_pool = &mut self.vec_pool;
         let suffix_pool = &mut self.suffix_pool;
 

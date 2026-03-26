@@ -196,3 +196,11 @@ fn cross_ffi_compress_rust_decompress_repeat_offsets() {
         "ffi→rust multi-block repeat offset roundtrip failed"
     );
 }
+
+#[test]
+fn cross_rust_default_compress_ffi_decompress_regression() {
+    let data = generate_huffman_friendly(900, 64 * 1024, 32);
+    let compressed = compress_to_vec(&data[..], CompressionLevel::Default);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(data, result, "rust default→ffi roundtrip failed");
+}

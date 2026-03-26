@@ -53,8 +53,6 @@ pub enum CompressionLevel {
     /// This level is roughly equivalent to Zstd level 3,
     /// or the one used by the official compressor when no level
     /// is specified.
-    ///
-    /// UNIMPLEMENTED
     Default,
     /// This level is roughly equivalent to Zstd level 7.
     ///
