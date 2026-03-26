@@ -323,6 +323,18 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
+    #[inline(always)]
+    #[cfg(target_endian = "little")]
+    fn mismatch_byte_index(diff: usize) -> usize {
+        diff.trailing_zeros() as usize / 8
+    }
+
+    #[inline(always)]
+    #[cfg(target_endian = "big")]
+    fn mismatch_byte_index(diff: usize) -> usize {
+        diff.leading_zeros() as usize / 8
+    }
+
     /// max_size defines how many bytes will be used at most in the window used for matching
     fn new(max_size: usize) -> Self {
         Self {
@@ -472,12 +484,7 @@ impl MatchGenerator {
             let rhs_word = unsafe { core::ptr::read_unaligned(rhs.add(off) as *const usize) };
             let diff = lhs_word ^ rhs_word;
             if diff != 0 {
-                let mismatch_bytes = if cfg!(target_endian = "little") {
-                    diff.trailing_zeros() as usize / 8
-                } else {
-                    diff.leading_zeros() as usize / 8
-                };
-                return off + mismatch_bytes;
+                return off + Self::mismatch_byte_index(diff);
             }
             off += chunk;
         }
@@ -1267,6 +1274,26 @@ fn simple_matcher_repcode_can_target_previous_window_entry() {
 
     let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data, 0);
     assert_eq!(candidate, Some((10, 10)));
+}
+
+#[test]
+fn simple_matcher_repcode_rejects_offsets_beyond_searchable_prefix() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.add_data(
+        b"abcdefghij".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.skip_matching();
+    matcher.add_data(
+        b"klmnopqrst".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.suffix_idx = 3;
+
+    let candidate = matcher.offset_match_len(14, &matcher.window.last().unwrap().data[3..]);
+    assert_eq!(candidate, None);
 }
 
 #[test]
