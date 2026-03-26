@@ -222,7 +222,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     header.serialize(output);
                     output.extend_from_slice(&uncompressed_data);
                 }
-                CompressionLevel::Fastest => {
+                CompressionLevel::Fastest | CompressionLevel::Default => {
+                    // Default shares this fast block-encoding pipeline, but it
+                    // remains a distinct level via the matcher's dfast backend.
                     compress_fastest(&mut self.state, last_block, uncompressed_data, output)
                 }
                 _ => {

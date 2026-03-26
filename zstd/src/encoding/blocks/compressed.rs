@@ -437,7 +437,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
         8195..=16386 => (49, len - 8195, 13),
         16387..=32770 => (50, len - 16387, 14),
         32771..=65538 => (51, len - 32771, 15),
-        65539..=131074 => (52, len - 32771, 16),
+        65539..=131074 => (52, len - 65539, 16),
         131075.. => unreachable!(),
     }
 }
@@ -446,7 +446,11 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
 /// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
 ///
 /// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
-fn encode_offset_with_history(actual_offset: u32, lit_len: u32, offset_hist: &mut [u32; 3]) -> u32 {
+pub(in crate::encoding) fn encode_offset_with_history(
+    actual_offset: u32,
+    lit_len: u32,
+    offset_hist: &mut [u32; 3],
+) -> u32 {
     let encoded = if lit_len > 0 {
         if actual_offset == offset_hist[0] {
             1
@@ -603,7 +607,7 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::{
-        FseTableMode, choose_table, encode_offset_with_history, previous_table,
+        FseTableMode, choose_table, encode_match_len, encode_offset_with_history, previous_table,
         remember_last_used_tables,
     };
     use crate::encoding::frame_compressor::{FseTables, PreviousFseTable};
@@ -643,6 +647,13 @@ mod tests {
         let mut hist = [10, 20, 30];
         assert_eq!(encode_offset_with_history(9, 0, &mut hist), 3);
         assert_eq!(hist, [9, 10, 20]);
+    }
+
+    #[test]
+    fn encode_match_len_uses_correct_upper_range_base() {
+        assert_eq!(encode_match_len(65539), (52, 0, 16));
+        assert_eq!(encode_match_len(65540), (52, 1, 16));
+        assert_eq!(encode_match_len(131074), (52, 65535, 16));
     }
 
     #[test]
