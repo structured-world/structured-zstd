@@ -1,7 +1,12 @@
 [workspace]
 semver_check = false
+# This fork releases through Git tags/GitHub releases instead of crates.io,
+# so release-plz must derive the last released version from tags.
+git_only = true
 git_release_enable = true
 changelog_update = true
+# Fork release tags now own the `v*` namespace in this repo, so release-plz
+# can follow the normal `v{{ version }}` pattern again.
 git_tag_name = "v{{ version }}"
 publish = false
 
