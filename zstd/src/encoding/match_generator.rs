@@ -40,6 +40,8 @@ impl MatchGeneratorDriver {
     }
 
     fn level_config(&self, level: CompressionLevel) -> (usize, usize) {
+        // All levels currently use the same baseline configuration.
+        // Explicit arms keep future compression-level changes intentional.
         match level {
             CompressionLevel::Uncompressed => (self.base_slice_size, self.base_window_size),
             CompressionLevel::Fastest => (self.base_slice_size, self.base_window_size),
