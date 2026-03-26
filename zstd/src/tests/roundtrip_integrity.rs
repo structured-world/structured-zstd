@@ -284,21 +284,19 @@ fn roundtrip_reused_frame_compressor_across_frames() {
     let second = generate_huffman_friendly(701, 512 * 1024, 48);
 
     let mut first_compressed = Vec::new();
-    let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
-    compressor.set_source(first.as_slice());
-    compressor.set_drain(&mut first_compressed);
-    compressor.compress();
-
     let mut second_compressed = Vec::new();
-    compressor.set_source(second.as_slice());
-    let first_snapshot = compressor
-        .set_drain(&mut second_compressed)
-        .unwrap()
-        .clone();
-    compressor.compress();
-    drop(compressor);
+    {
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_source(first.as_slice());
+        compressor.set_drain(&mut first_compressed);
+        compressor.compress();
 
-    let mut decoder = StreamingDecoder::new(first_snapshot.as_slice()).unwrap();
+        compressor.set_source(second.as_slice());
+        compressor.set_drain(&mut second_compressed);
+        compressor.compress();
+    }
+
+    let mut decoder = StreamingDecoder::new(first_compressed.as_slice()).unwrap();
     let mut first_roundtrip = Vec::new();
     decoder.read_to_end(&mut first_roundtrip).unwrap();
     assert_eq!(

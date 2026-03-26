@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::{
     bit_io::BitWriter,
-    encoding::frame_compressor::CompressState,
+    encoding::frame_compressor::{CompressState, FseTables},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{build_table_from_symbol_counts, FSETable, State},
     huff0::huff0_encoder,
@@ -89,9 +89,10 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        state.fse_tables.ll_previous = Some(ll_mode.as_ref().clone());
-        state.fse_tables.ml_previous = Some(ml_mode.as_ref().clone());
-        state.fse_tables.of_previous = Some(of_mode.as_ref().clone());
+        let ll_last = ll_mode.as_ref().clone();
+        let ml_last = ml_mode.as_ref().clone();
+        let of_last = of_mode.as_ref().clone();
+        remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
     }
     writer.flush();
 }
@@ -210,6 +211,17 @@ fn encode_fse_table_modes(
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
+}
+
+fn remember_last_used_tables(
+    fse_tables: &mut FseTables,
+    ll_last: FSETable,
+    ml_last: FSETable,
+    of_last: FSETable,
+) {
+    fse_tables.ll_previous = Some(ll_last);
+    fse_tables.ml_previous = Some(ml_last);
+    fse_tables.of_previous = Some(of_last);
 }
 
 fn encode_sequences(
@@ -511,7 +523,19 @@ fn compress_literals(
 
 #[cfg(test)]
 mod tests {
-    use super::encode_offset_with_history;
+    use super::{
+        choose_table, encode_offset_with_history, remember_last_used_tables, FseTableMode,
+    };
+    use crate::encoding::frame_compressor::FseTables;
+
+    fn tables_match(
+        lhs: &crate::fse::fse_encoder::FSETable,
+        rhs: &crate::fse::fse_encoder::FSETable,
+    ) -> bool {
+        lhs.table_size == rhs.table_size
+            && (0..=255u8)
+                .all(|symbol| lhs.symbol_probability(symbol) == rhs.symbol_probability(symbol))
+    }
 
     #[test]
     fn repeat_offset_codes_follow_rfc_mapping() {
@@ -538,5 +562,59 @@ mod tests {
         let mut hist = [10, 20, 30];
         assert_eq!(encode_offset_with_history(9, 0, &mut hist), 3);
         assert_eq!(hist, [9, 10, 20]);
+    }
+
+    #[test]
+    fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
+        let mut fse_tables = FseTables::new();
+
+        let (ll_last, ml_last, of_last) = {
+            let ll_mode = choose_table(None, &fse_tables.ll_default, core::iter::empty(), 9);
+            let ml_mode = choose_table(None, &fse_tables.ml_default, core::iter::empty(), 9);
+            let of_mode = choose_table(None, &fse_tables.of_default, core::iter::empty(), 8);
+            (
+                ll_mode.as_ref().clone(),
+                ml_mode.as_ref().clone(),
+                of_mode.as_ref().clone(),
+            )
+        };
+        remember_last_used_tables(&mut fse_tables, ll_last, ml_last, of_last);
+
+        assert!(tables_match(
+            fse_tables.ll_previous.as_ref().unwrap(),
+            &fse_tables.ll_default
+        ));
+        assert!(tables_match(
+            fse_tables.ml_previous.as_ref().unwrap(),
+            &fse_tables.ml_default
+        ));
+        assert!(tables_match(
+            fse_tables.of_previous.as_ref().unwrap(),
+            &fse_tables.of_default
+        ));
+
+        let sample_codes = [0u8, 1u8];
+        let ll_repeat = choose_table(
+            fse_tables.ll_previous.as_ref(),
+            &fse_tables.ll_default,
+            sample_codes.iter().copied(),
+            9,
+        );
+        let ml_repeat = choose_table(
+            fse_tables.ml_previous.as_ref(),
+            &fse_tables.ml_default,
+            sample_codes.iter().copied(),
+            9,
+        );
+        let of_repeat = choose_table(
+            fse_tables.of_previous.as_ref(),
+            &fse_tables.of_default,
+            sample_codes.iter().copied(),
+            8,
+        );
+
+        assert!(matches!(ll_repeat, FseTableMode::RepeateLast(_)));
+        assert!(matches!(ml_repeat, FseTableMode::RepeateLast(_)));
+        assert!(matches!(of_repeat, FseTableMode::RepeateLast(_)));
     }
 }

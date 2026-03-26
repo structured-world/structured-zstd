@@ -587,5 +587,6 @@ pub mod roundtrip_integrity;
 #[test]
 fn verbose_disabled() {
     use crate::VERBOSE;
-    assert_eq!(VERBOSE, false);
+    use core::hint::black_box;
+    assert!(!black_box(VERBOSE));
 }
