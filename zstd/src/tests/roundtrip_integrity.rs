@@ -352,3 +352,9 @@ fn roundtrip_default_level_regression() {
     let data = generate_compressible(777, 64 * 1024);
     assert_eq!(roundtrip_default(&data), data);
 }
+
+#[test]
+fn roundtrip_default_level_multi_block_regression() {
+    let data = generate_compressible(1337, 512 * 1024);
+    assert_eq!(roundtrip_default(&data), data);
+}

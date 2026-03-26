@@ -50,9 +50,12 @@ pub enum CompressionLevel {
     Uncompressed,
     /// This level is roughly equivalent to Zstd compression level 1
     Fastest,
-    /// This level is roughly equivalent to Zstd level 3,
-    /// or the one used by the official compressor when no level
-    /// is specified.
+    /// This level currently uses the same encoder path and matcher
+    /// configuration as [`CompressionLevel::Fastest`].
+    ///
+    /// It represents this crate's "default" compression setting and may
+    /// change in future versions to reflect a different tradeoff between
+    /// speed and compression ratio.
     Default,
     /// This level is roughly equivalent to Zstd level 7.
     ///

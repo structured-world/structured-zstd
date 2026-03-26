@@ -13,8 +13,6 @@ use super::Matcher;
 use super::Sequence;
 
 const MIN_MATCH_LEN: usize = 5;
-const DEFAULT_SLICE_SIZE: usize = 1024 * 128;
-const DEFAULT_LEVEL_WINDOW_SIZE: usize = 1024 * 128 * 32;
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
@@ -22,32 +20,41 @@ pub struct MatchGeneratorDriver {
     suffix_pool: Vec<SuffixStore>,
     match_generator: MatchGenerator,
     slice_size: usize,
+    base_slice_size: usize,
+    base_window_size: usize,
 }
 
 impl MatchGeneratorDriver {
     /// slice_size says how big the slices should be that are allocated to work with
     /// max_slices_in_window says how many slices should at most be used while looking for matches
     pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
+        let max_window_size = max_slices_in_window * slice_size;
         Self {
             vec_pool: Vec::new(),
             suffix_pool: Vec::new(),
-            match_generator: MatchGenerator::new(max_slices_in_window * slice_size),
+            match_generator: MatchGenerator::new(max_window_size),
             slice_size,
+            base_slice_size: slice_size,
+            base_window_size: max_window_size,
         }
     }
 
-    fn configure_for_level(&mut self, level: CompressionLevel) {
-        self.slice_size = DEFAULT_SLICE_SIZE;
-        self.match_generator.max_window_size = match level {
-            CompressionLevel::Default => DEFAULT_LEVEL_WINDOW_SIZE,
-            _ => self.slice_size,
-        };
+    fn level_config(&self, level: CompressionLevel) -> (usize, usize) {
+        match level {
+            CompressionLevel::Uncompressed => (self.base_slice_size, self.base_window_size),
+            CompressionLevel::Fastest => (self.base_slice_size, self.base_window_size),
+            CompressionLevel::Default => (self.base_slice_size, self.base_window_size),
+            CompressionLevel::Better => (self.base_slice_size, self.base_window_size),
+            CompressionLevel::Best => (self.base_slice_size, self.base_window_size),
+        }
     }
 }
 
 impl Matcher for MatchGeneratorDriver {
     fn reset(&mut self, level: CompressionLevel) {
-        self.configure_for_level(level);
+        let (slice_size, max_window_size) = self.level_config(level);
+        self.slice_size = slice_size;
+        self.match_generator.max_window_size = max_window_size;
         let vec_pool = &mut self.vec_pool;
         let suffix_pool = &mut self.suffix_pool;
 
