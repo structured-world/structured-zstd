@@ -1,3 +1,5 @@
 [toolchain]
+# Pin the default dev/CI toolchain for deterministic Rust 2024 syntax and linting.
+# MSRV remains 1.92 and is verified separately via `rust-version` plus the CI msrv job.
 channel = "1.94.0"
 components = ["clippy", "rustfmt"]

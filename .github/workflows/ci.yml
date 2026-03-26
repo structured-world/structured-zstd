@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # Default CI follows the workspace toolchain pin; the dedicated msrv job
+      # separately enforces the lower compatibility floor declared in Cargo.toml.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.0"

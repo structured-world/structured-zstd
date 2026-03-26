@@ -116,8 +116,8 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
 }
 
-/// Cross-validate exact table header cost: Rust compress (seed=100, 512KB) → C FFI decompress.
-/// Mirrors the roundtrip_multi_block_large_literals test to confirm encoder output is valid.
+/// Cross-validate Rust compress (seed=100, 512KB) → C FFI decompress for the
+/// same Huffman-heavy multi-block input used in roundtrip_multi_block_large_literals.
 #[test]
 fn cross_rust_compress_ffi_decompress_huffman_seed100() {
     let data = generate_huffman_friendly(100, 512 * 1024, 48);
