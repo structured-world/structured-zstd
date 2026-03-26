@@ -755,7 +755,38 @@ unsafe fn copy_with_nobranch_check(
 
 #[cfg(test)]
 mod tests {
-    use super::RingBuffer;
+    use super::{RingBuffer, copy_bytes_overshooting, copy_with_checks, copy_with_nobranch_check};
+    use core::mem::size_of;
+
+    fn assert_buffers_equal(expected: &RingBuffer, actual: &RingBuffer) {
+        assert_eq!(expected.len(), actual.len());
+        assert_eq!(expected.as_slices(), actual.as_slices());
+        assert_eq!(expected.head, actual.head);
+        assert_eq!(expected.tail, actual.tail);
+        assert_eq!(expected.cap, actual.cap);
+    }
+
+    fn assert_branchless_matches_checked(
+        mut checked: RingBuffer,
+        mut branchless: RingBuffer,
+        start: usize,
+        len: usize,
+    ) {
+        checked.reserve(len);
+        branchless.reserve(len);
+
+        unsafe {
+            checked.extend_from_within_unchecked(start, len);
+            branchless.extend_from_within_unchecked_branchless(start, len);
+        }
+
+        assert_buffers_equal(&checked, &branchless);
+    }
+
+    #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]
+    const COPY_CHUNK_SIZE: usize = size_of::<usize>();
+    #[cfg(any(target_feature = "sse2", target_feature = "neon"))]
+    const COPY_CHUNK_SIZE: usize = size_of::<u128>();
 
     #[test]
     fn smoke() {
@@ -895,5 +926,131 @@ mod tests {
         rb.extend_from_within(0, 4);
         assert_eq!(b"11", rb.as_slices().0);
         assert_eq!(b"111111", rb.as_slices().1);
+    }
+
+    #[test]
+    fn extend_from_within_branchless_matches_checked_across_layouts() {
+        let contiguous = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(16);
+            rb.extend(b"0123456789");
+            rb
+        };
+        assert_branchless_matches_checked(contiguous(), contiguous(), 2, 5);
+
+        let wrapped_write = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(16);
+            rb.extend(b"0123456789ABCD");
+            rb.drop_first_n(2);
+            rb
+        };
+        assert_branchless_matches_checked(wrapped_write(), wrapped_write(), 1, 5);
+
+        let wrapped_data = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(16);
+            rb.extend(b"0123456789ABCD");
+            rb.drop_first_n(10);
+            rb.extend(b"wxyz12");
+            rb
+        };
+        assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 8, 2);
+        assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 2, 8);
+    }
+
+    #[test]
+    fn copy_with_nobranch_check_matches_checked_for_all_valid_case_masks() {
+        let cases = [
+            (0, 0, 0, 0),
+            (1, 0, 0, 0),
+            (0, 1, 0, 0),
+            (0, 0, 1, 0),
+            (0, 0, 0, 1),
+            (1, 1, 0, 0),
+            (1, 0, 1, 0),
+            (1, 0, 0, 1),
+            (0, 1, 0, 1),
+            (0, 0, 1, 1),
+            (1, 1, 0, 1),
+            (1, 0, 1, 1),
+        ];
+
+        for (m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2) in cases {
+            let m1 = [11_u8, 12, 13, 14];
+            let m2 = [21_u8, 22, 23, 24];
+            let mut expected = [0_u8; 8];
+            let mut actual = [0_u8; 8];
+
+            unsafe {
+                copy_with_checks(
+                    m1.as_ptr(),
+                    m2.as_ptr(),
+                    expected.as_mut_ptr(),
+                    expected.as_mut_ptr().add(4),
+                    m1_in_f1,
+                    m2_in_f1,
+                    m1_in_f2,
+                    m2_in_f2,
+                );
+                copy_with_nobranch_check(
+                    m1.as_ptr(),
+                    m2.as_ptr(),
+                    actual.as_mut_ptr(),
+                    actual.as_mut_ptr().add(4),
+                    m1_in_f1,
+                    m2_in_f1,
+                    m1_in_f2,
+                    m2_in_f2,
+                );
+            }
+
+            assert_eq!(
+                expected, actual,
+                "case=({}, {}, {}, {})",
+                m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2
+            );
+        }
+    }
+
+    #[test]
+    fn copy_bytes_overshooting_covers_all_copy_strategies() {
+        let src_single = [1_u8; 64];
+        let mut dst_single = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_single.as_ptr(), COPY_CHUNK_SIZE),
+                (dst_single.as_mut_ptr(), COPY_CHUNK_SIZE),
+                COPY_CHUNK_SIZE,
+            );
+        }
+        assert_eq!(
+            &dst_single[..COPY_CHUNK_SIZE],
+            &src_single[..COPY_CHUNK_SIZE]
+        );
+
+        let multi_len = COPY_CHUNK_SIZE * 2;
+        let src_multi = [2_u8; 64];
+        let mut dst_multi = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_multi.as_ptr(), multi_len),
+                (dst_multi.as_mut_ptr(), multi_len),
+                multi_len,
+            );
+        }
+        assert_eq!(&dst_multi[..multi_len], &src_multi[..multi_len]);
+
+        let fallback_len = COPY_CHUNK_SIZE + 1;
+        let src_fallback = [3_u8; 64];
+        let mut dst_fallback = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_fallback.as_ptr(), fallback_len),
+                (dst_fallback.as_mut_ptr(), fallback_len),
+                fallback_len,
+            );
+        }
+        assert_eq!(&dst_fallback[..fallback_len], &src_fallback[..fallback_len]);
     }
 }

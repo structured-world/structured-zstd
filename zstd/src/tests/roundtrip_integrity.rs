@@ -124,7 +124,7 @@ fn roundtrip_streaming_api_1000_iterations() {
 #[test]
 fn roundtrip_edge_cases() {
     // Empty data
-    assert_eq!(roundtrip_simple(&[]), vec![]);
+    assert_eq!(roundtrip_simple(&[]), Vec::<u8>::new());
 
     // Single byte
     assert_eq!(roundtrip_simple(&[0x42]), vec![0x42]);

@@ -1168,3 +1168,95 @@ impl From<GetBitsError> for HuffmanDecoderError {
         Self::GetBitsError(val)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::{string::ToString, vec};
+
+    use super::{
+        BlockTypeError, DecodeBlockContentError, DecodeSequenceError, DecompressBlockError,
+        DecompressLiteralsError, FSETableError, FrameDecoderError, HuffmanTableError,
+    };
+
+    #[test]
+    fn display_messages_cover_recently_reformatted_variants() {
+        assert!(
+            BlockTypeError::InvalidBlocktypeNumber { num: 7 }
+                .to_string()
+                .contains("Invalid Blocktype number")
+        );
+        assert!(
+            DecompressBlockError::MalformedSectionHeader {
+                expected_len: 12,
+                remaining_bytes: 3,
+            }
+            .to_string()
+            .contains("there are only 3 bytes left")
+        );
+        assert!(
+            DecodeBlockContentError::ExpectedHeaderOfPreviousBlock
+                .to_string()
+                .contains("expecting to decode the header")
+        );
+        assert!(
+            FrameDecoderError::TargetTooSmall
+                .to_string()
+                .contains("contentsize of the frame")
+        );
+        assert!(
+            FrameDecoderError::DictNotProvided { dict_id: 0xABCD }
+                .to_string()
+                .contains("0xABCD")
+        );
+        assert!(
+            DecompressLiteralsError::MissingCompressedSize
+                .to_string()
+                .contains("compressed size was none")
+        );
+        assert!(
+            DecompressLiteralsError::MissingNumStreams
+                .to_string()
+                .contains("num_streams was none")
+        );
+        assert!(
+            DecompressLiteralsError::ExtraPadding { skipped_bits: 9 }
+                .to_string()
+                .contains("9 bits")
+        );
+        assert!(
+            DecodeSequenceError::ExtraPadding { skipped_bits: 11 }
+                .to_string()
+                .contains("11 bits")
+        );
+        assert!(
+            FSETableError::ProbabilityCounterMismatch {
+                got: 4,
+                expected_sum: 3,
+                symbol_probabilities: vec![1, -1],
+            }
+            .to_string()
+            .contains("expected sum: 3")
+        );
+        assert!(
+            HuffmanTableError::NotEnoughBytesForWeights {
+                got_bytes: 2,
+                expected_bytes: 5,
+            }
+            .to_string()
+            .contains("5 bytes")
+        );
+        assert!(
+            HuffmanTableError::ExtraPadding { skipped_bits: 13 }
+                .to_string()
+                .contains("13 bits")
+        );
+        assert!(
+            HuffmanTableError::FSETableUsedTooManyBytes {
+                used: 7,
+                available_bytes: 6,
+            }
+            .to_string()
+            .contains("used more bytes: 7")
+        );
+    }
+}
