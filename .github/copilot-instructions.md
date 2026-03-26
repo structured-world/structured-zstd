@@ -10,6 +10,6 @@ Pure Rust zstd implementation — managed fork of [ruzstd (KillingSpark/zstd-rs)
 
 ## Rust Code Standards
 
-- **Clippy:** Must pass `cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings` (`rustc-dep-of-std` is excluded — it's an internal feature for Rust stdlib builds only)
+- **Clippy:** Must pass `cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings` (`rustc-dep-of-std` is excluded — it's an internal feature for Rust stdlib builds only; `fuzz_exports` is excluded — fuzzing-specific entry points are validated separately from the regular lint gate)
 - This is a fork — avoid suggesting architectural changes that diverge too far from upstream
 - Performance-critical code: benchmark before/after any changes

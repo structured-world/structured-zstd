@@ -208,11 +208,10 @@ fn roundtrip_repeat_offsets() {
     assert_eq!(data, result, "Repeat offset streaming roundtrip failed");
 }
 
-/// Verify that repeat offsets actually improve compression ratio.
-/// Data with repeated offsets should compress significantly better than random data.
+/// Verify that highly repetitive data compresses significantly better than random data.
 #[test]
-fn repeat_offsets_improve_compression() {
-    // Repetitive-offset data: same 10-byte pattern repeated
+fn repetitive_data_compresses_better_than_random() {
+    // Repetitive data: same 10-byte pattern repeated
     let pattern = b"ABCDE12345";
     let mut repetitive = Vec::with_capacity(50_000);
     for _ in 0..5_000 {
@@ -227,7 +226,7 @@ fn repeat_offsets_improve_compression() {
     // Repetitive data should compress much better
     assert!(
         compressed_repetitive.len() < compressed_random.len() / 2,
-        "Repeat offsets should yield significantly better compression. \
+        "Repetitive input should compress significantly better than random input. \
          repetitive={} bytes, random={} bytes",
         compressed_repetitive.len(),
         compressed_random.len()
@@ -269,10 +268,49 @@ fn roundtrip_zero_literal_length_sequences() {
         data.push(i);
     }
     // Repeat the first 50 bytes many times — first match has literals, subsequent ones don't
+    let prefix = data[..50].to_vec();
     for _ in 0..100 {
-        data.extend_from_slice(&data[..50].to_vec());
+        data.extend_from_slice(&prefix);
     }
 
     let result = roundtrip_simple(&data);
     assert_eq!(data, result, "Zero ll sequence roundtrip failed");
+}
+
+/// Reusing the same `FrameCompressor` across frames must reset per-frame FSE repeat tables.
+#[test]
+fn roundtrip_reused_frame_compressor_across_frames() {
+    let first = generate_huffman_friendly(700, 512 * 1024, 48);
+    let second = generate_huffman_friendly(701, 512 * 1024, 48);
+
+    let mut first_compressed = Vec::new();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+    compressor.set_source(first.as_slice());
+    compressor.set_drain(&mut first_compressed);
+    compressor.compress();
+
+    let mut second_compressed = Vec::new();
+    compressor.set_source(second.as_slice());
+    let first_snapshot = compressor
+        .set_drain(&mut second_compressed)
+        .unwrap()
+        .clone();
+    compressor.compress();
+    drop(compressor);
+
+    let mut decoder = StreamingDecoder::new(first_snapshot.as_slice()).unwrap();
+    let mut first_roundtrip = Vec::new();
+    decoder.read_to_end(&mut first_roundtrip).unwrap();
+    assert_eq!(
+        first, first_roundtrip,
+        "First reused-frame roundtrip failed"
+    );
+
+    let mut decoder = StreamingDecoder::new(second_compressed.as_slice()).unwrap();
+    let mut second_roundtrip = Vec::new();
+    decoder.read_to_end(&mut second_roundtrip).unwrap();
+    assert_eq!(
+        second, second_roundtrip,
+        "Second reused-frame roundtrip failed"
+    );
 }

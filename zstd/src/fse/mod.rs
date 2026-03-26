@@ -42,6 +42,54 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
     }
 }
 
+/// Verify `table_header_bits()` matches the actual byte count written by `write_table()`.
+#[test]
+fn table_header_bits_exact() {
+    use crate::bit_io::BitWriter;
+    use fse_encoder::{
+        build_table_from_data, build_table_from_probabilities, default_ll_table, default_ml_table,
+        default_of_table,
+    };
+
+    let check = |table: &fse_encoder::FSETable| {
+        let mut buf = alloc::vec::Vec::new();
+        let mut writer = BitWriter::from(&mut buf);
+        table.write_table(&mut writer);
+        writer.flush();
+        let written_bits = buf.len() * 8; // flush pads to byte boundary
+        let computed_bits = table.table_header_bits();
+        assert_eq!(
+            computed_bits, written_bits,
+            "table_header_bits() mismatch: computed={computed_bits}, written={written_bits}"
+        );
+    };
+
+    // Predefined tables
+    check(&default_ll_table());
+    check(&default_ml_table());
+    check(&default_of_table());
+
+    // Tables built from synthetic data
+    let data: alloc::vec::Vec<u8> = (0u8..32).cycle().take(1000).collect();
+    check(&build_table_from_data(data.iter().copied(), 9, true));
+
+    let data2: alloc::vec::Vec<u8> = alloc::vec![0, 1, 2, 3]
+        .into_iter()
+        .cycle()
+        .take(500)
+        .collect();
+    check(&build_table_from_data(data2.iter().copied(), 8, true));
+
+    // Uniform distribution: 32 symbols × prob=2 = 64 = 1<<6 (acc_log=6 requires sum=64)
+    check(&build_table_from_probabilities(
+        &[
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2,
+        ],
+        6,
+    ));
+}
+
 #[test]
 fn roundtrip() {
     round_trip(&(0..64).collect::<alloc::vec::Vec<_>>());

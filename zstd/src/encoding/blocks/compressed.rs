@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     encoding::frame_compressor::CompressState,
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{build_table_from_symbol_counts, FSETable, State},
     huff0::huff0_encoder,
 };
 
@@ -89,15 +89,9 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
-        }
+        state.fse_tables.ll_previous = Some(ll_mode.as_ref().clone());
+        state.fse_tables.ml_previous = Some(ml_mode.as_ref().clone());
+        state.fse_tables.of_previous = Some(of_mode.as_ref().clone());
     }
     writer.flush();
 }
@@ -145,18 +139,6 @@ fn estimate_encoding_cost(counts: &[usize; 256], total: usize, table: &FSETable)
     Some(cost_bits as usize)
 }
 
-/// Estimate the serialized size of an FSE table header in bits.
-fn estimate_table_header_cost(table: &FSETable) -> usize {
-    // 4 bits for accuracy log + variable bits per probability.
-    // Approximate: each symbol with prob>0 costs ~(acc_log+1) bits on average,
-    // zero-run encoding saves some. Use a rough estimate.
-    let acc_log = table.acc_log();
-    let num_symbols = table.num_symbols();
-    // Conservative estimate: 4 bits header + ~(log2(table_size)+1) bits per non-zero symbol
-    let bits_per_prob = (acc_log as usize) + 1;
-    4 + num_symbols * bits_per_prob
-}
-
 fn choose_table<'a>(
     previous: Option<&'a FSETable>,
     default_table: &'a FSETable,
@@ -176,20 +158,16 @@ fn choose_table<'a>(
     }
 
     // Build a new table from the actual data distribution
-    let new_table = build_table_from_data(
-        counts
-            .iter()
-            .copied()
-            .enumerate()
-            .flat_map(|(sym, count)| core::iter::repeat_n(sym as u8, count)),
-        max_log,
-        true,
-    );
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    let new_table = build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true);
 
     // Estimate costs: encoding cost + table header cost
     let new_encoding_cost =
         estimate_encoding_cost(&counts, total, &new_table).unwrap_or(usize::MAX);
-    let new_header_cost = estimate_table_header_cost(&new_table);
+    let new_header_cost = new_table.table_header_bits();
     let new_total_cost = new_encoding_cost.saturating_add(new_header_cost);
 
     // Predefined table: zero header cost
@@ -528,5 +506,37 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_offset_with_history;
+
+    #[test]
+    fn repeat_offset_codes_follow_rfc_mapping() {
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(10, 5, &mut hist), 1);
+        assert_eq!(hist, [10, 20, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(20, 5, &mut hist), 2);
+        assert_eq!(hist, [20, 10, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(30, 5, &mut hist), 3);
+        assert_eq!(hist, [30, 10, 20]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(20, 0, &mut hist), 1);
+        assert_eq!(hist, [20, 10, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(30, 0, &mut hist), 2);
+        assert_eq!(hist, [30, 10, 20]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(9, 0, &mut hist), 3);
+        assert_eq!(hist, [9, 10, 20]);
     }
 }

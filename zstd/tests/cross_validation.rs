@@ -116,6 +116,16 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
 }
 
+/// Cross-validate exact table header cost: Rust compress (seed=100, 512KB) → C FFI decompress.
+/// Mirrors the roundtrip_multi_block_large_literals test to confirm encoder output is valid.
+#[test]
+fn cross_rust_compress_ffi_decompress_huffman_seed100() {
+    let data = generate_huffman_friendly(100, 512 * 1024, 48);
+    let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(data, result, "rust→ffi seed=100 512KB roundtrip failed");
+}
+
 /// Cross-validate repeat offset encoding: Rust compress → C FFI decompress.
 /// Exercises repeat offset codes (1/2/3) and offset history across blocks.
 #[test]
