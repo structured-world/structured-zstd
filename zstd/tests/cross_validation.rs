@@ -126,6 +126,18 @@ fn cross_rust_compress_ffi_decompress_huffman_seed100() {
     assert_eq!(data, result, "rust→ffi seed=100 512KB roundtrip failed");
 }
 
+/// Cross-validate the same Huffman-heavy 512KB input in the opposite direction:
+/// C FFI compress (seed=100) → Rust decompress.
+#[test]
+fn cross_ffi_compress_rust_decompress_huffman_seed100() {
+    let data = generate_huffman_friendly(100, 512 * 1024, 48);
+    let compressed = zstd::encode_all(&data[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "ffi→rust seed=100 512KB roundtrip failed");
+}
+
 /// Cross-validate repeat offset encoding: Rust compress → C FFI decompress.
 /// Exercises repeat offset codes (1/2/3) and offset history across blocks.
 #[test]
@@ -151,5 +163,36 @@ fn cross_rust_compress_ffi_decompress_repeat_offsets() {
     assert_eq!(
         multi_block, result,
         "rust→ffi multi-block repeat offset roundtrip failed"
+    );
+}
+
+/// Cross-validate repeat-offset-friendly inputs in the opposite direction:
+/// C FFI compress → Rust decompress.
+#[test]
+fn cross_ffi_compress_rust_decompress_repeat_offsets() {
+    let pattern = b"ABCDE12345";
+
+    let mut data = Vec::with_capacity(50_000);
+    for _ in 0..5_000 {
+        data.extend_from_slice(pattern);
+    }
+    let compressed = zstd::encode_all(&data[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "ffi→rust repeat offset roundtrip failed");
+
+    let mut multi_block = Vec::with_capacity(512 * 1024);
+    while multi_block.len() < 512 * 1024 {
+        multi_block.extend_from_slice(pattern);
+    }
+    multi_block.truncate(512 * 1024);
+    let compressed = zstd::encode_all(&multi_block[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(
+        multi_block, result,
+        "ffi→rust multi-block repeat offset roundtrip failed"
     );
 }
