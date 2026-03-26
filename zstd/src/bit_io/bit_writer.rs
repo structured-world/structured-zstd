@@ -194,7 +194,10 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// dumping
     pub fn dump(mut self) -> V {
         if self.misaligned() != 0 {
-            panic!("`dump` was called on a bit writer but an even number of bytes weren't written into the buffer. Was: {}", self.index())
+            panic!(
+                "`dump` was called on a bit writer but an even number of bytes weren't written into the buffer. Was: {}",
+                self.index()
+            )
         }
         self.flush();
         debug_assert_eq!(self.partial, 0);
@@ -248,7 +251,11 @@ mod tests {
         bw.write_bits(0b1111u8, 4);
         bw.write_bits(0b0000u8, 4);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer returned a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer returned a vec that wasn't one byte, vec was {} elements long",
+            output.len()
+        );
         assert_eq!(
             0b0000_1111, output[0],
             "4 bits and 4 bits written into buffer"
@@ -262,7 +269,11 @@ mod tests {
         bw.write_bits(0b111u8, 3);
         bw.write_bits(0b0_0000u8, 5);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long",
+            output.len()
+        );
         assert_eq!(0b0000_0111, output[0], "3 and 5 bits written into buffer");
     }
 
@@ -273,7 +284,11 @@ mod tests {
         bw.write_bits(0b1u8, 1);
         bw.write_bits(0u8, 7);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long",
+            output.len()
+        );
         assert_eq!(0b0000_0001, output[0], "1 and 7 bits written into buffer");
     }
 
@@ -283,7 +298,11 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_bits(1u8, 8);
         let output = bw.dump();
-        assert!(output.len() == 1, "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long", output.len());
+        assert!(
+            output.len() == 1,
+            "Single byte written into writer return a vec that wasn't one byte, vec was {} elements long",
+            output.len()
+        );
         assert_eq!(1, output[0], "1 and 7 bits written into buffer");
     }
 

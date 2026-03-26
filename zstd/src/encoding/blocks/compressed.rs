@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable},
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_symbol_counts, FSETable, State},
+    fse::fse_encoder::{FSETable, State, build_table_from_symbol_counts},
     huff0::huff0_encoder,
 };
 
@@ -570,8 +570,8 @@ fn compress_literals(
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_table, encode_offset_with_history, previous_table, remember_last_used_tables,
-        FseTableMode,
+        FseTableMode, choose_table, encode_offset_with_history, previous_table,
+        remember_last_used_tables,
     };
     use crate::encoding::frame_compressor::{FseTables, PreviousFseTable};
     use crate::fse::fse_encoder::build_table_from_symbol_counts;

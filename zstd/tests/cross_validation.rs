@@ -5,7 +5,7 @@
 //! - C FFI compress → Pure Rust decompress
 
 use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 use structured_zstd::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.

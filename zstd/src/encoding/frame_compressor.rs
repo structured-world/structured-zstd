@@ -9,10 +9,10 @@ use twox_hash::XxHash64;
 use core::hash::Hasher;
 
 use super::{
-    block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, CompressionLevel, Matcher,
+    CompressionLevel, Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
+    match_generator::MatchGeneratorDriver,
 };
-use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
+use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
 
 use crate::io::{Read, Write};
 

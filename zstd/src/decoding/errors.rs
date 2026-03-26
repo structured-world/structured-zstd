@@ -219,7 +219,8 @@ impl core::fmt::Display for BlockTypeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BlockTypeError::InvalidBlocktypeNumber { num } => {
-                write!(f,
+                write!(
+                    f,
                     "Invalid Blocktype number. Is: {num} Should be one of: 0, 1, 2, 3 (3 is reserved though",
                 )
             }
@@ -291,7 +292,8 @@ impl core::fmt::Display for DecompressBlockError {
                 expected_len,
                 remaining_bytes,
             } => {
-                write!(f,
+                write!(
+                    f,
                     "Malformed section header. Says literals would be this long: {expected_len} but there are only {remaining_bytes} bytes left",
                 )
             }
@@ -370,9 +372,10 @@ impl core::fmt::Display for DecodeBlockContentError {
                 )
             }
             DecodeBlockContentError::ExpectedHeaderOfPreviousBlock => {
-                write!(f,
-                            "Can't decode next block body, while expecting to decode the header of the previous block. Results will be nonsense",
-                        )
+                write!(
+                    f,
+                    "Can't decode next block body, while expecting to decode the header of the previous block. Results will be nonsense",
+                )
             }
             DecodeBlockContentError::ReadError { step, source } => {
                 write!(f, "Error while reading bytes for {step}: {source}",)
@@ -545,10 +548,16 @@ impl core::fmt::Display for FrameDecoderError {
                 )
             }
             FrameDecoderError::TargetTooSmall => {
-                write!(f, "Target must have at least as many bytes as the contentsize of the frame reports")
+                write!(
+                    f,
+                    "Target must have at least as many bytes as the contentsize of the frame reports"
+                )
             }
             FrameDecoderError::DictNotProvided { dict_id } => {
-                write!(f, "Frame header specified dictionary id 0x{dict_id:X} that wasnt provided by add_dict() or reset_with_dict()")
+                write!(
+                    f,
+                    "Frame header specified dictionary id 0x{dict_id:X} that wasnt provided by add_dict() or reset_with_dict()"
+                )
             }
         }
     }
@@ -609,12 +618,14 @@ impl core::fmt::Display for DecompressLiteralsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DecompressLiteralsError::MissingCompressedSize => {
-                write!(f,
+                write!(
+                    f,
                     "compressed size was none even though it must be set to something for compressed literals",
                 )
             }
             DecompressLiteralsError::MissingNumStreams => {
-                write!(f,
+                write!(
+                    f,
                     "num_streams was none even though it must be set to something (1 or 4) for compressed literals",
                 )
             }
@@ -637,7 +648,8 @@ impl core::fmt::Display for DecompressLiteralsError {
                 )
             }
             DecompressLiteralsError::ExtraPadding { skipped_bits } => {
-                write!(f,
+                write!(
+                    f,
                     "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption",
                 )
             }
@@ -754,7 +766,8 @@ impl core::fmt::Display for DecodeSequenceError {
             DecodeSequenceError::FSEDecoderError(e) => write!(f, "{e:?}"),
             DecodeSequenceError::FSETableError(e) => write!(f, "{e:?}"),
             DecodeSequenceError::ExtraPadding { skipped_bits } => {
-                write!(f,
+                write!(
+                    f,
                     "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption",
                 )
             }
@@ -929,7 +942,8 @@ impl core::fmt::Display for FSETableError {
                 expected_sum,
                 symbol_probabilities,
             } => {
-                write!(f,
+                write!(
+                    f,
                     "The counter ({got}) exceeded the expected sum: {expected_sum}. This means an error or corrupted data \n {symbol_probabilities:?}",
                 )
             }
@@ -1047,10 +1061,14 @@ impl core::fmt::Display for HuffmanTableError {
                 got_bytes,
                 expected_bytes,
             } => {
-                write!(f, "Header says there should be {expected_bytes} bytes for the weights but there are only {got_bytes} bytes in the stream")
+                write!(
+                    f,
+                    "Header says there should be {expected_bytes} bytes for the weights but there are only {got_bytes} bytes in the stream"
+                )
             }
             HuffmanTableError::ExtraPadding { skipped_bits } => {
-                write!(f,
+                write!(
+                    f,
                     "Padding at the end of the sequence_section was more than a byte long: {skipped_bits} bits. Probably caused by data corruption",
                 )
             }
@@ -1076,7 +1094,8 @@ impl core::fmt::Display for HuffmanTableError {
                 used,
                 available_bytes,
             } => {
-                write!(f,
+                write!(
+                    f,
                     "FSE table used more bytes: {used} than were meant to be used for the whole stream of huffman weights ({available_bytes})",
                 )
             }
