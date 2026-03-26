@@ -5,9 +5,9 @@ semver_check = false
 git_only = true
 git_release_enable = true
 changelog_update = true
-# Keep fork releases on their own tag lineage so upstream `v*` tags don't
-# interfere with release-plz's version discovery for structured-zstd.
-git_tag_name = "structured-zstd-v{{ version }}"
+# Fork release tags now own the `v*` namespace in this repo, so release-plz
+# can follow the normal `v{{ version }}` pattern again.
+git_tag_name = "v{{ version }}"
 publish = false
 
 [[package]]
