@@ -617,4 +617,11 @@ mod tests {
         assert!(matches!(ml_repeat, FseTableMode::RepeateLast(_)));
         assert!(matches!(of_repeat, FseTableMode::RepeateLast(_)));
     }
+
+    #[test]
+    fn choose_table_handles_single_symbol_distribution() {
+        let fse_tables = FseTables::new();
+        let mode = choose_table(None, &fse_tables.ll_default, core::iter::repeat_n(0u8, 32), 9);
+        assert!(matches!(mode, FseTableMode::Predefined(_)));
+    }
 }
