@@ -152,6 +152,9 @@ impl FSETable {
     /// Compute the exact serialized size (in bits) of the FSE table header,
     /// including the byte-alignment padding at the end.
     /// Mirrors `write_table` but counts bits instead of writing them.
+    ///
+    /// The result assumes the header starts at a byte boundary, which matches
+    /// all current encoder call sites.
     pub(crate) fn table_header_bits(&self) -> usize {
         let mut bits = 4; // acc_log - 5
         let mut probability_counter = 0usize;
@@ -198,6 +201,10 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
+        assert!(
+            writer.index().is_multiple_of(8),
+            "FSE table headers must start on a byte boundary"
+        );
         let start_idx = writer.index();
         writer.write_bits(self.acc_log() - 5, 4);
         let mut probability_counter = 0usize;

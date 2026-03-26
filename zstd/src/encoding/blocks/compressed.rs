@@ -176,6 +176,8 @@ fn choose_table<'a>(
         .rposition(|&count| count > 0)
         .unwrap_or_default();
     let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
+    // Sequence-section RLE mode is not implemented yet, so one-symbol streams
+    // stay on the Predefined/Repeat paths instead of inventing a partial mode-1 path here.
     // For non-degenerate inputs we still build the dynamic candidate here instead
     // of adding a heuristic short-circuit: exact cost comparison is what lets
     // Repeat, Predefined, and Encoded compete without hard-coded ratio regressions.
