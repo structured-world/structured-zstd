@@ -1,6 +1,6 @@
 //! Utilities and interfaces for encoding an entire frame. Allows reusing resources
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::convert::TryInto;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
@@ -44,13 +44,30 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     hasher: XxHash64,
 }
 
+#[derive(Clone)]
+pub(crate) enum PreviousFseTable {
+    // Default tables are immutable and already stored alongside the state, so
+    // repeating them only needs a lightweight marker instead of cloning FSETable.
+    Default,
+    Custom(Box<FSETable>),
+}
+
+impl PreviousFseTable {
+    pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> &'a FSETable {
+        match self {
+            Self::Default => default,
+            Self::Custom(table) => table,
+        }
+    }
+}
+
 pub(crate) struct FseTables {
     pub(crate) ll_default: FSETable,
-    pub(crate) ll_previous: Option<FSETable>,
+    pub(crate) ll_previous: Option<PreviousFseTable>,
     pub(crate) ml_default: FSETable,
-    pub(crate) ml_previous: Option<FSETable>,
+    pub(crate) ml_previous: Option<PreviousFseTable>,
     pub(crate) of_default: FSETable,
-    pub(crate) of_previous: Option<FSETable>,
+    pub(crate) of_previous: Option<PreviousFseTable>,
 }
 
 impl FseTables {

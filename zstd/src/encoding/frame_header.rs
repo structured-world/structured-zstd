@@ -42,12 +42,10 @@ impl FrameHeader {
 
         // `Window_Descriptor
         // TODO: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#window_descriptor
-        if !self.single_segment {
-            if let Some(window_size) = self.window_size {
-                let log = window_size.next_power_of_two().ilog2();
-                let exponent = if log > 10 { log - 10 } else { 1 } as u8;
-                output.push(exponent << 3);
-            }
+        if !self.single_segment && let Some(window_size) = self.window_size {
+            let log = window_size.next_power_of_two().ilog2();
+            let exponent = if log > 10 { log - 10 } else { 1 } as u8;
+            output.push(exponent << 3);
         }
 
         if let Some(id) = self.dictionary_id {

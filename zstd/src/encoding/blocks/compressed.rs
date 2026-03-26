@@ -1,8 +1,8 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     bit_io::BitWriter,
-    encoding::frame_compressor::{CompressState, FseTables},
+    encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{build_table_from_symbol_counts, FSETable, State},
     huff0::huff0_encoder,
@@ -57,19 +57,28 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 
         // Choose the tables
         let ll_mode = choose_table(
-            state.fse_tables.ll_previous.as_ref(),
+            previous_table(
+                state.fse_tables.ll_previous.as_ref(),
+                &state.fse_tables.ll_default,
+            ),
             &state.fse_tables.ll_default,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
         );
         let ml_mode = choose_table(
-            state.fse_tables.ml_previous.as_ref(),
+            previous_table(
+                state.fse_tables.ml_previous.as_ref(),
+                &state.fse_tables.ml_default,
+            ),
             &state.fse_tables.ml_default,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
         );
         let of_mode = choose_table(
-            state.fse_tables.of_previous.as_ref(),
+            previous_table(
+                state.fse_tables.of_previous.as_ref(),
+                &state.fse_tables.of_default,
+            ),
             &state.fse_tables.of_default,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
@@ -89,21 +98,9 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        let ll_last = into_last_used_table(
-            ll_mode,
-            &state.fse_tables.ll_default,
-            state.fse_tables.ll_previous.as_ref(),
-        );
-        let ml_last = into_last_used_table(
-            ml_mode,
-            &state.fse_tables.ml_default,
-            state.fse_tables.ml_previous.as_ref(),
-        );
-        let of_last = into_last_used_table(
-            of_mode,
-            &state.fse_tables.of_default,
-            state.fse_tables.of_previous.as_ref(),
-        );
+        let ll_last = into_last_used_table(ll_mode, state.fse_tables.ll_previous.as_ref());
+        let ml_last = into_last_used_table(ml_mode, state.fse_tables.ml_previous.as_ref());
+        let of_last = into_last_used_table(of_mode, state.fse_tables.of_previous.as_ref());
         remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
     }
     writer.flush();
@@ -114,14 +111,14 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
     Encoded(FSETable),
-    RepeateLast(&'a FSETable),
+    RepeatLast(&'a FSETable),
 }
 
 impl FseTableMode<'_> {
     pub fn as_ref(&self) -> &FSETable {
         match self {
             Self::Predefined(t) => t,
-            Self::RepeateLast(t) => t,
+            Self::RepeatLast(t) => t,
             Self::Encoded(t) => t,
         }
     }
@@ -205,7 +202,11 @@ fn choose_table<'a>(
 
     // Pick the cheapest option
     if previous_cost <= predefined_cost && previous_cost <= new_total_cost {
-        FseTableMode::RepeateLast(previous.unwrap())
+        if let Some(previous) = previous {
+            FseTableMode::RepeatLast(previous)
+        } else {
+            FseTableMode::Predefined(default_table)
+        }
     } else if predefined_cost <= new_total_cost {
         FseTableMode::Predefined(default_table)
     } else if let Some(new_table) = new_table {
@@ -218,7 +219,7 @@ fn choose_table<'a>(
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
         FseTableMode::Predefined(_) => {}
-        FseTableMode::RepeateLast(_) => {}
+        FseTableMode::RepeatLast(_) => {}
         FseTableMode::Encoded(table) => table.write_table(writer),
     }
 }
@@ -232,7 +233,7 @@ fn encode_fse_table_modes(
         match mode {
             FseTableMode::Predefined(_) => 0,
             FseTableMode::Encoded(_) => 2,
-            FseTableMode::RepeateLast(_) => 3,
+            FseTableMode::RepeatLast(_) => 3,
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
@@ -240,24 +241,30 @@ fn encode_fse_table_modes(
 
 fn remember_last_used_tables(
     fse_tables: &mut FseTables,
-    ll_last: FSETable,
-    ml_last: FSETable,
-    of_last: FSETable,
+    ll_last: PreviousFseTable,
+    ml_last: PreviousFseTable,
+    of_last: PreviousFseTable,
 ) {
     fse_tables.ll_previous = Some(ll_last);
     fse_tables.ml_previous = Some(ml_last);
     fse_tables.of_previous = Some(of_last);
 }
 
+fn previous_table<'a>(
+    previous: Option<&'a PreviousFseTable>,
+    default: &'a FSETable,
+) -> Option<&'a FSETable> {
+    previous.map(|previous| previous.as_table(default))
+}
+
 fn into_last_used_table(
     mode: FseTableMode<'_>,
-    default_table: &FSETable,
-    previous: Option<&FSETable>,
-) -> FSETable {
+    previous: Option<&PreviousFseTable>,
+) -> PreviousFseTable {
     match mode {
-        FseTableMode::Encoded(table) => table,
-        FseTableMode::Predefined(_) => default_table.clone(),
-        FseTableMode::RepeateLast(_) => previous
+        FseTableMode::Encoded(table) => PreviousFseTable::Custom(Box::new(table)),
+        FseTableMode::Predefined(_) => PreviousFseTable::Default,
+        FseTableMode::RepeatLast(_) => previous
             .expect("previous table must exist for Repeat mode")
             .clone(),
     }
@@ -563,9 +570,11 @@ fn compress_literals(
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_table, encode_offset_with_history, remember_last_used_tables, FseTableMode,
+        choose_table, encode_offset_with_history, previous_table, remember_last_used_tables,
+        FseTableMode,
     };
-    use crate::encoding::frame_compressor::FseTables;
+    use crate::encoding::frame_compressor::{FseTables, PreviousFseTable};
+    use crate::fse::fse_encoder::build_table_from_symbol_counts;
 
     fn tables_match(
         lhs: &crate::fse::fse_encoder::FSETable,
@@ -607,54 +616,47 @@ mod tests {
     fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         let mut fse_tables = FseTables::new();
 
-        let (ll_last, ml_last, of_last) = {
-            let ll_mode = choose_table(None, &fse_tables.ll_default, core::iter::empty(), 9);
-            let ml_mode = choose_table(None, &fse_tables.ml_default, core::iter::empty(), 9);
-            let of_mode = choose_table(None, &fse_tables.of_default, core::iter::empty(), 8);
-            (
-                ll_mode.as_ref().clone(),
-                ml_mode.as_ref().clone(),
-                of_mode.as_ref().clone(),
-            )
-        };
+        let ll_last = PreviousFseTable::Default;
+        let ml_last = PreviousFseTable::Default;
+        let of_last = PreviousFseTable::Default;
         remember_last_used_tables(&mut fse_tables, ll_last, ml_last, of_last);
 
         assert!(tables_match(
-            fse_tables.ll_previous.as_ref().unwrap(),
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
             &fse_tables.ll_default
         ));
         assert!(tables_match(
-            fse_tables.ml_previous.as_ref().unwrap(),
+            previous_table(fse_tables.ml_previous.as_ref(), &fse_tables.ml_default).unwrap(),
             &fse_tables.ml_default
         ));
         assert!(tables_match(
-            fse_tables.of_previous.as_ref().unwrap(),
+            previous_table(fse_tables.of_previous.as_ref(), &fse_tables.of_default).unwrap(),
             &fse_tables.of_default
         ));
 
         let sample_codes = [0u8, 1u8];
         let ll_repeat = choose_table(
-            fse_tables.ll_previous.as_ref(),
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default),
             &fse_tables.ll_default,
             sample_codes.iter().copied(),
             9,
         );
         let ml_repeat = choose_table(
-            fse_tables.ml_previous.as_ref(),
+            previous_table(fse_tables.ml_previous.as_ref(), &fse_tables.ml_default),
             &fse_tables.ml_default,
             sample_codes.iter().copied(),
             9,
         );
         let of_repeat = choose_table(
-            fse_tables.of_previous.as_ref(),
+            previous_table(fse_tables.of_previous.as_ref(), &fse_tables.of_default),
             &fse_tables.of_default,
             sample_codes.iter().copied(),
             8,
         );
 
-        assert!(matches!(ll_repeat, FseTableMode::RepeateLast(_)));
-        assert!(matches!(ml_repeat, FseTableMode::RepeateLast(_)));
-        assert!(matches!(of_repeat, FseTableMode::RepeateLast(_)));
+        assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
+        assert!(matches!(ml_repeat, FseTableMode::RepeatLast(_)));
+        assert!(matches!(of_repeat, FseTableMode::RepeatLast(_)));
     }
 
     #[test]
@@ -666,6 +668,13 @@ mod tests {
             core::iter::repeat_n(0u8, 32),
             9,
         );
+        assert!(matches!(mode, FseTableMode::Predefined(_)));
+    }
+
+    #[test]
+    fn choose_table_without_previous_does_not_unwrap_none() {
+        let only_zero_table = build_table_from_symbol_counts(&[1], 5, false);
+        let mode = choose_table(None, &only_zero_table, core::iter::repeat_n(1u8, 32), 5);
         assert!(matches!(mode, FseTableMode::Predefined(_)));
     }
 }

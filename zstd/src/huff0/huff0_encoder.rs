@@ -105,15 +105,12 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     pub(super) fn weights(&self) -> Vec<u8> {
         let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        let weights = self
-            .table
+        self.table
             .codes
             .iter()
             .copied()
             .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>();
-
-        weights
+            .collect::<Vec<u8>>()
     }
 
     fn write_table(&mut self) {

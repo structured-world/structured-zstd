@@ -6,7 +6,7 @@ authors = [
     "Moritz Borcherding <moritz.borcherding@web.de>",
     "Structured World Foundation <foundation@sw.foundation>",
 ]
-edition = "2018"
+edition = "2024"
 license = "Apache-2.0"
 homepage = "https://github.com/structured-world/structured-zstd"
 repository = "https://github.com/structured-world/structured-zstd"
