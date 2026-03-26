@@ -205,6 +205,7 @@ impl FSETable {
             writer.index().is_multiple_of(8),
             "FSE table headers must start on a byte boundary"
         );
+        #[cfg(debug_assertions)]
         let start_idx = writer.index();
         writer.write_bits(self.acc_log() - 5, 4);
         let mut probability_counter = 0usize;
@@ -246,9 +247,9 @@ impl FSETable {
             }
         }
         writer.write_bits(0u8, writer.misaligned());
-        let written_bits = writer.index() - start_idx;
         #[cfg(debug_assertions)]
         {
+            let written_bits = writer.index() - start_idx;
             let computed = self.table_header_bits();
             debug_assert_eq!(
                 written_bits, computed,
