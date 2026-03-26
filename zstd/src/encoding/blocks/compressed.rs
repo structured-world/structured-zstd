@@ -98,9 +98,9 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        let ll_last = into_last_used_table(ll_mode, state.fse_tables.ll_previous.as_ref());
-        let ml_last = into_last_used_table(ml_mode, state.fse_tables.ml_previous.as_ref());
-        let of_last = into_last_used_table(of_mode, state.fse_tables.of_previous.as_ref());
+        let ll_last = into_last_used_table(ll_mode);
+        let ml_last = into_last_used_table(ml_mode);
+        let of_last = into_last_used_table(of_mode);
         remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
     }
     writer.flush();
@@ -241,13 +241,13 @@ fn encode_fse_table_modes(
 
 fn remember_last_used_tables(
     fse_tables: &mut FseTables,
-    ll_last: PreviousFseTable,
-    ml_last: PreviousFseTable,
-    of_last: PreviousFseTable,
+    ll_last: Option<PreviousFseTable>,
+    ml_last: Option<PreviousFseTable>,
+    of_last: Option<PreviousFseTable>,
 ) {
-    fse_tables.ll_previous = Some(ll_last);
-    fse_tables.ml_previous = Some(ml_last);
-    fse_tables.of_previous = Some(of_last);
+    remember_last_used_table(&mut fse_tables.ll_previous, ll_last);
+    remember_last_used_table(&mut fse_tables.ml_previous, ml_last);
+    remember_last_used_table(&mut fse_tables.of_previous, of_last);
 }
 
 fn previous_table<'a>(
@@ -257,16 +257,17 @@ fn previous_table<'a>(
     previous.map(|previous| previous.as_table(default))
 }
 
-fn into_last_used_table(
-    mode: FseTableMode<'_>,
-    previous: Option<&PreviousFseTable>,
-) -> PreviousFseTable {
+fn remember_last_used_table(slot: &mut Option<PreviousFseTable>, next: Option<PreviousFseTable>) {
+    if let Some(next) = next {
+        *slot = Some(next);
+    }
+}
+
+fn into_last_used_table(mode: FseTableMode<'_>) -> Option<PreviousFseTable> {
     match mode {
-        FseTableMode::Encoded(table) => PreviousFseTable::Custom(Box::new(table)),
-        FseTableMode::Predefined(_) => PreviousFseTable::Default,
-        FseTableMode::RepeatLast(_) => previous
-            .expect("previous table must exist for Repeat mode")
-            .clone(),
+        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(Box::new(table))),
+        FseTableMode::Predefined(_) => Some(PreviousFseTable::Default),
+        FseTableMode::RepeatLast(_) => None,
     }
 }
 
@@ -569,6 +570,8 @@ fn compress_literals(
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use super::{
         FseTableMode, choose_table, encode_offset_with_history, previous_table,
         remember_last_used_tables,
@@ -616,10 +619,12 @@ mod tests {
     fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         let mut fse_tables = FseTables::new();
 
-        let ll_last = PreviousFseTable::Default;
-        let ml_last = PreviousFseTable::Default;
-        let of_last = PreviousFseTable::Default;
-        remember_last_used_tables(&mut fse_tables, ll_last, ml_last, of_last);
+        remember_last_used_tables(
+            &mut fse_tables,
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+        );
 
         assert!(tables_match(
             previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
@@ -657,6 +662,34 @@ mod tests {
         assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
         assert!(matches!(ml_repeat, FseTableMode::RepeatLast(_)));
         assert!(matches!(of_repeat, FseTableMode::RepeatLast(_)));
+    }
+
+    #[test]
+    fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
+        let mut fse_tables = FseTables::new();
+        let custom = build_table_from_symbol_counts(&[1, 1], 5, false);
+        fse_tables.ll_previous = Some(PreviousFseTable::Custom(Box::new(custom)));
+
+        let before = core::ptr::from_ref(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
+        );
+
+        remember_last_used_tables(
+            &mut fse_tables,
+            None,
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+        );
+
+        let after = core::ptr::from_ref(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
+        );
+
+        assert_eq!(before, after);
+        assert!(matches!(
+            fse_tables.ll_previous.as_ref(),
+            Some(PreviousFseTable::Custom(_))
+        ));
     }
 
     #[test]

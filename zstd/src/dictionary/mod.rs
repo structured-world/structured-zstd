@@ -33,7 +33,6 @@ use cover::*;
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
-    dbg,
     fs::{self, File},
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
@@ -160,11 +159,10 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     };
     // Score each segment in the epoch and select the highest scoring segment
     // for the pool
-    while dbg!(
-        buffered_source
-            .read(&mut current_epoch)
-            .expect("can read input")
-    ) != 0
+    while buffered_source
+        .read(&mut current_epoch)
+        .expect("can read input")
+        != 0
     {
         epoch_counter += 1;
         let best_segment = pick_best_segment(&params, &mut ctx, &collection_sample);

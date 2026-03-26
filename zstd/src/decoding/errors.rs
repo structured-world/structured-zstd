@@ -550,13 +550,13 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::TargetTooSmall => {
                 write!(
                     f,
-                    "Target must have at least as many bytes as the contentsize of the frame reports"
+                    "Target must have at least as many bytes as the content size reported by the frame"
                 )
             }
             FrameDecoderError::DictNotProvided { dict_id } => {
                 write!(
                     f,
-                    "Frame header specified dictionary id 0x{dict_id:X} that wasnt provided by add_dict() or reset_with_dict()"
+                    "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict() or reset_with_dict()"
                 )
             }
         }
@@ -1201,12 +1201,12 @@ mod tests {
         assert!(
             FrameDecoderError::TargetTooSmall
                 .to_string()
-                .contains("contentsize of the frame")
+                .contains("content size reported by the frame")
         );
         assert!(
             FrameDecoderError::DictNotProvided { dict_id: 0xABCD }
                 .to_string()
-                .contains("0xABCD")
+                .contains("wasn't provided via add_dict()")
         );
         assert!(
             DecompressLiteralsError::MissingCompressedSize

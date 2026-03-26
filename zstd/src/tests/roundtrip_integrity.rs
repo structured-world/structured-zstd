@@ -75,6 +75,15 @@ fn generate_huffman_friendly(seed: u64, len: usize, alphabet_size: u8) -> Vec<u8
     data
 }
 
+fn repeat_offset_fixture(pattern: &[u8], chunks: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(chunks * (pattern.len() + 2));
+    for i in 0..chunks {
+        data.extend_from_slice(pattern);
+        data.extend_from_slice(&(i as u16).to_le_bytes());
+    }
+    data
+}
+
 // Cross-validation tests (pure Rust ↔ C FFI) are in tests/cross_validation.rs
 // because dev-dependencies (zstd) aren't available in library test modules.
 
@@ -192,14 +201,10 @@ fn roundtrip_multi_block_large_literals() {
 /// better than data where every offset is unique, and must roundtrip correctly.
 #[test]
 fn roundtrip_repeat_offsets() {
-    // Build data with a repeating pattern at a fixed offset.
-    // The pattern "ABCDE" repeats every 10 bytes — the encoder should detect offset=10
-    // as a repeat offset after the first match.
-    let pattern = b"ABCDE12345";
-    let mut data = Vec::with_capacity(100_000);
-    for _ in 0..10_000 {
-        data.extend_from_slice(pattern);
-    }
+    // Break each repeated chunk with a changing 2-byte sentinel so the matcher
+    // has to re-emit the same offset instead of collapsing everything into one
+    // maximal match.
+    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
     let result = roundtrip_simple(&data);
     assert_eq!(data, result, "Repeat offset roundtrip failed");
 
@@ -211,12 +216,8 @@ fn roundtrip_repeat_offsets() {
 /// Verify that highly repetitive data compresses significantly better than random data.
 #[test]
 fn repetitive_data_compresses_better_than_random() {
-    // Repetitive data: same 10-byte pattern repeated
-    let pattern = b"ABCDE12345";
-    let mut repetitive = Vec::with_capacity(50_000);
-    for _ in 0..5_000 {
-        repetitive.extend_from_slice(pattern);
-    }
+    // Repetitive data: fixed-offset matches separated by a changing sentinel.
+    let repetitive = repeat_offset_fixture(b"ABCDE12345", 5_000);
     let compressed_repetitive = compress_to_vec(&repetitive[..], CompressionLevel::Fastest);
 
     // Random data of same size (incompressible)
@@ -237,13 +238,10 @@ fn repetitive_data_compresses_better_than_random() {
 /// persistence across block boundaries.
 #[test]
 fn roundtrip_multi_block_repeat_offsets() {
-    // 512KB of data with repeating patterns — spans multiple 128KB blocks.
-    // Offset history and FSE tables must persist correctly across blocks.
-    let pattern = b"HelloWorld";
-    let mut data = Vec::with_capacity(512 * 1024);
-    while data.len() < 512 * 1024 {
-        data.extend_from_slice(pattern);
-    }
+    // 512KB of data with fixed-offset repeats broken by a changing sentinel —
+    // spans multiple 128KB blocks, so offset history and FSE tables must
+    // persist correctly across block boundaries.
+    let mut data = repeat_offset_fixture(b"HelloWorld", (512 * 1024) / 12 + 1);
     data.truncate(512 * 1024);
 
     let result = roundtrip_simple(&data);
