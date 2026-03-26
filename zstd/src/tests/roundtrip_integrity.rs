@@ -278,11 +278,11 @@ fn roundtrip_multi_block_repeat_offsets() {
 }
 
 /// Zero literal length sequences (back-to-back matches with no literals between them)
-/// exercise the shifted repeat offset mapping (code 1→rep[1], code 2→rep[2], code 3→rep[0]-1).
+/// exercise the shifted repeat-offset remap path instead of only generic new offsets.
 #[test]
 fn roundtrip_zero_literal_length_sequences() {
     // Alternate a base prefix with a one-byte-shifted version so the encoder
-    // sees back-to-back zero-literal matches that must use the shifted repeat
+    // sees back-to-back zero-literal matches that must use a shifted repeat
     // remap path instead of only generic new offsets.
     let mut data = Vec::with_capacity(10_000);
     // Initial unique segment
