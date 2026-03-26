@@ -221,7 +221,7 @@ impl core::fmt::Display for BlockTypeError {
             BlockTypeError::InvalidBlocktypeNumber { num } => {
                 write!(
                     f,
-                    "Invalid Blocktype number. Is: {num} Should be one of: 0, 1, 2, 3 (3 is reserved though",
+                    "Invalid Blocktype number. Is: {num}. Should be one of: 0, 1, 2, 3 (3 is reserved).",
                 )
             }
         }
@@ -1179,11 +1179,11 @@ mod tests {
     };
 
     #[test]
-    fn display_messages_cover_recently_reformatted_variants() {
+    fn block_and_sequence_display_messages_are_specific() {
         assert!(
             BlockTypeError::InvalidBlocktypeNumber { num: 7 }
                 .to_string()
-                .contains("Invalid Blocktype number")
+                .contains("3 is reserved")
         );
         assert!(
             DecompressBlockError::MalformedSectionHeader {
@@ -1199,6 +1199,15 @@ mod tests {
                 .contains("expecting to decode the header")
         );
         assert!(
+            DecodeSequenceError::ExtraPadding { skipped_bits: 11 }
+                .to_string()
+                .contains("11 bits")
+        );
+    }
+
+    #[test]
+    fn frame_decoder_display_messages_are_specific() {
+        assert!(
             FrameDecoderError::TargetTooSmall
                 .to_string()
                 .contains("content size reported by the frame")
@@ -1208,6 +1217,10 @@ mod tests {
                 .to_string()
                 .contains("wasn't provided via add_dict()")
         );
+    }
+
+    #[test]
+    fn literal_display_messages_are_specific() {
         assert!(
             DecompressLiteralsError::MissingCompressedSize
                 .to_string()
@@ -1223,11 +1236,10 @@ mod tests {
                 .to_string()
                 .contains("9 bits")
         );
-        assert!(
-            DecodeSequenceError::ExtraPadding { skipped_bits: 11 }
-                .to_string()
-                .contains("11 bits")
-        );
+    }
+
+    #[test]
+    fn fse_and_huffman_display_messages_are_specific() {
         assert!(
             FSETableError::ProbabilityCounterMismatch {
                 got: 4,

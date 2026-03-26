@@ -46,14 +46,18 @@ fn roundtrip_simple(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Roundtrip using FrameCompressor (streaming API).
-fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
+fn compress_streaming(data: &[u8]) -> Vec<u8> {
     let mut compressed = Vec::new();
     let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
     compressor.set_source(data);
     compressor.set_drain(&mut compressed);
     compressor.compress();
+    compressed
+}
 
+/// Roundtrip using FrameCompressor (streaming API).
+fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
+    let compressed = compress_streaming(data);
     let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
@@ -221,7 +225,7 @@ fn repetitive_data_compresses_better_than_random() {
     let compressed_repetitive = compress_to_vec(&repetitive[..], CompressionLevel::Fastest);
 
     // Random data of same size (incompressible)
-    let random = generate_data(999, 50_000);
+    let random = generate_data(999, repetitive.len());
     let compressed_random = compress_to_vec(&random[..], CompressionLevel::Fastest);
 
     // Repetitive data should compress much better
@@ -252,22 +256,38 @@ fn roundtrip_multi_block_repeat_offsets() {
         data, result,
         "Multi-block repeat offset streaming roundtrip failed"
     );
+
+    let whole_frame = compress_streaming(&data);
+    let independent_chunks: usize = data
+        .chunks(128 * 1024)
+        .map(|chunk| compress_to_vec(chunk, CompressionLevel::Fastest).len())
+        .sum();
+    assert!(
+        whole_frame.len() < independent_chunks,
+        "Cross-block reuse should beat per-block resets. whole={} bytes, split={} bytes",
+        whole_frame.len(),
+        independent_chunks
+    );
 }
 
 /// Zero literal length sequences (back-to-back matches with no literals between them)
 /// exercise the shifted repeat offset mapping (code 1→rep[1], code 2→rep[2], code 3→rep[0]-1).
 #[test]
 fn roundtrip_zero_literal_length_sequences() {
-    // Create data where the same bytes appear at two different offsets,
-    // forcing back-to-back matches with ll=0.
+    // Alternate a base prefix with a one-byte-shifted version so the encoder
+    // sees back-to-back zero-literal matches that must use the shifted repeat
+    // remap path instead of only generic new offsets.
     let mut data = Vec::with_capacity(10_000);
     // Initial unique segment
     for i in 0..100u8 {
         data.push(i);
     }
-    // Repeat the first 50 bytes many times — first match has literals, subsequent ones don't
+    // Repeat the first 50 bytes, then alternate with a shifted 50-byte window.
     let prefix = data[..50].to_vec();
+    let shifted_prefix = data[1..51].to_vec();
+    data.extend_from_slice(&prefix);
     for _ in 0..100 {
+        data.extend_from_slice(&shifted_prefix);
         data.extend_from_slice(&prefix);
     }
 
