@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774476016527,
+  "lastUpdate": 1774538264194,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -391,6 +391,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.074,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "98894d01f31dd5444ffeb54194bb99ef280e0918",
+          "message": "feat(encoder): FSE table reuse and offset history optimization (#33)\n\n* feat(encoder): FSE table reuse and offset history optimization\n\n- Implement repeat offset encoding (codes 1/2/3) with offset history\n  tracking across blocks, matching decoder's RFC 8878 §3.1.2.5 logic\n- Replace hardcoded FSE table selection with cost-based heuristic that\n  compares new table (with header cost) vs predefined vs previous table\n- Add offset_hist [u32; 3] to CompressState, initialized per RFC 8878\n- Add symbol_probability() and num_symbols() accessors to FSETable\n- Add 5 regression tests covering repeat offsets, zero-ll sequences,\n  multi-block persistence, compression ratio, and C zstd interop\n\nCloses #17\n\n* docs: fix clippy command in copilot-instructions\n\nThe `--all-features` flag includes `rustc-dep-of-std` which pulls in\n`compiler_builtins` — an internal feature for Rust stdlib builds that\nfails on stable. Align with CI which already uses explicit features.\n\n* fix(encoder): align fse repeat state with decoder\n\n- charge exact FSE table header cost in table selection\n- store the actual last-used tables across blocks and reset them per frame\n- add interop and regression coverage for multi-block and reuse cases\n\nCloses #17\n\n* test(encoder): harden fse regressions\n\n- add a narrow regression for remembering last-used FSE tables\n- remove extra copying from reused FrameCompressor coverage\n- fix workspace lint noise in existing test helpers\n\nCloses #17\n\n* test(interop): add reverse fse regression coverage\n\n- cover Huffman-heavy seed=100 in ffi-to-rust direction\n- cover repeat-offset-friendly inputs in ffi-to-rust direction\n\nCloses #17\n\n* test(encoder): add single-symbol table regression\n\n- cover choose_table on a single emitted symbol\n- reproduce the dynamic-table panic before the fix\n\nCloses #17\n\n* fix(encoder): avoid single-symbol fse panic\n\n- skip the dynamic-table path for single-symbol distributions\n- reduce repeat-table persistence overhead for encoded modes\n- cache debug table-header verification in write_table\n\nCloses #17\n\n* docs(encoder): clarify fse cost comparison\n\n- document why choose_table keeps exact cost comparison\n- explain why only the degenerate single-symbol case is short-circuited\n\nCloses #17\n\n* fix(fse): assert table header alignment\\n\\n- document that single-symbol streams stay on predefined/repeat paths until sequence-section RLE exists\\n- assert byte-aligned FSE table header writes and document the matching size contract\\n\\nCloses #17\n\n* fix(encoder): harden repeat table state\\n\\n- avoid none unwrap when repeat mode has no previous table\\n- store previous default/custom tables without cloning full defaults each block\\n- raise crates to edition 2024 and fix resulting clippy/unsafe issues\\n\\nCloses #17\n\n* fix(ringbuffer): restore branchless copy path\\n\\n- wire extend_from_within_unchecked_branchless back to the no-branch helper\\n- keep workspace formatting aligned after the edition-2024 cleanup\\n\\nCloses #17\n\n* style(rustfmt): apply workspace formatting\\n\\n- run cargo fmt --all after the edition-2024 cleanup\\n- align imports and multiline formatting with current rustfmt output\\n\\nCloses #17\n\n* test(coverage): cover edition cleanup paths\n\n* fix(encoder): tighten repeat table reuse\n\n- remove dictionary training dbg! noise from the hot loop\n- keep repeat-mode previous FSE table slots without cloning custom boxes\n- strengthen repeat-offset fixtures so reuse paths require repeated short matches\n- clarify frame decoder wording in display errors\n\n* test(errors): sharpen regression coverage\n\n- fix block type display punctuation\n- split display regression assertions by error family\n- align repeat-offset comparison baselines by input size\n- make cross-block and ll=0 fixtures assert the intended reuse paths\n\n* fix(fse): silence bench-only warnings\n\n- gate debug-only header bit accounting locals behind debug_assertions\n- keep bench and release builds warning-free without weakening checks\n\n* build(rust): pin workspace toolchain to 1.94\n\n* fix(encoder): avoid invalid fse table fallback\n\n* ci(rust): install i686 target explicitly\n\n* ci(rust): pin workflow toolchain to 1.94\n\n* test(errors): lock display regressions to exact text\n\n* docs(ci): clarify toolchain and test intent\n\n* ci(bench): pin benchmark toolchain to 1.94\n\n* ci(rust): follow stable and pin msrv\n\n- switch the default workspace and CI toolchain back to stable\\n- pin the dedicated msrv job to 1.92.0 explicitly\\n- keep rust-version 1.92 in Cargo manifests as the compatibility floor\\n\\nCloses #17\n\n* fix(zstd): tighten wraparound review fixes\n\n- allow exact one-past-end pointer bounds in branchless ringbuffer writes\\n- keep the wraparound regression helper on real split layouts\\n- remove frame-overhead bias from the multi-block reuse size assertion\\n- document why the FSE cost model keeps the shared entropy estimate\\n\\nCloses #17\n\n* test(zstd): stabilize review-driven assertions\n\n- document the single-symbol fallback table workaround\\n- weaken the repetitive-vs-random compression assertion to a stable ordering check\\n\\nCloses #17\n\n* test(zstd): narrow zero-ll coverage claim\n\n- align the zero literal-length regression comments with the fixture actually exercised end-to-end\\n\\nCloses #17",
+          "timestamp": "2026-03-26T17:15:14+02:00",
+          "tree_id": "60699f79a9f24cae5888463ba3f2551cca58ca79",
+          "url": "https://github.com/structured-world/structured-zstd/commit/98894d01f31dd5444ffeb54194bb99ef280e0918"
+        },
+        "date": 1774538263638,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 9.044,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.91,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 18.51,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 3.47,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.124,
             "unit": "ms"
           }
         ]
