@@ -131,6 +131,8 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: bench
