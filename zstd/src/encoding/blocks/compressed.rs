@@ -235,6 +235,8 @@ fn choose_table<'a>(
         None => {
             let fallback_counts = [counts[0], 0];
             let fallback = if max_symbol == 0 {
+                // `build_table_from_symbol_counts` needs at least two entries, so
+                // single-symbol streams use a phantom zero-count second slot here.
                 build_table_from_symbol_counts(&fallback_counts, max_log, true)
             } else {
                 build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true)
