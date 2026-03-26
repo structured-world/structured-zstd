@@ -472,7 +472,12 @@ impl MatchGenerator {
             let rhs_word = unsafe { core::ptr::read_unaligned(rhs.add(off) as *const usize) };
             let diff = lhs_word ^ rhs_word;
             if diff != 0 {
-                return off + (diff.trailing_zeros() as usize / 8);
+                let mismatch_bytes = if cfg!(target_endian = "little") {
+                    diff.trailing_zeros() as usize / 8
+                } else {
+                    diff.leading_zeros() as usize / 8
+                };
+                return off + mismatch_bytes;
             }
             off += chunk;
         }
@@ -518,7 +523,8 @@ impl MatchGenerator {
 
         let last_idx = self.window.len().checked_sub(1)?;
         let last_entry = &self.window[last_idx];
-        if offset > last_entry.base_offset + self.suffix_idx {
+        let searchable_prefix = self.window_size - (last_entry.data.len() - self.suffix_idx);
+        if offset > searchable_prefix {
             return None;
         }
 
@@ -999,22 +1005,27 @@ fn matches() {
     let mut original_data = Vec::new();
     let mut reconstructed = Vec::new();
 
-    let replay_sequence =
-        |seq: Sequence<'_>, _expected: Sequence<'_>, reconstructed: &mut Vec<u8>| match seq {
-            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                reconstructed.extend_from_slice(literals);
-                let start = reconstructed.len() - offset;
-                for i in 0..match_len {
-                    let byte = reconstructed[start + i];
-                    reconstructed.push(byte);
-                }
+    let replay_sequence = |seq: Sequence<'_>, reconstructed: &mut Vec<u8>| match seq {
+        Sequence::Literals { literals } => {
+            assert!(!literals.is_empty());
+            reconstructed.extend_from_slice(literals);
+        }
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            assert!(offset > 0);
+            assert!(match_len >= MIN_MATCH_LEN);
+            reconstructed.extend_from_slice(literals);
+            assert!(offset <= reconstructed.len());
+            let start = reconstructed.len() - offset;
+            for i in 0..match_len {
+                let byte = reconstructed[start + i];
+                reconstructed.push(byte);
             }
-        };
+        }
+    };
 
     matcher.add_data(
         alloc::vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -1023,17 +1034,7 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[0, 0, 0, 0, 0],
-                offset: 5,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
 
     assert!(!matcher.next_sequence(|_| {}));
 
@@ -1048,39 +1049,9 @@ fn matches() {
         1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
     ]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[1, 2, 3, 4, 5, 6],
-                offset: 6,
-                match_len: 6,
-            },
-            &mut reconstructed,
-        )
-    });
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 12,
-                match_len: 6,
-            },
-            &mut reconstructed,
-        )
-    });
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 28,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
@@ -1090,28 +1061,8 @@ fn matches() {
     );
     original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 23,
-                match_len: 6,
-            },
-            &mut reconstructed,
-        )
-    });
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[7, 8, 9, 10, 11],
-                offset: 16,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
@@ -1121,17 +1072,7 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 0, 0, 0]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 5,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
@@ -1141,17 +1082,7 @@ fn matches() {
     );
     original_data.extend_from_slice(&[7, 8, 9, 10, 11]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 15,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
@@ -1171,17 +1102,7 @@ fn matches() {
     );
     original_data.extend_from_slice(&[1, 3, 5, 7, 9]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 5,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
@@ -1191,26 +1112,8 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Triple {
-                literals: &[0, 0, 11, 13, 15, 17, 20],
-                offset: 5,
-                match_len: 5,
-            },
-            &mut reconstructed,
-        )
-    });
-    matcher.next_sequence(|seq| {
-        replay_sequence(
-            seq,
-            Sequence::Literals {
-                literals: &[21, 23],
-            },
-            &mut reconstructed,
-        )
-    });
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
+    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
     assert!(!matcher.next_sequence(|_| {}));
 
     assert_eq!(reconstructed, original_data);
@@ -1342,6 +1245,27 @@ fn simple_matcher_zero_literal_repcode_checks_rep1_before_hash_lookup() {
     matcher.offset_hist = [99, 10, 4];
 
     let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
+    assert_eq!(candidate, Some((10, 10)));
+}
+
+#[test]
+fn simple_matcher_repcode_can_target_previous_window_entry() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.add_data(
+        b"abcdefghij".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.skip_matching();
+    matcher.add_data(
+        b"abcdefghij".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+
+    matcher.offset_hist = [99, 10, 4];
+
+    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data, 0);
     assert_eq!(candidate, Some((10, 10)));
 }
 
