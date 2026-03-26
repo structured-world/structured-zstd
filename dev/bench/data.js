@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774560253901,
+  "lastUpdate": 1774561286472,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -538,6 +538,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.169,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bd7b94196acba7839ba3c7558448784ea24ddcc0",
+          "message": "chore: release v0.0.3 (#37)\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-03-26T23:39:42+02:00",
+          "tree_id": "f799531ab02485ae16652eea7013df0cc8800306",
+          "url": "https://github.com/structured-world/structured-zstd/commit/bd7b94196acba7839ba3c7558448784ea24ddcc0"
+        },
+        "date": 1774561286105,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 8.979,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.922,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 18.432,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 3.388,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.106,
             "unit": "ms"
           }
         ]
