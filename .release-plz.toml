@@ -1,8 +1,13 @@
 [workspace]
 semver_check = false
+# This fork releases through Git tags/GitHub releases instead of crates.io,
+# so release-plz must derive the last released version from tags.
+git_only = true
 git_release_enable = true
 changelog_update = true
-git_tag_name = "v{{ version }}"
+# Keep fork releases on their own tag lineage so upstream `v*` tags don't
+# interfere with release-plz's version discovery for structured-zstd.
+git_tag_name = "structured-zstd-v{{ version }}"
 publish = false
 
 [[package]]
