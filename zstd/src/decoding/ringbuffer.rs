@@ -519,7 +519,7 @@ impl RingBuffer {
 
             debug_assert!((m1_in_f2 > 0) ^ (m2_in_f1 > 0) || (m1_in_f2 == 0 && m2_in_f1 == 0));
 
-            copy_with_checks(
+            copy_with_nobranch_check(
                 m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
             );
             self.tail = (self.tail + len) % self.cap;
