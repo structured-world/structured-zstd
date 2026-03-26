@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774558113773,
+  "lastUpdate": 1774560253901,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -489,6 +489,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.097,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c718d5e8ff3dd6d17d6d06148722cd2a8fa9c84",
+          "message": "fix(encoding): implement default compression level (#34)\n\n* fix(encoding): implement default compression level\n\n- route CompressionLevel::Default through the encoder\n- configure matcher window for default-level frames\n- add roundtrip and ffi regression coverage\n\nCloses #5\n\n* fix(encoding): tighten default matcher review follow-ups\n\n- preserve matcher constructor baselines across reset\n- document Default as matching Fastest behavior today\n- add multi-block default roundtrip regression\n\nCloses #5\n\n* docs(encoding): clarify explicit level config arms\n\n- explain why level_config keeps explicit match arms\n- document that current levels share the baseline matcher config\n\nCloses #5\n\n* feat(encoding): implement dfast default level\n\n* perf(encoding): incrementalize dfast matcher\n\n* test(encoding): cover dfast matcher dispatch\n\n* test(encoding): document dfast matcher tradeoffs\n\n* docs(encoding): clarify dfast review invariants\n\n* fix(encoding): tighten review follow-ups",
+          "timestamp": "2026-03-26T23:22:23+02:00",
+          "tree_id": "8d707f85547f63ed965378e355c8543330bdaf31",
+          "url": "https://github.com/structured-world/structured-zstd/commit/9c718d5e8ff3dd6d17d6d06148722cd2a8fa9c84"
+        },
+        "date": 1774560252934,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 8.977,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.911,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 18.512,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 3.377,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.169,
             "unit": "ms"
           }
         ]
