@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774538264194,
+  "lastUpdate": 1774558113773,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -440,6 +440,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.124,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b1096acbdf7b56e0acbeaf7e32bcf18296aed958",
+          "message": "ci(release): restore release-plz lineage (#36)\n\n* ci(release): restore release-plz lineage\n\n- switch release-plz to git-only fork tags\n\n- bump release-plz/action and fix workspace packaging inputs\n\n- prepare bootstrap tag state for the fork release history\n\nCloses #35\n\n* fix(zstd): make crate docs package-safe\n\n* fix(zstd): make crate README package-safe\n\n* fix(zstd): keep crate README as symlink\n\n* fix(zstd): correct crate README symlink casing\n\n* fix(release): stabilize crate readme wiring\n\n* ci(release): reclaim v-tag lineage",
+          "timestamp": "2026-03-26T22:46:49+02:00",
+          "tree_id": "44fefbdff9b013331970908a76f2727a76522ef8",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b1096acbdf7b56e0acbeaf7e32bcf18296aed958"
+        },
+        "date": 1774558113394,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 8.893,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.916,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 18.431,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 3.354,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.097,
             "unit": "ms"
           }
         ]
