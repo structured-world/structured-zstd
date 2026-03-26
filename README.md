@@ -45,6 +45,10 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 
 When the `dict_builder` feature is enabled, the `dictionary` module can create raw content dictionaries. Within 0.2% of the official implementation on the `github-users` sample set.
 
+## Benchmarking
+
+Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares `structured-zstd` against the C reference across small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora.
+
 ## Usage
 
 ### Compression

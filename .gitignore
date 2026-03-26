@@ -6,5 +6,7 @@ Cargo.lock
 /orig-zstd
 fuzz_decodecorpus
 perf.data*
+benchmark-results.json
+benchmark-report.md
 fuzz/corpus
 .idea
