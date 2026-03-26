@@ -446,7 +446,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
 /// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
 ///
 /// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
-pub(crate) fn encode_offset_with_history(
+pub(in crate::encoding) fn encode_offset_with_history(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],

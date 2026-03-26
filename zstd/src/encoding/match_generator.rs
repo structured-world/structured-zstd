@@ -661,9 +661,11 @@ impl DfastMatchGenerator {
 
         if literals_start < current_len {
             // We stop inserting once fewer than DFAST_MIN_MATCH_LEN bytes remain.
-            // Those tail positions cannot produce a fresh dfast candidate on their
-            // own, and the cross-block overlap case is covered by
-            // dfast_inserts_tail_positions_for_next_block_matching().
+            // The last boundary-spanning start that can seed a dfast hash is
+            // still inserted by the loop above; `dfast_inserts_tail_positions_
+            // for_next_block_matching()` asserts that the next block can match
+            // immediately at the boundary without eagerly seeding the final
+            // DFAST_MIN_MATCH_LEN - 1 bytes here.
             let current = self.window.back().unwrap().as_slice();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
@@ -1266,24 +1268,34 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     assert_eq!(history, b"012345bcdea");
 
     matcher.add_data(b"bcdeabcdeab".to_vec(), |_| {});
-    let mut saw_triple = false;
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => history.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            saw_triple = true;
-            history.extend_from_slice(literals);
-            let start = history.len() - offset;
-            for i in 0..match_len {
-                let byte = history[start + i];
-                history.push(byte);
+    let mut saw_first_sequence = false;
+    matcher.start_matching(|seq| {
+        assert!(!saw_first_sequence, "expected a single cross-block match");
+        saw_first_sequence = true;
+        match seq {
+            Sequence::Literals { .. } => {
+                panic!("expected tail-anchored cross-block match before any literals")
+            }
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                assert_eq!(literals, b"");
+                assert_eq!(offset, 5);
+                assert_eq!(match_len, 11);
+                let start = history.len() - offset;
+                for i in 0..match_len {
+                    let byte = history[start + i];
+                    history.push(byte);
+                }
             }
         }
     });
 
-    assert!(saw_triple, "expected tail-anchored cross-block match");
+    assert!(
+        saw_first_sequence,
+        "expected tail-anchored cross-block match"
+    );
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
 }
