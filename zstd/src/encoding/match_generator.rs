@@ -660,6 +660,10 @@ impl DfastMatchGenerator {
         }
 
         if literals_start < current_len {
+            // We stop inserting once fewer than DFAST_MIN_MATCH_LEN bytes remain.
+            // Those tail positions cannot produce a fresh dfast candidate on their
+            // own, and the cross-block overlap case is covered by
+            // dfast_inserts_tail_positions_for_next_block_matching().
             let current = self.window.back().unwrap().as_slice();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
@@ -669,6 +673,9 @@ impl DfastMatchGenerator {
 
     fn ensure_hash_tables(&mut self) {
         if self.short_hash.is_empty() {
+            // This is intentionally lazy so Fastest/Uncompressed never pay the
+            // ~dfast-level memory cost. The current size tracks the issue's
+            // zstd level-3 style parameters rather than a generic low-memory preset.
             self.short_hash =
                 alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; 1 << DFAST_HASH_BITS];
             self.long_hash =
