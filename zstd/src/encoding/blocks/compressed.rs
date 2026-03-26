@@ -176,6 +176,9 @@ fn choose_table<'a>(
         .rposition(|&count| count > 0)
         .unwrap_or_default();
     let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
+    // For non-degenerate inputs we still build the dynamic candidate here instead
+    // of adding a heuristic short-circuit: exact cost comparison is what lets
+    // Repeat, Predefined, and Encoded compete without hard-coded ratio regressions.
     let new_table = (distinct_symbols > 1)
         .then(|| build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true));
 
