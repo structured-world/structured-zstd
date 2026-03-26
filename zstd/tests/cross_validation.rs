@@ -207,6 +207,8 @@ fn cross_rust_default_compress_ffi_decompress_regression() {
 
 #[test]
 fn default_level_beats_fastest_on_corpus_proxy() {
+    // Keep this strict: issue #5 requires Default to be a real step up from Fastest,
+    // not just an alias that happens to roundtrip.
     let data = include_bytes!("../decodecorpus_files/z000033");
     let fastest = compress_to_vec(data.as_slice(), CompressionLevel::Fastest);
     let default = compress_to_vec(data.as_slice(), CompressionLevel::Default);
@@ -221,6 +223,8 @@ fn default_level_beats_fastest_on_corpus_proxy() {
 
 #[test]
 fn default_level_stays_within_ten_percent_of_ffi_level3_on_corpus_proxy() {
+    // This corpus-proxy check is the in-repo acceptance test for the issue's
+    // level-3 ratio target until the full Silesia corpus is vendored.
     let data = include_bytes!("../decodecorpus_files/z000033");
     let default = compress_to_vec(data.as_slice(), CompressionLevel::Default);
     let ffi_level3 = zstd::encode_all(data.as_slice(), 3).unwrap();
