@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(&fmt_duration(Duration::from_secs(5 * 60)), "5m");
         assert_eq!(&fmt_duration(Duration::from_secs(3 * 60 * 60)), "3h");
         assert_eq!(
-            &fmt_duration(Duration::from_secs(1 * 60 * 60 + 20 * 60 + 30)),
+            &fmt_duration(Duration::from_secs(60 * 60 + 20 * 60 + 30)),
             "1h 20m 30s"
         );
     }

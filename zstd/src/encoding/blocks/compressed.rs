@@ -1,10 +1,10 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     bit_io::BitWriter,
-    encoding::frame_compressor::CompressState,
+    encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable},
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{FSETable, State, build_table_from_symbol_counts},
     huff0::huff0_encoder,
 };
 
@@ -15,21 +15,23 @@ const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    let offset_hist = &mut state.offset_hist;
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            let ll = literals.len() as u32;
+            literals_vec.extend_from_slice(literals);
+            let actual_offset = offset as u32;
+            let of = encode_offset_with_history(actual_offset, ll, offset_hist);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll,
+                ml: match_len as u32,
+                of,
+            });
         }
     });
 
@@ -54,21 +56,29 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         encode_seqnum(sequences.len(), &mut writer);
 
         // Choose the tables
-        // TODO store previously used tables
         let ll_mode = choose_table(
-            state.fse_tables.ll_previous.as_ref(),
+            previous_table(
+                state.fse_tables.ll_previous.as_ref(),
+                &state.fse_tables.ll_default,
+            ),
             &state.fse_tables.ll_default,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
         );
         let ml_mode = choose_table(
-            state.fse_tables.ml_previous.as_ref(),
+            previous_table(
+                state.fse_tables.ml_previous.as_ref(),
+                &state.fse_tables.ml_default,
+            ),
             &state.fse_tables.ml_default,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
         );
         let of_mode = choose_table(
-            state.fse_tables.of_previous.as_ref(),
+            previous_table(
+                state.fse_tables.of_previous.as_ref(),
+                &state.fse_tables.of_default,
+            ),
             &state.fse_tables.of_default,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
@@ -88,15 +98,10 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
-        }
-        if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
-        }
+        let ll_last = into_last_used_table(ll_mode);
+        let ml_last = into_last_used_table(ml_mode);
+        let of_last = into_last_used_table(of_mode);
+        remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
     }
     writer.flush();
 }
@@ -106,17 +111,45 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
     Encoded(FSETable),
-    RepeateLast(&'a FSETable),
+    RepeatLast(&'a FSETable),
 }
 
 impl FseTableMode<'_> {
     pub fn as_ref(&self) -> &FSETable {
         match self {
             Self::Predefined(t) => t,
-            Self::RepeateLast(t) => t,
+            Self::RepeatLast(t) => t,
             Self::Encoded(t) => t,
         }
     }
+}
+
+/// Estimate the encoding cost (in bits) of the given symbol distribution using a table.
+/// Returns `None` if the table cannot encode all symbols present in the data.
+fn estimate_encoding_cost(counts: &[usize; 256], total: usize, table: &FSETable) -> Option<usize> {
+    if total == 0 {
+        return Some(0);
+    }
+    let table_size = table.table_size as f64;
+    let mut cost_bits = 0.0f64;
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let prob = table.symbol_probability(symbol as u8);
+        if prob == 0 {
+            // Table cannot encode this symbol
+            return None;
+        }
+        let effective_prob = if prob == -1 { 1 } else { prob as usize };
+        // Keep the same entropy-style estimate for every candidate table. A
+        // cheaper integer proxy perturbs close Encoded vs Repeat/Predefined
+        // decisions, which is harder to recover from than this small setup cost.
+        // Bits per symbol ≈ log2(table_size / probability)
+        let bits_per_symbol = (table_size / effective_prob as f64).log2();
+        cost_bits += count as f64 * bits_per_symbol;
+    }
+    Some(cost_bits as usize)
 }
 
 fn choose_table<'a>(
@@ -125,22 +158,98 @@ fn choose_table<'a>(
     data: impl Iterator<Item = u8>,
     max_log: u8,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
-        FseTableMode::Predefined(default_table)
+    // Collect symbol distribution
+    let mut counts = [0usize; 256];
+    let mut total = 0usize;
+    for symbol in data {
+        counts[symbol as usize] += 1;
+        total += 1;
+    }
+
+    if total == 0 {
+        return FseTableMode::Predefined(default_table);
+    }
+
+    // Build a new table from the actual data distribution
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
+    // Sequence-section RLE mode is not implemented yet, so one-symbol streams
+    // stay on the Predefined/Repeat paths unless those tables cannot encode the
+    // stream at all. For non-degenerate inputs we still build the dynamic candidate
+    // here instead of adding a heuristic short-circuit: exact cost comparison is
+    // what lets Repeat, Predefined, and Encoded compete without hard-coded ratio
+    // regressions.
+    let new_table = (distinct_symbols > 1)
+        .then(|| build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true));
+
+    // Estimate costs: encoding cost + table header cost. `None` means the
+    // candidate table cannot encode the observed distribution.
+    let new_total_cost = new_table.as_ref().and_then(|table| {
+        estimate_encoding_cost(&counts, total, table)
+            .map(|cost| cost.saturating_add(table.table_header_bits()))
+    });
+
+    // Predefined table: zero header cost
+    let predefined_cost = estimate_encoding_cost(&counts, total, default_table);
+
+    // Previous table: zero header cost (repeat mode)
+    let previous_cost = previous.and_then(|table| estimate_encoding_cost(&counts, total, table));
+
+    enum Choice {
+        Previous,
+        Predefined,
+        New,
+    }
+
+    let mut best: Option<(usize, Choice)> = None;
+
+    if let Some(cost) = previous_cost {
+        best = Some((cost, Choice::Previous));
+    }
+
+    if let Some(cost) = predefined_cost {
+        match best {
+            Some((best_cost, _)) if best_cost <= cost => {}
+            _ => best = Some((cost, Choice::Predefined)),
+        }
+    }
+
+    if let Some(cost) = new_total_cost {
+        match best {
+            Some((best_cost, _)) if best_cost <= cost => {}
+            _ => best = Some((cost, Choice::New)),
+        }
+    }
+
+    match best.map(|(_, choice)| choice) {
+        Some(Choice::Previous) => previous
+            .map(FseTableMode::RepeatLast)
+            .unwrap_or(FseTableMode::Predefined(default_table)),
+        Some(Choice::Predefined) => FseTableMode::Predefined(default_table),
+        Some(Choice::New) => new_table
+            .map(FseTableMode::Encoded)
+            .unwrap_or(FseTableMode::Predefined(default_table)),
+        None => {
+            let fallback_counts = [counts[0], 0];
+            let fallback = if max_symbol == 0 {
+                // `build_table_from_symbol_counts` needs at least two entries, so
+                // single-symbol streams use a phantom zero-count second slot here.
+                build_table_from_symbol_counts(&fallback_counts, max_log, true)
+            } else {
+                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true)
+            };
+            FseTableMode::Encoded(fallback)
+        }
     }
 }
 
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
     match mode {
         FseTableMode::Predefined(_) => {}
-        FseTableMode::RepeateLast(_) => {}
+        FseTableMode::RepeatLast(_) => {}
         FseTableMode::Encoded(table) => table.write_table(writer),
     }
 }
@@ -154,10 +263,42 @@ fn encode_fse_table_modes(
         match mode {
             FseTableMode::Predefined(_) => 0,
             FseTableMode::Encoded(_) => 2,
-            FseTableMode::RepeateLast(_) => 3,
+            FseTableMode::RepeatLast(_) => 3,
         }
     }
     mode_to_bits(ll_mode) << 6 | mode_to_bits(of_mode) << 4 | mode_to_bits(ml_mode) << 2
+}
+
+fn remember_last_used_tables(
+    fse_tables: &mut FseTables,
+    ll_last: Option<PreviousFseTable>,
+    ml_last: Option<PreviousFseTable>,
+    of_last: Option<PreviousFseTable>,
+) {
+    remember_last_used_table(&mut fse_tables.ll_previous, ll_last);
+    remember_last_used_table(&mut fse_tables.ml_previous, ml_last);
+    remember_last_used_table(&mut fse_tables.of_previous, of_last);
+}
+
+fn previous_table<'a>(
+    previous: Option<&'a PreviousFseTable>,
+    default: &'a FSETable,
+) -> Option<&'a FSETable> {
+    previous.map(|previous| previous.as_table(default))
+}
+
+fn remember_last_used_table(slot: &mut Option<PreviousFseTable>, next: Option<PreviousFseTable>) {
+    if let Some(next) = next {
+        *slot = Some(next);
+    }
+}
+
+fn into_last_used_table(mode: FseTableMode<'_>) -> Option<PreviousFseTable> {
+    match mode {
+        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(Box::new(table))),
+        FseTableMode::Predefined(_) => Some(PreviousFseTable::Default),
+        FseTableMode::RepeatLast(_) => None,
+    }
 }
 
 fn encode_sequences(
@@ -301,6 +442,71 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
     }
 }
 
+/// Convert an actual byte offset into the encoded offset code, using repeat offset
+/// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
+///
+/// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
+fn encode_offset_with_history(actual_offset: u32, lit_len: u32, offset_hist: &mut [u32; 3]) -> u32 {
+    let encoded = if lit_len > 0 {
+        if actual_offset == offset_hist[0] {
+            1
+        } else if actual_offset == offset_hist[1] {
+            2
+        } else if actual_offset == offset_hist[2] {
+            3
+        } else {
+            actual_offset + 3
+        }
+    } else {
+        // When lit_len == 0, repeat offset mapping shifts per RFC 8878:
+        // code 1 → rep[1], code 2 → rep[2], code 3 → rep[0]-1
+        if actual_offset == offset_hist[1] {
+            1
+        } else if actual_offset == offset_hist[2] {
+            2
+        } else if actual_offset == offset_hist[0].wrapping_sub(1) && offset_hist[0] > 1 {
+            3
+        } else {
+            actual_offset + 3
+        }
+    };
+
+    // Update history (same rules as decoder)
+    if lit_len > 0 {
+        match encoded {
+            1 => { /* rep[0] stays the same */ }
+            2 => {
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            _ => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+        }
+    } else {
+        match encoded {
+            1 => {
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            2 => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+            _ => {
+                offset_hist[2] = offset_hist[1];
+                offset_hist[1] = offset_hist[0];
+                offset_hist[0] = actual_offset;
+            }
+        }
+    }
+
+    encoded
+}
+
 fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);
@@ -389,5 +595,149 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+
+    use super::{
+        FseTableMode, choose_table, encode_offset_with_history, previous_table,
+        remember_last_used_tables,
+    };
+    use crate::encoding::frame_compressor::{FseTables, PreviousFseTable};
+    use crate::fse::fse_encoder::build_table_from_symbol_counts;
+
+    fn tables_match(
+        lhs: &crate::fse::fse_encoder::FSETable,
+        rhs: &crate::fse::fse_encoder::FSETable,
+    ) -> bool {
+        lhs.table_size == rhs.table_size
+            && (0..=255u8)
+                .all(|symbol| lhs.symbol_probability(symbol) == rhs.symbol_probability(symbol))
+    }
+
+    #[test]
+    fn repeat_offset_codes_follow_rfc_mapping() {
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(10, 5, &mut hist), 1);
+        assert_eq!(hist, [10, 20, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(20, 5, &mut hist), 2);
+        assert_eq!(hist, [20, 10, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(30, 5, &mut hist), 3);
+        assert_eq!(hist, [30, 10, 20]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(20, 0, &mut hist), 1);
+        assert_eq!(hist, [20, 10, 30]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(30, 0, &mut hist), 2);
+        assert_eq!(hist, [30, 10, 20]);
+
+        let mut hist = [10, 20, 30];
+        assert_eq!(encode_offset_with_history(9, 0, &mut hist), 3);
+        assert_eq!(hist, [9, 10, 20]);
+    }
+
+    #[test]
+    fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
+        let mut fse_tables = FseTables::new();
+
+        remember_last_used_tables(
+            &mut fse_tables,
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+        );
+
+        assert!(tables_match(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
+            &fse_tables.ll_default
+        ));
+        assert!(tables_match(
+            previous_table(fse_tables.ml_previous.as_ref(), &fse_tables.ml_default).unwrap(),
+            &fse_tables.ml_default
+        ));
+        assert!(tables_match(
+            previous_table(fse_tables.of_previous.as_ref(), &fse_tables.of_default).unwrap(),
+            &fse_tables.of_default
+        ));
+
+        let sample_codes = [0u8, 1u8];
+        let ll_repeat = choose_table(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default),
+            &fse_tables.ll_default,
+            sample_codes.iter().copied(),
+            9,
+        );
+        let ml_repeat = choose_table(
+            previous_table(fse_tables.ml_previous.as_ref(), &fse_tables.ml_default),
+            &fse_tables.ml_default,
+            sample_codes.iter().copied(),
+            9,
+        );
+        let of_repeat = choose_table(
+            previous_table(fse_tables.of_previous.as_ref(), &fse_tables.of_default),
+            &fse_tables.of_default,
+            sample_codes.iter().copied(),
+            8,
+        );
+
+        assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
+        assert!(matches!(ml_repeat, FseTableMode::RepeatLast(_)));
+        assert!(matches!(of_repeat, FseTableMode::RepeatLast(_)));
+    }
+
+    #[test]
+    fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
+        let mut fse_tables = FseTables::new();
+        let custom = build_table_from_symbol_counts(&[1, 1], 5, false);
+        fse_tables.ll_previous = Some(PreviousFseTable::Custom(Box::new(custom)));
+
+        let before = core::ptr::from_ref(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
+        );
+
+        remember_last_used_tables(
+            &mut fse_tables,
+            None,
+            Some(PreviousFseTable::Default),
+            Some(PreviousFseTable::Default),
+        );
+
+        let after = core::ptr::from_ref(
+            previous_table(fse_tables.ll_previous.as_ref(), &fse_tables.ll_default).unwrap(),
+        );
+
+        assert_eq!(before, after);
+        assert!(matches!(
+            fse_tables.ll_previous.as_ref(),
+            Some(PreviousFseTable::Custom(_))
+        ));
+    }
+
+    #[test]
+    fn choose_table_handles_single_symbol_distribution() {
+        let fse_tables = FseTables::new();
+        let mode = choose_table(
+            None,
+            &fse_tables.ll_default,
+            core::iter::repeat_n(0u8, 32),
+            9,
+        );
+        assert!(matches!(mode, FseTableMode::Predefined(_)));
+    }
+
+    #[test]
+    fn choose_table_without_previous_does_not_unwrap_none() {
+        let only_zero_table = build_table_from_symbol_counts(&[1], 5, false);
+        let mode = choose_table(None, &only_zero_table, core::iter::repeat_n(1u8, 32), 5);
+        assert!(matches!(mode, FseTableMode::Encoded(_)));
     }
 }

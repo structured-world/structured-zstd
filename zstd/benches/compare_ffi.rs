@@ -3,7 +3,7 @@
 //! Five variations: decompress (pure Rust/C FFI), compress (pure Rust/C FFI L1/L3).
 //! Both decompress benchmarks allocate per-iteration for symmetric comparison.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 /// Compressed corpus for decompression benchmarks.
 const COMPRESSED_CORPUS: &[u8] = include_bytes!("../decodecorpus_files/z000033.zst");

@@ -46,7 +46,7 @@ impl BlockDecoder {
             DecoderState::ReadyToDecodeNextBody => { /* Happy :) */ }
             DecoderState::Failed => return Err(DecodeBlockContentError::DecoderStateIsFailed),
             DecoderState::ReadyToDecodeNextHeader => {
-                return Err(DecodeBlockContentError::ExpectedHeaderOfPreviousBlock)
+                return Err(DecodeBlockContentError::ExpectedHeaderOfPreviousBlock);
             }
         }
 
@@ -108,7 +108,9 @@ impl BlockDecoder {
             }
 
             BlockType::Reserved => {
-                panic!("How did you even get this. The decoder should error out if it detects a reserved-type block");
+                panic!(
+                    "How did you even get this. The decoder should error out if it detects a reserved-type block"
+                );
             }
 
             BlockType::Compressed => {

@@ -144,7 +144,69 @@ impl FSETable {
         self.table_size.ilog2() as u8
     }
 
+    /// Get the probability assigned to a symbol (0 means absent, -1 means less-than-1).
+    pub(crate) fn symbol_probability(&self, symbol: u8) -> i32 {
+        self.states[symbol as usize].probability
+    }
+
+    /// Compute the exact serialized size (in bits) of the FSE table header,
+    /// including the byte-alignment padding at the end.
+    /// Mirrors `write_table` but counts bits instead of writing them.
+    ///
+    /// The result assumes the header starts at a byte boundary, which matches
+    /// all current encoder call sites.
+    pub(crate) fn table_header_bits(&self) -> usize {
+        let mut bits = 4; // acc_log - 5
+        let mut probability_counter = 0usize;
+        let probability_sum = 1 << self.acc_log();
+
+        let mut prob_idx = 0;
+        while probability_counter < probability_sum {
+            let max_remaining_value = probability_sum - probability_counter + 1;
+            let bits_to_write = max_remaining_value.ilog2() + 1;
+            let low_threshold = ((1 << bits_to_write) - 1) - max_remaining_value;
+
+            let prob = self.states[prob_idx].probability;
+            prob_idx += 1;
+            let value = (prob + 1) as u32;
+            if value < low_threshold as u32 {
+                bits += bits_to_write as usize - 1;
+            } else {
+                bits += bits_to_write as usize;
+            }
+
+            if prob == -1 {
+                probability_counter += 1;
+            } else if prob > 0 {
+                probability_counter += prob as usize;
+            } else {
+                let mut zeros = 0u8;
+                while prob_idx < self.states.len() && self.states[prob_idx].probability == 0 {
+                    zeros += 1;
+                    prob_idx += 1;
+                    if zeros == 3 {
+                        bits += 2;
+                        zeros = 0;
+                    }
+                }
+                bits += 2;
+            }
+        }
+        // Byte-alignment padding
+        let misaligned = bits % 8;
+        if misaligned != 0 {
+            bits += 8 - misaligned;
+        }
+        bits
+    }
+
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
+        assert!(
+            writer.index().is_multiple_of(8),
+            "FSE table headers must start on a byte boundary"
+        );
+        #[cfg(debug_assertions)]
+        let start_idx = writer.index();
         writer.write_bits(self.acc_log() - 5, 4);
         let mut probability_counter = 0usize;
         let probability_sum = 1 << self.acc_log();
@@ -173,7 +235,7 @@ impl FSETable {
                 probability_counter += prob as usize;
             } else {
                 let mut zeros = 0u8;
-                while self.states[prob_idx].probability == 0 {
+                while prob_idx < self.states.len() && self.states[prob_idx].probability == 0 {
                     zeros += 1;
                     prob_idx += 1;
                     if zeros == 3 {
@@ -185,6 +247,15 @@ impl FSETable {
             }
         }
         writer.write_bits(0u8, writer.misaligned());
+        #[cfg(debug_assertions)]
+        {
+            let written_bits = writer.index() - start_idx;
+            let computed = self.table_header_bits();
+            debug_assert_eq!(
+                written_bits, computed,
+                "table_header_bits() mismatch: written={written_bits}, computed={computed}"
+            );
+        }
     }
 }
 
@@ -239,6 +310,14 @@ pub fn build_table_from_data(
         }
     }
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
+}
+
+pub(crate) fn build_table_from_symbol_counts(
+    counts: &[usize],
+    max_log: u8,
+    avoid_0_numbit: bool,
+) -> FSETable {
+    build_table_from_counts(counts, max_log, avoid_0_numbit)
 }
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {

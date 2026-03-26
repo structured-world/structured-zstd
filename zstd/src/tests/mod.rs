@@ -489,8 +489,8 @@ fn test_streaming_no_std() {
 
 #[test]
 fn test_decode_all() {
-    use crate::decoding::errors::FrameDecoderError;
     use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
 
     let skip_frame = |input: &mut Vec<u8>, length: usize| {
         input.extend_from_slice(&0x184D2A50u32.to_le_bytes());
@@ -587,5 +587,6 @@ pub mod roundtrip_integrity;
 #[test]
 fn verbose_disabled() {
     use crate::VERBOSE;
-    assert_eq!(VERBOSE, false);
+    use core::hint::black_box;
+    assert!(!black_box(VERBOSE));
 }

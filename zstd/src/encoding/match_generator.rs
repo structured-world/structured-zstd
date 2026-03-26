@@ -442,7 +442,9 @@ fn matches() {
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
-        alloc::vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,],
+        alloc::vec![
+            1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
+        ],
         SuffixStore::with_capacity(100),
         |_, _| {},
     );

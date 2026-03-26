@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
+use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -46,14 +46,18 @@ fn roundtrip_simple(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Roundtrip using FrameCompressor (streaming API).
-fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
+fn compress_streaming(data: &[u8]) -> Vec<u8> {
     let mut compressed = Vec::new();
     let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
     compressor.set_source(data);
     compressor.set_drain(&mut compressed);
     compressor.compress();
+    compressed
+}
 
+/// Roundtrip using FrameCompressor (streaming API).
+fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
+    let compressed = compress_streaming(data);
     let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
@@ -71,6 +75,15 @@ fn generate_huffman_friendly(seed: u64, len: usize, alphabet_size: u8) -> Vec<u8
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         data.push(((state >> 33) as u8) % alphabet_size);
+    }
+    data
+}
+
+fn repeat_offset_fixture(pattern: &[u8], chunks: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(chunks * (pattern.len() + 2));
+    for i in 0..chunks {
+        data.extend_from_slice(pattern);
+        data.extend_from_slice(&(i as u16).to_le_bytes());
     }
     data
 }
@@ -124,7 +137,7 @@ fn roundtrip_streaming_api_1000_iterations() {
 #[test]
 fn roundtrip_edge_cases() {
     // Empty data
-    assert_eq!(roundtrip_simple(&[]), vec![]);
+    assert_eq!(roundtrip_simple(&[]), Vec::<u8>::new());
 
     // Single byte
     assert_eq!(roundtrip_simple(&[0x42]), vec![0x42]);
@@ -186,4 +199,141 @@ fn roundtrip_multi_block_large_literals() {
     let data = generate_huffman_friendly(100, 512 * 1024, 48);
     assert_eq!(roundtrip_simple(&data), data);
     assert_eq!(roundtrip_streaming(&data), data);
+}
+
+/// Repeat offset encoding: data with many repeated match offsets should compress
+/// better than data where every offset is unique, and must roundtrip correctly.
+#[test]
+fn roundtrip_repeat_offsets() {
+    // Break each repeated chunk with a changing 2-byte sentinel so the matcher
+    // has to re-emit the same offset instead of collapsing everything into one
+    // maximal match.
+    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Repeat offset roundtrip failed");
+
+    // Also verify with streaming API
+    let result = roundtrip_streaming(&data);
+    assert_eq!(data, result, "Repeat offset streaming roundtrip failed");
+}
+
+/// Verify that highly repetitive data compresses significantly better than random data.
+#[test]
+fn repetitive_data_compresses_better_than_random() {
+    // Repetitive data: fixed-offset matches separated by a changing sentinel.
+    let repetitive = repeat_offset_fixture(b"ABCDE12345", 5_000);
+    let compressed_repetitive = compress_to_vec(&repetitive[..], CompressionLevel::Fastest);
+
+    // Random data of same size (incompressible)
+    let random = generate_data(999, repetitive.len());
+    let compressed_random = compress_to_vec(&random[..], CompressionLevel::Fastest);
+
+    // Repetitive data should still beat random data, without pinning an exact
+    // ratio that may drift as encoder heuristics evolve.
+    assert!(
+        compressed_repetitive.len() < compressed_random.len(),
+        "Repetitive input should compress better than random input. \
+         repetitive={} bytes, random={} bytes",
+        compressed_repetitive.len(),
+        compressed_random.len()
+    );
+}
+
+/// Multi-block data exercises FSE table reuse across blocks and offset history
+/// persistence across block boundaries.
+#[test]
+fn roundtrip_multi_block_repeat_offsets() {
+    // 512KB of data with fixed-offset repeats broken by a changing sentinel —
+    // spans multiple 128KB blocks, so offset history and FSE tables must
+    // persist correctly across block boundaries.
+    let mut data = repeat_offset_fixture(b"HelloWorld", (512 * 1024) / 12 + 1);
+    data.truncate(512 * 1024);
+
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Multi-block repeat offset roundtrip failed");
+
+    let result = roundtrip_streaming(&data);
+    assert_eq!(
+        data, result,
+        "Multi-block repeat offset streaming roundtrip failed"
+    );
+
+    let whole_frame = compress_streaming(&data);
+    let frame_overhead = compress_to_vec(&[][..], CompressionLevel::Fastest).len();
+    let independent_chunks: usize = data
+        .chunks(128 * 1024)
+        .map(|chunk| {
+            compress_to_vec(chunk, CompressionLevel::Fastest)
+                .len()
+                .saturating_sub(frame_overhead)
+        })
+        .sum::<usize>()
+        .saturating_add(frame_overhead);
+    assert!(
+        whole_frame.len() < independent_chunks,
+        "Cross-block reuse should beat per-block resets. whole={} bytes, split={} bytes",
+        whole_frame.len(),
+        independent_chunks
+    );
+}
+
+/// Zero literal length sequences (back-to-back matches with no literals between them)
+/// exercise the shifted repeat-offset remap path instead of only generic new offsets.
+#[test]
+fn roundtrip_zero_literal_length_sequences() {
+    // Alternate a base prefix with a one-byte-shifted version so the encoder
+    // sees back-to-back zero-literal matches that must use a shifted repeat
+    // remap path instead of only generic new offsets.
+    let mut data = Vec::with_capacity(10_000);
+    // Initial unique segment
+    for i in 0..100u8 {
+        data.push(i);
+    }
+    // Repeat the first 50 bytes, then alternate with a shifted 50-byte window.
+    let prefix = data[..50].to_vec();
+    let shifted_prefix = data[1..51].to_vec();
+    data.extend_from_slice(&prefix);
+    for _ in 0..100 {
+        data.extend_from_slice(&shifted_prefix);
+        data.extend_from_slice(&prefix);
+    }
+
+    let result = roundtrip_simple(&data);
+    assert_eq!(data, result, "Zero ll sequence roundtrip failed");
+}
+
+/// Reusing the same `FrameCompressor` across frames must reset per-frame FSE repeat tables.
+#[test]
+fn roundtrip_reused_frame_compressor_across_frames() {
+    let first = generate_huffman_friendly(700, 512 * 1024, 48);
+    let second = generate_huffman_friendly(701, 512 * 1024, 48);
+
+    let mut first_compressed = Vec::new();
+    let mut second_compressed = Vec::new();
+    {
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_source(first.as_slice());
+        compressor.set_drain(&mut first_compressed);
+        compressor.compress();
+
+        compressor.set_source(second.as_slice());
+        compressor.set_drain(&mut second_compressed);
+        compressor.compress();
+    }
+
+    let mut decoder = StreamingDecoder::new(first_compressed.as_slice()).unwrap();
+    let mut first_roundtrip = Vec::new();
+    decoder.read_to_end(&mut first_roundtrip).unwrap();
+    assert_eq!(
+        first, first_roundtrip,
+        "First reused-frame roundtrip failed"
+    );
+
+    let mut decoder = StreamingDecoder::new(second_compressed.as_slice()).unwrap();
+    let mut second_roundtrip = Vec::new();
+    decoder.read_to_end(&mut second_roundtrip).unwrap();
+    assert_eq!(
+        second, second_roundtrip,
+        "Second reused-frame roundtrip failed"
+    );
 }

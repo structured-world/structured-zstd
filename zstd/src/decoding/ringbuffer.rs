@@ -470,56 +470,60 @@ impl RingBuffer {
     /// Needs start + len <= self.len()
     /// And more then len reserved space
     pub unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
-        // data slices in raw parts
-        let ((s1_ptr, s1_len), (s2_ptr, s2_len)) = self.data_slice_parts();
+        // SAFETY: caller guarantees the source range is valid and enough free
+        // space exists; the raw-pointer arithmetic and copy stay within those bounds.
+        unsafe {
+            // data slices in raw parts
+            let ((s1_ptr, s1_len), (s2_ptr, s2_len)) = self.data_slice_parts();
 
-        debug_assert!(len <= s1_len + s2_len, "{} > {} + {}", len, s1_len, s2_len);
+            debug_assert!(len <= s1_len + s2_len, "{} > {} + {}", len, s1_len, s2_len);
 
-        // calc the actually wanted slices in raw parts
-        let start_in_s1 = usize::min(s1_len, start);
-        let end_in_s1 = usize::min(s1_len, start + len);
-        let m1_ptr = s1_ptr.add(start_in_s1);
-        let m1_len = end_in_s1 - start_in_s1;
+            // calc the actually wanted slices in raw parts
+            let start_in_s1 = usize::min(s1_len, start);
+            let end_in_s1 = usize::min(s1_len, start + len);
+            let m1_ptr = s1_ptr.add(start_in_s1);
+            let m1_len = end_in_s1 - start_in_s1;
 
-        debug_assert!(end_in_s1 <= s1_len);
-        debug_assert!(start_in_s1 <= s1_len);
+            debug_assert!(end_in_s1 <= s1_len);
+            debug_assert!(start_in_s1 <= s1_len);
 
-        let start_in_s2 = start.saturating_sub(s1_len);
-        let end_in_s2 = start_in_s2 + (len - m1_len);
-        let m2_ptr = s2_ptr.add(start_in_s2);
-        let m2_len = end_in_s2 - start_in_s2;
+            let start_in_s2 = start.saturating_sub(s1_len);
+            let end_in_s2 = start_in_s2 + (len - m1_len);
+            let m2_ptr = s2_ptr.add(start_in_s2);
+            let m2_len = end_in_s2 - start_in_s2;
 
-        debug_assert!(start_in_s2 <= s2_len);
-        debug_assert!(end_in_s2 <= s2_len);
+            debug_assert!(start_in_s2 <= s2_len);
+            debug_assert!(end_in_s2 <= s2_len);
 
-        debug_assert_eq!(len, m1_len + m2_len);
+            debug_assert_eq!(len, m1_len + m2_len);
 
-        // the free slices, must hold: f1_len + f2_len >= m1_len + m2_len
-        let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
+            // the free slices, must hold: f1_len + f2_len >= m1_len + m2_len
+            let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
 
-        debug_assert!(f1_len + f2_len >= m1_len + m2_len);
+            debug_assert!(f1_len + f2_len >= m1_len + m2_len);
 
-        // calc how many from where bytes go where
-        let m1_in_f1 = usize::min(m1_len, f1_len);
-        let m1_in_f2 = m1_len - m1_in_f1;
-        let m2_in_f1 = usize::min(f1_len - m1_in_f1, m2_len);
-        let m2_in_f2 = m2_len - m2_in_f1;
+            // calc how many from where bytes go where
+            let m1_in_f1 = usize::min(m1_len, f1_len);
+            let m1_in_f2 = m1_len - m1_in_f1;
+            let m2_in_f1 = usize::min(f1_len - m1_in_f1, m2_len);
+            let m2_in_f2 = m2_len - m2_in_f1;
 
-        debug_assert_eq!(m1_len, m1_in_f1 + m1_in_f2);
-        debug_assert_eq!(m2_len, m2_in_f1 + m2_in_f2);
-        debug_assert!(f1_len >= m1_in_f1 + m2_in_f1);
-        debug_assert!(f2_len >= m1_in_f2 + m2_in_f2);
-        debug_assert_eq!(len, m1_in_f1 + m2_in_f1 + m1_in_f2 + m2_in_f2);
+            debug_assert_eq!(m1_len, m1_in_f1 + m1_in_f2);
+            debug_assert_eq!(m2_len, m2_in_f1 + m2_in_f2);
+            debug_assert!(f1_len >= m1_in_f1 + m2_in_f1);
+            debug_assert!(f2_len >= m1_in_f2 + m2_in_f2);
+            debug_assert_eq!(len, m1_in_f1 + m2_in_f1 + m1_in_f2 + m2_in_f2);
 
-        debug_assert!(self.buf.as_ptr().add(self.cap) > f1_ptr.add(m1_in_f1 + m2_in_f1));
-        debug_assert!(self.buf.as_ptr().add(self.cap) > f2_ptr.add(m1_in_f2 + m2_in_f2));
+            debug_assert!(self.buf.as_ptr().add(self.cap) >= f1_ptr.add(m1_in_f1 + m2_in_f1));
+            debug_assert!(self.buf.as_ptr().add(self.cap) >= f2_ptr.add(m1_in_f2 + m2_in_f2));
 
-        debug_assert!((m1_in_f2 > 0) ^ (m2_in_f1 > 0) || (m1_in_f2 == 0 && m2_in_f1 == 0));
+            debug_assert!((m1_in_f2 > 0) ^ (m2_in_f1 > 0) || (m1_in_f2 == 0 && m2_in_f1 == 0));
 
-        copy_with_checks(
-            m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
-        );
-        self.tail = (self.tail + len) % self.cap;
+            copy_with_nobranch_check(
+                m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
+            );
+            self.tail = (self.tail + len) % self.cap;
+        }
     }
 }
 
@@ -572,33 +576,35 @@ unsafe fn copy_bytes_overshooting(
     let min_buffer_size = usize::min(src.1, dst.1);
 
     // Can copy in just one read+write, very common case
-    if min_buffer_size >= COPY_AT_ONCE_SIZE && copy_at_least <= COPY_AT_ONCE_SIZE {
-        dst.0
-            .cast::<CopyType>()
-            .write_unaligned(src.0.cast::<CopyType>().read_unaligned())
-    } else {
-        let copy_multiple = copy_at_least.next_multiple_of(COPY_AT_ONCE_SIZE);
-        // Can copy in multiple simple instructions
-        if min_buffer_size >= copy_multiple {
-            let mut src_ptr = src.0.cast::<CopyType>();
-            let src_ptr_end = src.0.add(copy_multiple).cast::<CopyType>();
-            let mut dst_ptr = dst.0.cast::<CopyType>();
-
-            while src_ptr < src_ptr_end {
-                dst_ptr.write_unaligned(src_ptr.read_unaligned());
-                src_ptr = src_ptr.add(1);
-                dst_ptr = dst_ptr.add(1);
-            }
+    unsafe {
+        if min_buffer_size >= COPY_AT_ONCE_SIZE && copy_at_least <= COPY_AT_ONCE_SIZE {
+            dst.0
+                .cast::<CopyType>()
+                .write_unaligned(src.0.cast::<CopyType>().read_unaligned())
         } else {
-            // Fall back to standard memcopy
-            dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
-        }
-    }
+            let copy_multiple = copy_at_least.next_multiple_of(COPY_AT_ONCE_SIZE);
+            // Can copy in multiple simple instructions
+            if min_buffer_size >= copy_multiple {
+                let mut src_ptr = src.0.cast::<CopyType>();
+                let src_ptr_end = src.0.add(copy_multiple).cast::<CopyType>();
+                let mut dst_ptr = dst.0.cast::<CopyType>();
 
-    debug_assert_eq!(
-        slice::from_raw_parts(src.0, copy_at_least),
-        slice::from_raw_parts(dst.0, copy_at_least)
-    );
+                while src_ptr < src_ptr_end {
+                    dst_ptr.write_unaligned(src_ptr.read_unaligned());
+                    src_ptr = src_ptr.add(1);
+                    dst_ptr = dst_ptr.add(1);
+                }
+            } else {
+                // Fall back to standard memcopy
+                dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
+            }
+        }
+
+        debug_assert_eq!(
+            slice::from_raw_parts(src.0, copy_at_least),
+            slice::from_raw_parts(dst.0, copy_at_least)
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -614,15 +620,17 @@ unsafe fn copy_without_checks(
     m1_in_f2: usize,
     m2_in_f2: usize,
 ) {
-    f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-    f1_ptr
-        .add(m1_in_f1)
-        .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+    unsafe {
+        f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+        f1_ptr
+            .add(m1_in_f1)
+            .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
 
-    f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
-    f2_ptr
-        .add(m1_in_f2)
-        .copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+        f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+        f2_ptr
+            .add(m1_in_f2)
+            .copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+    }
 }
 
 #[allow(dead_code)]
@@ -638,22 +646,24 @@ unsafe fn copy_with_checks(
     m1_in_f2: usize,
     m2_in_f2: usize,
 ) {
-    if m1_in_f1 != 0 {
-        f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-    }
-    if m2_in_f1 != 0 {
-        f1_ptr
-            .add(m1_in_f1)
-            .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-    }
+    unsafe {
+        if m1_in_f1 != 0 {
+            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+        }
+        if m2_in_f1 != 0 {
+            f1_ptr
+                .add(m1_in_f1)
+                .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+        }
 
-    if m1_in_f2 != 0 {
-        f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
-    }
-    if m2_in_f2 != 0 {
-        f2_ptr
-            .add(m1_in_f2)
-            .copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+        if m1_in_f2 != 0 {
+            f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+        }
+        if m2_in_f2 != 0 {
+            f2_ptr
+                .add(m1_in_f2)
+                .copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+        }
     }
 }
 
@@ -670,80 +680,113 @@ unsafe fn copy_with_nobranch_check(
     m1_in_f2: usize,
     m2_in_f2: usize,
 ) {
-    let case = (m1_in_f1 > 0) as usize
-        | (((m2_in_f1 > 0) as usize) << 1)
-        | (((m1_in_f2 > 0) as usize) << 2)
-        | (((m2_in_f2 > 0) as usize) << 3);
+    unsafe {
+        let case = (m1_in_f1 > 0) as usize
+            | (((m2_in_f1 > 0) as usize) << 1)
+            | (((m1_in_f2 > 0) as usize) << 2)
+            | (((m2_in_f2 > 0) as usize) << 3);
 
-    match case {
-        0 => {}
+        match case {
+            0 => {}
 
-        // one bit set
-        1 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-        }
-        2 => {
-            f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-        }
-        4 => {
-            f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
-        }
-        8 => {
-            f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
-        }
+            // one bit set
+            1 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+            }
+            2 => {
+                f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+            }
+            4 => {
+                f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
+            }
+            8 => {
+                f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+            }
 
-        // two bit set
-        3 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-            f1_ptr
-                .add(m1_in_f1)
-                .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-        }
-        5 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-            f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
-        }
-        6 => core::hint::unreachable_unchecked(),
-        7 => core::hint::unreachable_unchecked(),
-        9 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-            f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
-        }
-        10 => {
-            f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-            f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
-        }
-        12 => {
-            f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
-            f2_ptr
-                .add(m1_in_f2)
-                .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
-        }
+            // two bit set
+            3 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                f1_ptr
+                    .add(m1_in_f1)
+                    .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+            }
+            5 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+            }
+            6 => core::hint::unreachable_unchecked(),
+            7 => core::hint::unreachable_unchecked(),
+            9 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+            }
+            10 => {
+                f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+                f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+            }
+            12 => {
+                f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
+                f2_ptr
+                    .add(m1_in_f2)
+                    .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+            }
 
-        // three bit set
-        11 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-            f1_ptr
-                .add(m1_in_f1)
-                .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-            f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+            // three bit set
+            11 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                f1_ptr
+                    .add(m1_in_f1)
+                    .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+                f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+            }
+            13 => {
+                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+                f2_ptr
+                    .add(m1_in_f2)
+                    .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+            }
+            14 => core::hint::unreachable_unchecked(),
+            15 => core::hint::unreachable_unchecked(),
+            _ => core::hint::unreachable_unchecked(),
         }
-        13 => {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-            f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
-            f2_ptr
-                .add(m1_in_f2)
-                .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
-        }
-        14 => core::hint::unreachable_unchecked(),
-        15 => core::hint::unreachable_unchecked(),
-        _ => core::hint::unreachable_unchecked(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RingBuffer;
+    use super::{RingBuffer, copy_bytes_overshooting, copy_with_checks, copy_with_nobranch_check};
+    use core::mem::size_of;
+
+    fn assert_buffers_equal(expected: &RingBuffer, actual: &RingBuffer) {
+        assert_eq!(expected.len(), actual.len());
+        assert_eq!(expected.as_slices(), actual.as_slices());
+        assert_eq!(expected.head, actual.head);
+        assert_eq!(expected.tail, actual.tail);
+        assert_eq!(expected.cap, actual.cap);
+    }
+
+    fn assert_branchless_matches_checked(
+        mut checked: RingBuffer,
+        mut branchless: RingBuffer,
+        start: usize,
+        len: usize,
+    ) {
+        assert!(checked.free() >= len);
+        assert!(branchless.free() >= len);
+
+        unsafe {
+            checked.extend_from_within_unchecked(start, len);
+            branchless.extend_from_within_unchecked_branchless(start, len);
+        }
+
+        assert_buffers_equal(&checked, &branchless);
+    }
+
+    #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]
+    const COPY_CHUNK_SIZE: usize = size_of::<usize>();
+    #[cfg(any(target_feature = "sse2", target_feature = "neon"))]
+    const COPY_CHUNK_SIZE: usize = size_of::<u128>();
 
     #[test]
     fn smoke() {
@@ -883,5 +926,131 @@ mod tests {
         rb.extend_from_within(0, 4);
         assert_eq!(b"11", rb.as_slices().0);
         assert_eq!(b"111111", rb.as_slices().1);
+    }
+
+    #[test]
+    fn extend_from_within_branchless_matches_checked_across_layouts() {
+        let contiguous = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(16);
+            rb.extend(b"0123456789");
+            rb
+        };
+        assert_branchless_matches_checked(contiguous(), contiguous(), 2, 5);
+
+        let wrapped_write = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(16);
+            rb.extend(b"0123456789ABC");
+            rb.drop_first_n(2);
+            rb
+        };
+        assert_branchless_matches_checked(wrapped_write(), wrapped_write(), 1, 5);
+
+        let wrapped_data = || {
+            let mut rb = RingBuffer::new();
+            rb.reserve(32);
+            rb.extend(b"0123456789abcdefghijklmn");
+            rb.drop_first_n(18);
+            rb.extend(b"wxyz012345");
+            rb
+        };
+        assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 8, 2);
+        assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 2, 8);
+    }
+
+    #[test]
+    fn copy_with_nobranch_check_matches_checked_for_all_valid_case_masks() {
+        let cases = [
+            (0, 0, 0, 0),
+            (1, 0, 0, 0),
+            (0, 1, 0, 0),
+            (0, 0, 1, 0),
+            (0, 0, 0, 1),
+            (1, 1, 0, 0),
+            (1, 0, 1, 0),
+            (1, 0, 0, 1),
+            (0, 1, 0, 1),
+            (0, 0, 1, 1),
+            (1, 1, 0, 1),
+            (1, 0, 1, 1),
+        ];
+
+        for (m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2) in cases {
+            let m1 = [11_u8, 12, 13, 14];
+            let m2 = [21_u8, 22, 23, 24];
+            let mut expected = [0_u8; 8];
+            let mut actual = [0_u8; 8];
+
+            unsafe {
+                copy_with_checks(
+                    m1.as_ptr(),
+                    m2.as_ptr(),
+                    expected.as_mut_ptr(),
+                    expected.as_mut_ptr().add(4),
+                    m1_in_f1,
+                    m2_in_f1,
+                    m1_in_f2,
+                    m2_in_f2,
+                );
+                copy_with_nobranch_check(
+                    m1.as_ptr(),
+                    m2.as_ptr(),
+                    actual.as_mut_ptr(),
+                    actual.as_mut_ptr().add(4),
+                    m1_in_f1,
+                    m2_in_f1,
+                    m1_in_f2,
+                    m2_in_f2,
+                );
+            }
+
+            assert_eq!(
+                expected, actual,
+                "case=({}, {}, {}, {})",
+                m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2
+            );
+        }
+    }
+
+    #[test]
+    fn copy_bytes_overshooting_covers_all_copy_strategies() {
+        let src_single = [1_u8; 64];
+        let mut dst_single = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_single.as_ptr(), COPY_CHUNK_SIZE),
+                (dst_single.as_mut_ptr(), COPY_CHUNK_SIZE),
+                COPY_CHUNK_SIZE,
+            );
+        }
+        assert_eq!(
+            &dst_single[..COPY_CHUNK_SIZE],
+            &src_single[..COPY_CHUNK_SIZE]
+        );
+
+        let multi_len = COPY_CHUNK_SIZE * 2;
+        let src_multi = [2_u8; 64];
+        let mut dst_multi = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_multi.as_ptr(), multi_len),
+                (dst_multi.as_mut_ptr(), multi_len),
+                multi_len,
+            );
+        }
+        assert_eq!(&dst_multi[..multi_len], &src_multi[..multi_len]);
+
+        let fallback_len = COPY_CHUNK_SIZE + 1;
+        let src_fallback = [3_u8; 64];
+        let mut dst_fallback = [0_u8; 64];
+        unsafe {
+            copy_bytes_overshooting(
+                (src_fallback.as_ptr(), fallback_len),
+                (dst_fallback.as_mut_ptr(), fallback_len),
+                fallback_len,
+            );
+        }
+        assert_eq!(&dst_fallback[..fallback_len], &src_fallback[..fallback_len]);
     }
 }

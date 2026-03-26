@@ -1,6 +1,6 @@
 //! Utilities and interfaces for encoding an entire frame. Allows reusing resources
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::convert::TryInto;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
@@ -9,10 +9,10 @@ use twox_hash::XxHash64;
 use core::hash::Hasher;
 
 use super::{
-    block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, CompressionLevel, Matcher,
+    CompressionLevel, Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
+    match_generator::MatchGeneratorDriver,
 };
-use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
+use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
 
 use crate::io::{Read, Write};
 
@@ -44,13 +44,30 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     hasher: XxHash64,
 }
 
+#[derive(Clone)]
+pub(crate) enum PreviousFseTable {
+    // Default tables are immutable and already stored alongside the state, so
+    // repeating them only needs a lightweight marker instead of cloning FSETable.
+    Default,
+    Custom(Box<FSETable>),
+}
+
+impl PreviousFseTable {
+    pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> &'a FSETable {
+        match self {
+            Self::Default => default,
+            Self::Custom(table) => table,
+        }
+    }
+}
+
 pub(crate) struct FseTables {
     pub(crate) ll_default: FSETable,
-    pub(crate) ll_previous: Option<FSETable>,
+    pub(crate) ll_previous: Option<PreviousFseTable>,
     pub(crate) ml_default: FSETable,
-    pub(crate) ml_previous: Option<FSETable>,
+    pub(crate) ml_previous: Option<PreviousFseTable>,
     pub(crate) of_default: FSETable,
-    pub(crate) of_previous: Option<FSETable>,
+    pub(crate) of_previous: Option<PreviousFseTable>,
 }
 
 impl FseTables {
@@ -70,6 +87,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
+    /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
+    pub(crate) offset_hist: [u32; 3],
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -83,6 +103,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -100,6 +121,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             compression_level,
             #[cfg(feature = "hash")]
@@ -132,6 +154,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
+        self.state.fse_tables.ll_previous = None;
+        self.state.fse_tables.ml_previous = None;
+        self.state.fse_tables.of_previous = None;
+        self.state.offset_hist = [1, 4, 8];
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);

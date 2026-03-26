@@ -5,7 +5,7 @@
 //! - C FFI compress → Pure Rust decompress
 
 use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 use structured_zstd::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -114,4 +114,85 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
+}
+
+/// Cross-validate Rust compress (seed=100, 512KB) → C FFI decompress for the
+/// same Huffman-heavy multi-block input used in roundtrip_multi_block_large_literals.
+#[test]
+fn cross_rust_compress_ffi_decompress_huffman_seed100() {
+    let data = generate_huffman_friendly(100, 512 * 1024, 48);
+    let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(data, result, "rust→ffi seed=100 512KB roundtrip failed");
+}
+
+/// Cross-validate the same Huffman-heavy 512KB input in the opposite direction:
+/// C FFI compress (seed=100) → Rust decompress.
+#[test]
+fn cross_ffi_compress_rust_decompress_huffman_seed100() {
+    let data = generate_huffman_friendly(100, 512 * 1024, 48);
+    let compressed = zstd::encode_all(&data[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "ffi→rust seed=100 512KB roundtrip failed");
+}
+
+/// Cross-validate repeat offset encoding: Rust compress → C FFI decompress.
+/// Exercises repeat offset codes (1/2/3) and offset history across blocks.
+#[test]
+fn cross_rust_compress_ffi_decompress_repeat_offsets() {
+    // Single-block: repeating pattern at fixed offset
+    let pattern = b"ABCDE12345";
+    let mut data = Vec::with_capacity(50_000);
+    for _ in 0..5_000 {
+        data.extend_from_slice(pattern);
+    }
+    let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(data, result, "rust→ffi repeat offset roundtrip failed");
+
+    // Multi-block: 512KB with repeating patterns spanning block boundaries
+    let mut multi_block = Vec::with_capacity(512 * 1024);
+    while multi_block.len() < 512 * 1024 {
+        multi_block.extend_from_slice(pattern);
+    }
+    multi_block.truncate(512 * 1024);
+    let compressed = compress_to_vec(&multi_block[..], CompressionLevel::Fastest);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(
+        multi_block, result,
+        "rust→ffi multi-block repeat offset roundtrip failed"
+    );
+}
+
+/// Cross-validate repeat-offset-friendly inputs in the opposite direction:
+/// C FFI compress → Rust decompress.
+#[test]
+fn cross_ffi_compress_rust_decompress_repeat_offsets() {
+    let pattern = b"ABCDE12345";
+
+    let mut data = Vec::with_capacity(50_000);
+    for _ in 0..5_000 {
+        data.extend_from_slice(pattern);
+    }
+    let compressed = zstd::encode_all(&data[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "ffi→rust repeat offset roundtrip failed");
+
+    let mut multi_block = Vec::with_capacity(512 * 1024);
+    while multi_block.len() < 512 * 1024 {
+        multi_block.extend_from_slice(pattern);
+    }
+    multi_block.truncate(512 * 1024);
+    let compressed = zstd::encode_all(&multi_block[..], 1).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(
+        multi_block, result,
+        "ffi→rust multi-block repeat offset roundtrip failed"
+    );
 }

@@ -1,7 +1,7 @@
 use crate::{
     common::MAX_BLOCK_SIZE,
     encoding::{
-        block_header::BlockHeader, blocks::compress_block, frame_compressor::CompressState, Matcher,
+        Matcher, block_header::BlockHeader, blocks::compress_block, frame_compressor::CompressState,
     },
 };
 use alloc::vec::Vec;

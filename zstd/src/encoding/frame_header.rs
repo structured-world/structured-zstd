@@ -42,12 +42,12 @@ impl FrameHeader {
 
         // `Window_Descriptor
         // TODO: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#window_descriptor
-        if !self.single_segment {
-            if let Some(window_size) = self.window_size {
-                let log = window_size.next_power_of_two().ilog2();
-                let exponent = if log > 10 { log - 10 } else { 1 } as u8;
-                output.push(exponent << 3);
-            }
+        if !self.single_segment
+            && let Some(window_size) = self.window_size
+        {
+            let log = window_size.next_power_of_two().ilog2();
+            let exponent = if log > 10 { log - 10 } else { 1 } as u8;
+            output.push(exponent << 3);
         }
 
         if let Some(id) = self.dictionary_id {
@@ -116,7 +116,10 @@ impl FrameHeader {
         // and the `Frame_Content_Size` field must be present in the header.
         // If this flag is not set, the `Window_Descriptor` field must be present in the frame header.
         if self.single_segment {
-            assert!(self.frame_content_size.is_some(), "if the `single_segment` flag is set to true, then a frame content size must be provided");
+            assert!(
+                self.frame_content_size.is_some(),
+                "if the `single_segment` flag is set to true, then a frame content size must be provided"
+            );
             bw.write_bits(1u8, 1);
         } else {
             assert!(
@@ -163,7 +166,7 @@ fn minify_val_fcs(val: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::FrameHeader;
-    use crate::decoding::frame::{read_frame_header, FrameDescriptor};
+    use crate::decoding::frame::{FrameDescriptor, read_frame_header};
     use alloc::vec::Vec;
 
     #[test]

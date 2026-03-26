@@ -1,0 +1,5 @@
+[toolchain]
+# Follow the latest stable toolchain by default.
+# MSRV remains 1.92.0 and is verified separately via `rust-version` plus the CI msrv job.
+channel = "stable"
+components = ["clippy", "rustfmt"]
