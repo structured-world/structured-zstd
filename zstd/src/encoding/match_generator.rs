@@ -87,6 +87,18 @@ impl MatchGeneratorDriver {
             ),
         }
     }
+
+    fn dfast_matcher(&self) -> &DfastMatchGenerator {
+        self.dfast_match_generator
+            .as_ref()
+            .expect("dfast backend must be initialized by reset() before use")
+    }
+
+    fn dfast_matcher_mut(&mut self) -> &mut DfastMatchGenerator {
+        self.dfast_match_generator
+            .as_mut()
+            .expect("dfast backend must be initialized by reset() before use")
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -149,9 +161,7 @@ impl Matcher for MatchGeneratorDriver {
     fn window_size(&self) -> u64 {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.max_window_size as u64,
-            MatcherBackend::Dfast => {
-                self.dfast_match_generator.as_ref().unwrap().max_window_size as u64
-            }
+            MatcherBackend::Dfast => self.dfast_matcher().max_window_size as u64,
         }
     }
 
@@ -166,11 +176,7 @@ impl Matcher for MatchGeneratorDriver {
     fn get_last_space(&mut self) -> &[u8] {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.window.last().unwrap().data.as_slice(),
-            MatcherBackend::Dfast => self
-                .dfast_match_generator
-                .as_ref()
-                .unwrap()
-                .get_last_space(),
+            MatcherBackend::Dfast => self.dfast_matcher().get_last_space(),
         }
     }
 
@@ -196,7 +202,7 @@ impl Matcher for MatchGeneratorDriver {
                 let vec_pool = &mut self.vec_pool;
                 self.dfast_match_generator
                     .as_mut()
-                    .unwrap()
+                    .expect("dfast backend must be initialized by reset() before use")
                     .add_data(space, |mut data| {
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
@@ -211,16 +217,14 @@ impl Matcher for MatchGeneratorDriver {
                 while self.match_generator.next_sequence(&mut handle_sequence) {}
             }
             MatcherBackend::Dfast => self
-                .dfast_match_generator
-                .as_mut()
-                .unwrap()
+                .dfast_matcher_mut()
                 .start_matching(&mut handle_sequence),
         }
     }
     fn skip_matching(&mut self) {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.skip_matching(),
-            MatcherBackend::Dfast => self.dfast_match_generator.as_mut().unwrap().skip_matching(),
+            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(),
         }
     }
 }
@@ -636,6 +640,8 @@ impl DfastMatchGenerator {
                     offset: candidate.offset,
                     match_len: candidate.match_len,
                 });
+                // The encoded offset value is irrelevant here; we only need the
+                // side effect on offset history for future rep-code matching.
                 let _ = encode_offset_with_history(
                     candidate.offset as u32,
                     literals.len() as u32,
@@ -1163,4 +1169,75 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
+}
+
+#[test]
+fn driver_switches_backends_and_initializes_dfast_via_reset() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    driver.reset(CompressionLevel::Default);
+    assert_eq!(driver.window_size(), DFAST_DEFAULT_WINDOW_SIZE as u64);
+
+    let mut first = driver.get_next_space();
+    first[..12].copy_from_slice(b"abcabcabcabc");
+    first.truncate(12);
+    driver.commit_space(first);
+    assert_eq!(driver.get_last_space(), b"abcabcabcabc");
+    driver.skip_matching();
+
+    let mut second = driver.get_next_space();
+    second[..12].copy_from_slice(b"abcabcabcabc");
+    second.truncate(12);
+    driver.commit_space(second);
+
+    let mut reconstructed = b"abcabcabcabc".to_vec();
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            reconstructed.extend_from_slice(literals);
+            let start = reconstructed.len() - offset;
+            for i in 0..match_len {
+                let byte = reconstructed[start + i];
+                reconstructed.push(byte);
+            }
+        }
+    });
+    assert_eq!(reconstructed, b"abcabcabcabcabcabcabcabc");
+
+    driver.reset(CompressionLevel::Fastest);
+    assert_eq!(driver.window_size(), 64);
+}
+
+#[test]
+fn dfast_skip_matching_handles_window_eviction() {
+    let mut matcher = DfastMatchGenerator::new(16);
+
+    matcher.add_data(alloc::vec![1, 2, 3, 4, 5, 6], |_| {});
+    matcher.skip_matching();
+    matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
+    matcher.skip_matching();
+    matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
+
+    let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            reconstructed.extend_from_slice(literals);
+            let start = reconstructed.len() - offset;
+            for i in 0..match_len {
+                let byte = reconstructed[start + i];
+                reconstructed.push(byte);
+            }
+        }
+    });
+
+    assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
