@@ -174,45 +174,70 @@ fn choose_table<'a>(
         .unwrap_or_default();
     let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
     // Sequence-section RLE mode is not implemented yet, so one-symbol streams
-    // stay on the Predefined/Repeat paths instead of inventing a partial mode-1 path here.
-    // For non-degenerate inputs we still build the dynamic candidate here instead
-    // of adding a heuristic short-circuit: exact cost comparison is what lets
-    // Repeat, Predefined, and Encoded compete without hard-coded ratio regressions.
+    // stay on the Predefined/Repeat paths unless those tables cannot encode the
+    // stream at all. For non-degenerate inputs we still build the dynamic candidate
+    // here instead of adding a heuristic short-circuit: exact cost comparison is
+    // what lets Repeat, Predefined, and Encoded compete without hard-coded ratio
+    // regressions.
     let new_table = (distinct_symbols > 1)
         .then(|| build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true));
 
-    // Estimate costs: encoding cost + table header cost
-    let new_total_cost = new_table
-        .as_ref()
-        .map(|table| {
-            estimate_encoding_cost(&counts, total, table)
-                .unwrap_or(usize::MAX)
-                .saturating_add(table.table_header_bits())
-        })
-        .unwrap_or(usize::MAX);
+    // Estimate costs: encoding cost + table header cost. `None` means the
+    // candidate table cannot encode the observed distribution.
+    let new_total_cost = new_table.as_ref().and_then(|table| {
+        estimate_encoding_cost(&counts, total, table)
+            .map(|cost| cost.saturating_add(table.table_header_bits()))
+    });
 
     // Predefined table: zero header cost
-    let predefined_cost =
-        estimate_encoding_cost(&counts, total, default_table).unwrap_or(usize::MAX);
+    let predefined_cost = estimate_encoding_cost(&counts, total, default_table);
 
     // Previous table: zero header cost (repeat mode)
-    let previous_cost = previous
-        .and_then(|t| estimate_encoding_cost(&counts, total, t))
-        .unwrap_or(usize::MAX);
+    let previous_cost = previous.and_then(|table| estimate_encoding_cost(&counts, total, table));
 
-    // Pick the cheapest option
-    if previous_cost <= predefined_cost && previous_cost <= new_total_cost {
-        if let Some(previous) = previous {
-            FseTableMode::RepeatLast(previous)
-        } else {
-            FseTableMode::Predefined(default_table)
+    enum Choice {
+        Previous,
+        Predefined,
+        New,
+    }
+
+    let mut best: Option<(usize, Choice)> = None;
+
+    if let Some(cost) = previous_cost {
+        best = Some((cost, Choice::Previous));
+    }
+
+    if let Some(cost) = predefined_cost {
+        match best {
+            Some((best_cost, _)) if best_cost <= cost => {}
+            _ => best = Some((cost, Choice::Predefined)),
         }
-    } else if predefined_cost <= new_total_cost {
-        FseTableMode::Predefined(default_table)
-    } else if let Some(new_table) = new_table {
-        FseTableMode::Encoded(new_table)
-    } else {
-        FseTableMode::Predefined(default_table)
+    }
+
+    if let Some(cost) = new_total_cost {
+        match best {
+            Some((best_cost, _)) if best_cost <= cost => {}
+            _ => best = Some((cost, Choice::New)),
+        }
+    }
+
+    match best.map(|(_, choice)| choice) {
+        Some(Choice::Previous) => previous
+            .map(FseTableMode::RepeatLast)
+            .unwrap_or(FseTableMode::Predefined(default_table)),
+        Some(Choice::Predefined) => FseTableMode::Predefined(default_table),
+        Some(Choice::New) => new_table
+            .map(FseTableMode::Encoded)
+            .unwrap_or(FseTableMode::Predefined(default_table)),
+        None => {
+            let fallback_counts = [counts[0], 0];
+            let fallback = if max_symbol == 0 {
+                build_table_from_symbol_counts(&fallback_counts, max_log, true)
+            } else {
+                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true)
+            };
+            FseTableMode::Encoded(fallback)
+        }
     }
 }
 
@@ -708,6 +733,6 @@ mod tests {
     fn choose_table_without_previous_does_not_unwrap_none() {
         let only_zero_table = build_table_from_symbol_counts(&[1], 5, false);
         let mode = choose_table(None, &only_zero_table, core::iter::repeat_n(1u8, 32), 5);
-        assert!(matches!(mode, FseTableMode::Predefined(_)));
+        assert!(matches!(mode, FseTableMode::Encoded(_)));
     }
 }

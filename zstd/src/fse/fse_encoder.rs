@@ -235,7 +235,7 @@ impl FSETable {
                 probability_counter += prob as usize;
             } else {
                 let mut zeros = 0u8;
-                while self.states[prob_idx].probability == 0 {
+                while prob_idx < self.states.len() && self.states[prob_idx].probability == 0 {
                     zeros += 1;
                     prob_idx += 1;
                     if zeros == 3 {
