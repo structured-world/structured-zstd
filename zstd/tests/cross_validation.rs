@@ -204,3 +204,31 @@ fn cross_rust_default_compress_ffi_decompress_regression() {
     let result = zstd::decode_all(compressed.as_slice()).unwrap();
     assert_eq!(data, result, "rust default→ffi roundtrip failed");
 }
+
+#[test]
+fn default_level_beats_fastest_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let fastest = compress_to_vec(data.as_slice(), CompressionLevel::Fastest);
+    let default = compress_to_vec(data.as_slice(), CompressionLevel::Default);
+
+    assert!(
+        default.len() < fastest.len(),
+        "Default should compress better than Fastest on corpus proxy. default={} fastest={}",
+        default.len(),
+        fastest.len()
+    );
+}
+
+#[test]
+fn default_level_stays_within_ten_percent_of_ffi_level3_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let default = compress_to_vec(data.as_slice(), CompressionLevel::Default);
+    let ffi_level3 = zstd::encode_all(data.as_slice(), 3).unwrap();
+
+    assert!(
+        (default.len() as u64) * 10 <= (ffi_level3.len() as u64) * 11,
+        "Default should stay within 10% of zstd level 3 on corpus proxy. default={} ffi_l3={}",
+        default.len(),
+        ffi_level3.len()
+    );
+}
