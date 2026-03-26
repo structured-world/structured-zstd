@@ -10,10 +10,10 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
-use super::blocks::encode_offset_with_history;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
+use super::blocks::encode_offset_with_history;
 
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
@@ -389,14 +389,9 @@ impl MatchGenerator {
 
             // Look in each window entry
             let mut candidate = self.repcode_candidate(data_slice, literals_len);
-            for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
-                let is_last = match_entry_idx == self.window.len() - 1;
+            for match_entry in self.window.iter() {
                 if let Some(match_index) = match_entry.suffixes.get(key) {
-                    let match_slice = if is_last {
-                        &match_entry.data[match_index..]
-                    } else {
-                        &match_entry.data[match_index..]
-                    };
+                    let match_slice = &match_entry.data[match_index..];
 
                     // Check how long the common prefix actually is
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
@@ -545,11 +540,7 @@ impl MatchGenerator {
         };
 
         let match_entry = &self.window[entry_idx];
-        let match_slice = if entry_idx == last_idx {
-            &match_entry.data[match_index..]
-        } else {
-            &match_entry.data[match_index..]
-        };
+        let match_slice = &match_entry.data[match_index..];
 
         Some(Self::common_prefix_len(match_slice, data_slice))
     }
@@ -1047,7 +1038,9 @@ fn matches() {
     assert!(!matcher.next_sequence(|_| {}));
 
     matcher.add_data(
-        alloc::vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,],
+        alloc::vec![
+            1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
+        ],
         SuffixStore::with_capacity(100),
         |_, _| {},
     );
