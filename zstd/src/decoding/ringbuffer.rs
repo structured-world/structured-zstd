@@ -514,8 +514,8 @@ impl RingBuffer {
             debug_assert!(f2_len >= m1_in_f2 + m2_in_f2);
             debug_assert_eq!(len, m1_in_f1 + m2_in_f1 + m1_in_f2 + m2_in_f2);
 
-            debug_assert!(self.buf.as_ptr().add(self.cap) > f1_ptr.add(m1_in_f1 + m2_in_f1));
-            debug_assert!(self.buf.as_ptr().add(self.cap) > f2_ptr.add(m1_in_f2 + m2_in_f2));
+            debug_assert!(self.buf.as_ptr().add(self.cap) >= f1_ptr.add(m1_in_f1 + m2_in_f1));
+            debug_assert!(self.buf.as_ptr().add(self.cap) >= f2_ptr.add(m1_in_f2 + m2_in_f2));
 
             debug_assert!((m1_in_f2 > 0) ^ (m2_in_f1 > 0) || (m1_in_f2 == 0 && m2_in_f1 == 0));
 
@@ -772,8 +772,8 @@ mod tests {
         start: usize,
         len: usize,
     ) {
-        checked.reserve(len);
-        branchless.reserve(len);
+        assert!(checked.free() >= len);
+        assert!(branchless.free() >= len);
 
         unsafe {
             checked.extend_from_within_unchecked(start, len);
@@ -941,7 +941,7 @@ mod tests {
         let wrapped_write = || {
             let mut rb = RingBuffer::new();
             rb.reserve(16);
-            rb.extend(b"0123456789ABCD");
+            rb.extend(b"0123456789ABC");
             rb.drop_first_n(2);
             rb
         };
@@ -949,10 +949,10 @@ mod tests {
 
         let wrapped_data = || {
             let mut rb = RingBuffer::new();
-            rb.reserve(16);
-            rb.extend(b"0123456789ABCD");
-            rb.drop_first_n(10);
-            rb.extend(b"wxyz12");
+            rb.reserve(32);
+            rb.extend(b"0123456789abcdefghijklmn");
+            rb.drop_first_n(18);
+            rb.extend(b"wxyz012345");
             rb
         };
         assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 8, 2);

@@ -258,10 +258,16 @@ fn roundtrip_multi_block_repeat_offsets() {
     );
 
     let whole_frame = compress_streaming(&data);
+    let frame_overhead = compress_to_vec(&[][..], CompressionLevel::Fastest).len();
     let independent_chunks: usize = data
         .chunks(128 * 1024)
-        .map(|chunk| compress_to_vec(chunk, CompressionLevel::Fastest).len())
-        .sum();
+        .map(|chunk| {
+            compress_to_vec(chunk, CompressionLevel::Fastest)
+                .len()
+                .saturating_sub(frame_overhead)
+        })
+        .sum::<usize>()
+        .saturating_add(frame_overhead);
     assert!(
         whole_frame.len() < independent_chunks,
         "Cross-block reuse should beat per-block resets. whole={} bytes, split={} bytes",

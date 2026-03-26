@@ -142,6 +142,9 @@ fn estimate_encoding_cost(counts: &[usize; 256], total: usize, table: &FSETable)
             return None;
         }
         let effective_prob = if prob == -1 { 1 } else { prob as usize };
+        // Keep the same entropy-style estimate for every candidate table. A
+        // cheaper integer proxy perturbs close Encoded vs Repeat/Predefined
+        // decisions, which is harder to recover from than this small setup cost.
         // Bits per symbol ≈ log2(table_size / probability)
         let bits_per_symbol = (table_size / effective_prob as f64).log2();
         cost_bits += count as f64 * bits_per_symbol;
