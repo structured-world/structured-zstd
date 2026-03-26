@@ -1180,95 +1180,86 @@ mod tests {
 
     #[test]
     fn block_and_sequence_display_messages_are_specific() {
-        assert!(
-            BlockTypeError::InvalidBlocktypeNumber { num: 7 }
-                .to_string()
-                .contains("3 is reserved")
+        assert_eq!(
+            BlockTypeError::InvalidBlocktypeNumber { num: 7 }.to_string(),
+            "Invalid Blocktype number. Is: 7. Should be one of: 0, 1, 2, 3 (3 is reserved)."
         );
-        assert!(
+        assert_eq!(
             DecompressBlockError::MalformedSectionHeader {
                 expected_len: 12,
                 remaining_bytes: 3,
             }
-            .to_string()
-            .contains("there are only 3 bytes left")
+            .to_string(),
+            "Malformed section header. Says literals would be this long: 12 but there are only 3 bytes left"
         );
-        assert!(
-            DecodeBlockContentError::ExpectedHeaderOfPreviousBlock
-                .to_string()
-                .contains("expecting to decode the header")
+        assert_eq!(
+            DecodeBlockContentError::ExpectedHeaderOfPreviousBlock.to_string(),
+            "Can't decode next block body, while expecting to decode the header of the previous block. Results will be nonsense"
         );
-        assert!(
-            DecodeSequenceError::ExtraPadding { skipped_bits: 11 }
-                .to_string()
-                .contains("11 bits")
+        assert_eq!(
+            DecodeSequenceError::ExtraPadding { skipped_bits: 11 }.to_string(),
+            "Padding at the end of the sequence_section was more than a byte long: 11 bits. Probably caused by data corruption"
         );
     }
 
     #[test]
     fn frame_decoder_display_messages_are_specific() {
-        assert!(
-            FrameDecoderError::TargetTooSmall
-                .to_string()
-                .contains("content size reported by the frame")
+        assert_eq!(
+            FrameDecoderError::TargetTooSmall.to_string(),
+            "Target must have at least as many bytes as the content size reported by the frame"
         );
-        assert!(
-            FrameDecoderError::DictNotProvided { dict_id: 0xABCD }
-                .to_string()
-                .contains("wasn't provided via add_dict()")
+        assert_eq!(
+            FrameDecoderError::DictNotProvided { dict_id: 0xABCD }.to_string(),
+            "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict() or reset_with_dict()"
         );
     }
 
     #[test]
     fn literal_display_messages_are_specific() {
-        assert!(
-            DecompressLiteralsError::MissingCompressedSize
-                .to_string()
-                .contains("compressed size was none")
+        assert_eq!(
+            DecompressLiteralsError::MissingCompressedSize.to_string(),
+            "compressed size was none even though it must be set to something for compressed literals"
         );
-        assert!(
-            DecompressLiteralsError::MissingNumStreams
-                .to_string()
-                .contains("num_streams was none")
+        assert_eq!(
+            DecompressLiteralsError::MissingNumStreams.to_string(),
+            "num_streams was none even though it must be set to something (1 or 4) for compressed literals"
         );
-        assert!(
-            DecompressLiteralsError::ExtraPadding { skipped_bits: 9 }
-                .to_string()
-                .contains("9 bits")
+        assert_eq!(
+            DecompressLiteralsError::ExtraPadding { skipped_bits: 9 }.to_string(),
+            "Padding at the end of the sequence_section was more than a byte long: 9 bits. Probably caused by data corruption"
         );
     }
 
     #[test]
     fn fse_and_huffman_display_messages_are_specific() {
-        assert!(
+        assert_eq!(
             FSETableError::ProbabilityCounterMismatch {
                 got: 4,
                 expected_sum: 3,
                 symbol_probabilities: vec![1, -1],
             }
-            .to_string()
-            .contains("expected sum: 3")
+            .to_string(),
+            "The counter (4) exceeded the expected sum: 3. This means an error or corrupted data \n [1, -1]"
         );
-        assert!(
+        assert_eq!(
             HuffmanTableError::NotEnoughBytesForWeights {
                 got_bytes: 2,
                 expected_bytes: 5,
             }
-            .to_string()
-            .contains("5 bytes")
+            .to_string(),
+            "Header says there should be 5 bytes for the weights but there are only 2 bytes in the stream"
         );
-        assert!(
-            HuffmanTableError::ExtraPadding { skipped_bits: 13 }
-                .to_string()
-                .contains("13 bits")
+        assert_eq!(
+            HuffmanTableError::ExtraPadding { skipped_bits: 13 }.to_string(),
+            "Padding at the end of the sequence_section was more than a byte long: 13 bits. Probably caused by data corruption"
         );
-        assert!(
+        assert_eq!(
             HuffmanTableError::FSETableUsedTooManyBytes {
                 used: 7,
                 available_bytes: 6,
             }
-            .to_string()
-            .contains("used more bytes: 7")
+            .to_string(),
+            "FSE table used more bytes: 7 than were meant to be used for the whole stream of huffman weights (6)"
         );
     }
 }
