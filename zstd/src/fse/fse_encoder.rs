@@ -240,12 +240,14 @@ impl FSETable {
         }
         writer.write_bits(0u8, writer.misaligned());
         let written_bits = writer.index() - start_idx;
-        debug_assert_eq!(
-            written_bits,
-            self.table_header_bits(),
-            "table_header_bits() mismatch: written={written_bits}, computed={}",
-            self.table_header_bits()
-        );
+        #[cfg(debug_assertions)]
+        {
+            let computed = self.table_header_bits();
+            debug_assert_eq!(
+                written_bits, computed,
+                "table_header_bits() mismatch: written={written_bits}, computed={computed}"
+            );
+        }
     }
 }
 

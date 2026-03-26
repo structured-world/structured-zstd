@@ -89,9 +89,21 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_mode.as_ref(),
         );
 
-        let ll_last = ll_mode.as_ref().clone();
-        let ml_last = ml_mode.as_ref().clone();
-        let of_last = of_mode.as_ref().clone();
+        let ll_last = into_last_used_table(
+            ll_mode,
+            &state.fse_tables.ll_default,
+            state.fse_tables.ll_previous.as_ref(),
+        );
+        let ml_last = into_last_used_table(
+            ml_mode,
+            &state.fse_tables.ml_default,
+            state.fse_tables.ml_previous.as_ref(),
+        );
+        let of_last = into_last_used_table(
+            of_mode,
+            &state.fse_tables.of_default,
+            state.fse_tables.of_previous.as_ref(),
+        );
         remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
     }
     writer.flush();
@@ -163,13 +175,19 @@ fn choose_table<'a>(
         .iter()
         .rposition(|&count| count > 0)
         .unwrap_or_default();
-    let new_table = build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true);
+    let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
+    let new_table = (distinct_symbols > 1)
+        .then(|| build_table_from_symbol_counts(&counts[..=max_symbol], max_log, true));
 
     // Estimate costs: encoding cost + table header cost
-    let new_encoding_cost =
-        estimate_encoding_cost(&counts, total, &new_table).unwrap_or(usize::MAX);
-    let new_header_cost = new_table.table_header_bits();
-    let new_total_cost = new_encoding_cost.saturating_add(new_header_cost);
+    let new_total_cost = new_table
+        .as_ref()
+        .map(|table| {
+            estimate_encoding_cost(&counts, total, table)
+                .unwrap_or(usize::MAX)
+                .saturating_add(table.table_header_bits())
+        })
+        .unwrap_or(usize::MAX);
 
     // Predefined table: zero header cost
     let predefined_cost =
@@ -185,8 +203,10 @@ fn choose_table<'a>(
         FseTableMode::RepeateLast(previous.unwrap())
     } else if predefined_cost <= new_total_cost {
         FseTableMode::Predefined(default_table)
-    } else {
+    } else if let Some(new_table) = new_table {
         FseTableMode::Encoded(new_table)
+    } else {
+        FseTableMode::Predefined(default_table)
     }
 }
 
@@ -222,6 +242,20 @@ fn remember_last_used_tables(
     fse_tables.ll_previous = Some(ll_last);
     fse_tables.ml_previous = Some(ml_last);
     fse_tables.of_previous = Some(of_last);
+}
+
+fn into_last_used_table(
+    mode: FseTableMode<'_>,
+    default_table: &FSETable,
+    previous: Option<&FSETable>,
+) -> FSETable {
+    match mode {
+        FseTableMode::Encoded(table) => table,
+        FseTableMode::Predefined(_) => default_table.clone(),
+        FseTableMode::RepeateLast(_) => previous
+            .expect("previous table must exist for Repeat mode")
+            .clone(),
+    }
 }
 
 fn encode_sequences(
@@ -621,7 +655,12 @@ mod tests {
     #[test]
     fn choose_table_handles_single_symbol_distribution() {
         let fse_tables = FseTables::new();
-        let mode = choose_table(None, &fse_tables.ll_default, core::iter::repeat_n(0u8, 32), 9);
+        let mode = choose_table(
+            None,
+            &fse_tables.ll_default,
+            core::iter::repeat_n(0u8, 32),
+            9,
+        );
         assert!(matches!(mode, FseTableMode::Predefined(_)));
     }
 }
