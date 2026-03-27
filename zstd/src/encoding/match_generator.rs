@@ -438,7 +438,7 @@ impl MatchGenerator {
             if let Some((offset, match_len)) = candidate {
                 // For each index in the match we found we do not need to look for another match
                 // But we still want them registered in the suffix store
-                self.add_suffixes_till(self.suffix_idx + match_len);
+                self.add_suffixes_till(self.suffix_idx + match_len, self.hash_fill_step);
 
                 // All literals that were not included between this match and the last are now included here
                 let last_entry = self.window.last().unwrap();
@@ -496,19 +496,24 @@ impl MatchGenerator {
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
     #[inline(always)]
-    fn add_suffixes_till(&mut self, idx: usize) {
+    fn add_suffixes_till(&mut self, idx: usize, fill_step: usize) {
+        let start = self.suffix_idx;
         let last_entry = self.window.last_mut().unwrap();
         if last_entry.data.len() < MIN_MATCH_LEN {
             return;
         }
-        let slice = &last_entry.data[self.suffix_idx..idx];
-        for (key_index, key) in slice
-            .windows(MIN_MATCH_LEN)
-            .enumerate()
-            .step_by(self.hash_fill_step)
-        {
+        let slice = &last_entry.data[start..idx];
+        for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate().step_by(fill_step) {
             if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx + key_index);
+                last_entry.suffixes.insert(key, start + key_index);
+            }
+        }
+
+        if idx >= start + MIN_MATCH_LEN {
+            let tail_start = idx - MIN_MATCH_LEN;
+            let tail_key = &last_entry.data[tail_start..tail_start + MIN_MATCH_LEN];
+            if !last_entry.suffixes.contains_key(tail_key) {
+                last_entry.suffixes.insert(tail_key, tail_start);
             }
         }
     }
@@ -591,7 +596,7 @@ impl MatchGenerator {
     /// Skip matching for the whole current window entry
     fn skip_matching(&mut self) {
         let len = self.window.last().unwrap().data.len();
-        self.add_suffixes_till(len);
+        self.add_suffixes_till(len, 1);
         self.suffix_idx = len;
         self.last_idx_in_sequence = len;
     }
@@ -1307,7 +1312,7 @@ fn simple_matcher_repcode_can_target_previous_window_entry() {
 }
 
 #[test]
-fn simple_matcher_zero_literal_repcode_checks_rep2_and_rep0_minus1() {
+fn simple_matcher_zero_literal_repcode_checks_rep2() {
     let mut matcher = MatchGenerator::new(64);
     matcher.add_data(
         b"abcdefghijabcdefghij".to_vec(),
@@ -1318,6 +1323,23 @@ fn simple_matcher_zero_literal_repcode_checks_rep2_and_rep0_minus1() {
     matcher.last_idx_in_sequence = 10;
     // rep1=4 does not match at idx 10, rep2=10 does.
     matcher.offset_hist = [99, 4, 10];
+
+    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
+    assert_eq!(candidate, Some((10, 10)));
+}
+
+#[test]
+fn simple_matcher_zero_literal_repcode_checks_rep0_minus1() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.add_data(
+        b"abcdefghijabcdefghij".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.suffix_idx = 10;
+    matcher.last_idx_in_sequence = 10;
+    // rep1=4 and rep2=99 do not match; rep0-1 == 10 does.
+    matcher.offset_hist = [11, 4, 99];
 
     let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
     assert_eq!(candidate, Some((10, 10)));
@@ -1341,6 +1363,47 @@ fn simple_matcher_repcode_rejects_offsets_beyond_searchable_prefix() {
 
     let candidate = matcher.offset_match_len(14, &matcher.window.last().unwrap().data[3..]);
     assert_eq!(candidate, None);
+}
+
+#[test]
+fn simple_matcher_skip_matching_seeds_every_position_even_with_fast_step() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"abcdefghijklmnop".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.skip_matching();
+    matcher.add_data(b"bcdef".to_vec(), SuffixStore::with_capacity(64), |_, _| {});
+
+    assert!(matcher.next_sequence(|seq| {
+        assert_eq!(
+            seq,
+            Sequence::Triple {
+                literals: b"",
+                offset: 15,
+                match_len: 5,
+            }
+        );
+    }));
+    assert!(!matcher.next_sequence(|_| {}));
+}
+
+#[test]
+fn simple_matcher_add_suffixes_till_backfills_last_searchable_anchor() {
+    let mut matcher = MatchGenerator::new(64);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"01234abcde".to_vec(),
+        SuffixStore::with_capacity(64),
+        |_, _| {},
+    );
+    matcher.add_suffixes_till(10, FAST_HASH_FILL_STEP);
+
+    let last = matcher.window.last().unwrap();
+    let tail = &last.data[5..10];
+    assert_eq!(last.suffixes.get(tail), Some(5));
 }
 
 #[test]
