@@ -15,14 +15,16 @@ if [[ "${BENCH_FLAMEGRAPH_USE_ROOT:-}" == "1" ]]; then
   EXTRA_FLAMEGRAPH_ARGS+=(--root)
 fi
 
-if ! cargo flamegraph \
+if cargo flamegraph \
   --bench compare_ffi \
   -p structured-zstd \
-  "${EXTRA_FLAMEGRAPH_ARGS[@]}" \
+  ${EXTRA_FLAMEGRAPH_ARGS[@]+"${EXTRA_FLAMEGRAPH_ARGS[@]}"} \
   --output "$OUTPUT_DIR/${BENCH_FILTER//\//_}.svg" \
   -- \
   --bench \
   "$BENCH_FILTER"; then
+  :
+else
   status=$?
   if [[ "${BENCH_FLAMEGRAPH_USE_ROOT:-}" != "1" ]]; then
     cat >&2 <<'EOF'
