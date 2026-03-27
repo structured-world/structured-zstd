@@ -153,21 +153,63 @@ fn repeated_log_lines(len: usize) -> Vec<u8> {
 }
 
 fn load_silesia_from_env() -> Vec<Scenario> {
+    const DEFAULT_MAX_FILES: usize = 12;
+    const DEFAULT_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
     let Some(dir) = env::var_os("STRUCTURED_ZSTD_SILESIA_DIR") else {
         return Vec::new();
     };
+    let max_files = env::var("STRUCTURED_ZSTD_SILESIA_MAX_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_FILES);
+    let max_file_bytes = env::var("STRUCTURED_ZSTD_SILESIA_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_FILE_BYTES);
 
     let Ok(entries) = fs::read_dir(Path::new(&dir)) else {
         eprintln!("BENCH_WARN failed to read STRUCTURED_ZSTD_SILESIA_DIR={dir:?}");
         return Vec::new();
     };
 
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    paths.sort();
+    if paths.len() > max_files {
+        eprintln!(
+            "BENCH_WARN limiting Silesia fixtures to first {} files from {} entries in {}",
+            max_files,
+            paths.len(),
+            Path::new(&dir).display()
+        );
+        paths.truncate(max_files);
+    }
+
     let mut scenarios = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            eprintln!(
+                "BENCH_WARN failed to stat Silesia fixture {}",
+                path.display()
+            );
+            continue;
+        };
+        let file_len = metadata.len() as usize;
+        if file_len > max_file_bytes {
+            eprintln!(
+                "BENCH_WARN skipping Silesia fixture {} ({} bytes > max {} bytes)",
+                path.display(),
+                file_len,
+                max_file_bytes
+            );
             continue;
         }
+
         let Ok(bytes) = fs::read(&path) else {
             eprintln!(
                 "BENCH_WARN failed to read Silesia fixture {}",
