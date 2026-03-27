@@ -175,6 +175,13 @@ fn load_silesia_from_env() -> Vec<Scenario> {
             );
             continue;
         };
+        if bytes.is_empty() {
+            eprintln!(
+                "BENCH_WARN skipping empty Silesia fixture {}",
+                path.display()
+            );
+            continue;
+        }
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };

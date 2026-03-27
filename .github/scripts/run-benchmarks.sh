@@ -11,13 +11,16 @@ set -eo pipefail
 echo "Running benchmark matrix..." >&2
 
 export STRUCTURED_ZSTD_BENCH_LARGE_BYTES="${STRUCTURED_ZSTD_BENCH_LARGE_BYTES:-16777216}"
+BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
+trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
-cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher | tee /tmp/bench-raw.txt
+cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher | tee "$BENCH_RAW_FILE"
 
 echo "Parsing results..." >&2
 
-python3 - <<'PYEOF'
+BENCH_RAW_FILE="$BENCH_RAW_FILE" python3 - <<'PYEOF'
 import json
+import os
 import re
 import sys
 
@@ -29,8 +32,9 @@ REPORT_RE = re.compile(
 benchmark_results = []
 timings = []
 ratios = []
+raw_path = os.environ["BENCH_RAW_FILE"]
 
-with open("/tmp/bench-raw.txt") as f:
+with open(raw_path) as f:
     for raw_line in f:
         line = raw_line.strip()
 

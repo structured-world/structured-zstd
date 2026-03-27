@@ -111,8 +111,14 @@ fn emit_report_line(
     ffi_compressed: &[u8],
 ) {
     let input_len = scenario.len() as f64;
-    let rust_ratio = rust_compressed.len() as f64 / input_len;
-    let ffi_ratio = ffi_compressed.len() as f64 / input_len;
+    let (rust_ratio, ffi_ratio) = if input_len > 0.0 {
+        (
+            rust_compressed.len() as f64 / input_len,
+            ffi_compressed.len() as f64 / input_len,
+        )
+    } else {
+        (0.0, 0.0)
+    };
     println!(
         "REPORT scenario={} label=\"{}\" level={} input_bytes={} rust_bytes={} ffi_bytes={} rust_ratio={:.6} ffi_ratio={:.6}",
         scenario.id,
