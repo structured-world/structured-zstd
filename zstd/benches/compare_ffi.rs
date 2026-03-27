@@ -236,8 +236,14 @@ fn emit_dictionary_report(
     with_dict_bytes: &[u8],
 ) {
     let input_len = scenario.len() as f64;
-    let no_dict_ratio = no_dict_bytes.len() as f64 / input_len;
-    let with_dict_ratio = with_dict_bytes.len() as f64 / input_len;
+    let (no_dict_ratio, with_dict_ratio) = if input_len > 0.0 {
+        (
+            no_dict_bytes.len() as f64 / input_len,
+            with_dict_bytes.len() as f64 / input_len,
+        )
+    } else {
+        (0.0, 0.0)
+    };
     println!(
         "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6}",
         scenario.id,
