@@ -156,26 +156,26 @@ lines.extend([
     "",
     "## Peak Memory Estimates",
     "",
-    "| Scenario | Level | Stage | Rust peak bytes | C peak bytes |",
-    "| --- | --- | --- | ---: | ---: |",
+    "| Scenario | Label | Level | Stage | Rust peak bytes | C peak bytes |",
+    "| --- | --- | --- | --- | ---: | ---: |",
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
     lines.append(
-        f'| {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_peak_bytes"]} | {row["ffi_peak_bytes"]} |'
+        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_peak_bytes"]} | {row["ffi_peak_bytes"]} |'
     )
 
 lines.extend([
     "",
     "## Dictionary Compression (C FFI)",
     "",
-    "| Scenario | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |",
-    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
 ])
 
 for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["level"])):
     lines.append(
-        f'| {row["label"]} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
+        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
     )
 
 lines.extend([
