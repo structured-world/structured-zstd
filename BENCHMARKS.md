@@ -15,9 +15,9 @@ The current matrix covers:
 - a large structured stream (`100 MiB`)
 - optional Silesia corpus files when `STRUCTURED_ZSTD_SILESIA_DIR=/path/to/silesia` is set
 
-The local default for the large scenario is `100 MiB`. CI can override it with
-`STRUCTURED_ZSTD_BENCH_LARGE_BYTES` to keep regression runs bounded while still exercising the
-same code path.
+The local default for the large scenario is `100 MiB`. In GitHub Actions, when
+`STRUCTURED_ZSTD_BENCH_LARGE_BYTES` is unset, `.github/scripts/run-benchmarks.sh` defaults it to
+`16 MiB` to keep CI regression runs bounded while still exercising the same code path.
 
 ## Level Mapping
 

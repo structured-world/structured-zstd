@@ -10,7 +10,9 @@ set -eo pipefail
 
 echo "Running benchmark matrix..." >&2
 
-export STRUCTURED_ZSTD_BENCH_LARGE_BYTES="${STRUCTURED_ZSTD_BENCH_LARGE_BYTES:-16777216}"
+if [ -n "${GITHUB_ACTIONS:-}" ] && [ -z "${STRUCTURED_ZSTD_BENCH_LARGE_BYTES:-}" ]; then
+  export STRUCTURED_ZSTD_BENCH_LARGE_BYTES=16777216
+fi
 BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
@@ -67,6 +69,13 @@ with open(raw_path) as f:
 
 if not benchmark_results:
     print("ERROR: No benchmark results parsed!", file=sys.stderr)
+    sys.exit(1)
+
+if not ratios:
+    print(
+        "ERROR: No REPORT ratio lines parsed; benchmark-report.md would have an empty ratio section.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 with open("benchmark-results.json", "w") as f:
