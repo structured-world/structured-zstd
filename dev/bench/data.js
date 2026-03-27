@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1774561286472,
+  "lastUpdate": 1774597633583,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -587,6 +587,55 @@ window.BENCHMARK_DATA = {
           {
             "name": "compress/c_ffi/level3",
             "value": 5.106,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5ca2e4e977ff490239ad2ef0cc1c587588923ebc",
+          "message": "perf(encoding): align fastest matcher with zstd fast path (#39)\n\n* perf(encoding): align fastest matcher with zstd fast path\n\n* style(encoding): satisfy fmt and clippy for matcher\n\n* fix(encoding): resolve matcher review feedback\n\n- fix repcode offset validation across full searchable window\n- make word-wise prefix counting endian-safe on big-endian targets\n- strengthen matches() invariants and add cross-slice repcode regression test\n\n* test(encoding): improve patch coverage for matcher fixes\n\n- split endian mismatch-byte logic with compile-time cfg helpers\n- add regression for out-of-range repcode offset rejection\n\n* fix(encoding): probe all zero-literal repcode candidates\n\n- check rep1, rep2, and rep0-1 when literals_len is zero\n- deduplicate repeat offsets before probing to avoid duplicate work\n- add regression test covering rep2 fallback when rep1 misses\n\n* fix(encoding): preserve boundary anchors with stepped hash fill\n\n- backfill the last searchable suffix anchor in add_suffixes_till\n- force full-position seeding for skip_matching blocks\n- split zero-literal repcode tests into explicit rep2 and rep0-1 cases",
+          "timestamp": "2026-03-27T09:45:19+02:00",
+          "tree_id": "98f4c2dadc34735044b6dc08d4ca8e9c7ed0f69a",
+          "url": "https://github.com/structured-world/structured-zstd/commit/5ca2e4e977ff490239ad2ef0cc1c587588923ebc"
+        },
+        "date": 1774597632761,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "decompress/pure_rust",
+            "value": 9,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/c_ffi",
+            "value": 2.915,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/pure_rust/fastest",
+            "value": 17.576,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level1",
+            "value": 2.769,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/c_ffi/level3",
+            "value": 5.114,
             "unit": "ms"
           }
         ]
