@@ -143,13 +143,13 @@ lines = [
     "",
     "## Compression Ratios",
     "",
-    "| Scenario | Level | Input bytes | Rust bytes | C bytes | Rust ratio | C ratio |",
-    "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    "| Scenario | Label | Level | Input bytes | Rust bytes | C bytes | Rust ratio | C ratio |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
 ]
 
 for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
     lines.append(
-        f'| {row["label"]} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
+        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
     )
 
 lines.extend([

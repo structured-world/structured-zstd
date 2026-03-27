@@ -75,18 +75,22 @@ fn bench_decompress(c: &mut Criterion) {
 
             group.bench_function("pure_rust", |b| {
                 let mut target = vec![0u8; expected_len];
+                let mut decoder = FrameDecoder::new();
                 b.iter(|| {
-                    let mut decoder = FrameDecoder::new();
                     let written = decoder.decode_all(&ffi_compressed, &mut target).unwrap();
                     assert_eq!(written, expected_len);
                 })
             });
 
             group.bench_function("c_ffi", |b| {
+                let mut decoder = zstd::bulk::Decompressor::new().unwrap();
+                let mut output = Vec::with_capacity(expected_len);
                 b.iter(|| {
-                    // Intentional: zstd::decode_all represents the common high-level FFI path and
-                    // includes allocation cost, while pure_rust isolates decode throughput.
-                    let output = zstd::decode_all(&ffi_compressed[..]).unwrap();
+                    output.clear();
+                    let written = decoder
+                        .decompress_to_buffer(&ffi_compressed[..], &mut output)
+                        .unwrap();
+                    assert_eq!(written, expected_len);
                     assert_eq!(output.len(), expected_len);
                 })
             });
