@@ -71,6 +71,8 @@ fn bench_decompress(c: &mut Criterion) {
 
             group.bench_function("c_ffi", |b| {
                 b.iter(|| {
+                    // Intentional: zstd::decode_all represents the common high-level FFI path and
+                    // includes allocation cost, while pure_rust isolates decode throughput.
                     let output = zstd::decode_all(&ffi_compressed[..]).unwrap();
                     assert_eq!(output.len(), expected_len);
                 })
