@@ -31,7 +31,7 @@ REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="([^"]+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="([^"]+)" level=(\S+) stage=(\S+) rust_peak_bytes=(\d+) ffi_peak_bytes=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="([^"]+)" level=(\S+) stage=(\S+) rust_buffer_bytes_estimate=(\d+) ffi_buffer_bytes_estimate=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="([^"]+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
@@ -78,14 +78,21 @@ with open(raw_path) as f:
 
         mem_match = MEM_RE.match(line)
         if mem_match:
-            scenario, label, level, stage, rust_peak_bytes, ffi_peak_bytes = mem_match.groups()
+            (
+                scenario,
+                label,
+                level,
+                stage,
+                rust_buffer_bytes_estimate,
+                ffi_buffer_bytes_estimate,
+            ) = mem_match.groups()
             memory_rows.append({
                 "scenario": scenario,
                 "label": label,
                 "level": level,
                 "stage": stage,
-                "rust_peak_bytes": int(rust_peak_bytes),
-                "ffi_peak_bytes": int(ffi_peak_bytes),
+                "rust_buffer_bytes_estimate": int(rust_buffer_bytes_estimate),
+                "ffi_buffer_bytes_estimate": int(ffi_buffer_bytes_estimate),
             })
             continue
 
@@ -154,15 +161,15 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
 
 lines.extend([
     "",
-    "## Peak Memory Estimates",
+    "## Buffer Size Estimates (Input + Output)",
     "",
-    "| Scenario | Label | Level | Stage | Rust peak bytes | C peak bytes |",
+    "| Scenario | Label | Level | Stage | Rust buffer bytes (estimate) | C buffer bytes (estimate) |",
     "| --- | --- | --- | --- | ---: | ---: |",
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
     lines.append(
-        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_peak_bytes"]} | {row["ffi_peak_bytes"]} |'
+        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_buffer_bytes_estimate"]} | {row["ffi_buffer_bytes_estimate"]} |'
     )
 
 lines.extend([

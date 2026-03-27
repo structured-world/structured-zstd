@@ -14,6 +14,8 @@ The current matrix covers:
 - low entropy repeated payloads (`1 MiB`)
 - a large structured stream (`100 MiB`)
 - optional Silesia corpus files when `STRUCTURED_ZSTD_SILESIA_DIR=/path/to/silesia` is set
+  - load is bounded by `STRUCTURED_ZSTD_SILESIA_MAX_FILES` (default `12`) and
+    `STRUCTURED_ZSTD_SILESIA_MAX_FILE_BYTES` (default `67108864`)
 
 The local default for the large scenario is `100 MiB`. In GitHub Actions, when
 `STRUCTURED_ZSTD_BENCH_LARGE_BYTES` is unset, `.github/scripts/run-benchmarks.sh` defaults it to
@@ -66,7 +68,7 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/matrix/
 - `benchmark-results.json` for GitHub regression tracking
 - `benchmark-report.md` with:
   - compression ratio tables (`REPORT`)
-  - peak memory estimate tables (`REPORT_MEM`)
+  - input+output buffer size estimate tables (`REPORT_MEM`)
   - dictionary compression tables (`REPORT_DICT`)
   - timing rows for all benchmark functions
 

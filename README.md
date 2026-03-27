@@ -55,7 +55,7 @@ When the `dict_builder` feature is enabled, the `dictionary` module can create r
 
 ## Benchmarking
 
-Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares `structured-zstd` against the C reference across small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora. Reports now include compression ratios, peak memory estimates, and C FFI dictionary compression (with/without dictionary) for small and corpus scenarios.
+Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares `structured-zstd` against the C reference across small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora. Reports now include compression ratios, input+output buffer size estimates, and C FFI dictionary compression (with/without dictionary) for small and corpus scenarios.
 
 ## Usage
 

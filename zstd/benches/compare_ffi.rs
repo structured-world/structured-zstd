@@ -190,12 +190,17 @@ fn emit_memory_report(
     scenario: &Scenario,
     level: LevelConfig,
     stage: &'static str,
-    rust_peak_bytes: usize,
-    ffi_peak_bytes: usize,
+    rust_buffer_bytes_estimate: usize,
+    ffi_buffer_bytes_estimate: usize,
 ) {
     println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_bytes={} ffi_peak_bytes={}",
-        scenario.id, scenario.label, level.name, stage, rust_peak_bytes, ffi_peak_bytes
+        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_buffer_bytes_estimate={} ffi_buffer_bytes_estimate={}",
+        scenario.id,
+        scenario.label,
+        level.name,
+        stage,
+        rust_buffer_bytes_estimate,
+        ffi_buffer_bytes_estimate
     );
 }
 
