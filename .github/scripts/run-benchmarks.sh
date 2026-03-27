@@ -30,10 +30,18 @@ BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
 REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="([^"]+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
+MEM_RE = re.compile(
+    r'^REPORT_MEM scenario=(\S+) label="([^"]+)" level=(\S+) stage=(\S+) rust_peak_bytes=(\d+) ffi_peak_bytes=(\d+)$'
+)
+DICT_RE = re.compile(
+    r'^REPORT_DICT scenario=(\S+) label="([^"]+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
+)
 
 benchmark_results = []
 timings = []
 ratios = []
+memory_rows = []
+dictionary_rows = []
 raw_path = os.environ["BENCH_RAW_FILE"]
 
 with open(raw_path) as f:
@@ -66,6 +74,45 @@ with open(raw_path) as f:
                 "rust_ratio": float(rust_ratio),
                 "ffi_ratio": float(ffi_ratio),
             })
+            continue
+
+        mem_match = MEM_RE.match(line)
+        if mem_match:
+            scenario, label, level, stage, rust_peak_bytes, ffi_peak_bytes = mem_match.groups()
+            memory_rows.append({
+                "scenario": scenario,
+                "label": label,
+                "level": level,
+                "stage": stage,
+                "rust_peak_bytes": int(rust_peak_bytes),
+                "ffi_peak_bytes": int(ffi_peak_bytes),
+            })
+            continue
+
+        dict_match = DICT_RE.match(line)
+        if dict_match:
+            (
+                scenario,
+                label,
+                level,
+                dict_bytes,
+                train_ms,
+                ffi_no_dict_bytes,
+                ffi_with_dict_bytes,
+                ffi_no_dict_ratio,
+                ffi_with_dict_ratio,
+            ) = dict_match.groups()
+            dictionary_rows.append({
+                "scenario": scenario,
+                "label": label,
+                "level": level,
+                "dict_bytes": int(dict_bytes),
+                "train_ms": float(train_ms),
+                "ffi_no_dict_bytes": int(ffi_no_dict_bytes),
+                "ffi_with_dict_bytes": int(ffi_with_dict_bytes),
+                "ffi_no_dict_ratio": float(ffi_no_dict_ratio),
+                "ffi_with_dict_ratio": float(ffi_with_dict_ratio),
+            })
 
 if not benchmark_results:
     print("ERROR: No benchmark results parsed!", file=sys.stderr)
@@ -76,6 +123,14 @@ if not ratios:
         "ERROR: No REPORT ratio lines parsed; benchmark-report.md would have an empty ratio section.",
         file=sys.stderr,
     )
+    sys.exit(1)
+
+if not memory_rows:
+    print("ERROR: No REPORT_MEM lines parsed; memory section would be empty.", file=sys.stderr)
+    sys.exit(1)
+
+if not dictionary_rows:
+    print("ERROR: No REPORT_DICT lines parsed; dictionary section would be empty.", file=sys.stderr)
     sys.exit(1)
 
 with open("benchmark-results.json", "w") as f:
@@ -99,6 +154,32 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
 
 lines.extend([
     "",
+    "## Peak Memory Estimates",
+    "",
+    "| Scenario | Level | Stage | Rust peak bytes | C peak bytes |",
+    "| --- | --- | --- | ---: | ---: |",
+])
+
+for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
+    lines.append(
+        f'| {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_peak_bytes"]} | {row["ffi_peak_bytes"]} |'
+    )
+
+lines.extend([
+    "",
+    "## Dictionary Compression (C FFI)",
+    "",
+    "| Scenario | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+])
+
+for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["level"])):
+    lines.append(
+        f'| {row["label"]} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
+    )
+
+lines.extend([
+    "",
     "## Timing Metrics",
     "",
     "| Benchmark | ms/iter |",
@@ -113,4 +194,6 @@ with open("benchmark-report.md", "w") as f:
 
 print(f"Wrote {len(benchmark_results)} timing results to benchmark-results.json", file=sys.stderr)
 print(f"Wrote {len(ratios)} ratio rows to benchmark-report.md", file=sys.stderr)
+print(f"Wrote {len(memory_rows)} memory rows to benchmark-report.md", file=sys.stderr)
+print(f"Wrote {len(dictionary_rows)} dictionary rows to benchmark-report.md", file=sys.stderr)
 PYEOF

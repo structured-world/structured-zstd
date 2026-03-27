@@ -27,9 +27,11 @@ encoder:
 - `structured-zstd::Fastest` vs `zstd` level `1`
 - `structured-zstd::Default` vs `zstd` level `3`
 
-`Better` and `Best` are intentionally excluded until the encoder implements them. Dictionary
-compression is also excluded from the timing matrix because the crate currently exposes dictionary
-training, but not dictionary-based compression.
+`Better` and `Best` are intentionally excluded until the encoder implements them.
+
+Dictionary benchmarks are tracked separately with C FFI `with_dict` vs `without_dict` runs, using a
+dictionary trained from scenario samples. Pure Rust dictionary compression is still pending and is
+therefore not part of the pure-Rust-vs-C timing matrix yet.
 
 ## Commands
 
@@ -62,6 +64,10 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/matrix/
 `run-benchmarks.sh` writes:
 
 - `benchmark-results.json` for GitHub regression tracking
-- `benchmark-report.md` with scenario-by-scenario compression ratios and timing rows
+- `benchmark-report.md` with:
+  - compression ratio tables (`REPORT`)
+  - peak memory estimate tables (`REPORT_MEM`)
+  - dictionary compression tables (`REPORT_DICT`)
+  - timing rows for all benchmark functions
 
 Criterion also writes its usual detailed estimates under `target/criterion/`.
