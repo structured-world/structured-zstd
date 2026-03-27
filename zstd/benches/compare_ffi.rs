@@ -63,7 +63,6 @@ fn bench_decompress(c: &mut Criterion) {
                 let mut target = vec![0u8; expected_len];
                 b.iter(|| {
                     let mut decoder = FrameDecoder::new();
-                    target.fill(0);
                     let written = decoder.decode_all(&ffi_compressed, &mut target).unwrap();
                     assert_eq!(written, expected_len);
                 })
