@@ -17,6 +17,13 @@ The current matrix covers:
   - load is bounded by `STRUCTURED_ZSTD_SILESIA_MAX_FILES` (default `12`) and
     `STRUCTURED_ZSTD_SILESIA_MAX_FILE_BYTES` (default `67108864`)
 
+For decompression, each scenario/level pair is benchmarked against two frame sources:
+
+- `rust_stream`: frame produced by `structured-zstd`
+- `c_stream`: frame produced by C `zstd`
+
+This keeps Rust-vs-C decoder comparisons symmetric and catches format/interop drift sooner.
+
 The local default for the large scenario is `100 MiB`. In GitHub Actions, when
 `STRUCTURED_ZSTD_BENCH_LARGE_BYTES` is unset, `.github/scripts/run-benchmarks.sh` defaults it to
 `16 MiB` to keep CI regression runs bounded while still exercising the same code path.
@@ -34,6 +41,14 @@ encoder:
 Dictionary benchmarks are tracked separately with C FFI `with_dict` vs `without_dict` runs, using a
 dictionary trained from scenario samples. Pure Rust dictionary compression is still pending and is
 therefore not part of the pure-Rust-vs-C timing matrix yet.
+
+## Issue #24 Acceptance Mapping
+
+- [x] Criterion benchmarks for compress/decompress at all currently implemented levels
+- [x] Comparison against C zstd at same levels
+- [x] Flamegraph generation script (`scripts/bench-flamegraph.sh`)
+- [x] Small data (`1-10 KiB`) scenarios for CoordiNode-like payloads
+- [x] Results documented in `benchmark-report.md`
 
 ## Commands
 
