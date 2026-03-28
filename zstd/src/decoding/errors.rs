@@ -427,6 +427,7 @@ pub enum DictionaryDecodeError {
     BadMagicNum { got: [u8; 4] },
     DictionaryTooSmall { got: usize, need: usize },
     ZeroDictionaryId,
+    ZeroRepeatOffsetInDictionary { index: u8 },
     FSETableError(FSETableError),
     HuffmanTableError(HuffmanTableError),
 }
@@ -461,6 +462,9 @@ impl core::fmt::Display for DictionaryDecodeError {
             }
             DictionaryDecodeError::ZeroDictionaryId => {
                 write!(f, "Dictionary id must be non-zero")
+            }
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index } => {
+                write!(f, "Dictionary repeat offset rep{index} must be non-zero")
             }
             DictionaryDecodeError::FSETableError(e) => write!(f, "{e:?}"),
             DictionaryDecodeError::HuffmanTableError(e) => write!(f, "{e:?}"),

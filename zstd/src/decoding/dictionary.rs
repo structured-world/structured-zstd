@@ -133,6 +133,16 @@ impl Dictionary {
         let offset3 = raw_tables[8..12].try_into().expect("optimized away");
         let offset3 = u32::from_le_bytes(offset3);
 
+        if offset1 == 0 {
+            return Err(DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 0 });
+        }
+        if offset2 == 0 {
+            return Err(DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 1 });
+        }
+        if offset3 == 0 {
+            return Err(DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 2 });
+        }
+
         new_dict.offset_hist[0] = offset1;
         new_dict.offset_hist[1] = offset2;
         new_dict.offset_hist[2] = offset3;
@@ -147,6 +157,47 @@ impl Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offset_history_start(raw: &[u8]) -> usize {
+        let mut huf = crate::decoding::scratch::HuffmanScratch::new();
+        let mut fse = crate::decoding::scratch::FSEScratch::new();
+        let mut cursor = 8usize;
+
+        let huf_size = huf
+            .table
+            .build_decoder(&raw[cursor..])
+            .expect("reference dictionary huffman table should decode");
+        cursor += huf_size as usize;
+
+        let of_size = fse
+            .offsets
+            .build_decoder(
+                &raw[cursor..],
+                crate::decoding::sequence_section_decoder::OF_MAX_LOG,
+            )
+            .expect("reference dictionary OF table should decode");
+        cursor += of_size;
+
+        let ml_size = fse
+            .match_lengths
+            .build_decoder(
+                &raw[cursor..],
+                crate::decoding::sequence_section_decoder::ML_MAX_LOG,
+            )
+            .expect("reference dictionary ML table should decode");
+        cursor += ml_size;
+
+        let ll_size = fse
+            .literal_lengths
+            .build_decoder(
+                &raw[cursor..],
+                crate::decoding::sequence_section_decoder::LL_MAX_LOG,
+            )
+            .expect("reference dictionary LL table should decode");
+        cursor += ll_size;
+
+        cursor
+    }
 
     #[test]
     fn decode_dict_rejects_short_buffer_before_magic_and_id() {
@@ -175,6 +226,20 @@ mod tests {
         assert!(
             result.unwrap().is_err(),
             "malformed dictionary must return error"
+        );
+    }
+
+    #[test]
+    fn decode_dict_rejects_zero_repeat_offsets() {
+        let mut raw = include_bytes!("../../dict_tests/dictionary").to_vec();
+        let offset_start = offset_history_start(&raw);
+
+        // Corrupt rep0 to zero.
+        raw[offset_start..offset_start + 4].copy_from_slice(&0u32.to_le_bytes());
+        let decoded = Dictionary::decode_dict(&raw);
+        assert!(
+            decoded.is_err(),
+            "dictionary with zero repeat offset must be rejected"
         );
     }
 }

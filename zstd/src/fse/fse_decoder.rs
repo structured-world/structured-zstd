@@ -112,6 +112,18 @@ impl FSETable {
         self.accuracy_log = 0;
     }
 
+    /// Build the equivalent encoder-side table from a parsed decoder table.
+    pub(crate) fn to_encoder_table(&self) -> Option<crate::fse::fse_encoder::FSETable> {
+        if self.accuracy_log == 0 || self.symbol_probabilities.is_empty() {
+            return None;
+        }
+
+        Some(crate::fse::fse_encoder::build_table_from_probabilities(
+            &self.symbol_probabilities,
+            self.accuracy_log,
+        ))
+    }
+
     /// returns how many BYTEs (not bits) were read while building the decoder
     pub fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
         self.accuracy_log = 0;

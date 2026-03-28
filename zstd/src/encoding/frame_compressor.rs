@@ -168,6 +168,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state
                 .matcher
                 .prime_with_dictionary(dict.dict_content.as_slice(), dict.offset_hist);
+            if let Some(huff_table) = dict.huf.table.to_encoder_table() {
+                self.state.last_huff_table = Some(huff_table);
+            }
+            if let Some(ll_previous) = dict.fse.literal_lengths.to_encoder_table() {
+                self.state.fse_tables.ll_previous =
+                    Some(PreviousFseTable::Custom(Box::new(ll_previous)));
+            }
+            if let Some(ml_previous) = dict.fse.match_lengths.to_encoder_table() {
+                self.state.fse_tables.ml_previous =
+                    Some(PreviousFseTable::Custom(Box::new(ml_previous)));
+            }
+            if let Some(of_previous) = dict.fse.offsets.to_encoder_table() {
+                self.state.fse_tables.of_previous =
+                    Some(PreviousFseTable::Custom(Box::new(of_previous)));
+            }
         }
         #[cfg(feature = "hash")]
         {
@@ -585,6 +600,40 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn set_dictionary_from_bytes_seeds_entropy_tables_for_first_block() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let mut output = Vec::new();
+        let input = b"short-payload-without-obvious-repetitions";
+
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let previous = compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        assert!(previous.is_none());
+
+        compressor.set_source(input.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        assert!(
+            compressor.state.last_huff_table.is_some(),
+            "dictionary entropy should seed previous huffman table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.ll_previous.is_some(),
+            "dictionary entropy should seed previous ll table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.ml_previous.is_some(),
+            "dictionary entropy should seed previous ml table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.of_previous.is_some(),
+            "dictionary entropy should seed previous of table before first block"
+        );
     }
 
     #[test]
