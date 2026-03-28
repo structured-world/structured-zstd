@@ -551,7 +551,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(
-                err,
+                &err,
                 crate::decoding::errors::FrameDecoderError::DictNotProvided { .. }
             ),
             "dict-compressed stream should require dictionary id, got: {err:?}"
