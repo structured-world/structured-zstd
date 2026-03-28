@@ -9,7 +9,7 @@ fn prefetch_slice_impl(slice: &[u8]) {
     use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
     if !slice.is_empty() {
-        _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0);
+        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
     }
 }
 
@@ -19,7 +19,7 @@ fn prefetch_slice_impl(slice: &[u8]) {
     use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
 
     if !slice.is_empty() {
-        _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0);
+        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
     }
 }
 
