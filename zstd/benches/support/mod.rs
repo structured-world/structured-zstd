@@ -179,20 +179,26 @@ fn load_silesia_from_env() -> Vec<Scenario> {
         return Vec::new();
     };
 
-    let mut paths: Vec<_> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
+    let mut paths = Vec::with_capacity(max_files);
+    let mut hit_limit = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if paths.len() >= max_files {
+            hit_limit = true;
+            break;
+        }
+        paths.push(path);
+    }
     paths.sort();
-    if paths.len() > max_files {
+    if hit_limit {
         eprintln!(
-            "BENCH_WARN limiting Silesia fixtures to first {} files from {} entries in {}",
+            "BENCH_WARN limiting Silesia fixtures to first {} discovered files in {}",
             max_files,
-            paths.len(),
             Path::new(&dir).display()
         );
-        paths.truncate(max_files);
     }
 
     let mut scenarios = Vec::new();
