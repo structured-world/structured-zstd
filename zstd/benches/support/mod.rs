@@ -45,12 +45,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
             repeated_log_lines(4 * 1024),
             ScenarioClass::Small,
         ),
-        Scenario::new(
-            "decodecorpus-z000033",
-            "Repo decode corpus sample",
-            load_decode_corpus_sample(),
-            ScenarioClass::Corpus,
-        ),
+        load_decode_corpus_scenario(),
         Scenario::new(
             "high-entropy-1m",
             "High entropy random payload (1 MiB)",
@@ -179,26 +174,22 @@ fn load_silesia_from_env() -> Vec<Scenario> {
         return Vec::new();
     };
 
-    let mut paths = Vec::with_capacity(max_files);
-    let mut hit_limit = false;
+    let mut paths = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        if paths.len() >= max_files {
-            hit_limit = true;
-            break;
-        }
         paths.push(path);
     }
     paths.sort();
-    if hit_limit {
+    if paths.len() > max_files {
         eprintln!(
-            "BENCH_WARN limiting Silesia fixtures to first {} discovered files in {}",
+            "BENCH_WARN limiting Silesia fixtures to first {} sorted files in {}",
             max_files,
             Path::new(&dir).display()
         );
+        paths.truncate(max_files);
     }
 
     let mut scenarios = Vec::new();
@@ -259,7 +250,12 @@ fn large_stream_len() -> usize {
         .unwrap_or(100 * 1024 * 1024)
 }
 
-fn load_decode_corpus_sample() -> Vec<u8> {
+fn load_decode_corpus_scenario() -> Scenario {
+    const REAL_ID: &str = "decodecorpus-z000033";
+    const REAL_LABEL: &str = "Repo decode corpus sample";
+    const FALLBACK_ID: &str = "decodecorpus-synthetic-1m";
+    const FALLBACK_LABEL: &str = "Synthetic decode corpus fallback (1 MiB)";
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok();
     let fixture_path = manifest_dir
         .as_deref()
@@ -268,7 +264,9 @@ fn load_decode_corpus_sample() -> Vec<u8> {
 
     if let Some(path) = fixture_path {
         match fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => return bytes,
+            Ok(bytes) if !bytes.is_empty() => {
+                return Scenario::new(REAL_ID, REAL_LABEL, bytes, ScenarioClass::Corpus);
+            }
             Ok(_) => {
                 eprintln!(
                     "BENCH_WARN decode corpus fixture is empty at {}, using synthetic fallback",
@@ -290,7 +288,12 @@ fn load_decode_corpus_sample() -> Vec<u8> {
     }
 
     // Keep the benchmark matrix runnable from packaged sources where fixture files may be omitted.
-    repeated_log_lines(1024 * 1024)
+    Scenario::new(
+        FALLBACK_ID,
+        FALLBACK_LABEL,
+        repeated_log_lines(1024 * 1024),
+        ScenarioClass::Corpus,
+    )
 }
 
 fn sanitize_scenario_stem(stem: &str) -> String {
