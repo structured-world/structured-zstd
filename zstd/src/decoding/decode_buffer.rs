@@ -163,15 +163,25 @@ impl DecodeBuffer {
             *slot = self.byte_at(start_idx + i);
         }
 
-        let mut scratch = [0u8; 64];
-        let mut copied = 0;
-        while copied < match_length {
-            let chunk = usize::min(64, match_length - copied);
-            for (j, slot) in scratch.iter_mut().take(chunk).enumerate() {
-                *slot = base[(copied + j) % offset];
+        let mut phase_patterns = [[0u8; 8]; 7];
+        for phase in 0..offset {
+            for i in 0..8 {
+                phase_patterns[phase][i] = base[(phase + i) % offset];
             }
-            self.buffer.extend(&scratch[..chunk]);
-            copied += chunk;
+        }
+
+        let phase_step = 8 % offset;
+        let mut phase = 0usize;
+        let mut copied = 0usize;
+        while copied + 8 <= match_length {
+            self.buffer.extend(&phase_patterns[phase]);
+            copied += 8;
+            phase = (phase + phase_step) % offset;
+        }
+
+        if copied < match_length {
+            let tail = match_length - copied;
+            self.buffer.extend(&phase_patterns[phase][..tail]);
         }
     }
 
@@ -546,6 +556,17 @@ mod tests {
             let expected = expected_match_expansion(seed, offset, match_len);
             assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
         }
+    }
+
+    #[test]
+    fn repeat_zero_offset_returns_error() {
+        let mut decode_buf = DecodeBuffer::new(1024);
+        decode_buf.push(b"abcdef");
+        let err = decode_buf.repeat(0, 5).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::decoding::errors::DecodeBufferError::ZeroOffset
+        ));
     }
 
     #[test]
