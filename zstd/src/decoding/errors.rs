@@ -425,6 +425,7 @@ impl core::fmt::Display for DecodeBufferError {
 #[non_exhaustive]
 pub enum DictionaryDecodeError {
     BadMagicNum { got: [u8; 4] },
+    ZeroDictionaryId,
     FSETableError(FSETableError),
     HuffmanTableError(HuffmanTableError),
 }
@@ -450,6 +451,9 @@ impl core::fmt::Display for DictionaryDecodeError {
                     got,
                     crate::decoding::dictionary::MAGIC_NUM,
                 )
+            }
+            DictionaryDecodeError::ZeroDictionaryId => {
+                write!(f, "Dictionary id must be non-zero")
             }
             DictionaryDecodeError::FSETableError(e) => write!(f, "{e:?}"),
             DictionaryDecodeError::HuffmanTableError(e) => write!(f, "{e:?}"),

@@ -40,6 +40,27 @@ pub struct Dictionary {
 pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 impl Dictionary {
+    /// Build a dictionary from raw content bytes (without entropy table sections).
+    ///
+    /// This is primarily intended for dictionaries produced by the `dict_builder`
+    /// module, which currently emits raw-content dictionaries.
+    pub fn from_raw_content(
+        id: u32,
+        dict_content: Vec<u8>,
+    ) -> Result<Dictionary, DictionaryDecodeError> {
+        if id == 0 {
+            return Err(DictionaryDecodeError::ZeroDictionaryId);
+        }
+
+        Ok(Dictionary {
+            id,
+            fse: FSEScratch::new(),
+            huf: HuffmanScratch::new(),
+            dict_content,
+            offset_hist: [1, 4, 8],
+        })
+    }
+
     /// Parses the dictionary from `raw` and set the tables
     /// it returns the dict_id for checking with the frame's `dict_id``
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
@@ -58,6 +79,9 @@ impl Dictionary {
 
         let dict_id = raw[4..8].try_into().expect("optimized away");
         let dict_id = u32::from_le_bytes(dict_id);
+        if dict_id == 0 {
+            return Err(DictionaryDecodeError::ZeroDictionaryId);
+        }
         new_dict.id = dict_id;
 
         let raw_tables = &raw[8..];

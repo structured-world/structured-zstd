@@ -167,6 +167,28 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
+        if dict_content.is_empty() {
+            return;
+        }
+
+        let mut start = 0usize;
+        while start < dict_content.len() {
+            let end = (start + self.slice_size).min(dict_content.len());
+            let mut space = self.get_next_space();
+            space.clear();
+            space.extend_from_slice(&dict_content[start..end]);
+            self.commit_space(space);
+            self.skip_matching();
+            start = end;
+        }
+
+        match self.active_backend {
+            MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
+            MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
+        }
+    }
+
     fn window_size(&self) -> u64 {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.max_window_size as u64,
