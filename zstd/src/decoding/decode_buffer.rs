@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 
+use super::prefetch;
 use super::ringbuffer::RingBuffer;
 use crate::decoding::errors::DecodeBufferError;
 
@@ -65,6 +66,10 @@ impl DecodeBuffer {
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        if offset == 0 {
+            return Err(DecodeBufferError::ZeroOffset);
+        }
+
         if match_length == 0 {
             return Ok(());
         }
@@ -149,6 +154,10 @@ impl DecodeBuffer {
 
     #[inline(always)]
     fn repeat_short_offset(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+        debug_assert!(
+            offset > 0,
+            "offset must be non-zero to avoid modulo by zero in short-offset path"
+        );
         let mut base = [0u8; 8];
         for (i, slot) in base.iter_mut().take(offset).enumerate() {
             *slot = self.byte_at(start_idx + i);
@@ -178,7 +187,15 @@ impl DecodeBuffer {
 
     #[inline(always)]
     fn prefetch_match_source(&self, start_idx: usize) {
-        prefetch_ring_slice(&self.buffer, start_idx);
+        let (s1, s2) = self.buffer.as_slices();
+        if start_idx < s1.len() {
+            prefetch::prefetch_slice(&s1[start_idx..]);
+        } else {
+            let idx = start_idx - s1.len();
+            if idx < s2.len() {
+                prefetch::prefetch_slice(&s2[idx..]);
+            }
+        }
     }
 
     #[cold]
@@ -200,7 +217,7 @@ impl DecodeBuffer {
 
             if bytes_from_dict < match_length {
                 let dict_slice = &self.dict_content[self.dict_content.len() - bytes_from_dict..];
-                prefetch_slice(dict_slice);
+                prefetch::prefetch_slice(dict_slice);
                 self.buffer.extend(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
@@ -209,7 +226,7 @@ impl DecodeBuffer {
                 let low = self.dict_content.len() - bytes_from_dict;
                 let high = low + match_length;
                 let dict_slice = &self.dict_content[low..high];
-                prefetch_slice(dict_slice);
+                prefetch::prefetch_slice(dict_slice);
                 self.buffer.extend(dict_slice);
             }
             Ok(())
@@ -371,56 +388,9 @@ fn write_all_bytes(mut sink: impl Write, buf: &[u8]) -> (usize, Result<(), Error
 }
 
 #[inline(always)]
-fn prefetch_slice(slice: &[u8]) {
-    prefetch_slice_impl(slice);
-}
-
-#[inline(always)]
 fn use_branchless_wildcopy() -> bool {
     cfg!(any(target_arch = "x86", target_arch = "x86_64"))
 }
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[inline(always)]
-fn prefetch_ring_slice(buffer: &RingBuffer, start_idx: usize) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-
-    let (s1, s2) = buffer.as_slices();
-    if start_idx < s1.len() {
-        let ptr = unsafe { s1.as_ptr().add(start_idx) };
-        unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
-    } else {
-        let idx = start_idx - s1.len();
-        if idx < s2.len() {
-            let ptr = unsafe { s2.as_ptr().add(idx) };
-            unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
-        }
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline(always)]
-fn prefetch_ring_slice(_buffer: &RingBuffer, _start_idx: usize) {}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[inline(always)]
-fn prefetch_slice_impl(slice: &[u8]) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-
-    if !slice.is_empty() {
-        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline(always)]
-fn prefetch_slice_impl(_slice: &[u8]) {}
 
 #[cfg(test)]
 mod tests {
@@ -578,6 +548,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() {
+        let window = 32usize;
+        let seed = b"0123456789abcdef0123456789abcdef";
+        let mut decode_buf = DecodeBuffer::new(window);
+        let mut model = Vec::new();
+
+        decode_buf.push(seed);
+        model_push(&mut model, seed);
+        decode_buf.repeat(16, 16).unwrap();
+        model_repeat(&mut model, 16, 16);
+
+        let drained = decode_buf.drain_to_window_size().unwrap();
+        let model_drained = model_drain_to_window(&mut model, window);
+        assert_eq!(drained, model_drained);
+
+        let cases = [(3usize, 97usize), (16usize, 64usize), (7usize, 73usize)];
+        for (offset, match_len) in cases {
+            decode_buf.repeat(offset, match_len).unwrap();
+            model_repeat(&mut model, offset, match_len);
+
+            if let Some(got) = decode_buf.drain_to_window_size() {
+                let expected = model_drain_to_window(&mut model, window);
+                assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
+            }
+        }
+
+        assert_eq!(decode_buf.drain(), model);
+    }
+
     fn expected_match_expansion(seed: &[u8], offset: usize, match_len: usize) -> Vec<u8> {
         let mut out = seed.to_vec();
         let start = out.len() - offset;
@@ -586,5 +586,25 @@ mod tests {
             out.push(byte);
         }
         out
+    }
+
+    fn model_push(model: &mut Vec<u8>, bytes: &[u8]) {
+        model.extend_from_slice(bytes);
+    }
+
+    fn model_repeat(model: &mut Vec<u8>, offset: usize, match_len: usize) {
+        let start = model.len() - offset;
+        for i in 0..match_len {
+            let byte = model[start + i];
+            model.push(byte);
+        }
+    }
+
+    fn model_drain_to_window(model: &mut Vec<u8>, window: usize) -> Vec<u8> {
+        if model.len() <= window {
+            return Vec::new();
+        }
+        let drain_len = model.len() - window;
+        model.drain(0..drain_len).collect()
     }
 }

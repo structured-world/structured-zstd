@@ -1,3 +1,4 @@
+use super::prefetch;
 use super::scratch::DecoderScratch;
 use crate::decoding::errors::ExecuteSequencesError;
 
@@ -117,22 +118,5 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
 
 #[inline(always)]
 fn prefetch_literals(slice: &[u8]) {
-    prefetch_literals_impl(slice);
+    prefetch::prefetch_slice(slice);
 }
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[inline(always)]
-fn prefetch_literals_impl(slice: &[u8]) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-
-    if !slice.is_empty() {
-        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline(always)]
-fn prefetch_literals_impl(_slice: &[u8]) {}
