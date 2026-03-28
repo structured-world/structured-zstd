@@ -23,20 +23,32 @@ fn benchmark_scenarios_cached() -> &'static [Scenario] {
     BENCHMARK_SCENARIOS.get_or_init(benchmark_scenarios)
 }
 
+fn emit_reports_enabled() -> bool {
+    std::env::var("STRUCTURED_ZSTD_EMIT_REPORT")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+}
+
 fn bench_compress(c: &mut Criterion) {
+    let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels() {
-            let rust_compressed =
-                structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
-            let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
-            emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
-            emit_memory_report(
-                scenario,
-                level,
-                "compress",
-                scenario.len() + rust_compressed.len(),
-                scenario.len() + ffi_compressed.len(),
-            );
+            if emit_reports {
+                let rust_compressed = structured_zstd::encoding::compress_to_vec(
+                    &scenario.bytes[..],
+                    level.rust_level,
+                );
+                let ffi_compressed =
+                    zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
+                emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
+                emit_memory_report(
+                    scenario,
+                    level,
+                    "compress",
+                    scenario.len() + rust_compressed.len(),
+                    scenario.len() + ffi_compressed.len(),
+                );
+            }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
@@ -64,17 +76,20 @@ fn bench_compress(c: &mut Criterion) {
 }
 
 fn bench_decompress(c: &mut Criterion) {
+    let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels() {
             let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
             let expected_len = scenario.len();
-            emit_memory_report(
-                scenario,
-                level,
-                "decompress",
-                ffi_compressed.len() + expected_len,
-                ffi_compressed.len() + expected_len,
-            );
+            if emit_reports {
+                emit_memory_report(
+                    scenario,
+                    level,
+                    "decompress",
+                    ffi_compressed.len() + expected_len,
+                    ffi_compressed.len() + expected_len,
+                );
+            }
             let benchmark_name = format!("decompress/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
             configure_group(&mut group, scenario);
@@ -108,6 +123,7 @@ fn bench_decompress(c: &mut Criterion) {
 }
 
 fn bench_dictionary(c: &mut Criterion) {
+    let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         if !matches!(scenario.class, ScenarioClass::Small | ScenarioClass::Corpus) {
             continue;
@@ -138,14 +154,16 @@ fn bench_dictionary(c: &mut Criterion) {
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &dictionary).unwrap();
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
-            emit_dictionary_report(
-                scenario,
-                level,
-                dictionary.len(),
-                train_ms,
-                &no_dict_bytes,
-                &with_dict_bytes,
-            );
+            if emit_reports {
+                emit_dictionary_report(
+                    scenario,
+                    level,
+                    dictionary.len(),
+                    train_ms,
+                    &no_dict_bytes,
+                    &with_dict_bytes,
+                );
+            }
 
             let benchmark_name =
                 format!("compress-dict/{}/{}/{}", level.name, scenario.id, "matrix");

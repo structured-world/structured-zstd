@@ -16,6 +16,7 @@ fi
 BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
+export STRUCTURED_ZSTD_EMIT_REPORT=1
 cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher | tee "$BENCH_RAW_FILE"
 
 echo "Parsing results..." >&2
@@ -49,6 +50,11 @@ def unescape_report_label(value):
             output.append(ch)
         i += 1
     return "".join(output)
+
+def markdown_table_escape(value):
+    escaped = value.replace("\\", "\\\\")
+    escaped = escaped.replace("|", "\\|")
+    return escaped.replace("\n", "<br>")
 
 benchmark_results = []
 timings = []
@@ -170,8 +176,9 @@ lines = [
 ]
 
 for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
+    label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
     )
 
 lines.extend([
@@ -183,8 +190,9 @@ lines.extend([
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
+    label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["stage"]} | {row["rust_buffer_bytes_estimate"]} | {row["ffi_buffer_bytes_estimate"]} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_buffer_bytes_estimate"]} | {row["ffi_buffer_bytes_estimate"]} |'
     )
 
 lines.extend([
@@ -196,8 +204,9 @@ lines.extend([
 ])
 
 for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["level"])):
+    label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {row["label"]} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
     )
 
 lines.extend([
