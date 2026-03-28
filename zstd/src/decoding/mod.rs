@@ -13,6 +13,7 @@ pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
 pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
+pub(crate) mod prefetch;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;

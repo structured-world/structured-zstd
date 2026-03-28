@@ -396,6 +396,7 @@ impl From<DecompressBlockError> for DecodeBlockContentError {
 pub enum DecodeBufferError {
     NotEnoughBytesInDictionary { got: usize, need: usize },
     OffsetTooBig { offset: usize, buf_len: usize },
+    ZeroOffset,
 }
 
 #[cfg(feature = "std")]
@@ -412,6 +413,9 @@ impl core::fmt::Display for DecodeBufferError {
             }
             DecodeBufferError::OffsetTooBig { offset, buf_len } => {
                 write!(f, "offset: {offset} bigger than buffer: {buf_len}",)
+            }
+            DecodeBufferError::ZeroOffset => {
+                write!(f, "Illegal offset: 0 found")
             }
         }
     }

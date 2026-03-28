@@ -1,3 +1,4 @@
+use super::prefetch;
 use super::scratch::DecoderScratch;
 use crate::decoding::errors::ExecuteSequencesError;
 
@@ -19,6 +20,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
                 });
             }
             let literals = &scratch.literals_buffer[literals_copy_counter..high];
+            prefetch_literals(literals);
             literals_copy_counter += seq.ll as usize;
 
             scratch.buffer.push(literals);
@@ -112,4 +114,9 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
     }
 
     actual_offset
+}
+
+#[inline(always)]
+fn prefetch_literals(slice: &[u8]) {
+    prefetch::prefetch_slice(slice);
 }
