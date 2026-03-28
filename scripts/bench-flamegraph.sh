@@ -21,7 +21,6 @@ if cargo flamegraph \
   ${EXTRA_FLAMEGRAPH_ARGS[@]+"${EXTRA_FLAMEGRAPH_ARGS[@]}"} \
   --output "$OUTPUT_DIR/${BENCH_FILTER//\//_}.svg" \
   -- \
-  --bench \
   "$BENCH_FILTER"; then
   :
 else
