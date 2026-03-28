@@ -168,7 +168,13 @@ mod tests {
         raw.extend_from_slice(&[0u8; 7]);
 
         let result = std::panic::catch_unwind(|| Dictionary::decode_dict(&raw));
-        assert!(result.is_ok(), "decode_dict must not panic on malformed input");
-        assert!(result.unwrap().is_err(), "malformed dictionary must return error");
+        assert!(
+            result.is_ok(),
+            "decode_dict must not panic on malformed input"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "malformed dictionary must return error"
+        );
     }
 }
