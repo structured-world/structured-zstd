@@ -200,6 +200,7 @@ impl Matcher for MatchGeneratorDriver {
         }
 
         let mut start = 0usize;
+        let mut committed_dict_budget = 0usize;
         while start < dict_content.len() {
             let end = (start + self.slice_size).min(dict_content.len());
             if end - start < MIN_MATCH_LEN {
@@ -210,7 +211,25 @@ impl Matcher for MatchGeneratorDriver {
             space.extend_from_slice(&dict_content[start..end]);
             self.commit_space(space);
             self.skip_matching();
+            committed_dict_budget += end - start;
             start = end;
+        }
+
+        let uncommitted_tail_budget = retained_dict_budget.saturating_sub(committed_dict_budget);
+        if uncommitted_tail_budget > 0 {
+            match self.active_backend {
+                MatcherBackend::Simple => {
+                    self.match_generator.max_window_size = self
+                        .match_generator
+                        .max_window_size
+                        .saturating_sub(uncommitted_tail_budget);
+                }
+                MatcherBackend::Dfast => {
+                    let matcher = self.dfast_matcher_mut();
+                    matcher.max_window_size =
+                        matcher.max_window_size.saturating_sub(uncommitted_tail_budget);
+                }
+            }
         }
     }
 
@@ -1487,6 +1506,22 @@ fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
     assert!(
         result.is_ok(),
         "tiny dictionary tail must not poison suffix store reuse"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_counts_only_committed_tail_budget() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let before = driver.match_generator.max_window_size;
+    // One full slice plus a 1-byte tail that cannot be committed.
+    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
+
+    assert_eq!(
+        driver.match_generator.max_window_size,
+        before + 8,
+        "retention budget must account only for dictionary bytes actually committed to history"
     );
 }
 
