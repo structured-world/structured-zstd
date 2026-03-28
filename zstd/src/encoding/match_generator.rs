@@ -226,8 +226,9 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherBackend::Dfast => {
                     let matcher = self.dfast_matcher_mut();
-                    matcher.max_window_size =
-                        matcher.max_window_size.saturating_sub(uncommitted_tail_budget);
+                    matcher.max_window_size = matcher
+                        .max_window_size
+                        .saturating_sub(uncommitted_tail_budget);
                 }
             }
         }
