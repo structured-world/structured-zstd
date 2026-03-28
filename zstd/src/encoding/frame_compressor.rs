@@ -162,6 +162,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state.fse_tables.of_previous = None;
         self.state.offset_hist = [1, 4, 8];
         if let Some(dict) = self.dictionary.as_ref() {
+            // This state drives sequence encoding, while matcher priming below updates
+            // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.offset_hist;
             self.state
                 .matcher
@@ -319,6 +321,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         dictionary: crate::decoding::Dictionary,
     ) -> Option<crate::decoding::Dictionary> {
+        // Keep this as a fail-fast contract for manually-constructed dictionaries.
+        // Parsing helpers already return Result and reject id==0 at the boundary.
         assert_ne!(
             dictionary.id, 0,
             "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."

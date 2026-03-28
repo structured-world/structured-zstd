@@ -79,7 +79,7 @@ impl Dictionary {
             fse: FSEScratch::new(),
             huf: HuffmanScratch::new(),
             dict_content: Vec::new(),
-            offset_hist: [2, 4, 8],
+            offset_hist: [1, 4, 8],
         };
 
         let magic_num: [u8; 4] = raw[..4].try_into().expect("optimized away");
