@@ -367,6 +367,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         if dictionary.id == 0 {
             return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
         }
+        if let Some(index) = dictionary.offset_hist.iter().position(|&rep| rep == 0) {
+            return Err(
+                crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {
+                    index: index as u8,
+                },
+            );
+        }
         self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
             huff: dictionary.huf.table.to_encoder_table(),
             ll_previous: dictionary.fse.literal_lengths.to_encoder_table(),
@@ -690,6 +697,32 @@ mod tests {
         assert!(matches!(
             result,
             Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId)
+        ));
+    }
+
+    #[test]
+    fn set_dictionary_rejects_zero_repeat_offsets() {
+        let invalid = crate::decoding::Dictionary {
+            id: 1,
+            fse: crate::decoding::scratch::FSEScratch::new(),
+            huf: crate::decoding::scratch::HuffmanScratch::new(),
+            dict_content: vec![1, 2, 3],
+            offset_hist: [0, 4, 8],
+        };
+
+        let mut compressor: FrameCompressor<
+            &[u8],
+            Vec<u8>,
+            crate::encoding::match_generator::MatchGeneratorDriver,
+        > = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let result = compressor.set_dictionary(invalid);
+        assert!(matches!(
+            result,
+            Err(
+                crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {
+                    index: 0
+                }
+            )
         ));
     }
 

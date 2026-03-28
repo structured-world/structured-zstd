@@ -177,9 +177,9 @@ impl Matcher for MatchGeneratorDriver {
             return;
         }
 
-        // Keep enough budget so dictionary-primed history survives adding
-        // one full data block (otherwise reserve() evicts dictionary first).
-        let retained_dict_budget = dict_content.len().min(self.slice_size);
+        // Dictionary bytes should stay addressable until produced frame output
+        // itself exceeds the live window size.
+        let retained_dict_budget = dict_content.len();
         match self.active_backend {
             MatcherBackend::Simple => {
                 self.match_generator.max_window_size = self
@@ -1368,6 +1368,39 @@ fn prime_with_dictionary_preserves_history_for_first_full_block() {
     assert!(
         saw_match,
         "first full block should still match dictionary-primed history"
+    );
+}
+
+#[test]
+fn prime_with_large_dictionary_preserves_early_history_until_first_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 24
+            && match_len >= MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "dictionary bytes should remain addressable until frame output exceeds the live window"
     );
 }
 
