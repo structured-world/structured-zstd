@@ -175,6 +175,9 @@ impl Matcher for MatchGeneratorDriver {
         let mut start = 0usize;
         while start < dict_content.len() {
             let end = (start + self.slice_size).min(dict_content.len());
+            if end - start < MIN_MATCH_LEN {
+                break;
+            }
             let mut space = self.get_next_space();
             space.clear();
             space.extend_from_slice(&dict_content[start..end]);
@@ -298,6 +301,10 @@ impl SuffixStore {
 
     #[inline(always)]
     fn key(&self, suffix: &[u8]) -> usize {
+        if self.len_log == 0 {
+            return 0;
+        }
+
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
@@ -1312,6 +1319,39 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), 64);
+}
+
+#[test]
+fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
+    let mut driver = MatchGeneratorDriver::new(8, 2);
+    driver.reset(CompressionLevel::Fastest);
+
+    // This dictionary leaves a 1-byte tail chunk (capacity=1 suffix table),
+    // which should never be committed to the matcher window.
+    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for block in [b"mnopqrstu", b"vwxyzabcd", b"efghijklm"] {
+            let mut space = driver.get_next_space();
+            space.clear();
+            space.extend_from_slice(block);
+            driver.commit_space(space);
+            driver.skip_matching();
+        }
+    }));
+
+    assert!(
+        result.is_ok(),
+        "tiny dictionary tail must not poison suffix store reuse"
+    );
+}
+
+#[test]
+fn suffix_store_with_single_slot_does_not_panic_on_keying() {
+    let mut suffixes = SuffixStore::with_capacity(1);
+    suffixes.insert(b"abcde", 0);
+    assert!(suffixes.contains_key(b"abcde"));
+    assert_eq!(suffixes.get(b"abcde"), Some(0));
 }
 
 #[test]
