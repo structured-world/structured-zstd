@@ -40,9 +40,18 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
     dictionary: Option<crate::decoding::Dictionary>,
+    dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     state: CompressState<M>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
+}
+
+#[derive(Clone, Default)]
+struct CachedDictionaryEntropy {
+    huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    ll_previous: Option<FSETable>,
+    ml_previous: Option<FSETable>,
+    of_previous: Option<FSETable>,
 }
 
 #[derive(Clone)]
@@ -101,6 +110,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             dictionary: None,
+            dictionary_entropy_cache: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
@@ -120,6 +130,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data: None,
             compressed_data: None,
             dictionary: None,
+            dictionary_entropy_cache: None,
             state: CompressState {
                 matcher,
                 last_huff_table: None,
@@ -168,18 +179,34 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state
                 .matcher
                 .prime_with_dictionary(dict.dict_content.as_slice(), dict.offset_hist);
-            if let Some(huff_table) = dict.huf.table.to_encoder_table() {
+            if let Some(huff_table) = self
+                .dictionary_entropy_cache
+                .as_ref()
+                .and_then(|cache| cache.huff.clone())
+            {
                 self.state.last_huff_table = Some(huff_table);
             }
-            if let Some(ll_previous) = dict.fse.literal_lengths.to_encoder_table() {
+            if let Some(ll_previous) = self
+                .dictionary_entropy_cache
+                .as_ref()
+                .and_then(|cache| cache.ll_previous.clone())
+            {
                 self.state.fse_tables.ll_previous =
                     Some(PreviousFseTable::Custom(Box::new(ll_previous)));
             }
-            if let Some(ml_previous) = dict.fse.match_lengths.to_encoder_table() {
+            if let Some(ml_previous) = self
+                .dictionary_entropy_cache
+                .as_ref()
+                .and_then(|cache| cache.ml_previous.clone())
+            {
                 self.state.fse_tables.ml_previous =
                     Some(PreviousFseTable::Custom(Box::new(ml_previous)));
             }
-            if let Some(of_previous) = dict.fse.offsets.to_encoder_table() {
+            if let Some(of_previous) = self
+                .dictionary_entropy_cache
+                .as_ref()
+                .and_then(|cache| cache.of_previous.clone())
+            {
                 self.state.fse_tables.of_previous =
                     Some(PreviousFseTable::Custom(Box::new(of_previous)));
             }
@@ -336,12 +363,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         dictionary: crate::decoding::Dictionary,
     ) -> Option<crate::decoding::Dictionary> {
-        // Keep this as a fail-fast contract for manually-constructed dictionaries.
-        // Parsing helpers already return Result and reject id==0 at the boundary.
+        // Keep this as a fail-fast contract for manually-constructed dictionaries:
+        // id=0 would produce a malformed frame header (signals "no dictionary").
+        // Parsing helpers stay fallible and reject zero-id at input boundaries.
         assert_ne!(
             dictionary.id, 0,
             "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."
         );
+        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
+            huff: dictionary.huf.table.to_encoder_table(),
+            ll_previous: dictionary.fse.literal_lengths.to_encoder_table(),
+            ml_previous: dictionary.fse.match_lengths.to_encoder_table(),
+            of_previous: dictionary.fse.offsets.to_encoder_table(),
+        });
         self.dictionary.replace(dictionary)
     }
 
@@ -357,6 +391,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
     /// Remove the attached dictionary.
     pub fn clear_dictionary(&mut self) -> Option<crate::decoding::Dictionary> {
+        self.dictionary_entropy_cache = None;
         self.dictionary.take()
     }
 }
