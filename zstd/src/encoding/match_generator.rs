@@ -320,6 +320,7 @@ impl SuffixStore {
 
     #[inline(always)]
     fn key(&self, suffix: &[u8]) -> usize {
+        // Capacity=1 yields len_log=0; shifting by 64 would panic.
         if self.len_log == 0 {
             return 0;
         }
