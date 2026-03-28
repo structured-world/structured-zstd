@@ -528,6 +528,13 @@ impl MatchGenerator {
 
     #[inline(always)]
     fn insert_suffix_if_absent(data: &[u8], suffixes: &mut SuffixStore, pos: usize) {
+        debug_assert!(
+            pos + MIN_MATCH_LEN <= data.len(),
+            "insert_suffix_if_absent: pos {} + MIN_MATCH_LEN {} exceeds data.len() {}",
+            pos,
+            MIN_MATCH_LEN,
+            data.len()
+        );
         let key = &data[pos..pos + MIN_MATCH_LEN];
         if !suffixes.contains_key(key) {
             suffixes.insert(key, pos);
