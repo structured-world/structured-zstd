@@ -42,6 +42,9 @@ pub struct MatchGeneratorDriver {
     slice_size: usize,
     base_slice_size: usize,
     base_window_size: usize,
+    // Frame header window size must stay at the configured live-window budget.
+    // Dictionary retention expands internal matcher capacity only.
+    reported_window_size: usize,
 }
 
 impl MatchGeneratorDriver {
@@ -58,6 +61,7 @@ impl MatchGeneratorDriver {
             slice_size,
             base_slice_size: slice_size,
             base_window_size: max_window_size,
+            reported_window_size: max_window_size,
         }
     }
 
@@ -139,6 +143,7 @@ impl Matcher for MatchGeneratorDriver {
 
         self.active_backend = backend;
         self.slice_size = slice_size;
+        self.reported_window_size = max_window_size;
         match self.active_backend {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
@@ -210,10 +215,7 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn window_size(&self) -> u64 {
-        match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.max_window_size as u64,
-            MatcherBackend::Dfast => self.dfast_matcher().max_window_size as u64,
-        }
+        self.reported_window_size as u64
     }
 
     fn get_next_space(&mut self) -> Vec<u8> {
@@ -1412,6 +1414,54 @@ fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
     driver.prime_with_dictionary(&[], [11, 7, 3]);
 
     assert_eq!(driver.match_generator.offset_hist, [11, 7, 3]);
+}
+
+#[test]
+fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= DFAST_MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "dfast backend should match dictionary-primed history in first full block"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_does_not_inflate_reported_window_size() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let before = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    let after = driver.window_size();
+
+    assert_eq!(
+        after, before,
+        "dictionary retention budget must not change reported frame window size"
+    );
 }
 
 #[test]
