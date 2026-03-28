@@ -29,9 +29,9 @@ fn bench_compress(c: &mut Criterion) {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
             let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
-            emit_report_line(&scenario, level, &rust_compressed, &ffi_compressed);
+            emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
             emit_memory_report(
-                &scenario,
+                scenario,
                 level,
                 "compress",
                 scenario.len() + rust_compressed.len(),
@@ -40,7 +40,7 @@ fn bench_compress(c: &mut Criterion) {
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, &scenario);
+            configure_group(&mut group, scenario);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
@@ -69,7 +69,7 @@ fn bench_decompress(c: &mut Criterion) {
             let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
             let expected_len = scenario.len();
             emit_memory_report(
-                &scenario,
+                scenario,
                 level,
                 "decompress",
                 ffi_compressed.len() + expected_len,
@@ -77,7 +77,7 @@ fn bench_decompress(c: &mut Criterion) {
             );
             let benchmark_name = format!("decompress/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, &scenario);
+            configure_group(&mut group, scenario);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
@@ -139,7 +139,7 @@ fn bench_dictionary(c: &mut Criterion) {
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
             emit_dictionary_report(
-                &scenario,
+                scenario,
                 level,
                 dictionary.len(),
                 train_ms,
@@ -150,7 +150,7 @@ fn bench_dictionary(c: &mut Criterion) {
             let benchmark_name =
                 format!("compress-dict/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, &scenario);
+            configure_group(&mut group, scenario);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("c_ffi_without_dict", |b| {
