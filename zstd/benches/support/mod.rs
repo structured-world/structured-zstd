@@ -232,8 +232,9 @@ fn load_silesia_from_env() -> Vec<Scenario> {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
+        let scenario_stem = sanitize_scenario_stem(stem);
         scenarios.push(Scenario::new(
-            format!("silesia-{stem}"),
+            format!("silesia-{scenario_stem}"),
             format!("Silesia corpus: {stem}"),
             bytes,
             ScenarioClass::Silesia,
@@ -250,4 +251,20 @@ fn large_stream_len() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(100 * 1024 * 1024)
+}
+
+fn sanitize_scenario_stem(stem: &str) -> String {
+    let mut sanitized = String::with_capacity(stem.len());
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    }
 }

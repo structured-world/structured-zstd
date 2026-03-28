@@ -200,10 +200,11 @@ fn emit_memory_report(
     rust_buffer_bytes_estimate: usize,
     ffi_buffer_bytes_estimate: usize,
 ) {
+    let escaped_label = escape_report_label(&scenario.label);
     println!(
         "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_buffer_bytes_estimate={} ffi_buffer_bytes_estimate={}",
         scenario.id,
-        scenario.label,
+        escaped_label,
         level.name,
         stage,
         rust_buffer_bytes_estimate,
@@ -218,6 +219,7 @@ fn emit_report_line(
     ffi_compressed: &[u8],
 ) {
     let input_len = scenario.len() as f64;
+    let escaped_label = escape_report_label(&scenario.label);
     let (rust_ratio, ffi_ratio) = if input_len > 0.0 {
         (
             rust_compressed.len() as f64 / input_len,
@@ -229,7 +231,7 @@ fn emit_report_line(
     println!(
         "REPORT scenario={} label=\"{}\" level={} input_bytes={} rust_bytes={} ffi_bytes={} rust_ratio={:.6} ffi_ratio={:.6}",
         scenario.id,
-        scenario.label,
+        escaped_label,
         level.name,
         scenario.len(),
         rust_compressed.len(),
@@ -248,6 +250,7 @@ fn emit_dictionary_report(
     with_dict_bytes: &[u8],
 ) {
     let input_len = scenario.len() as f64;
+    let escaped_label = escape_report_label(&scenario.label);
     let (no_dict_ratio, with_dict_ratio) = if input_len > 0.0 {
         (
             no_dict_bytes.len() as f64 / input_len,
@@ -259,7 +262,7 @@ fn emit_dictionary_report(
     println!(
         "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6}",
         scenario.id,
-        scenario.label,
+        escaped_label,
         level.name,
         dict_bytes,
         train_ms,
@@ -297,6 +300,10 @@ fn split_training_samples(source: &[u8]) -> Vec<Vec<u8>> {
 
 fn dictionary_size_for(input_len: usize) -> usize {
     input_len.div_ceil(8).clamp(256, 16 * 1024)
+}
+
+fn escape_report_label(label: &str) -> String {
+    label.replace('\\', "\\\\").replace('\"', "\\\"")
 }
 
 criterion_group!(benches, bench_compress, bench_decompress, bench_dictionary);
