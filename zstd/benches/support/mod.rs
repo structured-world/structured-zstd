@@ -1,5 +1,5 @@
 use rand::{RngCore, SeedableRng, rngs::SmallRng};
-use std::{env, fs, path::Path};
+use std::{collections::HashSet, env, fs, path::Path};
 use structured_zstd::encoding::CompressionLevel;
 
 pub(crate) struct Scenario {
@@ -193,6 +193,7 @@ fn load_silesia_from_env() -> Vec<Scenario> {
     }
 
     let mut scenarios = Vec::new();
+    let mut seen_silesia_ids = HashSet::new();
     for path in paths {
         let Ok(metadata) = fs::metadata(&path) else {
             eprintln!(
@@ -201,8 +202,8 @@ fn load_silesia_from_env() -> Vec<Scenario> {
             );
             continue;
         };
-        let file_len = metadata.len() as usize;
-        if file_len > max_file_bytes {
+        let file_len = metadata.len();
+        if file_len > max_file_bytes as u64 {
             eprintln!(
                 "BENCH_WARN skipping Silesia fixture {} ({} bytes > max {} bytes)",
                 path.display(),
@@ -226,13 +227,15 @@ fn load_silesia_from_env() -> Vec<Scenario> {
             );
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let scenario_stem = sanitize_scenario_stem(stem);
+        let scenario_stem = sanitize_scenario_stem(file_name);
+        let scenario_id =
+            dedupe_scenario_id(format!("silesia-{scenario_stem}"), &mut seen_silesia_ids);
         scenarios.push(Scenario::new(
-            format!("silesia-{scenario_stem}"),
-            format!("Silesia corpus: {stem}"),
+            scenario_id,
+            format!("Silesia corpus: {file_name}"),
             bytes,
             ScenarioClass::Silesia,
         ));
@@ -309,5 +312,20 @@ fn sanitize_scenario_stem(stem: &str) -> String {
         "unnamed".to_string()
     } else {
         sanitized
+    }
+}
+
+fn dedupe_scenario_id(base_id: String, seen_ids: &mut HashSet<String>) -> String {
+    if seen_ids.insert(base_id.clone()) {
+        return base_id;
+    }
+
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base_id}-{suffix}");
+        if seen_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
     }
 }
