@@ -28,14 +28,27 @@ import sys
 
 BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
 REPORT_RE = re.compile(
-    r'^REPORT scenario=(\S+) label="([^"]+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
+    r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="([^"]+)" level=(\S+) stage=(\S+) rust_buffer_bytes_estimate=(\d+) ffi_buffer_bytes_estimate=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_buffer_bytes_estimate=(\d+) ffi_buffer_bytes_estimate=(\d+)$'
 )
 DICT_RE = re.compile(
-    r'^REPORT_DICT scenario=(\S+) label="([^"]+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
+    r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
 )
+
+def unescape_report_label(value):
+    output = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            i += 1
+            output.append(value[i])
+        else:
+            output.append(ch)
+        i += 1
+    return "".join(output)
 
 benchmark_results = []
 timings = []
@@ -64,6 +77,7 @@ with open(raw_path) as f:
         report_match = REPORT_RE.match(line)
         if report_match:
             scenario, label, level, input_bytes, rust_bytes, ffi_bytes, rust_ratio, ffi_ratio = report_match.groups()
+            label = unescape_report_label(label)
             ratios.append({
                 "scenario": scenario,
                 "label": label,
@@ -86,6 +100,7 @@ with open(raw_path) as f:
                 rust_buffer_bytes_estimate,
                 ffi_buffer_bytes_estimate,
             ) = mem_match.groups()
+            label = unescape_report_label(label)
             memory_rows.append({
                 "scenario": scenario,
                 "label": label,
@@ -109,6 +124,7 @@ with open(raw_path) as f:
                 ffi_no_dict_ratio,
                 ffi_with_dict_ratio,
             ) = dict_match.groups()
+            label = unescape_report_label(label)
             dictionary_rows.append({
                 "scenario": scenario,
                 "label": label,
