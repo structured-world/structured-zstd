@@ -238,6 +238,7 @@ impl DecodeBuffer {
                 let dict_slice = &self.dict_content[low..high];
                 prefetch::prefetch_slice(dict_slice);
                 self.buffer.extend(dict_slice);
+                self.total_output_counter += match_length as u64;
             }
             Ok(())
         } else {
@@ -566,6 +567,19 @@ mod tests {
         assert!(matches!(
             err,
             crate::decoding::errors::DecodeBufferError::ZeroOffset
+        ));
+    }
+
+    #[test]
+    fn repeat_from_dict_full_copy_updates_total_output_counter() {
+        let mut decode_buf = DecodeBuffer::new(1);
+        decode_buf.dict_content = b"0123456789".to_vec();
+
+        decode_buf.repeat(10, 2).unwrap();
+        let err = decode_buf.repeat(10, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::decoding::errors::DecodeBufferError::OffsetTooBig { .. }
         ));
     }
 
