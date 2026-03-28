@@ -502,7 +502,7 @@ impl MatchGenerator {
         if last_entry.data.len() < MIN_MATCH_LEN {
             return;
         }
-        let insert_limit = idx.saturating_sub(MIN_MATCH_LEN).saturating_add(1);
+        let insert_limit = idx.saturating_sub(MIN_MATCH_LEN - 1);
         if insert_limit > start {
             let data = last_entry.data.as_slice();
             let suffixes = &mut last_entry.suffixes;
@@ -1459,6 +1459,46 @@ fn simple_matcher_add_suffixes_till_backfills_last_searchable_anchor() {
     let last = matcher.window.last().unwrap();
     let tail = &last.data[5..10];
     assert_eq!(last.suffixes.get(tail), Some(5));
+}
+
+#[test]
+fn simple_matcher_add_suffixes_till_skips_when_idx_below_min_match_len() {
+    let mut matcher = MatchGenerator::new(128);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+        SuffixStore::with_capacity(1 << 16),
+        |_, _| {},
+    );
+
+    matcher.add_suffixes_till(MIN_MATCH_LEN - 1, FAST_HASH_FILL_STEP);
+
+    let last = matcher.window.last().unwrap();
+    let first_key = &last.data[..MIN_MATCH_LEN];
+    assert_eq!(last.suffixes.get(first_key), None);
+}
+
+#[test]
+fn simple_matcher_add_suffixes_till_fast_step_registers_interleaved_positions() {
+    let mut matcher = MatchGenerator::new(128);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+        SuffixStore::with_capacity(1 << 16),
+        |_, _| {},
+    );
+
+    matcher.add_suffixes_till(17, FAST_HASH_FILL_STEP);
+
+    let last = matcher.window.last().unwrap();
+    for pos in [0usize, 3, 6, 9, 12] {
+        let key = &last.data[pos..pos + MIN_MATCH_LEN];
+        assert_eq!(
+            last.suffixes.get(key),
+            Some(pos),
+            "expected interleaved suffix registration at pos {pos}"
+        );
+    }
 }
 
 #[test]
