@@ -7,6 +7,14 @@ Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/Ki
 [![docs.rs](https://docs.rs/structured-zstd/badge.svg)](https://docs.rs/structured-zstd)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
+## Benchmarks Dashboard
+
+Historical benchmark charts are published to GitHub Pages:
+
+- [Performance dashboard](https://structured-world.github.io/structured-zstd/dev/bench/)
+
+Note: the root Pages URL can be empty; benchmark charts live under `/dev/bench/`.
+
 ## Managed Fork
 
 This is a **maintained fork** of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Structured World Foundation](https://sw.foundation). We maintain additional features and hardening for the [CoordiNode](https://github.com/structured-world/coordinode) database engine.
@@ -44,6 +52,10 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 ### Dictionary Generation
 
 When the `dict_builder` feature is enabled, the `dictionary` module can create raw content dictionaries. Within 0.2% of the official implementation on the `github-users` sample set.
+
+## Benchmarking
+
+Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares `structured-zstd` against the C reference across small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora. Reports now include compression ratios, input+output buffer size estimates, and C FFI dictionary compression (with/without dictionary) for small and corpus scenarios.
 
 ## Usage
 
