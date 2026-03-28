@@ -109,6 +109,11 @@ impl Scenario {
         self.bytes.len()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     pub(crate) fn throughput_bytes(&self) -> u64 {
         self.bytes.len() as u64
     }
