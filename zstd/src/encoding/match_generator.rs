@@ -168,8 +168,30 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
+        match self.active_backend {
+            MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
+            MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
+        }
+
         if dict_content.is_empty() {
             return;
+        }
+
+        // Keep enough budget so dictionary-primed history survives adding
+        // one full data block (otherwise reserve() evicts dictionary first).
+        let retained_dict_budget = dict_content.len().min(self.slice_size);
+        match self.active_backend {
+            MatcherBackend::Simple => {
+                self.match_generator.max_window_size = self
+                    .match_generator
+                    .max_window_size
+                    .saturating_add(retained_dict_budget);
+            }
+            MatcherBackend::Dfast => {
+                let matcher = self.dfast_matcher_mut();
+                matcher.max_window_size =
+                    matcher.max_window_size.saturating_add(retained_dict_budget);
+            }
         }
 
         let mut start = 0usize;
@@ -184,11 +206,6 @@ impl Matcher for MatchGeneratorDriver {
             self.commit_space(space);
             self.skip_matching();
             start = end;
-        }
-
-        match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
-            MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
         }
     }
 
@@ -1319,6 +1336,49 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), 64);
+}
+
+#[test]
+fn prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "first full block should still match dictionary-primed history"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(&[], [11, 7, 3]);
+
+    assert_eq!(driver.match_generator.offset_hist, [11, 7, 3]);
 }
 
 #[test]

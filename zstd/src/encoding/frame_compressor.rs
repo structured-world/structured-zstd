@@ -362,21 +362,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn set_dictionary(
         &mut self,
         dictionary: crate::decoding::Dictionary,
-    ) -> Option<crate::decoding::Dictionary> {
-        // Keep this as a fail-fast contract for manually-constructed dictionaries:
-        // id=0 would produce a malformed frame header (signals "no dictionary").
-        // Parsing helpers stay fallible and reject zero-id at input boundaries.
-        assert_ne!(
-            dictionary.id, 0,
-            "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."
-        );
+    ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
+    {
+        if dictionary.id == 0 {
+            return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
+        }
         self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
             huff: dictionary.huf.table.to_encoder_table(),
             ll_previous: dictionary.fse.literal_lengths.to_encoder_table(),
             ml_previous: dictionary.fse.match_lengths.to_encoder_table(),
             of_previous: dictionary.fse.offsets.to_encoder_table(),
         });
-        self.dictionary.replace(dictionary)
+        Ok(self.dictionary.replace(dictionary))
     }
 
     /// Parse and attach a serialized dictionary blob.
@@ -386,7 +383,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
     {
         let dictionary = crate::decoding::Dictionary::decode_dict(raw_dictionary)?;
-        Ok(self.set_dictionary(dictionary))
+        self.set_dictionary(dictionary)
     }
 
     /// Remove the attached dictionary.
@@ -520,6 +517,7 @@ mod tests {
         assert_eq!(
             compressor
                 .set_dictionary(dict_for_encoder)
+                .expect("valid dictionary should attach")
                 .expect("set_dictionary_from_bytes inserted previous dictionary")
                 .id,
             dict_for_decoder.id
@@ -615,7 +613,9 @@ mod tests {
 
         let mut with_dict = Vec::new();
         let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-        let _ = compressor.set_dictionary(encoder_dict);
+        compressor
+            .set_dictionary(encoder_dict)
+            .expect("valid dict_builder dictionary should attach");
         compressor.set_source(payload.as_slice());
         compressor.set_drain(&mut with_dict);
         compressor.compress();
@@ -672,9 +672,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."
-    )]
     fn set_dictionary_rejects_zero_dictionary_id() {
         let invalid = crate::decoding::Dictionary {
             id: 0,
@@ -689,7 +686,11 @@ mod tests {
             Vec<u8>,
             crate::encoding::match_generator::MatchGeneratorDriver,
         > = FrameCompressor::new(super::CompressionLevel::Fastest);
-        let _ = compressor.set_dictionary(invalid);
+        let result = compressor.set_dictionary(invalid);
+        assert!(matches!(
+            result,
+            Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId)
+        ));
     }
 
     #[cfg(feature = "hash")]
