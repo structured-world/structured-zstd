@@ -502,10 +502,18 @@ impl MatchGenerator {
         if last_entry.data.len() < MIN_MATCH_LEN {
             return;
         }
-        let slice = &last_entry.data[start..idx];
-        for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate().step_by(fill_step) {
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, start + key_index);
+        let insert_limit = idx.saturating_sub(MIN_MATCH_LEN).saturating_add(1);
+        if insert_limit > start {
+            let data = last_entry.data.as_slice();
+            let suffixes = &mut last_entry.suffixes;
+            if fill_step == FAST_HASH_FILL_STEP {
+                Self::add_suffixes_interleaved_fast(data, suffixes, start, insert_limit);
+            } else {
+                let mut pos = start;
+                while pos < insert_limit {
+                    Self::insert_suffix_if_absent(data, suffixes, pos);
+                    pos += fill_step;
+                }
             }
         }
 
@@ -515,6 +523,46 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(tail_key) {
                 last_entry.suffixes.insert(tail_key, tail_start);
             }
+        }
+    }
+
+    #[inline(always)]
+    fn insert_suffix_if_absent(data: &[u8], suffixes: &mut SuffixStore, pos: usize) {
+        let key = &data[pos..pos + MIN_MATCH_LEN];
+        if !suffixes.contains_key(key) {
+            suffixes.insert(key, pos);
+        }
+    }
+
+    #[inline(always)]
+    fn add_suffixes_interleaved_fast(
+        data: &[u8],
+        suffixes: &mut SuffixStore,
+        start: usize,
+        insert_limit: usize,
+    ) {
+        let lane = FAST_HASH_FILL_STEP;
+        let mut pos = start;
+
+        // Pipeline-ish fill: compute and retire several hash positions per loop
+        // so the fastest path keeps multiple independent hash lookups in flight.
+        while pos + lane * 3 < insert_limit {
+            let p0 = pos;
+            let p1 = pos + lane;
+            let p2 = pos + lane * 2;
+            let p3 = pos + lane * 3;
+
+            Self::insert_suffix_if_absent(data, suffixes, p0);
+            Self::insert_suffix_if_absent(data, suffixes, p1);
+            Self::insert_suffix_if_absent(data, suffixes, p2);
+            Self::insert_suffix_if_absent(data, suffixes, p3);
+
+            pos += lane * 4;
+        }
+
+        while pos < insert_limit {
+            Self::insert_suffix_if_absent(data, suffixes, pos);
+            pos += lane;
         }
     }
 
