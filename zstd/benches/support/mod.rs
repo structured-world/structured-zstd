@@ -284,7 +284,9 @@ fn load_decode_corpus_sample() -> Vec<u8> {
             }
         }
     } else {
-        eprintln!("BENCH_WARN CARGO_MANIFEST_DIR is not set, using synthetic decode corpus fallback");
+        eprintln!(
+            "BENCH_WARN CARGO_MANIFEST_DIR is not set, using synthetic decode corpus fallback"
+        );
     }
 
     // Keep the benchmark matrix runnable from packaged sources where fixture files may be omitted.
