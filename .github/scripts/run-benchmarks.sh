@@ -52,8 +52,17 @@ def unescape_report_label(value):
     return "".join(output)
 
 def markdown_table_escape(value):
-    escaped = value.replace("\\", "\\\\")
+    escaped = value.strip()
+    escaped = escaped.replace("\\", "\\\\")
     escaped = escaped.replace("|", "\\|")
+    escaped = escaped.replace("`", "\\`")
+    escaped = escaped.replace("[", "\\[")
+    escaped = escaped.replace("]", "\\]")
+    escaped = escaped.replace("*", "\\*")
+    escaped = escaped.replace("_", "\\_")
+    escaped = escaped.replace("<", "&lt;")
+    escaped = escaped.replace(">", "&gt;")
+    escaped = escaped.replace("%", "&#37;")
     return escaped.replace("\n", "<br>")
 
 benchmark_results = []

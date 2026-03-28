@@ -316,16 +316,21 @@ fn sanitize_scenario_stem(stem: &str) -> String {
 }
 
 fn dedupe_scenario_id(base_id: String, seen_ids: &mut HashSet<String>) -> String {
+    const MAX_SUFFIX: usize = 1_000_000;
+
     if seen_ids.insert(base_id.clone()) {
         return base_id;
     }
 
-    let mut suffix = 2usize;
-    loop {
+    for suffix in 2..=MAX_SUFFIX {
         let candidate = format!("{base_id}-{suffix}");
         if seen_ids.insert(candidate.clone()) {
             return candidate;
         }
-        suffix += 1;
     }
+
+    panic!(
+        "failed to allocate unique scenario id for base '{}' after {} attempts",
+        base_id, MAX_SUFFIX
+    );
 }
