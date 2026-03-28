@@ -12,12 +12,19 @@
 mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
 use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
 
+static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
+
+fn benchmark_scenarios_cached() -> &'static [Scenario] {
+    BENCHMARK_SCENARIOS.get_or_init(benchmark_scenarios)
+}
+
 fn bench_compress(c: &mut Criterion) {
-    for scenario in benchmark_scenarios() {
+    for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
@@ -57,7 +64,7 @@ fn bench_compress(c: &mut Criterion) {
 }
 
 fn bench_decompress(c: &mut Criterion) {
-    for scenario in benchmark_scenarios() {
+    for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels() {
             let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
             let expected_len = scenario.len();
@@ -101,7 +108,7 @@ fn bench_decompress(c: &mut Criterion) {
 }
 
 fn bench_dictionary(c: &mut Criterion) {
-    for scenario in benchmark_scenarios() {
+    for scenario in benchmark_scenarios_cached().iter() {
         if !matches!(scenario.class, ScenarioClass::Small | ScenarioClass::Corpus) {
             continue;
         }
