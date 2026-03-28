@@ -19,6 +19,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
                 });
             }
             let literals = &scratch.literals_buffer[literals_copy_counter..high];
+            prefetch_literals(literals);
             literals_copy_counter += seq.ll as usize;
 
             scratch.buffer.push(literals);
@@ -113,3 +114,25 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
 
     actual_offset
 }
+
+#[inline(always)]
+fn prefetch_literals(slice: &[u8]) {
+    prefetch_literals_impl(slice);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_literals_impl(slice: &[u8]) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+    if !slice.is_empty() {
+        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+fn prefetch_literals_impl(_slice: &[u8]) {}

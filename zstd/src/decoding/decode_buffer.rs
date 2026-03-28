@@ -65,6 +65,10 @@ impl DecodeBuffer {
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        if match_length == 0 {
+            return Ok(());
+        }
+
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
         } else {
@@ -73,9 +77,9 @@ impl DecodeBuffer {
             let end_idx = start_idx + match_length;
 
             self.buffer.reserve(match_length);
+            self.prefetch_match_source(start_idx);
             if end_idx > buf_len {
-                // We need to copy in chunks.
-                self.repeat_in_chunks(offset, match_length, start_idx);
+                self.repeat_overlapping(offset, match_length, start_idx);
             } else {
                 // can just copy parts of the existing buffer
                 // SAFETY: Requirements checked:
@@ -88,8 +92,13 @@ impl DecodeBuffer {
                 //
                 // 2. explicitly reserved enough memory for the whole match_length
                 unsafe {
-                    self.buffer
-                        .extend_from_within_unchecked(start_idx, match_length)
+                    if offset >= 16 && use_branchless_wildcopy() {
+                        self.buffer
+                            .extend_from_within_unchecked_branchless(start_idx, match_length);
+                    } else {
+                        self.buffer
+                            .extend_from_within_unchecked(start_idx, match_length);
+                    }
                 };
             }
 
@@ -98,34 +107,78 @@ impl DecodeBuffer {
         }
     }
 
-    fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
-        // We have at max offset bytes in one chunk, the last one can be smaller
+    #[inline(always)]
+    fn repeat_overlapping(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+        if offset >= 16 {
+            self.repeat_in_chunks(offset, match_length, start_idx, use_branchless_wildcopy());
+        } else if offset >= 8 {
+            self.repeat_in_chunks(offset, match_length, start_idx, false);
+        } else {
+            self.repeat_short_offset(offset, match_length, start_idx);
+        }
+    }
+
+    #[inline(always)]
+    fn repeat_in_chunks(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+        start_idx: usize,
+        use_branchless_copy: bool,
+    ) {
         let mut start_idx = start_idx;
         let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
         while copied_counter_left > 0 {
             let chunksize = usize::min(offset, copied_counter_left);
 
-            // SAFETY: Requirements checked:
-            // 1. start_idx + chunksize must be <= self.buffer.len()
-            //      We know that:
-            //      1. start_idx starts at buffer.len() - offset
-            //      2. chunksize <= offset (== offset for each iteration but the last, and match_length modulo offset in the last iteration)
-            //      3. the buffer grows by offset many bytes each iteration but the last
-            //      4. start_idx is increased by the same amount as the buffer grows each iteration
-            //
-            //      Thus follows: start_idx + chunksize == self.buffer.len() in each iteration but the last, where match_length modulo offset == chunksize < offset
-            //          Meaning: start_idx + chunksize <= self.buffer.len()
-            //
-            // 2. explicitly reserved enough memory for the whole match_length
+            // SAFETY: chunksize <= offset keeps each single copy in the currently readable
+            // source range, and repeat() reserved enough destination capacity.
             unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, chunksize)
+                if use_branchless_copy {
+                    self.buffer
+                        .extend_from_within_unchecked_branchless(start_idx, chunksize);
+                } else {
+                    self.buffer
+                        .extend_from_within_unchecked(start_idx, chunksize);
+                }
             };
             copied_counter_left -= chunksize;
             start_idx += chunksize;
         }
+    }
+
+    #[inline(always)]
+    fn repeat_short_offset(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+        let mut base = [0u8; 8];
+        for (i, slot) in base.iter_mut().take(offset).enumerate() {
+            *slot = self.byte_at(start_idx + i);
+        }
+
+        let mut scratch = [0u8; 64];
+        let mut copied = 0;
+        while copied < match_length {
+            let chunk = usize::min(64, match_length - copied);
+            for (j, slot) in scratch.iter_mut().take(chunk).enumerate() {
+                *slot = base[(copied + j) % offset];
+            }
+            self.buffer.extend(&scratch[..chunk]);
+            copied += chunk;
+        }
+    }
+
+    #[inline(always)]
+    fn byte_at(&self, idx: usize) -> u8 {
+        let (s1, s2) = self.buffer.as_slices();
+        if idx < s1.len() {
+            s1[idx]
+        } else {
+            s2[idx - s1.len()]
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_match_source(&self, start_idx: usize) {
+        prefetch_ring_slice(&self.buffer, start_idx);
     }
 
     #[cold]
@@ -147,6 +200,7 @@ impl DecodeBuffer {
 
             if bytes_from_dict < match_length {
                 let dict_slice = &self.dict_content[self.dict_content.len() - bytes_from_dict..];
+                prefetch_slice(dict_slice);
                 self.buffer.extend(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
@@ -155,6 +209,7 @@ impl DecodeBuffer {
                 let low = self.dict_content.len() - bytes_from_dict;
                 let high = low + match_length;
                 let dict_slice = &self.dict_content[low..high];
+                prefetch_slice(dict_slice);
                 self.buffer.extend(dict_slice);
             }
             Ok(())
@@ -315,6 +370,58 @@ fn write_all_bytes(mut sink: impl Write, buf: &[u8]) -> (usize, Result<(), Error
     (written, Ok(()))
 }
 
+#[inline(always)]
+fn prefetch_slice(slice: &[u8]) {
+    prefetch_slice_impl(slice);
+}
+
+#[inline(always)]
+fn use_branchless_wildcopy() -> bool {
+    cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_ring_slice(buffer: &RingBuffer, start_idx: usize) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+    let (s1, s2) = buffer.as_slices();
+    if start_idx < s1.len() {
+        let ptr = unsafe { s1.as_ptr().add(start_idx) };
+        unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
+    } else {
+        let idx = start_idx - s1.len();
+        if idx < s2.len() {
+            let ptr = unsafe { s2.as_ptr().add(idx) };
+            unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+fn prefetch_ring_slice(_buffer: &RingBuffer, _start_idx: usize) {}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_slice_impl(slice: &[u8]) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+    if !slice.is_empty() {
+        unsafe { _mm_prefetch(slice.as_ptr().cast(), _MM_HINT_T0) };
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+fn prefetch_slice_impl(_slice: &[u8]) {}
+
 #[cfg(test)]
 mod tests {
     use super::DecodeBuffer;
@@ -447,5 +554,37 @@ mod tests {
             }
         }
         assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
+    }
+
+    #[test]
+    fn repeat_overlap_fast_paths_match_reference_behavior() {
+        let seed = b"0123456789abcdef0123456789abcdef";
+        let cases = [
+            (16usize, 16usize), // non-overlapping boundary
+            (16usize, 211usize),
+            (8usize, 173usize),
+            (7usize, 149usize),
+            (3usize, 160usize),
+            (1usize, 255usize),
+        ];
+
+        for (offset, match_len) in cases {
+            let mut decode_buf = DecodeBuffer::new(4 * 1024);
+            decode_buf.push(seed);
+            decode_buf.repeat(offset, match_len).unwrap();
+            let got = decode_buf.drain();
+            let expected = expected_match_expansion(seed, offset, match_len);
+            assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
+        }
+    }
+
+    fn expected_match_expansion(seed: &[u8], offset: usize, match_len: usize) -> Vec<u8> {
+        let mut out = seed.to_vec();
+        let start = out.len() - offset;
+        for i in 0..match_len {
+            let byte = out[start + i];
+            out.push(byte);
+        }
+        out
     }
 }
