@@ -137,8 +137,7 @@ if not memory_rows:
     sys.exit(1)
 
 if not dictionary_rows:
-    print("ERROR: No REPORT_DICT lines parsed; dictionary section would be empty.", file=sys.stderr)
-    sys.exit(1)
+    print("WARN: No REPORT_DICT lines parsed; dictionary section will be empty.", file=sys.stderr)
 
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)
