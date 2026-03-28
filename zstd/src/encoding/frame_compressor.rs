@@ -460,9 +460,13 @@ mod tests {
 
         let mut with_dict = Vec::new();
         let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-        compressor
+        let previous = compressor
             .set_dictionary_from_bytes(dict_raw)
             .expect("dictionary bytes should parse");
+        assert!(
+            previous.is_none(),
+            "first dictionary insert should return None"
+        );
         assert_eq!(
             compressor
                 .set_dictionary(dict_for_encoder)
@@ -561,7 +565,7 @@ mod tests {
 
         let mut with_dict = Vec::new();
         let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-        compressor.set_dictionary(encoder_dict);
+        let _ = compressor.set_dictionary(encoder_dict);
         compressor.set_source(payload.as_slice());
         compressor.set_drain(&mut with_dict);
         compressor.compress();
