@@ -502,10 +502,18 @@ impl MatchGenerator {
         if last_entry.data.len() < MIN_MATCH_LEN {
             return;
         }
-        let slice = &last_entry.data[start..idx];
-        for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate().step_by(fill_step) {
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, start + key_index);
+        let insert_limit = idx.saturating_sub(MIN_MATCH_LEN - 1);
+        if insert_limit > start {
+            let data = last_entry.data.as_slice();
+            let suffixes = &mut last_entry.suffixes;
+            if fill_step == FAST_HASH_FILL_STEP {
+                Self::add_suffixes_interleaved_fast(data, suffixes, start, insert_limit);
+            } else {
+                let mut pos = start;
+                while pos < insert_limit {
+                    Self::insert_suffix_if_absent(data, suffixes, pos);
+                    pos += fill_step;
+                }
             }
         }
 
@@ -515,6 +523,53 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(tail_key) {
                 last_entry.suffixes.insert(tail_key, tail_start);
             }
+        }
+    }
+
+    #[inline(always)]
+    fn insert_suffix_if_absent(data: &[u8], suffixes: &mut SuffixStore, pos: usize) {
+        debug_assert!(
+            pos + MIN_MATCH_LEN <= data.len(),
+            "insert_suffix_if_absent: pos {} + MIN_MATCH_LEN {} exceeds data.len() {}",
+            pos,
+            MIN_MATCH_LEN,
+            data.len()
+        );
+        let key = &data[pos..pos + MIN_MATCH_LEN];
+        if !suffixes.contains_key(key) {
+            suffixes.insert(key, pos);
+        }
+    }
+
+    #[inline(always)]
+    fn add_suffixes_interleaved_fast(
+        data: &[u8],
+        suffixes: &mut SuffixStore,
+        start: usize,
+        insert_limit: usize,
+    ) {
+        let lane = FAST_HASH_FILL_STEP;
+        let mut pos = start;
+
+        // Pipeline-ish fill: compute and retire several hash positions per loop
+        // so the fastest path keeps multiple independent hash lookups in flight.
+        while pos + lane * 3 < insert_limit {
+            let p0 = pos;
+            let p1 = pos + lane;
+            let p2 = pos + lane * 2;
+            let p3 = pos + lane * 3;
+
+            Self::insert_suffix_if_absent(data, suffixes, p0);
+            Self::insert_suffix_if_absent(data, suffixes, p1);
+            Self::insert_suffix_if_absent(data, suffixes, p2);
+            Self::insert_suffix_if_absent(data, suffixes, p3);
+
+            pos += lane * 4;
+        }
+
+        while pos < insert_limit {
+            Self::insert_suffix_if_absent(data, suffixes, pos);
+            pos += lane;
         }
     }
 
@@ -1404,6 +1459,46 @@ fn simple_matcher_add_suffixes_till_backfills_last_searchable_anchor() {
     let last = matcher.window.last().unwrap();
     let tail = &last.data[5..10];
     assert_eq!(last.suffixes.get(tail), Some(5));
+}
+
+#[test]
+fn simple_matcher_add_suffixes_till_skips_when_idx_below_min_match_len() {
+    let mut matcher = MatchGenerator::new(128);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+        SuffixStore::with_capacity(1 << 16),
+        |_, _| {},
+    );
+
+    matcher.add_suffixes_till(MIN_MATCH_LEN - 1, FAST_HASH_FILL_STEP);
+
+    let last = matcher.window.last().unwrap();
+    let first_key = &last.data[..MIN_MATCH_LEN];
+    assert_eq!(last.suffixes.get(first_key), None);
+}
+
+#[test]
+fn simple_matcher_add_suffixes_till_fast_step_registers_interleaved_positions() {
+    let mut matcher = MatchGenerator::new(128);
+    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
+    matcher.add_data(
+        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+        SuffixStore::with_capacity(1 << 16),
+        |_, _| {},
+    );
+
+    matcher.add_suffixes_till(17, FAST_HASH_FILL_STEP);
+
+    let last = matcher.window.last().unwrap();
+    for pos in [0usize, 3, 6, 9, 12] {
+        let key = &last.data[pos..pos + MIN_MATCH_LEN];
+        assert_eq!(
+            last.suffixes.get(key),
+            Some(pos),
+            "expected interleaved suffix registration at pos {pos}"
+        );
+    }
 }
 
 #[test]
