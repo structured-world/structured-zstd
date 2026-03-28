@@ -10,3 +10,5 @@ benchmark-results.json
 benchmark-report.md
 fuzz/corpus
 .idea
+benchmark-results.json
+benchmark-report.md
