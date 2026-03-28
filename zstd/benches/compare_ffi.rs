@@ -285,7 +285,11 @@ fn split_training_samples(source: &[u8]) -> Vec<Vec<u8>> {
         if left.len() >= 64 && right.len() >= 64 {
             samples = vec![left.to_vec(), right.to_vec()];
         } else {
-            samples = vec![source.to_vec(), source.to_vec()];
+            eprintln!(
+                "BENCH_WARN tiny dictionary training input ({} bytes), using a single sample fallback",
+                source.len()
+            );
+            samples = vec![source.to_vec()];
         }
     }
     samples
