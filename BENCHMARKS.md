@@ -73,7 +73,7 @@ bash scripts/bench-flamegraph.sh
 Override the benchmark targeted by the flamegraph script:
 
 ```bash
-bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/matrix/pure_rust
+bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust
 ```
 
 ## Outputs

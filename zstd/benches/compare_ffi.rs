@@ -114,6 +114,8 @@ fn bench_decompress_source(
     expected_len: usize,
     emit_reports: bool,
 ) {
+    assert_decompress_matches_reference(scenario, compressed, expected_len);
+
     if emit_reports {
         emit_memory_report(
             scenario,
@@ -136,7 +138,10 @@ fn bench_decompress_source(
         let mut target = vec![0u8; expected_len];
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
-            let written = decoder.decode_all(compressed, &mut target).unwrap();
+            let written = decoder
+                .decode_all(black_box(compressed), &mut target)
+                .unwrap();
+            black_box(&target[..written]);
             assert_eq!(written, expected_len);
         })
     });
@@ -147,14 +152,37 @@ fn bench_decompress_source(
         b.iter(|| {
             output.clear();
             let written = decoder
-                .decompress_to_buffer(compressed, &mut output)
+                .decompress_to_buffer(black_box(compressed), &mut output)
                 .unwrap();
+            black_box(output.as_slice());
             assert_eq!(written, expected_len);
             assert_eq!(output.len(), expected_len);
         })
     });
 
     group.finish();
+}
+
+fn assert_decompress_matches_reference(
+    scenario: &Scenario,
+    compressed: &[u8],
+    expected_len: usize,
+) {
+    let mut rust_target = vec![0u8; expected_len];
+    let mut rust_decoder = FrameDecoder::new();
+    let rust_written = rust_decoder
+        .decode_all(compressed, &mut rust_target)
+        .unwrap();
+    assert_eq!(rust_written, expected_len);
+    assert_eq!(&rust_target[..rust_written], scenario.bytes.as_slice());
+
+    let mut ffi_decoder = zstd::bulk::Decompressor::new().unwrap();
+    let mut ffi_output = Vec::with_capacity(expected_len);
+    let ffi_written = ffi_decoder
+        .decompress_to_buffer(compressed, &mut ffi_output)
+        .unwrap();
+    assert_eq!(ffi_written, expected_len);
+    assert_eq!(ffi_output.as_slice(), scenario.bytes.as_slice());
 }
 
 fn bench_dictionary(c: &mut Criterion) {
