@@ -11,7 +11,7 @@ license = "Apache-2.0"
 homepage = "https://github.com/structured-world/structured-zstd"
 repository = "https://github.com/structured-world/structured-zstd"
 description = "Pure Rust zstd implementation — managed fork of ruzstd. Dictionary decompression, no FFI."
-exclude = ["dict_tests/*", "fuzz_decodecorpus/*", "decodecorpus_files/*"]
+exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*"]
 # Package metadata points at a crate-local symlink so the packaged crate and repo root README stay in sync.
 readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]

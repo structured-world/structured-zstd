@@ -64,6 +64,16 @@ impl Dictionary {
     /// Parses the dictionary from `raw` and set the tables
     /// it returns the dict_id for checking with the frame's `dict_id``
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        const MIN_MAGIC_AND_ID_LEN: usize = 8;
+        const OFFSET_HISTORY_LEN: usize = 12;
+
+        if raw.len() < MIN_MAGIC_AND_ID_LEN {
+            return Err(DictionaryDecodeError::DictionaryTooSmall {
+                got: raw.len(),
+                need: MIN_MAGIC_AND_ID_LEN,
+            });
+        }
+
         let mut new_dict = Dictionary {
             id: 0,
             fse: FSEScratch::new(),
@@ -107,6 +117,13 @@ impl Dictionary {
         )?;
         let raw_tables = &raw_tables[ll_size..];
 
+        if raw_tables.len() < OFFSET_HISTORY_LEN {
+            return Err(DictionaryDecodeError::DictionaryTooSmall {
+                got: raw_tables.len(),
+                need: OFFSET_HISTORY_LEN,
+            });
+        }
+
         let offset1 = raw_tables[0..4].try_into().expect("optimized away");
         let offset1 = u32::from_le_bytes(offset1);
 
@@ -124,5 +141,34 @@ impl Dictionary {
         new_dict.dict_content.extend(raw_content);
 
         Ok(new_dict)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_dict_rejects_short_buffer_before_magic_and_id() {
+        let err = match Dictionary::decode_dict(&[]) {
+            Ok(_) => panic!("expected short dictionary to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 8 }
+        ));
+    }
+
+    #[test]
+    fn decode_dict_malformed_input_returns_error_instead_of_panicking() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&MAGIC_NUM);
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 7]);
+
+        let result = std::panic::catch_unwind(|| Dictionary::decode_dict(&raw));
+        assert!(result.is_ok(), "decode_dict must not panic on malformed input");
+        assert!(result.unwrap().is_err(), "malformed dictionary must return error");
     }
 }

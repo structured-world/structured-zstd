@@ -319,6 +319,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         dictionary: crate::decoding::Dictionary,
     ) -> Option<crate::decoding::Dictionary> {
+        assert_ne!(
+            dictionary.id, 0,
+            "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."
+        );
         self.dictionary.replace(dictionary)
     }
 
@@ -573,6 +577,27 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "FrameCompressor::set_dictionary: dictionary.id must be non-zero (0 means 'no dictionary' in the frame header)."
+    )]
+    fn set_dictionary_rejects_zero_dictionary_id() {
+        let invalid = crate::decoding::Dictionary {
+            id: 0,
+            fse: crate::decoding::scratch::FSEScratch::new(),
+            huf: crate::decoding::scratch::HuffmanScratch::new(),
+            dict_content: vec![1, 2, 3],
+            offset_hist: [1, 4, 8],
+        };
+
+        let mut compressor: FrameCompressor<
+            &[u8],
+            Vec<u8>,
+            crate::encoding::match_generator::MatchGeneratorDriver,
+        > = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let _ = compressor.set_dictionary(invalid);
     }
 
     #[cfg(feature = "hash")]

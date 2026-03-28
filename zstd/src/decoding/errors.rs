@@ -425,6 +425,7 @@ impl core::fmt::Display for DecodeBufferError {
 #[non_exhaustive]
 pub enum DictionaryDecodeError {
     BadMagicNum { got: [u8; 4] },
+    DictionaryTooSmall { got: usize, need: usize },
     ZeroDictionaryId,
     FSETableError(FSETableError),
     HuffmanTableError(HuffmanTableError),
@@ -450,6 +451,12 @@ impl core::fmt::Display for DictionaryDecodeError {
                     "Bad magic_num at start of the dictionary; Got: {:#04X?}, Expected: {:#04x?}",
                     got,
                     crate::decoding::dictionary::MAGIC_NUM,
+                )
+            }
+            DictionaryDecodeError::DictionaryTooSmall { got, need } => {
+                write!(
+                    f,
+                    "Dictionary is too small: got {got} bytes, need at least {need} bytes",
                 )
             }
             DictionaryDecodeError::ZeroDictionaryId => {
