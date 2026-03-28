@@ -79,47 +79,110 @@ fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels() {
+            let rust_compressed =
+                structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
             let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
             let expected_len = scenario.len();
-            if emit_reports {
-                emit_memory_report(
-                    scenario,
-                    level,
-                    "decompress",
-                    ffi_compressed.len() + expected_len,
-                    ffi_compressed.len() + expected_len,
-                );
-            }
-            let benchmark_name = format!("decompress/{}/{}/{}", level.name, scenario.id, "matrix");
-            let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, scenario);
-            group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
-
-            group.bench_function("pure_rust", |b| {
-                let mut target = vec![0u8; expected_len];
-                let mut decoder = FrameDecoder::new();
-                b.iter(|| {
-                    let written = decoder.decode_all(&ffi_compressed, &mut target).unwrap();
-                    assert_eq!(written, expected_len);
-                })
-            });
-
-            group.bench_function("c_ffi", |b| {
-                let mut decoder = zstd::bulk::Decompressor::new().unwrap();
-                let mut output = Vec::with_capacity(expected_len);
-                b.iter(|| {
-                    output.clear();
-                    let written = decoder
-                        .decompress_to_buffer(&ffi_compressed[..], &mut output)
-                        .unwrap();
-                    assert_eq!(written, expected_len);
-                    assert_eq!(output.len(), expected_len);
-                })
-            });
-
-            group.finish();
+            bench_decompress_source(
+                c,
+                scenario,
+                level,
+                "rust_stream",
+                &rust_compressed,
+                expected_len,
+                emit_reports,
+            );
+            bench_decompress_source(
+                c,
+                scenario,
+                level,
+                "c_stream",
+                &ffi_compressed,
+                expected_len,
+                emit_reports,
+            );
         }
     }
+}
+
+fn bench_decompress_source(
+    c: &mut Criterion,
+    scenario: &Scenario,
+    level: LevelConfig,
+    source: &'static str,
+    compressed: &[u8],
+    expected_len: usize,
+    emit_reports: bool,
+) {
+    assert_decompress_matches_reference(scenario, compressed, expected_len);
+
+    if emit_reports {
+        emit_memory_report(
+            scenario,
+            level,
+            &format!("decompress-{source}"),
+            compressed.len() + expected_len,
+            compressed.len() + expected_len,
+        );
+    }
+
+    let benchmark_name = format!(
+        "decompress/{}/{}/{}/matrix",
+        level.name, scenario.id, source
+    );
+    let mut group = c.benchmark_group(benchmark_name);
+    configure_group(&mut group, scenario);
+    group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
+
+    group.bench_function("pure_rust", |b| {
+        let mut target = vec![0u8; expected_len];
+        let mut decoder = FrameDecoder::new();
+        b.iter(|| {
+            let written = decoder
+                .decode_all(black_box(compressed), &mut target)
+                .unwrap();
+            black_box(&target[..written]);
+            assert_eq!(written, expected_len);
+        })
+    });
+
+    group.bench_function("c_ffi", |b| {
+        let mut decoder = zstd::bulk::Decompressor::new().unwrap();
+        let mut output = Vec::with_capacity(expected_len);
+        b.iter(|| {
+            output.clear();
+            let written = decoder
+                .decompress_to_buffer(black_box(compressed), &mut output)
+                .unwrap();
+            black_box(output.as_slice());
+            assert_eq!(written, expected_len);
+            assert_eq!(output.len(), expected_len);
+        })
+    });
+
+    group.finish();
+}
+
+fn assert_decompress_matches_reference(
+    scenario: &Scenario,
+    compressed: &[u8],
+    expected_len: usize,
+) {
+    let mut rust_target = vec![0u8; expected_len];
+    let mut rust_decoder = FrameDecoder::new();
+    let rust_written = rust_decoder
+        .decode_all(compressed, &mut rust_target)
+        .unwrap();
+    assert_eq!(rust_written, expected_len);
+    assert_eq!(&rust_target[..rust_written], scenario.bytes.as_slice());
+
+    let mut ffi_decoder = zstd::bulk::Decompressor::new().unwrap();
+    let mut ffi_output = Vec::with_capacity(expected_len);
+    let ffi_written = ffi_decoder
+        .decompress_to_buffer(compressed, &mut ffi_output)
+        .unwrap();
+    assert_eq!(ffi_written, expected_len);
+    assert_eq!(ffi_output.as_slice(), scenario.bytes.as_slice());
 }
 
 fn bench_dictionary(c: &mut Criterion) {
@@ -214,7 +277,7 @@ fn configure_group<M: criterion::measurement::Measurement>(
 fn emit_memory_report(
     scenario: &Scenario,
     level: LevelConfig,
-    stage: &'static str,
+    stage: &str,
     rust_buffer_bytes_estimate: usize,
     ffi_buffer_bytes_estimate: usize,
 ) {
