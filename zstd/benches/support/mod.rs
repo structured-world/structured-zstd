@@ -48,7 +48,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
         Scenario::new(
             "decodecorpus-z000033",
             "Repo decode corpus sample",
-            include_bytes!("../../decodecorpus_files/z000033").to_vec(),
+            load_decode_corpus_sample(),
             ScenarioClass::Corpus,
         ),
         Scenario::new(
@@ -257,6 +257,38 @@ fn large_stream_len() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(100 * 1024 * 1024)
+}
+
+fn load_decode_corpus_sample() -> Vec<u8> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok();
+    let fixture_path = manifest_dir
+        .as_deref()
+        .map(Path::new)
+        .map(|dir| dir.join("decodecorpus_files/z000033"));
+
+    if let Some(path) = fixture_path {
+        match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => return bytes,
+            Ok(_) => {
+                eprintln!(
+                    "BENCH_WARN decode corpus fixture is empty at {}, using synthetic fallback",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "BENCH_WARN failed to read decode corpus fixture at {}: {}. Using synthetic fallback",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    } else {
+        eprintln!("BENCH_WARN CARGO_MANIFEST_DIR is not set, using synthetic decode corpus fallback");
+    }
+
+    // Keep the benchmark matrix runnable from packaged sources where fixture files may be omitted.
+    repeated_log_lines(1024 * 1024)
 }
 
 fn sanitize_scenario_stem(stem: &str) -> String {
