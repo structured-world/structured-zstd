@@ -49,9 +49,9 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
 #[derive(Clone, Default)]
 struct CachedDictionaryEntropy {
     huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
-    ll_previous: Option<FSETable>,
-    ml_previous: Option<FSETable>,
-    of_previous: Option<FSETable>,
+    ll_previous: Option<PreviousFseTable>,
+    ml_previous: Option<PreviousFseTable>,
+    of_previous: Option<PreviousFseTable>,
 }
 
 #[derive(Clone)]
@@ -188,38 +188,25 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .matcher
                 .prime_with_dictionary(dict.dict_content.as_slice(), dict.offset_hist);
         }
-        self.state
-            .last_huff_table
-            .clone_from(&cached_entropy.and_then(|cache| cache.huff.clone()));
+        if let Some(cache) = cached_entropy {
+            self.state.last_huff_table.clone_from(&cache.huff);
+        } else {
+            self.state.last_huff_table = None;
+        }
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
         self.state
             .fse_tables
             .ll_previous
-            .clone_from(&cached_entropy.and_then(|cache| {
-                cache
-                    .ll_previous
-                    .clone()
-                    .map(|table| PreviousFseTable::Custom(Box::new(table)))
-            }));
+            .clone_from(&cached_entropy.and_then(|cache| cache.ll_previous.clone()));
         self.state
             .fse_tables
             .ml_previous
-            .clone_from(&cached_entropy.and_then(|cache| {
-                cache
-                    .ml_previous
-                    .clone()
-                    .map(|table| PreviousFseTable::Custom(Box::new(table)))
-            }));
+            .clone_from(&cached_entropy.and_then(|cache| cache.ml_previous.clone()));
         self.state
             .fse_tables
             .of_previous
-            .clone_from(&cached_entropy.and_then(|cache| {
-                cache
-                    .of_previous
-                    .clone()
-                    .map(|table| PreviousFseTable::Custom(Box::new(table)))
-            }));
+            .clone_from(&cached_entropy.and_then(|cache| cache.of_previous.clone()));
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -391,9 +378,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
         self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
             huff: dictionary.huf.table.to_encoder_table(),
-            ll_previous: dictionary.fse.literal_lengths.to_encoder_table(),
-            ml_previous: dictionary.fse.match_lengths.to_encoder_table(),
-            of_previous: dictionary.fse.offsets.to_encoder_table(),
+            ll_previous: dictionary
+                .fse
+                .literal_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+            ml_previous: dictionary
+                .fse
+                .match_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+            of_previous: dictionary
+                .fse
+                .offsets
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
         });
         Ok(self.dictionary.replace(dictionary))
     }
