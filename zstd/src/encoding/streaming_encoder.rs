@@ -179,7 +179,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         last_block: bool,
     ) -> Result<(), (Error, Vec<u8>)> {
         let mut raw_block = Some(uncompressed_data);
-        let mut encoded = Vec::new();
+        let mut encoded = Vec::with_capacity(self.block_capacity());
         let mut moved_into_matcher = false;
         if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
             let header = BlockHeader {
@@ -228,8 +228,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         if moved_into_matcher {
             #[cfg(feature = "hash")]
             {
-                let block = self.state.matcher.get_last_space().to_vec();
-                self.hash_block(&block);
+                self.hasher.write(self.state.matcher.get_last_space());
             }
             #[cfg(not(feature = "hash"))]
             {

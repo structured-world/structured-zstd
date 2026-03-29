@@ -224,8 +224,10 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
         .permissions();
 
     let backup_output_path = create_temporary_output_path(output);
-    fs::rename(output, &backup_output_path)
-        .wrap_err("failed to move existing output file into backup location")?;
+    if let Err(err) = fs::rename(output, &backup_output_path) {
+        let _ = fs::remove_file(temporary_output_path);
+        return Err(err).wrap_err("failed to move existing output file into backup location");
+    }
 
     if let Err(err) = fs::rename(temporary_output_path, output) {
         let restore_result = fs::rename(&backup_output_path, output);
