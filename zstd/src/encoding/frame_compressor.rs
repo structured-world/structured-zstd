@@ -172,7 +172,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state.fse_tables.ml_previous = None;
         self.state.fse_tables.of_previous = None;
         self.state.offset_hist = [1, 4, 8];
-        if let Some(dict) = self.dictionary.as_ref() {
+        let use_dictionary_state =
+            !matches!(self.compression_level, CompressionLevel::Uncompressed);
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.offset_hist;
@@ -224,7 +226,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             frame_content_size: None,
             single_segment: false,
             content_checksum: cfg!(feature = "hash"),
-            dictionary_id: self.dictionary.as_ref().map(|dict| dict.id as u64),
+            dictionary_id: if use_dictionary_state {
+                self.dictionary.as_ref().map(|dict| dict.id as u64)
+            } else {
+                None
+            },
             window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);
@@ -724,6 +730,37 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn uncompressed_mode_does_not_require_dictionary() {
+        let dict_id = 0xABCD_0001;
+        let dict =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"shared-history".to_vec())
+                .expect("raw dictionary should be valid");
+
+        let payload = b"plain-bytes-that-should-stay-raw";
+        let mut output = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach in uncompressed mode");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            None,
+            "raw/uncompressed frames must not advertise dictionary dependency"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[cfg(feature = "hash")]
