@@ -173,7 +173,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state.fse_tables.of_previous = None;
         self.state.offset_hist = [1, 4, 8];
         let use_dictionary_state =
-            !matches!(self.compression_level, CompressionLevel::Uncompressed);
+            !matches!(self.compression_level, CompressionLevel::Uncompressed)
+                && self.state.matcher.supports_dictionary_priming();
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -421,7 +422,52 @@ mod tests {
     use super::FrameCompressor;
     use crate::common::MAGIC_NUM;
     use crate::decoding::FrameDecoder;
+    use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    struct NoDictionaryMatcher {
+        last_space: Vec<u8>,
+        window_size: u64,
+    }
+
+    impl NoDictionaryMatcher {
+        fn new(window_size: u64) -> Self {
+            Self {
+                last_space: Vec::new(),
+                window_size,
+            }
+        }
+    }
+
+    impl Matcher for NoDictionaryMatcher {
+        fn get_next_space(&mut self) -> Vec<u8> {
+            vec![0; self.window_size as usize]
+        }
+
+        fn get_last_space(&mut self) -> &[u8] {
+            self.last_space.as_slice()
+        }
+
+        fn commit_space(&mut self, space: Vec<u8>) {
+            self.last_space = space;
+        }
+
+        fn skip_matching(&mut self) {}
+
+        fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+            handle_sequence(Sequence::Literals {
+                literals: self.last_space.as_slice(),
+            });
+        }
+
+        fn reset(&mut self, _level: super::CompressionLevel) {
+            self.last_space.clear();
+        }
+
+        fn window_size(&self) -> u64 {
+            self.window_size
+        }
+    }
 
     #[test]
     fn frame_starts_with_magic_num() {
@@ -753,6 +799,21 @@ mod tests {
                 .expect("raw dictionary should be valid");
 
         let payload = b"abcdefgh".repeat(512);
+        let matcher = MatchGeneratorDriver::new(8, 1);
+
+        let mut no_dict_output = Vec::new();
+        let mut no_dict_compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        no_dict_compressor.set_source(payload.as_slice());
+        no_dict_compressor.set_drain(&mut no_dict_output);
+        no_dict_compressor.compress();
+        let (no_dict_frame_header, _) =
+            crate::decoding::frame::read_frame_header(no_dict_output.as_slice())
+                .expect("baseline frame should have a header");
+        let no_dict_window = no_dict_frame_header
+            .window_size()
+            .expect("window size should be present");
+
         let mut output = Vec::new();
         let matcher = MatchGeneratorDriver::new(8, 1);
         let mut compressor =
@@ -769,6 +830,10 @@ mod tests {
         let advertised_window = frame_header
             .window_size()
             .expect("window size should be present");
+        assert_eq!(
+            advertised_window, no_dict_window,
+            "dictionary priming must not inflate advertised window size"
+        );
         assert!(
             payload.len() > advertised_window as usize,
             "test must cross the advertised window boundary"
@@ -776,6 +841,38 @@ mod tests {
 
         let mut decoder = FrameDecoder::new();
         decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn custom_matcher_without_dictionary_priming_does_not_advertise_dict_id() {
+        let dict_id = 0xABCD_0003;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+            .expect("raw dictionary should be valid");
+        let payload = b"abcdefghabcdefgh";
+
+        let mut output = Vec::new();
+        let matcher = NoDictionaryMatcher::new(64);
+        let mut compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            None,
+            "matchers that do not support dictionary priming must not advertise dictionary dependency"
+        );
+
+        let mut decoder = FrameDecoder::new();
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
         assert_eq!(decoded, payload);

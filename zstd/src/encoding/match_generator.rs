@@ -114,6 +114,10 @@ impl MatchGeneratorDriver {
 }
 
 impl Matcher for MatchGeneratorDriver {
+    fn supports_dictionary_priming(&self) -> bool {
+        true
+    }
+
     fn reset(&mut self, level: CompressionLevel) {
         let (backend, slice_size, max_window_size, hash_fill_step) = self.level_config(level);
         if self.active_backend != backend {
