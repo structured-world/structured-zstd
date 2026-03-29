@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{ContextCompat, WrapErr};
+use color_eyre::eyre::{ContextCompat, WrapErr, eyre};
 use structured_zstd::encoding::CompressionLevel;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -106,11 +106,12 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         0 => CompressionLevel::Uncompressed,
         1 => CompressionLevel::Fastest,
         2 => CompressionLevel::Default,
-        3 => CompressionLevel::Better,
-        4 => CompressionLevel::Best,
-        _ => {
-            unimplemented!("unsupported compression level: {}", level);
+        3 | 4 => {
+            return Err(eyre!(
+                "compression level {level} is not supported by streaming encoder yet (supported: 0, 1, 2)"
+            ));
         }
+        _ => return Err(eyre!("unsupported compression level: {level}")),
     };
     let source_file = File::open(input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;

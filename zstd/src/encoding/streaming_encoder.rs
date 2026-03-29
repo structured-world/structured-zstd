@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::mem;
 
+use crate::common::MAX_BLOCK_SIZE;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 #[cfg(feature = "hash")]
@@ -33,21 +34,11 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
 
 impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
     pub fn new(drain: W, compression_level: CompressionLevel) -> Self {
-        Self {
-            drain: Some(drain),
+        Self::new_with_matcher(
+            MatchGeneratorDriver::new(1024 * 128, 1),
+            drain,
             compression_level,
-            state: CompressState {
-                matcher: MatchGeneratorDriver::new(1024 * 128, 1),
-                last_huff_table: None,
-                fse_tables: FseTables::new(),
-                offset_hist: [1, 4, 8],
-            },
-            pending: Vec::new(),
-            frame_started: false,
-            frame_finished: false,
-            #[cfg(feature = "hash")]
-            hasher: XxHash64::with_seed(0),
-        }
+        )
     }
 }
 
@@ -122,6 +113,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             return Ok(());
         }
 
+        self.ensure_level_supported()?;
         self.state.matcher.reset(self.compression_level);
         self.state.offset_hist = [1, 4, 8];
         self.state.last_huff_table = None;
@@ -149,7 +141,19 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     }
 
     fn block_capacity(&self) -> usize {
-        self.state.matcher.window_size() as usize
+        let matcher_window = self.state.matcher.window_size() as usize;
+        core::cmp::max(1, core::cmp::min(matcher_window, MAX_BLOCK_SIZE as usize))
+    }
+
+    fn ensure_level_supported(&self) -> Result<(), Error> {
+        match self.compression_level {
+            CompressionLevel::Uncompressed
+            | CompressionLevel::Fastest
+            | CompressionLevel::Default => Ok(()),
+            _ => Err(other_error(
+                "streaming encoder currently supports Uncompressed/Fastest/Default only",
+            )),
+        }
     }
 
     fn encode_block(&mut self, uncompressed_data: Vec<u8>, last_block: bool) -> Result<(), Error> {
@@ -202,11 +206,20 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         }
 
         self.ensure_frame_started()?;
-        self.pending.extend_from_slice(buf);
         let block_capacity = self.block_capacity();
-        while self.pending.len() >= block_capacity {
-            let block: Vec<u8> = self.pending.drain(..block_capacity).collect();
-            self.encode_block(block, false)?;
+        let mut remaining = buf;
+
+        while !remaining.is_empty() {
+            let available = block_capacity - self.pending.len();
+            let to_take = core::cmp::min(remaining.len(), available);
+            self.pending.extend_from_slice(&remaining[..to_take]);
+            remaining = &remaining[to_take..];
+
+            if self.pending.len() == block_capacity {
+                let mut full_block = Vec::new();
+                mem::swap(&mut self.pending, &mut full_block);
+                self.encode_block(full_block, false)?;
+            }
         }
         Ok(buf.len())
     }
@@ -312,7 +325,11 @@ mod tests {
             flushed_len > 0,
             "flush should emit header+partial block bytes"
         );
-        let _ = encoder.finish().unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"partial-block");
     }
 
     #[test]
@@ -358,8 +375,15 @@ mod tests {
     #[test]
     fn better_level_returns_unsupported_error() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
-        encoder.write_all(b"payload").unwrap();
+        assert!(encoder.write_all(b"payload").is_err());
         assert!(encoder.finish().is_err());
+    }
+
+    #[test]
+    fn unsupported_level_write_fails_before_emitting_frame_header() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
+        assert!(encoder.write_all(b"payload").is_err());
+        assert_eq!(encoder.get_ref().unwrap().len(), 0);
     }
 
     #[test]
