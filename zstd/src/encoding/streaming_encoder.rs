@@ -71,7 +71,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.drain.as_mut()
     }
 
-    pub fn finish(&mut self) -> Result<W, Error> {
+    pub fn finish(mut self) -> Result<W, Error> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
 
@@ -79,13 +79,11 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.write_empty_last_block()
                 .map_err(|err| self.fail(err))?;
         } else {
-            let mut block = Vec::new();
-            mem::swap(&mut self.pending, &mut block);
-            if let Err(err) = self.encode_block(&block, true) {
-                mem::swap(&mut self.pending, &mut block);
+            let block = mem::take(&mut self.pending);
+            if let Err((err, block)) = self.encode_block(block, true) {
+                self.pending = block;
                 return Err(self.fail(err));
             }
-            self.hash_block(&block);
         }
 
         #[cfg(feature = "hash")]
@@ -175,9 +173,15 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    fn encode_block(&mut self, uncompressed_data: &[u8], last_block: bool) -> Result<(), Error> {
+    fn encode_block(
+        &mut self,
+        uncompressed_data: Vec<u8>,
+        last_block: bool,
+    ) -> Result<(), (Error, Vec<u8>)> {
+        let mut raw_block = Some(uncompressed_data);
         let mut encoded = Vec::new();
-        if uncompressed_data.is_empty() {
+        let mut moved_into_matcher = false;
+        if raw_block.as_ref().map_or(false, |block| block.is_empty()) {
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
@@ -187,35 +191,58 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         } else {
             match self.compression_level {
                 CompressionLevel::Uncompressed => {
+                    let block = raw_block.as_ref().expect("raw block missing");
                     let header = BlockHeader {
                         last_block,
                         block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: uncompressed_data.len() as u32,
+                        block_size: block.len() as u32,
                     };
                     header.serialize(&mut encoded);
-                    encoded.extend_from_slice(uncompressed_data);
+                    encoded.extend_from_slice(block);
                 }
                 CompressionLevel::Fastest | CompressionLevel::Default => {
-                    compress_fastest(
-                        &mut self.state,
-                        last_block,
-                        uncompressed_data.to_vec(),
-                        &mut encoded,
-                    );
+                    let block = raw_block.take().expect("raw block missing");
+                    compress_fastest(&mut self.state, last_block, block, &mut encoded);
+                    moved_into_matcher = true;
                 }
                 _ => {
-                    return Err(other_error(
-                        "streaming encoder currently supports Uncompressed/Fastest/Default only",
+                    return Err((
+                        other_error(
+                            "streaming encoder currently supports Uncompressed/Fastest/Default only",
+                        ),
+                        raw_block.unwrap_or_default(),
                     ));
                 }
             }
         }
 
-        self.drain_mut()?.write_all(&encoded)
+        if let Err(err) = self.drain_mut().and_then(|drain| drain.write_all(&encoded)) {
+            let restored = if moved_into_matcher {
+                self.state.matcher.get_last_space().to_vec()
+            } else {
+                raw_block.unwrap_or_default()
+            };
+            return Err((err, restored));
+        }
+
+        if moved_into_matcher {
+            #[cfg(feature = "hash")]
+            {
+                let block = self.state.matcher.get_last_space().to_vec();
+                self.hash_block(&block);
+            }
+            #[cfg(not(feature = "hash"))]
+            {
+                self.hash_block(&[]);
+            }
+        } else {
+            self.hash_block(raw_block.as_deref().unwrap_or(&[]));
+        }
+        Ok(())
     }
 
     fn write_empty_last_block(&mut self) -> Result<(), Error> {
-        self.encode_block(&[], true)
+        self.encode_block(Vec::new(), true).map_err(|(err, _)| err)
     }
 
     fn fail(&mut self, err: Error) -> Error {
@@ -246,16 +273,15 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 
         while !remaining.is_empty() {
             if self.pending.len() == block_capacity {
-                let mut full_block = Vec::new();
-                mem::swap(&mut self.pending, &mut full_block);
-                if let Err(err) = self.encode_block(&full_block, false) {
-                    mem::swap(&mut self.pending, &mut full_block);
+                let full_block = mem::take(&mut self.pending);
+                if let Err((err, restored_block)) = self.encode_block(full_block, false) {
+                    self.pending = restored_block;
+                    let err = self.fail(err);
                     if consumed > 0 {
                         return Ok(consumed);
                     }
-                    return Err(self.fail(err));
+                    return Err(err);
                 }
-                self.hash_block(&full_block);
             }
 
             let available = block_capacity - self.pending.len();
@@ -274,13 +300,11 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
         if !self.pending.is_empty() {
-            let mut block = Vec::new();
-            mem::swap(&mut self.pending, &mut block);
-            if let Err(err) = self.encode_block(&block, false) {
-                mem::swap(&mut self.pending, &mut block);
+            let block = mem::take(&mut self.pending);
+            if let Err((err, restored_block)) = self.encode_block(block, false) {
+                self.pending = restored_block;
                 return Err(self.fail(err));
             }
-            self.hash_block(&block);
         }
         self.drain_mut()
             .and_then(|drain| drain.flush())
@@ -383,6 +407,52 @@ mod tests {
         }
     }
 
+    struct PartialThenFailWriter {
+        writes: usize,
+        fail_on_write_number: usize,
+        partial_prefix_len: usize,
+        terminal_failure: bool,
+        sink: Vec<u8>,
+    }
+
+    impl PartialThenFailWriter {
+        fn new(fail_on_write_number: usize, partial_prefix_len: usize) -> Self {
+            Self {
+                writes: 0,
+                fail_on_write_number,
+                partial_prefix_len,
+                terminal_failure: false,
+                sink: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for PartialThenFailWriter {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+            if self.terminal_failure {
+                return Err(super::other_error("injected terminal write failure"));
+            }
+
+            self.writes += 1;
+            if self.writes == self.fail_on_write_number {
+                let written = core::cmp::min(self.partial_prefix_len, buf.len());
+                if written > 0 {
+                    self.sink.extend_from_slice(&buf[..written]);
+                    self.terminal_failure = true;
+                    return Ok(written);
+                }
+                return Err(super::other_error("injected terminal write failure"));
+            }
+
+            self.sink.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn streaming_encoder_roundtrip_multiple_writes() {
         let payload = b"streaming-encoder-roundtrip-".repeat(1024);
@@ -416,17 +486,19 @@ mod tests {
     }
 
     #[test]
-    fn write_after_finish_returns_error() {
+    fn finish_consumes_encoder_and_emits_frame() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.write_all(b"abc").unwrap();
-        let _ = encoder.finish().unwrap();
-        assert!(encoder.write_all(b"def").is_err());
-        assert!(encoder.flush().is_err());
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"abc");
     }
 
     #[test]
     fn finish_without_writes_emits_empty_frame() {
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        let encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         let compressed = encoder.finish().unwrap();
         let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
         let mut decoded = Vec::new();
@@ -480,13 +552,12 @@ mod tests {
         assert!(encoder.write_all(b"ABCD").is_err());
         assert!(encoder.flush().is_err());
         assert!(encoder.write_all(b"EFGH").is_err());
-        assert!(encoder.finish().is_err());
-
         assert_eq!(encoder.get_ref().unwrap().sink.len(), 0);
+        assert!(encoder.finish().is_err());
     }
 
     #[test]
-    fn write_preserves_progress_when_later_block_write_fails() {
+    fn write_reports_progress_but_poisoning_is_sticky_after_later_block_failure() {
         let payload = b"ABCDEFGHIJKL";
         let mut encoder = StreamingEncoder::new_with_matcher(
             TinyMatcher::new(4),
@@ -496,15 +567,27 @@ mod tests {
 
         let first_write = encoder.write(payload).unwrap();
         assert_eq!(first_write, 8);
-        let second_write = encoder.write(&payload[first_write..]).unwrap();
-        assert_eq!(second_write, payload.len() - first_write);
+        assert!(encoder.write(&payload[first_write..]).is_err());
+        assert!(encoder.flush().is_err());
+        assert!(encoder.write_all(b"EFGH").is_err());
+    }
 
-        encoder.flush().unwrap();
-        let compressed = encoder.finish().unwrap().sink;
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
-        let mut decoded = Vec::new();
-        decoder.read_to_end(&mut decoded).unwrap();
-        assert_eq!(decoded, payload);
+    #[test]
+    fn partial_write_failure_after_progress_poisons_encoder() {
+        let payload = b"ABCDEFGHIJKL";
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            PartialThenFailWriter::new(3, 1),
+            CompressionLevel::Uncompressed,
+        );
+
+        let first_write = encoder.write(payload).unwrap();
+        assert_eq!(first_write, 8);
+
+        let second_write = encoder.write(&payload[first_write..]);
+        assert!(second_write.is_err());
+        assert!(encoder.flush().is_err());
+        assert!(encoder.write_all(b"MNOP").is_err());
     }
 
     #[test]

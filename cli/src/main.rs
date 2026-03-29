@@ -2,7 +2,7 @@ mod progress;
 use progress::ProgressMonitor;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::BufReader;
+use std::io::{BufReader, ErrorKind};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -116,12 +116,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let buffered_source = BufReader::new(source_file);
     let mut encoder_input = ProgressMonitor::new(buffered_source, source_size);
 
-    let temporary_output_path = create_temporary_output_path(&output);
-    let temporary_output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary_output_path)
-        .wrap_err("failed to create temporary output file")?;
+    let (temporary_output_path, temporary_output) = create_temporary_output_file(&output)?;
 
     let compression_result: color_eyre::Result<File> = (|| {
         let mut encoder =
@@ -182,19 +177,71 @@ fn create_temporary_output_path(output: &Path) -> PathBuf {
     parent.join(format!(".{file_name}.tmp.{}", std::process::id()))
 }
 
+fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, File)> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output.zst");
+    for attempt in 0..u16::MAX {
+        let candidate = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            attempt
+        ));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).wrap_err("failed to create temporary output file");
+            }
+        }
+    }
+    Err(eyre!("failed to allocate unique temporary output file"))
+}
+
 fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
     if !output.exists() {
         return fs::rename(temporary_output_path, output)
             .wrap_err("failed to move temporary output file into final location");
     }
 
+    let output_kind = fs::symlink_metadata(output)
+        .wrap_err("failed to inspect existing output path")?
+        .file_type();
+    if !output_kind.is_file() {
+        let _ = fs::remove_file(temporary_output_path);
+        return Err(eyre!(
+            "output path exists and is not a regular file: {output:?}"
+        ));
+    }
+    let original_permissions = fs::metadata(output)
+        .wrap_err("failed to read existing output file metadata")?
+        .permissions();
+
     let backup_output_path = create_temporary_output_path(output);
     fs::rename(output, &backup_output_path)
         .wrap_err("failed to move existing output file into backup location")?;
 
     if let Err(err) = fs::rename(temporary_output_path, output) {
-        let _ = fs::rename(&backup_output_path, output);
+        let restore_result = fs::rename(&backup_output_path, output);
+        let _ = fs::remove_file(temporary_output_path);
+        if let Err(restore_err) = restore_result {
+            return Err(err).wrap_err(format!(
+                "failed to move temporary output file into final location; also failed to restore backup: {restore_err}"
+            ));
+        }
         return Err(err).wrap_err("failed to move temporary output file into final location");
+    }
+
+    if let Err(err) = fs::set_permissions(output, original_permissions) {
+        let _ = fs::remove_file(output);
+        let _ = fs::rename(&backup_output_path, output);
+        return Err(err).wrap_err("failed to preserve existing output file permissions");
     }
 
     let _ = fs::remove_file(&backup_output_path);
@@ -238,11 +285,14 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
 
-    use super::{Cli, compress};
+    use super::{Cli, compress, replace_output_file};
     use std::path::PathBuf;
 
     use crate::add_extension;
@@ -279,5 +329,64 @@ mod tests {
         );
 
         let _ = fs::remove_file(input);
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, content: &[u8]) {
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn replace_output_file_rejects_non_regular_destination() {
+        let dir = unique_test_dir("structured-zstd-cli-non-regular");
+        let temporary_output = dir.join("result.tmp");
+        write_file(&temporary_output, b"compressed");
+        let destination = dir.join("existing-dir");
+        fs::create_dir(&destination).unwrap();
+
+        let err = replace_output_file(&temporary_output, &destination).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(destination.is_dir());
+        assert!(
+            !temporary_output.exists(),
+            "temporary file should be cleaned up when destination is invalid"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_output_file_preserves_existing_permissions() {
+        let dir = unique_test_dir("structured-zstd-cli-preserve-permissions");
+        let destination = dir.join("result.zst");
+        write_file(&destination, b"old-data");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let temporary_output = dir.join("result.tmp");
+        write_file(&temporary_output, b"new-data");
+        fs::set_permissions(&temporary_output, fs::Permissions::from_mode(0o600)).unwrap();
+
+        replace_output_file(&temporary_output, &destination).unwrap();
+
+        let mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(fs::read(&destination).unwrap(), b"new-data");
+        assert!(!temporary_output.exists());
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
