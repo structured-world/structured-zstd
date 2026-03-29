@@ -372,7 +372,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
             self.writes += 1;
             if self.writes == self.fail_on_write_number {
-                return Err(Error::other("injected write failure"));
+                return Err(super::other_error("injected write failure"));
             }
             self.sink.extend_from_slice(buf);
             Ok(buf.len())
