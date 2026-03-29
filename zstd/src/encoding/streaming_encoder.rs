@@ -236,11 +236,56 @@ fn other_error(message: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use alloc::vec::Vec;
 
     use crate::decoding::StreamingDecoder;
-    use crate::encoding::{CompressionLevel, StreamingEncoder};
+    use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
     use crate::io::{Read, Write};
+
+    struct TinyMatcher {
+        last_space: Vec<u8>,
+        window_size: u64,
+    }
+
+    impl TinyMatcher {
+        fn new(window_size: u64) -> Self {
+            Self {
+                last_space: Vec::new(),
+                window_size,
+            }
+        }
+    }
+
+    impl Matcher for TinyMatcher {
+        fn get_next_space(&mut self) -> Vec<u8> {
+            vec![0; self.window_size as usize]
+        }
+
+        fn get_last_space(&mut self) -> &[u8] {
+            self.last_space.as_slice()
+        }
+
+        fn commit_space(&mut self, space: Vec<u8>) {
+            self.last_space = space;
+        }
+
+        fn skip_matching(&mut self) {}
+
+        fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+            handle_sequence(Sequence::Literals {
+                literals: self.last_space.as_slice(),
+            });
+        }
+
+        fn reset(&mut self, _level: CompressionLevel) {
+            self.last_space.clear();
+        }
+
+        fn window_size(&self) -> u64 {
+            self.window_size
+        }
+    }
 
     #[test]
     fn streaming_encoder_roundtrip_multiple_writes() {
@@ -276,6 +321,59 @@ mod tests {
         encoder.write_all(b"abc").unwrap();
         let _ = encoder.finish().unwrap();
         assert!(encoder.write_all(b"def").is_err());
+        assert!(encoder.flush().is_err());
+    }
+
+    #[test]
+    fn finish_without_writes_emits_empty_frame() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn write_empty_buffer_returns_zero() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        assert_eq!(encoder.write(&[]).unwrap(), 0);
+        let _ = encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn uncompressed_level_roundtrip() {
+        let payload = b"uncompressed-streaming-roundtrip".repeat(64);
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Uncompressed);
+        for chunk in payload.chunks(41) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn better_level_returns_unsupported_error() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
+        encoder.write_all(b"payload").unwrap();
+        assert!(encoder.finish().is_err());
+    }
+
+    #[test]
+    fn new_with_matcher_and_get_mut_work() {
+        let matcher = TinyMatcher::new(128 * 1024);
+        let mut encoder =
+            StreamingEncoder::new_with_matcher(matcher, Vec::new(), CompressionLevel::Fastest);
+        encoder.get_mut().unwrap().extend_from_slice(b"");
+        encoder.write_all(b"custom-matcher").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"custom-matcher");
     }
 
     #[cfg(feature = "std")]
