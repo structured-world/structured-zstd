@@ -370,8 +370,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
     /// Attach a pre-parsed dictionary to be used for subsequent compressions.
     ///
-    /// The dictionary id will be written to the frame header and the matcher will be
-    /// primed with dictionary content/history before compressing each frame.
+    /// In compressed modes, the dictionary id is written only when the active
+    /// matcher supports dictionary priming.
+    /// Uncompressed mode and non-priming matchers ignore the attached dictionary
+    /// at encode time.
     pub fn set_dictionary(
         &mut self,
         dictionary: crate::decoding::Dictionary,

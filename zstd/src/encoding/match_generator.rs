@@ -45,6 +45,9 @@ pub struct MatchGeneratorDriver {
     // Frame header window size must stay at the configured live-window budget.
     // Dictionary retention expands internal matcher capacity only.
     reported_window_size: usize,
+    // Tracks currently retained bytes that originated from primed dictionary
+    // history and have not been evicted yet.
+    dictionary_retained_budget: usize,
 }
 
 impl MatchGeneratorDriver {
@@ -62,6 +65,7 @@ impl MatchGeneratorDriver {
             base_slice_size: slice_size,
             base_window_size: max_window_size,
             reported_window_size: max_window_size,
+            dictionary_retained_budget: 0,
         }
     }
 
@@ -111,6 +115,61 @@ impl MatchGeneratorDriver {
             .as_mut()
             .expect("dfast backend must be initialized by reset() before use")
     }
+
+    fn retire_dictionary_budget(&mut self, evicted_bytes: usize) {
+        let reclaimed = evicted_bytes.min(self.dictionary_retained_budget);
+        if reclaimed == 0 {
+            return;
+        }
+        self.dictionary_retained_budget -= reclaimed;
+        match self.active_backend {
+            MatcherBackend::Simple => {
+                self.match_generator.max_window_size = self
+                    .match_generator
+                    .max_window_size
+                    .saturating_sub(reclaimed);
+            }
+            MatcherBackend::Dfast => {
+                let matcher = self.dfast_matcher_mut();
+                matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
+            }
+        }
+    }
+
+    fn trim_after_budget_retire(&mut self) {
+        loop {
+            let mut evicted_bytes = 0usize;
+            match self.active_backend {
+                MatcherBackend::Simple => {
+                    let vec_pool = &mut self.vec_pool;
+                    let suffix_pool = &mut self.suffix_pool;
+                    self.match_generator.reserve(0, |mut data, mut suffixes| {
+                        evicted_bytes += data.len();
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                        suffixes.slots.clear();
+                        suffixes.slots.resize(suffixes.slots.capacity(), None);
+                        suffix_pool.push(suffixes);
+                    });
+                }
+                MatcherBackend::Dfast => {
+                    let mut retired = Vec::new();
+                    self.dfast_matcher_mut().trim_to_window(|data| {
+                        evicted_bytes += data.len();
+                        retired.push(data);
+                    });
+                    for mut data in retired {
+                        data.resize(data.capacity(), 0);
+                        self.vec_pool.push(data);
+                    }
+                }
+            }
+            if evicted_bytes == 0 {
+                break;
+            }
+            self.retire_dictionary_budget(evicted_bytes);
+        }
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -120,6 +179,7 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: CompressionLevel) {
         let (backend, slice_size, max_window_size, hash_fill_step) = self.level_config(level);
+        self.dictionary_retained_budget = 0;
         if self.active_backend != backend {
             match self.active_backend {
                 MatcherBackend::Simple => {
@@ -240,6 +300,11 @@ impl Matcher for MatchGeneratorDriver {
                 }
             }
         }
+        if committed_dict_budget > 0 {
+            self.dictionary_retained_budget = self
+                .dictionary_retained_budget
+                .saturating_add(committed_dict_budget);
+        }
     }
 
     fn window_size(&self) -> u64 {
@@ -265,6 +330,7 @@ impl Matcher for MatchGeneratorDriver {
         match self.active_backend {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
+                let mut evicted_bytes = 0usize;
                 let suffixes = self
                     .suffix_pool
                     .pop()
@@ -272,22 +338,29 @@ impl Matcher for MatchGeneratorDriver {
                 let suffix_pool = &mut self.suffix_pool;
                 self.match_generator
                     .add_data(space, suffixes, |mut data, mut suffixes| {
+                        evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
                         suffixes.slots.clear();
                         suffixes.slots.resize(suffixes.slots.capacity(), None);
                         suffix_pool.push(suffixes);
                     });
+                self.retire_dictionary_budget(evicted_bytes);
+                self.trim_after_budget_retire();
             }
             MatcherBackend::Dfast => {
                 let vec_pool = &mut self.vec_pool;
+                let mut evicted_bytes = 0usize;
                 self.dfast_match_generator
                     .as_mut()
                     .expect("dfast backend must be initialized by reset() before use")
                     .add_data(space, |mut data| {
+                        evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
                     });
+                self.retire_dictionary_budget(evicted_bytes);
+                self.trim_after_budget_retire();
             }
         }
     }
@@ -855,6 +928,17 @@ impl DfastMatchGenerator {
         self.history.extend_from_slice(&data);
         self.window_size += data.len();
         self.window.push_back(data);
+    }
+
+    fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+        while self.window_size > self.max_window_size {
+            let mut removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            removed.resize(removed.capacity(), 0);
+            reuse_space(removed);
+        }
     }
 
     fn skip_matching(&mut self) {
@@ -1542,6 +1626,65 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
         driver.dfast_matcher().max_window_size,
         before + 12,
         "dfast retention budget should include 4-byte dictionary tails"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let base_window = driver.match_generator.max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.match_generator.max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.match_generator.max_window_size, base_window,
+        "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+    // Use a small live window in this regression so dictionary-primed slices are
+    // evicted quickly and budget retirement can be asserted deterministically.
+    driver.dfast_matcher_mut().max_window_size = 8;
+    driver.reported_window_size = 8;
+
+    let base_window = driver.dfast_matcher().max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.dfast_matcher().max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.dfast_matcher().max_window_size,
+        base_window,
+        "retired dictionary budget must not remain reusable for live history"
     );
 }
 
