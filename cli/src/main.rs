@@ -115,10 +115,11 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let source_file = File::open(input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;
     let buffered_source = BufReader::new(source_file);
-    let encoder_input = ProgressMonitor::new(buffered_source, source_size);
+    let mut encoder_input = ProgressMonitor::new(buffered_source, source_size);
     let output: File = File::create(output).wrap_err("failed to open output file for writing")?;
-
-    structured_zstd::encoding::compress(encoder_input, &output, compression_level);
+    let mut encoder = structured_zstd::encoding::StreamingEncoder::new(output, compression_level);
+    std::io::copy(&mut encoder_input, &mut encoder).wrap_err("streaming compression failed")?;
+    let output = encoder.finish().wrap_err("failed to finalize zstd frame")?;
     let compressed_size = output.metadata()?.len();
     let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
     info!(
