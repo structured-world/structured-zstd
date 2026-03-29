@@ -649,7 +649,7 @@ mod tests {
             crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
 
         let mut payload = Vec::new();
-        for idx in 0..512u32 {
+        for idx in 0..96u32 {
             payload.extend_from_slice(
                 format!(
                     "tenant=demo table=orders op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n"
@@ -657,6 +657,12 @@ mod tests {
                 .as_bytes(),
             );
         }
+
+        let mut without_dict = Vec::new();
+        let mut baseline = FrameCompressor::new(super::CompressionLevel::Fastest);
+        baseline.set_source(payload.as_slice());
+        baseline.set_drain(&mut without_dict);
+        baseline.compress();
 
         let mut with_dict = Vec::new();
         let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
@@ -675,13 +681,17 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+        assert!(
+            with_dict.len() < without_dict.len(),
+            "trained dictionary should improve compression for this small payload"
+        );
     }
 
     #[test]
     fn set_dictionary_from_bytes_seeds_entropy_tables_for_first_block() {
         let dict_raw = include_bytes!("../../dict_tests/dictionary");
         let mut output = Vec::new();
-        let input = b"short-payload-without-obvious-repetitions";
+        let input = b"";
 
         let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
         let previous = compressor

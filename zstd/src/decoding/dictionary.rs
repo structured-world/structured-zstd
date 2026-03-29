@@ -51,6 +51,9 @@ impl Dictionary {
         if id == 0 {
             return Err(DictionaryDecodeError::ZeroDictionaryId);
         }
+        if dict_content.is_empty() {
+            return Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 });
+        }
 
         Ok(Dictionary {
             id,
@@ -238,9 +241,18 @@ mod tests {
         // Corrupt rep0 to zero.
         raw[offset_start..offset_start + 4].copy_from_slice(&0u32.to_le_bytes());
         let decoded = Dictionary::decode_dict(&raw);
-        assert!(
-            decoded.is_err(),
-            "dictionary with zero repeat offset must be rejected"
-        );
+        assert!(matches!(
+            decoded,
+            Err(DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn from_raw_content_rejects_empty_dictionary_content() {
+        let result = Dictionary::from_raw_content(1, Vec::new());
+        assert!(matches!(
+            result,
+            Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 })
+        ));
     }
 }
