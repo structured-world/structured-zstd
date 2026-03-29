@@ -137,7 +137,11 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     drop(temporary_output);
     replace_output_file(&temporary_output_path, &output)?;
 
-    let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
+    let compression_ratio = if source_size == 0 {
+        0.0
+    } else {
+        compressed_size as f64 / source_size as f64 * 100.0
+    };
     info!(
         "{} ——> {} ({compression_ratio:.2}%)",
         fmt_size(source_size as f64),
@@ -148,33 +152,23 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
 
 fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> {
     let canonical_input = fs::canonicalize(input).wrap_err("failed to canonicalize input file")?;
-    if let Ok(canonical_output) = fs::canonicalize(output)
-        && canonical_input == canonical_output
-    {
-        return Err(eyre!(
-            "input and output paths refer to the same file: {input:?} -> {output:?}"
-        ));
+    if output.exists() {
+        let canonical_output =
+            fs::canonicalize(output).wrap_err("failed to canonicalize existing output file")?;
+        if canonical_input == canonical_output {
+            return Err(eyre!(
+                "input and output paths refer to the same file: {input:?} -> {output:?}"
+            ));
+        }
     }
     Ok(())
 }
 
-fn create_temporary_output_path(output: &Path) -> PathBuf {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("output.zst");
-    for attempt in 0..u16::MAX {
-        let candidate = parent.join(format!(
-            ".{file_name}.tmp.{}.{}",
-            std::process::id(),
-            attempt
-        ));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    parent.join(format!(".{file_name}.tmp.{}", std::process::id()))
+fn create_temporary_output_path(output: &Path) -> color_eyre::Result<PathBuf> {
+    let (path, file) = create_temporary_output_file(output)?;
+    drop(file);
+    fs::remove_file(&path).wrap_err("failed to reserve temporary output path")?;
+    Ok(path)
 }
 
 fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, File)> {
@@ -223,7 +217,7 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
         .wrap_err("failed to read existing output file metadata")?
         .permissions();
 
-    let backup_output_path = create_temporary_output_path(output);
+    let backup_output_path = create_temporary_output_path(output)?;
     if let Err(err) = fs::rename(output, &backup_output_path) {
         let _ = fs::remove_file(temporary_output_path);
         return Err(err).wrap_err("failed to move existing output file into backup location");
@@ -242,7 +236,12 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
 
     if let Err(err) = fs::set_permissions(output, original_permissions) {
         let _ = fs::remove_file(output);
-        let _ = fs::rename(&backup_output_path, output);
+        let restore_result = fs::rename(&backup_output_path, output);
+        if let Err(restore_err) = restore_result {
+            return Err(err).wrap_err(format!(
+                "failed to preserve existing output file permissions; also failed to restore backup: {restore_err}"
+            ));
+        }
         return Err(err).wrap_err("failed to preserve existing output file permissions");
     }
 

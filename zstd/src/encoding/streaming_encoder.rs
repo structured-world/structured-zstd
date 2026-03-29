@@ -12,9 +12,7 @@ use crate::encoding::{
     CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
     frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
 };
-#[cfg(not(feature = "std"))]
-use crate::io::ErrorKind;
-use crate::io::{Error, Write};
+use crate::io::{Error, ErrorKind, Write};
 
 /// Incremental frame encoder that implements [`Write`].
 ///
@@ -27,6 +25,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     state: CompressState<M>,
     pending: Vec<u8>,
     errored: bool,
+    last_error_kind: Option<ErrorKind>,
     frame_started: bool,
     frame_finished: bool,
     #[cfg(feature = "hash")]
@@ -56,6 +55,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             },
             pending: Vec::new(),
             errored: false,
+            last_error_kind: None,
             frame_started: false,
             frame_finished: false,
             #[cfg(feature = "hash")]
@@ -105,8 +105,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
-            return Err(other_error(
-                "cannot use streaming encoder after a previous write failure",
+            return Err(error_from_kind(
+                self.last_error_kind.unwrap_or(ErrorKind::Other),
             ));
         }
         if self.frame_finished {
@@ -160,6 +160,42 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     fn block_capacity(&self) -> usize {
         let matcher_window = self.state.matcher.window_size() as usize;
         core::cmp::max(1, core::cmp::min(matcher_window, MAX_BLOCK_SIZE as usize))
+    }
+
+    fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {
+        let mut space = match self.compression_level {
+            CompressionLevel::Fastest | CompressionLevel::Default => {
+                self.state.matcher.get_next_space()
+            }
+            _ => Vec::new(),
+        };
+        space.clear();
+        if space.capacity() < block_capacity {
+            space.reserve(block_capacity - space.capacity());
+        }
+        space
+    }
+
+    fn emit_full_pending_block(
+        &mut self,
+        block_capacity: usize,
+        consumed: usize,
+    ) -> Option<Result<usize, Error>> {
+        if self.pending.len() != block_capacity {
+            return None;
+        }
+
+        let new_pending = self.allocate_pending_space(block_capacity);
+        let full_block = mem::replace(&mut self.pending, new_pending);
+        if let Err((err, restored_block)) = self.encode_block(full_block, false) {
+            self.pending = restored_block;
+            let err = self.fail(err);
+            if consumed > 0 {
+                return Some(Ok(consumed));
+            }
+            return Some(Err(err));
+        }
+        None
     }
 
     fn ensure_level_supported(&self) -> Result<(), Error> {
@@ -246,6 +282,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn fail(&mut self, err: Error) -> Error {
         self.errored = true;
+        if self.last_error_kind.is_none() {
+            self.last_error_kind = Some(err.kind());
+        }
         err
     }
 
@@ -267,20 +306,15 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 
         self.ensure_frame_started()?;
         let block_capacity = self.block_capacity();
+        if self.pending.capacity() == 0 {
+            self.pending = self.allocate_pending_space(block_capacity);
+        }
         let mut remaining = buf;
         let mut consumed = 0usize;
 
         while !remaining.is_empty() {
-            if self.pending.len() == block_capacity {
-                let full_block = mem::take(&mut self.pending);
-                if let Err((err, restored_block)) = self.encode_block(full_block, false) {
-                    self.pending = restored_block;
-                    let err = self.fail(err);
-                    if consumed > 0 {
-                        return Ok(consumed);
-                    }
-                    return Err(err);
-                }
+            if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
+                return result;
             }
 
             let available = block_capacity - self.pending.len();
@@ -291,6 +325,10 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
             self.pending.extend_from_slice(&remaining[..to_take]);
             remaining = &remaining[to_take..];
             consumed += to_take;
+
+            if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
+                return result;
+            }
         }
         Ok(consumed)
     }
@@ -304,10 +342,23 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
                 self.pending = restored_block;
                 return Err(self.fail(err));
             }
+            let block_capacity = self.block_capacity();
+            self.pending = self.allocate_pending_space(block_capacity);
         }
         self.drain_mut()
             .and_then(|drain| drain.flush())
             .map_err(|err| self.fail(err))
+    }
+}
+
+fn error_from_kind(kind: ErrorKind) -> Error {
+    #[cfg(feature = "std")]
+    {
+        Error::from(kind)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        Error::from(kind)
     }
 }
 
@@ -327,7 +378,7 @@ fn other_error(message: &str) -> Error {
 mod tests {
     use crate::decoding::StreamingDecoder;
     use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
-    use crate::io::{Error, Read, Write};
+    use crate::io::{Error, ErrorKind, Read, Write};
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -398,6 +449,36 @@ mod tests {
                 return Err(super::other_error("injected write failure"));
             }
             self.sink.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct FailingWithKind {
+        writes: usize,
+        fail_on_write_number: usize,
+        kind: ErrorKind,
+    }
+
+    impl FailingWithKind {
+        fn new(fail_on_write_number: usize, kind: ErrorKind) -> Self {
+            Self {
+                writes: 0,
+                fail_on_write_number,
+                kind,
+            }
+        }
+    }
+
+    impl Write for FailingWithKind {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+            self.writes += 1;
+            if self.writes == self.fail_on_write_number {
+                return Err(Error::from(self.kind));
+            }
             Ok(buf.len())
         }
 
@@ -485,6 +566,30 @@ mod tests {
     }
 
     #[test]
+    fn block_boundary_write_emits_block_in_same_call() {
+        let mut boundary = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            Vec::new(),
+            CompressionLevel::Uncompressed,
+        );
+        let mut below = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            Vec::new(),
+            CompressionLevel::Uncompressed,
+        );
+
+        boundary.write_all(b"ABCD").unwrap();
+        below.write_all(b"ABC").unwrap();
+
+        let boundary_len = boundary.get_ref().unwrap().len();
+        let below_len = below.get_ref().unwrap().len();
+        assert!(
+            boundary_len > below_len,
+            "full block should be emitted immediately at block boundary"
+        );
+    }
+
+    #[test]
     fn finish_consumes_encoder_and_emits_frame() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.write_all(b"abc").unwrap();
@@ -553,6 +658,21 @@ mod tests {
         assert!(encoder.write_all(b"EFGH").is_err());
         assert_eq!(encoder.get_ref().unwrap().sink.len(), 0);
         assert!(encoder.finish().is_err());
+    }
+
+    #[test]
+    fn poisoned_encoder_returns_original_error_kind() {
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            FailingWithKind::new(1, ErrorKind::BrokenPipe),
+            CompressionLevel::Uncompressed,
+        );
+
+        let first_error = encoder.write_all(b"ABCD").unwrap_err();
+        assert_eq!(first_error.kind(), ErrorKind::BrokenPipe);
+
+        let second_error = encoder.write_all(b"EFGH").unwrap_err();
+        assert_eq!(second_error.kind(), ErrorKind::BrokenPipe);
     }
 
     #[test]
