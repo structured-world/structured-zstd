@@ -167,10 +167,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
-        self.state.last_huff_table = None;
-        self.state.fse_tables.ll_previous = None;
-        self.state.fse_tables.ml_previous = None;
-        self.state.fse_tables.of_previous = None;
         self.state.offset_hist = [1, 4, 8];
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
