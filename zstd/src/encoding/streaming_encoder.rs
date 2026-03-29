@@ -26,6 +26,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     compression_level: CompressionLevel,
     state: CompressState<M>,
     pending: Vec<u8>,
+    errored: bool,
     frame_started: bool,
     frame_finished: bool,
     #[cfg(feature = "hash")]
@@ -54,6 +55,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 offset_hist: [1, 4, 8],
             },
             pending: Vec::new(),
+            errored: false,
             frame_started: false,
             frame_finished: false,
             #[cfg(feature = "hash")]
@@ -74,26 +76,41 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.ensure_frame_started()?;
 
         if self.pending.is_empty() {
-            self.write_empty_last_block()?;
+            self.write_empty_last_block()
+                .map_err(|err| self.fail(err))?;
         } else {
-            let block = mem::take(&mut self.pending);
-            self.encode_block(block, true)?;
+            let mut block = Vec::new();
+            mem::swap(&mut self.pending, &mut block);
+            if let Err(err) = self.encode_block(&block, true) {
+                mem::swap(&mut self.pending, &mut block);
+                return Err(self.fail(err));
+            }
+            self.hash_block(&block);
         }
 
         #[cfg(feature = "hash")]
         {
             let checksum = self.hasher.finish() as u32;
-            self.drain_mut()?.write_all(&checksum.to_le_bytes())?;
+            self.drain_mut()
+                .and_then(|drain| drain.write_all(&checksum.to_le_bytes()))
+                .map_err(|err| self.fail(err))?;
         }
 
         self.frame_finished = true;
-        self.drain_mut()?.flush()?;
+        self.drain_mut()
+            .and_then(|drain| drain.flush())
+            .map_err(|err| self.fail(err))?;
         self.drain
             .take()
             .ok_or_else(|| other_error("streaming encoder drain already taken"))
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
+        if self.errored {
+            return Err(other_error(
+                "cannot use streaming encoder after a previous write failure",
+            ));
+        }
         if self.frame_finished {
             return Err(other_error(
                 "cannot write to a finished streaming encoder frame",
@@ -134,7 +151,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
-        self.drain_mut()?.write_all(&encoded_header)?;
+        self.drain_mut()
+            .and_then(|drain| drain.write_all(&encoded_header))
+            .map_err(|err| self.fail(err))?;
 
         self.frame_started = true;
         Ok(())
@@ -156,10 +175,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    fn encode_block(&mut self, uncompressed_data: Vec<u8>, last_block: bool) -> Result<(), Error> {
-        #[cfg(feature = "hash")]
-        self.hasher.write(&uncompressed_data);
-
+    fn encode_block(&mut self, uncompressed_data: &[u8], last_block: bool) -> Result<(), Error> {
         let mut encoded = Vec::new();
         if uncompressed_data.is_empty() {
             let header = BlockHeader {
@@ -177,10 +193,15 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         block_size: uncompressed_data.len() as u32,
                     };
                     header.serialize(&mut encoded);
-                    encoded.extend_from_slice(&uncompressed_data);
+                    encoded.extend_from_slice(uncompressed_data);
                 }
                 CompressionLevel::Fastest | CompressionLevel::Default => {
-                    compress_fastest(&mut self.state, last_block, uncompressed_data, &mut encoded);
+                    compress_fastest(
+                        &mut self.state,
+                        last_block,
+                        uncompressed_data.to_vec(),
+                        &mut encoded,
+                    );
                 }
                 _ => {
                     return Err(other_error(
@@ -194,8 +215,21 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     }
 
     fn write_empty_last_block(&mut self) -> Result<(), Error> {
-        self.encode_block(Vec::new(), true)
+        self.encode_block(&[], true)
     }
+
+    fn fail(&mut self, err: Error) -> Error {
+        self.errored = true;
+        err
+    }
+
+    #[cfg(feature = "hash")]
+    fn hash_block(&mut self, uncompressed_data: &[u8]) {
+        self.hasher.write(uncompressed_data);
+    }
+
+    #[cfg(not(feature = "hash"))]
+    fn hash_block(&mut self, _uncompressed_data: &[u8]) {}
 }
 
 impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
@@ -218,7 +252,11 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
             if self.pending.len() == block_capacity {
                 let mut full_block = Vec::new();
                 mem::swap(&mut self.pending, &mut full_block);
-                self.encode_block(full_block, false)?;
+                if let Err(err) = self.encode_block(&full_block, false) {
+                    mem::swap(&mut self.pending, &mut full_block);
+                    return Err(self.fail(err));
+                }
+                self.hash_block(&full_block);
             }
         }
         Ok(buf.len())
@@ -228,10 +266,17 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
         if !self.pending.is_empty() {
-            let block = mem::take(&mut self.pending);
-            self.encode_block(block, false)?;
+            let mut block = Vec::new();
+            mem::swap(&mut self.pending, &mut block);
+            if let Err(err) = self.encode_block(&block, false) {
+                mem::swap(&mut self.pending, &mut block);
+                return Err(self.fail(err));
+            }
+            self.hash_block(&block);
         }
-        self.drain_mut()?.flush()
+        self.drain_mut()
+            .and_then(|drain| drain.flush())
+            .map_err(|err| self.fail(err))
     }
 }
 
@@ -249,12 +294,11 @@ fn other_error(message: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-    use alloc::vec::Vec;
-
     use crate::decoding::StreamingDecoder;
     use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
-    use crate::io::{Read, Write};
+    use crate::io::{Error, Read, Write};
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     struct TinyMatcher {
         last_space: Vec<u8>,
@@ -297,6 +341,37 @@ mod tests {
 
         fn window_size(&self) -> u64 {
             self.window_size
+        }
+    }
+
+    struct FailingWriteOnce {
+        writes: usize,
+        fail_on_write_number: usize,
+        sink: Vec<u8>,
+    }
+
+    impl FailingWriteOnce {
+        fn new(fail_on_write_number: usize) -> Self {
+            Self {
+                writes: 0,
+                fail_on_write_number,
+                sink: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for FailingWriteOnce {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+            self.writes += 1;
+            if self.writes == self.fail_on_write_number {
+                return Err(Error::other("injected write failure"));
+            }
+            self.sink.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            Ok(())
         }
     }
 
@@ -384,6 +459,26 @@ mod tests {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
         assert!(encoder.write_all(b"payload").is_err());
         assert_eq!(encoder.get_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_failure_poisoning_is_sticky() {
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            FailingWriteOnce::new(2),
+            CompressionLevel::Uncompressed,
+        );
+
+        assert!(encoder.write_all(b"ABCD").is_err());
+        assert!(encoder.flush().is_err());
+        assert!(encoder.write_all(b"EFGH").is_err());
+        assert!(encoder.finish().is_err());
+
+        let written_len = encoder.get_ref().unwrap().sink.len();
+        assert!(
+            written_len > 0 && written_len <= 32,
+            "only frame header bytes should be written after first block write failure, got {written_len}"
+        );
     }
 
     #[test]

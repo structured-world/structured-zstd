@@ -1,7 +1,7 @@
 mod progress;
 use progress::ProgressMonitor;
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,13 +40,14 @@ enum Commands {
         /// - 0: Uncompressed
         /// - 1: Fastest
         /// - 2: Default
-        /// - 3: Better
-        /// - 4: Best
+        ///
+        /// Streaming mode currently supports only levels 0..=2.
         #[arg(
             short,
             long,
             value_name = "COMPRESSION_LEVEL",
             default_value_t = 2,
+            value_parser = clap::value_parser!(u8).range(0..=2),
             verbatim_doc_comment
         )]
         level: u8,
@@ -106,22 +107,41 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         0 => CompressionLevel::Uncompressed,
         1 => CompressionLevel::Fastest,
         2 => CompressionLevel::Default,
-        3 | 4 => {
-            return Err(eyre!(
-                "compression level {level} is not supported by streaming encoder yet (supported: 0, 1, 2)"
-            ));
-        }
         _ => return Err(eyre!("unsupported compression level: {level}")),
     };
-    let source_file = File::open(input).wrap_err("failed to open input file")?;
+    ensure_distinct_paths(&input, &output)?;
+
+    let source_file = File::open(&input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;
     let buffered_source = BufReader::new(source_file);
     let mut encoder_input = ProgressMonitor::new(buffered_source, source_size);
-    let output: File = File::create(output).wrap_err("failed to open output file for writing")?;
-    let mut encoder = structured_zstd::encoding::StreamingEncoder::new(output, compression_level);
-    std::io::copy(&mut encoder_input, &mut encoder).wrap_err("streaming compression failed")?;
-    let output = encoder.finish().wrap_err("failed to finalize zstd frame")?;
-    let compressed_size = output.metadata()?.len();
+
+    let temporary_output_path = create_temporary_output_path(&output);
+    let temporary_output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary_output_path)
+        .wrap_err("failed to create temporary output file")?;
+
+    let compression_result: color_eyre::Result<File> = (|| {
+        let mut encoder =
+            structured_zstd::encoding::StreamingEncoder::new(temporary_output, compression_level);
+        std::io::copy(&mut encoder_input, &mut encoder).wrap_err("streaming compression failed")?;
+        encoder.finish().wrap_err("failed to finalize zstd frame")
+    })();
+
+    let temporary_output = match compression_result {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = fs::remove_file(&temporary_output_path);
+            return Err(err);
+        }
+    };
+
+    let compressed_size = temporary_output.metadata()?.len();
+    drop(temporary_output);
+    replace_output_file(&temporary_output_path, &output)?;
+
     let compression_ratio = compressed_size as f64 / source_size as f64 * 100.0;
     info!(
         "{} ——> {} ({compression_ratio:.2}%)",
@@ -129,6 +149,52 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         fmt_size(compressed_size as f64)
     );
     Ok(())
+}
+
+fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> {
+    let canonical_input = fs::canonicalize(input).wrap_err("failed to canonicalize input file")?;
+    if let Ok(canonical_output) = fs::canonicalize(output)
+        && canonical_input == canonical_output
+    {
+        return Err(eyre!(
+            "input and output paths refer to the same file: {input:?} -> {output:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn create_temporary_output_path(output: &Path) -> PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output.zst");
+    for attempt in 0..u16::MAX {
+        let candidate = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            attempt
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!(".{file_name}.tmp.{}", std::process::id()))
+}
+
+#[cfg(not(windows))]
+fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
+    fs::rename(temporary_output_path, output)
+        .wrap_err("failed to move temporary output file into final location")
+}
+
+#[cfg(windows)]
+fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
+    if output.exists() {
+        fs::remove_file(output).wrap_err("failed to replace existing output file")?;
+    }
+    fs::rename(temporary_output_path, output)
+        .wrap_err("failed to move temporary output file into final location")
 }
 
 fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
@@ -167,6 +233,12 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use clap::Parser;
+
+    use super::{Cli, compress};
     use std::path::PathBuf;
 
     use crate::add_extension;
@@ -178,5 +250,30 @@ mod tests {
             add_extension(&filename, ".zst"),
             PathBuf::from("README.md.zst")
         );
+    }
+
+    #[test]
+    fn cli_rejects_unsupported_compression_level_at_parse_time() {
+        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "3"]);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn compress_rejects_same_input_and_output_paths() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let input = std::env::temp_dir().join(format!("structured-zstd-cli-alias-{unique}.txt"));
+        fs::write(&input, b"streaming-cli-alias-check").unwrap();
+
+        let err = compress(input.clone(), input.clone(), 2).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("input and output"),
+            "unexpected error: {message}"
+        );
+
+        let _ = fs::remove_file(input);
     }
 }
