@@ -181,7 +181,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         let mut raw_block = Some(uncompressed_data);
         let mut encoded = Vec::new();
         let mut moved_into_matcher = false;
-        if raw_block.as_ref().map_or(false, |block| block.is_empty()) {
+        if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
