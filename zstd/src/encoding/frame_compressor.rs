@@ -190,6 +190,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state
             .last_huff_table
             .clone_from(&cached_entropy.and_then(|cache| cache.huff.clone()));
+        // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
+        // reusing existing allocations where possible instead of reallocating every frame.
         self.state
             .fse_tables
             .ll_previous
@@ -734,6 +736,46 @@ mod tests {
         );
 
         let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn dictionary_roundtrip_stays_valid_after_output_exceeds_window() {
+        use crate::encoding::match_generator::MatchGeneratorDriver;
+
+        let dict_id = 0xABCD_0002;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+            .expect("raw dictionary should be valid");
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+                .expect("raw dictionary should be valid");
+
+        let payload = b"abcdefgh".repeat(512);
+        let mut output = Vec::new();
+        let matcher = MatchGeneratorDriver::new(8, 1);
+        let mut compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        let advertised_window = frame_header
+            .window_size()
+            .expect("window size should be present");
+        assert!(
+            payload.len() > advertised_window as usize,
+            "test must cross the advertised window boundary"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
