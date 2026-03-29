@@ -39,9 +39,19 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
+    dictionary: Option<crate::decoding::Dictionary>,
+    dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     state: CompressState<M>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
+}
+
+#[derive(Clone, Default)]
+struct CachedDictionaryEntropy {
+    huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    ll_previous: Option<PreviousFseTable>,
+    ml_previous: Option<PreviousFseTable>,
+    of_previous: Option<PreviousFseTable>,
 }
 
 #[derive(Clone)]
@@ -99,6 +109,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             uncompressed_data: None,
             compressed_data: None,
             compression_level,
+            dictionary: None,
+            dictionary_entropy_cache: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
@@ -117,6 +129,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         Self {
             uncompressed_data: None,
             compressed_data: None,
+            dictionary: None,
+            dictionary_entropy_cache: None,
             state: CompressState {
                 matcher,
                 last_huff_table: None,
@@ -153,11 +167,48 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compress(&mut self) {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
-        self.state.last_huff_table = None;
-        self.state.fse_tables.ll_previous = None;
-        self.state.fse_tables.ml_previous = None;
-        self.state.fse_tables.of_previous = None;
         self.state.offset_hist = [1, 4, 8];
+        let use_dictionary_state =
+            !matches!(self.compression_level, CompressionLevel::Uncompressed)
+                && self.state.matcher.supports_dictionary_priming();
+        let cached_entropy = if use_dictionary_state {
+            self.dictionary_entropy_cache.as_ref()
+        } else {
+            None
+        };
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
+            // This state drives sequence encoding, while matcher priming below updates
+            // the match generator's internal repeat-offset history for match finding.
+            self.state.offset_hist = dict.offset_hist;
+            self.state
+                .matcher
+                .prime_with_dictionary(dict.dict_content.as_slice(), dict.offset_hist);
+        }
+        if let Some(cache) = cached_entropy {
+            self.state.last_huff_table.clone_from(&cache.huff);
+        } else {
+            self.state.last_huff_table = None;
+        }
+        // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
+        // reusing existing allocations where possible instead of reallocating every frame.
+        if let Some(cache) = cached_entropy {
+            self.state
+                .fse_tables
+                .ll_previous
+                .clone_from(&cache.ll_previous);
+            self.state
+                .fse_tables
+                .ml_previous
+                .clone_from(&cache.ml_previous);
+            self.state
+                .fse_tables
+                .of_previous
+                .clone_from(&cache.of_previous);
+        } else {
+            self.state.fse_tables.ll_previous = None;
+            self.state.fse_tables.ml_previous = None;
+            self.state.fse_tables.of_previous = None;
+        }
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -171,7 +222,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             frame_content_size: None,
             single_segment: false,
             content_checksum: cfg!(feature = "hash"),
-            dictionary_id: None,
+            dictionary_id: if use_dictionary_state {
+                self.dictionary.as_ref().map(|dict| dict.id as u64)
+            } else {
+                None
+            },
             window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);
@@ -301,16 +356,121 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compression_level(&self) -> CompressionLevel {
         self.compression_level
     }
+
+    /// Attach a pre-parsed dictionary to be used for subsequent compressions.
+    ///
+    /// In compressed modes, the dictionary id is written only when the active
+    /// matcher supports dictionary priming.
+    /// Uncompressed mode and non-priming matchers ignore the attached dictionary
+    /// at encode time.
+    pub fn set_dictionary(
+        &mut self,
+        dictionary: crate::decoding::Dictionary,
+    ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
+    {
+        if dictionary.id == 0 {
+            return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
+        }
+        if let Some(index) = dictionary.offset_hist.iter().position(|&rep| rep == 0) {
+            return Err(
+                crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {
+                    index: index as u8,
+                },
+            );
+        }
+        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
+            huff: dictionary.huf.table.to_encoder_table(),
+            ll_previous: dictionary
+                .fse
+                .literal_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+            ml_previous: dictionary
+                .fse
+                .match_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+            of_previous: dictionary
+                .fse
+                .offsets
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+        });
+        Ok(self.dictionary.replace(dictionary))
+    }
+
+    /// Parse and attach a serialized dictionary blob.
+    pub fn set_dictionary_from_bytes(
+        &mut self,
+        raw_dictionary: &[u8],
+    ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
+    {
+        let dictionary = crate::decoding::Dictionary::decode_dict(raw_dictionary)?;
+        self.set_dictionary(dictionary)
+    }
+
+    /// Remove the attached dictionary.
+    pub fn clear_dictionary(&mut self) -> Option<crate::decoding::Dictionary> {
+        self.dictionary_entropy_cache = None;
+        self.dictionary.take()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "dict_builder", feature = "std"))]
+    use alloc::format;
     use alloc::vec;
 
     use super::FrameCompressor;
     use crate::common::MAGIC_NUM;
     use crate::decoding::FrameDecoder;
+    use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    struct NoDictionaryMatcher {
+        last_space: Vec<u8>,
+        window_size: u64,
+    }
+
+    impl NoDictionaryMatcher {
+        fn new(window_size: u64) -> Self {
+            Self {
+                last_space: Vec::new(),
+                window_size,
+            }
+        }
+    }
+
+    impl Matcher for NoDictionaryMatcher {
+        fn get_next_space(&mut self) -> Vec<u8> {
+            vec![0; self.window_size as usize]
+        }
+
+        fn get_last_space(&mut self) -> &[u8] {
+            self.last_space.as_slice()
+        }
+
+        fn commit_space(&mut self, space: Vec<u8>) {
+            self.last_space = space;
+        }
+
+        fn skip_matching(&mut self) {}
+
+        fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+            handle_sequence(Sequence::Literals {
+                literals: self.last_space.as_slice(),
+            });
+        }
+
+        fn reset(&mut self, _level: super::CompressionLevel) {
+            self.last_space.clear();
+        }
+
+        fn window_size(&self) -> u64 {
+            self.window_size
+        }
+    }
 
     #[test]
     fn frame_starts_with_magic_num() {
@@ -393,6 +553,342 @@ mod tests {
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
         assert_eq!(mock_data, decoded);
+    }
+
+    #[test]
+    fn dictionary_compression_sets_required_dict_id_and_roundtrips() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_for_encoder = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let dict_for_decoder = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+
+        let mut data = Vec::new();
+        for _ in 0..8 {
+            data.extend_from_slice(&dict_for_decoder.dict_content[..2048]);
+        }
+
+        let mut with_dict = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let previous = compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        assert!(
+            previous.is_none(),
+            "first dictionary insert should return None"
+        );
+        assert_eq!(
+            compressor
+                .set_dictionary(dict_for_encoder)
+                .expect("valid dictionary should attach")
+                .expect("set_dictionary_from_bytes inserted previous dictionary")
+                .id,
+            dict_for_decoder.id
+        );
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut with_dict);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(with_dict.as_slice())
+            .expect("encoded stream should have a frame header");
+        assert_eq!(frame_header.dictionary_id(), Some(dict_for_decoder.id));
+
+        let mut decoder = FrameDecoder::new();
+        let mut missing_dict_target = Vec::with_capacity(data.len());
+        let err = decoder
+            .decode_all_to_vec(&with_dict, &mut missing_dict_target)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::decoding::errors::FrameDecoderError::DictNotProvided { .. }
+            ),
+            "dict-compressed stream should require dictionary id, got: {err:?}"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(data.len());
+        decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+
+        let mut ffi_decoder = zstd::bulk::Decompressor::with_dictionary(dict_raw).unwrap();
+        let mut ffi_decoded = Vec::with_capacity(data.len());
+        let ffi_written = ffi_decoder
+            .decompress_to_buffer(with_dict.as_slice(), &mut ffi_decoded)
+            .unwrap();
+        assert_eq!(ffi_written, data.len());
+        assert_eq!(ffi_decoded, data);
+    }
+
+    #[cfg(all(feature = "dict_builder", feature = "std"))]
+    #[test]
+    fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
+        use std::io::Cursor;
+
+        let mut training = Vec::new();
+        for idx in 0..256u32 {
+            training.extend_from_slice(
+                format!("tenant=demo table=orders key={idx} region=eu\n").as_bytes(),
+            );
+        }
+        let mut raw_dict = Vec::new();
+        crate::dictionary::create_raw_dict_from_source(
+            Cursor::new(training.as_slice()),
+            training.len(),
+            &mut raw_dict,
+            4096,
+        );
+        assert!(
+            !raw_dict.is_empty(),
+            "dict_builder produced an empty dictionary"
+        );
+
+        let dict_id = 0xD1C7_0008;
+        let encoder_dict =
+            crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
+        let decoder_dict =
+            crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
+
+        let mut payload = Vec::new();
+        for idx in 0..96u32 {
+            payload.extend_from_slice(
+                format!(
+                    "tenant=demo table=orders op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n"
+                )
+                .as_bytes(),
+            );
+        }
+
+        let mut without_dict = Vec::new();
+        let mut baseline = FrameCompressor::new(super::CompressionLevel::Fastest);
+        baseline.set_source(payload.as_slice());
+        baseline.set_drain(&mut without_dict);
+        baseline.compress();
+
+        let mut with_dict = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(encoder_dict)
+            .expect("valid dict_builder dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut with_dict);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(with_dict.as_slice())
+            .expect("encoded stream should have a frame header");
+        assert_eq!(frame_header.dictionary_id(), Some(dict_id));
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(decoder_dict).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(
+            with_dict.len() < without_dict.len(),
+            "trained dictionary should improve compression for this small payload"
+        );
+    }
+
+    #[test]
+    fn set_dictionary_from_bytes_seeds_entropy_tables_for_first_block() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let mut output = Vec::new();
+        let input = b"";
+
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let previous = compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        assert!(previous.is_none());
+
+        compressor.set_source(input.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        assert!(
+            compressor.state.last_huff_table.is_some(),
+            "dictionary entropy should seed previous huffman table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.ll_previous.is_some(),
+            "dictionary entropy should seed previous ll table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.ml_previous.is_some(),
+            "dictionary entropy should seed previous ml table before first block"
+        );
+        assert!(
+            compressor.state.fse_tables.of_previous.is_some(),
+            "dictionary entropy should seed previous of table before first block"
+        );
+    }
+
+    #[test]
+    fn set_dictionary_rejects_zero_dictionary_id() {
+        let invalid = crate::decoding::Dictionary {
+            id: 0,
+            fse: crate::decoding::scratch::FSEScratch::new(),
+            huf: crate::decoding::scratch::HuffmanScratch::new(),
+            dict_content: vec![1, 2, 3],
+            offset_hist: [1, 4, 8],
+        };
+
+        let mut compressor: FrameCompressor<
+            &[u8],
+            Vec<u8>,
+            crate::encoding::match_generator::MatchGeneratorDriver,
+        > = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let result = compressor.set_dictionary(invalid);
+        assert!(matches!(
+            result,
+            Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId)
+        ));
+    }
+
+    #[test]
+    fn set_dictionary_rejects_zero_repeat_offsets() {
+        let invalid = crate::decoding::Dictionary {
+            id: 1,
+            fse: crate::decoding::scratch::FSEScratch::new(),
+            huf: crate::decoding::scratch::HuffmanScratch::new(),
+            dict_content: vec![1, 2, 3],
+            offset_hist: [0, 4, 8],
+        };
+
+        let mut compressor: FrameCompressor<
+            &[u8],
+            Vec<u8>,
+            crate::encoding::match_generator::MatchGeneratorDriver,
+        > = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let result = compressor.set_dictionary(invalid);
+        assert!(matches!(
+            result,
+            Err(
+                crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {
+                    index: 0
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn uncompressed_mode_does_not_require_dictionary() {
+        let dict_id = 0xABCD_0001;
+        let dict =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"shared-history".to_vec())
+                .expect("raw dictionary should be valid");
+
+        let payload = b"plain-bytes-that-should-stay-raw";
+        let mut output = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach in uncompressed mode");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            None,
+            "raw/uncompressed frames must not advertise dictionary dependency"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn dictionary_roundtrip_stays_valid_after_output_exceeds_window() {
+        use crate::encoding::match_generator::MatchGeneratorDriver;
+
+        let dict_id = 0xABCD_0002;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+            .expect("raw dictionary should be valid");
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+                .expect("raw dictionary should be valid");
+
+        let payload = b"abcdefgh".repeat(512);
+        let matcher = MatchGeneratorDriver::new(8, 1);
+
+        let mut no_dict_output = Vec::new();
+        let mut no_dict_compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        no_dict_compressor.set_source(payload.as_slice());
+        no_dict_compressor.set_drain(&mut no_dict_output);
+        no_dict_compressor.compress();
+        let (no_dict_frame_header, _) =
+            crate::decoding::frame::read_frame_header(no_dict_output.as_slice())
+                .expect("baseline frame should have a header");
+        let no_dict_window = no_dict_frame_header
+            .window_size()
+            .expect("window size should be present");
+
+        let mut output = Vec::new();
+        let matcher = MatchGeneratorDriver::new(8, 1);
+        let mut compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        let advertised_window = frame_header
+            .window_size()
+            .expect("window size should be present");
+        assert_eq!(
+            advertised_window, no_dict_window,
+            "dictionary priming must not inflate advertised window size"
+        );
+        assert!(
+            payload.len() > advertised_window as usize,
+            "test must cross the advertised window boundary"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn custom_matcher_without_dictionary_priming_does_not_advertise_dict_id() {
+        let dict_id = 0xABCD_0003;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
+            .expect("raw dictionary should be valid");
+        let payload = b"abcdefghabcdefgh";
+
+        let mut output = Vec::new();
+        let matcher = NoDictionaryMatcher::new(64);
+        let mut compressor =
+            FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(dict)
+            .expect("dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            None,
+            "matchers that do not support dictionary priming must not advertise dictionary dependency"
+        );
+
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[cfg(feature = "hash")]

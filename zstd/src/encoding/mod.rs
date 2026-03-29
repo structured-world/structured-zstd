@@ -95,6 +95,14 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// Prime matcher state with dictionary history before compressing the next frame.
+    /// Default implementation is a no-op for custom matchers that do not support this.
+    fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}
+    /// Returns whether this matcher can consume dictionary priming state and produce
+    /// dictionary-dependent sequences. Defaults to `false` for custom matchers.
+    fn supports_dictionary_priming(&self) -> bool {
+        false
+    }
     /// The size of the window the decoder will need to execute all sequences produced by this matcher
     ///
     /// May change after a call to reset with a different compression level

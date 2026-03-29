@@ -111,6 +111,28 @@ impl HuffmanTable {
         self.fse_table.reset();
     }
 
+    /// Build the equivalent encoder-side Huffman table from parsed weights.
+    pub(crate) fn to_encoder_table(&self) -> Option<crate::huff0::huff0_encoder::HuffmanTable> {
+        if self.bits.is_empty() || self.max_num_bits == 0 {
+            return None;
+        }
+
+        let max_bits = usize::from(self.max_num_bits);
+        let weights = self
+            .bits
+            .iter()
+            .copied()
+            .map(|num_bits| {
+                if num_bits == 0 {
+                    0
+                } else {
+                    max_bits - usize::from(num_bits) + 1
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(crate::huff0::huff0_encoder::HuffmanTable::build_from_weights(&weights))
+    }
+
     /// Read from `source` and decode the input, populating the huffman decoding table.
     ///
     /// Returns the number of bytes read.

@@ -42,6 +42,12 @@ pub struct MatchGeneratorDriver {
     slice_size: usize,
     base_slice_size: usize,
     base_window_size: usize,
+    // Frame header window size must stay at the configured live-window budget.
+    // Dictionary retention expands internal matcher capacity only.
+    reported_window_size: usize,
+    // Tracks currently retained bytes that originated from primed dictionary
+    // history and have not been evicted yet.
+    dictionary_retained_budget: usize,
 }
 
 impl MatchGeneratorDriver {
@@ -58,6 +64,8 @@ impl MatchGeneratorDriver {
             slice_size,
             base_slice_size: slice_size,
             base_window_size: max_window_size,
+            reported_window_size: max_window_size,
+            dictionary_retained_budget: 0,
         }
     }
 
@@ -107,11 +115,71 @@ impl MatchGeneratorDriver {
             .as_mut()
             .expect("dfast backend must be initialized by reset() before use")
     }
+
+    fn retire_dictionary_budget(&mut self, evicted_bytes: usize) {
+        let reclaimed = evicted_bytes.min(self.dictionary_retained_budget);
+        if reclaimed == 0 {
+            return;
+        }
+        self.dictionary_retained_budget -= reclaimed;
+        match self.active_backend {
+            MatcherBackend::Simple => {
+                self.match_generator.max_window_size = self
+                    .match_generator
+                    .max_window_size
+                    .saturating_sub(reclaimed);
+            }
+            MatcherBackend::Dfast => {
+                let matcher = self.dfast_matcher_mut();
+                matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
+            }
+        }
+    }
+
+    fn trim_after_budget_retire(&mut self) {
+        loop {
+            let mut evicted_bytes = 0usize;
+            match self.active_backend {
+                MatcherBackend::Simple => {
+                    let vec_pool = &mut self.vec_pool;
+                    let suffix_pool = &mut self.suffix_pool;
+                    self.match_generator.reserve(0, |mut data, mut suffixes| {
+                        evicted_bytes += data.len();
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                        suffixes.slots.clear();
+                        suffixes.slots.resize(suffixes.slots.capacity(), None);
+                        suffix_pool.push(suffixes);
+                    });
+                }
+                MatcherBackend::Dfast => {
+                    let mut retired = Vec::new();
+                    self.dfast_matcher_mut().trim_to_window(|data| {
+                        evicted_bytes += data.len();
+                        retired.push(data);
+                    });
+                    for mut data in retired {
+                        data.resize(data.capacity(), 0);
+                        self.vec_pool.push(data);
+                    }
+                }
+            }
+            if evicted_bytes == 0 {
+                break;
+            }
+            self.retire_dictionary_budget(evicted_bytes);
+        }
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
+    fn supports_dictionary_priming(&self) -> bool {
+        true
+    }
+
     fn reset(&mut self, level: CompressionLevel) {
         let (backend, slice_size, max_window_size, hash_fill_step) = self.level_config(level);
+        self.dictionary_retained_budget = 0;
         if self.active_backend != backend {
             match self.active_backend {
                 MatcherBackend::Simple => {
@@ -139,6 +207,7 @@ impl Matcher for MatchGeneratorDriver {
 
         self.active_backend = backend;
         self.slice_size = slice_size;
+        self.reported_window_size = max_window_size;
         match self.active_backend {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
@@ -167,11 +236,79 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn window_size(&self) -> u64 {
+    fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.max_window_size as u64,
-            MatcherBackend::Dfast => self.dfast_matcher().max_window_size as u64,
+            MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
+            MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
         }
+
+        if dict_content.is_empty() {
+            return;
+        }
+
+        // Dictionary bytes should stay addressable until produced frame output
+        // itself exceeds the live window size.
+        let retained_dict_budget = dict_content.len();
+        match self.active_backend {
+            MatcherBackend::Simple => {
+                self.match_generator.max_window_size = self
+                    .match_generator
+                    .max_window_size
+                    .saturating_add(retained_dict_budget);
+            }
+            MatcherBackend::Dfast => {
+                let matcher = self.dfast_matcher_mut();
+                matcher.max_window_size =
+                    matcher.max_window_size.saturating_add(retained_dict_budget);
+            }
+        }
+
+        let mut start = 0usize;
+        let mut committed_dict_budget = 0usize;
+        let min_primed_tail = match self.active_backend {
+            MatcherBackend::Simple => MIN_MATCH_LEN,
+            MatcherBackend::Dfast => 4,
+        };
+        while start < dict_content.len() {
+            let end = (start + self.slice_size).min(dict_content.len());
+            if end - start < min_primed_tail {
+                break;
+            }
+            let mut space = self.get_next_space();
+            space.clear();
+            space.extend_from_slice(&dict_content[start..end]);
+            self.commit_space(space);
+            self.skip_matching();
+            committed_dict_budget += end - start;
+            start = end;
+        }
+
+        let uncommitted_tail_budget = retained_dict_budget.saturating_sub(committed_dict_budget);
+        if uncommitted_tail_budget > 0 {
+            match self.active_backend {
+                MatcherBackend::Simple => {
+                    self.match_generator.max_window_size = self
+                        .match_generator
+                        .max_window_size
+                        .saturating_sub(uncommitted_tail_budget);
+                }
+                MatcherBackend::Dfast => {
+                    let matcher = self.dfast_matcher_mut();
+                    matcher.max_window_size = matcher
+                        .max_window_size
+                        .saturating_sub(uncommitted_tail_budget);
+                }
+            }
+        }
+        if committed_dict_budget > 0 {
+            self.dictionary_retained_budget = self
+                .dictionary_retained_budget
+                .saturating_add(committed_dict_budget);
+        }
+    }
+
+    fn window_size(&self) -> u64 {
+        self.reported_window_size as u64
     }
 
     fn get_next_space(&mut self) -> Vec<u8> {
@@ -193,6 +330,7 @@ impl Matcher for MatchGeneratorDriver {
         match self.active_backend {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
+                let mut evicted_bytes = 0usize;
                 let suffixes = self
                     .suffix_pool
                     .pop()
@@ -200,22 +338,29 @@ impl Matcher for MatchGeneratorDriver {
                 let suffix_pool = &mut self.suffix_pool;
                 self.match_generator
                     .add_data(space, suffixes, |mut data, mut suffixes| {
+                        evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
                         suffixes.slots.clear();
                         suffixes.slots.resize(suffixes.slots.capacity(), None);
                         suffix_pool.push(suffixes);
                     });
+                self.retire_dictionary_budget(evicted_bytes);
+                self.trim_after_budget_retire();
             }
             MatcherBackend::Dfast => {
                 let vec_pool = &mut self.vec_pool;
+                let mut evicted_bytes = 0usize;
                 self.dfast_match_generator
                     .as_mut()
                     .expect("dfast backend must be initialized by reset() before use")
                     .add_data(space, |mut data| {
+                        evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
                     });
+                self.retire_dictionary_budget(evicted_bytes);
+                self.trim_after_budget_retire();
             }
         }
     }
@@ -276,6 +421,11 @@ impl SuffixStore {
 
     #[inline(always)]
     fn key(&self, suffix: &[u8]) -> usize {
+        // Capacity=1 yields len_log=0; shifting by 64 would panic.
+        if self.len_log == 0 {
+            return 0;
+        }
+
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
@@ -767,17 +917,26 @@ impl DfastMatchGenerator {
     fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         while self.window_size + data.len() > self.max_window_size {
-            let mut removed = self.window.pop_front().unwrap();
+            let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
             self.history_start += removed.len();
             self.history_abs_start += removed.len();
-            removed.resize(removed.capacity(), 0);
             reuse_space(removed);
         }
         self.compact_history();
         self.history.extend_from_slice(&data);
         self.window_size += data.len();
         self.window.push_back(data);
+    }
+
+    fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+        while self.window_size > self.max_window_size {
+            let removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            reuse_space(removed);
+        }
     }
 
     fn skip_matching(&mut self) {
@@ -1293,6 +1452,249 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 }
 
 #[test]
+fn prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "first full block should still match dictionary-primed history"
+    );
+}
+
+#[test]
+fn prime_with_large_dictionary_preserves_early_history_until_first_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 24
+            && match_len >= MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "dictionary bytes should remain addressable until frame output exceeds the live window"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.prime_with_dictionary(&[], [11, 7, 3]);
+
+    assert_eq!(driver.match_generator.offset_hist, [11, 7, 3]);
+}
+
+#[test]
+fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= DFAST_MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "dfast backend should match dictionary-primed history in first full block"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_does_not_inflate_reported_window_size() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let before = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    let after = driver.window_size();
+
+    assert_eq!(
+        after, before,
+        "dictionary retention budget must not change reported frame window size"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
+    let mut driver = MatchGeneratorDriver::new(8, 2);
+    driver.reset(CompressionLevel::Fastest);
+
+    // This dictionary leaves a 1-byte tail chunk (capacity=1 suffix table),
+    // which should never be committed to the matcher window.
+    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
+
+    assert!(
+        driver
+            .match_generator
+            .window
+            .iter()
+            .all(|entry| entry.data.len() >= MIN_MATCH_LEN),
+        "dictionary priming must not commit tails shorter than MIN_MATCH_LEN"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_counts_only_committed_tail_budget() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let before = driver.match_generator.max_window_size;
+    // One full slice plus a 1-byte tail that cannot be committed.
+    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
+
+    assert_eq!(
+        driver.match_generator.max_window_size,
+        before + 8,
+        "retention budget must account only for dictionary bytes actually committed to history"
+    );
+}
+
+#[test]
+fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+
+    let before = driver.dfast_matcher().max_window_size;
+    // One full slice plus a 4-byte tail. Dfast can still use this tail through
+    // short-hash overlap into the next block, so it should stay retained.
+    driver.prime_with_dictionary(b"abcdefghijkl", [1, 4, 8]);
+
+    assert_eq!(
+        driver.dfast_matcher().max_window_size,
+        before + 12,
+        "dfast retention budget should include 4-byte dictionary tails"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Fastest);
+
+    let base_window = driver.match_generator.max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.match_generator.max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.match_generator.max_window_size, base_window,
+        "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+    // Use a small live window in this regression so dictionary-primed slices are
+    // evicted quickly and budget retirement can be asserted deterministically.
+    driver.dfast_matcher_mut().max_window_size = 8;
+    driver.reported_window_size = 8;
+
+    let base_window = driver.dfast_matcher().max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.dfast_matcher().max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.dfast_matcher().max_window_size,
+        base_window,
+        "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn suffix_store_with_single_slot_does_not_panic_on_keying() {
+    let mut suffixes = SuffixStore::with_capacity(1);
+    suffixes.insert(b"abcde", 0);
+    assert!(suffixes.contains_key(b"abcde"));
+    assert_eq!(suffixes.get(b"abcde"), Some(0));
+}
+
+#[test]
 fn fastest_reset_uses_interleaved_hash_fill_step() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
@@ -1529,6 +1931,55 @@ fn dfast_skip_matching_handles_window_eviction() {
     });
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
+}
+
+#[test]
+fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
+    let mut matcher = DfastMatchGenerator::new(8);
+
+    let mut first = Vec::with_capacity(64);
+    first.extend_from_slice(b"abcdefgh");
+    matcher.add_data(first, |_| {});
+
+    let mut second = Vec::with_capacity(64);
+    second.extend_from_slice(b"ijklmnop");
+
+    let mut observed_evicted_len = None;
+    matcher.add_data(second, |data| {
+        observed_evicted_len = Some(data.len());
+    });
+
+    assert_eq!(
+        observed_evicted_len,
+        Some(8),
+        "eviction callback must report evicted byte length, not backing capacity"
+    );
+}
+
+#[test]
+fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
+    let mut matcher = DfastMatchGenerator::new(16);
+
+    let mut first = Vec::with_capacity(64);
+    first.extend_from_slice(b"abcdefgh");
+    matcher.add_data(first, |_| {});
+
+    let mut second = Vec::with_capacity(64);
+    second.extend_from_slice(b"ijklmnop");
+    matcher.add_data(second, |_| {});
+
+    matcher.max_window_size = 8;
+
+    let mut observed_evicted_len = None;
+    matcher.trim_to_window(|data| {
+        observed_evicted_len = Some(data.len());
+    });
+
+    assert_eq!(
+        observed_evicted_len,
+        Some(8),
+        "trim callback must report evicted byte length, not backing capacity"
+    );
 }
 
 #[test]
