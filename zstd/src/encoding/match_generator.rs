@@ -917,11 +917,10 @@ impl DfastMatchGenerator {
     fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         while self.window_size + data.len() > self.max_window_size {
-            let mut removed = self.window.pop_front().unwrap();
+            let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
             self.history_start += removed.len();
             self.history_abs_start += removed.len();
-            removed.resize(removed.capacity(), 0);
             reuse_space(removed);
         }
         self.compact_history();
@@ -932,11 +931,10 @@ impl DfastMatchGenerator {
 
     fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
         while self.window_size > self.max_window_size {
-            let mut removed = self.window.pop_front().unwrap();
+            let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
             self.history_start += removed.len();
             self.history_abs_start += removed.len();
-            removed.resize(removed.capacity(), 0);
             reuse_space(removed);
         }
     }
@@ -1933,6 +1931,55 @@ fn dfast_skip_matching_handles_window_eviction() {
     });
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
+}
+
+#[test]
+fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
+    let mut matcher = DfastMatchGenerator::new(8);
+
+    let mut first = Vec::with_capacity(64);
+    first.extend_from_slice(b"abcdefgh");
+    matcher.add_data(first, |_| {});
+
+    let mut second = Vec::with_capacity(64);
+    second.extend_from_slice(b"ijklmnop");
+
+    let mut observed_evicted_len = None;
+    matcher.add_data(second, |data| {
+        observed_evicted_len = Some(data.len());
+    });
+
+    assert_eq!(
+        observed_evicted_len,
+        Some(8),
+        "eviction callback must report evicted byte length, not backing capacity"
+    );
+}
+
+#[test]
+fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
+    let mut matcher = DfastMatchGenerator::new(16);
+
+    let mut first = Vec::with_capacity(64);
+    first.extend_from_slice(b"abcdefgh");
+    matcher.add_data(first, |_| {});
+
+    let mut second = Vec::with_capacity(64);
+    second.extend_from_slice(b"ijklmnop");
+    matcher.add_data(second, |_| {});
+
+    matcher.max_window_size = 8;
+
+    let mut observed_evicted_len = None;
+    matcher.trim_to_window(|data| {
+        observed_evicted_len = Some(data.len());
+    });
+
+    assert_eq!(
+        observed_evicted_len,
+        Some(8),
+        "trim callback must report evicted byte length, not backing capacity"
+    );
 }
 
 #[test]

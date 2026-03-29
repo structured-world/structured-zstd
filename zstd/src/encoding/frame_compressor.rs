@@ -195,18 +195,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
-        self.state
-            .fse_tables
-            .ll_previous
-            .clone_from(&cached_entropy.and_then(|cache| cache.ll_previous.clone()));
-        self.state
-            .fse_tables
-            .ml_previous
-            .clone_from(&cached_entropy.and_then(|cache| cache.ml_previous.clone()));
-        self.state
-            .fse_tables
-            .of_previous
-            .clone_from(&cached_entropy.and_then(|cache| cache.of_previous.clone()));
+        if let Some(cache) = cached_entropy {
+            self.state
+                .fse_tables
+                .ll_previous
+                .clone_from(&cache.ll_previous);
+            self.state
+                .fse_tables
+                .ml_previous
+                .clone_from(&cache.ml_previous);
+            self.state
+                .fse_tables
+                .of_previous
+                .clone_from(&cache.of_previous);
+        } else {
+            self.state.fse_tables.ll_previous = None;
+            self.state.fse_tables.ml_previous = None;
+            self.state.fse_tables.of_previous = None;
+        }
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
