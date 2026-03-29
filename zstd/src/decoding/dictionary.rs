@@ -61,8 +61,9 @@ impl Dictionary {
         })
     }
 
-    /// Parses the dictionary from `raw` and set the tables
-    /// it returns the dict_id for checking with the frame's `dict_id``
+    /// Parses the dictionary from `raw`, initializes its tables,
+    /// and returns a fully constructed [`Dictionary`] whose `id` can be
+    /// checked against the frame's `dict_id`.
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
         const MIN_MAGIC_AND_ID_LEN: usize = 8;
         const OFFSET_HISTORY_LEN: usize = 12;

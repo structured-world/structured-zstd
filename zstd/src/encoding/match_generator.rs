@@ -201,9 +201,13 @@ impl Matcher for MatchGeneratorDriver {
 
         let mut start = 0usize;
         let mut committed_dict_budget = 0usize;
+        let min_primed_tail = match self.active_backend {
+            MatcherBackend::Simple => MIN_MATCH_LEN,
+            MatcherBackend::Dfast => 4,
+        };
         while start < dict_content.len() {
             let end = (start + self.slice_size).min(dict_content.len());
-            if end - start < MIN_MATCH_LEN {
+            if end - start < min_primed_tail {
                 break;
             }
             let mut space = self.get_next_space();
@@ -1494,19 +1498,13 @@ fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
     // which should never be committed to the matcher window.
     driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for block in [b"mnopqrstu", b"vwxyzabcd", b"efghijklm"] {
-            let mut space = driver.get_next_space();
-            space.clear();
-            space.extend_from_slice(block);
-            driver.commit_space(space);
-            driver.skip_matching();
-        }
-    }));
-
     assert!(
-        result.is_ok(),
-        "tiny dictionary tail must not poison suffix store reuse"
+        driver
+            .match_generator
+            .window
+            .iter()
+            .all(|entry| entry.data.len() >= MIN_MATCH_LEN),
+        "dictionary priming must not commit tails shorter than MIN_MATCH_LEN"
     );
 }
 
@@ -1523,6 +1521,23 @@ fn prime_with_dictionary_counts_only_committed_tail_budget() {
         driver.match_generator.max_window_size,
         before + 8,
         "retention budget must account only for dictionary bytes actually committed to history"
+    );
+}
+
+#[test]
+fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Default);
+
+    let before = driver.dfast_matcher().max_window_size;
+    // One full slice plus a 4-byte tail. Dfast can still use this tail through
+    // short-hash overlap into the next block, so it should stay retained.
+    driver.prime_with_dictionary(b"abcdefghijkl", [1, 4, 8]);
+
+    assert_eq!(
+        driver.dfast_matcher().max_window_size,
+        before + 12,
+        "dfast retention budget should include 4-byte dictionary tails"
     );
 }
 
