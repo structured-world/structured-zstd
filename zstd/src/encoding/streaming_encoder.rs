@@ -242,24 +242,32 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         self.ensure_frame_started()?;
         let block_capacity = self.block_capacity();
         let mut remaining = buf;
+        let mut consumed = 0usize;
 
         while !remaining.is_empty() {
-            let available = block_capacity - self.pending.len();
-            let to_take = core::cmp::min(remaining.len(), available);
-            self.pending.extend_from_slice(&remaining[..to_take]);
-            remaining = &remaining[to_take..];
-
             if self.pending.len() == block_capacity {
                 let mut full_block = Vec::new();
                 mem::swap(&mut self.pending, &mut full_block);
                 if let Err(err) = self.encode_block(&full_block, false) {
                     mem::swap(&mut self.pending, &mut full_block);
+                    if consumed > 0 {
+                        return Ok(consumed);
+                    }
                     return Err(self.fail(err));
                 }
                 self.hash_block(&full_block);
             }
+
+            let available = block_capacity - self.pending.len();
+            let to_take = core::cmp::min(remaining.len(), available);
+            if to_take == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&remaining[..to_take]);
+            remaining = &remaining[to_take..];
+            consumed += to_take;
         }
-        Ok(buf.len())
+        Ok(consumed)
     }
 
     fn flush(&mut self) -> Result<(), Error> {
@@ -465,7 +473,7 @@ mod tests {
     fn write_failure_poisoning_is_sticky() {
         let mut encoder = StreamingEncoder::new_with_matcher(
             TinyMatcher::new(4),
-            FailingWriteOnce::new(2),
+            FailingWriteOnce::new(1),
             CompressionLevel::Uncompressed,
         );
 
@@ -474,11 +482,29 @@ mod tests {
         assert!(encoder.write_all(b"EFGH").is_err());
         assert!(encoder.finish().is_err());
 
-        let written_len = encoder.get_ref().unwrap().sink.len();
-        assert!(
-            written_len > 0 && written_len <= 32,
-            "only frame header bytes should be written after first block write failure, got {written_len}"
+        assert_eq!(encoder.get_ref().unwrap().sink.len(), 0);
+    }
+
+    #[test]
+    fn write_preserves_progress_when_later_block_write_fails() {
+        let payload = b"ABCDEFGHIJKL";
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(4),
+            FailingWriteOnce::new(3),
+            CompressionLevel::Uncompressed,
         );
+
+        let first_write = encoder.write(payload).unwrap();
+        assert_eq!(first_write, 8);
+        let second_write = encoder.write(&payload[first_write..]).unwrap();
+        assert_eq!(second_write, payload.len() - first_write);
+
+        encoder.flush().unwrap();
+        let compressed = encoder.finish().unwrap().sink;
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]

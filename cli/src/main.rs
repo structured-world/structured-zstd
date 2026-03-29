@@ -182,19 +182,23 @@ fn create_temporary_output_path(output: &Path) -> PathBuf {
     parent.join(format!(".{file_name}.tmp.{}", std::process::id()))
 }
 
-#[cfg(not(windows))]
 fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
-    fs::rename(temporary_output_path, output)
-        .wrap_err("failed to move temporary output file into final location")
-}
-
-#[cfg(windows)]
-fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
-    if output.exists() {
-        fs::remove_file(output).wrap_err("failed to replace existing output file")?;
+    if !output.exists() {
+        return fs::rename(temporary_output_path, output)
+            .wrap_err("failed to move temporary output file into final location");
     }
-    fs::rename(temporary_output_path, output)
-        .wrap_err("failed to move temporary output file into final location")
+
+    let backup_output_path = create_temporary_output_path(output);
+    fs::rename(output, &backup_output_path)
+        .wrap_err("failed to move existing output file into backup location")?;
+
+    if let Err(err) = fs::rename(temporary_output_path, output) {
+        let _ = fs::rename(&backup_output_path, output);
+        return Err(err).wrap_err("failed to move temporary output file into final location");
+    }
+
+    let _ = fs::remove_file(&backup_output_path);
+    Ok(())
 }
 
 fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
