@@ -158,7 +158,15 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
 }
 
 fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> {
-    let canonical_input = fs::canonicalize(input).wrap_err("failed to canonicalize input file")?;
+    let canonical_input = match fs::canonicalize(input) {
+        Ok(path) => path,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(err).wrap_err("failed to open input file");
+        }
+        Err(err) => {
+            return Err(err).wrap_err("failed to canonicalize input file");
+        }
+    };
     if output.exists() {
         let canonical_output =
             fs::canonicalize(output).wrap_err("failed to canonicalize existing output file")?;
@@ -399,6 +407,27 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compress_reports_open_error_for_missing_input() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_input =
+            std::env::temp_dir().join(format!("structured-zstd-cli-missing-input-{unique}.txt"));
+        let output =
+            std::env::temp_dir().join(format!("structured-zstd-cli-missing-output-{unique}.zst"));
+
+        let err = compress(missing_input, output.clone(), 2).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to open input file"),
+            "unexpected error: {message}"
+        );
+
+        let _ = fs::remove_file(output);
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
