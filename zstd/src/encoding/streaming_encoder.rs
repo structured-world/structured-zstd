@@ -33,6 +33,10 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
 }
 
 impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
+    /// Creates a streaming encoder backed by the default match generator.
+    ///
+    /// The encoder writes compressed bytes into `drain` and applies `compression_level`
+    /// to all subsequently written blocks.
     pub fn new(drain: W, compression_level: CompressionLevel) -> Self {
         Self::new_with_matcher(
             MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize, 1),
@@ -43,6 +47,10 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
 }
 
 impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
+    /// Creates a streaming encoder with an explicitly provided matcher implementation.
+    ///
+    /// This constructor is primarily intended for tests and advanced callers that need
+    /// custom match-window behavior.
     pub fn new_with_matcher(matcher: M, drain: W, compression_level: CompressionLevel) -> Self {
         Self {
             drain: Some(drain),
@@ -63,14 +71,24 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
+    /// Returns an immutable reference to the wrapped output drain, if still present.
+    ///
+    /// After [`finish`](Self::finish), the drain is moved out and this returns `None`.
     pub fn get_ref(&self) -> Option<&W> {
         self.drain.as_ref()
     }
 
+    /// Returns a mutable reference to the wrapped output drain, if still present.
+    ///
+    /// After [`finish`](Self::finish), the drain is moved out and this returns `None`.
     pub fn get_mut(&mut self) -> Option<&mut W> {
         self.drain.as_mut()
     }
 
+    /// Finalizes the current zstd frame and returns the wrapped output drain.
+    ///
+    /// If no payload was written yet, this still emits a valid empty frame.
+    /// Calling this method consumes the encoder.
     pub fn finish(mut self) -> Result<W, Error> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
