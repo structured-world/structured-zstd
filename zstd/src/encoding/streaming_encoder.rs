@@ -1,3 +1,5 @@
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::mem;
 
@@ -26,8 +28,8 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     pending: Vec<u8>,
     errored: bool,
     last_error_kind: Option<ErrorKind>,
+    last_error_message: Option<String>,
     frame_started: bool,
-    frame_finished: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -64,25 +66,31 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             pending: Vec::new(),
             errored: false,
             last_error_kind: None,
+            last_error_message: None,
             frame_started: false,
-            frame_finished: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
     }
 
-    /// Returns an immutable reference to the wrapped output drain, if still present.
+    /// Returns an immutable reference to the wrapped output drain.
     ///
-    /// After [`finish`](Self::finish), the drain is moved out and this returns `None`.
-    pub fn get_ref(&self) -> Option<&W> {
-        self.drain.as_ref()
+    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
+    /// consumes the encoder and returns ownership of the drain.
+    pub fn get_ref(&self) -> &W {
+        self.drain
+            .as_ref()
+            .expect("streaming encoder drain is present until finish consumes self")
     }
 
-    /// Returns a mutable reference to the wrapped output drain, if still present.
+    /// Returns a mutable reference to the wrapped output drain.
     ///
-    /// After [`finish`](Self::finish), the drain is moved out and this returns `None`.
-    pub fn get_mut(&mut self) -> Option<&mut W> {
-        self.drain.as_mut()
+    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
+    /// consumes the encoder and returns ownership of the drain.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.drain
+            .as_mut()
+            .expect("streaming encoder drain is present until finish consumes self")
     }
 
     /// Finalizes the current zstd frame and returns the wrapped output drain.
@@ -100,35 +108,44 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.emit_pending_block(true)?;
         }
 
+        let mut drain = self
+            .drain
+            .take()
+            .expect("streaming encoder drain must be present when finishing");
+
         #[cfg(feature = "hash")]
         {
             let checksum = self.hasher.finish() as u32;
-            self.drain_mut()
-                .and_then(|drain| drain.write_all(&checksum.to_le_bytes()))
+            drain
+                .write_all(&checksum.to_le_bytes())
                 .map_err(|err| self.fail(err))?;
         }
 
-        self.frame_finished = true;
-        self.drain_mut()
-            .and_then(|drain| drain.flush())
-            .map_err(|err| self.fail(err))?;
-        self.drain
-            .take()
-            .ok_or_else(|| other_error("streaming encoder drain already taken"))
+        drain.flush().map_err(|err| self.fail(err))?;
+        Ok(drain)
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
-            return Err(error_from_kind(
-                self.last_error_kind.unwrap_or(ErrorKind::Other),
-            ));
-        }
-        if self.frame_finished {
-            return Err(other_error(
-                "cannot write to a finished streaming encoder frame",
-            ));
+            return Err(self.sticky_error());
         }
         Ok(())
+    }
+
+    fn sticky_error(&self) -> Error {
+        match (self.last_error_kind, self.last_error_message.as_deref()) {
+            (Some(kind), Some(message)) => error_with_kind_message(
+                kind,
+                format!(
+                    "streaming encoder is in an errored state due to previous {kind:?} failure: {message}"
+                ),
+            ),
+            (Some(kind), None) => error_from_kind(kind),
+            (None, Some(message)) => other_error_owned(format!(
+                "streaming encoder is in an errored state: {message}"
+            )),
+            (None, None) => other_error("streaming encoder is in an errored state"),
+        }
     }
 
     fn drain_mut(&mut self) -> Result<&mut W, Error> {
@@ -192,6 +209,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             _ => Vec::new(),
         };
         space.clear();
+        if space.capacity() > block_capacity {
+            space.shrink_to(block_capacity);
+        }
         if space.capacity() < block_capacity {
             space.reserve(block_capacity - space.capacity());
         }
@@ -320,6 +340,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         if self.last_error_kind.is_none() {
             self.last_error_kind = Some(err.kind());
         }
+        if self.last_error_message.is_none() {
+            self.last_error_message = Some(err.to_string());
+        }
         err
     }
 
@@ -385,13 +408,30 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 }
 
 fn error_from_kind(kind: ErrorKind) -> Error {
+    Error::from(kind)
+}
+
+fn error_with_kind_message(kind: ErrorKind, message: String) -> Error {
     #[cfg(feature = "std")]
     {
-        Error::from(kind)
+        Error::new(kind, message)
     }
     #[cfg(not(feature = "std"))]
     {
+        let _ = message;
         Error::from(kind)
+    }
+}
+
+fn other_error_owned(message: String) -> Error {
+    #[cfg(feature = "std")]
+    {
+        Error::other(message)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = message;
+        Error::from(ErrorKind::Other)
     }
 }
 
@@ -586,7 +626,7 @@ mod tests {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.write_all(b"partial-block").unwrap();
         encoder.flush().unwrap();
-        let flushed_len = encoder.get_ref().unwrap().len();
+        let flushed_len = encoder.get_ref().len();
         assert!(
             flushed_len > 0,
             "flush should emit header+partial block bytes"
@@ -602,7 +642,7 @@ mod tests {
     fn flush_without_writes_does_not_emit_frame_header() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.flush().unwrap();
-        assert!(encoder.get_ref().unwrap().is_empty());
+        assert!(encoder.get_ref().is_empty());
     }
 
     #[test]
@@ -621,8 +661,8 @@ mod tests {
         boundary.write_all(b"ABCD").unwrap();
         below.write_all(b"ABC").unwrap();
 
-        let boundary_len = boundary.get_ref().unwrap().len();
-        let below_len = below.get_ref().unwrap().len();
+        let boundary_len = boundary.get_ref().len();
+        let below_len = below.get_ref().len();
         assert!(
             boundary_len > below_len,
             "full block should be emitted immediately at block boundary"
@@ -693,7 +733,7 @@ mod tests {
     fn unsupported_level_write_fails_before_emitting_frame_header() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
         assert!(encoder.write_all(b"payload").is_err());
-        assert_eq!(encoder.get_ref().unwrap().len(), 0);
+        assert_eq!(encoder.get_ref().len(), 0);
     }
 
     #[test]
@@ -707,7 +747,7 @@ mod tests {
         assert!(encoder.write_all(b"ABCD").is_err());
         assert!(encoder.flush().is_err());
         assert!(encoder.write_all(b"EFGH").is_err());
-        assert_eq!(encoder.get_ref().unwrap().sink.len(), 0);
+        assert_eq!(encoder.get_ref().sink.len(), 0);
         assert!(encoder.finish().is_err());
     }
 
@@ -765,7 +805,7 @@ mod tests {
         let matcher = TinyMatcher::new(128 * 1024);
         let mut encoder =
             StreamingEncoder::new_with_matcher(matcher, Vec::new(), CompressionLevel::Fastest);
-        encoder.get_mut().unwrap().extend_from_slice(b"");
+        encoder.get_mut().extend_from_slice(b"");
         encoder.write_all(b"custom-matcher").unwrap();
         let compressed = encoder.finish().unwrap();
         let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();

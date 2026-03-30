@@ -110,6 +110,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         _ => return Err(eyre!("unsupported compression level: {level}")),
     };
     ensure_distinct_paths(&input, &output)?;
+    ensure_regular_output_destination(&output)?;
 
     let source_file = File::open(&input).wrap_err("failed to open input file")?;
     let source_size = source_file.metadata()?.len() as usize;
@@ -245,19 +246,18 @@ fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, F
 }
 
 fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
-    if !output.exists() {
-        return match fs::rename(temporary_output_path, output) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let _ = fs::remove_file(temporary_output_path);
-                Err(err).wrap_err("failed to move temporary output file into final location")
-            }
-        };
-    }
-
-    let output_kind = fs::symlink_metadata(output)
-        .wrap_err("failed to inspect existing output path")?
-        .file_type();
+    let output_kind = match output_destination_kind(output)? {
+        Some(kind) => kind,
+        None => {
+            return match fs::rename(temporary_output_path, output) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let _ = fs::remove_file(temporary_output_path);
+                    Err(err).wrap_err("failed to move temporary output file into final location")
+                }
+            };
+        }
+    };
     if !output_kind.is_file() {
         let _ = fs::remove_file(temporary_output_path);
         return Err(eyre!(
@@ -313,6 +313,23 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
     }
 }
 
+fn output_destination_kind(output: &Path) -> color_eyre::Result<Option<std::fs::FileType>> {
+    match fs::symlink_metadata(output) {
+        Ok(metadata) => Ok(Some(metadata.file_type())),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).wrap_err("failed to inspect existing output path"),
+    }
+}
+
+fn ensure_regular_output_destination(output: &Path) -> color_eyre::Result<()> {
+    if output_destination_kind(output)?.is_some_and(|kind| !kind.is_file()) {
+        return Err(eyre!(
+            "output path exists and is not a regular file: {output:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
     info!("extracting {input:?} to {output:?}");
     let source_file = File::open(input).wrap_err("failed to open input file")?;
@@ -352,6 +369,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -436,6 +455,32 @@ mod tests {
         let _ = fs::remove_file(output);
     }
 
+    #[test]
+    fn compress_rejects_non_regular_output_before_creating_temp_file() {
+        let dir = unique_test_dir("structured-zstd-cli-preflight-output");
+        let input = dir.join("input.txt");
+        write_file(&input, b"streaming-cli-preflight");
+        let output = dir.join("existing-dir");
+        fs::create_dir(&output).unwrap();
+
+        let err = compress(input, output.clone(), 2).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+
+        let tmp_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(tmp_count, 0, "temporary output should not be created");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -491,6 +536,37 @@ mod tests {
         assert_eq!(mode, 0o640);
         assert_eq!(fs::read(&destination).unwrap(), b"new-data");
         assert!(!temporary_output.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_output_file_rejects_broken_symlink_destination() {
+        let dir = unique_test_dir("structured-zstd-cli-broken-symlink");
+        let temporary_output = dir.join("result.tmp");
+        write_file(&temporary_output, b"compressed");
+        let destination = dir.join("result.zst");
+        let missing_target = dir.join("missing-target.zst");
+        symlink(&missing_target, &destination).unwrap();
+
+        let err = replace_output_file(&temporary_output, &destination).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !temporary_output.exists(),
+            "temporary file should be cleaned up when destination is invalid"
+        );
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "destination symlink should remain untouched"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
