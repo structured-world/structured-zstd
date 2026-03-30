@@ -201,8 +201,13 @@ fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, F
 
 fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
     if !output.exists() {
-        return fs::rename(temporary_output_path, output)
-            .wrap_err("failed to move temporary output file into final location");
+        return match fs::rename(temporary_output_path, output) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(temporary_output_path);
+                Err(err).wrap_err("failed to move temporary output file into final location")
+            }
+        };
     }
 
     let output_kind = fs::symlink_metadata(output)
@@ -224,8 +229,13 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
 
     #[cfg(not(windows))]
     {
-        fs::rename(temporary_output_path, output)
-            .wrap_err("failed to move temporary output file into final location")
+        match fs::rename(temporary_output_path, output) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(temporary_output_path);
+                Err(err).wrap_err("failed to move temporary output file into final location")
+            }
+        }
     }
 
     #[cfg(windows)]
