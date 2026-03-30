@@ -133,7 +133,14 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         }
     };
 
-    let compressed_size = temporary_output.metadata()?.len();
+    let compressed_size = match temporary_output.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            drop(temporary_output);
+            let _ = fs::remove_file(&temporary_output_path);
+            return Err(err).wrap_err("failed to get compressed file size");
+        }
+    };
     drop(temporary_output);
     replace_output_file(&temporary_output_path, &output)?;
 
@@ -155,13 +162,43 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> 
     if output.exists() {
         let canonical_output =
             fs::canonicalize(output).wrap_err("failed to canonicalize existing output file")?;
-        if canonical_input == canonical_output {
+        if canonical_input == canonical_output || paths_point_to_same_file(input, output)? {
             return Err(eyre!(
                 "input and output paths refer to the same file: {input:?} -> {output:?}"
             ));
         }
     }
     Ok(())
+}
+
+fn paths_point_to_same_file(input: &Path, output: &Path) -> color_eyre::Result<bool> {
+    let input_metadata = fs::metadata(input).wrap_err("failed to inspect input file metadata")?;
+    let output_metadata =
+        fs::metadata(output).wrap_err("failed to inspect existing output file metadata")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(input_metadata.dev() == output_metadata.dev()
+            && input_metadata.ino() == output_metadata.ino())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(
+            input_metadata.volume_serial_number() == output_metadata.volume_serial_number()
+                && input_metadata.file_index_high() == output_metadata.file_index_high()
+                && input_metadata.file_index_low() == output_metadata.file_index_low(),
+        )
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = input_metadata;
+        let _ = output_metadata;
+        Ok(false)
+    }
 }
 
 #[cfg(windows)]
@@ -343,6 +380,25 @@ mod tests {
         );
 
         let _ = fs::remove_file(input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compress_rejects_hardlinked_output_paths() {
+        let dir = unique_test_dir("structured-zstd-cli-hardlink-alias");
+        let input = dir.join("input.txt");
+        let output = dir.join("output.zst");
+        fs::write(&input, b"streaming-cli-hardlink-check").unwrap();
+        fs::hard_link(&input, &output).unwrap();
+
+        let err = compress(input.clone(), output.clone(), 2).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("input and output"),
+            "unexpected error: {message}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {

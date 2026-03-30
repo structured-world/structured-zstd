@@ -35,7 +35,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
 impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
     pub fn new(drain: W, compression_level: CompressionLevel) -> Self {
         Self::new_with_matcher(
-            MatchGeneratorDriver::new(1024 * 128, 1),
+            MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize, 1),
             drain,
             compression_level,
         )
@@ -224,7 +224,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         last_block: bool,
     ) -> Result<(), (Error, Vec<u8>)> {
         let mut raw_block = Some(uncompressed_data);
-        let mut encoded = Vec::with_capacity(self.block_capacity());
+        let mut encoded = Vec::with_capacity(self.block_capacity() + 3);
         let mut moved_into_matcher = false;
         if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
             let header = BlockHeader {
@@ -351,9 +351,7 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
                 .map_err(|err| self.fail(err));
         }
         self.ensure_frame_started()?;
-        if !self.pending.is_empty() {
-            self.emit_pending_block(false)?;
-        }
+        self.emit_pending_block(false)?;
         self.drain_mut()
             .and_then(|drain| drain.flush())
             .map_err(|err| self.fail(err))
