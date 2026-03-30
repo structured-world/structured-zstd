@@ -285,7 +285,13 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
 
     #[cfg(windows)]
     {
-        let backup_output_path = create_temporary_output_path(output)?;
+        let backup_output_path = match create_temporary_output_path(output) {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = fs::remove_file(temporary_output_path);
+                return Err(err).wrap_err("failed to allocate backup output path");
+            }
+        };
         if let Err(err) = fs::rename(output, &backup_output_path) {
             let _ = fs::remove_file(temporary_output_path);
             return Err(err).wrap_err("failed to move existing output file into backup location");
