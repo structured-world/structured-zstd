@@ -302,7 +302,7 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
             let _ = fs::remove_file(temporary_output_path);
             if let Err(restore_err) = restore_result {
                 return Err(err).wrap_err(format!(
-                "failed to move temporary output file into final location; also failed to restore backup: {restore_err}"
+                "failed to move temporary output file into final location; also failed to restore backup from {backup_output_path:?}: {restore_err}"
             ));
             }
             return Err(err).wrap_err("failed to move temporary output file into final location");

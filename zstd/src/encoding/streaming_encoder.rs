@@ -154,12 +154,20 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.hasher = XxHash64::with_seed(0);
         }
 
+        let window_size = self.state.matcher.window_size();
+        if window_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "matcher reported window_size == 0, which is invalid",
+            ));
+        }
+
         let header = FrameHeader {
             frame_content_size: None,
             single_segment: false,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: None,
-            window_size: Some(self.state.matcher.window_size()),
+            window_size: Some(window_size),
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
@@ -668,6 +676,17 @@ mod tests {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
         assert!(encoder.write_all(b"payload").is_err());
         assert!(encoder.finish().is_err());
+    }
+
+    #[test]
+    fn zero_window_matcher_returns_invalid_input_error() {
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(0),
+            Vec::new(),
+            CompressionLevel::Fastest,
+        );
+        let err = encoder.write_all(b"payload").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
