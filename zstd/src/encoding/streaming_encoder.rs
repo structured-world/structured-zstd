@@ -344,6 +344,12 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 
     fn flush(&mut self) -> Result<(), Error> {
         self.ensure_open()?;
+        if self.pending.is_empty() {
+            return self
+                .drain_mut()
+                .and_then(|drain| drain.flush())
+                .map_err(|err| self.fail(err));
+        }
         self.ensure_frame_started()?;
         if !self.pending.is_empty() {
             self.emit_pending_block(false)?;
@@ -566,6 +572,13 @@ mod tests {
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, b"partial-block");
+    }
+
+    #[test]
+    fn flush_without_writes_does_not_emit_frame_header() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.flush().unwrap();
+        assert!(encoder.get_ref().unwrap().is_empty());
     }
 
     #[test]

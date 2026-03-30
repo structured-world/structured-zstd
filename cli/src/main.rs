@@ -164,6 +164,7 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> 
     Ok(())
 }
 
+#[cfg(windows)]
 fn create_temporary_output_path(output: &Path) -> color_eyre::Result<PathBuf> {
     let (path, file) = create_temporary_output_file(output)?;
     drop(file);
@@ -221,25 +222,34 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
         return Err(err).wrap_err("failed to apply existing output permissions to temporary file");
     }
 
-    let backup_output_path = create_temporary_output_path(output)?;
-    if let Err(err) = fs::rename(output, &backup_output_path) {
-        let _ = fs::remove_file(temporary_output_path);
-        return Err(err).wrap_err("failed to move existing output file into backup location");
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary_output_path, output)
+            .wrap_err("failed to move temporary output file into final location")
     }
 
-    if let Err(err) = fs::rename(temporary_output_path, output) {
-        let restore_result = fs::rename(&backup_output_path, output);
-        let _ = fs::remove_file(temporary_output_path);
-        if let Err(restore_err) = restore_result {
-            return Err(err).wrap_err(format!(
+    #[cfg(windows)]
+    {
+        let backup_output_path = create_temporary_output_path(output)?;
+        if let Err(err) = fs::rename(output, &backup_output_path) {
+            let _ = fs::remove_file(temporary_output_path);
+            return Err(err).wrap_err("failed to move existing output file into backup location");
+        }
+
+        if let Err(err) = fs::rename(temporary_output_path, output) {
+            let restore_result = fs::rename(&backup_output_path, output);
+            let _ = fs::remove_file(temporary_output_path);
+            if let Err(restore_err) = restore_result {
+                return Err(err).wrap_err(format!(
                 "failed to move temporary output file into final location; also failed to restore backup: {restore_err}"
             ));
+            }
+            return Err(err).wrap_err("failed to move temporary output file into final location");
         }
-        return Err(err).wrap_err("failed to move temporary output file into final location");
-    }
 
-    let _ = fs::remove_file(&backup_output_path);
-    Ok(())
+        let _ = fs::remove_file(&backup_output_path);
+        Ok(())
+    }
 }
 
 fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
