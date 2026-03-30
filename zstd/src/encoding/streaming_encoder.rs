@@ -79,11 +79,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.write_empty_last_block()
                 .map_err(|err| self.fail(err))?;
         } else {
-            let block = mem::take(&mut self.pending);
-            if let Err((err, block)) = self.encode_block(block, true) {
-                self.pending = block;
-                return Err(self.fail(err));
-            }
+            self.emit_pending_block(true)?;
         }
 
         #[cfg(feature = "hash")]
@@ -196,6 +192,19 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             return Some(Err(err));
         }
         None
+    }
+
+    fn emit_pending_block(&mut self, last_block: bool) -> Result<(), Error> {
+        let block = mem::take(&mut self.pending);
+        if let Err((err, restored_block)) = self.encode_block(block, last_block) {
+            self.pending = restored_block;
+            return Err(self.fail(err));
+        }
+        if !last_block {
+            let block_capacity = self.block_capacity();
+            self.pending = self.allocate_pending_space(block_capacity);
+        }
+        Ok(())
     }
 
     fn ensure_level_supported(&self) -> Result<(), Error> {
@@ -337,13 +346,7 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
         if !self.pending.is_empty() {
-            let block = mem::take(&mut self.pending);
-            if let Err((err, restored_block)) = self.encode_block(block, false) {
-                self.pending = restored_block;
-                return Err(self.fail(err));
-            }
-            let block_capacity = self.block_capacity();
-            self.pending = self.allocate_pending_space(block_capacity);
+            self.emit_pending_block(false)?;
         }
         self.drain_mut()
             .and_then(|drain| drain.flush())

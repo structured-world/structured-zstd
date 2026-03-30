@@ -216,6 +216,10 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
     let original_permissions = fs::metadata(output)
         .wrap_err("failed to read existing output file metadata")?
         .permissions();
+    if let Err(err) = fs::set_permissions(temporary_output_path, original_permissions.clone()) {
+        let _ = fs::remove_file(temporary_output_path);
+        return Err(err).wrap_err("failed to apply existing output permissions to temporary file");
+    }
 
     let backup_output_path = create_temporary_output_path(output)?;
     if let Err(err) = fs::rename(output, &backup_output_path) {
@@ -232,17 +236,6 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
             ));
         }
         return Err(err).wrap_err("failed to move temporary output file into final location");
-    }
-
-    if let Err(err) = fs::set_permissions(output, original_permissions) {
-        let _ = fs::remove_file(output);
-        let restore_result = fs::rename(&backup_output_path, output);
-        if let Err(restore_err) = restore_result {
-            return Err(err).wrap_err(format!(
-                "failed to preserve existing output file permissions; also failed to restore backup: {restore_err}"
-            ));
-        }
-        return Err(err).wrap_err("failed to preserve existing output file permissions");
     }
 
     let _ = fs::remove_file(&backup_output_path);
