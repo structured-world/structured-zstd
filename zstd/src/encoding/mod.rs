@@ -111,7 +111,9 @@ pub trait Matcher {
     /// [`StreamingEncoder`] to reject the first write with an invalid-input error
     /// (`InvalidInput` with `std`, `Other` with `no_std`).
     ///
-    /// May change after a call to reset with a different compression level.
+    /// Must remain stable for the lifetime of a frame.
+    /// It may change only after `reset()` is called for the next frame
+    /// (for example because the compression level changed).
     fn window_size(&self) -> u64;
 }
 

@@ -43,7 +43,7 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 
 - [x] Uncompressed blocks
 - [x] Fastest (roughly level 1)
-- [ ] Default (roughly level 3)
+- [x] Default (roughly level 3)
 - [ ] Better (roughly level 7)
 - [ ] Best (roughly level 11)
 - [x] Checksums
