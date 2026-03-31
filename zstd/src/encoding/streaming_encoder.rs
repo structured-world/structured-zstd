@@ -135,9 +135,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
-    // Cold path (only reached after poisoning). The format!() allocations are
-    // discarded in no_std via error_with_kind_message/other_error_owned, but this
-    // is acceptable on an error recovery path to keep the match arms simple.
+    // Cold path (only reached after poisoning). The format!() calls still allocate
+    // in no_std even though error_with_kind_message/other_error_owned drop the
+    // message; this is acceptable on an error recovery path to keep match arms simple.
     fn sticky_error(&self) -> Error {
         match (self.last_error_kind, self.last_error_message.as_deref()) {
             (Some(kind), Some(message)) => error_with_kind_message(
@@ -421,8 +421,7 @@ fn error_with_kind_message(kind: ErrorKind, message: String) -> Error {
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = message;
-        Error::from(kind)
+        Error::new(kind, alloc::boxed::Box::new(message))
     }
 }
 
@@ -433,8 +432,10 @@ fn invalid_input_error(message: &str) -> Error {
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = message;
-        Error::from(ErrorKind::Other)
+        Error::new(
+            ErrorKind::Other,
+            alloc::boxed::Box::new(alloc::string::String::from(message)),
+        )
     }
 }
 
@@ -445,8 +446,7 @@ fn other_error_owned(message: String) -> Error {
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = message;
-        Error::from(ErrorKind::Other)
+        Error::new(ErrorKind::Other, alloc::boxed::Box::new(message))
     }
 }
 
@@ -457,8 +457,10 @@ fn other_error(message: &str) -> Error {
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = message;
-        Error::from(ErrorKind::Other)
+        Error::new(
+            ErrorKind::Other,
+            alloc::boxed::Box::new(alloc::string::String::from(message)),
+        )
     }
 }
 

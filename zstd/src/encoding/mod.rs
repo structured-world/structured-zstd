@@ -108,7 +108,8 @@ pub trait Matcher {
     /// The size of the window the decoder will need to execute all sequences produced by this matcher.
     ///
     /// Must return a positive (non-zero) value; returning 0 causes
-    /// [`StreamingEncoder`] to reject the first write with an `InvalidInput` error.
+    /// [`StreamingEncoder`] to reject the first write with an invalid-input error
+    /// (`InvalidInput` with `std`, `Other` with `no_std`).
     ///
     /// May change after a call to reset with a different compression level.
     fn window_size(&self) -> u64;
