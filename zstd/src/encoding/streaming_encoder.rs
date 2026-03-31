@@ -135,6 +135,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
+    // Cold path (only reached after poisoning). The format!() allocations are
+    // discarded in no_std via error_with_kind_message/other_error_owned, but this
+    // is acceptable on an error recovery path to keep the match arms simple.
     fn sticky_error(&self) -> Error {
         match (self.last_error_kind, self.last_error_message.as_deref()) {
             (Some(kind), Some(message)) => error_with_kind_message(
@@ -261,7 +264,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             CompressionLevel::Uncompressed
             | CompressionLevel::Fastest
             | CompressionLevel::Default => Ok(()),
-            _ => Err(other_error(
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
                 "streaming encoder currently supports Uncompressed/Fastest/Default only",
             )),
         }
@@ -273,6 +277,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         last_block: bool,
     ) -> Result<(), (Error, Vec<u8>)> {
         let mut raw_block = Some(uncompressed_data);
+        // TODO: reuse scratch buffer across blocks to reduce allocation churn (#47)
         let mut encoded = Vec::with_capacity(self.block_capacity() + 3);
         let mut moved_into_matcher = false;
         if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
@@ -301,7 +306,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 }
                 _ => {
                     return Err((
-                        other_error(
+                        Error::new(
+                            ErrorKind::InvalidInput,
                             "streaming encoder currently supports Uncompressed/Fastest/Default only",
                         ),
                         raw_block.unwrap_or_default(),
@@ -717,7 +723,8 @@ mod tests {
     #[test]
     fn better_level_returns_unsupported_error() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
-        assert!(encoder.write_all(b"payload").is_err());
+        let err = encoder.write_all(b"payload").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(encoder.finish().is_err());
     }
 
