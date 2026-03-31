@@ -105,9 +105,12 @@ pub trait Matcher {
     fn supports_dictionary_priming(&self) -> bool {
         false
     }
-    /// The size of the window the decoder will need to execute all sequences produced by this matcher
+    /// The size of the window the decoder will need to execute all sequences produced by this matcher.
     ///
-    /// May change after a call to reset with a different compression level
+    /// Must return a positive (non-zero) value; returning 0 causes
+    /// [`StreamingEncoder`] to reject the first write with an `InvalidInput` error.
+    ///
+    /// May change after a call to reset with a different compression level.
     fn window_size(&self) -> u64;
 }
 

@@ -179,8 +179,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
         let window_size = self.state.matcher.window_size();
         if window_size == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
+            return Err(invalid_input_error(
                 "matcher reported window_size == 0, which is invalid",
             ));
         }
@@ -264,8 +263,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             CompressionLevel::Uncompressed
             | CompressionLevel::Fastest
             | CompressionLevel::Default => Ok(()),
-            _ => Err(Error::new(
-                ErrorKind::InvalidInput,
+            _ => Err(invalid_input_error(
                 "streaming encoder currently supports Uncompressed/Fastest/Default only",
             )),
         }
@@ -301,13 +299,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 }
                 CompressionLevel::Fastest | CompressionLevel::Default => {
                     let block = raw_block.take().expect("raw block missing");
+                    debug_assert!(!block.is_empty(), "empty blocks handled above");
                     compress_fastest(&mut self.state, last_block, block, &mut encoded);
                     moved_into_matcher = true;
                 }
                 _ => {
                     return Err((
-                        Error::new(
-                            ErrorKind::InvalidInput,
+                        invalid_input_error(
                             "streaming encoder currently supports Uncompressed/Fastest/Default only",
                         ),
                         raw_block.unwrap_or_default(),
@@ -329,10 +327,6 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             #[cfg(feature = "hash")]
             {
                 self.hasher.write(self.state.matcher.get_last_space());
-            }
-            #[cfg(not(feature = "hash"))]
-            {
-                self.hash_block(&[]);
             }
         } else {
             self.hash_block(raw_block.as_deref().unwrap_or(&[]));
@@ -429,6 +423,18 @@ fn error_with_kind_message(kind: ErrorKind, message: String) -> Error {
     {
         let _ = message;
         Error::from(kind)
+    }
+}
+
+fn invalid_input_error(message: &str) -> Error {
+    #[cfg(feature = "std")]
+    {
+        Error::new(ErrorKind::InvalidInput, message)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = message;
+        Error::from(ErrorKind::Other)
     }
 }
 

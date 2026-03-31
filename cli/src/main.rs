@@ -113,7 +113,11 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     ensure_regular_output_destination(&output)?;
 
     let source_file = File::open(&input).wrap_err("failed to open input file")?;
-    let source_size = source_file.metadata()?.len() as usize;
+    let source_size: usize = source_file
+        .metadata()?
+        .len()
+        .try_into()
+        .wrap_err("input file too large for this platform")?;
     let buffered_source = BufReader::new(source_file);
     let mut encoder_input = ProgressMonitor::new(buffered_source, source_size);
 
