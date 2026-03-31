@@ -201,8 +201,7 @@ fn paths_point_to_same_file(input: &Path, output: &Path) -> color_eyre::Result<b
         use std::os::windows::fs::MetadataExt;
         Ok(
             input_metadata.volume_serial_number() == output_metadata.volume_serial_number()
-                && input_metadata.file_index_high() == output_metadata.file_index_high()
-                && input_metadata.file_index_low() == output_metadata.file_index_low(),
+                && input_metadata.file_index() == output_metadata.file_index(),
         )
     }
 
