@@ -85,6 +85,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     /// Returns a mutable reference to the wrapped output drain.
     ///
+    /// It is inadvisable to directly write to the underlying writer, as doing
+    /// so would corrupt the zstd frame being assembled by the encoder.
+    ///
     /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
     /// consumes the encoder and returns ownership of the drain.
     pub fn get_mut(&mut self) -> &mut W {

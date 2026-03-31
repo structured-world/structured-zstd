@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{ContextCompat, WrapErr, eyre};
+use color_eyre::eyre::{eyre, ContextCompat, WrapErr};
 use structured_zstd::encoding::CompressionLevel;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -246,7 +246,9 @@ fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, F
 }
 
 fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
-    let output_kind = match output_destination_kind(output)? {
+    let output_kind = match output_destination_kind(output).inspect_err(|_err| {
+        let _ = fs::remove_file(temporary_output_path);
+    })? {
         Some(kind) => kind,
         None => {
             return match fs::rename(temporary_output_path, output) {
@@ -265,7 +267,10 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
         ));
     }
     let original_permissions = fs::metadata(output)
-        .wrap_err("failed to read existing output file metadata")?
+        .wrap_err("failed to read existing output file metadata")
+        .inspect_err(|_err| {
+            let _ = fs::remove_file(temporary_output_path);
+        })?
         .permissions();
     if let Err(err) = fs::set_permissions(temporary_output_path, original_permissions.clone()) {
         let _ = fs::remove_file(temporary_output_path);
@@ -368,15 +373,15 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 mod tests {
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
 
-    use super::{Cli, compress, replace_output_file};
+    use super::{compress, replace_output_file, Cli};
     use std::path::PathBuf;
 
     use crate::add_extension;
