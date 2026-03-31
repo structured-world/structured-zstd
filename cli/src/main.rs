@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{eyre, ContextCompat, WrapErr};
+use color_eyre::eyre::{ContextCompat, WrapErr, eyre};
 use structured_zstd::encoding::CompressionLevel;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -373,15 +373,15 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 mod tests {
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
 
-    use super::{compress, replace_output_file, Cli};
+    use super::{Cli, compress, replace_output_file};
     use std::path::PathBuf;
 
     use crate::add_extension;
