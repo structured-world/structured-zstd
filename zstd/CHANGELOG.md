@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/structured-world/structured-zstd/compare/v0.0.3...v0.0.4) - 2026-04-01
+
+### Added
+
+- *(encoding)* add streaming write encoder ([#45](https://github.com/structured-world/structured-zstd/pull/45))
+- *(encoding)* add dictionary compression support ([#44](https://github.com/structured-world/structured-zstd/pull/44))
+
+### Performance
+
+- *(decoding)* optimize sequence execution with overlap fast paths ([#42](https://github.com/structured-world/structured-zstd/pull/42))
+- *(encoding)* interleave fastest hash fill insertion ([#41](https://github.com/structured-world/structured-zstd/pull/41))
+- *(encoding)* align fastest matcher with zstd fast path ([#39](https://github.com/structured-world/structured-zstd/pull/39))
+
+### Testing
+
+- *(bench)* expand benchmark parity matrix ([#43](https://github.com/structured-world/structured-zstd/pull/43))
+- *(bench)* expand zstd benchmark suite ([#38](https://github.com/structured-world/structured-zstd/pull/38))
+
 ## [0.0.3](https://github.com/structured-world/structured-zstd/compare/v0.0.2...v0.0.3) - 2026-03-26
 
 ### Added
