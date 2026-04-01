@@ -43,11 +43,12 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 
 - [x] Uncompressed blocks
 - [x] Fastest (roughly level 1)
-- [ ] Default (roughly level 3)
+- [x] Default (roughly level 3)
 - [ ] Better (roughly level 7)
 - [ ] Best (roughly level 11)
 - [x] Checksums
-- [ ] Dictionary compression
+- [x] Dictionary compression
+- [x] Streaming encoder (`io::Write`)
 
 ### Dictionary Generation
 
@@ -66,6 +67,18 @@ use structured_zstd::encoding::{compress, compress_to_vec, CompressionLevel};
 
 let data: &[u8] = b"hello world";
 let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+```
+
+```rust,no_run
+use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
+use std::io::Write;
+
+let mut out = Vec::new();
+let mut encoder = StreamingEncoder::new(&mut out, CompressionLevel::Fastest);
+encoder.write_all(b"hello ")?;
+encoder.write_all(b"world")?;
+encoder.finish()?;
+# Ok::<(), std::io::Error>(())
 ```
 
 ### Decompression

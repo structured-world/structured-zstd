@@ -8,8 +8,10 @@ pub(crate) mod util;
 
 mod frame_compressor;
 mod levels;
+mod streaming_encoder;
 pub use frame_compressor::FrameCompressor;
 pub use match_generator::MatchGeneratorDriver;
+pub use streaming_encoder::StreamingEncoder;
 
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
@@ -103,9 +105,15 @@ pub trait Matcher {
     fn supports_dictionary_priming(&self) -> bool {
         false
     }
-    /// The size of the window the decoder will need to execute all sequences produced by this matcher
+    /// The size of the window the decoder will need to execute all sequences produced by this matcher.
     ///
-    /// May change after a call to reset with a different compression level
+    /// Must return a positive (non-zero) value; returning 0 causes
+    /// [`StreamingEncoder`] to reject the first write with an invalid-input error
+    /// (`InvalidInput` with `std`, `Other` with `no_std`).
+    ///
+    /// Must remain stable for the lifetime of a frame.
+    /// It may change only after `reset()` is called for the next frame
+    /// (for example because the compression level changed).
     fn window_size(&self) -> u64;
 }
 
