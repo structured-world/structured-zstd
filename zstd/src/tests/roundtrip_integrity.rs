@@ -37,13 +37,17 @@ fn generate_compressible(seed: u64, len: usize) -> Vec<u8> {
     data
 }
 
-/// Roundtrip using compress_to_vec (simple API).
-fn roundtrip_simple(data: &[u8]) -> Vec<u8> {
-    let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+/// Roundtrip using compress_to_vec at the given level.
+fn roundtrip_at_level(data: &[u8], level: CompressionLevel) -> Vec<u8> {
+    let compressed = compress_to_vec(data, level);
     let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     result
+}
+
+fn roundtrip_simple(data: &[u8]) -> Vec<u8> {
+    roundtrip_at_level(data, CompressionLevel::Fastest)
 }
 
 fn compress_streaming(data: &[u8]) -> Vec<u8> {
@@ -55,7 +59,19 @@ fn compress_streaming(data: &[u8]) -> Vec<u8> {
     compressed
 }
 
-/// Roundtrip using FrameCompressor (streaming API).
+/// Roundtrip using FrameCompressor at the given level.
+fn roundtrip_streaming_at_level(data: &[u8], level: CompressionLevel) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    let mut compressor = FrameCompressor::new(level);
+    compressor.set_source(data);
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    result
+}
+
 fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
     let compressed = compress_streaming(data);
     let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
@@ -64,13 +80,16 @@ fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Roundtrip using compress_to_vec with the default compression level.
 fn roundtrip_default(data: &[u8]) -> Vec<u8> {
-    let compressed = compress_to_vec(data, CompressionLevel::Default);
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
-    let mut result = Vec::new();
-    decoder.read_to_end(&mut result).unwrap();
-    result
+    roundtrip_at_level(data, CompressionLevel::Default)
+}
+
+fn roundtrip_better(data: &[u8]) -> Vec<u8> {
+    roundtrip_at_level(data, CompressionLevel::Better)
+}
+
+fn roundtrip_better_streaming(data: &[u8]) -> Vec<u8> {
+    roundtrip_streaming_at_level(data, CompressionLevel::Better)
 }
 
 /// Generate data with limited alphabet for better Huffman compressibility
@@ -357,4 +376,85 @@ fn roundtrip_default_level_regression() {
 fn roundtrip_default_level_multi_block_regression() {
     let data = generate_compressible(1337, 512 * 1024);
     assert_eq!(roundtrip_default(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_compressible() {
+    let data = generate_compressible(888, 64 * 1024);
+    assert_eq!(roundtrip_better(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_random() {
+    let data = generate_data(999, 64 * 1024);
+    assert_eq!(roundtrip_better(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_multi_block() {
+    let data = generate_compressible(2001, 512 * 1024);
+    assert_eq!(roundtrip_better(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_streaming() {
+    let data = generate_compressible(3003, 64 * 1024);
+    assert_eq!(roundtrip_better_streaming(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_edge_cases() {
+    assert_eq!(roundtrip_better(&[]), Vec::<u8>::new());
+    assert_eq!(roundtrip_better(&[0x42]), vec![0x42]);
+    let zeros = vec![0u8; 100_000];
+    assert_eq!(roundtrip_better(&zeros), zeros);
+    let ascending: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+    assert_eq!(roundtrip_better(&ascending), ascending);
+}
+
+#[test]
+fn roundtrip_better_level_repeat_offsets() {
+    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
+    assert_eq!(roundtrip_better(&data), data);
+}
+
+#[test]
+fn roundtrip_better_level_large_literals() {
+    let data = generate_huffman_friendly(200, 128 * 1024, 64);
+    assert_eq!(roundtrip_better(&data), data);
+}
+
+/// Better (lazy2) should compress close to or better than Default (lazy) on
+/// structured, compressible data. Lazy2 may be marginally worse on some inputs
+/// due to skipping otherwise-adequate matches while looking further ahead.
+#[test]
+fn better_level_compresses_close_to_default() {
+    let data = repeat_offset_fixture(b"HelloWorld", (256 * 1024) / 12 + 1);
+    let compressed_default = compress_to_vec(&data[..], CompressionLevel::Default);
+    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
+    // Allow up to 1% regression; lazy2 optimizes for broader data patterns.
+    assert!(
+        (compressed_better.len() as u64) * 100 <= (compressed_default.len() as u64) * 101,
+        "Better level should stay within 1% of Default. \
+         better={} bytes, default={} bytes",
+        compressed_better.len(),
+        compressed_default.len(),
+    );
+}
+
+/// Exercise the 8 MiB window: place a repeated pattern beyond Default's
+/// 4 MiB window so only Better (8 MiB) can match it.
+#[test]
+fn roundtrip_better_level_large_window() {
+    // ~5 MiB of data: 128-byte pattern, 5 MiB unique filler, then the same pattern.
+    // The second occurrence is ~5 MiB away — outside Default's 4 MiB window
+    // but inside Better's 8 MiB window.
+    let pattern = generate_data(0xBE77, 128);
+    let filler_len = 5 * 1024 * 1024; // 5 MiB gap
+    let mut data = Vec::with_capacity(pattern.len() + filler_len + pattern.len());
+    data.extend_from_slice(&pattern);
+    data.extend(generate_data(0xF111, filler_len));
+    data.extend_from_slice(&pattern);
+
+    assert_eq!(roundtrip_better(&data), data);
 }

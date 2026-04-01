@@ -35,8 +35,9 @@ encoder:
 
 - `structured-zstd::Fastest` vs `zstd` level `1`
 - `structured-zstd::Default` vs `zstd` level `3`
+- `structured-zstd::Better` vs `zstd` level `7`
 
-`Better` and `Best` are intentionally excluded until the encoder implements them.
+`Best` is intentionally excluded until the encoder implements it.
 
 Dictionary benchmarks are tracked separately with C FFI `with_dict` vs `without_dict` runs, using a
 dictionary trained from scenario samples. Pure Rust dictionary compression is still pending and is

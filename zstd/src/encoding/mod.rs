@@ -61,7 +61,9 @@ pub enum CompressionLevel {
     Default,
     /// This level is roughly equivalent to Zstd level 7.
     ///
-    /// UNIMPLEMENTED
+    /// Uses the hash-chain matcher with a lazy2 matching strategy: the encoder
+    /// evaluates up to two positions ahead before committing to a match,
+    /// trading speed for a better compression ratio than [`CompressionLevel::Default`].
     Better,
     /// This level is roughly equivalent to Zstd level 11.
     ///

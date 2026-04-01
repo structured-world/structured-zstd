@@ -24,12 +24,23 @@ const DFAST_TARGET_LEN: usize = 48;
 const DFAST_HASH_BITS: usize = 20;
 const DFAST_SEARCH_DEPTH: usize = 4;
 const DFAST_DEFAULT_WINDOW_SIZE: usize = 1 << 22;
+const BETTER_DEFAULT_WINDOW_SIZE: usize = 1 << 23;
 const DFAST_EMPTY_SLOT: usize = usize::MAX;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+const HC_HASH_LOG: usize = 20;
+const HC_CHAIN_LOG: usize = 19;
+const HC_SEARCH_DEPTH: usize = 16;
+const HC_MIN_MATCH_LEN: usize = 5;
+const HC_TARGET_LEN: usize = 48;
+// Safe sentinel: even if abs_pos wraps to u32::MAX at ~4GB input, chain_candidates
+// filters by history_abs_start bounds so a wrapped position can never match live history.
+const HC_EMPTY: u32 = u32::MAX;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatcherBackend {
     Simple,
     Dfast,
+    HashChain,
 }
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
@@ -38,6 +49,7 @@ pub struct MatchGeneratorDriver {
     suffix_pool: Vec<SuffixStore>,
     match_generator: MatchGenerator,
     dfast_match_generator: Option<DfastMatchGenerator>,
+    hc_match_generator: Option<HcMatchGenerator>,
     active_backend: MatcherBackend,
     slice_size: usize,
     base_slice_size: usize,
@@ -60,6 +72,7 @@ impl MatchGeneratorDriver {
             suffix_pool: Vec::new(),
             match_generator: MatchGenerator::new(max_window_size),
             dfast_match_generator: None,
+            hc_match_generator: None,
             active_backend: MatcherBackend::Simple,
             slice_size,
             base_slice_size: slice_size,
@@ -90,9 +103,9 @@ impl MatchGeneratorDriver {
                 1,
             ),
             CompressionLevel::Better => (
-                MatcherBackend::Simple,
+                MatcherBackend::HashChain,
                 self.base_slice_size,
-                self.base_window_size,
+                BETTER_DEFAULT_WINDOW_SIZE,
                 1,
             ),
             CompressionLevel::Best => (
@@ -116,6 +129,18 @@ impl MatchGeneratorDriver {
             .expect("dfast backend must be initialized by reset() before use")
     }
 
+    fn hc_matcher(&self) -> &HcMatchGenerator {
+        self.hc_match_generator
+            .as_ref()
+            .expect("hash chain backend must be initialized by reset() before use")
+    }
+
+    fn hc_matcher_mut(&mut self) -> &mut HcMatchGenerator {
+        self.hc_match_generator
+            .as_mut()
+            .expect("hash chain backend must be initialized by reset() before use")
+    }
+
     fn retire_dictionary_budget(&mut self, evicted_bytes: usize) {
         let reclaimed = evicted_bytes.min(self.dictionary_retained_budget);
         if reclaimed == 0 {
@@ -131,6 +156,10 @@ impl MatchGeneratorDriver {
             }
             MatcherBackend::Dfast => {
                 let matcher = self.dfast_matcher_mut();
+                matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
+            }
+            MatcherBackend::HashChain => {
+                let matcher = self.hc_matcher_mut();
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
         }
@@ -155,6 +184,17 @@ impl MatchGeneratorDriver {
                 MatcherBackend::Dfast => {
                     let mut retired = Vec::new();
                     self.dfast_matcher_mut().trim_to_window(|data| {
+                        evicted_bytes += data.len();
+                        retired.push(data);
+                    });
+                    for mut data in retired {
+                        data.resize(data.capacity(), 0);
+                        self.vec_pool.push(data);
+                    }
+                }
+                MatcherBackend::HashChain => {
+                    let mut retired = Vec::new();
+                    self.hc_matcher_mut().trim_to_window(|data| {
                         evicted_bytes += data.len();
                         retired.push(data);
                     });
@@ -202,6 +242,15 @@ impl Matcher for MatchGeneratorDriver {
                         });
                     }
                 }
+                MatcherBackend::HashChain => {
+                    if let Some(hc) = self.hc_match_generator.as_mut() {
+                        let vec_pool = &mut self.vec_pool;
+                        hc.reset(|mut data| {
+                            data.resize(data.capacity(), 0);
+                            vec_pool.push(data);
+                        });
+                    }
+                }
             }
         }
 
@@ -227,8 +276,21 @@ impl Matcher for MatchGeneratorDriver {
                     .dfast_match_generator
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
+                dfast.lazy_depth = 1;
                 let vec_pool = &mut self.vec_pool;
                 dfast.reset(|mut data| {
+                    data.resize(data.capacity(), 0);
+                    vec_pool.push(data);
+                });
+            }
+            MatcherBackend::HashChain => {
+                let hc = self
+                    .hc_match_generator
+                    .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
+                hc.max_window_size = max_window_size;
+                hc.lazy_depth = 2;
+                let vec_pool = &mut self.vec_pool;
+                hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
@@ -240,6 +302,7 @@ impl Matcher for MatchGeneratorDriver {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
             MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
+            MatcherBackend::HashChain => self.hc_matcher_mut().offset_hist = offset_hist,
         }
 
         if dict_content.is_empty() {
@@ -261,13 +324,18 @@ impl Matcher for MatchGeneratorDriver {
                 matcher.max_window_size =
                     matcher.max_window_size.saturating_add(retained_dict_budget);
             }
+            MatcherBackend::HashChain => {
+                let matcher = self.hc_matcher_mut();
+                matcher.max_window_size =
+                    matcher.max_window_size.saturating_add(retained_dict_budget);
+            }
         }
 
         let mut start = 0usize;
         let mut committed_dict_budget = 0usize;
         let min_primed_tail = match self.active_backend {
             MatcherBackend::Simple => MIN_MATCH_LEN,
-            MatcherBackend::Dfast => 4,
+            MatcherBackend::Dfast | MatcherBackend::HashChain => 4,
         };
         while start < dict_content.len() {
             let end = (start + self.slice_size).min(dict_content.len());
@@ -298,6 +366,12 @@ impl Matcher for MatchGeneratorDriver {
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
+                MatcherBackend::HashChain => {
+                    let matcher = self.hc_matcher_mut();
+                    matcher.max_window_size = matcher
+                        .max_window_size
+                        .saturating_sub(uncommitted_tail_budget);
+                }
             }
         }
         if committed_dict_budget > 0 {
@@ -323,6 +397,7 @@ impl Matcher for MatchGeneratorDriver {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.window.last().unwrap().data.as_slice(),
             MatcherBackend::Dfast => self.dfast_matcher().get_last_space(),
+            MatcherBackend::HashChain => self.hc_matcher().get_last_space(),
         }
     }
 
@@ -362,6 +437,20 @@ impl Matcher for MatchGeneratorDriver {
                 self.retire_dictionary_budget(evicted_bytes);
                 self.trim_after_budget_retire();
             }
+            MatcherBackend::HashChain => {
+                let vec_pool = &mut self.vec_pool;
+                let mut evicted_bytes = 0usize;
+                self.hc_match_generator
+                    .as_mut()
+                    .expect("hash chain backend must be initialized by reset() before use")
+                    .add_data(space, |mut data| {
+                        evicted_bytes += data.len();
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                    });
+                self.retire_dictionary_budget(evicted_bytes);
+                self.trim_after_budget_retire();
+            }
         }
     }
 
@@ -373,12 +462,14 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::Dfast => self
                 .dfast_matcher_mut()
                 .start_matching(&mut handle_sequence),
+            MatcherBackend::HashChain => self.hc_matcher_mut().start_matching(&mut handle_sequence),
         }
     }
     fn skip_matching(&mut self) {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.skip_matching(),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(),
+            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
         }
     }
 }
@@ -870,6 +961,8 @@ struct DfastMatchGenerator {
     offset_hist: [u32; 3],
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
+    // Lazy match lookahead depth: 1 = lazy (Default), 2 = lazy2 (Better).
+    lazy_depth: u8,
 }
 
 #[derive(Copy, Clone)]
@@ -891,6 +984,7 @@ impl DfastMatchGenerator {
             offset_hist: [1, 4, 8],
             short_hash: Vec::new(),
             long_hash: Vec::new(),
+            lazy_depth: 1,
         }
     }
 
@@ -1053,16 +1147,26 @@ impl DfastMatchGenerator {
             return Some(best);
         }
 
+        // Lazy check: evaluate pos+1
         let next = self.best_match(abs_pos + 1, lit_len + 1);
-        match next {
-            Some(next)
-                if next.match_len > best.match_len
-                    || (next.match_len == best.match_len && next.offset < best.offset) =>
-            {
-                None
-            }
-            _ => Some(best),
+        if let Some(next) = next
+            && (next.match_len > best.match_len
+                || (next.match_len == best.match_len && next.offset < best.offset))
+        {
+            return None;
         }
+
+        // Lazy2 check: also evaluate pos+2
+        if self.lazy_depth >= 2 && abs_pos + 2 + DFAST_MIN_MATCH_LEN <= self.history_abs_end() {
+            let next2 = self.best_match(abs_pos + 2, lit_len + 2);
+            if let Some(next2) = next2
+                && next2.match_len > best.match_len + 1
+            {
+                return None;
+            }
+        }
+
+        Some(best)
     }
 
     fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
@@ -1252,6 +1356,412 @@ impl DfastMatchGenerator {
     fn hash_bits(value: u64) -> usize {
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
         ((value.wrapping_mul(PRIME)) >> (64 - DFAST_HASH_BITS)) as usize
+    }
+}
+
+struct HcMatchGenerator {
+    max_window_size: usize,
+    window: VecDeque<Vec<u8>>,
+    window_size: usize,
+    history: Vec<u8>,
+    history_start: usize,
+    history_abs_start: usize,
+    offset_hist: [u32; 3],
+    hash_table: Vec<u32>,
+    chain_table: Vec<u32>,
+    lazy_depth: u8,
+}
+
+impl HcMatchGenerator {
+    fn new(max_window_size: usize) -> Self {
+        Self {
+            max_window_size,
+            window: VecDeque::new(),
+            window_size: 0,
+            history: Vec::new(),
+            history_start: 0,
+            history_abs_start: 0,
+            offset_hist: [1, 4, 8],
+            hash_table: Vec::new(),
+            chain_table: Vec::new(),
+            lazy_depth: 2,
+        }
+    }
+
+    fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+        self.window_size = 0;
+        self.history.clear();
+        self.history_start = 0;
+        self.history_abs_start = 0;
+        self.offset_hist = [1, 4, 8];
+        if !self.hash_table.is_empty() {
+            self.hash_table.fill(HC_EMPTY);
+            self.chain_table.fill(HC_EMPTY);
+        }
+        for mut data in self.window.drain(..) {
+            data.resize(data.capacity(), 0);
+            reuse_space(data);
+        }
+    }
+
+    fn get_last_space(&self) -> &[u8] {
+        self.window.back().unwrap().as_slice()
+    }
+
+    // History duplicates window data for O(1) contiguous access during match
+    // finding (common_prefix_len, extend_backwards). Same pattern as
+    // DfastMatchGenerator. Peak: ~2x window size for data buffers + 6 MB tables.
+    fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
+        assert!(data.len() <= self.max_window_size);
+        while self.window_size + data.len() > self.max_window_size {
+            let removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            reuse_space(removed);
+        }
+        self.compact_history();
+        self.history.extend_from_slice(&data);
+        self.window_size += data.len();
+        self.window.push_back(data);
+    }
+
+    fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+        while self.window_size > self.max_window_size {
+            let removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            reuse_space(removed);
+        }
+    }
+
+    /// Backfill positions from the tail of the previous slice that couldn't be
+    /// hashed at the time (insert_position needs 4 bytes of lookahead).
+    fn backfill_boundary_positions(&mut self, current_abs_start: usize) {
+        let backfill_start = current_abs_start
+            .saturating_sub(3)
+            .max(self.history_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
+    }
+
+    fn skip_matching(&mut self) {
+        self.ensure_tables();
+        let current_len = self.window.back().unwrap().len();
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        self.backfill_boundary_positions(current_abs_start);
+        self.insert_positions(current_abs_start, current_abs_start + current_len);
+    }
+
+    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        self.ensure_tables();
+
+        let current_len = self.window.back().unwrap().len();
+        if current_len == 0 {
+            return;
+        }
+
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        self.backfill_boundary_positions(current_abs_start);
+
+        let mut pos = 0usize;
+        let mut literals_start = 0usize;
+        while pos + HC_MIN_MATCH_LEN <= current_len {
+            let abs_pos = current_abs_start + pos;
+            let lit_len = pos - literals_start;
+
+            let best = self.find_best_match(abs_pos, lit_len);
+            if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
+                self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+                let current = self.window.back().unwrap().as_slice();
+                let start = candidate.start - current_abs_start;
+                let literals = &current[literals_start..start];
+                handle_sequence(Sequence::Triple {
+                    literals,
+                    offset: candidate.offset,
+                    match_len: candidate.match_len,
+                });
+                let _ = encode_offset_with_history(
+                    candidate.offset as u32,
+                    literals.len() as u32,
+                    &mut self.offset_hist,
+                );
+                pos = start + candidate.match_len;
+                literals_start = pos;
+            } else {
+                self.insert_position(abs_pos);
+                pos += 1;
+            }
+        }
+
+        // Insert remaining hashable positions in the tail (the matching loop
+        // stops at HC_MIN_MATCH_LEN but insert_position only needs 4 bytes).
+        while pos + 4 <= current_len {
+            self.insert_position(current_abs_start + pos);
+            pos += 1;
+        }
+
+        if literals_start < current_len {
+            let current = self.window.back().unwrap().as_slice();
+            handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
+    }
+
+    fn ensure_tables(&mut self) {
+        if self.hash_table.is_empty() {
+            self.hash_table = alloc::vec![HC_EMPTY; 1 << HC_HASH_LOG];
+            self.chain_table = alloc::vec![HC_EMPTY; 1 << HC_CHAIN_LOG];
+        }
+    }
+
+    fn compact_history(&mut self) {
+        if self.history_start == 0 {
+            return;
+        }
+        if self.history_start >= self.max_window_size
+            || self.history_start * 2 >= self.history.len()
+        {
+            self.history.drain(..self.history_start);
+            self.history_start = 0;
+        }
+    }
+
+    fn live_history(&self) -> &[u8] {
+        &self.history[self.history_start..]
+    }
+
+    fn history_abs_end(&self) -> usize {
+        self.history_abs_start + self.live_history().len()
+    }
+
+    fn hash_position(&self, data: &[u8]) -> usize {
+        let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+        const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+        ((value.wrapping_mul(PRIME)) >> (64 - HC_HASH_LOG)) as usize
+    }
+
+    fn insert_position(&mut self, abs_pos: usize) {
+        let idx = abs_pos - self.history_abs_start;
+        let concat = self.live_history();
+        if idx + 4 > concat.len() {
+            return;
+        }
+        let hash = self.hash_position(&concat[idx..]);
+        // Chain table uses u32 positions — wrapping is safe because chain_idx
+        // is masked and stale entries are filtered by history_abs_start bounds.
+        let pos_u32 = abs_pos as u32;
+        let chain_idx = (pos_u32 as usize) & ((1 << HC_CHAIN_LOG) - 1);
+        let prev = self.hash_table[hash];
+        self.chain_table[chain_idx] = prev;
+        self.hash_table[hash] = pos_u32;
+    }
+
+    fn insert_positions(&mut self, start: usize, end: usize) {
+        for pos in start..end {
+            self.insert_position(pos);
+        }
+    }
+
+    fn chain_candidates(&self, abs_pos: usize) -> [usize; HC_SEARCH_DEPTH] {
+        let mut buf = [usize::MAX; HC_SEARCH_DEPTH];
+        let idx = abs_pos - self.history_abs_start;
+        let concat = self.live_history();
+        if idx + 4 > concat.len() {
+            return buf;
+        }
+        let hash = self.hash_position(&concat[idx..]);
+        let chain_mask = (1 << HC_CHAIN_LOG) - 1;
+
+        let mut cur = self.hash_table[hash];
+        let mut filled = 0;
+        // Follow chain up to HC_SEARCH_DEPTH valid candidates, skipping stale
+        // entries (evicted from window) instead of stopping at them.
+        let mut steps = 0;
+        while filled < HC_SEARCH_DEPTH && steps < HC_SEARCH_DEPTH * 4 {
+            if cur == HC_EMPTY {
+                break;
+            }
+            let candidate_abs = cur as usize;
+            cur = self.chain_table[candidate_abs & chain_mask];
+            steps += 1;
+            if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
+                continue;
+            }
+            buf[filled] = candidate_abs;
+            filled += 1;
+        }
+        buf
+    }
+
+    fn find_best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        let rep = self.repcode_candidate(abs_pos, lit_len);
+        let hash = self.hash_chain_candidate(abs_pos, lit_len);
+        Self::better_candidate(rep, hash)
+    }
+
+    fn hash_chain_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        let concat = self.live_history();
+        let current_idx = abs_pos - self.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best: Option<MatchCandidate> = None;
+        for candidate_abs in self.chain_candidates(abs_pos) {
+            if candidate_abs == usize::MAX {
+                break;
+            }
+            let candidate_idx = candidate_abs - self.history_abs_start;
+            let match_len =
+                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate = self.extend_backwards(candidate_abs, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+                if best.is_some_and(|b| b.match_len >= HC_TARGET_LEN) {
+                    return best;
+                }
+            }
+        }
+        best
+    }
+
+    fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        let reps = if lit_len == 0 {
+            [
+                Some(self.offset_hist[1] as usize),
+                Some(self.offset_hist[2] as usize),
+                (self.offset_hist[0] > 1).then_some((self.offset_hist[0] - 1) as usize),
+            ]
+        } else {
+            [
+                Some(self.offset_hist[0] as usize),
+                Some(self.offset_hist[1] as usize),
+                Some(self.offset_hist[2] as usize),
+            ]
+        };
+
+        let concat = self.live_history();
+        let current_idx = abs_pos - self.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best = None;
+        for rep in reps.into_iter().flatten() {
+            if rep == 0 || rep > abs_pos {
+                continue;
+            }
+            let candidate_pos = abs_pos - rep;
+            if candidate_pos < self.history_abs_start {
+                continue;
+            }
+            let candidate_idx = candidate_pos - self.history_abs_start;
+            let match_len =
+                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+            }
+        }
+        best
+    }
+
+    fn extend_backwards(
+        &self,
+        mut candidate_pos: usize,
+        mut abs_pos: usize,
+        mut match_len: usize,
+        lit_len: usize,
+    ) -> MatchCandidate {
+        let concat = self.live_history();
+        let min_abs_pos = abs_pos - lit_len;
+        while abs_pos > min_abs_pos
+            && candidate_pos > self.history_abs_start
+            && concat[candidate_pos - self.history_abs_start - 1]
+                == concat[abs_pos - self.history_abs_start - 1]
+        {
+            candidate_pos -= 1;
+            abs_pos -= 1;
+            match_len += 1;
+        }
+        MatchCandidate {
+            start: abs_pos,
+            offset: abs_pos - candidate_pos,
+            match_len,
+        }
+    }
+
+    fn better_candidate(
+        lhs: Option<MatchCandidate>,
+        rhs: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        match (lhs, rhs) {
+            (None, other) | (other, None) => other,
+            (Some(lhs), Some(rhs)) => {
+                let lhs_gain = Self::match_gain(lhs.match_len, lhs.offset);
+                let rhs_gain = Self::match_gain(rhs.match_len, rhs.offset);
+                if rhs_gain > lhs_gain {
+                    Some(rhs)
+                } else {
+                    Some(lhs)
+                }
+            }
+        }
+    }
+
+    fn match_gain(match_len: usize, offset: usize) -> i32 {
+        debug_assert!(
+            offset > 0,
+            "zstd offsets are 1-indexed, offset=0 is invalid"
+        );
+        let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
+        (match_len as i32) * 4 - offset_bits
+    }
+
+    // Lazy lookahead queries pos+1/pos+2 before they are inserted into hash
+    // tables — matching C zstd behavior. Seeding before comparing would let a
+    // position match against itself, changing semantics.
+    fn pick_lazy_match(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        best: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        let best = best?;
+        if best.match_len >= HC_TARGET_LEN
+            || abs_pos + 1 + HC_MIN_MATCH_LEN > self.history_abs_end()
+        {
+            return Some(best);
+        }
+
+        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
+
+        // Lazy check: evaluate pos+1
+        let next = self.find_best_match(abs_pos + 1, lit_len + 1);
+        if let Some(next) = next {
+            let next_gain = Self::match_gain(next.match_len, next.offset);
+            if next_gain > current_gain {
+                return None;
+            }
+        }
+
+        // Lazy2 check: also evaluate pos+2
+        if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= self.history_abs_end() {
+            let next2 = self.find_best_match(abs_pos + 2, lit_len + 2);
+            if let Some(next2) = next2 {
+                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
+                // Must beat current gain + extra literal cost
+                if next2_gain > current_gain + 4 {
+                    return None;
+                }
+            }
+        }
+
+        Some(best)
     }
 }
 
@@ -1704,8 +2214,11 @@ fn fastest_reset_uses_interleaved_hash_fill_step() {
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.match_generator.hash_fill_step, FAST_HASH_FILL_STEP);
 
+    // Better uses the HashChain backend with lazy2; verify that the backend switch
+    // happened and the lazy_depth is configured correctly.
     driver.reset(CompressionLevel::Better);
-    assert_eq!(driver.match_generator.hash_fill_step, 1);
+    assert_eq!(driver.active_backend, MatcherBackend::HashChain);
+    assert_eq!(driver.hc_matcher().lazy_depth, 2);
 }
 
 #[test]

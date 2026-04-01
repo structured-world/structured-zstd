@@ -208,7 +208,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {
         let mut space = match self.compression_level {
-            CompressionLevel::Fastest | CompressionLevel::Default => {
+            CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => {
                 self.state.matcher.get_next_space()
             }
             _ => Vec::new(),
@@ -262,9 +262,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         match self.compression_level {
             CompressionLevel::Uncompressed
             | CompressionLevel::Fastest
-            | CompressionLevel::Default => Ok(()),
+            | CompressionLevel::Default
+            | CompressionLevel::Better => Ok(()),
             _ => Err(invalid_input_error(
-                "streaming encoder currently supports Uncompressed/Fastest/Default only",
+                "streaming encoder currently supports Uncompressed/Fastest/Default/Better only",
             )),
         }
     }
@@ -297,7 +298,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                     header.serialize(&mut encoded);
                     encoded.extend_from_slice(block);
                 }
-                CompressionLevel::Fastest | CompressionLevel::Default => {
+                CompressionLevel::Fastest
+                | CompressionLevel::Default
+                | CompressionLevel::Better => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
                     compress_fastest(&mut self.state, last_block, block, &mut encoded);
@@ -306,7 +309,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 _ => {
                     return Err((
                         invalid_input_error(
-                            "streaming encoder currently supports Uncompressed/Fastest/Default only",
+                            "streaming encoder currently supports Uncompressed/Fastest/Default/Better only",
                         ),
                         raw_block.unwrap_or_default(),
                     ));
@@ -729,11 +732,17 @@ mod tests {
     }
 
     #[test]
-    fn better_level_returns_unsupported_error() {
+    fn better_level_streaming_roundtrip() {
+        let payload = b"better-level-streaming-test".repeat(256);
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
-        let err = encoder.write_all(b"payload").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(encoder.finish().is_err());
+        for chunk in payload.chunks(53) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]
@@ -749,7 +758,7 @@ mod tests {
 
     #[test]
     fn unsupported_level_write_fails_before_emitting_frame_header() {
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Better);
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Best);
         assert!(encoder.write_all(b"payload").is_err());
         assert_eq!(encoder.get_ref().len(), 0);
     }
