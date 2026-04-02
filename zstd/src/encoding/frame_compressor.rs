@@ -279,7 +279,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 }
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
-                | CompressionLevel::Better => {
+                | CompressionLevel::Better
+                | CompressionLevel::Best => {
                     // All compressed levels share this block-encoding pipeline;
                     // they differ only in the matcher backend and its parameters.
                     compress_block_encoded(&mut self.state, last_block, uncompressed_data, output)

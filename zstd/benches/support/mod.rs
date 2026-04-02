@@ -1,4 +1,4 @@
-use rand::{RngCore, SeedableRng, rngs::SmallRng};
+use rand::{rngs::SmallRng, RngCore, SeedableRng};
 use std::{collections::HashSet, env, fs, path::Path};
 use structured_zstd::encoding::CompressionLevel;
 
@@ -70,7 +70,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
     scenarios
 }
 
-pub(crate) fn supported_levels() -> [LevelConfig; 3] {
+pub(crate) fn supported_levels() -> [LevelConfig; 4] {
     [
         LevelConfig {
             name: "fastest",
@@ -86,6 +86,11 @@ pub(crate) fn supported_levels() -> [LevelConfig; 3] {
             name: "better",
             rust_level: CompressionLevel::Better,
             ffi_level: 7,
+        },
+        LevelConfig {
+            name: "best",
+            rust_level: CompressionLevel::Best,
+            ffi_level: 11,
         },
     ]
 }

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use progress::fmt_size;
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{ContextCompat, WrapErr, eyre};
+use color_eyre::eyre::{eyre, ContextCompat, WrapErr};
 use structured_zstd::encoding::CompressionLevel;
 use tracing::info;
 use tracing_indicatif::IndicatifLayer;
@@ -41,14 +41,13 @@ enum Commands {
         /// - 1: Fastest
         /// - 2: Default
         /// - 3: Better (lazy2, ~zstd level 7)
-        ///
-        /// Streaming mode currently supports only levels 0..=3.
+        /// - 4: Best  (deep lazy2, ~zstd level 11)
         #[arg(
             short,
             long,
             value_name = "COMPRESSION_LEVEL",
             default_value_t = 2,
-            value_parser = clap::value_parser!(u8).range(0..=3),
+            value_parser = clap::value_parser!(u8).range(0..=4),
             verbatim_doc_comment
         )]
         level: u8,
@@ -109,6 +108,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         1 => CompressionLevel::Fastest,
         2 => CompressionLevel::Default,
         3 => CompressionLevel::Better,
+        4 => CompressionLevel::Best,
         _ => return Err(eyre!("unsupported compression level: {level}")),
     };
     ensure_distinct_paths(&input, &output)?;
@@ -378,15 +378,15 @@ fn add_extension<P: AsRef<Path>>(path: &Path, extension: P) -> PathBuf {
 mod tests {
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
 
-    use super::{Cli, compress, replace_output_file};
+    use super::{compress, replace_output_file, Cli};
     use std::path::PathBuf;
 
     use crate::add_extension;
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_unsupported_compression_level_at_parse_time() {
-        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "4"]);
+        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "5"]);
         assert!(parse.is_err());
     }
 

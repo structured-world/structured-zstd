@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
+use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -86,6 +86,14 @@ fn roundtrip_better(data: &[u8]) -> Vec<u8> {
 
 fn roundtrip_better_streaming(data: &[u8]) -> Vec<u8> {
     roundtrip_streaming_at_level(data, CompressionLevel::Better)
+}
+
+fn roundtrip_best(data: &[u8]) -> Vec<u8> {
+    roundtrip_at_level(data, CompressionLevel::Best)
+}
+
+fn roundtrip_best_streaming(data: &[u8]) -> Vec<u8> {
+    roundtrip_streaming_at_level(data, CompressionLevel::Best)
 }
 
 /// Generate data with limited alphabet for better Huffman compressibility
@@ -466,4 +474,103 @@ fn roundtrip_better_level_large_window() {
         compressed_better.len(),
         compressed_default.len(),
     );
+}
+
+#[test]
+fn roundtrip_best_level_compressible() {
+    let data = generate_compressible(1111, 64 * 1024);
+    assert_eq!(roundtrip_best(&data), data);
+}
+
+#[test]
+fn roundtrip_best_level_random() {
+    let data = generate_data(2222, 64 * 1024);
+    assert_eq!(roundtrip_best(&data), data);
+}
+
+#[test]
+fn roundtrip_best_level_multi_block() {
+    let data = generate_compressible(3333, 512 * 1024);
+    assert_eq!(roundtrip_best(&data), data);
+}
+
+#[test]
+fn roundtrip_best_level_streaming() {
+    let data = generate_compressible(4444, 64 * 1024);
+    assert_eq!(roundtrip_best_streaming(&data), data);
+}
+
+#[test]
+fn roundtrip_best_level_edge_cases() {
+    assert_eq!(roundtrip_best(&[]), Vec::<u8>::new());
+    assert_eq!(roundtrip_best(&[0x42]), vec![0x42]);
+    let zeros = vec![0u8; 100_000];
+    assert_eq!(roundtrip_best(&zeros), zeros);
+    let ascending: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+    assert_eq!(roundtrip_best(&ascending), ascending);
+}
+
+#[test]
+fn roundtrip_best_level_repeat_offsets() {
+    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
+    assert_eq!(roundtrip_best(&data), data);
+}
+
+#[test]
+fn roundtrip_best_level_large_literals() {
+    let data = generate_huffman_friendly(300, 128 * 1024, 64);
+    assert_eq!(roundtrip_best(&data), data);
+}
+
+/// Best should compress close to or better than Better on structured,
+/// compressible data. Deeper search and larger tables should find longer
+/// matches, but the margin may be small on some inputs.
+#[test]
+fn best_level_compresses_close_to_better() {
+    let data = repeat_offset_fixture(b"HelloWorld", (256 * 1024) / 12 + 1);
+    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
+    let compressed_best = compress_to_vec(&data[..], CompressionLevel::Best);
+    // Allow up to 1% regression; deeper search optimizes for broader data patterns.
+    assert!(
+        (compressed_best.len() as u64) * 100 <= (compressed_better.len() as u64) * 101,
+        "Best level should stay within 1% of Better. \
+         best={} bytes, better={} bytes",
+        compressed_best.len(),
+        compressed_better.len(),
+    );
+}
+
+/// Exercise the 16 MiB window: place a repeated pattern beyond Better's
+/// 8 MiB window so only Best (16 MiB) can match it.
+#[test]
+fn roundtrip_best_level_large_window() {
+    // Two identical 256 KiB regions separated by a 9 MiB compressible gap.
+    // Best's 16 MiB window can still reach the first region;
+    // Better's 8 MiB window cannot.
+    let region = generate_compressible(42, 256 * 1024);
+    let gap = generate_compressible(7777, 9 * 1024 * 1024);
+    let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
+    data.extend_from_slice(&region);
+    data.extend_from_slice(&gap);
+    data.extend_from_slice(&region);
+
+    assert_eq!(roundtrip_best(&data), data);
+
+    // Best should compress the duplicated region; Better cannot reach it.
+    let compressed_best = compress_to_vec(&data[..], CompressionLevel::Best);
+    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
+    assert!(
+        compressed_best.len() < compressed_better.len(),
+        "Best (16 MiB window) should beat Better (8 MiB) across 9 MiB gap. \
+         best={} better={}",
+        compressed_best.len(),
+        compressed_better.len(),
+    );
+}
+
+/// Best level streaming should produce identical decompressed output.
+#[test]
+fn roundtrip_best_level_streaming_multi_block() {
+    let data = generate_compressible(5555, 512 * 1024);
+    assert_eq!(roundtrip_best_streaming(&data), data);
 }

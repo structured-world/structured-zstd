@@ -36,6 +36,16 @@ const HC_TARGET_LEN: usize = 48;
 // that can never collide with any valid position, even at the 4 GiB boundary.
 const HC_EMPTY: u32 = 0;
 
+// Best-level hash-chain parameters: deeper search, larger tables, higher target.
+const BEST_HC_HASH_LOG: usize = 21;
+const BEST_HC_CHAIN_LOG: usize = 20;
+const BEST_HC_SEARCH_DEPTH: usize = 32;
+const BEST_HC_TARGET_LEN: usize = 128;
+const BEST_DEFAULT_WINDOW_SIZE: usize = 1 << 24;
+// Maximum search depth across all HC-based levels. Used to size the
+// fixed-length candidate array returned by chain_candidates().
+const MAX_HC_SEARCH_DEPTH: usize = BEST_HC_SEARCH_DEPTH;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatcherBackend {
     Simple,
@@ -109,9 +119,9 @@ impl MatchGeneratorDriver {
                 1,
             ),
             CompressionLevel::Best => (
-                MatcherBackend::Simple,
+                MatcherBackend::HashChain,
                 self.base_slice_size,
-                self.base_window_size,
+                BEST_DEFAULT_WINDOW_SIZE,
                 1,
             ),
         }
@@ -289,6 +299,20 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
                 hc.max_window_size = max_window_size;
                 hc.lazy_depth = 2;
+                match level {
+                    CompressionLevel::Best => hc.configure(
+                        BEST_HC_HASH_LOG,
+                        BEST_HC_CHAIN_LOG,
+                        BEST_HC_SEARCH_DEPTH,
+                        BEST_HC_TARGET_LEN,
+                    ),
+                    _ => hc.configure(
+                        HC_HASH_LOG,
+                        HC_CHAIN_LOG,
+                        HC_SEARCH_DEPTH,
+                        HC_TARGET_LEN,
+                    ),
+                }
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -1373,6 +1397,10 @@ struct HcMatchGenerator {
     hash_table: Vec<u32>,
     chain_table: Vec<u32>,
     lazy_depth: u8,
+    hash_log: usize,
+    chain_log: usize,
+    search_depth: usize,
+    target_len: usize,
 }
 
 impl HcMatchGenerator {
@@ -1388,6 +1416,29 @@ impl HcMatchGenerator {
             hash_table: Vec::new(),
             chain_table: Vec::new(),
             lazy_depth: 2,
+            hash_log: HC_HASH_LOG,
+            chain_log: HC_CHAIN_LOG,
+            search_depth: HC_SEARCH_DEPTH,
+            target_len: HC_TARGET_LEN,
+        }
+    }
+
+    fn configure(
+        &mut self,
+        hash_log: usize,
+        chain_log: usize,
+        search_depth: usize,
+        target_len: usize,
+    ) {
+        let resize = self.hash_log != hash_log || self.chain_log != chain_log;
+        self.hash_log = hash_log;
+        self.chain_log = chain_log;
+        self.search_depth = search_depth;
+        self.target_len = target_len;
+        if resize && !self.hash_table.is_empty() {
+            // Force reallocation on next ensure_tables() call.
+            self.hash_table.clear();
+            self.chain_table.clear();
         }
     }
 
@@ -1516,8 +1567,8 @@ impl HcMatchGenerator {
 
     fn ensure_tables(&mut self) {
         if self.hash_table.is_empty() {
-            self.hash_table = alloc::vec![HC_EMPTY; 1 << HC_HASH_LOG];
-            self.chain_table = alloc::vec![HC_EMPTY; 1 << HC_CHAIN_LOG];
+            self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
+            self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
         }
     }
 
@@ -1544,7 +1595,7 @@ impl HcMatchGenerator {
     fn hash_position(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-        ((value.wrapping_mul(PRIME)) >> (64 - HC_HASH_LOG)) as usize
+        ((value.wrapping_mul(PRIME)) >> (64 - self.hash_log)) as usize
     }
 
     fn insert_position(&mut self, abs_pos: usize) {
@@ -1563,7 +1614,7 @@ impl HcMatchGenerator {
         }
         let pos_u32 = abs_pos as u32;
         let stored = pos_u32 + 1;
-        let chain_idx = pos_u32 as usize & ((1 << HC_CHAIN_LOG) - 1);
+        let chain_idx = pos_u32 as usize & ((1 << self.chain_log) - 1);
         let prev = self.hash_table[hash];
         self.chain_table[chain_idx] = prev;
         self.hash_table[hash] = stored;
@@ -1575,27 +1626,27 @@ impl HcMatchGenerator {
         }
     }
 
-    fn chain_candidates(&self, abs_pos: usize) -> [usize; HC_SEARCH_DEPTH] {
-        let mut buf = [usize::MAX; HC_SEARCH_DEPTH];
+    fn chain_candidates(&self, abs_pos: usize) -> [usize; MAX_HC_SEARCH_DEPTH] {
+        let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
         if idx + 4 > concat.len() {
             return buf;
         }
         let hash = self.hash_position(&concat[idx..]);
-        let chain_mask = (1 << HC_CHAIN_LOG) - 1;
+        let chain_mask = (1 << self.chain_log) - 1;
 
         let mut cur = self.hash_table[hash];
         let mut filled = 0;
-        // Follow chain up to HC_SEARCH_DEPTH valid candidates, skipping stale
+        // Follow chain up to search_depth valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
         // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
-        // Break on self-loops (masked chain_idx collision at 512K periodicity).
+        // Break on self-loops (masked chain_idx collision at periodicity).
         // Cap total steps at 4x search depth to bound time spent skipping
         // stale entries while still finding valid candidates deeper in chain.
         let mut steps = 0;
-        const MAX_CHAIN_STEPS: usize = HC_SEARCH_DEPTH * 4;
-        while filled < HC_SEARCH_DEPTH && steps < MAX_CHAIN_STEPS {
+        let max_chain_steps = self.search_depth * 4;
+        while filled < self.search_depth && steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
             }
@@ -1644,7 +1695,7 @@ impl HcMatchGenerator {
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_abs, abs_pos, match_len, lit_len);
                 best = Self::better_candidate(best, Some(candidate));
-                if best.is_some_and(|b| b.match_len >= HC_TARGET_LEN) {
+                if best.is_some_and(|b| b.match_len >= self.target_len) {
                     return best;
                 }
             }
@@ -1755,7 +1806,7 @@ impl HcMatchGenerator {
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
         let best = best?;
-        if best.match_len >= HC_TARGET_LEN
+        if best.match_len >= self.target_len
             || abs_pos + 1 + HC_MIN_MATCH_LEN > self.history_abs_end()
         {
             return Some(best);
