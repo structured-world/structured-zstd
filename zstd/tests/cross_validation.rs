@@ -265,3 +265,31 @@ fn better_level_beats_default_on_corpus_proxy() {
         default.len()
     );
 }
+
+#[test]
+fn cross_rust_best_compress_ffi_decompress_regression() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let compressed = compress_to_vec(data.as_slice(), CompressionLevel::Best);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(
+        data.as_slice(),
+        result.as_slice(),
+        "rust best→ffi roundtrip failed"
+    );
+}
+
+/// Verify that Best compresses strictly better than Better on the corpus proxy.
+/// Deeper search and larger tables should find longer matches.
+#[test]
+fn best_level_beats_better_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let better = compress_to_vec(data.as_slice(), CompressionLevel::Better);
+    let best = compress_to_vec(data.as_slice(), CompressionLevel::Best);
+
+    assert!(
+        best.len() < better.len(),
+        "Best should compress strictly better than Better on corpus proxy. best={} better={}",
+        best.len(),
+        better.len()
+    );
+}

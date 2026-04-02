@@ -74,7 +74,19 @@ pub enum CompressionLevel {
     Better,
     /// This level is roughly equivalent to Zstd level 11.
     ///
-    /// UNIMPLEMENTED
+    /// Uses the hash-chain matcher with a deep lazy2 matching strategy and
+    /// a 16 MiB window. Compared to [`CompressionLevel::Better`], this level
+    /// uses larger hash and chain tables (2 M / 1 M entries vs 1 M / 512 K),
+    /// a deeper search (32 candidates vs 16), and a higher target match
+    /// length (128 vs 48), trading speed for the best compression ratio
+    /// available in this crate.
+    ///
+    /// **Limitation:** hash-chain tables use 32-bit positions. For single-frame
+    /// inputs exceeding ~4 GiB, matches can still be found for roughly one
+    /// window past that point; once all in-window positions exceed `u32::MAX`
+    /// (≈4 GiB + window size), matching becomes effectively repcode-only.
+    /// Prefer [`CompressionLevel::Default`] for very large single-frame
+    /// streams until table rebasing is implemented.
     Best,
 }
 

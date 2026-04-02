@@ -208,9 +208,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {
         let mut space = match self.compression_level {
-            CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => {
-                self.state.matcher.get_next_space()
-            }
+            CompressionLevel::Fastest
+            | CompressionLevel::Default
+            | CompressionLevel::Better
+            | CompressionLevel::Best => self.state.matcher.get_next_space(),
             _ => Vec::new(),
         };
         space.clear();
@@ -258,15 +259,16 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
+    // Exhaustive match kept intentionally: adding a new CompressionLevel
+    // variant will produce a compile error here, forcing the developer to
+    // decide whether the streaming encoder supports it before shipping.
     fn ensure_level_supported(&self) -> Result<(), Error> {
         match self.compression_level {
             CompressionLevel::Uncompressed
             | CompressionLevel::Fastest
             | CompressionLevel::Default
-            | CompressionLevel::Better => Ok(()),
-            _ => Err(invalid_input_error(
-                "streaming encoder currently supports Uncompressed/Fastest/Default/Better only",
-            )),
+            | CompressionLevel::Better
+            | CompressionLevel::Best => Ok(()),
         }
     }
 
@@ -300,19 +302,12 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 }
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
-                | CompressionLevel::Better => {
+                | CompressionLevel::Better
+                | CompressionLevel::Best => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
                     compress_block_encoded(&mut self.state, last_block, block, &mut encoded);
                     moved_into_matcher = true;
-                }
-                _ => {
-                    return Err((
-                        invalid_input_error(
-                            "streaming encoder currently supports Uncompressed/Fastest/Default/Better only",
-                        ),
-                        raw_block.unwrap_or_default(),
-                    ));
                 }
             }
         }
@@ -757,10 +752,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_level_write_fails_before_emitting_frame_header() {
+    fn best_level_streaming_roundtrip() {
+        // 200 KiB payload crosses the 128 KiB block boundary, exercising
+        // multi-block emission and matcher state carry-over for Best.
+        let payload = b"best-level-streaming-test".repeat(8 * 1024);
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Best);
-        assert!(encoder.write_all(b"payload").is_err());
-        assert_eq!(encoder.get_ref().len(), 0);
+        for chunk in payload.chunks(53) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]
