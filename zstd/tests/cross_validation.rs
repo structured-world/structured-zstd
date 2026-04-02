@@ -236,3 +236,32 @@ fn default_level_stays_within_ten_percent_of_ffi_level3_on_corpus_proxy() {
         ffi_level3.len()
     );
 }
+
+#[test]
+fn cross_rust_better_compress_ffi_decompress_regression() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let compressed = compress_to_vec(data.as_slice(), CompressionLevel::Better);
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(
+        data.as_slice(),
+        result.as_slice(),
+        "rust better→ffi roundtrip failed"
+    );
+}
+
+/// Verify that Better compresses better than Default on the corpus proxy.
+/// The hash-chain matcher with lazy2 should find longer matches than Dfast on
+/// this reference input.
+#[test]
+fn better_level_beats_default_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let default = compress_to_vec(data.as_slice(), CompressionLevel::Default);
+    let better = compress_to_vec(data.as_slice(), CompressionLevel::Better);
+
+    assert!(
+        better.len() < default.len(),
+        "Better should compress better than Default on corpus proxy. better={} default={}",
+        better.len(),
+        default.len()
+    );
+}

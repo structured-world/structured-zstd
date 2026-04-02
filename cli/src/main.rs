@@ -40,14 +40,15 @@ enum Commands {
         /// - 0: Uncompressed
         /// - 1: Fastest
         /// - 2: Default
+        /// - 3: Better (lazy2, ~zstd level 7)
         ///
-        /// Streaming mode currently supports only levels 0..=2.
+        /// Streaming mode currently supports only levels 0..=3.
         #[arg(
             short,
             long,
             value_name = "COMPRESSION_LEVEL",
             default_value_t = 2,
-            value_parser = clap::value_parser!(u8).range(0..=2),
+            value_parser = clap::value_parser!(u8).range(0..=3),
             verbatim_doc_comment
         )]
         level: u8,
@@ -107,6 +108,7 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
         0 => CompressionLevel::Uncompressed,
         1 => CompressionLevel::Fastest,
         2 => CompressionLevel::Default,
+        3 => CompressionLevel::Better,
         _ => return Err(eyre!("unsupported compression level: {level}")),
     };
     ensure_distinct_paths(&input, &output)?;
@@ -400,7 +402,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_unsupported_compression_level_at_parse_time() {
-        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "3"]);
+        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "4"]);
         assert!(parse.is_err());
     }
 

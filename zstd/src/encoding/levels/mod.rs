@@ -1,2 +1,2 @@
 mod fastest;
-pub use fastest::compress_fastest;
+pub use fastest::compress_block_encoded;

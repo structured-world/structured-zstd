@@ -61,7 +61,16 @@ pub enum CompressionLevel {
     Default,
     /// This level is roughly equivalent to Zstd level 7.
     ///
-    /// UNIMPLEMENTED
+    /// Uses the hash-chain matcher with a lazy2 matching strategy: the encoder
+    /// evaluates up to two positions ahead before committing to a match,
+    /// trading speed for a better compression ratio than [`CompressionLevel::Default`].
+    ///
+    /// **Limitation:** hash-chain tables use 32-bit positions. For single-frame
+    /// inputs exceeding ~4 GiB, matches can still be found for roughly one
+    /// window past that point; once all in-window positions exceed `u32::MAX`
+    /// (≈4 GiB + window size), matching becomes effectively repcode-only.
+    /// Prefer [`CompressionLevel::Default`] for very large single-frame streams
+    /// until table rebasing is implemented.
     Better,
     /// This level is roughly equivalent to Zstd level 11.
     ///
