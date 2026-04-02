@@ -11,11 +11,12 @@
 
 mod support;
 
-use criterion::{Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
+use std::hint::black_box;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
-use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
+use support::{benchmark_scenarios, supported_levels, LevelConfig, Scenario, ScenarioClass};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
