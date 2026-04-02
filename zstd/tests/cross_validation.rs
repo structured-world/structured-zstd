@@ -278,8 +278,8 @@ fn cross_rust_best_compress_ffi_decompress_regression() {
     );
 }
 
-/// Verify that Best compresses at least as well as Better on the corpus proxy.
-/// Deeper search and larger tables should find equal or longer matches.
+/// Verify that Best compresses strictly better than Better on the corpus proxy.
+/// Deeper search and larger tables should find longer matches.
 #[test]
 fn best_level_beats_better_on_corpus_proxy() {
     let data = include_bytes!("../decodecorpus_files/z000033");
@@ -287,8 +287,8 @@ fn best_level_beats_better_on_corpus_proxy() {
     let best = compress_to_vec(data.as_slice(), CompressionLevel::Best);
 
     assert!(
-        best.len() <= better.len(),
-        "Best should compress at least as well as Better on corpus proxy. best={} better={}",
+        best.len() < better.len(),
+        "Best should compress strictly better than Better on corpus proxy. best={} better={}",
         best.len(),
         better.len()
     );

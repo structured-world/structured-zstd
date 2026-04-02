@@ -259,6 +259,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
+    // Exhaustive match kept intentionally: adding a new CompressionLevel
+    // variant will produce a compile error here, forcing the developer to
+    // decide whether the streaming encoder supports it before shipping.
     fn ensure_level_supported(&self) -> Result<(), Error> {
         match self.compression_level {
             CompressionLevel::Uncompressed
@@ -750,7 +753,9 @@ mod tests {
 
     #[test]
     fn best_level_streaming_roundtrip() {
-        let payload = b"best-level-streaming-test".repeat(256);
+        // 200 KiB payload crosses the 128 KiB block boundary, exercising
+        // multi-block emission and matcher state carry-over for Best.
+        let payload = b"best-level-streaming-test".repeat(8 * 1024);
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Best);
         for chunk in payload.chunks(53) {
             encoder.write_all(chunk).unwrap();

@@ -1428,7 +1428,7 @@ impl HcMatchGenerator {
         let resize = self.hash_log != hash_log || self.chain_log != chain_log;
         self.hash_log = hash_log;
         self.chain_log = chain_log;
-        self.search_depth = search_depth;
+        self.search_depth = search_depth.min(MAX_HC_SEARCH_DEPTH);
         self.target_len = target_len;
         if resize && !self.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
@@ -1621,6 +1621,8 @@ impl HcMatchGenerator {
         }
     }
 
+    // Fixed-size array (256 bytes on stack) is intentional: it avoids heap
+    // allocation on the hot path and the sentinel loop exits at self.search_depth.
     fn chain_candidates(&self, abs_pos: usize) -> [usize; MAX_HC_SEARCH_DEPTH] {
         let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
         let idx = abs_pos - self.history_abs_start;
