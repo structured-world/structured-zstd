@@ -2048,6 +2048,81 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 }
 
 #[test]
+fn driver_best_to_fastest_releases_oversized_hc_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    // Initialize at Best — allocates large HC tables (2M hash, 1M chain).
+    driver.reset(CompressionLevel::Best);
+    assert_eq!(driver.window_size(), BEST_DEFAULT_WINDOW_SIZE as u64);
+
+    // Feed data so tables are actually allocated via ensure_tables().
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+
+    // Switch to Fastest — must release HC tables.
+    driver.reset(CompressionLevel::Fastest);
+    assert_eq!(driver.window_size(), 64);
+
+    // HC matcher should have empty tables after backend switch.
+    let hc = driver.hc_match_generator.as_ref().unwrap();
+    assert!(
+        hc.hash_table.is_empty(),
+        "HC hash_table should be released after switching away from Best"
+    );
+    assert!(
+        hc.chain_table.is_empty(),
+        "HC chain_table should be released after switching away from Best"
+    );
+}
+
+#[test]
+fn driver_better_to_best_resizes_hc_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    // Initialize at Better — allocates small HC tables (1M hash, 512K chain).
+    driver.reset(CompressionLevel::Better);
+    assert_eq!(driver.window_size(), BETTER_DEFAULT_WINDOW_SIZE as u64);
+
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+
+    let hc = driver.hc_match_generator.as_ref().unwrap();
+    let better_hash_len = hc.hash_table.len();
+    let better_chain_len = hc.chain_table.len();
+
+    // Switch to Best — must resize to larger tables.
+    driver.reset(CompressionLevel::Best);
+    assert_eq!(driver.window_size(), BEST_DEFAULT_WINDOW_SIZE as u64);
+
+    // Feed data to trigger ensure_tables with new sizes.
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+
+    let hc = driver.hc_match_generator.as_ref().unwrap();
+    assert!(
+        hc.hash_table.len() > better_hash_len,
+        "Best hash_table ({}) should be larger than Better ({})",
+        hc.hash_table.len(),
+        better_hash_len
+    );
+    assert!(
+        hc.chain_table.len() > better_chain_len,
+        "Best chain_table ({}) should be larger than Better ({})",
+        hc.chain_table.len(),
+        better_chain_len
+    );
+}
+
+#[test]
 fn prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Fastest);
