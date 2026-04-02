@@ -446,15 +446,26 @@ fn better_level_compresses_close_to_default() {
 /// 4 MiB window so only Better (8 MiB) can match it.
 #[test]
 fn roundtrip_better_level_large_window() {
-    // ~5 MiB of data: 128-byte pattern, 5 MiB unique filler, then the same pattern.
-    // The second occurrence is ~5 MiB away — outside Default's 4 MiB window
-    // but inside Better's 8 MiB window.
-    let pattern = generate_data(0xBE77, 128);
-    let filler_len = 5 * 1024 * 1024; // 5 MiB gap
-    let mut data = Vec::with_capacity(pattern.len() + filler_len + pattern.len());
-    data.extend_from_slice(&pattern);
-    data.extend(generate_data(0xF111, filler_len));
-    data.extend_from_slice(&pattern);
+    // Compressible data that exceeds Default's 4 MiB window: repeating
+    // 48-byte chunks with 2-byte sentinels across 6 MiB. Better's 8 MiB
+    // window can reference matches from the first half of the stream that
+    // Default's 4 MiB window has already evicted.
+    let data = repeat_offset_fixture(
+        b"LargeWindowTestPattern_0123456789abcdefghijklmnop",
+        6 * 1024 * 1024 / 50,
+    );
 
     assert_eq!(roundtrip_better(&data), data);
+
+    // Better (8 MiB window) should compress better than Default (4 MiB)
+    // on data that spans more than 4 MiB of repeated structure.
+    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
+    let compressed_default = compress_to_vec(&data[..], CompressionLevel::Default);
+    assert!(
+        compressed_better.len() < compressed_default.len(),
+        "Better (8 MiB window) should beat Default (4 MiB) on 6 MiB repeating data. \
+         better={} default={}",
+        compressed_better.len(),
+        compressed_default.len(),
+    );
 }

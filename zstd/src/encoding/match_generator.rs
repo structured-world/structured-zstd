@@ -961,7 +961,7 @@ struct DfastMatchGenerator {
     offset_hist: [u32; 3],
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
-    // Lazy match lookahead depth: 1 = lazy (Default), 2 = lazy2 (Better).
+    // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
 }
 
@@ -2218,6 +2218,7 @@ fn fastest_reset_uses_interleaved_hash_fill_step() {
     // happened and the lazy_depth is configured correctly.
     driver.reset(CompressionLevel::Better);
     assert_eq!(driver.active_backend, MatcherBackend::HashChain);
+    assert_eq!(driver.window_size(), BETTER_DEFAULT_WINDOW_SIZE as u64);
     assert_eq!(driver.hc_matcher().lazy_depth, 2);
 }
 
