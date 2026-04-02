@@ -2220,6 +2220,72 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
 }
 
 #[test]
+fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Better);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    // Repeat the dictionary content so the HC matcher can find it.
+    // HC_MIN_MATCH_LEN is 5, so an 8-byte match is well above threshold.
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= HC_MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "hash-chain backend should match dictionary-primed history in first full block"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Better);
+    // Use a small live window so dictionary-primed slices are evicted quickly.
+    driver.hc_matcher_mut().max_window_size = 8;
+    driver.reported_window_size = 8;
+
+    let base_window = driver.hc_matcher().max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.hc_matcher().max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.hc_matcher().max_window_size,
+        base_window,
+        "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
 fn suffix_store_with_single_slot_does_not_panic_on_keying() {
     let mut suffixes = SuffixStore::with_capacity(1);
     suffixes.insert(b"abcde", 0);
