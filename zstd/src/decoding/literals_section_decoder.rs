@@ -85,40 +85,99 @@ fn decompress_literals(
             });
         }
 
-        //decode 4 streams
-        let stream1 = &source[..jump1];
-        let stream2 = &source[jump1..jump2];
-        let stream3 = &source[jump2..jump3];
-        let stream4 = &source[jump3..];
+        //decode 4 streams with interleaved operations to hide memory latency
+        let streams: [&[u8]; 4] = [
+            &source[..jump1],
+            &source[jump1..jump2],
+            &source[jump2..jump3],
+            &source[jump3..],
+        ];
 
-        for stream in &[stream1, stream2, stream3, stream4] {
-            let mut decoder = HuffmanDecoder::new(&scratch.table);
-            let mut br = BitReaderReversed::new(stream);
-            //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
+        let mut decoders: [HuffmanDecoder<'_>; 4] = [
+            HuffmanDecoder::new(&scratch.table),
+            HuffmanDecoder::new(&scratch.table),
+            HuffmanDecoder::new(&scratch.table),
+            HuffmanDecoder::new(&scratch.table),
+        ];
+        let mut brs: [BitReaderReversed<'_>; 4] = [
+            BitReaderReversed::new(streams[0]),
+            BitReaderReversed::new(streams[1]),
+            BitReaderReversed::new(streams[2]),
+            BitReaderReversed::new(streams[3]),
+        ];
+
+        // Initialize all 4 streams: skip padding and set initial state
+        for i in 0..4 {
             let mut skipped_bits = 0;
             loop {
-                let val = br.get_bits(1);
+                let val = brs[i].get_bits(1);
                 skipped_bits += 1;
                 if val == 1 || skipped_bits > 8 {
                     break;
                 }
             }
             if skipped_bits > 8 {
-                //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
                 return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
             }
-            decoder.init_state(&mut br);
+            decoders[i].init_state(&mut brs[i]);
+        }
 
-            while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-                target.push(decoder.decode_symbol());
-                decoder.next_state(&mut br);
+        // Each stream decodes into its own buffer, concatenated at the end.
+        // Estimate ~1/4 of regenerated_size per stream for pre-allocation.
+        let est = section.regenerated_size as usize / 4 + 1;
+        let mut bufs: [Vec<u8>; 4] = [
+            Vec::with_capacity(est),
+            Vec::with_capacity(est),
+            Vec::with_capacity(est),
+            Vec::with_capacity(est),
+        ];
+
+        let max_bits = scratch.table.max_num_bits as isize;
+
+        // Fast interleaved loop: while all 4 streams have bits remaining,
+        // issue 4 independent table lookups then 4 independent state advances
+        // per iteration. This gives the CPU's out-of-order engine more
+        // independent work to schedule, hiding table-lookup latency.
+        while brs[0].bits_remaining() > -max_bits
+            && brs[1].bits_remaining() > -max_bits
+            && brs[2].bits_remaining() > -max_bits
+            && brs[3].bits_remaining() > -max_bits
+        {
+            // Decode phase: 4 independent table lookups
+            let s0 = decoders[0].decode_symbol();
+            let s1 = decoders[1].decode_symbol();
+            let s2 = decoders[2].decode_symbol();
+            let s3 = decoders[3].decode_symbol();
+
+            bufs[0].push(s0);
+            bufs[1].push(s1);
+            bufs[2].push(s2);
+            bufs[3].push(s3);
+
+            // State advance phase: 4 independent bit reads + state updates
+            decoders[0].next_state(&mut brs[0]);
+            decoders[1].next_state(&mut brs[1]);
+            decoders[2].next_state(&mut brs[2]);
+            decoders[3].next_state(&mut brs[3]);
+        }
+
+        // Drain remaining symbols from each stream individually
+        for i in 0..4 {
+            while brs[i].bits_remaining() > -max_bits {
+                bufs[i].push(decoders[i].decode_symbol());
+                decoders[i].next_state(&mut brs[i]);
             }
-            if br.bits_remaining() != -(scratch.table.max_num_bits as isize) {
+            if brs[i].bits_remaining() != -max_bits {
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
-                    read_til: br.bits_remaining(),
-                    expected: -(scratch.table.max_num_bits as isize),
+                    read_til: brs[i].bits_remaining(),
+                    expected: -max_bits,
                 });
             }
+        }
+
+        // Concatenate all 4 stream outputs
+        for buf in &bufs {
+            target.extend_from_slice(buf);
         }
 
         bytes_read += source.len() as u32;
