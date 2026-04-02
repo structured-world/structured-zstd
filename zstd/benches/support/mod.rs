@@ -1,4 +1,4 @@
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{collections::HashSet, env, fs, path::Path};
 use structured_zstd::encoding::CompressionLevel;
 
