@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
+use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -544,10 +544,12 @@ fn best_level_compresses_close_to_better() {
 /// 8 MiB window so only Best (16 MiB) can match it.
 #[test]
 fn roundtrip_best_level_large_window() {
-    // Two identical 256 KiB regions separated by a 9 MiB compressible gap.
+    // Two identical 256 KiB high-entropy regions separated by a 9 MiB
+    // compressible gap. The region is random so the only way to compress
+    // the second copy is via long-distance matching (window reach).
     // Best's 16 MiB window can still reach the first region;
     // Better's 8 MiB window cannot.
-    let region = generate_compressible(42, 256 * 1024);
+    let region = generate_data(42, 256 * 1024);
     let gap = generate_compressible(7777, 9 * 1024 * 1024);
     let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
     data.extend_from_slice(&region);
