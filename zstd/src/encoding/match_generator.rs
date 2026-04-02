@@ -1621,8 +1621,8 @@ impl HcMatchGenerator {
         }
     }
 
-    // Fixed-size array (256 bytes on stack) is intentional: it avoids heap
-    // allocation on the hot path and the sentinel loop exits at self.search_depth.
+    // Fixed-size stack array is intentional: it avoids heap allocation on
+    // the hot path and the sentinel loop exits at self.search_depth.
     fn chain_candidates(&self, abs_pos: usize) -> [usize; MAX_HC_SEARCH_DEPTH] {
         let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
         let idx = abs_pos - self.history_abs_start;
