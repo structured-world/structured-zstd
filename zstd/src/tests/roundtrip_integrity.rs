@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
+use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -446,24 +446,26 @@ fn better_level_compresses_close_to_default() {
 /// 4 MiB window so only Better (8 MiB) can match it.
 #[test]
 fn roundtrip_better_level_large_window() {
-    // Compressible data that exceeds Default's 4 MiB window: repeating
-    // 49-byte chunks with 2-byte sentinels across 6 MiB. Better's 8 MiB
-    // window can reference matches from the first half of the stream that
-    // Default's 4 MiB window has already evicted.
-    let data = repeat_offset_fixture(
-        b"LargeWindowTestPattern_0123456789abcdefghijklmnop",
-        6 * 1024 * 1024 / 50,
-    );
+    // Two identical 256 KiB regions separated by a 4.5 MiB compressible gap.
+    // The gap uses a different seed so it doesn't share patterns with the
+    // regions, but being compressible means hash chains aren't fully
+    // destroyed by random noise. Better's 8 MiB window can still reach the
+    // first region; Default's 4 MiB window cannot.
+    let region = generate_compressible(42, 256 * 1024);
+    let gap = generate_compressible(9999, 4 * 1024 * 1024 + 512 * 1024);
+    let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
+    data.extend_from_slice(&region);
+    data.extend_from_slice(&gap);
+    data.extend_from_slice(&region);
 
     assert_eq!(roundtrip_better(&data), data);
 
-    // Better (8 MiB window) should compress better than Default (4 MiB)
-    // on data that spans more than 4 MiB of repeated structure.
+    // Better should compress the duplicated region; Default cannot reach it.
     let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
     let compressed_default = compress_to_vec(&data[..], CompressionLevel::Default);
     assert!(
         compressed_better.len() < compressed_default.len(),
-        "Better (8 MiB window) should beat Default (4 MiB) on 6 MiB repeating data. \
+        "Better (8 MiB window) should beat Default (4 MiB) across 4.5 MiB gap. \
          better={} default={}",
         compressed_better.len(),
         compressed_default.len(),

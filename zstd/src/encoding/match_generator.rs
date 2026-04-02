@@ -1552,10 +1552,15 @@ impl HcMatchGenerator {
         }
         let hash = self.hash_position(&concat[idx..]);
         // Store as (abs_pos + 1) so HC_EMPTY (0) never collides with a valid
-        // position. u32 wrapping is safe: chain_idx is masked and
-        // chain_candidates filters stale entries via history_abs_start.
-        let stored = (abs_pos as u32).wrapping_add(1);
-        let chain_idx = (stored.wrapping_sub(1) as usize) & ((1 << HC_CHAIN_LOG) - 1);
+        // position. Skip insertion at u32::MAX to avoid wrapping to HC_EMPTY.
+        // Streams >4 GiB silently stop inserting — matches still work from
+        // existing chain entries until the window slides past them.
+        let pos_u32 = abs_pos as u32;
+        if pos_u32 == u32::MAX {
+            return;
+        }
+        let stored = pos_u32 + 1;
+        let chain_idx = pos_u32 as usize & ((1 << HC_CHAIN_LOG) - 1);
         let prev = self.hash_table[hash];
         self.chain_table[chain_idx] = prev;
         self.hash_table[hash] = stored;
@@ -1582,14 +1587,24 @@ impl HcMatchGenerator {
         // Follow chain up to HC_SEARCH_DEPTH valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
         // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
+        // Break on self-loops (masked chain_idx collision at 512K periodicity).
         let mut steps = 0;
         while filled < HC_SEARCH_DEPTH && steps < HC_SEARCH_DEPTH * 4 {
             if cur == HC_EMPTY {
                 break;
             }
             let candidate_abs = cur.wrapping_sub(1) as usize;
-            cur = self.chain_table[(cur.wrapping_sub(1) as usize) & chain_mask];
+            let next = self.chain_table[candidate_abs & chain_mask];
             steps += 1;
+            if next == cur {
+                // Self-loop: two positions share chain_idx, stop to avoid
+                // spinning on the same candidate forever.
+                if candidate_abs >= self.history_abs_start && candidate_abs < abs_pos {
+                    buf[filled] = candidate_abs;
+                }
+                break;
+            }
+            cur = next;
             if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
                 continue;
             }
