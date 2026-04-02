@@ -132,7 +132,15 @@ fn decompress_literals(
 
         let base = target.len();
         target.resize(base + regen, 0);
-        let starts: [usize; 4] = [base, base + seg, base + 2 * seg, base + 3 * seg];
+        // Clamp starts[3] so it never exceeds base+regen (guards against
+        // small regen where 3*seg > regen, e.g. corrupted frame headers).
+        let starts: [usize; 4] = [
+            base,
+            base + seg,
+            base + 2 * seg,
+            base + (3 * seg).min(regen),
+        ];
+        let ends: [usize; 4] = [starts[1], starts[2], starts[3], base + regen];
         let mut cursors = starts;
 
         // Fast interleaved loop: while all 4 streams have bits remaining,
@@ -143,6 +151,10 @@ fn decompress_literals(
             && brs[1].bits_remaining() > -max_bits
             && brs[2].bits_remaining() > -max_bits
             && brs[3].bits_remaining() > -max_bits
+            && cursors[0] < ends[0]
+            && cursors[1] < ends[1]
+            && cursors[2] < ends[2]
+            && cursors[3] < ends[3]
         {
             // Decode phase: 4 independent table lookups
             let s0 = decoders[0].decode_symbol();
@@ -166,9 +178,9 @@ fn decompress_literals(
             decoders[3].next_state(&mut brs[3]);
         }
 
-        // Drain remaining symbols from each stream individually
+        // Drain remaining symbols from each stream, bounded by segment end
         for i in 0..4 {
-            while brs[i].bits_remaining() > -max_bits {
+            while brs[i].bits_remaining() > -max_bits && cursors[i] < ends[i] {
                 target[cursors[i]] = decoders[i].decode_symbol();
                 cursors[i] += 1;
                 decoders[i].next_state(&mut brs[i]);
@@ -181,7 +193,7 @@ fn decompress_literals(
             }
         }
 
-        // If any stream produced fewer/more symbols than its segment,
+        // If any stream produced fewer symbols than its segment (corrupted data),
         // adjust target length so the final decoded count check catches it.
         let decoded: usize = cursors.iter().zip(starts.iter()).map(|(c, s)| c - s).sum();
         if decoded != regen {
