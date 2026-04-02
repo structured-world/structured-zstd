@@ -85,8 +85,8 @@ pub enum CompressionLevel {
     /// inputs exceeding ~4 GiB, matches can still be found for roughly one
     /// window past that point; once all in-window positions exceed `u32::MAX`
     /// (≈4 GiB + window size), matching becomes effectively repcode-only.
-    /// Prefer [`CompressionLevel::Better`] or lower for very large
-    /// single-frame streams until table rebasing is implemented.
+    /// Prefer [`CompressionLevel::Default`] for very large single-frame
+    /// streams until table rebasing is implemented.
     Best,
 }
 
