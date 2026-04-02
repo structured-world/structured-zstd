@@ -122,17 +122,18 @@ fn decompress_literals(
             decoders[i].init_state(&mut brs[i]);
         }
 
-        // Each stream decodes into its own buffer, concatenated at the end.
-        // Estimate ~1/4 of regenerated_size per stream for pre-allocation.
-        let est = section.regenerated_size as usize / 4 + 1;
-        let mut bufs: [Vec<u8>; 4] = [
-            Vec::with_capacity(est),
-            Vec::with_capacity(est),
-            Vec::with_capacity(est),
-            Vec::with_capacity(est),
-        ];
-
         let max_bits = scratch.table.max_num_bits as isize;
+
+        // RFC 8878 §3.1.1.3.2: first 3 streams produce ceil(regen_size/4)
+        // symbols each, 4th produces the remainder. Pre-allocate target and
+        // decode directly into slices — no temporary Vec allocations.
+        let regen = section.regenerated_size as usize;
+        let seg = regen.div_ceil(4);
+
+        let base = target.len();
+        target.resize(base + regen, 0);
+        let starts: [usize; 4] = [base, base + seg, base + 2 * seg, base + 3 * seg];
+        let mut cursors = starts;
 
         // Fast interleaved loop: while all 4 streams have bits remaining,
         // issue 4 independent table lookups then 4 independent state advances
@@ -149,10 +150,14 @@ fn decompress_literals(
             let s2 = decoders[2].decode_symbol();
             let s3 = decoders[3].decode_symbol();
 
-            bufs[0].push(s0);
-            bufs[1].push(s1);
-            bufs[2].push(s2);
-            bufs[3].push(s3);
+            target[cursors[0]] = s0;
+            target[cursors[1]] = s1;
+            target[cursors[2]] = s2;
+            target[cursors[3]] = s3;
+            cursors[0] += 1;
+            cursors[1] += 1;
+            cursors[2] += 1;
+            cursors[3] += 1;
 
             // State advance phase: 4 independent bit reads + state updates
             decoders[0].next_state(&mut brs[0]);
@@ -164,7 +169,8 @@ fn decompress_literals(
         // Drain remaining symbols from each stream individually
         for i in 0..4 {
             while brs[i].bits_remaining() > -max_bits {
-                bufs[i].push(decoders[i].decode_symbol());
+                target[cursors[i]] = decoders[i].decode_symbol();
+                cursors[i] += 1;
                 decoders[i].next_state(&mut brs[i]);
             }
             if brs[i].bits_remaining() != -max_bits {
@@ -175,9 +181,11 @@ fn decompress_literals(
             }
         }
 
-        // Concatenate all 4 stream outputs
-        for buf in &bufs {
-            target.extend_from_slice(buf);
+        // If any stream produced fewer/more symbols than its segment,
+        // adjust target length so the final decoded count check catches it.
+        let decoded: usize = cursors.iter().zip(starts.iter()).map(|(c, s)| c - s).sum();
+        if decoded != regen {
+            target.truncate(base + decoded);
         }
 
         bytes_read += source.len() as u32;
