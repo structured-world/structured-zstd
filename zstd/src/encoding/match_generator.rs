@@ -1591,8 +1591,11 @@ impl HcMatchGenerator {
         // entries (evicted from window) instead of stopping at them.
         // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
         // Break on self-loops (masked chain_idx collision at 512K periodicity).
+        // Cap total steps at 4x search depth to bound time spent skipping
+        // stale entries while still finding valid candidates deeper in chain.
         let mut steps = 0;
-        while filled < HC_SEARCH_DEPTH && steps < HC_SEARCH_DEPTH * 4 {
+        const MAX_CHAIN_STEPS: usize = HC_SEARCH_DEPTH * 4;
+        while filled < HC_SEARCH_DEPTH && steps < MAX_CHAIN_STEPS {
             if cur == HC_EMPTY {
                 break;
             }
