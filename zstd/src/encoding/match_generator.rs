@@ -306,12 +306,7 @@ impl Matcher for MatchGeneratorDriver {
                         BEST_HC_SEARCH_DEPTH,
                         BEST_HC_TARGET_LEN,
                     ),
-                    _ => hc.configure(
-                        HC_HASH_LOG,
-                        HC_CHAIN_LOG,
-                        HC_SEARCH_DEPTH,
-                        HC_TARGET_LEN,
-                    ),
+                    _ => hc.configure(HC_HASH_LOG, HC_CHAIN_LOG, HC_SEARCH_DEPTH, HC_TARGET_LEN),
                 }
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {

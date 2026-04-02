@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
+use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.

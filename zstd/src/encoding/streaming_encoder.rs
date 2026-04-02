@@ -11,8 +11,8 @@ use twox_hash::XxHash64;
 
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
-    block_header::BlockHeader, frame_compressor::CompressState, frame_compressor::FseTables,
-    frame_header::FrameHeader, CompressionLevel, MatchGeneratorDriver, Matcher,
+    CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
+    frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
 };
 use crate::io::{Error, ErrorKind, Write};
 
