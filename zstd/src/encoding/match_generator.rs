@@ -274,6 +274,12 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherBackend::HashChain => {
                     if let Some(hc) = self.hc_match_generator.as_mut() {
+                        // Release oversized tables when switching away from Best
+                        // so the higher memory floor doesn't persist across frames.
+                        if backend != MatcherBackend::HashChain {
+                            hc.hash_table = Vec::new();
+                            hc.chain_table = Vec::new();
+                        }
                         let vec_pool = &mut self.vec_pool;
                         hc.reset(|mut data| {
                             data.resize(data.capacity(), 0);
