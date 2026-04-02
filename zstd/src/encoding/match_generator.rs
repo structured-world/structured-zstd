@@ -333,6 +333,9 @@ impl Matcher for MatchGeneratorDriver {
 
         let mut start = 0usize;
         let mut committed_dict_budget = 0usize;
+        // insert_position needs 4 bytes of lookahead for hashing;
+        // backfill_boundary_positions re-visits tail positions once the
+        // next slice extends history, but cannot hash <4 byte fragments.
         let min_primed_tail = match self.active_backend {
             MatcherBackend::Simple => MIN_MATCH_LEN,
             MatcherBackend::Dfast | MatcherBackend::HashChain => 4,
@@ -1553,7 +1556,8 @@ impl HcMatchGenerator {
         let hash = self.hash_position(&concat[idx..]);
         // Store as (abs_pos + 1) so HC_EMPTY (0) never collides with a valid
         // position. Guard on usize before cast to avoid silent u32 truncation.
-        // Streams >4 GiB stop inserting; matches degrade gracefully.
+        // Streams >4 GiB stop inserting; matches degrade to repcodes-only.
+        // TODO(#51): rebase table positions to avoid 4 GiB cutoff
         if abs_pos >= u32::MAX as usize {
             return;
         }
