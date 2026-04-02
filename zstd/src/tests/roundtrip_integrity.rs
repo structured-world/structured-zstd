@@ -491,19 +491,18 @@ fn roundtrip_better_level_large_window() {
     );
 }
 
-/// Best should compress close to or better than Better on structured,
-/// compressible data. Deeper search and larger tables should find longer
-/// matches, but the margin may be small on some inputs.
+/// Best must not regress vs Better on this repetitive fixture. Equal
+/// output is expected here (HC finds identical matches at any depth);
+/// the strict Best < Better check lives in cross_validation.rs on the
+/// more diverse decodecorpus sample.
 #[test]
-fn best_level_compresses_close_to_better() {
+fn best_level_does_not_regress_vs_better() {
     let data = repeat_offset_fixture(b"HelloWorld", (256 * 1024) / 12 + 1);
     let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
     let compressed_best = compress_to_vec(&data[..], CompressionLevel::Best);
-    // Allow up to 1% regression; deeper search optimizes for broader data patterns.
     assert!(
-        (compressed_best.len() as u64) * 100 <= (compressed_better.len() as u64) * 101,
-        "Best level should stay within 1% of Better. \
-         best={} bytes, better={} bytes",
+        compressed_best.len() <= compressed_better.len(),
+        "Best must not regress vs Better. best={} bytes, better={} bytes",
         compressed_best.len(),
         compressed_better.len(),
     );
