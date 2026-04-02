@@ -36,15 +36,35 @@ const HC_TARGET_LEN: usize = 48;
 // that can never collide with any valid position, even at the 4 GiB boundary.
 const HC_EMPTY: u32 = 0;
 
-// Best-level hash-chain parameters: deeper search, larger tables, higher target.
-const BEST_HC_HASH_LOG: usize = 21;
-const BEST_HC_CHAIN_LOG: usize = 20;
-const BEST_HC_SEARCH_DEPTH: usize = 32;
-const BEST_HC_TARGET_LEN: usize = 128;
 const BEST_DEFAULT_WINDOW_SIZE: usize = 1 << 24;
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
-const MAX_HC_SEARCH_DEPTH: usize = BEST_HC_SEARCH_DEPTH;
+const MAX_HC_SEARCH_DEPTH: usize = 32;
+
+/// Bundled tuning knobs for the hash-chain matcher. Using a typed config
+/// instead of positional `usize` args eliminates parameter-order hazards.
+#[derive(Copy, Clone)]
+struct HcConfig {
+    hash_log: usize,
+    chain_log: usize,
+    search_depth: usize,
+    target_len: usize,
+}
+
+const HC_CONFIG: HcConfig = HcConfig {
+    hash_log: HC_HASH_LOG,
+    chain_log: HC_CHAIN_LOG,
+    search_depth: HC_SEARCH_DEPTH,
+    target_len: HC_TARGET_LEN,
+};
+
+/// Best-level: deeper search, larger tables, higher target length.
+const BEST_HC_CONFIG: HcConfig = HcConfig {
+    hash_log: 21,
+    chain_log: 20,
+    search_depth: 32,
+    target_len: 128,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatcherBackend {
@@ -300,13 +320,8 @@ impl Matcher for MatchGeneratorDriver {
                 hc.max_window_size = max_window_size;
                 hc.lazy_depth = 2;
                 match level {
-                    CompressionLevel::Best => hc.configure(
-                        BEST_HC_HASH_LOG,
-                        BEST_HC_CHAIN_LOG,
-                        BEST_HC_SEARCH_DEPTH,
-                        BEST_HC_TARGET_LEN,
-                    ),
-                    _ => hc.configure(HC_HASH_LOG, HC_CHAIN_LOG, HC_SEARCH_DEPTH, HC_TARGET_LEN),
+                    CompressionLevel::Best => hc.configure(BEST_HC_CONFIG),
+                    _ => hc.configure(HC_CONFIG),
                 }
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
@@ -1418,18 +1433,12 @@ impl HcMatchGenerator {
         }
     }
 
-    fn configure(
-        &mut self,
-        hash_log: usize,
-        chain_log: usize,
-        search_depth: usize,
-        target_len: usize,
-    ) {
-        let resize = self.hash_log != hash_log || self.chain_log != chain_log;
-        self.hash_log = hash_log;
-        self.chain_log = chain_log;
-        self.search_depth = search_depth.min(MAX_HC_SEARCH_DEPTH);
-        self.target_len = target_len;
+    fn configure(&mut self, config: HcConfig) {
+        let resize = self.hash_log != config.hash_log || self.chain_log != config.chain_log;
+        self.hash_log = config.hash_log;
+        self.chain_log = config.chain_log;
+        self.search_depth = config.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        self.target_len = config.target_len;
         if resize && !self.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
             self.hash_table.clear();

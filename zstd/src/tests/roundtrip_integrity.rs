@@ -382,51 +382,66 @@ fn roundtrip_default_level_multi_block_regression() {
     assert_eq!(roundtrip_default(&data), data);
 }
 
-#[test]
-fn roundtrip_better_level_compressible() {
-    let data = generate_compressible(888, 64 * 1024);
-    assert_eq!(roundtrip_better(&data), data);
+/// Standard roundtrip test suite for a compression level. Generates 7 tests
+/// covering compressible, random, multi-block, streaming, edge-case,
+/// repeat-offset, and large-literal inputs inside a named module.
+macro_rules! level_roundtrip_suite {
+    (mod $mod_name:ident, $level:expr, $seed_base:expr) => {
+        mod $mod_name {
+            use super::*;
+
+            fn rt(data: &[u8]) -> Vec<u8> {
+                roundtrip_at_level(data, $level)
+            }
+            fn rt_stream(data: &[u8]) -> Vec<u8> {
+                roundtrip_streaming_at_level(data, $level)
+            }
+
+            #[test]
+            fn compressible() {
+                let data = generate_compressible($seed_base, 64 * 1024);
+                assert_eq!(rt(&data), data);
+            }
+            #[test]
+            fn random() {
+                let data = generate_data($seed_base + 111, 64 * 1024);
+                assert_eq!(rt(&data), data);
+            }
+            #[test]
+            fn multi_block() {
+                let data = generate_compressible($seed_base + 222, 512 * 1024);
+                assert_eq!(rt(&data), data);
+            }
+            #[test]
+            fn streaming() {
+                let data = generate_compressible($seed_base + 333, 64 * 1024);
+                assert_eq!(rt_stream(&data), data);
+            }
+            #[test]
+            fn edge_cases() {
+                assert_eq!(rt(&[]), Vec::<u8>::new());
+                assert_eq!(rt(&[0x42]), vec![0x42]);
+                let zeros = vec![0u8; 100_000];
+                assert_eq!(rt(&zeros), zeros);
+                let ascending: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+                assert_eq!(rt(&ascending), ascending);
+            }
+            #[test]
+            fn repeat_offsets() {
+                let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
+                assert_eq!(rt(&data), data);
+            }
+            #[test]
+            fn large_literals() {
+                let data = generate_huffman_friendly($seed_base + 444, 128 * 1024, 64);
+                assert_eq!(rt(&data), data);
+            }
+        }
+    };
 }
 
-#[test]
-fn roundtrip_better_level_random() {
-    let data = generate_data(999, 64 * 1024);
-    assert_eq!(roundtrip_better(&data), data);
-}
-
-#[test]
-fn roundtrip_better_level_multi_block() {
-    let data = generate_compressible(2001, 512 * 1024);
-    assert_eq!(roundtrip_better(&data), data);
-}
-
-#[test]
-fn roundtrip_better_level_streaming() {
-    let data = generate_compressible(3003, 64 * 1024);
-    assert_eq!(roundtrip_better_streaming(&data), data);
-}
-
-#[test]
-fn roundtrip_better_level_edge_cases() {
-    assert_eq!(roundtrip_better(&[]), Vec::<u8>::new());
-    assert_eq!(roundtrip_better(&[0x42]), vec![0x42]);
-    let zeros = vec![0u8; 100_000];
-    assert_eq!(roundtrip_better(&zeros), zeros);
-    let ascending: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
-    assert_eq!(roundtrip_better(&ascending), ascending);
-}
-
-#[test]
-fn roundtrip_better_level_repeat_offsets() {
-    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
-    assert_eq!(roundtrip_better(&data), data);
-}
-
-#[test]
-fn roundtrip_better_level_large_literals() {
-    let data = generate_huffman_friendly(200, 128 * 1024, 64);
-    assert_eq!(roundtrip_better(&data), data);
-}
+level_roundtrip_suite!(mod better_level, CompressionLevel::Better, 888);
+level_roundtrip_suite!(mod best_level, CompressionLevel::Best, 1111);
 
 /// Better (lazy2) should compress close to or better than Default (lazy) on
 /// structured, compressible data. Lazy2 may be marginally worse on some inputs
@@ -474,52 +489,6 @@ fn roundtrip_better_level_large_window() {
         compressed_better.len(),
         compressed_default.len(),
     );
-}
-
-#[test]
-fn roundtrip_best_level_compressible() {
-    let data = generate_compressible(1111, 64 * 1024);
-    assert_eq!(roundtrip_best(&data), data);
-}
-
-#[test]
-fn roundtrip_best_level_random() {
-    let data = generate_data(2222, 64 * 1024);
-    assert_eq!(roundtrip_best(&data), data);
-}
-
-#[test]
-fn roundtrip_best_level_multi_block() {
-    let data = generate_compressible(3333, 512 * 1024);
-    assert_eq!(roundtrip_best(&data), data);
-}
-
-#[test]
-fn roundtrip_best_level_streaming() {
-    let data = generate_compressible(4444, 64 * 1024);
-    assert_eq!(roundtrip_best_streaming(&data), data);
-}
-
-#[test]
-fn roundtrip_best_level_edge_cases() {
-    assert_eq!(roundtrip_best(&[]), Vec::<u8>::new());
-    assert_eq!(roundtrip_best(&[0x42]), vec![0x42]);
-    let zeros = vec![0u8; 100_000];
-    assert_eq!(roundtrip_best(&zeros), zeros);
-    let ascending: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
-    assert_eq!(roundtrip_best(&ascending), ascending);
-}
-
-#[test]
-fn roundtrip_best_level_repeat_offsets() {
-    let data = repeat_offset_fixture(b"ABCDE12345", 10_000);
-    assert_eq!(roundtrip_best(&data), data);
-}
-
-#[test]
-fn roundtrip_best_level_large_literals() {
-    let data = generate_huffman_friendly(300, 128 * 1024, 64);
-    assert_eq!(roundtrip_best(&data), data);
 }
 
 /// Best should compress close to or better than Better on structured,
