@@ -9,7 +9,7 @@ use core::hash::Hasher;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
 
-use crate::encoding::levels::compress_fastest;
+use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
     CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
     frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
@@ -303,7 +303,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 | CompressionLevel::Better => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
-                    compress_fastest(&mut self.state, last_block, block, &mut encoded);
+                    compress_block_encoded(&mut self.state, last_block, block, &mut encoded);
                     moved_into_matcher = true;
                 }
                 _ => {

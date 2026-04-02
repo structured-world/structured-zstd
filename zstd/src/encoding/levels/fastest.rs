@@ -6,7 +6,11 @@ use crate::{
 };
 use alloc::vec::Vec;
 
-/// Compresses a single block at [`crate::encoding::CompressionLevel::Fastest`].
+/// Compresses a single block using the shared compressed-block pipeline.
+///
+/// Used by all compressed levels (Fastest, Default, Better). The actual
+/// compression quality is determined by the matcher backend in `state`,
+/// not by this function.
 ///
 /// # Parameters
 /// - `state`: [`CompressState`] so the compressor can refer to data before
@@ -17,7 +21,7 @@ use alloc::vec::Vec;
 ///   larger input
 /// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
 #[inline]
-pub fn compress_fastest<M: Matcher>(
+pub fn compress_block_encoded<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
     uncompressed_data: Vec<u8>,

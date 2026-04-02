@@ -32,9 +32,9 @@ const HC_CHAIN_LOG: usize = 19;
 const HC_SEARCH_DEPTH: usize = 16;
 const HC_MIN_MATCH_LEN: usize = 5;
 const HC_TARGET_LEN: usize = 48;
-// Safe sentinel: even if abs_pos wraps to u32::MAX at ~4GB input, chain_candidates
-// filters by history_abs_start bounds so a wrapped position can never match live history.
-const HC_EMPTY: u32 = u32::MAX;
+// Positions are stored as (abs_pos + 1) so that 0 is a safe empty sentinel
+// that can never collide with any valid position, even at the 4 GiB boundary.
+const HC_EMPTY: u32 = 0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatcherBackend {
@@ -1551,13 +1551,14 @@ impl HcMatchGenerator {
             return;
         }
         let hash = self.hash_position(&concat[idx..]);
-        // Chain table uses u32 positions — wrapping is safe because chain_idx
-        // is masked and stale entries are filtered by history_abs_start bounds.
-        let pos_u32 = abs_pos as u32;
-        let chain_idx = (pos_u32 as usize) & ((1 << HC_CHAIN_LOG) - 1);
+        // Store as (abs_pos + 1) so HC_EMPTY (0) never collides with a valid
+        // position. u32 wrapping is safe: chain_idx is masked and
+        // chain_candidates filters stale entries via history_abs_start.
+        let stored = (abs_pos as u32).wrapping_add(1);
+        let chain_idx = (stored.wrapping_sub(1) as usize) & ((1 << HC_CHAIN_LOG) - 1);
         let prev = self.hash_table[hash];
         self.chain_table[chain_idx] = prev;
-        self.hash_table[hash] = pos_u32;
+        self.hash_table[hash] = stored;
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
@@ -1580,13 +1581,14 @@ impl HcMatchGenerator {
         let mut filled = 0;
         // Follow chain up to HC_SEARCH_DEPTH valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
+        // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
         let mut steps = 0;
         while filled < HC_SEARCH_DEPTH && steps < HC_SEARCH_DEPTH * 4 {
             if cur == HC_EMPTY {
                 break;
             }
-            let candidate_abs = cur as usize;
-            cur = self.chain_table[candidate_abs & chain_mask];
+            let candidate_abs = cur.wrapping_sub(1) as usize;
+            cur = self.chain_table[(cur.wrapping_sub(1) as usize) & chain_mask];
             steps += 1;
             if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
                 continue;

@@ -447,7 +447,7 @@ fn better_level_compresses_close_to_default() {
 #[test]
 fn roundtrip_better_level_large_window() {
     // Compressible data that exceeds Default's 4 MiB window: repeating
-    // 48-byte chunks with 2-byte sentinels across 6 MiB. Better's 8 MiB
+    // 49-byte chunks with 2-byte sentinels across 6 MiB. Better's 8 MiB
     // window can reference matches from the first half of the stream that
     // Default's 4 MiB window has already evicted.
     let data = repeat_offset_fixture(
