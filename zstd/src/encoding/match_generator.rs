@@ -1552,13 +1552,12 @@ impl HcMatchGenerator {
         }
         let hash = self.hash_position(&concat[idx..]);
         // Store as (abs_pos + 1) so HC_EMPTY (0) never collides with a valid
-        // position. Skip insertion at u32::MAX to avoid wrapping to HC_EMPTY.
-        // Streams >4 GiB silently stop inserting — matches still work from
-        // existing chain entries until the window slides past them.
-        let pos_u32 = abs_pos as u32;
-        if pos_u32 == u32::MAX {
+        // position. Guard on usize before cast to avoid silent u32 truncation.
+        // Streams >4 GiB stop inserting; matches degrade gracefully.
+        if abs_pos >= u32::MAX as usize {
             return;
         }
+        let pos_u32 = abs_pos as u32;
         let stored = pos_u32 + 1;
         let chain_idx = pos_u32 as usize & ((1 << HC_CHAIN_LOG) - 1);
         let prev = self.hash_table[hash];

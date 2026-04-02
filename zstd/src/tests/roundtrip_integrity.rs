@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{compress_to_vec, CompressionLevel, FrameCompressor};
+use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -73,11 +73,7 @@ fn roundtrip_streaming_at_level(data: &[u8], level: CompressionLevel) -> Vec<u8>
 }
 
 fn roundtrip_streaming(data: &[u8]) -> Vec<u8> {
-    let compressed = compress_streaming(data);
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
-    let mut result = Vec::new();
-    decoder.read_to_end(&mut result).unwrap();
-    result
+    roundtrip_streaming_at_level(data, CompressionLevel::Fastest)
 }
 
 fn roundtrip_default(data: &[u8]) -> Vec<u8> {
