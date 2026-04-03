@@ -64,6 +64,7 @@ impl DecodeBuffer {
     ///
     /// Call this before a batch of `push`/`repeat` operations to avoid
     /// repeated re-allocations inside the hot decode loop.
+    #[inline]
     pub fn reserve(&mut self, amount: usize) {
         self.buffer.reserve(amount);
     }
