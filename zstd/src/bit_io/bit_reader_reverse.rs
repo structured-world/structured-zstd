@@ -118,6 +118,12 @@ impl<'s> BitReaderReversed<'s> {
     #[inline(always)]
     pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {
         debug_assert!(n <= 56);
+        debug_assert!(
+            self.bits_consumed + n <= 64,
+            "get_bits_unchecked: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            n
+        );
         let value = self.peek_bits(n);
         self.consume(n);
         value
@@ -221,7 +227,9 @@ mod test {
         let r3 = ref_br.get_bits(13);
         let r4 = ref_br.get_bits(9);
         let r5 = ref_br.get_bits(8);
-        // After 37 bits consumed, force a batched read of 26 (simulates 3 FSE updates)
+        let r5b = ref_br.get_bits(2);
+        // After 39 bits consumed, ensure_bits(26) triggers a real refill
+        // because 39 + 26 = 65 > 64.
         let r6 = ref_br.get_bits(9);
         let r7 = ref_br.get_bits(9);
         let r8 = ref_br.get_bits(8);
@@ -246,7 +254,11 @@ mod test {
         fast_br.ensure_bits(8);
         assert_eq!(fast_br.get_bits_unchecked(8), r5);
 
-        // Batched: one ensure covering 9+9+8 = 26 bits
+        fast_br.ensure_bits(2);
+        assert_eq!(fast_br.get_bits_unchecked(2), r5b);
+
+        // Batched: one ensure covering 9+9+8 = 26 bits.
+        // At 39 bits consumed, this forces a real refill (39+26=65 > 64).
         fast_br.ensure_bits(26);
         assert_eq!(fast_br.get_bits_unchecked(9), r6);
         assert_eq!(fast_br.get_bits_unchecked(9), r7);
