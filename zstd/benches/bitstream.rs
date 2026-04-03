@@ -3,7 +3,7 @@
 //! Measures the throughput of the core bit-reading primitives that underlie
 //! all entropy decoding (Huffman + FSE).
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
 /// Build a test buffer: 1 KiB of pseudo-random bytes seeded deterministically.
