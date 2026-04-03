@@ -22,14 +22,14 @@ const BIT_MASK: [u64; 65] = {
 ///
 /// On x86-64 with BMI2 this compiles to a single `bzhi` instruction.
 /// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
-/// Callers guarantee `n <= 56` (the maximum single-symbol width in zstd).
-/// The `debug_assert` catches misuse in debug/test builds. In release mode
-/// we intentionally do NOT clamp: an out-of-range `n` would indicate a
-/// corrupted bitstream or caller bug, and we prefer a fast panic over
-/// silently returning garbage.
+/// This function supports `n <= 64`; zstd callers normally guarantee
+/// `n <= 56` (the maximum single-symbol width in zstd).
+/// We intentionally do NOT clamp: an out-of-range `n` indicates a
+/// corrupted bitstream or caller bug, and should panic consistently
+/// rather than silently returning garbage.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
-    debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
+    assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         // SAFETY: `_bzhi_u64` is always safe to call when the target supports BMI2.
