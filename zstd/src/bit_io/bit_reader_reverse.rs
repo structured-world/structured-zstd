@@ -24,6 +24,7 @@ const BIT_MASK: [u64; 65] = {
 /// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
+    debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         // SAFETY: `_bzhi_u64` is always safe to call when the target supports BMI2.
@@ -173,6 +174,14 @@ impl<'s> BitReaderReversed<'s> {
     /// when `bits_consumed == 0` and `n == 0`).
     #[inline(always)]
     pub fn peek_bits(&mut self, n: u8) -> u64 {
+        // n == 0 is valid (branchless no-op); otherwise the caller must
+        // guarantee bits_consumed + n <= 64 via ensure_bits / get_bits.
+        debug_assert!(
+            n == 0 || self.bits_consumed + n <= 64,
+            "peek_bits: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            n
+        );
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(n);
         mask_lower_bits(self.bit_container.wrapping_shr(shift_by as u32), n)
     }
@@ -183,6 +192,12 @@ impl<'s> BitReaderReversed<'s> {
     /// Branchless: when all widths are zero the masks are zero, producing (0, 0, 0).
     #[inline(always)]
     pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        debug_assert!(
+            sum == 0 || self.bits_consumed + sum <= 64,
+            "peek_bits_triple: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            sum
+        );
         // all_three contains bits like this: |XXXX..XXX111122223333|
         // Where XXX are already consumed bytes, 1/2/3 are bits of the respective value
         // Lower bits are to the right

@@ -23,26 +23,28 @@ fn bench_get_bits(c: &mut Criterion) {
     let total_bits = data.len() * 8;
 
     let mut group = c.benchmark_group("bitstream/get_bits");
-    group.throughput(Throughput::Bytes(data.len() as u64));
 
+    let reads_9 = (total_bits / 9) as u64;
+    let reads_11 = (total_bits / 11) as u64;
+
+    group.throughput(Throughput::Elements(reads_9));
     group.bench_function("sequential_9bit", |b| {
         b.iter(|| {
             let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
             let mut sum = 0u64;
-            let reads = total_bits / 9;
-            for _ in 0..reads {
+            for _ in 0..reads_9 {
                 sum = sum.wrapping_add(br.get_bits(9));
             }
             black_box(sum)
         })
     });
 
+    group.throughput(Throughput::Elements(reads_11));
     group.bench_function("sequential_11bit", |b| {
         b.iter(|| {
             let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
             let mut sum = 0u64;
-            let reads = total_bits / 11;
-            for _ in 0..reads {
+            for _ in 0..reads_11 {
                 sum = sum.wrapping_add(br.get_bits(11));
             }
             black_box(sum)
@@ -57,15 +59,15 @@ fn bench_get_bits_triple(c: &mut Criterion) {
     let total_bits = data.len() * 8;
 
     let mut group = c.benchmark_group("bitstream/get_bits_triple");
-    group.throughput(Throughput::Bytes(data.len() as u64));
+    let reads_triple = (total_bits / 26) as u64;
+    group.throughput(Throughput::Elements(reads_triple));
 
     // Simulates FSE sequence decode: offset(8) + match(9) + literal(9) = 26 bits
     group.bench_function("fse_pattern_8_9_9", |b| {
         b.iter(|| {
             let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
             let mut sum = 0u64;
-            let reads = total_bits / 26;
-            for _ in 0..reads {
+            for _ in 0..reads_triple {
                 let (a, b_val, c_val) = br.get_bits_triple(8, 9, 9);
                 sum = sum.wrapping_add(a).wrapping_add(b_val).wrapping_add(c_val);
             }
@@ -81,15 +83,15 @@ fn bench_ensure_and_unchecked(c: &mut Criterion) {
     let total_bits = data.len() * 8;
 
     let mut group = c.benchmark_group("bitstream/ensure_unchecked");
-    group.throughput(Throughput::Bytes(data.len() as u64));
+    let reads_unchecked = (total_bits / 26) as u64;
+    group.throughput(Throughput::Elements(reads_unchecked));
 
     // Simulates interleaved FSE: one ensure_bits(26) then 3 unchecked reads
     group.bench_function("ensure26_3x_unchecked", |b| {
         b.iter(|| {
             let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
             let mut sum = 0u64;
-            let reads = total_bits / 26;
-            for _ in 0..reads {
+            for _ in 0..reads_unchecked {
                 br.ensure_bits(26);
                 sum = sum.wrapping_add(br.get_bits_unchecked(8));
                 sum = sum.wrapping_add(br.get_bits_unchecked(9));
