@@ -36,10 +36,16 @@ pub fn new() -> BlockDecoder {
 }
 
 impl BlockDecoder {
+    /// Decode the body of a single block described by `header` from `source` into `workspace`.
+    ///
+    /// Returns the number of bytes consumed from `source`.
+    /// The decode buffer inside `workspace` may be reserved or grown during
+    /// decoding. For some block types the decompressed size is known up front,
+    /// but this is not guaranteed before any data is written.
     pub fn decode_block_content(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch,
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {
@@ -57,6 +63,8 @@ impl BlockDecoder {
                 let mut buf = [0u8; BATCH_SIZE];
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
+
+                workspace.buffer.reserve(header.decompressed_size as usize);
 
                 source.read_exact(&mut buf[0..1]).map_err(|err| {
                     DecodeBlockContentError::ReadError {
@@ -83,6 +91,8 @@ impl BlockDecoder {
                 let mut buf = [0u8; BATCH_SIZE];
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
+
+                workspace.buffer.reserve(header.decompressed_size as usize);
 
                 for _ in 0..full_reads {
                     source.read_exact(&mut buf[..]).map_err(|err| {

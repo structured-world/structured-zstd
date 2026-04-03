@@ -1,5 +1,6 @@
 use super::prefetch;
 use super::scratch::DecoderScratch;
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::ExecuteSequencesError;
 
 /// Take the provided decoder and execute the sequences stored within
@@ -7,6 +8,12 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     let mut literals_copy_counter = 0;
     let old_buffer_size = scratch.buffer.len();
     let mut seq_sum = 0;
+
+    // Reserve once for the maximum possible decoded block output (128 KB per
+    // the zstd spec). This avoids repeated re-allocations inside the hot
+    // execute loop without an extra scan over the sequence vector, and is
+    // inherently bounded against corrupted inputs.
+    scratch.buffer.reserve(MAX_BLOCK_SIZE as usize);
 
     for idx in 0..scratch.sequences.len() {
         let seq = scratch.sequences[idx];

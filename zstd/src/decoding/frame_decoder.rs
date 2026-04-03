@@ -14,9 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-/// While the maximum window size allowed by the spec is significantly larger,
-/// our implementation limits it to 100mb to protect against malformed frames.
-const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
+use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 
 /// Low level Zstandard decoder that can be used to decompress frames with fine control over when and how many bytes are decoded.
 ///
@@ -93,20 +91,38 @@ pub enum BlockDecodingStrategy {
 }
 
 impl FrameDecoderState {
+    /// Read the frame header from `source` and create a new decoder state.
+    ///
+    /// Pre-allocates the decode buffer to `window_size` so the first block
+    /// does not trigger incremental growth from zero capacity.
     pub fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
+
+        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
+            return Err(FrameDecoderError::WindowSizeTooBig {
+                requested: window_size,
+            });
+        }
+
+        let mut decoder_scratch = DecoderScratch::new(window_size as usize);
+        decoder_scratch.buffer.reserve(window_size as usize);
         Ok(FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
             block_counter: 0,
-            decoder_scratch: DecoderScratch::new(window_size as usize),
+            decoder_scratch,
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
         })
     }
 
+    /// Reset this state for a new frame read from `source`, reusing existing allocations.
+    ///
+    /// `DecodeBuffer::reset` reserves `window_size` internally, so no
+    /// additional frame-level reservation is needed here. Further buffer
+    /// growth during decoding is performed on demand by the active block path.
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header(source)?;
         let window_size = frame_header.window_size()?;
