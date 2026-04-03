@@ -267,14 +267,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
-                | CompressionLevel::Best => {
-                    compress_block_encoded(
-                        &mut self.state,
-                        last_block,
-                        uncompressed_data,
-                        &mut all_blocks,
-                    )
-                }
+                | CompressionLevel::Best => compress_block_encoded(
+                    &mut self.state,
+                    last_block,
+                    uncompressed_data,
+                    &mut all_blocks,
+                ),
             }
             if last_block {
                 break;
@@ -458,10 +456,9 @@ mod tests {
             for data in &inputs {
                 let compressed = crate::encoding::compress_to_vec(*data, level);
                 // Verify FCS is present and correct
-                let header =
-                    crate::decoding::frame::read_frame_header(compressed.as_slice())
-                        .unwrap()
-                        .0;
+                let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+                    .unwrap()
+                    .0;
                 assert_eq!(
                     header.frame_content_size(),
                     data.len() as u64,

@@ -11,8 +11,8 @@ use twox_hash::XxHash64;
 
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
-    block_header::BlockHeader, frame_compressor::CompressState, frame_compressor::FseTables,
-    frame_header::FrameHeader, CompressionLevel, MatchGeneratorDriver, Matcher,
+    CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
+    frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
 };
 use crate::io::{Error, ErrorKind, Write};
 
@@ -907,10 +907,9 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         // Verify FCS is present and correct
-        let header =
-            crate::decoding::frame::read_frame_header(compressed.as_slice())
-                .unwrap()
-                .0;
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
         assert_eq!(header.frame_content_size(), payload.len() as u64);
 
         // Verify roundtrip
@@ -951,10 +950,9 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         // FCS should be written
-        let header =
-            crate::decoding::frame::read_frame_header(compressed.as_slice())
-                .unwrap()
-                .0;
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
         assert_eq!(header.frame_content_size(), payload.len() as u64);
 
         // C zstd should decompress successfully
@@ -970,10 +968,9 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         // FCS should be 0 (not present — decoder returns 0 for absent FCS)
-        let header =
-            crate::decoding::frame::read_frame_header(compressed.as_slice())
-                .unwrap()
-                .0;
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
         assert_eq!(header.frame_content_size(), 0);
     }
 }
