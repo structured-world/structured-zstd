@@ -195,11 +195,15 @@ fn decompress_literals(
             }
         }
 
-        // If any stream produced fewer symbols than its segment (corrupted data),
-        // adjust target length so the final decoded count check catches it.
+        // Verify total decoded count matches expected regenerated size.
+        // Return error immediately rather than deferring to the downstream check.
         let decoded: usize = cursors.iter().zip(starts.iter()).map(|(c, s)| c - s).sum();
         if decoded != regen {
             target.truncate(base + decoded);
+            return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                decoded: target.len(),
+                expected: section.regenerated_size as usize,
+            });
         }
 
         bytes_read += source.len() as u32;
