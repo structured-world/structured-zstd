@@ -14,8 +14,6 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-/// While the maximum window size allowed by the spec is significantly larger,
-/// our implementation limits it to 100mb to protect against malformed frames.
 /// Implementation limit for window size (100 MiB) to protect against
 /// malformed frames. The zstd spec allows much larger windows, but this
 /// cap prevents excessive memory allocation on untrusted input.
@@ -98,8 +96,8 @@ pub enum BlockDecodingStrategy {
 impl FrameDecoderState {
     /// Read the frame header from `source` and create a new decoder state.
     ///
-    /// Pre-allocates the decode buffer based on the declared frame content size
-    /// (when available) or falls back to the window size.
+    /// Pre-allocates the decode buffer to `window_size` so the first block
+    /// does not trigger incremental growth from zero capacity.
     pub fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
@@ -111,15 +109,7 @@ impl FrameDecoderState {
         }
 
         let mut decoder_scratch = DecoderScratch::new(window_size as usize);
-        // When the frame header declares the decompressed size, pre-allocate
-        // for the full content to avoid incremental re-allocations.
-        let fcs = frame.frame_content_size();
-        let reserve = if fcs > 0 && fcs <= MAXIMUM_ALLOWED_WINDOW_SIZE {
-            fcs as usize
-        } else {
-            window_size as usize
-        };
-        decoder_scratch.buffer.reserve(reserve);
+        decoder_scratch.buffer.reserve(window_size as usize);
         Ok(FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
@@ -133,7 +123,9 @@ impl FrameDecoderState {
 
     /// Reset this state for a new frame read from `source`, reusing existing allocations.
     ///
-    /// Pre-allocates the decode buffer when the frame content size is declared.
+    /// `DecodeBuffer::reset` reserves `window_size` internally; no additional
+    /// frame-level reservation is needed since block-level pre-allocation
+    /// (MAX_BLOCK_SIZE per block) handles growth during decoding.
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header(source)?;
         let window_size = frame_header.window_size()?;
@@ -147,13 +139,7 @@ impl FrameDecoderState {
         self.frame_header = frame_header;
         self.frame_finished = false;
         self.block_counter = 0;
-        // reset() already reserves window_size internally via DecodeBuffer::reset,
-        // so we only need an additional reserve when FCS exceeds that.
         self.decoder_scratch.reset(window_size as usize);
-        let fcs = self.frame_header.frame_content_size();
-        if fcs > 0 && fcs <= MAXIMUM_ALLOWED_WINDOW_SIZE {
-            self.decoder_scratch.buffer.reserve(fcs as usize);
-        }
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
