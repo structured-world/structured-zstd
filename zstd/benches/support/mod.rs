@@ -1,3 +1,5 @@
+// rand 0.10: SmallRng is available with default features (no `small_rng` flag needed).
+// Rng provides fill_bytes(); RngCore was removed from rand's public root in 0.10.
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{collections::HashSet, env, fs, path::Path};
 use structured_zstd::encoding::CompressionLevel;
