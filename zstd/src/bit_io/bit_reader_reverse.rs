@@ -99,6 +99,36 @@ impl<'s> BitReaderReversed<'s> {
         value
     }
 
+    /// Ensure at least `n` bits are available for subsequent unchecked reads.
+    /// After calling this, it is safe to call [`get_bits_unchecked`](Self::get_bits_unchecked)
+    /// for a combined total of up to `n` bits without individual refill checks.
+    ///
+    /// `n` must be at most 56.
+    #[inline(always)]
+    pub fn ensure_bits(&mut self, n: u8) {
+        debug_assert!(n <= 56);
+        if self.bits_consumed + n > 64 {
+            self.refill();
+        }
+    }
+
+    /// Read `n` bits from the source **without** checking whether a refill is
+    /// needed. The caller **must** guarantee enough bits are available (e.g. via
+    /// a prior [`ensure_bits`](Self::ensure_bits) call).
+    #[inline(always)]
+    pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {
+        debug_assert!(n <= 56);
+        debug_assert!(
+            self.bits_consumed + n <= 64,
+            "get_bits_unchecked: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            n
+        );
+        let value = self.peek_bits(n);
+        self.consume(n);
+        value
+    }
+
     /// Get the next `n` bits from the source without consuming them.
     /// Caller is responsible for making sure that `n` many bits have been refilled.
     #[inline(always)]
@@ -180,5 +210,60 @@ mod test {
         // All zeroes filled in
         assert_eq!(br.get_bits(4), 0b0000);
         assert_eq!(br.bits_remaining(), -7);
+    }
+
+    /// Verify that `ensure_bits(n)` + `get_bits_unchecked(..)` returns the same
+    /// values as plain `get_bits(..)`, including across refill boundaries and
+    /// for edge cases like n=0.
+    #[test]
+    fn ensure_and_unchecked_match_get_bits() {
+        // 10 bytes = 80 bits — enough to force multiple refills
+        let data: [u8; 10] = [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01];
+
+        // Reference: read with get_bits
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let r1 = ref_br.get_bits(0);
+        let r2 = ref_br.get_bits(7);
+        let r3 = ref_br.get_bits(13);
+        let r4 = ref_br.get_bits(9);
+        let r5 = ref_br.get_bits(8);
+        let r5b = ref_br.get_bits(2);
+        // After 39 bits consumed, ensure_bits(26) triggers a real refill
+        // because 39 + 26 = 65 > 64.
+        let r6 = ref_br.get_bits(9);
+        let r7 = ref_br.get_bits(9);
+        let r8 = ref_br.get_bits(8);
+
+        // Unchecked path: same reads via ensure_bits + get_bits_unchecked
+        let mut fast_br = super::BitReaderReversed::new(&data);
+
+        // n=0 edge case
+        fast_br.ensure_bits(0);
+        assert_eq!(fast_br.get_bits_unchecked(0), r1);
+
+        // Single reads
+        fast_br.ensure_bits(7);
+        assert_eq!(fast_br.get_bits_unchecked(7), r2);
+
+        fast_br.ensure_bits(13);
+        assert_eq!(fast_br.get_bits_unchecked(13), r3);
+
+        fast_br.ensure_bits(9);
+        assert_eq!(fast_br.get_bits_unchecked(9), r4);
+
+        fast_br.ensure_bits(8);
+        assert_eq!(fast_br.get_bits_unchecked(8), r5);
+
+        fast_br.ensure_bits(2);
+        assert_eq!(fast_br.get_bits_unchecked(2), r5b);
+
+        // Batched: one ensure covering 9+9+8 = 26 bits.
+        // At 39 bits consumed, this forces a real refill (39+26=65 > 64).
+        fast_br.ensure_bits(26);
+        assert_eq!(fast_br.get_bits_unchecked(9), r6);
+        assert_eq!(fast_br.get_bits_unchecked(9), r7);
+        assert_eq!(fast_br.get_bits_unchecked(8), r8);
+
+        assert_eq!(ref_br.bits_remaining(), fast_br.bits_remaining());
     }
 }

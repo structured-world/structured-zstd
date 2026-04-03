@@ -69,6 +69,25 @@ fn decode_sequences_with_rle(
     target.clear();
     target.reserve(section.num_sequences as usize);
 
+    // Only non-RLE decoders need state updates; compute their combined worst-case.
+    let max_update_bits = if scratch.ll_rle.is_none() {
+        scratch.literal_lengths.accuracy_log
+    } else {
+        0
+    } + if scratch.ml_rle.is_none() {
+        scratch.match_lengths.accuracy_log
+    } else {
+        0
+    } + if scratch.of_rle.is_none() {
+        scratch.offsets.accuracy_log
+    } else {
+        0
+    };
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
+
     for _seq_idx in 0..section.num_sequences {
         //get the codes from either the RLE byte or from the decoder
         let ll_code = if let Some(ll_rle) = scratch.ll_rle {
@@ -90,17 +109,6 @@ fn decode_sequences_with_rle(
         let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
         let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
 
-        //println!("Sequence: {}", i);
-        //println!("of stat: {}", of_dec.state);
-        //println!("of Code: {}", of_code);
-        //println!("ll stat: {}", ll_dec.state);
-        //println!("ll bits: {}", ll_num_bits);
-        //println!("ll Code: {}", ll_value);
-        //println!("ml stat: {}", ml_dec.state);
-        //println!("ml bits: {}", ml_num_bits);
-        //println!("ml Code: {}", ml_value);
-        //println!("");
-
         if of_code > MAX_OFFSET_CODE {
             return Err(DecodeSequenceError::UnsupportedOffset {
                 offset_code: of_code,
@@ -121,19 +129,18 @@ fn decode_sequences_with_rle(
         });
 
         if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
+            // One refill check for all non-RLE state updates (batched fast path).
+            if max_update_bits > 0 {
+                br.ensure_bits(max_update_bits);
+            }
             if scratch.ll_rle.is_none() {
-                ll_dec.update_state(br);
+                ll_dec.update_state_fast(br);
             }
             if scratch.ml_rle.is_none() {
-                ml_dec.update_state(br);
+                ml_dec.update_state_fast(br);
             }
             if scratch.of_rle.is_none() {
-                of_dec.update_state(br);
+                of_dec.update_state_fast(br);
             }
         }
 
@@ -168,6 +175,19 @@ fn decode_sequences_without_rle(
     target.clear();
     target.reserve(section.num_sequences as usize);
 
+    // Maximum bits consumed by the three state updates combined.
+    // LL and ML accuracy logs are at most 9, OF at most 8, so the ceiling is 26.
+    // A single ensure_bits call (which guarantees ≥56 bits after refill) replaces
+    // three individual per-update refill checks, eliminating two branches per
+    // iteration on the hot decode path.
+    let max_update_bits = scratch.literal_lengths.accuracy_log
+        + scratch.match_lengths.accuracy_log
+        + scratch.offsets.accuracy_log;
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
+
     for _seq_idx in 0..section.num_sequences {
         let ll_code = ll_dec.decode_symbol();
         let ml_code = ml_dec.decode_symbol();
@@ -196,14 +216,11 @@ fn decode_sequences_without_rle(
         });
 
         if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            ll_dec.update_state(br);
-            ml_dec.update_state(br);
-            of_dec.update_state(br);
+            // One refill check for all three state updates (batched fast path).
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(br);
+            ml_dec.update_state_fast(br);
+            of_dec.update_state_fast(br);
         }
 
         if br.bits_remaining() < 0 {
