@@ -22,6 +22,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
+    #[inline(always)]
     pub fn decode_symbol(&mut self) -> u8 {
         self.table.decode[self.state as usize].symbol
     }
@@ -29,6 +30,7 @@ impl<'t> HuffmanDecoder<'t> {
     /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
     /// to read the byte the internal cursor is pointing at, and `next_state` can be called to advance
     /// the cursor until the max number of bits has been read.
+    #[inline(always)]
     pub fn init_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let num_bits = self.table.max_num_bits;
         let new_bits = br.get_bits(num_bits);
@@ -38,6 +40,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
+    #[inline(always)]
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
@@ -388,10 +391,11 @@ impl HuffmanTable {
                 let base_idx = self.rank_indexes[bits_for_symbol as usize];
                 let len = 1 << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
-                for idx in 0..len {
-                    self.decode[base_idx + idx].symbol = symbol as u8;
-                    self.decode[base_idx + idx].num_bits = bits_for_symbol;
-                }
+                let entry = Entry {
+                    symbol: symbol as u8,
+                    num_bits: bits_for_symbol,
+                };
+                self.decode[base_idx..base_idx + len].fill(entry);
             }
         }
 

@@ -1,4 +1,6 @@
-use rand::{RngCore, SeedableRng, rngs::SmallRng};
+// rand 0.10: SmallRng is available with default features (no `small_rng` flag needed).
+// Use Rng::fill() instead of RngCore::fill_bytes(); RngCore removed from rand's public root in 0.10.
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{collections::HashSet, env, fs, path::Path};
 use structured_zstd::encoding::CompressionLevel;
 
@@ -127,7 +129,7 @@ impl Scenario {
 fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut bytes = vec![0u8; len];
-    rng.fill_bytes(&mut bytes);
+    rng.fill(&mut bytes[..]);
     bytes
 }
 
