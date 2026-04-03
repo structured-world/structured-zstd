@@ -205,8 +205,8 @@ impl<'s> BitReaderReversed<'s> {
     #[inline(always)]
     pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
         debug_assert_eq!(
-            sum,
-            n1 + n2 + n3,
+            u16::from(sum),
+            u16::from(n1) + u16::from(n2) + u16::from(n3),
             "peek_bits_triple: sum ({}) must equal n1+n2+n3 ({}+{}+{})",
             sum,
             n1,
@@ -246,8 +246,11 @@ impl<'s> BitReaderReversed<'s> {
     /// bit container already holds enough bits.
     #[inline(always)]
     pub fn get_bits_triple(&mut self, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        let sum = n1 + n2 + n3;
-        if sum <= 56 {
+        // Compute in u16 to avoid u8 overflow (max realistic sum is ~26,
+        // but the type system allows up to 3×255).
+        let sum_wide = u16::from(n1) + u16::from(n2) + u16::from(n3);
+        if sum_wide <= 56 {
+            let sum = sum_wide as u8;
             self.ensure_bits(sum);
 
             let triple = self.peek_bits_triple(sum, n1, n2, n3);
