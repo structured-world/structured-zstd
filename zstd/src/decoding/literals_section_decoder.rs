@@ -201,7 +201,7 @@ fn decompress_literals(
         if decoded != regen {
             target.truncate(base + decoded);
             return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
-                decoded: target.len(),
+                decoded,
                 expected: section.regenerated_size as usize,
             });
         }
