@@ -1,5 +1,49 @@
 use core::convert::TryInto;
 
+/// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
+/// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
+///
+/// Using a lookup table instead of computing the mask on every call
+/// eliminates a shift + subtract on the hot decode path.
+/// On BMI2-capable x86-64 CPUs the table is bypassed entirely in favour
+/// of the single-cycle `bzhi` instruction (see [`mask_lower_bits`]).
+// On BMI2 builds the table is only used by tests; suppress dead_code there.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
+const BIT_MASK: [u64; 65] = {
+    let mut table = [0u64; 65];
+    let mut i: u32 = 1;
+    while i < 64 {
+        table[i as usize] = (1u64 << i) - 1;
+        i += 1;
+    }
+    table[64] = u64::MAX;
+    table
+};
+
+/// Return the lowest `n` bits of `value` (zero the rest).
+///
+/// On x86-64 with BMI2 this compiles to a single `bzhi` instruction.
+/// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
+/// This function supports `n <= 64`; zstd callers normally guarantee
+/// `n <= 56` (the maximum single-symbol width in zstd).
+/// On the non-BMI2 fallback path, `n > 64` naturally panics via
+/// `BIT_MASK[n]` index-out-of-bounds. The `debug_assert` catches
+/// misuse on the BMI2 path (where `_bzhi_u64` would silently
+/// truncate) without adding a branch to the release hot path.
+#[inline(always)]
+fn mask_lower_bits(value: u64, n: u8) -> u64 {
+    debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: `_bzhi_u64` is always safe to call when the target supports BMI2.
+        unsafe { core::arch::x86_64::_bzhi_u64(value, n as u32) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        value & BIT_MASK[n as usize]
+    }
+}
+
 /// Zstandard encodes some types of data in a way that the data must be read
 /// back to front to decode it properly. `BitReaderReversed` provides a
 /// convenient interface to do that.
@@ -131,40 +175,59 @@ impl<'s> BitReaderReversed<'s> {
 
     /// Get the next `n` bits from the source without consuming them.
     /// Caller is responsible for making sure that `n` many bits have been refilled.
+    ///
+    /// Branchless: when `n == 0` the mask is zero so the result is zero
+    /// without a dedicated check. `wrapping_shr` avoids a debug-mode
+    /// panic when the computed shift equals 64 (which happens legitimately
+    /// when `bits_consumed == 0` and `n == 0`).
     #[inline(always)]
     pub fn peek_bits(&mut self, n: u8) -> u64 {
-        if n == 0 {
-            return 0;
-        }
-
-        let mask = (1u64 << n) - 1u64;
-        let shift_by = 64 - self.bits_consumed - n;
-        (self.bit_container >> shift_by) & mask
+        // n == 0 is valid (branchless no-op); otherwise the caller must
+        // guarantee bits_consumed + n <= 64 via ensure_bits / get_bits.
+        debug_assert!(
+            n == 0 || self.bits_consumed + n <= 64,
+            "peek_bits: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            n
+        );
+        let shift_by = (64u8 - self.bits_consumed).wrapping_sub(n);
+        mask_lower_bits(self.bit_container.wrapping_shr(shift_by as u32), n)
     }
 
     /// Get the next `n1` `n2` and `n3` bits from the source without consuming them.
     /// Caller is responsible for making sure that `sum` many bits have been refilled.
+    ///
+    /// # Contract
+    /// `sum` **must** equal `n1 + n2 + n3`. This is enforced by `debug_assert`
+    /// but not checked in release builds for performance.
+    ///
+    /// Branchless: when all widths are zero the masks are zero, producing (0, 0, 0).
     #[inline(always)]
     pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        if sum == 0 {
-            return (0, 0, 0);
-        }
-
+        debug_assert_eq!(
+            u16::from(sum),
+            u16::from(n1) + u16::from(n2) + u16::from(n3),
+            "peek_bits_triple: sum ({}) must equal n1+n2+n3 ({}+{}+{})",
+            sum,
+            n1,
+            n2,
+            n3
+        );
+        debug_assert!(
+            sum == 0 || self.bits_consumed + sum <= 64,
+            "peek_bits_triple: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            sum
+        );
         // all_three contains bits like this: |XXXX..XXX111122223333|
         // Where XXX are already consumed bytes, 1/2/3 are bits of the respective value
         // Lower bits are to the right
-        let all_three = self.bit_container >> (64 - self.bits_consumed - sum);
+        let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
+        let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
-        let mask1 = (1u64 << n1) - 1u64;
-        let shift_by1 = n3 + n2;
-        let val1 = (all_three >> shift_by1) & mask1;
-
-        let mask2 = (1u64 << n2) - 1u64;
-        let shift_by2 = n3;
-        let val2 = (all_three >> shift_by2) & mask2;
-
-        let mask3 = (1u64 << n3) - 1u64;
-        let val3 = all_three & mask3;
+        let val1 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
+        let val2 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
+        let val3 = mask_lower_bits(all_three, n3);
 
         (val1, val2, val3)
     }
@@ -176,12 +239,19 @@ impl<'s> BitReaderReversed<'s> {
         debug_assert!(self.bits_consumed <= 64);
     }
 
-    /// Same as calling get_bits three times but slightly more performant
+    /// Same as calling get_bits three times but slightly more performant.
+    ///
+    /// Uses a single conditional refill (via [`ensure_bits`](Self::ensure_bits))
+    /// instead of unconditionally refilling, avoiding redundant work when the
+    /// bit container already holds enough bits.
     #[inline(always)]
     pub fn get_bits_triple(&mut self, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        let sum = n1 + n2 + n3;
-        if sum <= 56 {
-            self.refill();
+        // Compute in u16 to avoid u8 overflow (max realistic sum is ~26,
+        // but the type system allows up to 3×255).
+        let sum_wide = u16::from(n1) + u16::from(n2) + u16::from(n3);
+        if sum_wide <= 56 {
+            let sum = sum_wide as u8;
+            self.ensure_bits(sum);
 
             let triple = self.peek_bits_triple(sum, n1, n2, n3);
             self.consume(sum);
@@ -265,5 +335,111 @@ mod test {
         assert_eq!(fast_br.get_bits_unchecked(8), r8);
 
         assert_eq!(ref_br.bits_remaining(), fast_br.bits_remaining());
+    }
+
+    /// Verify that the pre-computed BIT_MASK table produces correct values.
+    #[test]
+    fn mask_table_correctness() {
+        assert_eq!(super::BIT_MASK[0], 0);
+        assert_eq!(super::BIT_MASK[1], 1);
+        assert_eq!(super::BIT_MASK[8], 0xFF);
+        assert_eq!(super::BIT_MASK[16], 0xFFFF);
+        assert_eq!(super::BIT_MASK[32], 0xFFFF_FFFF);
+        assert_eq!(super::BIT_MASK[63], (1u64 << 63) - 1);
+        assert_eq!(super::BIT_MASK[64], u64::MAX);
+        for n in 0..64u32 {
+            assert_eq!(
+                super::BIT_MASK[n as usize],
+                (1u64 << n) - 1,
+                "BIT_MASK[{n}] mismatch"
+            );
+        }
+    }
+
+    /// Verify mask_lower_bits matches manual computation for edge values.
+    #[test]
+    fn mask_lower_bits_edge_cases() {
+        assert_eq!(super::mask_lower_bits(u64::MAX, 0), 0);
+        assert_eq!(super::mask_lower_bits(u64::MAX, 1), 1);
+        assert_eq!(
+            super::mask_lower_bits(0xABCD_1234_5678_9ABC, 64),
+            0xABCD_1234_5678_9ABC
+        );
+        assert_eq!(super::mask_lower_bits(0xABCD_1234_5678_9ABC, 8), 0xBC);
+        assert_eq!(super::mask_lower_bits(0xABCD_1234_5678_9ABC, 16), 0x9ABC);
+    }
+
+    /// peek_bits(0) must return 0 in all states, including when
+    /// bits_consumed is 0 (post-exhaustion refill).
+    #[test]
+    fn peek_bits_zero_is_always_zero() {
+        let data = [0xFF; 8];
+        let mut br = super::BitReaderReversed::new(&data);
+
+        // Initial state: bits_consumed = 64
+        assert_eq!(br.peek_bits(0), 0);
+
+        // After reading some bits: bits_consumed < 64
+        br.get_bits(7);
+        assert_eq!(br.peek_bits(0), 0);
+
+        // Force bits_consumed == 0 to exercise the shift-by-64 edge case
+        // in peek_bits. This state occurs naturally during refill() when the
+        // source is exhausted. We set it directly because get_bits always
+        // calls consume(n) after refill, making bits_consumed > 0 by the
+        // time it returns.
+        br.bits_consumed = 0;
+        assert_eq!(br.peek_bits(0), 0);
+    }
+
+    /// get_bits_triple must produce the same values as three individual
+    /// get_bits calls, both with and without a refill in between.
+    #[test]
+    fn get_bits_triple_matches_individual() {
+        let data: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01, 0x99, 0x88, 0x77, 0x66,
+            0x55, 0x44,
+        ];
+
+        // Reference: individual reads
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let r1 = ref_br.get_bits(8);
+        let r2 = ref_br.get_bits(9);
+        let r3 = ref_br.get_bits(9);
+
+        // Triple read
+        let mut triple_br = super::BitReaderReversed::new(&data);
+        let (t1, t2, t3) = triple_br.get_bits_triple(8, 9, 9);
+
+        assert_eq!((r1, r2, r3), (t1, t2, t3));
+        assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+
+        // No-refill fast path: 8 bits already consumed, so the next 26 bits
+        // still fit in the current container and `ensure_bits(26)` should
+        // skip `refill()`.
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut triple_br = super::BitReaderReversed::new(&data);
+        let _ = ref_br.get_bits(8);
+        let _ = triple_br.get_bits(8);
+
+        let r1 = ref_br.get_bits(8);
+        let r2 = ref_br.get_bits(9);
+        let r3 = ref_br.get_bits(9);
+        let (t1, t2, t3) = triple_br.get_bits_triple(8, 9, 9);
+
+        assert_eq!((r1, r2, r3), (t1, t2, t3));
+        assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+
+        // Mixed zero-widths: individual sequence extra-bit fields can be zero.
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut triple_br = super::BitReaderReversed::new(&data);
+
+        let r1 = ref_br.get_bits(5);
+        let r2 = ref_br.get_bits(0);
+        let r3 = ref_br.get_bits(4);
+        let (t1, t2, t3) = triple_br.get_bits_triple(5, 0, 4);
+
+        assert_eq!((r1, r2, r3), (t1, t2, t3));
+        assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
     }
 }

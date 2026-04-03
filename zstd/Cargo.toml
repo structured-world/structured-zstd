@@ -37,6 +37,7 @@ zstd = { version = "0.13.3", features = ["zdict_builder"] }
 default = ["hash", "std"]
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
+bench_internals = []
 fuzz_exports = []
 std = []
 
@@ -51,3 +52,8 @@ harness = false
 [[bench]]
 name = "compare_ffi"
 harness = false
+
+[[bench]]
+name = "bitstream"
+harness = false
+required-features = ["bench_internals"]
