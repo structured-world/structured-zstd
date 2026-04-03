@@ -32,7 +32,11 @@ macro_rules! vprintln {
     }
 }
 
-mod bit_io;
+// `pub` so that `testing::BitReaderReversed` can be re-exported for
+// benchmarks. The module is `#[doc(hidden)]` to keep it out of the
+// public API documentation — only `testing` surfaces the type.
+#[doc(hidden)]
+pub mod bit_io;
 mod common;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
@@ -65,3 +69,11 @@ pub mod io_nostd;
 pub use io_nostd as io;
 
 mod tests;
+
+/// Re-exports of internal types used by benchmarks.
+///
+/// Not part of the public API; items may change or disappear without notice.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::bit_io::BitReaderReversed;
+}

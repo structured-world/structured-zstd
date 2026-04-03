@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "compare_ffi"
 harness = false
+
+[[bench]]
+name = "bitstream"
+harness = false
