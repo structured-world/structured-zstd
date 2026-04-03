@@ -197,6 +197,10 @@ impl<'s> BitReaderReversed<'s> {
     /// Get the next `n1` `n2` and `n3` bits from the source without consuming them.
     /// Caller is responsible for making sure that `sum` many bits have been refilled.
     ///
+    /// # Contract
+    /// `sum` **must** equal `n1 + n2 + n3`. This is enforced by `debug_assert`
+    /// but not checked in release builds for performance.
+    ///
     /// Branchless: when all widths are zero the masks are zero, producing (0, 0, 0).
     #[inline(always)]
     pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {

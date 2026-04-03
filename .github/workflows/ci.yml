@@ -31,7 +31,7 @@ jobs:
       - name: Clippy
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
       - name: Clippy (bench_internals)
-        run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals -- -D warnings
+        run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals --benches -- -D warnings
 
   test:
     needs: lint
