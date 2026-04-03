@@ -218,8 +218,8 @@ impl<'s> BitReaderReversed<'s> {
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
-        let val1 = mask_lower_bits(all_three >> (n3 + n2), n1);
-        let val2 = mask_lower_bits(all_three >> n3, n2);
+        let val1 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
+        let val2 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
         let val3 = mask_lower_bits(all_three, n3);
 
         (val1, val2, val3)
