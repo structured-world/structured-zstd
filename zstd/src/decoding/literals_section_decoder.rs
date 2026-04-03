@@ -47,8 +47,10 @@ fn decompress_literals(
 
     let compressed_size = section.compressed_size.ok_or(err::MissingCompressedSize)? as usize;
     let num_streams = section.num_streams.ok_or(err::MissingNumStreams)?;
+    let base = target.len();
+    let regen = section.regenerated_size as usize;
 
-    target.reserve(section.regenerated_size as usize);
+    target.reserve(regen);
     let source = &source[0..compressed_size];
     let mut bytes_read = 0;
 
@@ -127,10 +129,8 @@ fn decompress_literals(
         // RFC 8878 §3.1.1.3.2: first 3 streams produce ceil(regen_size/4)
         // symbols each, 4th produces the remainder. Pre-allocate target and
         // decode directly into slices — no temporary Vec allocations.
-        let regen = section.regenerated_size as usize;
         let seg = regen.div_ceil(4);
 
-        let base = target.len();
         target.resize(base + regen, 0);
         // Clamp every start/end into [base, base+regen] so cursors can
         // never index past the pre-allocated region, even with corrupted
@@ -199,10 +199,12 @@ fn decompress_literals(
         // Return error immediately rather than deferring to the downstream check.
         let decoded: usize = cursors.iter().zip(starts.iter()).map(|(c, s)| c - s).sum();
         if decoded != regen {
-            target.truncate(base + decoded);
+            // Truncate to base: segmented layout means partial decode left
+            // bytes scattered across segments, so only base is a clean boundary.
+            target.truncate(base);
             return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
                 decoded,
-                expected: section.regenerated_size as usize,
+                expected: regen,
             });
         }
 
@@ -232,10 +234,10 @@ fn decompress_literals(
         bytes_read += source.len() as u32;
     }
 
-    if target.len() != section.regenerated_size as usize {
+    if target.len() != base + regen {
         return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
-            decoded: target.len(),
-            expected: section.regenerated_size as usize,
+            decoded: target.len() - base,
+            expected: regen,
         });
     }
 
