@@ -299,11 +299,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             window_size: Some(window_size),
         };
-        // Prepend the header into all_blocks so we write to drain once,
-        // avoiding a second full-size buffer copy.
+        // Write the frame header and compressed blocks separately to avoid
+        // shifting the entire `all_blocks` buffer to prepend the header.
         let mut header_buf: Vec<u8> = Vec::with_capacity(14);
         header.serialize(&mut header_buf);
-        all_blocks.splice(..0, header_buf);
+        drain.write_all(&header_buf).unwrap();
         drain.write_all(&all_blocks).unwrap();
 
         // If the `hash` feature is enabled, then `content_checksum` is set to true in the header

@@ -31,7 +31,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     last_error_message: Option<String>,
     frame_started: bool,
     pledged_content_size: Option<u64>,
-    bytes_written: u64,
+    bytes_consumed: u64,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -71,7 +71,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             last_error_message: None,
             frame_started: false,
             pledged_content_size: None,
-            bytes_written: 0,
+            bytes_consumed: 0,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
@@ -125,15 +125,18 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// Calling this method consumes the encoder.
     pub fn finish(mut self) -> Result<W, Error> {
         self.ensure_open()?;
-        self.ensure_frame_started()?;
 
+        // Validate pledge before emitting the frame header to avoid writing
+        // a header with an incorrect FCS into the drain on mismatch.
         if let Some(pledged) = self.pledged_content_size
-            && self.bytes_written != pledged
+            && self.bytes_consumed != pledged
         {
             return Err(invalid_input_error(
-                "pledged content size does not match bytes written",
+                "pledged content size does not match bytes consumed",
             ));
         }
+
+        self.ensure_frame_started()?;
 
         if self.pending.is_empty() {
             self.write_empty_last_block()
@@ -395,6 +398,17 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
         }
 
         self.ensure_frame_started()?;
+
+        // Enforce pledged upper bound before accepting more input so the
+        // already-emitted header FCS is never contradicted by block content.
+        if let Some(pledged) = self.pledged_content_size
+            && self.bytes_consumed + buf.len() as u64 > pledged
+        {
+            return Err(invalid_input_error(
+                "write would exceed pledged content size",
+            ));
+        }
+
         let block_capacity = self.block_capacity();
         if self.pending.capacity() == 0 {
             self.pending = self.allocate_pending_space(block_capacity);
@@ -418,12 +432,12 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 
             if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
                 if let Ok(n) = &result {
-                    self.bytes_written += *n as u64;
+                    self.bytes_consumed += *n as u64;
                 }
                 return result;
             }
         }
-        self.bytes_written += consumed as u64;
+        self.bytes_consumed += consumed as u64;
         Ok(consumed)
     }
 
