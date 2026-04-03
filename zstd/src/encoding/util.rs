@@ -34,7 +34,9 @@ pub fn minify_val(val: u64) -> Vec<u8> {
 /// FCS has different sizing rules than `Dictionary_ID` due to the +256 offset
 /// for 2-byte fields (spec range 256–65791). When `single_segment` is true,
 /// values 0–255 can use a 1-byte field (FCS flag = 0 combined with the
-/// single-segment flag). Otherwise the smallest usable field is 4 bytes.
+/// single-segment flag). Otherwise, only the 1-byte encoding is unavailable:
+/// values 256–65791 still use a 2-byte field, while smaller values fall back
+/// to the 4-byte encoding.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
 pub fn find_fcs_field_size(val: u64, single_segment: bool) -> usize {

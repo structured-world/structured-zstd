@@ -157,7 +157,14 @@ impl FrameHeader {
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
 fn serialize_fcs(val: u64, field_size: usize) -> Vec<u8> {
-    let adjusted = if field_size == 2 { val - 256 } else { val };
+    debug_assert!(matches!(field_size, 1 | 2 | 4 | 8));
+    debug_assert!(field_size != 2 || val >= 256);
+
+    let adjusted = match field_size {
+        2 => val - 256,
+        1 | 4 | 8 => val,
+        _ => unreachable!("invalid Frame_Content_Size field size: {field_size}"),
+    };
     adjusted.to_le_bytes()[..field_size].to_vec()
 }
 

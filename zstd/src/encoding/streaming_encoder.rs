@@ -79,10 +79,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     /// Pledge the total uncompressed content size for this frame.
     ///
-    /// When set, the frame header will include a `Frame_Content_Size` field
-    /// and, when the pledged size fits within the matcher window, the
-    /// `Single_Segment` flag will be set (omitting the window descriptor to
-    /// save one byte). This enables decoders to pre-allocate output buffers.
+    /// When set, the frame header will include a `Frame_Content_Size` field.
+    /// This enables decoders to pre-allocate output buffers.
     ///
     /// Must be called **before** the first [`write`](Write::write) call;
     /// calling it after the frame header has already been emitted returns an
