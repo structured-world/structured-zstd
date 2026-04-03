@@ -36,10 +36,15 @@ pub fn new() -> BlockDecoder {
 }
 
 impl BlockDecoder {
+    /// Decode the body of a single block described by `header` from `source` into `workspace`.
+    ///
+    /// Returns the number of bytes consumed from `source`.
+    /// The decode buffer inside `workspace` is pre-allocated for the expected
+    /// decompressed size before any data is written.
     pub fn decode_block_content(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch,
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {

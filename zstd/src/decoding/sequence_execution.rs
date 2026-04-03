@@ -1,5 +1,6 @@
 use super::prefetch;
 use super::scratch::DecoderScratch;
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::ExecuteSequencesError;
 
 /// Take the provided decoder and execute the sequences stored within
@@ -10,8 +11,11 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 
     // Pre-allocate the exact output size for this block in one shot.
     // Total output = all literals (copied via sequences + trailing) + all match bytes.
+    // Clamped to MAX_BLOCK_SIZE to guard against corrupted inputs that could
+    // trigger huge allocations before semantic validation catches the error.
     let total_match_len: usize = scratch.sequences.iter().map(|s| s.ml as usize).sum();
-    let total_output = total_match_len + scratch.literals_buffer.len();
+    let total_output =
+        (total_match_len + scratch.literals_buffer.len()).min(MAX_BLOCK_SIZE as usize);
     scratch.buffer.reserve(total_output);
 
     for idx in 0..scratch.sequences.len() {

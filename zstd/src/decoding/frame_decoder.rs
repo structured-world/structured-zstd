@@ -93,9 +93,20 @@ pub enum BlockDecodingStrategy {
 }
 
 impl FrameDecoderState {
+    /// Read the frame header from `source` and create a new decoder state.
+    ///
+    /// Pre-allocates the decode buffer based on the declared frame content size
+    /// (when available) or falls back to the window size.
     pub fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
+
+        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
+            return Err(FrameDecoderError::WindowSizeTooBig {
+                requested: window_size,
+            });
+        }
+
         let mut decoder_scratch = DecoderScratch::new(window_size as usize);
         // When the frame header declares the decompressed size, pre-allocate
         // for the full content to avoid incremental re-allocations.
@@ -117,6 +128,9 @@ impl FrameDecoderState {
         })
     }
 
+    /// Reset this state for a new frame read from `source`, reusing existing allocations.
+    ///
+    /// Pre-allocates the decode buffer when the frame content size is declared.
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header(source)?;
         let window_size = frame_header.window_size()?;
