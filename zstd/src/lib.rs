@@ -68,7 +68,10 @@ mod tests;
 
 /// Re-exports of internal types used by benchmarks.
 ///
-/// Not part of the public API; items may change or disappear without notice.
+/// Gated behind the `bench_internals` feature so normal builds do not
+/// widen the public API surface. Not part of the stable API; items may
+/// change or disappear without notice.
+#[cfg(feature = "bench_internals")]
 #[doc(hidden)]
 pub mod testing {
     pub use crate::bit_io::BitReaderReversed;

@@ -192,6 +192,15 @@ impl<'s> BitReaderReversed<'s> {
     /// Branchless: when all widths are zero the masks are zero, producing (0, 0, 0).
     #[inline(always)]
     pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        debug_assert_eq!(
+            sum,
+            n1 + n2 + n3,
+            "peek_bits_triple: sum ({}) must equal n1+n2+n3 ({}+{}+{})",
+            sum,
+            n1,
+            n2,
+            n3
+        );
         debug_assert!(
             sum == 0 || self.bits_consumed + sum <= 64,
             "peek_bits_triple: not enough bits (consumed={}, requested={})",
