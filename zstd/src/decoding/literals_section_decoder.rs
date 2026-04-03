@@ -132,15 +132,17 @@ fn decompress_literals(
 
         let base = target.len();
         target.resize(base + regen, 0);
-        // Clamp starts[3] so it never exceeds base+regen (guards against
-        // small regen where 3*seg > regen, e.g. corrupted frame headers).
+        // Clamp every start/end into [base, base+regen] so cursors can
+        // never index past the pre-allocated region, even with corrupted
+        // frame headers that produce small regen (where N*seg > regen).
+        let limit = base + regen;
         let starts: [usize; 4] = [
             base,
-            base + seg,
-            base + 2 * seg,
-            base + (3 * seg).min(regen),
+            (base + seg).min(limit),
+            (base + 2 * seg).min(limit),
+            (base + 3 * seg).min(limit),
         ];
-        let ends: [usize; 4] = [starts[1], starts[2], starts[3], base + regen];
+        let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
         // Fast interleaved loop: while all 4 streams have bits remaining,
