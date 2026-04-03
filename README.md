@@ -47,6 +47,7 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 - [x] Better (roughly level 7)
 - [x] Best (roughly level 11)
 - [x] Checksums
+- [x] Frame Content Size (enables decoder pre-allocation)
 - [x] Dictionary compression
 - [x] Streaming encoder (`io::Write`)
 

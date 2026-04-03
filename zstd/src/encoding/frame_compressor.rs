@@ -215,22 +215,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
-        // As the frame is compressed, it's stored here
-        let output: &mut Vec<u8> = &mut Vec::with_capacity(1024 * 130);
-        // First write the frame header
-        let header = FrameHeader {
-            frame_content_size: None,
-            single_segment: false,
-            content_checksum: cfg!(feature = "hash"),
-            dictionary_id: if use_dictionary_state {
-                self.dictionary.as_ref().map(|dict| dict.id as u64)
-            } else {
-                None
-            },
-            window_size: Some(self.state.matcher.window_size()),
-        };
-        header.serialize(output);
-        // Now compress block by block
+        let window_size = self.state.matcher.window_size();
+        // Accumulate all compressed blocks; the frame header is written after
+        // all input has been read so that Frame_Content_Size is known.
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
+        let mut total_uncompressed: u64 = 0;
+        // Compress block by block
         loop {
             // Read a single block's worth of uncompressed data from the input
             let mut uncompressed_data = self.state.matcher.get_next_space();
@@ -249,20 +239,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 }
             }
             uncompressed_data.resize(read_bytes, 0);
+            total_uncompressed += read_bytes as u64;
             // As we read, hash that data too
             #[cfg(feature = "hash")]
             self.hasher.write(&uncompressed_data);
-            // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
+            // Special handling is needed for compression of a totally empty file
             if uncompressed_data.is_empty() {
                 let header = BlockHeader {
                     last_block: true,
                     block_type: crate::blocks::block::BlockType::Raw,
                     block_size: 0,
                 };
-                // Write the header, then the block
-                header.serialize(output);
-                drain.write_all(output).unwrap();
-                output.clear();
+                header.serialize(&mut all_blocks);
                 break;
             }
 
@@ -273,25 +261,46 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_type: crate::blocks::block::BlockType::Raw,
                         block_size: read_bytes.try_into().unwrap(),
                     };
-                    // Write the header, then the block
-                    header.serialize(output);
-                    output.extend_from_slice(&uncompressed_data);
+                    header.serialize(&mut all_blocks);
+                    all_blocks.extend_from_slice(&uncompressed_data);
                 }
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
                 | CompressionLevel::Best => {
-                    // All compressed levels share this block-encoding pipeline;
-                    // they differ only in the matcher backend and its parameters.
-                    compress_block_encoded(&mut self.state, last_block, uncompressed_data, output)
+                    compress_block_encoded(
+                        &mut self.state,
+                        last_block,
+                        uncompressed_data,
+                        &mut all_blocks,
+                    )
                 }
             }
-            drain.write_all(output).unwrap();
-            output.clear();
             if last_block {
                 break;
             }
         }
+
+        // Now that total_uncompressed is known, write the frame header with FCS.
+        // We always include the window descriptor (single_segment = false) because
+        // compressed blocks are encoded against the matcher's window, not the content
+        // size. Setting single_segment would tell the decoder to use FCS as window,
+        // which can be smaller than the encoder's actual window and trip up decoders.
+        let header = FrameHeader {
+            frame_content_size: Some(total_uncompressed),
+            single_segment: false,
+            content_checksum: cfg!(feature = "hash"),
+            dictionary_id: if use_dictionary_state {
+                self.dictionary.as_ref().map(|dict| dict.id as u64)
+            } else {
+                None
+            },
+            window_size: Some(window_size),
+        };
+        let mut header_buf: Vec<u8> = Vec::with_capacity(14);
+        header.serialize(&mut header_buf);
+        drain.write_all(&header_buf).unwrap();
+        drain.write_all(&all_blocks).unwrap();
 
         // If the `hash` feature is enabled, then `content_checksum` is set to true in the header
         // and a 32 bit hash is written at the end of the data.
@@ -427,6 +436,51 @@ mod tests {
     use crate::decoding::FrameDecoder;
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    /// Frame content size is written correctly and C zstd can decompress the output.
+    #[cfg(feature = "std")]
+    #[test]
+    fn fcs_header_written_and_c_zstd_compatible() {
+        let levels = [
+            crate::encoding::CompressionLevel::Uncompressed,
+            crate::encoding::CompressionLevel::Fastest,
+            crate::encoding::CompressionLevel::Default,
+            crate::encoding::CompressionLevel::Better,
+            crate::encoding::CompressionLevel::Best,
+        ];
+        let inputs: [&[u8]; 4] = [
+            &[],
+            &[0x00],
+            b"abcdefghijklmnopqrstuvwxy\n",
+            &vec![0xABu8; 100_000],
+        ];
+        for level in levels {
+            for data in &inputs {
+                let compressed = crate::encoding::compress_to_vec(*data, level);
+                // Verify FCS is present and correct
+                let header =
+                    crate::decoding::frame::read_frame_header(compressed.as_slice())
+                        .unwrap()
+                        .0;
+                assert_eq!(
+                    header.frame_content_size(),
+                    data.len() as u64,
+                    "FCS mismatch for len={} level={:?}",
+                    data.len(),
+                    level as u8,
+                );
+                // Verify C zstd can decompress
+                let mut decoded = Vec::new();
+                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+                assert_eq!(
+                    decoded.as_slice(),
+                    *data,
+                    "C zstd roundtrip failed for len={}",
+                    data.len()
+                );
+            }
+        }
+    }
 
     struct NoDictionaryMatcher {
         last_space: Vec<u8>,

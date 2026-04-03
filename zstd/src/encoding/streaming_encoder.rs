@@ -11,8 +11,8 @@ use twox_hash::XxHash64;
 
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
-    CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
-    frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
+    block_header::BlockHeader, frame_compressor::CompressState, frame_compressor::FseTables,
+    frame_header::FrameHeader, CompressionLevel, MatchGeneratorDriver, Matcher,
 };
 use crate::io::{Error, ErrorKind, Write};
 
@@ -30,6 +30,8 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     last_error_kind: Option<ErrorKind>,
     last_error_message: Option<String>,
     frame_started: bool,
+    pledged_content_size: Option<u64>,
+    bytes_written: u64,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -68,9 +70,31 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             last_error_kind: None,
             last_error_message: None,
             frame_started: false,
+            pledged_content_size: None,
+            bytes_written: 0,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Pledge the total uncompressed content size for this frame.
+    ///
+    /// When set, the frame header will include a `Frame_Content_Size` field
+    /// and, when the pledged size fits within the matcher window, the
+    /// `Single_Segment` flag will be set (omitting the window descriptor to
+    /// save one byte). This enables decoders to pre-allocate output buffers.
+    ///
+    /// Must be called **before** the first [`write`](Write::write) call;
+    /// calling it after the frame header has already been emitted returns an
+    /// error.
+    pub fn set_pledged_content_size(&mut self, size: u64) -> Result<(), Error> {
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "pledged content size must be set before the first write",
+            ));
+        }
+        self.pledged_content_size = Some(size);
+        Ok(())
     }
 
     /// Returns an immutable reference to the wrapped output drain.
@@ -103,6 +127,14 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     pub fn finish(mut self) -> Result<W, Error> {
         self.ensure_open()?;
         self.ensure_frame_started()?;
+
+        if let Some(pledged) = self.pledged_content_size
+            && self.bytes_written != pledged
+        {
+            return Err(invalid_input_error(
+                "pledged content size does not match bytes written",
+            ));
+        }
 
         if self.pending.is_empty() {
             self.write_empty_last_block()
@@ -185,7 +217,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
 
         let header = FrameHeader {
-            frame_content_size: None,
+            frame_content_size: self.pledged_content_size,
             single_segment: false,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: None,
@@ -386,9 +418,13 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
             consumed += to_take;
 
             if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
+                if let Ok(n) = &result {
+                    self.bytes_written += *n as u64;
+                }
                 return result;
             }
         }
+        self.bytes_written += consumed as u64;
         Ok(consumed)
     }
 
@@ -858,5 +894,86 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn pledged_content_size_written_in_header() {
+        let payload = b"hello world, pledged size test";
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Verify FCS is present and correct
+        let header =
+            crate::decoding::frame::read_frame_header(compressed.as_slice())
+                .unwrap()
+                .0;
+        assert_eq!(header.frame_content_size(), payload.len() as u64);
+
+        // Verify roundtrip
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn pledged_content_size_mismatch_returns_error() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.set_pledged_content_size(100).unwrap();
+        encoder.write_all(b"only 10 bytes").unwrap();
+        let err = encoder.finish().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn pledged_content_size_after_write_returns_error() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.write_all(b"already writing").unwrap();
+        let err = encoder.set_pledged_content_size(15).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pledged_content_size_c_zstd_compatible() {
+        let payload = b"tenant=demo op=put key=streaming value=abcdef\n".repeat(4096);
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        for chunk in payload.chunks(1024) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+
+        // FCS should be written
+        let header =
+            crate::decoding::frame::read_frame_header(compressed.as_slice())
+                .unwrap()
+                .0;
+        assert_eq!(header.frame_content_size(), payload.len() as u64);
+
+        // C zstd should decompress successfully
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn no_pledged_size_omits_fcs_from_header() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.write_all(b"no pledged size").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // FCS should be 0 (not present — decoder returns 0 for absent FCS)
+        let header =
+            crate::decoding::frame::read_frame_header(compressed.as_slice())
+                .unwrap()
+                .0;
+        assert_eq!(header.frame_content_size(), 0);
     }
 }
