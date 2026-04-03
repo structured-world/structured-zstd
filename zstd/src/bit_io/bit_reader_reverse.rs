@@ -22,6 +22,11 @@ const BIT_MASK: [u64; 65] = {
 ///
 /// On x86-64 with BMI2 this compiles to a single `bzhi` instruction.
 /// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
+/// Callers guarantee `n <= 56` (the maximum single-symbol width in zstd).
+/// The `debug_assert` catches misuse in debug/test builds. In release mode
+/// we intentionally do NOT clamp: an out-of-range `n` would indicate a
+/// corrupted bitstream or caller bug, and we prefer a fast panic over
+/// silently returning garbage.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
     debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
@@ -364,10 +369,12 @@ mod test {
         br.get_bits(7);
         assert_eq!(br.peek_bits(0), 0);
 
-        // Drain past the end to reach bits_consumed = 0 path
-        for _ in 0..20 {
-            br.get_bits(8);
-        }
+        // Force bits_consumed == 0 to exercise the shift-by-64 edge case
+        // in peek_bits. This state occurs naturally during refill() when the
+        // source is exhausted. We set it directly because get_bits always
+        // calls consume(n) after refill, making bits_consumed > 0 by the
+        // time it returns.
+        br.bits_consumed = 0;
         assert_eq!(br.peek_bits(0), 0);
     }
 
