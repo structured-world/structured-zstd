@@ -47,7 +47,7 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 - [x] Better (roughly level 7)
 - [x] Best (roughly level 11)
 - [x] Checksums
-- [x] Frame Content Size (enables decoder pre-allocation)
+- [x] Frame Content Size — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before first write
 - [x] Dictionary compression
 - [x] Streaming encoder (`io::Write`)
 

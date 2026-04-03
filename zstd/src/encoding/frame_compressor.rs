@@ -216,6 +216,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
         let window_size = self.state.matcher.window_size();
+        assert!(
+            window_size != 0,
+            "matcher reported window_size == 0, which is invalid"
+        );
         // Accumulate all compressed blocks; the frame header is written after
         // all input has been read so that Frame_Content_Size is known.
         let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);

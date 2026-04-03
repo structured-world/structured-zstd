@@ -86,6 +86,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// calling it after the frame header has already been emitted returns an
     /// error.
     pub fn set_pledged_content_size(&mut self, size: u64) -> Result<(), Error> {
+        self.ensure_open()?;
         if self.frame_started {
             return Err(invalid_input_error(
                 "pledged content size must be set before the first write",
