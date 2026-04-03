@@ -8,6 +8,12 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     let old_buffer_size = scratch.buffer.len();
     let mut seq_sum = 0;
 
+    // Pre-allocate the exact output size for this block in one shot.
+    // Total output = all literals (copied via sequences + trailing) + all match bytes.
+    let total_match_len: usize = scratch.sequences.iter().map(|s| s.ml as usize).sum();
+    let total_output = total_match_len + scratch.literals_buffer.len();
+    scratch.buffer.reserve(total_output);
+
     for idx in 0..scratch.sequences.len() {
         let seq = scratch.sequences[idx];
 

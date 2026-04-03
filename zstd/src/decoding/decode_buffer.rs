@@ -60,6 +60,14 @@ impl DecodeBuffer {
         self.buffer.len()
     }
 
+    /// Pre-allocate capacity for `amount` additional bytes.
+    ///
+    /// Call this before a batch of `push`/`repeat` operations to avoid
+    /// repeated re-allocations inside the hot decode loop.
+    pub fn reserve(&mut self, amount: usize) {
+        self.buffer.reserve(amount);
+    }
+
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;

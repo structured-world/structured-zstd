@@ -58,6 +58,8 @@ impl BlockDecoder {
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
 
+                workspace.buffer.reserve(header.decompressed_size as usize);
+
                 source.read_exact(&mut buf[0..1]).map_err(|err| {
                     DecodeBlockContentError::ReadError {
                         step: block_type,
@@ -83,6 +85,8 @@ impl BlockDecoder {
                 let mut buf = [0u8; BATCH_SIZE];
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
+
+                workspace.buffer.reserve(header.decompressed_size as usize);
 
                 for _ in 0..full_reads {
                     source.read_exact(&mut buf[..]).map_err(|err| {
