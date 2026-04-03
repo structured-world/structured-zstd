@@ -83,6 +83,10 @@ fn decode_sequences_with_rle(
     } else {
         0
     };
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
 
     for _seq_idx in 0..section.num_sequences {
         //get the codes from either the RLE byte or from the decoder
@@ -179,6 +183,10 @@ fn decode_sequences_without_rle(
     let max_update_bits = scratch.literal_lengths.accuracy_log
         + scratch.match_lengths.accuracy_log
         + scratch.offsets.accuracy_log;
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
 
     for _seq_idx in 0..section.num_sequences {
         let ll_code = ll_dec.decode_symbol();

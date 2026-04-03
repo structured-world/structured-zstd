@@ -117,6 +117,7 @@ impl<'s> BitReaderReversed<'s> {
     /// a prior [`ensure_bits`](Self::ensure_bits) call).
     #[inline(always)]
     pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {
+        debug_assert!(n <= 56);
         let value = self.peek_bits(n);
         self.consume(n);
         value
@@ -203,5 +204,54 @@ mod test {
         // All zeroes filled in
         assert_eq!(br.get_bits(4), 0b0000);
         assert_eq!(br.bits_remaining(), -7);
+    }
+
+    /// Verify that `ensure_bits(n)` + `get_bits_unchecked(..)` returns the same
+    /// values as plain `get_bits(..)`, including across refill boundaries and
+    /// for edge cases like n=0.
+    #[test]
+    fn ensure_and_unchecked_match_get_bits() {
+        // 10 bytes = 80 bits — enough to force multiple refills
+        let data: [u8; 10] = [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01];
+
+        // Reference: read with get_bits
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let r1 = ref_br.get_bits(0);
+        let r2 = ref_br.get_bits(7);
+        let r3 = ref_br.get_bits(13);
+        let r4 = ref_br.get_bits(9);
+        let r5 = ref_br.get_bits(8);
+        // After 37 bits consumed, force a batched read of 26 (simulates 3 FSE updates)
+        let r6 = ref_br.get_bits(9);
+        let r7 = ref_br.get_bits(9);
+        let r8 = ref_br.get_bits(8);
+
+        // Unchecked path: same reads via ensure_bits + get_bits_unchecked
+        let mut fast_br = super::BitReaderReversed::new(&data);
+
+        // n=0 edge case
+        fast_br.ensure_bits(0);
+        assert_eq!(fast_br.get_bits_unchecked(0), r1);
+
+        // Single reads
+        fast_br.ensure_bits(7);
+        assert_eq!(fast_br.get_bits_unchecked(7), r2);
+
+        fast_br.ensure_bits(13);
+        assert_eq!(fast_br.get_bits_unchecked(13), r3);
+
+        fast_br.ensure_bits(9);
+        assert_eq!(fast_br.get_bits_unchecked(9), r4);
+
+        fast_br.ensure_bits(8);
+        assert_eq!(fast_br.get_bits_unchecked(8), r5);
+
+        // Batched: one ensure covering 9+9+8 = 26 bits
+        fast_br.ensure_bits(26);
+        assert_eq!(fast_br.get_bits_unchecked(9), r6);
+        assert_eq!(fast_br.get_bits_unchecked(9), r7);
+        assert_eq!(fast_br.get_bits_unchecked(8), r8);
+
+        assert_eq!(ref_br.bits_remaining(), fast_br.bits_remaining());
     }
 }
