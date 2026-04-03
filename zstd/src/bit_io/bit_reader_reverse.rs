@@ -351,6 +351,10 @@ mod test {
     fn mask_lower_bits_edge_cases() {
         assert_eq!(super::mask_lower_bits(u64::MAX, 0), 0);
         assert_eq!(super::mask_lower_bits(u64::MAX, 1), 1);
+        assert_eq!(
+            super::mask_lower_bits(0xABCD_1234_5678_9ABC, 64),
+            0xABCD_1234_5678_9ABC
+        );
         assert_eq!(super::mask_lower_bits(0xABCD_1234_5678_9ABC, 8), 0xBC);
         assert_eq!(super::mask_lower_bits(0xABCD_1234_5678_9ABC, 16), 0x9ABC);
     }
@@ -412,6 +416,18 @@ mod test {
         let r2 = ref_br.get_bits(9);
         let r3 = ref_br.get_bits(9);
         let (t1, t2, t3) = triple_br.get_bits_triple(8, 9, 9);
+
+        assert_eq!((r1, r2, r3), (t1, t2, t3));
+        assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+
+        // Mixed zero-widths: individual sequence extra-bit fields can be zero.
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut triple_br = super::BitReaderReversed::new(&data);
+
+        let r1 = ref_br.get_bits(5);
+        let r2 = ref_br.get_bits(0);
+        let r3 = ref_br.get_bits(4);
+        let (t1, t2, t3) = triple_br.get_bits_triple(5, 0, 4);
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
