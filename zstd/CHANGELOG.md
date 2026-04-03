@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/structured-world/structured-zstd/compare/v0.0.4...v0.0.5) - 2026-04-03
+
+### Added
+
+- *(encoding)* add Best compression level (zstd level 11, btlazy2 strategy) ([#53](https://github.com/structured-world/structured-zstd/pull/53))
+- *(encoding)* add Better compression level (zstd level 7, lazy2 strategy) ([#48](https://github.com/structured-world/structured-zstd/pull/48))
+
+### Performance
+
+- *(decoding)* 4-stream interleaved Huffman decode and bulk table init ([#54](https://github.com/structured-world/structured-zstd/pull/54))
+
 ## [0.0.4](https://github.com/structured-world/structured-zstd/compare/v0.0.3...v0.0.4) - 2026-04-01
 
 ### Added
