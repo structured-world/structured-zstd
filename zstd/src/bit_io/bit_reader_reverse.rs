@@ -99,6 +99,29 @@ impl<'s> BitReaderReversed<'s> {
         value
     }
 
+    /// Ensure at least `n` bits are available for subsequent unchecked reads.
+    /// After calling this, it is safe to call [`get_bits_unchecked`](Self::get_bits_unchecked)
+    /// for a combined total of up to `n` bits without individual refill checks.
+    ///
+    /// `n` must be at most 56.
+    #[inline(always)]
+    pub fn ensure_bits(&mut self, n: u8) {
+        debug_assert!(n <= 56);
+        if self.bits_consumed + n > 64 {
+            self.refill();
+        }
+    }
+
+    /// Read `n` bits from the source **without** checking whether a refill is
+    /// needed. The caller **must** guarantee enough bits are available (e.g. via
+    /// a prior [`ensure_bits`](Self::ensure_bits) call).
+    #[inline(always)]
+    pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {
+        let value = self.peek_bits(n);
+        self.consume(n);
+        value
+    }
+
     /// Get the next `n` bits from the source without consuming them.
     /// Caller is responsible for making sure that `n` many bits have been refilled.
     #[inline(always)]

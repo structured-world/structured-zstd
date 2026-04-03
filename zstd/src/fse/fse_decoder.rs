@@ -49,6 +49,22 @@ impl<'t> FSEDecoder<'t> {
 
         //println!("Update: {}, {} -> {}", base_line, add,  self.state);
     }
+
+    /// Advance the internal state **without** an individual refill check.
+    ///
+    /// The caller **must** guarantee that enough bits are available in the bit
+    /// reader (e.g. via [`BitReaderReversed::ensure_bits`] with a budget that
+    /// covers this and any other unchecked reads in the same batch).
+    ///
+    /// This is the "fast path" used in the interleaved sequence decode loop
+    /// where a single refill check covers all three FSE state updates.
+    #[inline(always)]
+    pub fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
+        let num_bits = self.state.num_bits;
+        let add = bits.get_bits_unchecked(num_bits);
+        let new_state = self.state.base_line + add as u32;
+        self.state = self.table.decode[new_state as usize];
+    }
 }
 
 /// FSE decoding involves a decoding table that describes the probabilities of
