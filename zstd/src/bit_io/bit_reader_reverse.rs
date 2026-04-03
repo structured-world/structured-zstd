@@ -392,5 +392,21 @@ mod test {
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+
+        // No-refill fast path: 8 bits already consumed, so the next 26 bits
+        // still fit in the current container and `ensure_bits(26)` should
+        // skip `refill()`.
+        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut triple_br = super::BitReaderReversed::new(&data);
+        let _ = ref_br.get_bits(8);
+        let _ = triple_br.get_bits(8);
+
+        let r1 = ref_br.get_bits(8);
+        let r2 = ref_br.get_bits(9);
+        let r3 = ref_br.get_bits(9);
+        let (t1, t2, t3) = triple_br.get_bits_triple(8, 9, 9);
+
+        assert_eq!((r1, r2, r3), (t1, t2, t3));
+        assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
     }
 }
