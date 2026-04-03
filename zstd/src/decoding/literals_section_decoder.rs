@@ -188,6 +188,7 @@ fn decompress_literals(
                 decoders[i].next_state(&mut brs[i]);
             }
             if brs[i].bits_remaining() != -max_bits {
+                target.truncate(base);
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
                     read_til: brs[i].bits_remaining(),
                     expected: -max_bits,
@@ -235,8 +236,10 @@ fn decompress_literals(
     }
 
     if target.len() != base + regen {
+        let decoded = target.len() - base;
+        target.truncate(base);
         return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
-            decoded: target.len() - base,
+            decoded,
             expected: regen,
         });
     }
