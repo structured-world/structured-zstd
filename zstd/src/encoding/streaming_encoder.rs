@@ -126,8 +126,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     pub fn finish(mut self) -> Result<W, Error> {
         self.ensure_open()?;
 
-        // Validate pledge before emitting the frame header to avoid writing
-        // a header with an incorrect FCS into the drain on mismatch.
+        // Validate the pledge before finalizing the frame. If finish() is
+        // called before any writes, this also avoids emitting a header with
+        // an incorrect FCS into the drain on mismatch.
         if let Some(pledged) = self.pledged_content_size
             && self.bytes_consumed != pledged
         {
