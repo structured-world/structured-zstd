@@ -14,10 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-/// Implementation limit for window size (100 MiB) to protect against
-/// malformed frames. The zstd spec allows much larger windows, but this
-/// cap prevents excessive memory allocation on untrusted input.
-pub(crate) const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
+use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 
 /// Low level Zstandard decoder that can be used to decompress frames with fine control over when and how many bytes are decoded.
 ///
@@ -123,9 +120,9 @@ impl FrameDecoderState {
 
     /// Reset this state for a new frame read from `source`, reusing existing allocations.
     ///
-    /// `DecodeBuffer::reset` reserves `window_size` internally; no additional
-    /// frame-level reservation is needed since block-level pre-allocation
-    /// (MAX_BLOCK_SIZE per block) handles growth during decoding.
+    /// `DecodeBuffer::reset` reserves `window_size` internally, so no
+    /// additional frame-level reservation is needed here. Further buffer
+    /// growth during decoding is performed on demand by the active block path.
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header(source)?;
         let window_size = frame_header.window_size()?;

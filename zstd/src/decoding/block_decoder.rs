@@ -39,8 +39,9 @@ impl BlockDecoder {
     /// Decode the body of a single block described by `header` from `source` into `workspace`.
     ///
     /// Returns the number of bytes consumed from `source`.
-    /// The decode buffer inside `workspace` is pre-allocated for the expected
-    /// decompressed size before any data is written.
+    /// The decode buffer inside `workspace` may be reserved or grown during
+    /// decoding. For some block types the decompressed size is known up front,
+    /// but this is not guaranteed before any data is written.
     pub fn decode_block_content(
         &mut self,
         header: &BlockHeader,
