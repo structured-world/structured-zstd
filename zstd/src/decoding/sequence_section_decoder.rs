@@ -129,7 +129,7 @@ fn decode_sequences_with_rle(
         });
 
         if target.len() < section.num_sequences as usize {
-            // One refill for all non-RLE state updates (interleaved fast path).
+            // One refill check for all non-RLE state updates (batched fast path).
             if max_update_bits > 0 {
                 br.ensure_bits(max_update_bits);
             }
@@ -178,8 +178,8 @@ fn decode_sequences_without_rle(
     // Maximum bits consumed by the three state updates combined.
     // LL and ML accuracy logs are at most 9, OF at most 8, so the ceiling is 26.
     // A single ensure_bits call (which guarantees ≥56 bits after refill) replaces
-    // three individual per-update refill checks — the core of the dual-state
-    // interleaving optimisation from the C reference.
+    // three individual per-update refill checks, eliminating two branches per
+    // iteration on the hot decode path.
     let max_update_bits = scratch.literal_lengths.accuracy_log
         + scratch.match_lengths.accuracy_log
         + scratch.offsets.accuracy_log;
@@ -216,7 +216,7 @@ fn decode_sequences_without_rle(
         });
 
         if target.len() < section.num_sequences as usize {
-            // One refill for all three state updates (interleaved fast path).
+            // One refill check for all three state updates (batched fast path).
             br.ensure_bits(max_update_bits);
             ll_dec.update_state_fast(br);
             ml_dec.update_state_fast(br);
