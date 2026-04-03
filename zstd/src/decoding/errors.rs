@@ -531,9 +531,9 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::WindowSizeTooBig { requested } => {
                 write!(
                     f,
-                    "Specified window_size is too big; Requested: {}, Max: {}",
+                    "Specified window_size is too big; Requested: {}, Allowed: {}",
                     requested,
-                    crate::common::MAX_WINDOW_SIZE,
+                    crate::decoding::frame_decoder::MAXIMUM_ALLOWED_WINDOW_SIZE,
                 )
             }
             FrameDecoderError::DictionaryDecodeError(e) => {

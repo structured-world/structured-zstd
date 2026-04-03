@@ -16,7 +16,10 @@ use core::convert::TryInto;
 
 /// While the maximum window size allowed by the spec is significantly larger,
 /// our implementation limits it to 100mb to protect against malformed frames.
-const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
+/// Implementation limit for window size (100 MiB) to protect against
+/// malformed frames. The zstd spec allows much larger windows, but this
+/// cap prevents excessive memory allocation on untrusted input.
+pub(crate) const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
 
 /// Low level Zstandard decoder that can be used to decompress frames with fine control over when and how many bytes are decoded.
 ///
@@ -144,9 +147,9 @@ impl FrameDecoderState {
         self.frame_header = frame_header;
         self.frame_finished = false;
         self.block_counter = 0;
+        // reset() already reserves window_size internally via DecodeBuffer::reset,
+        // so we only need an additional reserve when FCS exceeds that.
         self.decoder_scratch.reset(window_size as usize);
-        // When the frame header declares the decompressed size, pre-allocate
-        // for the full content to avoid incremental re-allocations.
         let fcs = self.frame_header.frame_content_size();
         if fcs > 0 && fcs <= MAXIMUM_ALLOWED_WINDOW_SIZE {
             self.decoder_scratch.buffer.reserve(fcs as usize);
