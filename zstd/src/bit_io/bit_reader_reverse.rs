@@ -7,6 +7,8 @@ use core::convert::TryInto;
 /// eliminates a shift + subtract on the hot decode path.
 /// On BMI2-capable x86-64 CPUs the table is bypassed entirely in favour
 /// of the single-cycle `bzhi` instruction (see [`mask_lower_bits`]).
+// On BMI2 builds the table is only used by tests; suppress dead_code there.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
@@ -24,12 +26,13 @@ const BIT_MASK: [u64; 65] = {
 /// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
 /// This function supports `n <= 64`; zstd callers normally guarantee
 /// `n <= 56` (the maximum single-symbol width in zstd).
-/// We intentionally do NOT clamp: an out-of-range `n` indicates a
-/// corrupted bitstream or caller bug, and should panic consistently
-/// rather than silently returning garbage.
+/// On the non-BMI2 fallback path, `n > 64` naturally panics via
+/// `BIT_MASK[n]` index-out-of-bounds. The `debug_assert` catches
+/// misuse on the BMI2 path (where `_bzhi_u64` would silently
+/// truncate) without adding a branch to the release hot path.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
-    assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
+    debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         // SAFETY: `_bzhi_u64` is always safe to call when the target supports BMI2.
