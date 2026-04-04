@@ -576,15 +576,20 @@ fn numeric_levels_map_to_named_variants() {
     ));
 }
 
-/// `from_level(3)` must be equivalent to `Default` — same compressed output.
+/// `from_level(3)` and direct `Level(3)` must be equivalent to `Default`.
 #[test]
 fn numeric_level_3_matches_default() {
     let data = generate_compressible(9000, 64 * 1024);
     let default = compress_to_vec(&data[..], CompressionLevel::Default);
-    let level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    let from_level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    let direct_level_3 = compress_to_vec(&data[..], CompressionLevel::Level(3));
     assert_eq!(
-        default, level_3,
-        "Level(3) output must be identical to Default"
+        default, from_level_3,
+        "from_level(3) output must be identical to Default"
+    );
+    assert_eq!(
+        default, direct_level_3,
+        "direct Level(3) output must be identical to Default"
     );
 }
 
@@ -621,13 +626,21 @@ fn numeric_level_11_matches_best() {
     assert_eq!(best, level_11, "Level(11) output must be identical to Best");
 }
 
-/// `from_level(0)` maps to default compression (level 3), matching C zstd.
+/// `from_level(0)` and direct `Level(0)` map to default compression (level 3).
 #[test]
 fn numeric_level_0_is_default_compression() {
     let data = generate_compressible(9004, 64 * 1024);
-    let level_0 = compress_to_vec(&data[..], CompressionLevel::from_level(0));
+    let from_level_0 = compress_to_vec(&data[..], CompressionLevel::from_level(0));
+    let direct_level_0 = compress_to_vec(&data[..], CompressionLevel::Level(0));
     let level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
-    assert_eq!(level_0, level_3, "Level(0) should map to default (level 3)");
+    assert_eq!(
+        from_level_0, level_3,
+        "from_level(0) should map to default (level 3)"
+    );
+    assert_eq!(
+        direct_level_0, level_3,
+        "direct Level(0) should map to default (level 3)"
+    );
 }
 
 /// All 22 positive levels produce valid output that round-trips correctly.
