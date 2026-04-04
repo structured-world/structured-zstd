@@ -973,6 +973,17 @@ mod tests {
     }
 
     #[test]
+    fn write_straddling_pledge_reports_partial_progress() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.set_pledged_content_size(5).unwrap();
+        // write() should accept exactly 5 bytes (partial progress)
+        assert_eq!(encoder.write(b"abcdef").unwrap(), 5);
+        // Next write should fail — pledge exhausted
+        let err = encoder.write(b"g").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn pledged_content_size_after_write_returns_error() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.write_all(b"already writing").unwrap();

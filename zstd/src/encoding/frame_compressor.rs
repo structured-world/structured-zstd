@@ -455,10 +455,12 @@ mod tests {
             crate::encoding::CompressionLevel::Better,
             crate::encoding::CompressionLevel::Best,
         ];
-        let inputs: [&[u8]; 4] = [
+        let fcs_2byte = vec![0xCDu8; 300]; // 300 bytes → 2-byte FCS (256..=65791 range)
+        let inputs: [&[u8]; 5] = [
             &[],
             &[0x00],
             b"abcdefghijklmnopqrstuvwxy\n",
+            &fcs_2byte,
             &vec![0xABu8; 100_000],
         ];
         for level in levels {
