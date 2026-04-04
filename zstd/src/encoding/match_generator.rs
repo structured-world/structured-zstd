@@ -23,8 +23,6 @@ const DFAST_TARGET_LEN: usize = 48;
 // measurements show we can shrink them without regressing acceptance tests.
 const DFAST_HASH_BITS: usize = 20;
 const DFAST_SEARCH_DEPTH: usize = 4;
-const DFAST_DEFAULT_WINDOW_SIZE: usize = 1 << 22;
-const BETTER_DEFAULT_WINDOW_SIZE: usize = 1 << 23;
 const DFAST_EMPTY_SLOT: usize = usize::MAX;
 
 const HC_HASH_LOG: usize = 20;
@@ -36,7 +34,6 @@ const HC_TARGET_LEN: usize = 48;
 // that can never collide with any valid position, even at the 4 GiB boundary.
 const HC_EMPTY: u32 = 0;
 
-const BEST_DEFAULT_WINDOW_SIZE: usize = 1 << 24;
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 32;
@@ -66,6 +63,91 @@ const BEST_HC_CONFIG: HcConfig = HcConfig {
     target_len: 128,
 };
 
+/// Resolved tuning parameters for a compression level.
+#[derive(Copy, Clone)]
+struct LevelParams {
+    backend: MatcherBackend,
+    window_log: u8,
+    hash_fill_step: usize,
+    lazy_depth: u8,
+    hc: HcConfig,
+}
+
+/// Parameter table for numeric compression levels 1–22.
+///
+/// Each entry maps a zstd compression level to the best-available matcher
+/// backend and tuning knobs.  Levels that require strategies this crate does
+/// not implement (greedy, btopt, btultra) are approximated with the closest
+/// available backend.
+///
+/// Index 0 = level 1, index 21 = level 22.
+#[rustfmt::skip]
+const LEVEL_TABLE: [LevelParams; 22] = [
+    // Lvl  Strategy       wlog  step  lazy  HC config
+    // ---  -------------- ----  ----  ----  ------------------------------------------
+    /* 1 */ LevelParams { backend: MatcherBackend::Simple,    window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG },
+    /* 2 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG },
+    /* 3 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG },
+    /* 4 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG },
+    /* 5 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32  } },
+    /* 6 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 23, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48  } },
+    /* 7 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 23, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48  } },
+    /* 8 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 23, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64  } },
+    /* 9 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 23, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64  } },
+    /*10 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96  } },
+    /*11 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG },
+    /*12 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 } },
+    /*13 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 } },
+    /*14 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 } },
+    /*15 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 } },
+    /*16 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 256 } },
+    /*17 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+    /*18 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+    /*19 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+    /*20 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+    /*21 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+    /*22 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
+];
+
+/// Resolve a [`CompressionLevel`] to internal tuning parameters.
+fn resolve_level_params(level: CompressionLevel) -> LevelParams {
+    match level {
+        CompressionLevel::Uncompressed => LevelParams {
+            backend: MatcherBackend::Simple,
+            window_log: 17,
+            hash_fill_step: 1,
+            lazy_depth: 0,
+            hc: HC_CONFIG,
+        },
+        CompressionLevel::Fastest => LEVEL_TABLE[0],
+        CompressionLevel::Default => LEVEL_TABLE[2],
+        CompressionLevel::Better => LEVEL_TABLE[6],
+        CompressionLevel::Best => LEVEL_TABLE[10],
+        CompressionLevel::Level(n) => {
+            if n > 0 {
+                let idx = (n as usize).min(CompressionLevel::MAX_LEVEL as usize) - 1;
+                LEVEL_TABLE[idx]
+            } else if n == 0 {
+                // Level 0 = default, matching C zstd semantics.
+                LEVEL_TABLE[2]
+            } else {
+                // Negative levels: ultra-fast with the Simple backend.
+                // Acceleration grows with magnitude, expressed as larger
+                // hash_fill_step (fewer positions indexed).
+                let acceleration = ((-n) as usize).min(131072);
+                let step = (acceleration + 3).min(128);
+                LevelParams {
+                    backend: MatcherBackend::Simple,
+                    window_log: 17,
+                    hash_fill_step: step,
+                    lazy_depth: 0,
+                    hc: HC_CONFIG,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MatcherBackend {
     Simple,
@@ -83,7 +165,6 @@ pub struct MatchGeneratorDriver {
     active_backend: MatcherBackend,
     slice_size: usize,
     base_slice_size: usize,
-    base_window_size: usize,
     // Frame header window size must stay at the configured live-window budget.
     // Dictionary retention expands internal matcher capacity only.
     reported_window_size: usize,
@@ -106,45 +187,13 @@ impl MatchGeneratorDriver {
             active_backend: MatcherBackend::Simple,
             slice_size,
             base_slice_size: slice_size,
-            base_window_size: max_window_size,
             reported_window_size: max_window_size,
             dictionary_retained_budget: 0,
         }
     }
 
-    fn level_config(&self, level: CompressionLevel) -> (MatcherBackend, usize, usize, usize) {
-        match level {
-            CompressionLevel::Uncompressed => (
-                MatcherBackend::Simple,
-                self.base_slice_size,
-                self.base_window_size,
-                1,
-            ),
-            CompressionLevel::Fastest => (
-                MatcherBackend::Simple,
-                self.base_slice_size,
-                self.base_window_size,
-                FAST_HASH_FILL_STEP,
-            ),
-            CompressionLevel::Default => (
-                MatcherBackend::Dfast,
-                self.base_slice_size,
-                DFAST_DEFAULT_WINDOW_SIZE,
-                1,
-            ),
-            CompressionLevel::Better => (
-                MatcherBackend::HashChain,
-                self.base_slice_size,
-                BETTER_DEFAULT_WINDOW_SIZE,
-                1,
-            ),
-            CompressionLevel::Best => (
-                MatcherBackend::HashChain,
-                self.base_slice_size,
-                BEST_DEFAULT_WINDOW_SIZE,
-                1,
-            ),
-        }
+    fn level_params(level: CompressionLevel) -> LevelParams {
+        resolve_level_params(level)
     }
 
     fn dfast_matcher(&self) -> &DfastMatchGenerator {
@@ -248,9 +297,10 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn reset(&mut self, level: CompressionLevel) {
-        let (backend, slice_size, max_window_size, hash_fill_step) = self.level_config(level);
+        let params = Self::level_params(level);
+        let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
-        if self.active_backend != backend {
+        if self.active_backend != params.backend {
             match self.active_backend {
                 MatcherBackend::Simple => {
                     let vec_pool = &mut self.vec_pool;
@@ -288,15 +338,15 @@ impl Matcher for MatchGeneratorDriver {
             }
         }
 
-        self.active_backend = backend;
-        self.slice_size = slice_size;
+        self.active_backend = params.backend;
+        self.slice_size = self.base_slice_size;
         self.reported_window_size = max_window_size;
         match self.active_backend {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
                 let suffix_pool = &mut self.suffix_pool;
                 self.match_generator.max_window_size = max_window_size;
-                self.match_generator.hash_fill_step = hash_fill_step;
+                self.match_generator.hash_fill_step = params.hash_fill_step;
                 self.match_generator.reset(|mut data, mut suffixes| {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
@@ -310,7 +360,7 @@ impl Matcher for MatchGeneratorDriver {
                     .dfast_match_generator
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
-                dfast.lazy_depth = 1;
+                dfast.lazy_depth = params.lazy_depth;
                 let vec_pool = &mut self.vec_pool;
                 dfast.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -322,11 +372,8 @@ impl Matcher for MatchGeneratorDriver {
                     .hc_match_generator
                     .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
                 hc.max_window_size = max_window_size;
-                hc.lazy_depth = 2;
-                match level {
-                    CompressionLevel::Best => hc.configure(BEST_HC_CONFIG),
-                    _ => hc.configure(HC_CONFIG),
-                }
+                hc.lazy_depth = params.lazy_depth;
+                hc.configure(params.hc);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -1975,7 +2022,7 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     let first_block: Vec<u8> = pattern.iter().copied().cycle().take(128 * 1024).collect();
     let second_block: Vec<u8> = pattern.iter().copied().cycle().take(128 * 1024).collect();
 
-    let mut matcher = DfastMatchGenerator::new(DFAST_DEFAULT_WINDOW_SIZE);
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
     let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
         Sequence::Literals { literals } => decoded.extend_from_slice(literals),
         Sequence::Triple {
@@ -2009,7 +2056,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Default);
-    assert_eq!(driver.window_size(), DFAST_DEFAULT_WINDOW_SIZE as u64);
+    assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut first = driver.get_next_space();
     first[..12].copy_from_slice(b"abcabcabcabc");
@@ -2042,7 +2089,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     assert_eq!(reconstructed, b"abcabcabcabcabcabcabcabc");
 
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.window_size(), 64);
+    assert_eq!(driver.window_size(), (1u64 << 17));
 }
 
 #[test]
@@ -2051,7 +2098,7 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
 
     // Initialize at Best — allocates large HC tables (2M hash, 1M chain).
     driver.reset(CompressionLevel::Best);
-    assert_eq!(driver.window_size(), BEST_DEFAULT_WINDOW_SIZE as u64);
+    assert_eq!(driver.window_size(), (1u64 << 24));
 
     // Feed data so tables are actually allocated via ensure_tables().
     let mut space = driver.get_next_space();
@@ -2062,7 +2109,7 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
 
     // Switch to Fastest — must release HC tables.
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.window_size(), 64);
+    assert_eq!(driver.window_size(), (1u64 << 17));
 
     // HC matcher should have empty tables after backend switch.
     let hc = driver.hc_match_generator.as_ref().unwrap();
@@ -2082,7 +2129,7 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     // Initialize at Better — allocates small HC tables (1M hash, 512K chain).
     driver.reset(CompressionLevel::Better);
-    assert_eq!(driver.window_size(), BETTER_DEFAULT_WINDOW_SIZE as u64);
+    assert_eq!(driver.window_size(), (1u64 << 23));
 
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
@@ -2096,7 +2143,7 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     // Switch to Best — must resize to larger tables.
     driver.reset(CompressionLevel::Best);
-    assert_eq!(driver.window_size(), BEST_DEFAULT_WINDOW_SIZE as u64);
+    assert_eq!(driver.window_size(), (1u64 << 24));
 
     // Feed data to trigger ensure_tables with new sizes.
     let mut space = driver.get_next_space();
@@ -2300,6 +2347,10 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
 fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Fastest);
+    // Use a small live window so dictionary-primed slices are evicted
+    // quickly and budget retirement can be asserted deterministically.
+    driver.match_generator.max_window_size = 8;
+    driver.reported_window_size = 8;
 
     let base_window = driver.match_generator.max_window_size;
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
@@ -2443,7 +2494,7 @@ fn fastest_reset_uses_interleaved_hash_fill_step() {
     // happened and the lazy_depth is configured correctly.
     driver.reset(CompressionLevel::Better);
     assert_eq!(driver.active_backend, MatcherBackend::HashChain);
-    assert_eq!(driver.window_size(), BETTER_DEFAULT_WINDOW_SIZE as u64);
+    assert_eq!(driver.window_size(), (1u64 << 23));
     assert_eq!(driver.hc_matcher().lazy_depth, 2);
 }
 
@@ -2723,7 +2774,7 @@ fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
 
 #[test]
 fn dfast_inserts_tail_positions_for_next_block_matching() {
-    let mut matcher = DfastMatchGenerator::new(DFAST_DEFAULT_WINDOW_SIZE);
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
 
     matcher.add_data(b"012345bcdea".to_vec(), |_| {});
     let mut history = Vec::new();

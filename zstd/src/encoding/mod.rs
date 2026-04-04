@@ -45,7 +45,7 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum CompressionLevel {
     /// This level does not compress the data at all, and simply wraps
     /// it in a Zstandard frame.
@@ -88,6 +88,41 @@ pub enum CompressionLevel {
     /// Prefer [`CompressionLevel::Default`] for very large single-frame
     /// streams until table rebasing is implemented.
     Best,
+    /// Numeric compression level.
+    ///
+    /// Levels 1–22 correspond to the C zstd level numbering.  Higher values
+    /// produce smaller output at the cost of more CPU time.  Negative values
+    /// select ultra-fast modes that trade ratio for speed.  Level 0 is
+    /// treated as [`DEFAULT_LEVEL`](Self::DEFAULT_LEVEL), matching C zstd
+    /// semantics.
+    ///
+    /// Named variants map to specific numeric levels:
+    /// [`Fastest`](Self::Fastest) = 1, [`Default`](Self::Default) = 3,
+    /// [`Better`](Self::Better) = 7, [`Best`](Self::Best) = 11.
+    ///
+    /// Levels above 11 use progressively larger windows and deeper search
+    /// with the lazy2 hash-chain backend.  Levels that require strategies
+    /// this crate has not yet implemented (btopt, btultra) are approximated
+    /// with the closest available matcher.
+    Level(i32),
+}
+
+impl CompressionLevel {
+    /// The minimum supported numeric compression level (ultra-fast mode).
+    pub const MIN_LEVEL: i32 = -131072;
+    /// The maximum supported numeric compression level.
+    pub const MAX_LEVEL: i32 = 22;
+    /// The default numeric compression level (equivalent to [`Default`](Self::Default)).
+    pub const DEFAULT_LEVEL: i32 = 3;
+
+    /// Create a compression level from a numeric value.
+    ///
+    /// Wraps the raw integer in [`Level`](Self::Level).  Values outside
+    /// [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL) are
+    /// silently clamped during parameter resolution.
+    pub const fn from_level(level: i32) -> Self {
+        CompressionLevel::Level(level)
+    }
 }
 
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm

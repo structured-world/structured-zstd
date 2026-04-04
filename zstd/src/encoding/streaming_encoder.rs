@@ -246,8 +246,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             CompressionLevel::Fastest
             | CompressionLevel::Default
             | CompressionLevel::Better
-            | CompressionLevel::Best => self.state.matcher.get_next_space(),
-            _ => Vec::new(),
+            | CompressionLevel::Best
+            | CompressionLevel::Level(_) => self.state.matcher.get_next_space(),
+            CompressionLevel::Uncompressed => Vec::new(),
         };
         space.clear();
         if space.capacity() > block_capacity {
@@ -303,7 +304,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             | CompressionLevel::Fastest
             | CompressionLevel::Default
             | CompressionLevel::Better
-            | CompressionLevel::Best => Ok(()),
+            | CompressionLevel::Best
+            | CompressionLevel::Level(_) => Ok(()),
         }
     }
 
@@ -338,7 +340,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
-                | CompressionLevel::Best => {
+                | CompressionLevel::Best
+                | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
                     compress_block_encoded(&mut self.state, last_block, block, &mut encoded);

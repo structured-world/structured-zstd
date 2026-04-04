@@ -544,3 +544,129 @@ fn roundtrip_best_level_streaming_multi_block() {
     let data = generate_compressible(5555, 512 * 1024);
     assert_eq!(roundtrip_best_streaming(&data), data);
 }
+
+// ─── Numeric compression levels (CompressionLevel::Level) ─────────
+
+/// `from_level(3)` must be equivalent to `Default` — same compressed output.
+#[test]
+fn numeric_level_3_matches_default() {
+    let data = generate_compressible(9000, 64 * 1024);
+    let default = compress_to_vec(&data[..], CompressionLevel::Default);
+    let level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    assert_eq!(
+        default, level_3,
+        "Level(3) output must be identical to Default"
+    );
+}
+
+/// `from_level(1)` must be equivalent to `Fastest`.
+#[test]
+fn numeric_level_1_matches_fastest() {
+    let data = generate_compressible(9001, 64 * 1024);
+    let fastest = compress_to_vec(&data[..], CompressionLevel::Fastest);
+    let level_1 = compress_to_vec(&data[..], CompressionLevel::from_level(1));
+    assert_eq!(
+        fastest, level_1,
+        "Level(1) output must be identical to Fastest"
+    );
+}
+
+/// `from_level(7)` must be equivalent to `Better`.
+#[test]
+fn numeric_level_7_matches_better() {
+    let data = generate_compressible(9002, 64 * 1024);
+    let better = compress_to_vec(&data[..], CompressionLevel::Better);
+    let level_7 = compress_to_vec(&data[..], CompressionLevel::from_level(7));
+    assert_eq!(
+        better, level_7,
+        "Level(7) output must be identical to Better"
+    );
+}
+
+/// `from_level(11)` must be equivalent to `Best`.
+#[test]
+fn numeric_level_11_matches_best() {
+    let data = generate_compressible(9003, 64 * 1024);
+    let best = compress_to_vec(&data[..], CompressionLevel::Best);
+    let level_11 = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    assert_eq!(best, level_11, "Level(11) output must be identical to Best");
+}
+
+/// `from_level(0)` maps to default compression (level 3), matching C zstd.
+#[test]
+fn numeric_level_0_is_default_compression() {
+    let data = generate_compressible(9004, 64 * 1024);
+    let level_0 = compress_to_vec(&data[..], CompressionLevel::from_level(0));
+    let level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    assert_eq!(level_0, level_3, "Level(0) should map to default (level 3)");
+}
+
+/// All 22 positive levels produce valid output that round-trips correctly.
+#[test]
+fn all_22_levels_roundtrip() {
+    let data = generate_compressible(9100, 32 * 1024);
+    for level in 1..=22 {
+        let result = roundtrip_at_level(&data, CompressionLevel::from_level(level));
+        assert_eq!(data, result, "Roundtrip failed for Level({level})");
+    }
+}
+
+/// Negative levels produce valid compressed output (ultra-fast mode).
+#[test]
+fn negative_levels_roundtrip() {
+    let data = generate_compressible(9200, 32 * 1024);
+    for level in [-1, -2, -3, -5] {
+        let result = roundtrip_at_level(&data, CompressionLevel::from_level(level));
+        assert_eq!(data, result, "Roundtrip failed for Level({level})");
+    }
+}
+
+/// Higher levels should generally not produce *larger* output than lower levels
+/// on reasonably compressible data.
+#[test]
+fn levels_monotonic_compression_ratio() {
+    let data = generate_compressible(9300, 64 * 1024);
+    let mut prev_size = usize::MAX;
+    for level in [1, 3, 7, 11] {
+        let compressed = compress_to_vec(&data[..], CompressionLevel::from_level(level));
+        assert!(
+            compressed.len() <= prev_size,
+            "Level {level} produced larger output ({}) than a lower level ({prev_size})",
+            compressed.len(),
+        );
+        prev_size = compressed.len();
+    }
+}
+
+/// Numeric levels work with the streaming encoder.
+#[test]
+fn numeric_level_streaming_roundtrip() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let data = generate_compressible(9400, 200 * 1024);
+    for level in [1, 3, 5, 7, 9, 11, -1] {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
+        for chunk in data.chunks(4096) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Streaming roundtrip failed for Level({level})"
+        );
+    }
+}
+
+/// Values beyond MAX_LEVEL are clamped — they must still produce valid output.
+#[test]
+fn out_of_range_level_clamped() {
+    let data = generate_compressible(9500, 16 * 1024);
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(100));
+    assert_eq!(data, result, "Clamped Level(100) must still roundtrip");
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(-200000));
+    assert_eq!(data, result, "Clamped Level(-200000) must still roundtrip");
+}
