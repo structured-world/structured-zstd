@@ -160,7 +160,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
     ///
     /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.
-    /// Also [Write::write_all] will be called on the drain after each block has been encoded.
+    /// All compressed blocks are buffered in memory so that the frame header can include the
+    /// `Frame_Content_Size` field (which requires knowing the total uncompressed size). The
+    /// entire frame — header, blocks, and optional checksum — is then written to the drain
+    /// at the end. This means peak memory usage is O(compressed_size).
     ///
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function

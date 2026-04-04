@@ -400,15 +400,26 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
 
         self.ensure_frame_started()?;
 
-        // Enforce pledged upper bound before accepting more input so the
-        // already-emitted header FCS is never contradicted by block content.
-        if let Some(pledged) = self.pledged_content_size
-            && self.bytes_consumed + buf.len() as u64 > pledged
-        {
-            return Err(invalid_input_error(
-                "write would exceed pledged content size",
-            ));
-        }
+        // Enforce pledged upper bound: truncate the accepted slice to the
+        // remaining allowance so that partial-write semantics are honored
+        // (return Ok(n) with n < buf.len()) instead of failing the full call.
+        let buf = if let Some(pledged) = self.pledged_content_size {
+            let remaining_allowed = pledged
+                .checked_sub(self.bytes_consumed)
+                .ok_or_else(|| invalid_input_error("bytes consumed exceed pledged content size"))?;
+            if remaining_allowed == 0 {
+                return Err(invalid_input_error(
+                    "write would exceed pledged content size",
+                ));
+            }
+            let accepted = core::cmp::min(
+                buf.len(),
+                usize::try_from(remaining_allowed).unwrap_or(usize::MAX),
+            );
+            &buf[..accepted]
+        } else {
+            buf
+        };
 
         let block_capacity = self.block_capacity();
         if self.pending.capacity() == 0 {
@@ -939,6 +950,14 @@ mod tests {
         encoder.set_pledged_content_size(100).unwrap();
         encoder.write_all(b"short payload").unwrap(); // 13 bytes != 100 pledged
         let err = encoder.finish().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_exceeding_pledge_returns_error() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.set_pledged_content_size(5).unwrap();
+        let err = encoder.write_all(b"exceeds five bytes").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
