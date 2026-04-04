@@ -1,7 +1,7 @@
 //! Utilities and representations for a frame header.
 use crate::bit_io::BitWriter;
 use crate::common::MAGIC_NUM;
-use crate::encoding::util::{find_min_size, minify_val};
+use crate::encoding::util::{find_fcs_field_size, find_min_size, minify_val};
 use alloc::vec::Vec;
 
 /// A header for a single Zstandard frame.
@@ -55,7 +55,8 @@ impl FrameHeader {
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
-            output.extend(minify_val_fcs(frame_content_size));
+            let field_size = find_fcs_field_size(frame_content_size, self.single_segment);
+            output.extend(serialize_fcs(frame_content_size, field_size));
         }
     }
 
@@ -130,13 +131,13 @@ impl FrameHeader {
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
-            let field_size = find_min_size(frame_content_size);
+            let field_size = find_fcs_field_size(frame_content_size, self.single_segment);
             let flag_value: u8 = match field_size {
                 1 => 0,
                 2 => 1,
                 4 => 2,
-                3 => 8,
-                _ => panic!(),
+                8 => 3,
+                _ => unreachable!(),
             };
 
             bw.write_bits(flag_value, 2);
@@ -149,18 +150,22 @@ impl FrameHeader {
     }
 }
 
-/// Identical to [`minify_val`], but it implements the following edge case:
+/// Serialize a `Frame_Content_Size` value into `field_size` bytes.
 ///
-/// > When FCS_Field_Size is 1, 4 or 8 bytes, the value is read directly. When FCS_Field_Size is 2, the offset of 256 is added.
+/// For 1, 4, and 8-byte fields the value is stored directly.
+/// For 2-byte fields an offset of 256 is subtracted before encoding.
 ///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size
-fn minify_val_fcs(val: u64) -> Vec<u8> {
-    let new_size = find_min_size(val);
-    let mut val = val;
-    if new_size == 2 {
-        val -= 256;
-    }
-    val.to_le_bytes()[0..new_size].to_vec()
+/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
+fn serialize_fcs(val: u64, field_size: usize) -> Vec<u8> {
+    debug_assert!(matches!(field_size, 1 | 2 | 4 | 8));
+    debug_assert!(field_size != 2 || val >= 256);
+
+    let adjusted = match field_size {
+        2 => val - 256,
+        1 | 4 | 8 => val,
+        _ => unreachable!("invalid Frame_Content_Size field size: {field_size}"),
+    };
+    adjusted.to_le_bytes()[..field_size].to_vec()
 }
 
 #[cfg(test)]
