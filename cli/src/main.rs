@@ -418,7 +418,15 @@ mod tests {
 
     #[test]
     fn cli_rejects_unsupported_compression_level_at_parse_time() {
-        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "23"]);
+        let too_high =
+            (structured_zstd::encoding::CompressionLevel::MAX_LEVEL as i64 + 1).to_string();
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--level",
+            too_high.as_str(),
+        ]);
         assert!(parse.is_err());
     }
 
@@ -430,26 +438,29 @@ mod tests {
 
     #[test]
     fn cli_rejects_too_negative_compression_level() {
-        // MIN_LEVEL is -131072; anything below that should be rejected
+        let too_low =
+            (structured_zstd::encoding::CompressionLevel::MIN_LEVEL as i64 - 1).to_string();
         let parse = Cli::try_parse_from([
             "structured-zstd",
             "compress",
             "in.bin",
             "--level",
-            "-131073",
+            too_low.as_str(),
         ]);
         assert!(parse.is_err());
     }
 
     #[test]
     fn cli_store_still_validates_level_range_at_parse_time() {
+        let too_high =
+            (structured_zstd::encoding::CompressionLevel::MAX_LEVEL as i64 + 1).to_string();
         let parse = Cli::try_parse_from([
             "structured-zstd",
             "compress",
             "in.bin",
             "--store",
             "--level",
-            "23",
+            too_high.as_str(),
         ]);
         assert!(parse.is_err());
     }
