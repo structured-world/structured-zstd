@@ -398,6 +398,17 @@ impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
             return Ok(0);
         }
 
+        // Check pledge before emitting the frame header so that a misuse
+        // like set_pledged_content_size(0) + write(non_empty) doesn't leave
+        // a partially-written header in the drain.
+        if let Some(pledged) = self.pledged_content_size
+            && self.bytes_consumed >= pledged
+        {
+            return Err(invalid_input_error(
+                "write would exceed pledged content size",
+            ));
+        }
+
         self.ensure_frame_started()?;
 
         // Enforce pledged upper bound: truncate the accepted slice to the
@@ -1000,10 +1011,13 @@ mod tests {
         encoder.write_all(b"no pledged size").unwrap();
         let compressed = encoder.finish().unwrap();
 
-        // FCS should be 0 (not present — decoder returns 0 for absent FCS)
+        // FCS should be omitted from the header; the decoder reports absent FCS as 0.
         let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
             .unwrap()
             .0;
         assert_eq!(header.frame_content_size(), 0);
+        // Verify the descriptor confirms FCS field is truly absent (0 bytes),
+        // not just FCS present with value 0.
+        assert_eq!(header.descriptor.frame_content_size_bytes().unwrap(), 0);
     }
 }

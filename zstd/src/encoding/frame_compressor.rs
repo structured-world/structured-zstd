@@ -475,6 +475,15 @@ mod tests {
                     data.len(),
                     level as u8,
                 );
+                // Confirm the FCS field is actually present in the header
+                // (not just the decoder returning 0 for absent FCS).
+                assert_ne!(
+                    header.descriptor.frame_content_size_bytes().unwrap(),
+                    0,
+                    "FCS field must be present for len={} level={:?}",
+                    data.len(),
+                    level as u8,
+                );
                 // Verify C zstd can decompress
                 let mut decoded = Vec::new();
                 zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
