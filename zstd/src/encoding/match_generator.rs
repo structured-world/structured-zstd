@@ -119,16 +119,18 @@ const MIN_WINDOW_LOG: u8 = 10;
 
 /// Adjust level parameters for a known source size.
 ///
-/// Follows the C zstd `clevels.h` approach: for small inputs, cap
-/// window_log (and hash/chain for HC) so the encoder doesn't allocate
-/// oversized tables.  The four C size classes are:
-///   >256 KiB (default table), ≤256 KiB, ≤128 KiB, ≤16 KiB.
+/// For non-empty inputs, this derives a cap from `ceil(log2(src_size))`,
+/// then clamps it to [`MIN_WINDOW_LOG`]. This keeps tables bounded for
+/// small inputs while preserving the encoder's minimum supported window.
+/// For the HC backend, `hash_log` and `chain_log` are reduced
+/// proportionally.
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     if src_size == 0 {
         return params;
     }
-    // Cap window_log so the window doesn't exceed the source.
-    // ceil_log2(src_size): the minimum number of bits to represent src_size.
+    // Derive a source-size-based cap from ceil(log2(src_size)), then
+    // clamp to MIN_WINDOW_LOG. For inputs smaller than 1 KiB we keep the
+    // 1 KiB minimum window instead of shrinking below that floor.
     let src_log = 64 - (src_size - 1).leading_zeros(); // ceil_log2
     let src_log = (src_log as u8).max(MIN_WINDOW_LOG);
     if src_log < params.window_log {

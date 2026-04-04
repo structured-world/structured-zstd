@@ -81,6 +81,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     ///
     /// When set, the frame header will include a `Frame_Content_Size` field.
     /// This enables decoders to pre-allocate output buffers.
+    /// The pledged size is also forwarded as a source-size hint to the
+    /// matcher so small inputs can use smaller matching tables.
     ///
     /// Must be called **before** the first [`write`](Write::write) call;
     /// calling it after the frame header has already been emitted returns an
