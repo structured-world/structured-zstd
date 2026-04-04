@@ -52,7 +52,7 @@ enum Commands {
             short,
             long,
             value_name = "LEVEL",
-            default_value_t = 3,
+            default_value_t = CompressionLevel::DEFAULT_LEVEL,
             value_parser = clap::value_parser!(i32).range(
                 (CompressionLevel::MIN_LEVEL as i64)..=(CompressionLevel::MAX_LEVEL as i64)
             ),

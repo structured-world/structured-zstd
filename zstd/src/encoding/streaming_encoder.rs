@@ -1016,6 +1016,41 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
+    #[test]
+    fn source_size_hint_directly_reduces_window_header() {
+        let payload = b"streaming-source-size-hint".repeat(64);
+
+        let mut no_hint = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+        no_hint.write_all(payload.as_slice()).unwrap();
+        let no_hint_frame = no_hint.finish().unwrap();
+        let no_hint_header = crate::decoding::frame::read_frame_header(no_hint_frame.as_slice())
+            .unwrap()
+            .0;
+        let no_hint_window = no_hint_header.window_size().unwrap();
+
+        let mut with_hint = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+        with_hint
+            .set_source_size_hint(payload.len() as u64)
+            .unwrap();
+        with_hint.write_all(payload.as_slice()).unwrap();
+        let with_hint_frame = with_hint.finish().unwrap();
+        let with_hint_header =
+            crate::decoding::frame::read_frame_header(with_hint_frame.as_slice())
+                .unwrap()
+                .0;
+        let with_hint_window = with_hint_header.window_size().unwrap();
+
+        assert!(
+            with_hint_window <= no_hint_window,
+            "source size hint should not increase advertised window"
+        );
+
+        let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn pledged_content_size_c_zstd_compatible() {
