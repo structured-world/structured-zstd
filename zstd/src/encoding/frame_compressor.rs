@@ -157,6 +157,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// When set, the encoder selects smaller hash tables and windows for
+    /// small inputs, matching the C zstd source-size-class behavior.
+    /// Must be called before [`compress`](Self::compress).
+    pub fn set_source_size_hint(&mut self, size: u64) {
+        self.state.matcher.set_source_size_hint(size);
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
     ///
     /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.
@@ -274,7 +283,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
-                | CompressionLevel::Best => compress_block_encoded(
+                | CompressionLevel::Best
+                | CompressionLevel::Level(_) => compress_block_encoded(
                     &mut self.state,
                     last_block,
                     uncompressed_data,
@@ -476,7 +486,7 @@ mod tests {
                     data.len() as u64,
                     "FCS mismatch for len={} level={:?}",
                     data.len(),
-                    level as u8,
+                    level,
                 );
                 // Confirm the FCS field is actually present in the header
                 // (not just the decoder returning 0 for absent FCS).
@@ -485,7 +495,7 @@ mod tests {
                     0,
                     "FCS field must be present for len={} level={:?}",
                     data.len(),
-                    level as u8,
+                    level,
                 );
                 // Verify C zstd can decompress
                 let mut decoded = Vec::new();
@@ -883,8 +893,10 @@ mod tests {
             crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
                 .expect("raw dictionary should be valid");
 
-        let payload = b"abcdefgh".repeat(512);
-        let matcher = MatchGeneratorDriver::new(8, 1);
+        // Payload must exceed the encoder's advertised window (128 KiB for
+        // Fastest) so the test actually exercises cross-window-boundary behavior.
+        let payload = b"abcdefgh".repeat(128 * 1024 / 8 + 64);
+        let matcher = MatchGeneratorDriver::new(1024, 1);
 
         let mut no_dict_output = Vec::new();
         let mut no_dict_compressor =
@@ -900,7 +912,7 @@ mod tests {
             .expect("window size should be present");
 
         let mut output = Vec::new();
-        let matcher = MatchGeneratorDriver::new(8, 1);
+        let matcher = MatchGeneratorDriver::new(1024, 1);
         let mut compressor =
             FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
         compressor

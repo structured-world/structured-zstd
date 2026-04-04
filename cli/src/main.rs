@@ -34,23 +34,40 @@ enum Commands {
         /// Where the compressed file is written
         /// [default: <INPUT_FILE>.zst]
         output_file: Option<PathBuf>,
-        /// How thoroughly the file should be compressed. A higher level will take
-        /// more time to compress but result in a smaller file, and vice versa.
+        /// Compression level (higher = smaller, slower).
         ///
-        /// - 0: Uncompressed
-        /// - 1: Fastest
-        /// - 2: Default
-        /// - 3: Better (lazy2, ~zstd level 7)
-        /// - 4: Best  (deep lazy2, ~zstd level 11)
+        /// Numeric levels follow the zstd convention where 0 means
+        /// "use the default level" (currently 3).
+        ///
+        /// -  0: Default (same as 3)
+        /// -  1: Fastest (fast hash, ~zstd level 1)
+        /// -  3: Default (dfast, ~zstd level 3)
+        /// -  7: Better  (lazy2, ~zstd level 7)
+        /// - 11: Best    (deep lazy2, ~zstd level 11)
+        /// - Negative: ultra-fast modes (less compression, more speed)
+        /// - 12-22: progressively higher ratio (capped at lazy2 backend)
+        ///
+        /// Use --store to write an uncompressed zstd frame.
         #[arg(
             short,
             long,
-            value_name = "COMPRESSION_LEVEL",
-            default_value_t = 2,
-            value_parser = clap::value_parser!(u8).range(0..=4),
-            verbatim_doc_comment
+            value_name = "LEVEL",
+            default_value_t = CompressionLevel::DEFAULT_LEVEL,
+            // clap's ranged parser expects i64 bounds here (RangedI64ValueParser),
+            // even though the target value type is i32.
+            value_parser = clap::value_parser!(i32).range(
+                (CompressionLevel::MIN_LEVEL as i64)..=(CompressionLevel::MAX_LEVEL as i64)
+            ),
+            verbatim_doc_comment,
+            allow_hyphen_values = true,
         )]
-        level: u8,
+        level: i32,
+        /// Write an uncompressed zstd frame (no compression).
+        ///
+        /// When set, compression itself ignores `--level` and writes a raw
+        /// zstd frame. The CLI still validates `--level` range at parse time.
+        #[arg(long)]
+        store: bool,
     },
     Decompress {
         /// .zst archive to decompress
@@ -81,9 +98,10 @@ fn main() -> color_eyre::Result<()> {
             input_file,
             output_file,
             level,
+            store,
         } => {
             let output_file = output_file.unwrap_or_else(|| add_extension(&input_file, ".zst"));
-            compress(input_file, output_file, level)?;
+            compress(input_file, output_file, level, store)?;
         }
         Commands::Decompress {
             input_file,
@@ -101,15 +119,12 @@ fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()> {
+fn compress(input: PathBuf, output: PathBuf, level: i32, store: bool) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: structured_zstd::encoding::CompressionLevel = match level {
-        0 => CompressionLevel::Uncompressed,
-        1 => CompressionLevel::Fastest,
-        2 => CompressionLevel::Default,
-        3 => CompressionLevel::Better,
-        4 => CompressionLevel::Best,
-        _ => return Err(eyre!("unsupported compression level: {level}")),
+    let compression_level = if store {
+        CompressionLevel::Uncompressed
+    } else {
+        CompressionLevel::from_level(level)
     };
     ensure_distinct_paths(&input, &output)?;
     ensure_regular_output_destination(&output)?;
@@ -128,6 +143,9 @@ fn compress(input: PathBuf, output: PathBuf, level: u8) -> color_eyre::Result<()
     let compression_result: color_eyre::Result<File> = (|| {
         let mut encoder =
             structured_zstd::encoding::StreamingEncoder::new(temporary_output, compression_level);
+        encoder
+            .set_source_size_hint(source_size as u64)
+            .wrap_err("failed to configure source size hint")?;
         std::io::copy(&mut encoder_input, &mut encoder).wrap_err("streaming compression failed")?;
         encoder.finish().wrap_err("failed to finalize zstd frame")
     })();
@@ -402,7 +420,50 @@ mod tests {
 
     #[test]
     fn cli_rejects_unsupported_compression_level_at_parse_time() {
-        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "5"]);
+        let too_high =
+            (structured_zstd::encoding::CompressionLevel::MAX_LEVEL as i64 + 1).to_string();
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--level",
+            too_high.as_str(),
+        ]);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn cli_accepts_negative_compression_level() {
+        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "-3"]);
+        assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn cli_rejects_too_negative_compression_level() {
+        let too_low =
+            (structured_zstd::encoding::CompressionLevel::MIN_LEVEL as i64 - 1).to_string();
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--level",
+            too_low.as_str(),
+        ]);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn cli_store_still_validates_level_range_at_parse_time() {
+        let too_high =
+            (structured_zstd::encoding::CompressionLevel::MAX_LEVEL as i64 + 1).to_string();
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--store",
+            "--level",
+            too_high.as_str(),
+        ]);
         assert!(parse.is_err());
     }
 
@@ -415,7 +476,7 @@ mod tests {
         let input = std::env::temp_dir().join(format!("structured-zstd-cli-alias-{unique}.txt"));
         fs::write(&input, b"streaming-cli-alias-check").unwrap();
 
-        let err = compress(input.clone(), input.clone(), 2).unwrap_err();
+        let err = compress(input.clone(), input.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("input and output"),
@@ -434,7 +495,7 @@ mod tests {
         fs::write(&input, b"streaming-cli-hardlink-check").unwrap();
         fs::hard_link(&input, &output).unwrap();
 
-        let err = compress(input.clone(), output.clone(), 2).unwrap_err();
+        let err = compress(input.clone(), output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("input and output"),
@@ -455,7 +516,7 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("structured-zstd-cli-missing-output-{unique}.zst"));
 
-        let err = compress(missing_input, output.clone(), 2).unwrap_err();
+        let err = compress(missing_input, output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("failed to open input file"),
@@ -473,7 +534,7 @@ mod tests {
         let output = dir.join("existing-dir");
         fs::create_dir(&output).unwrap();
 
-        let err = compress(input, output.clone(), 2).unwrap_err();
+        let err = compress(input, output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("not a regular file"),

@@ -81,6 +81,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     ///
     /// When set, the frame header will include a `Frame_Content_Size` field.
     /// This enables decoders to pre-allocate output buffers.
+    /// The pledged size is also forwarded as a source-size hint to the
+    /// matcher so small inputs can use smaller matching tables.
     ///
     /// Must be called **before** the first [`write`](Write::write) call;
     /// calling it after the frame header has already been emitted returns an
@@ -93,6 +95,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
         self.pledged_content_size = Some(size);
+        // Also use pledged size as source-size hint so the matcher
+        // can select smaller tables for small inputs.
+        self.state.matcher.set_source_size_hint(size);
+        Ok(())
+    }
+
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// Unlike [`set_pledged_content_size`](Self::set_pledged_content_size),
+    /// this does **not** enforce that exactly `size` bytes are written; it
+    /// only optimises matcher parameters for small inputs.  Must be called
+    /// before the first [`write`](Write::write).
+    pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "source size hint must be set before the first write",
+            ));
+        }
+        self.state.matcher.set_source_size_hint(size);
         Ok(())
     }
 
@@ -246,8 +268,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             CompressionLevel::Fastest
             | CompressionLevel::Default
             | CompressionLevel::Better
-            | CompressionLevel::Best => self.state.matcher.get_next_space(),
-            _ => Vec::new(),
+            | CompressionLevel::Best
+            | CompressionLevel::Level(_) => self.state.matcher.get_next_space(),
+            CompressionLevel::Uncompressed => Vec::new(),
         };
         space.clear();
         if space.capacity() > block_capacity {
@@ -303,7 +326,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             | CompressionLevel::Fastest
             | CompressionLevel::Default
             | CompressionLevel::Better
-            | CompressionLevel::Best => Ok(()),
+            | CompressionLevel::Best
+            | CompressionLevel::Level(_) => Ok(()),
         }
     }
 
@@ -338,7 +362,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
-                | CompressionLevel::Best => {
+                | CompressionLevel::Best
+                | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
                     compress_block_encoded(&mut self.state, last_block, block, &mut encoded);
@@ -989,6 +1014,41 @@ mod tests {
         encoder.write_all(b"already writing").unwrap();
         let err = encoder.set_pledged_content_size(15).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn source_size_hint_directly_reduces_window_header() {
+        let payload = b"streaming-source-size-hint".repeat(64);
+
+        let mut no_hint = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+        no_hint.write_all(payload.as_slice()).unwrap();
+        let no_hint_frame = no_hint.finish().unwrap();
+        let no_hint_header = crate::decoding::frame::read_frame_header(no_hint_frame.as_slice())
+            .unwrap()
+            .0;
+        let no_hint_window = no_hint_header.window_size().unwrap();
+
+        let mut with_hint = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+        with_hint
+            .set_source_size_hint(payload.len() as u64)
+            .unwrap();
+        with_hint.write_all(payload.as_slice()).unwrap();
+        let with_hint_frame = with_hint.finish().unwrap();
+        let with_hint_header =
+            crate::decoding::frame::read_frame_header(with_hint_frame.as_slice())
+                .unwrap()
+                .0;
+        let with_hint_window = with_hint_header.window_size().unwrap();
+
+        assert!(
+            with_hint_window <= no_hint_window,
+            "source size hint should not increase advertised window"
+        );
+
+        let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[cfg(feature = "std")]

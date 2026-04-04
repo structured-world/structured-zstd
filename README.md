@@ -22,7 +22,7 @@ This is a **maintained fork** of [KillingSpark/zstd-rs](https://github.com/Killi
 **Fork goals:**
 - Dictionary compression improvements (critical for per-label trained dictionaries in LSM-tree)
 - Performance parity with C zstd for decompression (currently 1.4-3.5x slower)
-- Additional compression levels (Fastest, Default, Better, and Best are all implemented)
+- Full numeric compression levels (0 = default, 1–22 plus negative ultra-fast, C zstd compatible)
 - No FFI — pure `cargo build`, no cmake/system libraries (ADR-013 compliance)
 
 **Upstream relationship:** We periodically sync with upstream but maintain an independent development trajectory focused on CoordiNode requirements.
@@ -46,6 +46,8 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 - [x] Default (roughly level 3)
 - [x] Better (roughly level 7)
 - [x] Best (roughly level 11)
+- [x] Numeric levels `0` (default), `1–22`, and negative ultra-fast levels via `CompressionLevel::from_level(n)` (C zstd compatible numbering)
+- [x] Negative levels for ultra-fast compression
 - [x] Checksums
 - [x] Frame Content Size — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before first write
 - [x] Dictionary compression
@@ -67,7 +69,10 @@ Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares
 use structured_zstd::encoding::{compress, compress_to_vec, CompressionLevel};
 
 let data: &[u8] = b"hello world";
+// Named level
 let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+// Numeric level (C zstd compatible: 0 = default, 1-22, negative for ultra-fast)
+let compressed = compress_to_vec(data, CompressionLevel::from_level(7));
 ```
 
 ```rust,no_run

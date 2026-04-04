@@ -544,3 +544,325 @@ fn roundtrip_best_level_streaming_multi_block() {
     let data = generate_compressible(5555, 512 * 1024);
     assert_eq!(roundtrip_best_streaming(&data), data);
 }
+
+// ─── Numeric compression levels (CompressionLevel::Level) ─────────
+
+/// Canonical numeric levels should map to named enum variants for pattern/equality checks.
+#[test]
+fn numeric_levels_map_to_named_variants() {
+    assert!(matches!(
+        CompressionLevel::from_level(0),
+        CompressionLevel::Default
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(3),
+        CompressionLevel::Default
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(1),
+        CompressionLevel::Fastest
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(7),
+        CompressionLevel::Better
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(11),
+        CompressionLevel::Best
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(2),
+        CompressionLevel::Level(2)
+    ));
+}
+
+/// `from_level(3)` and direct `Level(3)` must be equivalent to `Default`.
+#[test]
+fn numeric_level_3_matches_default() {
+    let data = generate_compressible(9000, 64 * 1024);
+    let default = compress_to_vec(&data[..], CompressionLevel::Default);
+    let from_level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    let direct_level_3 = compress_to_vec(&data[..], CompressionLevel::Level(3));
+    assert_eq!(
+        default, from_level_3,
+        "from_level(3) output must be identical to Default"
+    );
+    assert_eq!(
+        default, direct_level_3,
+        "direct Level(3) output must be identical to Default"
+    );
+}
+
+/// `from_level(1)` must be equivalent to `Fastest`.
+#[test]
+fn numeric_level_1_matches_fastest() {
+    let data = generate_compressible(9001, 64 * 1024);
+    let fastest = compress_to_vec(&data[..], CompressionLevel::Fastest);
+    let level_1 = compress_to_vec(&data[..], CompressionLevel::from_level(1));
+    assert_eq!(
+        fastest, level_1,
+        "Level(1) output must be identical to Fastest"
+    );
+}
+
+/// `from_level(7)` must be equivalent to `Better`.
+#[test]
+fn numeric_level_7_matches_better() {
+    let data = generate_compressible(9002, 64 * 1024);
+    let better = compress_to_vec(&data[..], CompressionLevel::Better);
+    let level_7 = compress_to_vec(&data[..], CompressionLevel::from_level(7));
+    assert_eq!(
+        better, level_7,
+        "Level(7) output must be identical to Better"
+    );
+}
+
+/// `from_level(11)` must be equivalent to `Best`.
+#[test]
+fn numeric_level_11_matches_best() {
+    let data = generate_compressible(9003, 64 * 1024);
+    let best = compress_to_vec(&data[..], CompressionLevel::Best);
+    let level_11 = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    assert_eq!(best, level_11, "Level(11) output must be identical to Best");
+}
+
+/// `from_level(0)` and direct `Level(0)` map to default compression (level 3).
+#[test]
+fn numeric_level_0_is_default_compression() {
+    let data = generate_compressible(9004, 64 * 1024);
+    let from_level_0 = compress_to_vec(&data[..], CompressionLevel::from_level(0));
+    let direct_level_0 = compress_to_vec(&data[..], CompressionLevel::Level(0));
+    let level_3 = compress_to_vec(&data[..], CompressionLevel::from_level(3));
+    assert_eq!(
+        from_level_0, level_3,
+        "from_level(0) should map to default (level 3)"
+    );
+    assert_eq!(
+        direct_level_0, level_3,
+        "direct Level(0) should map to default (level 3)"
+    );
+}
+
+/// All 22 positive levels produce valid output that round-trips correctly.
+#[test]
+fn all_22_levels_roundtrip() {
+    let data = generate_compressible(9100, 32 * 1024);
+    for level in 1..=22 {
+        let compressed = {
+            let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(data, result, "Roundtrip failed for Level({level})");
+    }
+}
+
+/// Negative levels produce valid compressed output (ultra-fast mode).
+#[test]
+fn negative_levels_roundtrip() {
+    let data = generate_compressible(9200, 32 * 1024);
+    for level in [-1, -2, -3, -5] {
+        let result = roundtrip_at_level(&data, CompressionLevel::from_level(level));
+        assert_eq!(data, result, "Roundtrip failed for Level({level})");
+    }
+}
+
+/// Sampled numeric levels should produce valid compressed output and preserve
+/// data through a full compress/decompress roundtrip.
+#[test]
+fn sampled_levels_roundtrip_validity() {
+    let data = generate_compressible(9300, 64 * 1024);
+    for level in [1, 3, 7, 11] {
+        let compressed = compress_to_vec(&data[..], CompressionLevel::from_level(level));
+        assert!(
+            !compressed.is_empty(),
+            "Level {level} produced empty compressed output"
+        );
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Roundtrip failed for sampled compression level {level}"
+        );
+    }
+}
+
+/// Numeric levels work with the streaming encoder.
+#[test]
+fn numeric_level_streaming_roundtrip() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let data = generate_compressible(9400, 200 * 1024);
+    for level in [1, 3, 5, 7, 9, 11, -1] {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
+        for chunk in data.chunks(4096) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Streaming roundtrip failed for Level({level})"
+        );
+    }
+}
+
+/// Values beyond MAX_LEVEL are clamped — they must still produce valid output.
+#[test]
+fn out_of_range_level_clamped() {
+    let data = generate_compressible(9500, 16 * 1024);
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(100));
+    assert_eq!(data, result, "Clamped Level(100) must still roundtrip");
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(-200000));
+    assert_eq!(data, result, "Clamped Level(-200000) must still roundtrip");
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(i32::MIN));
+    assert_eq!(data, result, "Clamped Level(i32::MIN) must still roundtrip");
+}
+
+// ─── Source-size-aware selection ───────────────────────────────────
+
+/// Small input with source size hint should produce valid output.
+#[test]
+fn source_size_hint_small_input_roundtrip() {
+    let data = generate_compressible(9600, 4 * 1024); // 4 KiB
+    let compressed = {
+        let mut compressor = FrameCompressor::new(CompressionLevel::from_level(7));
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        let mut out = Vec::new();
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    };
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "Small input with size hint must roundtrip");
+}
+
+/// Source size hint should reduce compressed output overhead for small inputs
+/// by avoiding oversized windows/tables.
+#[test]
+fn source_size_hint_reduces_window_for_small_input() {
+    let data = generate_compressible(9601, 1024); // 1 KiB
+    // Without hint: uses full level-11 window (16 MiB)
+    let no_hint = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    let no_hint_header = crate::decoding::frame::read_frame_header(no_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
+    // With hint: should use smaller window
+    let with_hint = {
+        let mut compressor = FrameCompressor::new(CompressionLevel::from_level(11));
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        let mut out = Vec::new();
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    };
+    let with_hint_header = crate::decoding::frame::read_frame_header(with_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
+    // Both must decompress correctly
+    let mut decoder = StreamingDecoder::new(no_hint.as_slice()).unwrap();
+    let mut r = Vec::new();
+    decoder.read_to_end(&mut r).unwrap();
+    assert_eq!(data, r);
+
+    let mut decoder = StreamingDecoder::new(with_hint.as_slice()).unwrap();
+    let mut r = Vec::new();
+    decoder.read_to_end(&mut r).unwrap();
+    assert_eq!(data, r);
+
+    assert!(
+        with_hint_header <= no_hint_header,
+        "size hint should not increase frame window size: hint={} no_hint={}",
+        with_hint_header,
+        no_hint_header
+    );
+    assert!(
+        with_hint_header < (16 * 1024 * 1024),
+        "hinted level-11 frame should advertise smaller-than-default window, got {}",
+        with_hint_header
+    );
+}
+
+/// Streaming encoder with pledged content size automatically uses source size hint.
+#[test]
+fn streaming_pledged_size_uses_source_hint() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let data = generate_compressible(9602, 2 * 1024); // 2 KiB
+    let no_hint = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    let no_hint_header = crate::decoding::frame::read_frame_header(no_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+    encoder.set_pledged_content_size(data.len() as u64).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let hinted_header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
+
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "Pledged-size streaming must roundtrip");
+    assert!(
+        hinted_header <= no_hint_header,
+        "pledged source hint should not increase window size: hinted={} no_hint={}",
+        hinted_header,
+        no_hint_header
+    );
+    assert!(
+        hinted_header < (16 * 1024 * 1024),
+        "pledged source hint should reduce level-11 advertised window, got {}",
+        hinted_header
+    );
+}
+
+/// All 22 levels produce valid output for a tiny (256 byte) input with size hint.
+#[test]
+fn all_levels_tiny_input_with_hint() {
+    let data = generate_compressible(9603, 256);
+    for level in 1..=22 {
+        let compressed = {
+            let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Tiny input with hint failed for Level({level})"
+        );
+    }
+}
