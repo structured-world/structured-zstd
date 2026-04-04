@@ -539,9 +539,6 @@ impl Matcher for MatchGeneratorDriver {
             if space.len() > self.slice_size {
                 space.truncate(self.slice_size);
             }
-            if space.capacity() > self.slice_size {
-                space.shrink_to(self.slice_size);
-            }
             if space.len() < self.slice_size {
                 space.resize(self.slice_size, 0);
             }
@@ -2213,6 +2210,27 @@ fn source_hint_clamps_driver_slice_size_to_window() {
     let space = driver.get_next_space();
     assert_eq!(space.len(), window);
     driver.commit_space(space);
+}
+
+#[test]
+fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
+    driver.reset(CompressionLevel::Default);
+
+    let large = driver.get_next_space();
+    let large_capacity = large.capacity();
+    assert!(large_capacity >= 128 * 1024);
+    driver.commit_space(large);
+
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Default);
+
+    let small = driver.get_next_space();
+    assert_eq!(small.len(), 1024);
+    assert!(
+        small.capacity() >= large_capacity,
+        "pooled buffer capacity should be preserved to avoid shrink/grow churn"
+    );
 }
 
 #[test]
