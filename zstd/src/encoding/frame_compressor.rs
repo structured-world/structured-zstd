@@ -157,6 +157,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// When set, the encoder selects smaller hash tables and windows for
+    /// small inputs, matching the C zstd source-size-class behavior.
+    /// Must be called before [`compress`](Self::compress).
+    pub fn set_source_size_hint(&mut self, size: u64) {
+        self.state.matcher.set_source_size_hint(size);
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
     ///
     /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.

@@ -153,6 +153,15 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// Implementations may use this to select smaller hash tables and windows
+    /// for small inputs, matching the C zstd source-size-class behavior.
+    /// Called before [`reset`](Self::reset) when the caller knows the input
+    /// size (e.g. from pledged content size or file metadata).
+    ///
+    /// The default implementation is a no-op for custom matchers.
+    fn set_source_size_hint(&mut self, _size: u64) {}
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}

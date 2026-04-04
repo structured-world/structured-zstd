@@ -53,7 +53,9 @@ enum Commands {
             long,
             value_name = "LEVEL",
             default_value_t = 3,
-            value_parser = clap::value_parser!(i32).range(-5..=22),
+            value_parser = clap::value_parser!(i32).range(
+                (CompressionLevel::MIN_LEVEL as i64)..=(CompressionLevel::MAX_LEVEL as i64)
+            ),
             verbatim_doc_comment,
             allow_hyphen_values = true,
         )]
@@ -425,7 +427,14 @@ mod tests {
 
     #[test]
     fn cli_rejects_too_negative_compression_level() {
-        let parse = Cli::try_parse_from(["structured-zstd", "compress", "in.bin", "--level", "-6"]);
+        // MIN_LEVEL is -131072; anything below that should be rejected
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--level",
+            "-131073",
+        ]);
         assert!(parse.is_err());
     }
 

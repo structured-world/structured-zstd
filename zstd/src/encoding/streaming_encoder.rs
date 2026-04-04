@@ -93,6 +93,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
         self.pledged_content_size = Some(size);
+        // Also use pledged size as source-size hint so the matcher
+        // can select smaller tables for small inputs.
+        self.state.matcher.set_source_size_hint(size);
+        Ok(())
+    }
+
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// Unlike [`set_pledged_content_size`](Self::set_pledged_content_size),
+    /// this does **not** enforce that exactly `size` bytes are written; it
+    /// only optimises matcher parameters for small inputs.  Must be called
+    /// before the first [`write`](Write::write).
+    pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "source size hint must be set before the first write",
+            ));
+        }
+        self.state.matcher.set_source_size_hint(size);
         Ok(())
     }
 

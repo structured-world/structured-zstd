@@ -621,8 +621,8 @@ fn negative_levels_roundtrip() {
     }
 }
 
-/// Higher levels should generally not produce *larger* output than lower levels
-/// on reasonably compressible data.
+/// For this reasonably compressible fixture, the sampled higher levels are
+/// expected not to produce larger output than the lower sampled levels.
 #[test]
 fn levels_monotonic_compression_ratio() {
     let data = generate_compressible(9300, 64 * 1024);
@@ -669,4 +669,105 @@ fn out_of_range_level_clamped() {
     assert_eq!(data, result, "Clamped Level(100) must still roundtrip");
     let result = roundtrip_at_level(&data, CompressionLevel::from_level(-200000));
     assert_eq!(data, result, "Clamped Level(-200000) must still roundtrip");
+}
+
+// ─── Source-size-aware selection ───────────────────────────────────
+
+/// Small input with source size hint should produce valid output.
+#[test]
+fn source_size_hint_small_input_roundtrip() {
+    let data = generate_compressible(9600, 4 * 1024); // 4 KiB
+    let compressed = {
+        let mut compressor = FrameCompressor::new(CompressionLevel::from_level(7));
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        let mut out = Vec::new();
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    };
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "Small input with size hint must roundtrip");
+}
+
+/// Source size hint should reduce compressed output overhead for small inputs
+/// by avoiding oversized windows/tables.
+#[test]
+fn source_size_hint_reduces_window_for_small_input() {
+    let data = generate_compressible(9601, 1024); // 1 KiB
+    // Without hint: uses full level-11 window (16 MiB)
+    let no_hint = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    // With hint: should use smaller window
+    let with_hint = {
+        let mut compressor = FrameCompressor::new(CompressionLevel::from_level(11));
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        let mut out = Vec::new();
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    };
+    // Both must decompress correctly
+    let mut decoder = StreamingDecoder::new(no_hint.as_slice()).unwrap();
+    let mut r = Vec::new();
+    decoder.read_to_end(&mut r).unwrap();
+    assert_eq!(data, r);
+
+    let mut decoder = StreamingDecoder::new(with_hint.as_slice()).unwrap();
+    let mut r = Vec::new();
+    decoder.read_to_end(&mut r).unwrap();
+    assert_eq!(data, r);
+
+    // With hint should produce output no larger than without
+    // (smaller window descriptor in frame header, similar or identical blocks)
+    assert!(
+        with_hint.len() <= no_hint.len(),
+        "Size hint should not produce larger output: hint={} no_hint={}",
+        with_hint.len(),
+        no_hint.len(),
+    );
+}
+
+/// Streaming encoder with pledged content size automatically uses source size hint.
+#[test]
+fn streaming_pledged_size_uses_source_hint() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let data = generate_compressible(9602, 2 * 1024); // 2 KiB
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
+    encoder.set_pledged_content_size(data.len() as u64).unwrap();
+    encoder.write_all(&data).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert_eq!(data, result, "Pledged-size streaming must roundtrip");
+}
+
+/// All 22 levels produce valid output for a tiny (256 byte) input with size hint.
+#[test]
+fn all_levels_tiny_input_with_hint() {
+    let data = generate_compressible(9603, 256);
+    for level in 1..=22 {
+        let compressed = {
+            let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Tiny input with hint failed for Level({level})"
+        );
+    }
 }

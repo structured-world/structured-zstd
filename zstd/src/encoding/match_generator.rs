@@ -109,9 +109,44 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 } },
 ];
 
-/// Resolve a [`CompressionLevel`] to internal tuning parameters.
-fn resolve_level_params(level: CompressionLevel) -> LevelParams {
-    match level {
+/// Smallest window_log the encoder will use regardless of source size.
+const MIN_WINDOW_LOG: u8 = 10;
+
+/// Adjust level parameters for a known source size.
+///
+/// Follows the C zstd `clevels.h` approach: for small inputs, cap
+/// window_log (and hash/chain for HC) so the encoder doesn't allocate
+/// oversized tables.  The four C size classes are:
+///   >256 KiB (default table), ≤256 KiB, ≤128 KiB, ≤16 KiB.
+fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
+    if src_size == 0 {
+        return params;
+    }
+    // Cap window_log so the window doesn't exceed the source.
+    // ceil_log2(src_size): the minimum number of bits to represent src_size.
+    let src_log = 64 - (src_size - 1).leading_zeros(); // ceil_log2
+    let src_log = (src_log as u8).max(MIN_WINDOW_LOG);
+    if src_log < params.window_log {
+        params.window_log = src_log;
+    }
+    // For HC backend: also cap hash_log and chain_log so tables are
+    // proportional to the source, avoiding multi-MB allocations for
+    // tiny inputs.
+    if params.backend == MatcherBackend::HashChain {
+        if (src_log + 2) < params.hc.hash_log as u8 {
+            params.hc.hash_log = (src_log + 2) as usize;
+        }
+        if (src_log + 1) < params.hc.chain_log as u8 {
+            params.hc.chain_log = (src_log + 1) as usize;
+        }
+    }
+    params
+}
+
+/// Resolve a [`CompressionLevel`] to internal tuning parameters,
+/// optionally adjusted for a known source size.
+fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
+    let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
             backend: MatcherBackend::Simple,
             window_log: 17,
@@ -129,7 +164,7 @@ fn resolve_level_params(level: CompressionLevel) -> LevelParams {
                 LEVEL_TABLE[idx]
             } else if n == 0 {
                 // Level 0 = default, matching C zstd semantics.
-                LEVEL_TABLE[2]
+                LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
             } else {
                 // Negative levels: ultra-fast with the Simple backend.
                 // Acceleration grows with magnitude, expressed as larger
@@ -146,6 +181,11 @@ fn resolve_level_params(level: CompressionLevel) -> LevelParams {
                 }
             }
         }
+    };
+    if let Some(size) = source_size {
+        adjust_params_for_source_size(params, size)
+    } else {
+        params
     }
 }
 
@@ -172,6 +212,8 @@ pub struct MatchGeneratorDriver {
     // Tracks currently retained bytes that originated from primed dictionary
     // history and have not been evicted yet.
     dictionary_retained_budget: usize,
+    // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
+    source_size_hint: Option<u64>,
 }
 
 impl MatchGeneratorDriver {
@@ -190,11 +232,12 @@ impl MatchGeneratorDriver {
             base_slice_size: slice_size,
             reported_window_size: max_window_size,
             dictionary_retained_budget: 0,
+            source_size_hint: None,
         }
     }
 
-    fn level_params(level: CompressionLevel) -> LevelParams {
-        resolve_level_params(level)
+    fn level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
+        resolve_level_params(level, source_size)
     }
 
     fn dfast_matcher(&self) -> &DfastMatchGenerator {
@@ -297,8 +340,13 @@ impl Matcher for MatchGeneratorDriver {
         true
     }
 
+    fn set_source_size_hint(&mut self, size: u64) {
+        self.source_size_hint = Some(size);
+    }
+
     fn reset(&mut self, level: CompressionLevel) {
-        let params = Self::level_params(level);
+        let hint = self.source_size_hint.take();
+        let params = Self::level_params(level, hint);
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
         if self.active_backend != params.backend {
