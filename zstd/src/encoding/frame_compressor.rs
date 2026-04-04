@@ -41,6 +41,7 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     compression_level: CompressionLevel,
     dictionary: Option<crate::decoding::Dictionary>,
     dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
+    source_size_hint: Option<u64>,
     state: CompressState<M>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
@@ -111,6 +112,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compression_level,
             dictionary: None,
             dictionary_entropy_cache: None,
+            source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
@@ -131,6 +133,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compressed_data: None,
             dictionary: None,
             dictionary_entropy_cache: None,
+            source_size_hint: None,
             state: CompressState {
                 matcher,
                 last_huff_table: None,
@@ -163,7 +166,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// small inputs, matching the C zstd source-size-class behavior.
     /// Must be called before [`compress`](Self::compress).
     pub fn set_source_size_hint(&mut self, size: u64) {
-        self.state.matcher.set_source_size_hint(size);
+        self.source_size_hint = Some(size);
     }
 
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
@@ -177,12 +180,25 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.compression_level);
-        self.state.offset_hist = [1, 4, 8];
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming();
+        if let Some(size_hint) = self.source_size_hint.take() {
+            let effective_hint = if use_dictionary_state {
+                let dict_floor = self
+                    .dictionary
+                    .as_ref()
+                    .map(|dict| dict.dict_content.len() as u64)
+                    .unwrap_or(0);
+                size_hint.max(dict_floor)
+            } else {
+                size_hint
+            };
+            self.state.matcher.set_source_size_hint(effective_hint);
+        }
+        // Clearing buffers to allow re-using of the compressor
+        self.state.matcher.reset(self.compression_level);
+        self.state.offset_hist = [1, 4, 8];
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -941,6 +957,33 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn source_size_hint_does_not_shrink_window_below_dictionary_history() {
+        let dict_id = 0xABCD_0004;
+        let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
+        let dict_len = dict_content.len() as u64;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let payload = b"abcdabcdabcdabcd".repeat(128);
+
+        let mut output = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor.set_dictionary(dict).unwrap();
+        compressor.set_source_size_hint(1); // would clamp to MIN_WINDOW_LOG without dictionary guard
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        let advertised_window = frame_header
+            .window_size()
+            .expect("window size should be present");
+        assert!(
+            advertised_window >= dict_len,
+            "window_size ({advertised_window}) must cover dictionary history ({dict_len})",
+        );
     }
 
     #[test]
