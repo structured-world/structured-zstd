@@ -53,6 +53,8 @@ enum Commands {
             long,
             value_name = "LEVEL",
             default_value_t = CompressionLevel::DEFAULT_LEVEL,
+            // clap's ranged parser expects i64 bounds here (RangedI64ValueParser),
+            // even though the target value type is i32.
             value_parser = clap::value_parser!(i32).range(
                 (CompressionLevel::MIN_LEVEL as i64)..=(CompressionLevel::MAX_LEVEL as i64)
             ),
