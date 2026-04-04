@@ -119,20 +119,22 @@ const MIN_WINDOW_LOG: u8 = 10;
 
 /// Adjust level parameters for a known source size.
 ///
-/// For non-empty inputs, this derives a cap from `ceil(log2(src_size))`,
-/// then clamps it to [`MIN_WINDOW_LOG`]. This keeps tables bounded for
+/// This derives a cap from `ceil(log2(src_size))`, then clamps it to
+/// [`MIN_WINDOW_LOG`]. A zero-byte size hint is treated as
+/// [`MIN_WINDOW_LOG`]. This keeps tables bounded for
 /// small inputs while preserving the encoder's minimum supported window.
 /// For the HC backend, `hash_log` and `chain_log` are reduced
 /// proportionally.
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
-    if src_size == 0 {
-        return params;
-    }
     // Derive a source-size-based cap from ceil(log2(src_size)), then
-    // clamp to MIN_WINDOW_LOG. For inputs smaller than 1 KiB we keep the
+    // clamp to MIN_WINDOW_LOG. For inputs smaller than 1 KiB (or zero) we keep the
     // 1 KiB minimum window instead of shrinking below that floor.
-    let src_log = 64 - (src_size - 1).leading_zeros(); // ceil_log2
-    let src_log = (src_log as u8).max(MIN_WINDOW_LOG);
+    let src_log = if src_size == 0 {
+        MIN_WINDOW_LOG
+    } else {
+        (64 - (src_size - 1).leading_zeros()) as u8 // ceil_log2
+    };
+    let src_log = src_log.max(MIN_WINDOW_LOG);
     if src_log < params.window_log {
         params.window_log = src_log;
     }
