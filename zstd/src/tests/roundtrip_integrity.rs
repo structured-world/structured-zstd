@@ -752,15 +752,38 @@ fn streaming_pledged_size_uses_source_hint() {
     use crate::io::Write;
 
     let data = generate_compressible(9602, 2 * 1024); // 2 KiB
+    let no_hint = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    let no_hint_header = crate::decoding::frame::read_frame_header(no_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
+
     let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(11));
     encoder.set_pledged_content_size(data.len() as u64).unwrap();
     encoder.write_all(&data).unwrap();
     let compressed = encoder.finish().unwrap();
+    let hinted_header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
 
     let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "Pledged-size streaming must roundtrip");
+    assert!(
+        hinted_header <= no_hint_header,
+        "pledged source hint should not increase window size: hinted={} no_hint={}",
+        hinted_header,
+        no_hint_header
+    );
+    assert!(
+        hinted_header < (16 * 1024 * 1024),
+        "pledged source hint should reduce level-11 advertised window, got {}",
+        hinted_header
+    );
 }
 
 /// All 22 levels produce valid output for a tiny (256 byte) input with size hint.

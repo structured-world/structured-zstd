@@ -62,8 +62,8 @@ enum Commands {
         level: i32,
         /// Write an uncompressed zstd frame (no compression).
         ///
-        /// When set, --level is ignored and the input is wrapped in a
-        /// raw zstd frame without any compression.
+        /// When set, compression itself ignores `--level` and writes a raw
+        /// zstd frame. The CLI still validates `--level` range at parse time.
         #[arg(long)]
         store: bool,
     },
@@ -437,6 +437,19 @@ mod tests {
             "in.bin",
             "--level",
             "-131073",
+        ]);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn cli_store_still_validates_level_range_at_parse_time() {
+        let parse = Cli::try_parse_from([
+            "structured-zstd",
+            "compress",
+            "in.bin",
+            "--store",
+            "--level",
+            "23",
         ]);
         assert!(parse.is_err());
     }
