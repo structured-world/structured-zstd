@@ -173,7 +173,9 @@ pub trait Matcher {
     /// Called before [`reset`](Self::reset) when the caller knows the input
     /// size (e.g. from pledged content size or file metadata).
     ///
-    /// The default implementation is a no-op for custom matchers.
+    /// The default implementation is a no-op for custom matchers and
+    /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
+    /// overrides this hook and applies the hint during level resolution.
     fn set_source_size_hint(&mut self, _size: u64) {}
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
