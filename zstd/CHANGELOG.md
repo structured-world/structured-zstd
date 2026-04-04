@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/structured-world/structured-zstd/compare/v0.0.5...v0.0.6) - 2026-04-04
+
+### Added
+
+- *(encoding)* write frame content size in encoder output ([#60](https://github.com/structured-world/structured-zstd/pull/60))
+
+### Performance
+
+- *(decoding)* pre-allocate decode buffer from sequence block analysis ([#59](https://github.com/structured-world/structured-zstd/pull/59))
+- *(decoding)* branchless bitstream reader with mask table and BMI2 support ([#58](https://github.com/structured-world/structured-zstd/pull/58))
+- *(decoding)* dual-state interleaved FSE sequence decoding ([#55](https://github.com/structured-world/structured-zstd/pull/55))
+
 ## [0.0.5](https://github.com/structured-world/structured-zstd/compare/v0.0.4...v0.0.5) - 2026-04-03
 
 ### Added
