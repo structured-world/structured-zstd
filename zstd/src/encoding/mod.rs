@@ -104,6 +104,10 @@ pub enum CompressionLevel {
     /// with the lazy2 hash-chain backend.  Levels that require strategies
     /// this crate has not yet implemented (btopt, btultra) are approximated
     /// with the closest available matcher.
+    ///
+    /// Semver note: this variant was added after the initial enum shape and
+    /// is a breaking API change for downstream crates that exhaustively
+    /// `match` on [`CompressionLevel`] without a wildcard arm.
     Level(i32),
 }
 
