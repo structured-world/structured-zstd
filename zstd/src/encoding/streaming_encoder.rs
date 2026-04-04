@@ -937,7 +937,7 @@ mod tests {
     fn pledged_content_size_mismatch_returns_error() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.set_pledged_content_size(100).unwrap();
-        encoder.write_all(b"only 10 bytes").unwrap();
+        encoder.write_all(b"short payload").unwrap(); // 13 bytes != 100 pledged
         let err = encoder.finish().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
