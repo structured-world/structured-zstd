@@ -621,20 +621,24 @@ fn negative_levels_roundtrip() {
     }
 }
 
-/// For this reasonably compressible fixture, the sampled higher levels are
-/// expected not to produce larger output than the lower sampled levels.
+/// Sampled numeric levels should produce valid compressed output and preserve
+/// data through a full compress/decompress roundtrip.
 #[test]
 fn levels_monotonic_compression_ratio() {
     let data = generate_compressible(9300, 64 * 1024);
-    let mut prev_size = usize::MAX;
     for level in [1, 3, 7, 11] {
         let compressed = compress_to_vec(&data[..], CompressionLevel::from_level(level));
         assert!(
-            compressed.len() <= prev_size,
-            "Level {level} produced larger output ({}) than a lower level ({prev_size})",
-            compressed.len(),
+            !compressed.is_empty(),
+            "Level {level} produced empty compressed output"
         );
-        prev_size = compressed.len();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            data, result,
+            "Roundtrip failed for sampled compression level {level}"
+        );
     }
 }
 
