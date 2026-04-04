@@ -99,11 +99,21 @@ pub enum CompressionLevel {
     /// Named variants map to specific numeric levels:
     /// [`Fastest`](Self::Fastest) = 1, [`Default`](Self::Default) = 3,
     /// [`Better`](Self::Better) = 7, [`Best`](Self::Best) = 11.
+    /// [`Best`](Self::Best) remains the highest-ratio named preset, but
+    /// [`Level`](Self::Level) values above 11 can target stronger (slower)
+    /// tuning than the named hierarchy.
     ///
     /// Levels above 11 use progressively larger windows and deeper search
     /// with the lazy2 hash-chain backend.  Levels that require strategies
     /// this crate has not yet implemented (btopt, btultra) are approximated
     /// with the closest available matcher.
+    ///
+    /// **Limitation:** large hash-chain levels still use 32-bit positions.
+    /// For single-frame inputs exceeding ~4 GiB, matches can still be found
+    /// for roughly one window past that point; once all in-window positions
+    /// exceed `u32::MAX` (≈4 GiB + window size), matching becomes effectively
+    /// repcode-only. Prefer [`CompressionLevel::Default`] for very large
+    /// single-frame streams until table rebasing is implemented.
     ///
     /// Semver note: this variant was added after the initial enum shape and
     /// is a breaking API change for downstream crates that exhaustively

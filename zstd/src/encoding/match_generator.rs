@@ -357,6 +357,7 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
+        let hinted = hint.is_some();
         let params = Self::level_params(level, hint);
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
@@ -421,7 +422,11 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
-                dfast.set_hash_bits(dfast_hash_bits_for_window(max_window_size));
+                dfast.set_hash_bits(if hinted {
+                    dfast_hash_bits_for_window(max_window_size)
+                } else {
+                    DFAST_HASH_BITS
+                });
                 let vec_pool = &mut self.vec_pool;
                 dfast.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -560,10 +565,10 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::Simple => {
                 let vec_pool = &mut self.vec_pool;
                 let mut evicted_bytes = 0usize;
-                let suffixes = self
-                    .suffix_pool
-                    .pop()
-                    .unwrap_or_else(|| SuffixStore::with_capacity(space.len()));
+                let suffixes = match self.suffix_pool.pop() {
+                    Some(store) if store.slots.len() >= space.len() => store,
+                    _ => SuffixStore::with_capacity(space.len()),
+                };
                 let suffix_pool = &mut self.suffix_pool;
                 self.match_generator
                     .add_data(space, suffixes, |mut data, mut suffixes| {
@@ -2194,6 +2199,51 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     assert!(
         hinted_tables < full_tables,
         "tiny source hint should reduce dfast table footprint"
+    );
+}
+
+#[test]
+fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    driver.reset(CompressionLevel::Level(2));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+
+    let table_len = driver.dfast_matcher().short_hash.len();
+    assert_eq!(
+        table_len,
+        1 << DFAST_HASH_BITS,
+        "unhinted Level(2) should keep default dfast table size"
+    );
+}
+
+#[test]
+fn simple_backend_rejects_undersized_pooled_suffix_store() {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
+    driver.reset(CompressionLevel::Fastest);
+
+    driver.suffix_pool.push(SuffixStore::with_capacity(1024));
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.resize(4096, 0xAB);
+    driver.commit_space(space);
+
+    let last_suffix_slots = driver
+        .match_generator
+        .window
+        .last()
+        .expect("window entry must exist after commit")
+        .suffixes
+        .slots
+        .len();
+    assert!(
+        last_suffix_slots >= 4096,
+        "undersized pooled suffix store must not be reused for larger blocks"
     );
 }
 
