@@ -606,7 +606,18 @@ fn numeric_level_0_is_default_compression() {
 fn all_22_levels_roundtrip() {
     let data = generate_compressible(9100, 32 * 1024);
     for level in 1..=22 {
-        let result = roundtrip_at_level(&data, CompressionLevel::from_level(level));
+        let compressed = {
+            let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
         assert_eq!(data, result, "Roundtrip failed for Level({level})");
     }
 }
@@ -624,7 +635,7 @@ fn negative_levels_roundtrip() {
 /// Sampled numeric levels should produce valid compressed output and preserve
 /// data through a full compress/decompress roundtrip.
 #[test]
-fn levels_monotonic_compression_ratio() {
+fn sampled_levels_roundtrip_validity() {
     let data = generate_compressible(9300, 64 * 1024);
     for level in [1, 3, 7, 11] {
         let compressed = compress_to_vec(&data[..], CompressionLevel::from_level(level));
