@@ -536,11 +536,15 @@ impl Matcher for MatchGeneratorDriver {
 
     fn get_next_space(&mut self) -> Vec<u8> {
         if let Some(mut space) = self.vec_pool.pop() {
-            space.clear();
+            if space.len() > self.slice_size {
+                space.truncate(self.slice_size);
+            }
             if space.capacity() > self.slice_size {
                 space.shrink_to(self.slice_size);
             }
-            space.resize(self.slice_size, 0);
+            if space.len() < self.slice_size {
+                space.resize(self.slice_size, 0);
+            }
             return space;
         }
         alloc::vec![0; self.slice_size]
