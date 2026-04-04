@@ -124,8 +124,9 @@ impl CompressionLevel {
     /// Returns named variants for canonical levels (`0`/`3`, `1`, `7`, `11`)
     /// and [`Level`](Self::Level) for all other values.
     ///
-    /// Values outside [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL)
-    /// are silently clamped during parameter resolution.
+    /// With the default matcher backend (`MatchGeneratorDriver`), values
+    /// outside [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL)
+    /// are silently clamped during built-in level parameter resolution.
     pub const fn from_level(level: i32) -> Self {
         match level {
             0 | Self::DEFAULT_LEVEL => Self::Default,
