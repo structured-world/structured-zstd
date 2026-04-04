@@ -134,7 +134,8 @@ fn resolve_level_params(level: CompressionLevel) -> LevelParams {
                 // Negative levels: ultra-fast with the Simple backend.
                 // Acceleration grows with magnitude, expressed as larger
                 // hash_fill_step (fewer positions indexed).
-                let acceleration = ((-n) as usize).min(131072);
+                let acceleration =
+                    (n.saturating_abs() as usize).min((-CompressionLevel::MIN_LEVEL) as usize);
                 let step = (acceleration + 3).min(128);
                 LevelParams {
                     backend: MatcherBackend::Simple,

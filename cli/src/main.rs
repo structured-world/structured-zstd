@@ -34,15 +34,20 @@ enum Commands {
         /// Where the compressed file is written
         /// [default: <INPUT_FILE>.zst]
         output_file: Option<PathBuf>,
-        /// Compression level using C zstd numbering (higher = smaller, slower).
+        /// Compression level (higher = smaller, slower).
         ///
-        /// -  0: Uncompressed (no compression, raw zstd frame)
+        /// Numeric levels follow the zstd convention where 0 means
+        /// "use the default level" (currently 3).
+        ///
+        /// -  0: Default (same as 3)
         /// -  1: Fastest (fast hash, ~zstd level 1)
         /// -  3: Default (dfast, ~zstd level 3)
         /// -  7: Better  (lazy2, ~zstd level 7)
         /// - 11: Best    (deep lazy2, ~zstd level 11)
         /// - Negative: ultra-fast modes (less compression, more speed)
         /// - 12-22: progressively higher ratio (capped at lazy2 backend)
+        ///
+        /// Use --store to write an uncompressed zstd frame.
         #[arg(
             short,
             long,
@@ -53,6 +58,12 @@ enum Commands {
             allow_hyphen_values = true,
         )]
         level: i32,
+        /// Write an uncompressed zstd frame (no compression).
+        ///
+        /// When set, --level is ignored and the input is wrapped in a
+        /// raw zstd frame without any compression.
+        #[arg(long)]
+        store: bool,
     },
     Decompress {
         /// .zst archive to decompress
@@ -83,9 +94,10 @@ fn main() -> color_eyre::Result<()> {
             input_file,
             output_file,
             level,
+            store,
         } => {
             let output_file = output_file.unwrap_or_else(|| add_extension(&input_file, ".zst"));
-            compress(input_file, output_file, level)?;
+            compress(input_file, output_file, level, store)?;
         }
         Commands::Decompress {
             input_file,
@@ -103,11 +115,12 @@ fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn compress(input: PathBuf, output: PathBuf, level: i32) -> color_eyre::Result<()> {
+fn compress(input: PathBuf, output: PathBuf, level: i32, store: bool) -> color_eyre::Result<()> {
     info!("compressing {input:?} to {output:?}");
-    let compression_level: structured_zstd::encoding::CompressionLevel = match level {
-        0 => CompressionLevel::Uncompressed,
-        n => CompressionLevel::from_level(n),
+    let compression_level = if store {
+        CompressionLevel::Uncompressed
+    } else {
+        CompressionLevel::from_level(level)
     };
     ensure_distinct_paths(&input, &output)?;
     ensure_regular_output_destination(&output)?;
@@ -425,7 +438,7 @@ mod tests {
         let input = std::env::temp_dir().join(format!("structured-zstd-cli-alias-{unique}.txt"));
         fs::write(&input, b"streaming-cli-alias-check").unwrap();
 
-        let err = compress(input.clone(), input.clone(), 3).unwrap_err();
+        let err = compress(input.clone(), input.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("input and output"),
@@ -444,7 +457,7 @@ mod tests {
         fs::write(&input, b"streaming-cli-hardlink-check").unwrap();
         fs::hard_link(&input, &output).unwrap();
 
-        let err = compress(input.clone(), output.clone(), 3).unwrap_err();
+        let err = compress(input.clone(), output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("input and output"),
@@ -465,7 +478,7 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("structured-zstd-cli-missing-output-{unique}.zst"));
 
-        let err = compress(missing_input, output.clone(), 3).unwrap_err();
+        let err = compress(missing_input, output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("failed to open input file"),
@@ -483,7 +496,7 @@ mod tests {
         let output = dir.join("existing-dir");
         fs::create_dir(&output).unwrap();
 
-        let err = compress(input, output.clone(), 3).unwrap_err();
+        let err = compress(input, output.clone(), 3, false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains("not a regular file"),
