@@ -669,6 +669,8 @@ fn out_of_range_level_clamped() {
     assert_eq!(data, result, "Clamped Level(100) must still roundtrip");
     let result = roundtrip_at_level(&data, CompressionLevel::from_level(-200000));
     assert_eq!(data, result, "Clamped Level(-200000) must still roundtrip");
+    let result = roundtrip_at_level(&data, CompressionLevel::from_level(i32::MIN));
+    assert_eq!(data, result, "Clamped Level(i32::MIN) must still roundtrip");
 }
 
 // ─── Source-size-aware selection ───────────────────────────────────
@@ -699,6 +701,11 @@ fn source_size_hint_reduces_window_for_small_input() {
     let data = generate_compressible(9601, 1024); // 1 KiB
     // Without hint: uses full level-11 window (16 MiB)
     let no_hint = compress_to_vec(&data[..], CompressionLevel::from_level(11));
+    let no_hint_header = crate::decoding::frame::read_frame_header(no_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
     // With hint: should use smaller window
     let with_hint = {
         let mut compressor = FrameCompressor::new(CompressionLevel::from_level(11));
@@ -709,6 +716,11 @@ fn source_size_hint_reduces_window_for_small_input() {
         compressor.compress();
         out
     };
+    let with_hint_header = crate::decoding::frame::read_frame_header(with_hint.as_slice())
+        .unwrap()
+        .0
+        .window_size()
+        .unwrap();
     // Both must decompress correctly
     let mut decoder = StreamingDecoder::new(no_hint.as_slice()).unwrap();
     let mut r = Vec::new();
@@ -720,13 +732,16 @@ fn source_size_hint_reduces_window_for_small_input() {
     decoder.read_to_end(&mut r).unwrap();
     assert_eq!(data, r);
 
-    // With hint should produce output no larger than without
-    // (smaller window descriptor in frame header, similar or identical blocks)
     assert!(
-        with_hint.len() <= no_hint.len(),
-        "Size hint should not produce larger output: hint={} no_hint={}",
-        with_hint.len(),
-        no_hint.len(),
+        with_hint_header <= no_hint_header,
+        "size hint should not increase frame window size: hint={} no_hint={}",
+        with_hint_header,
+        no_hint_header
+    );
+    assert!(
+        with_hint_header < (16 * 1024 * 1024),
+        "hinted level-11 frame should advertise smaller-than-default window, got {}",
+        with_hint_header
     );
 }
 

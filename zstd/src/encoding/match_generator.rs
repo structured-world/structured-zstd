@@ -73,6 +73,11 @@ struct LevelParams {
     hc: HcConfig,
 }
 
+fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
+    let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
+    window_log.clamp(MIN_WINDOW_LOG as usize, DFAST_HASH_BITS)
+}
+
 /// Parameter table for numeric compression levels 1–22.
 ///
 /// Each entry maps a zstd compression level to the best-available matcher
@@ -217,8 +222,10 @@ pub struct MatchGeneratorDriver {
 }
 
 impl MatchGeneratorDriver {
-    /// slice_size says how big the slices should be that are allocated to work with
-    /// max_slices_in_window says how many slices should at most be used while looking for matches
+    /// `slice_size` sets the base block allocation size used for matcher input chunks.
+    /// `max_slices_in_window` determines the initial window capacity at construction
+    /// time. Effective window sizing is recalculated on every [`reset`](Self::reset)
+    /// from the resolved compression level and optional source-size hint.
     pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
         let max_window_size = max_slices_in_window * slice_size;
         Self {
@@ -388,7 +395,7 @@ impl Matcher for MatchGeneratorDriver {
         }
 
         self.active_backend = params.backend;
-        self.slice_size = self.base_slice_size;
+        self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         match self.active_backend {
             MatcherBackend::Simple => {
@@ -410,6 +417,7 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
+                dfast.set_hash_bits(dfast_hash_bits_for_window(max_window_size));
                 let vec_pool = &mut self.vec_pool;
                 dfast.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -1098,6 +1106,7 @@ struct DfastMatchGenerator {
     offset_hist: [u32; 3],
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
+    hash_bits: usize,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
 }
@@ -1121,7 +1130,17 @@ impl DfastMatchGenerator {
             offset_hist: [1, 4, 8],
             short_hash: Vec::new(),
             long_hash: Vec::new(),
+            hash_bits: DFAST_HASH_BITS,
             lazy_depth: 1,
+        }
+    }
+
+    fn set_hash_bits(&mut self, bits: usize) {
+        let clamped = bits.clamp(MIN_WINDOW_LOG as usize, DFAST_HASH_BITS);
+        if self.hash_bits != clamped {
+            self.hash_bits = clamped;
+            self.short_hash = Vec::new();
+            self.long_hash = Vec::new();
         }
     }
 
@@ -1234,14 +1253,13 @@ impl DfastMatchGenerator {
     }
 
     fn ensure_hash_tables(&mut self) {
-        if self.short_hash.is_empty() {
+        let table_len = 1usize << self.hash_bits;
+        if self.short_hash.len() != table_len {
             // This is intentionally lazy so Fastest/Uncompressed never pay the
             // ~dfast-level memory cost. The current size tracks the issue's
             // zstd level-3 style parameters rather than a generic low-memory preset.
-            self.short_hash =
-                alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; 1 << DFAST_HASH_BITS];
-            self.long_hash =
-                alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; 1 << DFAST_HASH_BITS];
+            self.short_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; table_len];
+            self.long_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; table_len];
         }
     }
 
@@ -1437,7 +1455,7 @@ impl DfastMatchGenerator {
         let idx = pos - self.history_abs_start;
         let short = {
             let concat = self.live_history();
-            (idx + 4 <= concat.len()).then(|| Self::hash4(&concat[idx..]))
+            (idx + 4 <= concat.len()).then(|| self.hash4(&concat[idx..]))
         };
         if let Some(short) = short {
             let bucket = &mut self.short_hash[short];
@@ -1449,7 +1467,7 @@ impl DfastMatchGenerator {
 
         let long = {
             let concat = self.live_history();
-            (idx + 8 <= concat.len()).then(|| Self::hash8(&concat[idx..]))
+            (idx + 8 <= concat.len()).then(|| self.hash8(&concat[idx..]))
         };
         if let Some(long) = long {
             let bucket = &mut self.long_hash[long];
@@ -1464,7 +1482,7 @@ impl DfastMatchGenerator {
         let concat = self.live_history();
         let idx = pos - self.history_abs_start;
         (idx + 4 <= concat.len())
-            .then(|| self.short_hash[Self::hash4(&concat[idx..])])
+            .then(|| self.short_hash[self.hash4(&concat[idx..])])
             .into_iter()
             .flatten()
             .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
@@ -1474,25 +1492,25 @@ impl DfastMatchGenerator {
         let concat = self.live_history();
         let idx = pos - self.history_abs_start;
         (idx + 8 <= concat.len())
-            .then(|| self.long_hash[Self::hash8(&concat[idx..])])
+            .then(|| self.long_hash[self.hash8(&concat[idx..])])
             .into_iter()
             .flatten()
             .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
     }
 
-    fn hash4(data: &[u8]) -> usize {
+    fn hash4(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
-        Self::hash_bits(value)
+        self.hash_bits(value)
     }
 
-    fn hash8(data: &[u8]) -> usize {
+    fn hash8(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
-        Self::hash_bits(value)
+        self.hash_bits(value)
     }
 
-    fn hash_bits(value: u64) -> usize {
+    fn hash_bits(&self, value: u64) -> usize {
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-        ((value.wrapping_mul(PRIME)) >> (64 - DFAST_HASH_BITS)) as usize
+        ((value.wrapping_mul(PRIME)) >> (64 - self.hash_bits)) as usize
     }
 }
 
@@ -2139,6 +2157,50 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), (1u64 << 17));
+}
+
+#[test]
+fn driver_small_source_hint_shrinks_dfast_hash_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    driver.reset(CompressionLevel::Default);
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+    let full_tables = driver.dfast_matcher().short_hash.len();
+    assert_eq!(full_tables, 1 << DFAST_HASH_BITS);
+
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Default);
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+    let hinted_tables = driver.dfast_matcher().short_hash.len();
+
+    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
+    assert!(
+        hinted_tables < full_tables,
+        "tiny source hint should reduce dfast table footprint"
+    );
+}
+
+#[test]
+fn source_hint_clamps_driver_slice_size_to_window() {
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Default);
+
+    let window = driver.window_size() as usize;
+    assert_eq!(window, 1024);
+    assert_eq!(driver.slice_size, window);
+
+    let space = driver.get_next_space();
+    assert_eq!(space.len(), window);
+    driver.commit_space(space);
 }
 
 #[test]

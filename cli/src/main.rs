@@ -141,6 +141,9 @@ fn compress(input: PathBuf, output: PathBuf, level: i32, store: bool) -> color_e
     let compression_result: color_eyre::Result<File> = (|| {
         let mut encoder =
             structured_zstd::encoding::StreamingEncoder::new(temporary_output, compression_level);
+        encoder
+            .set_source_size_hint(source_size as u64)
+            .wrap_err("failed to configure source size hint")?;
         std::io::copy(&mut encoder_input, &mut encoder).wrap_err("streaming compression failed")?;
         encoder.finish().wrap_err("failed to finalize zstd frame")
     })();
