@@ -547,6 +547,35 @@ fn roundtrip_best_level_streaming_multi_block() {
 
 // ─── Numeric compression levels (CompressionLevel::Level) ─────────
 
+/// Canonical numeric levels should map to named enum variants for pattern/equality checks.
+#[test]
+fn numeric_levels_map_to_named_variants() {
+    assert!(matches!(
+        CompressionLevel::from_level(0),
+        CompressionLevel::Default
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(3),
+        CompressionLevel::Default
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(1),
+        CompressionLevel::Fastest
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(7),
+        CompressionLevel::Better
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(11),
+        CompressionLevel::Best
+    ));
+    assert!(matches!(
+        CompressionLevel::from_level(2),
+        CompressionLevel::Level(2)
+    ));
+}
+
 /// `from_level(3)` must be equivalent to `Default` — same compressed output.
 #[test]
 fn numeric_level_3_matches_default() {

@@ -121,11 +121,19 @@ impl CompressionLevel {
 
     /// Create a compression level from a numeric value.
     ///
-    /// Wraps the raw integer in [`Level`](Self::Level).  Values outside
-    /// [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL) are
-    /// silently clamped during parameter resolution.
+    /// Returns named variants for canonical levels (`0`/`3`, `1`, `7`, `11`)
+    /// and [`Level`](Self::Level) for all other values.
+    ///
+    /// Values outside [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL)
+    /// are silently clamped during parameter resolution.
     pub const fn from_level(level: i32) -> Self {
-        CompressionLevel::Level(level)
+        match level {
+            0 | Self::DEFAULT_LEVEL => Self::Default,
+            1 => Self::Fastest,
+            7 => Self::Better,
+            11 => Self::Best,
+            _ => Self::Level(level),
+        }
     }
 }
 
