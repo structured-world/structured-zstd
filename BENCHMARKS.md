@@ -96,7 +96,7 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
 
 Delta interpretation:
 
-- **Ratio delta** (`rust_ratio / ffi_ratio`): lower is better for Rust (`< 0.99` better, `0.99..1.05` parity, `> 1.05` worse)
-- **Speed delta** (`rust_bytes_per_sec / ffi_bytes_per_sec`): higher is better for Rust (`> 1.05` faster, `0.99..1.05` parity, `< 0.99` slower)
+- **Ratio delta** (`rust_ratio / ffi_ratio`): lower is better for Rust (`< 0.99` better, `0.99..=1.05` parity, `> 1.05` worse)
+- **Speed delta** (`rust_bytes_per_sec / ffi_bytes_per_sec`): higher is better for Rust (`> 1.05` faster, `0.99..=1.05` parity, `< 0.99` slower)
 
 Criterion also writes its usual detailed estimates under `target/criterion/`.

@@ -330,6 +330,13 @@ for key in all_keys:
         },
     )
 
+    has_comparable_ratio = (
+        ratio_pack["rust_ratio"] is not None and ratio_pack["ffi_ratio"] is not None
+    )
+    has_comparable_speed = rust_timing is not None and ffi_timing is not None
+    if not has_comparable_ratio and not has_comparable_speed:
+        continue
+
     delta_rows.append(
         {
             "key": key,
@@ -443,12 +450,15 @@ delta_lines = [
     "| --- | ---: |",
 ]
 
+def format_ratio(value):
+    return f"{value:.6g}"
+
 for row in delta_rows:
     key = markdown_table_escape(row["key"])
     rust_ratio = row["ratio"]["rust"]
     if rust_ratio is None:
         continue
-    delta_lines.append(f"| {key} | {rust_ratio:.4f} |")
+    delta_lines.append(f"| {key} | {format_ratio(rust_ratio)} |")
 
 delta_lines.extend(
     [
@@ -465,7 +475,7 @@ for row in delta_rows:
     ffi_ratio = row["ratio"]["ffi"]
     if ffi_ratio is None:
         continue
-    delta_lines.append(f"| {key} | {ffi_ratio:.4f} |")
+    delta_lines.append(f"| {key} | {format_ratio(ffi_ratio)} |")
 
 delta_lines.extend(
     [
