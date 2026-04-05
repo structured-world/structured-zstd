@@ -36,6 +36,13 @@ fn clamp_table_bits(f: u32) -> u32 {
     f.clamp(8, 20)
 }
 
+pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCoverParams {
+    params.d = params.d.clamp(4, 32);
+    params.k = params.k.max(params.d).max(16);
+    params.f = clamp_table_bits(params.f);
+    params
+}
+
 fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u32> {
     let bits = clamp_table_bits(f);
     let size = 1usize << bits;
@@ -73,8 +80,9 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         return Vec::new();
     }
 
-    let k = params.k.max(params.d).max(16);
-    let d = params.d.clamp(4, 32);
+    let params = normalize_fastcover_params(params);
+    let k = params.k;
+    let d = params.d;
     let table = build_frequency_table(sample, d, params.f, params.accel);
     let mask = table.len().saturating_sub(1);
 
@@ -151,12 +159,12 @@ pub fn optimize_fastcover_raw(
     };
 
     if sample.len() < 2 {
-        let params = FastCoverParams {
+        let params = normalize_fastcover_params(FastCoverParams {
             k: k_candidates[0],
             d: d_values[0],
             f: f_values[0],
             accel,
-        };
+        });
         let mut dict = build_raw_dict(sample, dict_size, params);
         if dict.is_empty() && dict_size > 0 {
             let take = sample.len().min(dict_size);
@@ -191,14 +199,14 @@ pub fn optimize_fastcover_raw(
     for &f in f_values {
         for &d in d_values {
             for &k in k_candidates {
-                let params = FastCoverParams { k, d, f, accel };
+                let params = normalize_fastcover_params(FastCoverParams { k, d, f, accel });
                 let dict = build_raw_dict(train, dict_size, params);
-                let score = coverage_score(dict.as_slice(), eval, d, accel);
+                let score = coverage_score(dict.as_slice(), eval, params.d, accel);
                 if best_dict.is_empty() || score > best.score {
                     best.score = score;
-                    best.k = k;
-                    best.d = d;
-                    best.f = f;
+                    best.k = params.k;
+                    best.d = params.d;
+                    best.f = params.f;
                     best_dict = dict;
                 }
             }
@@ -297,7 +305,7 @@ mod tests {
         let sample = b"abcdefghijklmnopqrst";
         let (dict, tuned) = optimize_fastcover_raw(sample, 16, 0.9, 1, &[6], &[16], &[8]);
         assert!(!dict.is_empty());
-        assert_eq!(tuned.k, 8);
+        assert_eq!(tuned.k, 16);
         assert_eq!(tuned.d, 6);
         assert_eq!(tuned.f, 16);
         assert_eq!(tuned.score, 0);
@@ -332,5 +340,16 @@ mod tests {
         assert!(!dict_high.is_empty());
         assert_eq!(tuned_low.k, 128);
         assert_eq!(tuned_high.k, 128);
+    }
+
+    #[test]
+    fn fastcover_optimizer_reports_normalized_params() {
+        let sample = corpus();
+        let (dict, tuned) =
+            optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[42], &[8]);
+        assert!(!dict.is_empty());
+        assert_eq!(tuned.d, 32);
+        assert_eq!(tuned.f, 20);
+        assert_eq!(tuned.k, 32);
     }
 }

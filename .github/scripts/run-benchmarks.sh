@@ -292,9 +292,10 @@ if not dictionary_rows:
 
 if not dictionary_training_rows:
     print(
-        "WARN: No REPORT_DICT_TRAIN lines parsed; dictionary training section will be empty.",
+        "ERROR: No REPORT_DICT_TRAIN lines parsed; dictionary training section would be empty.",
         file=sys.stderr,
     )
+    sys.exit(1)
 
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)

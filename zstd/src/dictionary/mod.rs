@@ -382,18 +382,18 @@ fn train_fastcover_internal(
             options.k_candidates.as_slice(),
         )
     } else {
-        let params = FastCoverParams {
+        let params = fastcover::normalize_fastcover_params(FastCoverParams {
             k: options.k,
             d: options.d,
             f: options.f,
             accel: options.accel,
-        };
+        });
         (
             fastcover::train_fastcover_raw(sample, dict_size, params),
             FastCoverTuned {
-                k: options.k,
-                d: options.d,
-                f: options.f,
+                k: params.k,
+                d: params.d,
+                f: params.f,
                 accel: options.accel,
                 score: 0,
             },
@@ -413,7 +413,14 @@ pub fn train_fastcover_raw_from_slice(
             "source stream is empty",
         ));
     }
-    Ok(train_fastcover_internal(sample, dict_size, options))
+    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options);
+    if dict.is_empty() && dict_size > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "training sample is too small for FastCOVER",
+        ));
+    }
+    Ok((dict, tuned))
 }
 
 /// Train a raw FastCOVER dictionary from a source stream.
@@ -615,6 +622,35 @@ mod tests {
         assert_eq!(tuned.d, 6);
         assert_eq!(tuned.f, 18);
         assert_eq!(tuned.score, 0);
+    }
+
+    #[test]
+    fn train_fastcover_raw_from_slice_rejects_tiny_sample_with_empty_dict() {
+        let sample = b"tiny";
+        let err = train_fastcover_raw_from_slice(sample, 1024, &FastCoverOptions::default())
+            .expect_err("tiny sample should not produce an empty dictionary successfully");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "training sample is too small for FastCOVER"
+        );
+    }
+
+    #[test]
+    fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
+        let sample = training_data();
+        let options = FastCoverOptions {
+            optimize: false,
+            k: 8,
+            d: 64,
+            f: 42,
+            ..FastCoverOptions::default()
+        };
+        let (_, tuned) =
+            train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
+        assert_eq!(tuned.k, 32);
+        assert_eq!(tuned.d, 32);
+        assert_eq!(tuned.f, 20);
     }
 
     #[test]
