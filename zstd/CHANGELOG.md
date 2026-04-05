@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/structured-world/structured-zstd/compare/v0.0.6...v0.0.7) - 2026-04-05
+
+### Added
+
+- *(encoding)* numeric compression levels (1-22) API ([#63](https://github.com/structured-world/structured-zstd/pull/63))
+
+### Performance
+
+- *(bench)* add rust/ffi delta benchmark artifacts ([#65](https://github.com/structured-world/structured-zstd/pull/65))
+
 ## [0.0.6](https://github.com/structured-world/structured-zstd/compare/v0.0.5...v0.0.6) - 2026-04-04
 
 ### Added
