@@ -165,9 +165,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// When set, the encoder selects smaller hash tables and windows for
     /// small inputs, matching the C zstd source-size-class behavior.
     ///
-    /// When dictionary priming is active, the effective matcher hint also
-    /// includes primed dictionary history bytes in addition to frame payload
-    /// bytes so the advertised window can cover both.
+    /// This hint applies only to frame payload bytes (`size`). Dictionary
+    /// history is primed separately and does not inflate the hinted size or
+    /// advertised frame window.
     /// Must be called before [`compress`](Self::compress).
     pub fn set_source_size_hint(&mut self, size: u64) {
         self.source_size_hint = Some(size);
