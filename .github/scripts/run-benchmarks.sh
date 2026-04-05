@@ -350,6 +350,10 @@ for key in all_keys:
                 "ffi": ratio_pack["ffi_ratio"],
                 "delta_rust_over_ffi": ratio_pack["delta"],
                 "status": ratio_pack["status"],
+                "reference_band": {
+                    "delta_low": DELTA_LOW,
+                    "delta_high": DELTA_HIGH,
+                },
                 "interpretation": "delta<1 means Rust compressed output smaller than FFI; delta>1 means larger",
             },
             "speed": {
@@ -360,6 +364,10 @@ for key in all_keys:
                 "ffi_bytes_per_sec": ffi_bps,
                 "delta_rust_over_ffi": speed_delta,
                 "status": classify_speed_delta(speed_delta),
+                "reference_band": {
+                    "delta_low": DELTA_LOW,
+                    "delta_high": DELTA_HIGH,
+                },
                 "interpretation": "delta>1 means Rust faster than FFI; delta<1 means slower",
             },
         }
