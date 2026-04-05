@@ -971,6 +971,8 @@ mod tests {
         let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
         let dict_len = dict_content.len() as u64;
         let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
         let payload = b"abcdabcdabcdabcd".repeat(128);
 
         let mut output = Vec::new();
@@ -990,6 +992,12 @@ mod tests {
             advertised_window >= dict_len,
             "window_size ({advertised_window}) must cover dictionary history ({dict_len})",
         );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]
