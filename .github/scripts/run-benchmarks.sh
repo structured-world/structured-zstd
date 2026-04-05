@@ -75,6 +75,9 @@ timing_rows = []
 scenario_input_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
 
+DELTA_LOW = 0.99
+DELTA_HIGH = 1.05
+
 def parse_benchmark_name(name):
     parts = name.split("/")
     if len(parts) == 5 and parts[0] == "compress" and parts[3] == "matrix":
@@ -127,6 +130,24 @@ def normalize_impl(impl):
     if impl == "c_ffi":
         return "ffi"
     return impl
+
+def classify_ratio_delta(delta):
+    if delta is None:
+        return "insufficient-data"
+    if delta < DELTA_LOW:
+        return "rust_better_smaller"
+    if delta <= DELTA_HIGH:
+        return "near_parity"
+    return "rust_worse_larger"
+
+def classify_speed_delta(delta):
+    if delta is None:
+        return "insufficient-data"
+    if delta < DELTA_LOW:
+        return "rust_slower"
+    if delta <= DELTA_HIGH:
+        return "near_parity"
+    return "rust_faster"
 
 with open(raw_path) as f:
     for raw_line in f:
@@ -250,6 +271,7 @@ for row in ratios:
         "rust_ratio": row["rust_ratio"],
         "ffi_ratio": row["ffi_ratio"],
         "delta": ratio_delta,
+        "status": classify_ratio_delta(ratio_delta),
     }
 
 speed_index = defaultdict(dict)
@@ -304,6 +326,7 @@ for key in all_keys:
             "rust_ratio": None,
             "ffi_ratio": None,
             "delta": None,
+            "status": "insufficient-data",
         },
     )
 
@@ -328,6 +351,7 @@ for key in all_keys:
                 "rust": ratio_pack["rust_ratio"],
                 "ffi": ratio_pack["ffi_ratio"],
                 "delta_rust_over_ffi": ratio_pack["delta"],
+                "status": ratio_pack["status"],
                 "interpretation": "ratio<1 means Rust compressed output smaller than FFI; ratio>1 means larger",
             },
             "speed": {
@@ -337,6 +361,7 @@ for key in all_keys:
                 "rust_bytes_per_sec": rust_bps,
                 "ffi_bytes_per_sec": ffi_bps,
                 "delta_rust_over_ffi": speed_delta,
+                "status": classify_speed_delta(speed_delta),
                 "interpretation": "speed>1 means Rust faster than FFI; speed<1 means slower",
             },
         }
@@ -451,8 +476,8 @@ delta_lines.extend(
         "",
         "### Rust/FFI ratio delta",
         "",
-        "| Key | Delta |",
-        "| --- | ---: |",
+        "| Key | Delta | Status |",
+        "| --- | ---: | --- |",
     ]
 )
 
@@ -461,7 +486,8 @@ for row in delta_rows:
     delta = row["ratio"]["delta_rust_over_ffi"]
     if delta is None:
         continue
-    delta_lines.append(f"| {key} | {delta:.4f} |")
+    status = row["ratio"]["status"]
+    delta_lines.append(f"| {key} | {delta:.4f} | {status} |")
 
 delta_lines.extend(
     [
@@ -508,8 +534,8 @@ delta_lines.extend(
         "",
         "### Rust/FFI speed delta",
         "",
-        "| Key | Delta |",
-        "| --- | ---: |",
+        "| Key | Delta | Status |",
+        "| --- | ---: | --- |",
     ]
 )
 
@@ -518,7 +544,8 @@ for row in delta_rows:
     delta = row["speed"]["delta_rust_over_ffi"]
     if delta is None:
         continue
-    delta_lines.append(f"| {key} | {delta:.4f} |")
+    status = row["speed"]["status"]
+    delta_lines.append(f"| {key} | {delta:.4f} | {status} |")
 
 with open("benchmark-delta.md", "w") as f:
     f.write("\n".join(delta_lines) + "\n")

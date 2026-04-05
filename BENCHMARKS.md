@@ -98,4 +98,10 @@ Delta interpretation (direct same-run comparison on the same environment):
 - **Ratio delta** (`rust_ratio / ffi_ratio`): lower is better for Rust
 - **Speed delta** (`rust_bytes_per_sec / ffi_bytes_per_sec`): higher is better for Rust
 
+Status labels in `benchmark-delta` are derived directly from the same-run deltas (no environment
+calibration/pre-test coefficients):
+
+- **ratio status**: `rust_better_smaller` when `< 0.99`, `near_parity` when `0.99..=1.05`, `rust_worse_larger` when `> 1.05`
+- **speed status**: `rust_faster` when `> 1.05`, `near_parity` when `0.99..=1.05`, `rust_slower` when `< 0.99`
+
 Criterion also writes its usual detailed estimates under `target/criterion/`.
