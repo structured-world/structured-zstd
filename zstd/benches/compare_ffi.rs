@@ -13,9 +13,11 @@ mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
+use structured_zstd::dictionary::{FastCoverOptions, create_fastcover_raw_dict_from_source};
 use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -195,12 +197,34 @@ fn bench_dictionary(c: &mut Criterion) {
 
         let training_samples = split_training_samples(&scenario.bytes);
         let sample_refs: Vec<&[u8]> = training_samples.iter().map(Vec::as_slice).collect();
+        let training_blob: Vec<u8> = training_samples.concat();
         let total_training_bytes = sample_refs.iter().map(|sample| sample.len()).sum::<usize>();
         let dict_size = dictionary_size_for(scenario.len())
             .min(total_training_bytes.saturating_sub(64))
             .max(256);
-        let train_started = Instant::now();
-        let Ok(dictionary) = zstd::dict::from_samples(&sample_refs, dict_size) else {
+        let fastcover_options = fastcover_fixed_options();
+
+        let rust_train_started = Instant::now();
+        let mut rust_dictionary = Vec::new();
+        let Ok(rust_tuned) = create_fastcover_raw_dict_from_source(
+            Cursor::new(training_blob.as_slice()),
+            &mut rust_dictionary,
+            dict_size,
+            &fastcover_options,
+        ) else {
+            eprintln!(
+                "BENCH_WARN skipping Rust FastCOVER dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
+                scenario.id,
+                sample_refs.len(),
+                total_training_bytes,
+                dict_size
+            );
+            continue;
+        };
+        let rust_train_ms = rust_train_started.elapsed().as_secs_f64() * 1_000.0;
+
+        let ffi_train_started = Instant::now();
+        let Ok(ffi_dictionary) = zstd::dict::from_samples(&sample_refs, dict_size) else {
             eprintln!(
                 "BENCH_WARN skipping dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
                 scenario.id,
@@ -210,20 +234,63 @@ fn bench_dictionary(c: &mut Criterion) {
             );
             continue;
         };
-        let train_ms = train_started.elapsed().as_secs_f64() * 1_000.0;
+        let ffi_train_ms = ffi_train_started.elapsed().as_secs_f64() * 1_000.0;
+
+        if emit_reports {
+            emit_dictionary_training_report(
+                scenario,
+                dict_size,
+                rust_train_ms,
+                ffi_train_ms,
+                rust_dictionary.len(),
+                ffi_dictionary.len(),
+                rust_tuned.score,
+            );
+        }
+
+        let benchmark_name = format!("dict-train/na/{}/{}", scenario.id, "matrix");
+        let mut group = c.benchmark_group(benchmark_name);
+        configure_group(&mut group, scenario);
+        group.throughput(Throughput::Bytes(total_training_bytes as u64));
+
+        group.bench_function("pure_rust", |b| {
+            b.iter(|| {
+                let mut out = Vec::new();
+                let tuned = create_fastcover_raw_dict_from_source(
+                    Cursor::new(training_blob.as_slice()),
+                    &mut out,
+                    dict_size,
+                    &fastcover_options,
+                )
+                .expect("fastcover training should succeed");
+                black_box((out.len(), tuned.score));
+            })
+        });
+
+        group.bench_function("c_ffi", |b| {
+            b.iter(|| {
+                black_box(
+                    zstd::dict::from_samples(&sample_refs, dict_size)
+                        .expect("ffi dictionary training should succeed")
+                        .len(),
+                )
+            })
+        });
+
+        group.finish();
 
         for level in supported_levels() {
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
             let mut with_dict =
-                zstd::bulk::Compressor::with_dictionary(level.ffi_level, &dictionary).unwrap();
+                zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
             if emit_reports {
                 emit_dictionary_report(
                     scenario,
                     level,
-                    dictionary.len(),
-                    train_ms,
+                    ffi_dictionary.len(),
+                    ffi_train_ms,
                     &no_dict_bytes,
                     &with_dict_bytes,
                 );
@@ -242,7 +309,8 @@ fn bench_dictionary(c: &mut Criterion) {
 
             group.bench_function("c_ffi_with_dict", |b| {
                 let mut compressor =
-                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &dictionary).unwrap();
+                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
+                        .unwrap();
                 b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
             });
 
@@ -355,6 +423,29 @@ fn emit_dictionary_report(
     );
 }
 
+fn emit_dictionary_training_report(
+    scenario: &Scenario,
+    dict_bytes_requested: usize,
+    rust_train_ms: f64,
+    ffi_train_ms: f64,
+    rust_dict_bytes: usize,
+    ffi_dict_bytes: usize,
+    rust_fastcover_score: usize,
+) {
+    let escaped_label = escape_report_label(&scenario.label);
+    println!(
+        "REPORT_DICT_TRAIN scenario={} label=\"{}\" dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
+        scenario.id,
+        escaped_label,
+        dict_bytes_requested,
+        rust_train_ms,
+        ffi_train_ms,
+        rust_dict_bytes,
+        ffi_dict_bytes,
+        rust_fastcover_score
+    );
+}
+
 fn split_training_samples(source: &[u8]) -> Vec<Vec<u8>> {
     let sample_size = source.len().div_ceil(16).clamp(256, 8192);
     let mut samples: Vec<Vec<u8>> = source
@@ -382,6 +473,17 @@ fn split_training_samples(source: &[u8]) -> Vec<Vec<u8>> {
 
 fn dictionary_size_for(input_len: usize) -> usize {
     input_len.div_ceil(8).clamp(256, 16 * 1024)
+}
+
+fn fastcover_fixed_options() -> FastCoverOptions {
+    FastCoverOptions {
+        optimize: false,
+        accel: 4,
+        k: 256,
+        d: 8,
+        f: 20,
+        ..FastCoverOptions::default()
+    }
 }
 
 fn escape_report_label(label: &str) -> String {

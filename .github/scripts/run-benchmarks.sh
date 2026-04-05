@@ -17,7 +17,7 @@ BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
 export STRUCTURED_ZSTD_EMIT_REPORT=1
-cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher | tee "$BENCH_RAW_FILE"
+cargo bench --bench compare_ffi -p structured-zstd --features dict_builder -- --output-format bencher | tee "$BENCH_RAW_FILE"
 
 echo "Parsing results..." >&2
 
@@ -37,6 +37,9 @@ MEM_RE = re.compile(
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
+)
+DICT_TRAIN_RE = re.compile(
+    r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
 )
 
 def unescape_report_label(value):
@@ -71,6 +74,7 @@ timings = []
 ratios = []
 memory_rows = []
 dictionary_rows = []
+dictionary_training_rows = []
 timing_rows = []
 scenario_input_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
@@ -99,6 +103,14 @@ def parse_benchmark_name(name):
     if len(parts) == 5 and parts[0] == "compress-dict" and parts[3] == "matrix":
         return {
             "stage": "compress-dict",
+            "level": parts[1],
+            "scenario": parts[2],
+            "source": None,
+            "implementation": parts[4],
+        }
+    if len(parts) == 5 and parts[0] == "dict-train" and parts[3] == "matrix":
+        return {
+            "stage": "dict-train",
             "level": parts[1],
             "scenario": parts[2],
             "source": None,
@@ -227,6 +239,38 @@ with open(raw_path) as f:
                 "ffi_no_dict_ratio": float(ffi_no_dict_ratio),
                 "ffi_with_dict_ratio": float(ffi_with_dict_ratio),
             })
+            continue
+
+        dict_train_match = DICT_TRAIN_RE.match(line)
+        if dict_train_match:
+            (
+                scenario,
+                label,
+                dict_bytes_requested,
+                rust_train_ms,
+                ffi_train_ms,
+                rust_dict_bytes,
+                ffi_dict_bytes,
+                rust_fastcover_score,
+            ) = dict_train_match.groups()
+            label = unescape_report_label(label)
+            delta = None
+            rust_train_ms_float = float(rust_train_ms)
+            ffi_train_ms_float = float(ffi_train_ms)
+            if rust_train_ms_float > 0.0:
+                delta = ffi_train_ms_float / rust_train_ms_float
+            dictionary_training_rows.append({
+                "scenario": scenario,
+                "label": label,
+                "dict_bytes_requested": int(dict_bytes_requested),
+                "rust_train_ms": rust_train_ms_float,
+                "ffi_train_ms": ffi_train_ms_float,
+                "rust_dict_bytes": int(rust_dict_bytes),
+                "ffi_dict_bytes": int(ffi_dict_bytes),
+                "rust_fastcover_score": int(rust_fastcover_score),
+                "delta_rust_over_ffi": delta,
+                "status": classify_speed_delta(delta),
+            })
 
 if not benchmark_results:
     print("ERROR: No benchmark results parsed!", file=sys.stderr)
@@ -245,6 +289,12 @@ if not memory_rows:
 
 if not dictionary_rows:
     print("WARN: No REPORT_DICT lines parsed; dictionary section will be empty.", file=sys.stderr)
+
+if not dictionary_training_rows:
+    print(
+        "WARN: No REPORT_DICT_TRAIN lines parsed; dictionary training section will be empty.",
+        file=sys.stderr,
+    )
 
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)
@@ -325,7 +375,11 @@ for key in all_keys:
     speed_delta = (
         rust_bps / ffi_bps
         if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
-        else None
+        else (
+            ffi_ms / rust_ms
+            if (rust_ms is not None and ffi_ms is not None and rust_ms > 0.0)
+            else None
+        )
     )
 
     has_comparable_ratio = (
@@ -368,7 +422,7 @@ for key in all_keys:
                     "delta_low": DELTA_LOW,
                     "delta_high": DELTA_HIGH,
                 },
-                "interpretation": "delta>1 means Rust faster than FFI; delta<1 means slower",
+                "interpretation": "delta>1 means Rust faster than FFI; throughput ratio uses rust_bytes_per_sec/ffi_bytes_per_sec when available, otherwise fallback is ffi_ms_per_iter/rust_ms_per_iter",
             },
         }
     )
@@ -419,6 +473,22 @@ for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["lev
     label = markdown_table_escape(row["label"])
     lines.append(
         f'| {row["scenario"]} | {label} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
+    )
+
+lines.extend([
+    "",
+    "## Dictionary Training (Rust FastCOVER vs C FFI)",
+    "",
+    "| Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+])
+
+for row in sorted(dictionary_training_rows, key=lambda item: item["scenario"]):
+    label = markdown_table_escape(row["label"])
+    delta = row["delta_rust_over_ffi"]
+    delta_cell = f"{delta:.4f}" if delta is not None else "n/a"
+    lines.append(
+        f'| {row["scenario"]} | {label} | {row["dict_bytes_requested"]} | {row["rust_train_ms"]:.3f} | {row["ffi_train_ms"]:.3f} | {row["rust_dict_bytes"]} | {row["ffi_dict_bytes"]} | {row["rust_fastcover_score"]} | {delta_cell} | {row["status"]} |'
     )
 
 lines.extend([
@@ -502,7 +572,7 @@ delta_lines.extend(
         "",
         "## Speed pack",
         "",
-        "Interpretation: higher speed is better (`rust_bytes_per_sec / ffi_bytes_per_sec`).",
+        "Interpretation: higher speed is better; delta uses `rust_bytes_per_sec / ffi_bytes_per_sec` when throughput exists, otherwise fallback is `ffi_ms_per_iter / rust_ms_per_iter`.",
         "",
         "### Rust speed",
         "",
@@ -564,6 +634,7 @@ print(f"Wrote {len(benchmark_results)} timing results to benchmark-results.json"
 print(f"Wrote {len(ratios)} ratio rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(memory_rows)} memory rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(dictionary_rows)} dictionary rows to benchmark-report.md", file=sys.stderr)
+print(f"Wrote {len(dictionary_training_rows)} dictionary training rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.json", file=sys.stderr)
 print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.md", file=sys.stderr)
 PYEOF

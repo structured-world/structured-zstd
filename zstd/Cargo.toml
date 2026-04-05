@@ -52,6 +52,7 @@ harness = false
 [[bench]]
 name = "compare_ffi"
 harness = false
+required-features = ["dict_builder"]
 
 [[bench]]
 name = "bitstream"
