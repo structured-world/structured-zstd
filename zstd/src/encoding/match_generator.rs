@@ -1514,15 +1514,15 @@ impl DfastMatchGenerator {
 
     fn hash4(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
-        self.hash_bits(value)
+        self.hash_index(value)
     }
 
     fn hash8(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
-        self.hash_bits(value)
+        self.hash_index(value)
     }
 
-    fn hash_bits(&self, value: u64) -> usize {
+    fn hash_index(&self, value: u64) -> usize {
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
         ((value.wrapping_mul(PRIME)) >> (64 - self.hash_bits)) as usize
     }

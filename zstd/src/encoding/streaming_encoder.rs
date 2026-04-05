@@ -1033,6 +1033,10 @@ mod tests {
             .set_source_size_hint(payload.len() as u64)
             .unwrap();
         with_hint.write_all(payload.as_slice()).unwrap();
+        let late_hint_err = with_hint
+            .set_source_size_hint(payload.len() as u64)
+            .unwrap_err();
+        assert_eq!(late_hint_err.kind(), ErrorKind::InvalidInput);
         let with_hint_frame = with_hint.finish().unwrap();
         let with_hint_header =
             crate::decoding::frame::read_frame_header(with_hint_frame.as_slice())
