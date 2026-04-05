@@ -23,21 +23,66 @@
 //    the frequency of w in the reservoir using a rolling karp-rabin hash
 //  - The score of a segment is the sum of `f(w)` called on every kmer within the segment
 mod cover;
+mod fastcover;
 mod frequency;
 mod reservoir;
 
+use crate::bit_io::BitWriter;
+use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
+use crate::fse::fse_encoder;
+use crate::huff0::HuffmanTable as HuffmanDecoderTable;
+use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 use crate::dictionary::reservoir::create_sample;
-use alloc::vec;
 use core::cmp::Reverse;
 use cover::*;
+pub use fastcover::{
+    DEFAULT_D_CANDIDATES, DEFAULT_F_CANDIDATES, DEFAULT_K_CANDIDATES, FastCoverParams,
+    FastCoverTuned,
+};
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
+    format,
     fs::{self, File},
-    io::{self, BufReader, Read},
+    io::{self, Read},
     path::{Path, PathBuf},
     vec::Vec,
 };
+
+/// Tuning knobs for pure-Rust FastCOVER training.
+#[derive(Debug, Clone)]
+pub struct FastCoverOptions {
+    pub optimize: bool,
+    pub split_point: f64,
+    pub accel: usize,
+    pub k: usize,
+    pub d: usize,
+    pub f: u32,
+    pub k_candidates: Vec<usize>,
+    pub d_candidates: Vec<usize>,
+    pub f_candidates: Vec<u32>,
+}
+
+impl Default for FastCoverOptions {
+    fn default() -> Self {
+        Self {
+            optimize: true,
+            split_point: 0.75,
+            accel: 1,
+            k: 256,
+            d: 8,
+            f: 20,
+            k_candidates: DEFAULT_K_CANDIDATES.to_vec(),
+            d_candidates: DEFAULT_D_CANDIDATES.to_vec(),
+            f_candidates: DEFAULT_F_CANDIDATES.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FinalizeOptions {
+    pub dict_id: Option<u32>,
+}
 
 /// A set of values that are used during dictionary construction.
 ///
@@ -125,22 +170,45 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 ///
 /// This function uses `BufRead` internally, the provided reader need not be buffered.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
-    source: R,
+    mut source: R,
     source_size: usize,
     output: &mut W,
     dict_size: usize,
 ) {
+    if source_size == 0 || dict_size == 0 {
+        return;
+    }
+    let mut all = Vec::with_capacity(source_size);
+    source
+        .read_to_end(&mut all)
+        .expect("can read full source for dictionary training");
+    if all.is_empty() {
+        return;
+    }
+
+    if all.len() < K {
+        let keep = usize::min(all.len(), dict_size);
+        output
+            .write_all(&all[all.len() - keep..])
+            .expect("can write tiny dictionary");
+        return;
+    }
+
+    let source_size = all.len();
     vprintln!("create_dict: creating {dict_size} byte dict from {source_size} byte source");
-    let mut buffered_source = BufReader::with_capacity(128_000, source);
 
     let params = DictParams { segment_size: 2048 };
-    let num_segments = source_size / params.segment_size as usize;
+    let num_segments = usize::max(1, source_size / params.segment_size as usize);
     // According to 4. Experiments - Varying Reservoir Sampler Thresholds,
     // setting reservoir size to collection size / min{collection size / (2 * number of segments),
     // 256} was effective
-    let sample_size = source_size / usize::min(source_size / (2 * num_segments), 256);
+    let denom = usize::max(1, source_size / (2 * num_segments));
+    let sample_scale = usize::max(1, usize::min(denom, 256));
+    let mut sample_size = source_size / sample_scale;
+    sample_size = usize::max(sample_size, usize::min(source_size, 16));
     vprintln!("create_dict: creating {sample_size} byte sample of collection");
-    let collection_sample = create_sample(&mut buffered_source, sample_size);
+    let mut sample_reader = all.as_slice();
+    let collection_sample = create_sample(&mut sample_reader, sample_size);
 
     // A collection of segments to be used in the final dictionary.
     //
@@ -151,21 +219,15 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let (_, epoch_size) = compute_epoch_info(&params, dict_size, source_size / K);
     let num_epochs = source_size / epoch_size;
     vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
-    //let mut current_epoch = vec![0; epoch_size];
-    let mut current_epoch = vec![0; 100];
     let mut epoch_counter = 0;
     let mut ctx = Context {
         frequencies: HashMap::with_capacity(epoch_size / K),
     };
     // Score each segment in the epoch and select the highest scoring segment
     // for the pool
-    while buffered_source
-        .read(&mut current_epoch)
-        .expect("can read input")
-        != 0
-    {
+    for epoch in all.chunks(epoch_size) {
         epoch_counter += 1;
-        let best_segment = pick_best_segment(&params, &mut ctx, &collection_sample);
+        let best_segment = pick_best_segment(&params, &mut ctx, epoch, &collection_sample);
         vprintln!(
             "\tcreate_dict: epoch {epoch_counter}/{num_epochs} has best segment score {}",
             best_segment.score
@@ -184,5 +246,280 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
         output
             .write_all(&segment.0.raw)
             .expect("can write to output");
+    }
+}
+
+fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stats = if sample_data.len() >= 2 {
+        sample_data.to_vec()
+    } else {
+        raw_content.to_vec()
+    };
+    if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
+        stats = (0u8..=255).collect();
+    }
+
+    let table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    let mut writer = BitWriter::new();
+    let mut encoder = HuffmanEncoder::new(&table, &mut writer);
+    encoder.encode(&[stats[0]], true);
+    let encoded = writer.dump();
+
+    let mut decoder = HuffmanDecoderTable::new();
+    let table_size = decoder
+        .build_decoder(encoded.as_slice())
+        .map_err(|e| io::Error::other(format!("failed to decode generated huffman table: {e}")))?;
+    Ok(encoded[..table_size as usize].to_vec())
+}
+
+fn serialize_fse_table(table: &fse_encoder::FSETable) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    table.write_table(&mut writer);
+    writer.dump()
+}
+
+fn derive_dict_id(raw_content: &[u8]) -> u32 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in raw_content {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let compliant = (h % ((1u64 << 31) - 32768)) + 32768;
+    compliant as u32
+}
+
+/// Finalize raw dictionary content into a full zstd dictionary binary
+/// (`magic + dict_id + entropy tables + offset history + content`).
+pub fn finalize_raw_dict(
+    raw_content: &[u8],
+    sample_data: &[u8],
+    dict_size: usize,
+    options: FinalizeOptions,
+) -> io::Result<Vec<u8>> {
+    if raw_content.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw dictionary content must not be empty",
+        ));
+    }
+    let mut out = Vec::with_capacity(dict_size.max(256));
+    out.extend_from_slice(&DICT_MAGIC_NUM);
+    let dict_id = options.dict_id.unwrap_or_else(|| derive_dict_id(raw_content));
+    out.extend_from_slice(&dict_id.to_le_bytes());
+    out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
+    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_of_table()).as_slice());
+    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_ml_table()).as_slice());
+    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_ll_table()).as_slice());
+
+    // Repeat offsets: keep default bootstrap history.
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+
+    let min_content_size = 8usize;
+    let max_content_budget = dict_size.saturating_sub(out.len());
+    if max_content_budget < min_content_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dictionary size too small to fit header and offset history",
+        ));
+    }
+
+    let content = if raw_content.len() > max_content_budget {
+        &raw_content[raw_content.len() - max_content_budget..]
+    } else {
+        raw_content
+    };
+    if content.len() < min_content_size {
+        out.resize(out.len() + (min_content_size - content.len()), 0);
+    }
+    out.extend_from_slice(content);
+    Ok(out)
+}
+
+/// Train a raw FastCOVER dictionary from a source stream.
+pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
+    mut source: R,
+    output: &mut W,
+    dict_size: usize,
+    options: &FastCoverOptions,
+) -> io::Result<FastCoverTuned> {
+    let mut sample = Vec::new();
+    source.read_to_end(&mut sample)?;
+    if sample.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source stream is empty",
+        ));
+    }
+
+    let (dict, tuned) = if options.optimize {
+        let (dict, tuned) = fastcover::optimize_fastcover_raw(
+            sample.as_slice(),
+            dict_size,
+            options.split_point,
+            options.accel,
+            options.d_candidates.as_slice(),
+            options.f_candidates.as_slice(),
+            options.k_candidates.as_slice(),
+        );
+        (dict, tuned)
+    } else {
+        let params = FastCoverParams {
+            k: options.k,
+            d: options.d,
+            f: options.f,
+            accel: options.accel,
+        };
+        let dict = fastcover::train_fastcover_raw(sample.as_slice(), dict_size, params);
+        (
+            dict,
+            FastCoverTuned {
+                k: options.k,
+                d: options.d,
+                f: options.f,
+                accel: options.accel,
+                score: 0,
+            },
+        )
+    };
+    output.write_all(dict.as_slice())?;
+    Ok(tuned)
+}
+
+/// Train and finalize a FastCOVER dictionary in pure Rust.
+pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
+    mut source: R,
+    output: &mut W,
+    dict_size: usize,
+    fastcover: &FastCoverOptions,
+    finalize: FinalizeOptions,
+) -> io::Result<FastCoverTuned> {
+    let mut sample = Vec::new();
+    source.read_to_end(&mut sample)?;
+    if sample.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source stream is empty",
+        ));
+    }
+
+    let (raw_dict, tuned) = if fastcover.optimize {
+        fastcover::optimize_fastcover_raw(
+            sample.as_slice(),
+            dict_size,
+            fastcover.split_point,
+            fastcover.accel,
+            fastcover.d_candidates.as_slice(),
+            fastcover.f_candidates.as_slice(),
+            fastcover.k_candidates.as_slice(),
+        )
+    } else {
+        let params = FastCoverParams {
+            k: fastcover.k,
+            d: fastcover.d,
+            f: fastcover.f,
+            accel: fastcover.accel,
+        };
+        (
+            fastcover::train_fastcover_raw(sample.as_slice(), dict_size, params),
+            FastCoverTuned {
+                k: fastcover.k,
+                d: fastcover.d,
+                f: fastcover.f,
+                accel: fastcover.accel,
+                score: 0,
+            },
+        )
+    };
+
+    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample.as_slice(), dict_size, finalize)?;
+    output.write_all(finalized.as_slice())?;
+    Ok(tuned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoding::Dictionary;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use std::io::Cursor;
+
+    fn training_data() -> Vec<u8> {
+        let mut data = Vec::new();
+        for i in 0..512u32 {
+            data.extend_from_slice(
+                format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n")
+                    .as_bytes(),
+            );
+        }
+        data
+    }
+
+    #[test]
+    fn finalize_raw_dict_roundtrips_with_ffi_decoder() {
+        let sample = training_data();
+        let raw = fastcover::train_fastcover_raw(
+            sample.as_slice(),
+            4096,
+            FastCoverParams {
+                k: 256,
+                d: 8,
+                f: 20,
+                accel: 1,
+            },
+        );
+        let finalized = finalize_raw_dict(
+            raw.as_slice(),
+            sample.as_slice(),
+            4096,
+            FinalizeOptions::default(),
+        )
+        .expect("finalization should succeed");
+        let parsed = Dictionary::decode_dict(finalized.as_slice())
+            .expect("finalized dictionary should parse");
+        assert!(!parsed.dict_content.is_empty());
+
+        let mut payload = Vec::new();
+        for idx in 0..96u32 {
+            payload.extend_from_slice(
+                format!("tenant=demo op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n").as_bytes(),
+            );
+        }
+
+        let mut compressed = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor
+            .set_dictionary(parsed)
+            .expect("dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut ffi_decoder = zstd::bulk::Decompressor::with_dictionary(finalized.as_slice())
+            .expect("ffi decoder should accept finalized dictionary");
+        let mut decoded = Vec::with_capacity(payload.len());
+        let written = ffi_decoder
+            .decompress_to_buffer(compressed.as_slice(), &mut decoded)
+            .expect("ffi decoder should decode payload");
+        assert_eq!(written, payload.len());
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn create_fastcover_dict_from_source_writes_non_empty_output() {
+        let sample = training_data();
+        let mut out = Vec::new();
+        let tuned = create_fastcover_dict_from_source(
+            Cursor::new(sample.as_slice()),
+            &mut out,
+            4096,
+            &FastCoverOptions::default(),
+            FinalizeOptions::default(),
+        )
+        .expect("fastcover+finalize should succeed");
+        assert!(!out.is_empty());
+        assert!(tuned.k > 0);
+        assert!(tuned.d > 0);
     }
 }

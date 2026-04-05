@@ -57,3 +57,8 @@ harness = false
 name = "bitstream"
 harness = false
 required-features = ["bench_internals"]
+
+[[bench]]
+name = "dict_builder_fastcover"
+harness = false
+required-features = ["dict_builder"]
