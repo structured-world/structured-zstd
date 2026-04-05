@@ -133,6 +133,15 @@ jobs:
       - name: Run benchmarks
         run: bash .github/scripts/run-benchmarks.sh
 
+      - name: Upload benchmark delta artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-delta
+          path: |
+            benchmark-delta.json
+            benchmark-delta.md
+          if-no-files-found: error
+
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@v1

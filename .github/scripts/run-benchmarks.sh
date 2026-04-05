@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+from collections import defaultdict
 
 BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
 REPORT_RE = re.compile(
@@ -70,7 +71,71 @@ timings = []
 ratios = []
 memory_rows = []
 dictionary_rows = []
+timing_rows = []
+scenario_input_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
+
+DELTA_LOW = 0.99
+DELTA_HIGH = 1.05
+
+def parse_benchmark_name(name):
+    parts = name.split("/")
+    if len(parts) == 5 and parts[0] == "compress" and parts[3] == "matrix":
+        return {
+            "stage": "compress",
+            "level": parts[1],
+            "scenario": parts[2],
+            "source": None,
+            "implementation": parts[4],
+        }
+    if len(parts) == 6 and parts[0] == "decompress" and parts[4] == "matrix":
+        return {
+            "stage": "decompress",
+            "level": parts[1],
+            "scenario": parts[2],
+            "source": parts[3],
+            "implementation": parts[5],
+        }
+    if len(parts) == 5 and parts[0] == "compress-dict" and parts[3] == "matrix":
+        return {
+            "stage": "compress-dict",
+            "level": parts[1],
+            "scenario": parts[2],
+            "source": None,
+            "implementation": parts[4],
+        }
+    raise ValueError(f"Unsupported benchmark name format: {name} (parts={parts})")
+
+def canonical_key(stage, scenario, level, source):
+    params = [f"stage={stage}", f"level={level}"]
+    if source:
+        params.append(f"source={source}")
+    return f"{scenario} + {', '.join(params)}"
+
+def normalize_impl(impl):
+    if impl == "pure_rust":
+        return "rust"
+    if impl == "c_ffi":
+        return "ffi"
+    return impl
+
+def classify_ratio_delta(delta):
+    if delta is None:
+        return "insufficient-data"
+    if delta < DELTA_LOW:
+        return "rust_better_smaller"
+    if delta <= DELTA_HIGH:
+        return "near_parity"
+    return "rust_worse_larger"
+
+def classify_speed_delta(delta):
+    if delta is None:
+        return "insufficient-data"
+    if delta < DELTA_LOW:
+        return "rust_slower"
+    if delta <= DELTA_HIGH:
+        return "near_parity"
+    return "rust_faster"
 
 with open(raw_path) as f:
     for raw_line in f:
@@ -87,6 +152,16 @@ with open(raw_path) as f:
                 "value": round(ms, 3),
             })
             timings.append((name, ms))
+            parsed = parse_benchmark_name(name)
+            timing_rows.append({
+                "name": name,
+                "stage": parsed["stage"],
+                "level": parsed["level"],
+                "scenario": parsed["scenario"],
+                "source": parsed["source"],
+                "implementation": normalize_impl(parsed["implementation"]),
+                "ms_per_iter": ms,
+            })
             continue
 
         report_match = REPORT_RE.match(line)
@@ -103,6 +178,7 @@ with open(raw_path) as f:
                 "rust_ratio": float(rust_ratio),
                 "ffi_ratio": float(ffi_ratio),
             })
+            scenario_input_bytes[scenario] = int(input_bytes)
             continue
 
         mem_match = MEM_RE.match(line)
@@ -173,6 +249,133 @@ if not dictionary_rows:
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)
 
+ratio_index = {}
+for row in ratios:
+    key = canonical_key("compress", row["scenario"], row["level"], None)
+    ratio_delta = None
+    if row["ffi_ratio"] > 0.0:
+        ratio_delta = row["rust_ratio"] / row["ffi_ratio"]
+    ratio_index[key] = {
+        "meta": {
+            "stage": "compress",
+            "scenario": row["scenario"],
+            "level": row["level"],
+            "source": None,
+        },
+        "rust_ratio": row["rust_ratio"],
+        "ffi_ratio": row["ffi_ratio"],
+        "delta": ratio_delta,
+        "status": classify_ratio_delta(ratio_delta),
+    }
+
+speed_index = defaultdict(dict)
+key_meta = {}
+for row in timing_rows:
+    key = canonical_key(row["stage"], row["scenario"], row["level"], row["source"])
+    key_meta[key] = {
+        "stage": row["stage"],
+        "scenario": row["scenario"],
+        "level": row["level"],
+        "source": row["source"],
+    }
+    impl = row["implementation"]
+    speed_index[key][impl] = {
+        "name": row["name"],
+        "ms_per_iter": row["ms_per_iter"],
+    }
+
+delta_rows = []
+all_keys = sorted(set(key_meta.keys()) | set(ratio_index.keys()))
+for key in all_keys:
+    ratio_pack = ratio_index.get(
+        key,
+        {
+            "meta": None,
+            "rust_ratio": None,
+            "ffi_ratio": None,
+            "delta": None,
+            "status": "insufficient-data",
+        },
+    )
+    meta = key_meta.get(key) or ratio_pack["meta"]
+    stage = meta["stage"] if meta else "compress"
+    scenario = meta["scenario"] if meta else key.split(" + ")[0]
+    level = meta["level"] if meta else "unknown"
+    source = meta["source"] if meta else None
+    input_bytes = scenario_input_bytes.get(scenario)
+
+    speed_series = {}
+    for impl_name, impl_row in speed_index.get(key, {}).items():
+        ms_value = impl_row["ms_per_iter"]
+        bps_value = None
+        if input_bytes is not None and ms_value is not None and ms_value > 0.0:
+            bps_value = input_bytes / (ms_value / 1000.0)
+        speed_series[impl_name] = {
+            "benchmark_name": impl_row["name"],
+            "ms_per_iter": ms_value,
+            "bytes_per_sec": bps_value,
+        }
+
+    rust_timing = speed_series.get("rust")
+    ffi_timing = speed_series.get("ffi")
+    rust_ms = rust_timing["ms_per_iter"] if rust_timing else None
+    ffi_ms = ffi_timing["ms_per_iter"] if ffi_timing else None
+    rust_bps = rust_timing["bytes_per_sec"] if rust_timing else None
+    ffi_bps = ffi_timing["bytes_per_sec"] if ffi_timing else None
+    speed_delta = (
+        rust_bps / ffi_bps
+        if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
+        else None
+    )
+
+    has_comparable_ratio = (
+        ratio_pack["rust_ratio"] is not None and ratio_pack["ffi_ratio"] is not None
+    )
+    has_comparable_speed = rust_timing is not None and ffi_timing is not None
+    if not has_comparable_ratio and not has_comparable_speed:
+        continue
+
+    delta_rows.append(
+        {
+            "key": key,
+            "scenario": scenario,
+            "params": {
+                "stage": stage,
+                "level": level,
+                "source": source,
+            },
+            "input_bytes": input_bytes,
+            "ratio": {
+                "rust": ratio_pack["rust_ratio"],
+                "ffi": ratio_pack["ffi_ratio"],
+                "delta_rust_over_ffi": ratio_pack["delta"],
+                "status": ratio_pack["status"],
+                "reference_band": {
+                    "delta_low": DELTA_LOW,
+                    "delta_high": DELTA_HIGH,
+                },
+                "interpretation": "delta<1 means Rust compressed output smaller than FFI; delta>1 means larger",
+            },
+            "speed": {
+                "series": speed_series,
+                "rust_ms_per_iter": rust_ms,
+                "ffi_ms_per_iter": ffi_ms,
+                "rust_bytes_per_sec": rust_bps,
+                "ffi_bytes_per_sec": ffi_bps,
+                "delta_rust_over_ffi": speed_delta,
+                "status": classify_speed_delta(speed_delta),
+                "reference_band": {
+                    "delta_low": DELTA_LOW,
+                    "delta_high": DELTA_HIGH,
+                },
+                "interpretation": "delta>1 means Rust faster than FFI; delta<1 means slower",
+            },
+        }
+    )
+
+with open("benchmark-delta.json", "w") as f:
+    json.dump(delta_rows, f, indent=2)
+
 lines = [
     "# Benchmark Report",
     "",
@@ -232,8 +435,135 @@ for name, ms in sorted(timings):
 with open("benchmark-report.md", "w") as f:
     f.write("\n".join(lines) + "\n")
 
+delta_lines = [
+    "# Benchmark Delta Report",
+    "",
+    "Generated by `.github/scripts/run-benchmarks.sh` from `cargo bench --bench compare_ffi`.",
+    "",
+    "## Ratio pack",
+    "",
+    "Interpretation: lower ratio is better (smaller compressed output).",
+    "",
+    "### Rust compression ratio",
+    "",
+    "| Key | Rust ratio |",
+    "| --- | ---: |",
+]
+
+def format_ratio(value):
+    return f"{value:.6g}"
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    rust_ratio = row["ratio"]["rust"]
+    if rust_ratio is None:
+        continue
+    delta_lines.append(f"| {key} | {format_ratio(rust_ratio)} |")
+
+delta_lines.extend(
+    [
+        "",
+        "### FFI compression ratio",
+        "",
+        "| Key | FFI ratio |",
+        "| --- | ---: |",
+    ]
+)
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    ffi_ratio = row["ratio"]["ffi"]
+    if ffi_ratio is None:
+        continue
+    delta_lines.append(f"| {key} | {format_ratio(ffi_ratio)} |")
+
+delta_lines.extend(
+    [
+        "",
+        "### Rust/FFI ratio delta",
+        "",
+        f"Reference band: `{DELTA_LOW:.2f}–{DELTA_HIGH:.2f}` (near parity).",
+        "",
+        "| Key | Delta | Status |",
+        "| --- | ---: | --- |",
+    ]
+)
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    delta = row["ratio"]["delta_rust_over_ffi"]
+    if delta is None:
+        continue
+    status = row["ratio"]["status"]
+    delta_lines.append(f"| {key} | {delta:.4f} | {status} |")
+
+delta_lines.extend(
+    [
+        "",
+        "## Speed pack",
+        "",
+        "Interpretation: higher speed is better (`rust_bytes_per_sec / ffi_bytes_per_sec`).",
+        "",
+        "### Rust speed",
+        "",
+        "| Key | Rust bytes/sec | Rust ms/iter |",
+        "| --- | ---: | ---: |",
+    ]
+)
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    bps = row["speed"]["rust_bytes_per_sec"]
+    ms = row["speed"]["rust_ms_per_iter"]
+    if bps is None or ms is None:
+        continue
+    delta_lines.append(f"| {key} | {bps:.2f} | {ms:.3f} |")
+
+delta_lines.extend(
+    [
+        "",
+        "### FFI speed",
+        "",
+        "| Key | FFI bytes/sec | FFI ms/iter |",
+        "| --- | ---: | ---: |",
+    ]
+)
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    bps = row["speed"]["ffi_bytes_per_sec"]
+    ms = row["speed"]["ffi_ms_per_iter"]
+    if bps is None or ms is None:
+        continue
+    delta_lines.append(f"| {key} | {bps:.2f} | {ms:.3f} |")
+
+delta_lines.extend(
+    [
+        "",
+        "### Rust/FFI speed delta",
+        "",
+        f"Reference band: `{DELTA_LOW:.2f}–{DELTA_HIGH:.2f}` (near parity).",
+        "",
+        "| Key | Delta | Status |",
+        "| --- | ---: | --- |",
+    ]
+)
+
+for row in delta_rows:
+    key = markdown_table_escape(row["key"])
+    delta = row["speed"]["delta_rust_over_ffi"]
+    if delta is None:
+        continue
+    status = row["speed"]["status"]
+    delta_lines.append(f"| {key} | {delta:.4f} | {status} |")
+
+with open("benchmark-delta.md", "w") as f:
+    f.write("\n".join(delta_lines) + "\n")
+
 print(f"Wrote {len(benchmark_results)} timing results to benchmark-results.json", file=sys.stderr)
 print(f"Wrote {len(ratios)} ratio rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(memory_rows)} memory rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(dictionary_rows)} dictionary rows to benchmark-report.md", file=sys.stderr)
+print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.json", file=sys.stderr)
+print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.md", file=sys.stderr)
 PYEOF

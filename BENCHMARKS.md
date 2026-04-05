@@ -86,5 +86,22 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
   - input+output buffer size estimate tables (`REPORT_MEM`)
   - dictionary compression tables (`REPORT_DICT`)
   - timing rows for all benchmark functions
+- `benchmark-delta.json` with canonical `(scenario + params)` rows including:
+  - raw Rust/FFI ratio values and `rust/ffi` ratio delta
+  - raw Rust/FFI speed values (`bytes/sec`) and `rust/ffi` speed delta
+- `benchmark-delta.md` with two packs:
+  - Ratio pack: Rust ratio, FFI ratio, Rust/FFI ratio delta
+  - Speed pack: Rust speed, FFI speed, Rust/FFI speed delta
+
+Delta interpretation (direct same-run comparison on the same environment):
+
+- **Ratio delta** (`rust_ratio / ffi_ratio`): lower is better for Rust
+- **Speed delta** (`rust_bytes_per_sec / ffi_bytes_per_sec`): higher is better for Rust
+
+Status labels in `benchmark-delta` are derived directly from the same-run deltas (no environment
+calibration/pre-test coefficients):
+
+- **ratio status**: `rust_better_smaller` when `< 0.99`, `near_parity` when `0.99..=1.05`, `rust_worse_larger` when `> 1.05`
+- **speed status**: `rust_faster` when `> 1.05`, `near_parity` when `0.99..=1.05`, `rust_slower` when `< 0.99`
 
 Criterion also writes its usual detailed estimates under `target/criterion/`.
