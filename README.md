@@ -54,7 +54,8 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 
 ### Dictionary Generation
 
-When the `dict_builder` feature is enabled, the `dictionary` module can create raw content dictionaries. Within 0.2% of the official implementation on the `github-users` sample set.
+When the `dict_builder` feature is enabled, the `dictionary` module can create raw content dictionaries.  
+When `dict_builder_ffi` is also enabled, it additionally exposes C-zstd-backed COVER/FastCOVER training (including parameter optimization) and raw-content dictionary finalization into full zstd dictionary format.
 
 ## Benchmarking
 
