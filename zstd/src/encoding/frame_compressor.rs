@@ -164,6 +164,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ///
     /// When set, the encoder selects smaller hash tables and windows for
     /// small inputs, matching the C zstd source-size-class behavior.
+    ///
+    /// When dictionary priming is active, the effective matcher hint also
+    /// includes primed dictionary history bytes in addition to frame payload
+    /// bytes so the advertised window can cover both.
     /// Must be called before [`compress`](Self::compress).
     pub fn set_source_size_hint(&mut self, size: u64) {
         self.source_size_hint = Some(size);
@@ -994,6 +998,8 @@ mod tests {
         let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
         let dict_len = dict_content.len() as u64;
         let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
         let payload = b"abcd".repeat(1024); // 4 KiB payload
         let payload_len = payload.len() as u64;
 
@@ -1014,6 +1020,12 @@ mod tests {
             advertised_window >= dict_len + payload_len,
             "window_size ({advertised_window}) must cover dictionary ({dict_len}) + payload ({payload_len})"
         );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]
