@@ -28,9 +28,13 @@ mod frequency;
 mod reservoir;
 
 use crate::bit_io::BitWriter;
+use crate::blocks::sequence_section::{
+    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
+};
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
+use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
 use crate::dictionary::reservoir::create_sample;
-use crate::fse::fse_encoder;
+use crate::fse::fse_encoder::{self, build_table_from_data};
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 use core::cmp::Reverse;
@@ -164,9 +168,8 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// The completed dictionary is written to `output`.
 ///
 /// - `source` will be used as training data for the entire dictionary.
-/// - `source_size` influences how the data is divided and sampled and is measured
-///   in bytes. While this does not need to be exact, estimates should attempt to be
-///   larger than the actual collection size.
+/// - `source_size` is used only as a preallocation hint before reading `source` and
+///   does not affect sampling once all data has been buffered.
 /// - `output` is where the completed dictionary will be written.
 /// - `dict_size` determines how large the complete dictionary should be. The completed
 ///   dictionary will be this size or smaller.
@@ -298,6 +301,78 @@ fn serialize_fse_table(table: &fse_encoder::FSETable) -> Vec<u8> {
     writer.dump()
 }
 
+fn bounded_fse_symbols(data: &[u8], max_symbol: u8) -> Vec<u8> {
+    let modulo = u16::from(max_symbol) + 1;
+    if data.is_empty() {
+        return Vec::from([0u8]);
+    }
+    if data.len() <= MAX_HUFFMAN_STATS_BYTES {
+        return data
+            .iter()
+            .map(|b| (u16::from(*b) % modulo) as u8)
+            .collect();
+    }
+
+    let mut out = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
+    for i in 0..MAX_HUFFMAN_STATS_BYTES {
+        let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
+        out.push((u16::from(data[idx]) % modulo) as u8);
+    }
+    out
+}
+
+fn serialize_fse_table_from_corpus(
+    sample_data: &[u8],
+    raw_content: &[u8],
+    max_symbol: u8,
+    max_log: u8,
+) -> Vec<u8> {
+    let source = if sample_data.is_empty() {
+        raw_content
+    } else {
+        sample_data
+    };
+    let symbols = bounded_fse_symbols(source, max_symbol);
+    let table = build_table_from_data(symbols.into_iter(), max_log, false);
+    serialize_fse_table(&table)
+}
+
+fn finalized_content_budget(
+    sample_data: &[u8],
+    raw_fallback: &[u8],
+    dict_size: usize,
+) -> io::Result<usize> {
+    let min_content_size = 8usize;
+    let huf_len = serialize_huffman_table(sample_data, raw_fallback)?.len();
+    let of_len =
+        serialize_fse_table_from_corpus(sample_data, raw_fallback, MAX_OFFSET_CODE, OF_MAX_LOG)
+            .len();
+    let ml_len = serialize_fse_table_from_corpus(
+        sample_data,
+        raw_fallback,
+        MAX_MATCH_LENGTH_CODE,
+        ML_MAX_LOG,
+    )
+    .len();
+    let ll_len = serialize_fse_table_from_corpus(
+        sample_data,
+        raw_fallback,
+        MAX_LITERAL_LENGTH_CODE,
+        LL_MAX_LOG,
+    )
+    .len();
+
+    let header_len = DICT_MAGIC_NUM.len() + 4 + huf_len + of_len + ml_len + ll_len + 12;
+    let max_content_budget = dict_size.saturating_sub(header_len);
+    if max_content_budget < min_content_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dictionary size too small to fit header and offset history",
+        ));
+    }
+    Ok(max_content_budget)
+}
+
 fn derive_dict_id(raw_content: &[u8]) -> u32 {
     let mut h = 0xcbf29ce484222325u64;
     for &b in raw_content {
@@ -335,9 +410,28 @@ pub fn finalize_raw_dict(
     }
     out.extend_from_slice(&dict_id.to_le_bytes());
     out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
-    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_of_table()).as_slice());
-    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_ml_table()).as_slice());
-    out.extend_from_slice(serialize_fse_table(&fse_encoder::default_ll_table()).as_slice());
+    out.extend_from_slice(
+        serialize_fse_table_from_corpus(sample_data, raw_content, MAX_OFFSET_CODE, OF_MAX_LOG)
+            .as_slice(),
+    );
+    out.extend_from_slice(
+        serialize_fse_table_from_corpus(
+            sample_data,
+            raw_content,
+            MAX_MATCH_LENGTH_CODE,
+            ML_MAX_LOG,
+        )
+        .as_slice(),
+    );
+    out.extend_from_slice(
+        serialize_fse_table_from_corpus(
+            sample_data,
+            raw_content,
+            MAX_LITERAL_LENGTH_CODE,
+            LL_MAX_LOG,
+        )
+        .as_slice(),
+    );
 
     // Repeat offsets: keep default bootstrap history.
     out.extend_from_slice(&1u32.to_le_bytes());
@@ -424,6 +518,9 @@ pub fn train_fastcover_raw_from_slice(
 }
 
 /// Train a raw FastCOVER dictionary from a source stream.
+///
+/// This function fully buffers the entire training corpus into memory via
+/// `read_to_end`, which can consume significant RAM for large inputs.
 pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     output: &mut W,
@@ -438,6 +535,9 @@ pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
 }
 
 /// Train and finalize a FastCOVER dictionary in pure Rust.
+///
+/// This function fully buffers the entire training corpus into memory via
+/// `read_to_end`, which can consume significant RAM for large inputs.
 pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     output: &mut W,
@@ -447,8 +547,9 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
+    let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)?;
     let (raw_dict, tuned) =
-        train_fastcover_raw_from_slice(sample.as_slice(), dict_size, fastcover)?;
+        train_fastcover_raw_from_slice(sample.as_slice(), content_budget, fastcover)?;
 
     let finalized = finalize_raw_dict(raw_dict.as_slice(), sample.as_slice(), dict_size, finalize)?;
     output.write_all(finalized.as_slice())?;

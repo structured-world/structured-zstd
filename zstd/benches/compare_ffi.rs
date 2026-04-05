@@ -426,10 +426,12 @@ fn emit_dictionary_training_report(
     rust_fastcover_score: usize,
 ) {
     let escaped_label = escape_report_label(&scenario.label);
+    let training_bytes = scenario.len();
     println!(
-        "REPORT_DICT_TRAIN scenario={} label=\"{}\" dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
+        "REPORT_DICT_TRAIN scenario={} label=\"{}\" training_bytes={} dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
         scenario.id,
         escaped_label,
+        training_bytes,
         dict_bytes_requested,
         rust_train_ms,
         ffi_train_ms,

@@ -39,7 +39,7 @@ DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
 )
 DICT_TRAIN_RE = re.compile(
-    r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
+    r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
 )
 
 def unescape_report_label(value):
@@ -77,6 +77,7 @@ dictionary_rows = []
 dictionary_training_rows = []
 timing_rows = []
 scenario_input_bytes = {}
+scenario_training_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
 
 DELTA_LOW = 0.99
@@ -246,6 +247,7 @@ with open(raw_path) as f:
             (
                 scenario,
                 label,
+                training_bytes,
                 dict_bytes_requested,
                 rust_train_ms,
                 ffi_train_ms,
@@ -262,6 +264,7 @@ with open(raw_path) as f:
             dictionary_training_rows.append({
                 "scenario": scenario,
                 "label": label,
+                "training_bytes": int(training_bytes),
                 "dict_bytes_requested": int(dict_bytes_requested),
                 "rust_train_ms": rust_train_ms_float,
                 "ffi_train_ms": ffi_train_ms_float,
@@ -271,6 +274,7 @@ with open(raw_path) as f:
                 "delta_ffi_over_rust": delta,
                 "status": classify_speed_delta(delta),
             })
+            scenario_training_bytes[scenario] = int(training_bytes)
 
 if not benchmark_results:
     print("ERROR: No benchmark results parsed!", file=sys.stderr)
@@ -353,7 +357,10 @@ for key in all_keys:
     scenario = meta["scenario"] if meta else key.split(" + ")[0]
     level = meta["level"] if meta else "unknown"
     source = meta["source"] if meta else None
-    input_bytes = None if stage == "dict-train" else scenario_input_bytes.get(scenario)
+    if stage == "dict-train":
+        input_bytes = scenario_training_bytes.get(scenario)
+    else:
+        input_bytes = scenario_input_bytes.get(scenario)
 
     speed_series = {}
     for impl_name, impl_row in speed_index.get(key, {}).items():
