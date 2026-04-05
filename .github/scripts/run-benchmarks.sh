@@ -104,19 +104,7 @@ def parse_benchmark_name(name):
             "source": None,
             "implementation": parts[4],
         }
-    # Fallback for future benchmark name variants.
-    stage = parts[0] if len(parts) > 0 else "unknown"
-    level = parts[1] if len(parts) > 1 else "unknown"
-    scenario = parts[2] if len(parts) > 2 else name
-    source = None
-    implementation = parts[-1]
-    return {
-        "stage": stage,
-        "level": level,
-        "scenario": scenario,
-        "source": source,
-        "implementation": implementation,
-    }
+    raise ValueError(f"Unsupported benchmark name format: {name} (parts={parts})")
 
 def canonical_key(stage, scenario, level, source):
     params = [f"stage={stage}", f"level={level}"]
@@ -268,6 +256,12 @@ for row in ratios:
     if row["ffi_ratio"] > 0.0:
         ratio_delta = row["rust_ratio"] / row["ffi_ratio"]
     ratio_index[key] = {
+        "meta": {
+            "stage": "compress",
+            "scenario": row["scenario"],
+            "level": row["level"],
+            "source": None,
+        },
         "rust_ratio": row["rust_ratio"],
         "ffi_ratio": row["ffi_ratio"],
         "delta": ratio_delta,
@@ -293,7 +287,17 @@ for row in timing_rows:
 delta_rows = []
 all_keys = sorted(set(key_meta.keys()) | set(ratio_index.keys()))
 for key in all_keys:
-    meta = key_meta.get(key)
+    ratio_pack = ratio_index.get(
+        key,
+        {
+            "meta": None,
+            "rust_ratio": None,
+            "ffi_ratio": None,
+            "delta": None,
+            "status": "insufficient-data",
+        },
+    )
+    meta = key_meta.get(key) or ratio_pack["meta"]
     stage = meta["stage"] if meta else "compress"
     scenario = meta["scenario"] if meta else key.split(" + ")[0]
     level = meta["level"] if meta else "unknown"
@@ -304,7 +308,7 @@ for key in all_keys:
     for impl_name, impl_row in speed_index.get(key, {}).items():
         ms_value = impl_row["ms_per_iter"]
         bps_value = None
-        if input_bytes and ms_value and ms_value > 0.0:
+        if input_bytes is not None and ms_value is not None and ms_value > 0.0:
             bps_value = input_bytes / (ms_value / 1000.0)
         speed_series[impl_name] = {
             "benchmark_name": impl_row["name"],
@@ -318,16 +322,10 @@ for key in all_keys:
     ffi_ms = ffi_timing["ms_per_iter"] if ffi_timing else None
     rust_bps = rust_timing["bytes_per_sec"] if rust_timing else None
     ffi_bps = ffi_timing["bytes_per_sec"] if ffi_timing else None
-    speed_delta = (rust_bps / ffi_bps) if (rust_bps and ffi_bps and ffi_bps > 0.0) else None
-
-    ratio_pack = ratio_index.get(
-        key,
-        {
-            "rust_ratio": None,
-            "ffi_ratio": None,
-            "delta": None,
-            "status": "insufficient-data",
-        },
+    speed_delta = (
+        rust_bps / ffi_bps
+        if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
+        else None
     )
 
     has_comparable_ratio = (
@@ -352,7 +350,7 @@ for key in all_keys:
                 "ffi": ratio_pack["ffi_ratio"],
                 "delta_rust_over_ffi": ratio_pack["delta"],
                 "status": ratio_pack["status"],
-                "interpretation": "ratio<1 means Rust compressed output smaller than FFI; ratio>1 means larger",
+                "interpretation": "delta<1 means Rust compressed output smaller than FFI; delta>1 means larger",
             },
             "speed": {
                 "series": speed_series,
@@ -362,7 +360,7 @@ for key in all_keys:
                 "ffi_bytes_per_sec": ffi_bps,
                 "delta_rust_over_ffi": speed_delta,
                 "status": classify_speed_delta(speed_delta),
-                "interpretation": "speed>1 means Rust faster than FFI; speed<1 means slower",
+                "interpretation": "delta>1 means Rust faster than FFI; delta<1 means slower",
             },
         }
     )
