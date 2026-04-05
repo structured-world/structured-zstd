@@ -41,6 +41,7 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     compression_level: CompressionLevel,
     dictionary: Option<crate::decoding::Dictionary>,
     dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
+    source_size_hint: Option<u64>,
     state: CompressState<M>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
@@ -111,6 +112,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compression_level,
             dictionary: None,
             dictionary_entropy_cache: None,
+            source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
@@ -131,6 +133,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compressed_data: None,
             dictionary: None,
             dictionary_entropy_cache: None,
+            source_size_hint: None,
             state: CompressState {
                 matcher,
                 last_huff_table: None,
@@ -157,6 +160,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// When set, the encoder selects smaller hash tables and windows for
+    /// small inputs, matching the C zstd source-size-class behavior.
+    ///
+    /// This hint applies only to frame payload bytes (`size`). Dictionary
+    /// history is primed separately and does not inflate the hinted size or
+    /// advertised frame window.
+    /// Must be called before [`compress`](Self::compress).
+    pub fn set_source_size_hint(&mut self, size: u64) {
+        self.source_size_hint = Some(size);
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
     ///
     /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.
@@ -168,12 +184,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.compression_level);
-        self.state.offset_hist = [1, 4, 8];
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming();
+        if let Some(size_hint) = self.source_size_hint.take() {
+            // Keep source-size hint scoped to payload bytes; dictionary priming
+            // is applied separately and should not force larger matcher sizing.
+            self.state.matcher.set_source_size_hint(size_hint);
+        }
+        // Clearing buffers to allow re-using of the compressor
+        self.state.matcher.reset(self.compression_level);
+        self.state.offset_hist = [1, 4, 8];
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -274,7 +295,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
-                | CompressionLevel::Best => compress_block_encoded(
+                | CompressionLevel::Best
+                | CompressionLevel::Level(_) => compress_block_encoded(
                     &mut self.state,
                     last_block,
                     uncompressed_data,
@@ -476,7 +498,7 @@ mod tests {
                     data.len() as u64,
                     "FCS mismatch for len={} level={:?}",
                     data.len(),
-                    level as u8,
+                    level,
                 );
                 // Confirm the FCS field is actually present in the header
                 // (not just the decoder returning 0 for absent FCS).
@@ -485,7 +507,7 @@ mod tests {
                     0,
                     "FCS field must be present for len={} level={:?}",
                     data.len(),
-                    level as u8,
+                    level,
                 );
                 // Verify C zstd can decompress
                 let mut decoded = Vec::new();
@@ -883,8 +905,10 @@ mod tests {
             crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
                 .expect("raw dictionary should be valid");
 
-        let payload = b"abcdefgh".repeat(512);
-        let matcher = MatchGeneratorDriver::new(8, 1);
+        // Payload must exceed the encoder's advertised window (128 KiB for
+        // Fastest) so the test actually exercises cross-window-boundary behavior.
+        let payload = b"abcdefgh".repeat(128 * 1024 / 8 + 64);
+        let matcher = MatchGeneratorDriver::new(1024, 1);
 
         let mut no_dict_output = Vec::new();
         let mut no_dict_compressor =
@@ -900,7 +924,7 @@ mod tests {
             .expect("window size should be present");
 
         let mut output = Vec::new();
-        let matcher = MatchGeneratorDriver::new(8, 1);
+        let matcher = MatchGeneratorDriver::new(1024, 1);
         let mut compressor =
             FrameCompressor::new_with_matcher(matcher, super::CompressionLevel::Fastest);
         compressor
@@ -928,6 +952,113 @@ mod tests {
         decoder.add_dict(dict_for_decoder).unwrap();
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn source_size_hint_with_dictionary_keeps_roundtrip_and_nonincreasing_window() {
+        let dict_id = 0xABCD_0004;
+        let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
+        let payload = b"abcdabcdabcdabcd".repeat(128);
+
+        let mut hinted_output = Vec::new();
+        let mut hinted = FrameCompressor::new(super::CompressionLevel::Fastest);
+        hinted.set_dictionary(dict).unwrap();
+        hinted.set_source_size_hint(1);
+        hinted.set_source(payload.as_slice());
+        hinted.set_drain(&mut hinted_output);
+        hinted.compress();
+
+        let mut no_hint_output = Vec::new();
+        let mut no_hint = FrameCompressor::new(super::CompressionLevel::Fastest);
+        no_hint
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024))
+                    .unwrap(),
+            )
+            .unwrap();
+        no_hint.set_source(payload.as_slice());
+        no_hint.set_drain(&mut no_hint_output);
+        no_hint.compress();
+
+        let hinted_window = crate::decoding::frame::read_frame_header(hinted_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        let no_hint_window = crate::decoding::frame::read_frame_header(no_hint_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        assert!(
+            hinted_window <= no_hint_window,
+            "source-size hint should not increase advertised window with dictionary priming",
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decode_all_to_vec(&hinted_output, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn source_size_hint_with_dictionary_keeps_roundtrip_for_larger_payload() {
+        let dict_id = 0xABCD_0005;
+        let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let dict_for_decoder =
+            crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
+        let payload = b"abcd".repeat(1024); // 4 KiB payload
+        let payload_len = payload.len() as u64;
+
+        let mut hinted_output = Vec::new();
+        let mut hinted = FrameCompressor::new(super::CompressionLevel::Fastest);
+        hinted.set_dictionary(dict).unwrap();
+        hinted.set_source_size_hint(payload_len);
+        hinted.set_source(payload.as_slice());
+        hinted.set_drain(&mut hinted_output);
+        hinted.compress();
+
+        let mut no_hint_output = Vec::new();
+        let mut no_hint = FrameCompressor::new(super::CompressionLevel::Fastest);
+        no_hint
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024))
+                    .unwrap(),
+            )
+            .unwrap();
+        no_hint.set_source(payload.as_slice());
+        no_hint.set_drain(&mut no_hint_output);
+        no_hint.compress();
+
+        let hinted_window = crate::decoding::frame::read_frame_header(hinted_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        let no_hint_window = crate::decoding::frame::read_frame_header(no_hint_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        assert!(
+            hinted_window <= no_hint_window,
+            "source-size hint should not increase advertised window with dictionary priming",
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict_for_decoder).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decode_all_to_vec(&hinted_output, &mut decoded)
+            .unwrap();
         assert_eq!(decoded, payload);
     }
 

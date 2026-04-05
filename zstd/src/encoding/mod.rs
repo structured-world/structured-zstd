@@ -45,7 +45,7 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum CompressionLevel {
     /// This level does not compress the data at all, and simply wraps
     /// it in a Zstandard frame.
@@ -88,6 +88,64 @@ pub enum CompressionLevel {
     /// Prefer [`CompressionLevel::Default`] for very large single-frame
     /// streams until table rebasing is implemented.
     Best,
+    /// Numeric compression level.
+    ///
+    /// Levels 1–22 correspond to the C zstd level numbering.  Higher values
+    /// produce smaller output at the cost of more CPU time.  Negative values
+    /// select ultra-fast modes that trade ratio for speed.  Level 0 is
+    /// treated as [`DEFAULT_LEVEL`](Self::DEFAULT_LEVEL), matching C zstd
+    /// semantics.
+    ///
+    /// Named variants map to specific numeric levels:
+    /// [`Fastest`](Self::Fastest) = 1, [`Default`](Self::Default) = 3,
+    /// [`Better`](Self::Better) = 7, [`Best`](Self::Best) = 11.
+    /// [`Best`](Self::Best) remains the highest-ratio named preset, but
+    /// [`Level`](Self::Level) values above 11 can target stronger (slower)
+    /// tuning than the named hierarchy.
+    ///
+    /// Levels above 11 use progressively larger windows and deeper search
+    /// with the lazy2 hash-chain backend.  Levels that require strategies
+    /// this crate has not yet implemented (btopt, btultra) are approximated
+    /// with the closest available matcher.
+    ///
+    /// **Limitation:** large hash-chain levels still use 32-bit positions.
+    /// For single-frame inputs exceeding ~4 GiB, matches can still be found
+    /// for roughly one window past that point; once all in-window positions
+    /// exceed `u32::MAX` (≈4 GiB + window size), matching becomes effectively
+    /// repcode-only. Prefer [`CompressionLevel::Default`] for very large
+    /// single-frame streams until table rebasing is implemented.
+    ///
+    /// Semver note: this variant was added after the initial enum shape and
+    /// is a breaking API change for downstream crates that exhaustively
+    /// `match` on [`CompressionLevel`] without a wildcard arm.
+    Level(i32),
+}
+
+impl CompressionLevel {
+    /// The minimum supported numeric compression level (ultra-fast mode).
+    pub const MIN_LEVEL: i32 = -131072;
+    /// The maximum supported numeric compression level.
+    pub const MAX_LEVEL: i32 = 22;
+    /// The default numeric compression level (equivalent to [`Default`](Self::Default)).
+    pub const DEFAULT_LEVEL: i32 = 3;
+
+    /// Create a compression level from a numeric value.
+    ///
+    /// Returns named variants for canonical levels (`0`/`3`, `1`, `7`, `11`)
+    /// and [`Level`](Self::Level) for all other values.
+    ///
+    /// With the default matcher backend (`MatchGeneratorDriver`), values
+    /// outside [`MIN_LEVEL`](Self::MIN_LEVEL)..=[`MAX_LEVEL`](Self::MAX_LEVEL)
+    /// are silently clamped during built-in level parameter resolution.
+    pub const fn from_level(level: i32) -> Self {
+        match level {
+            0 | Self::DEFAULT_LEVEL => Self::Default,
+            1 => Self::Fastest,
+            7 => Self::Better,
+            11 => Self::Best,
+            _ => Self::Level(level),
+        }
+    }
 }
 
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
@@ -118,6 +176,17 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// Provide a hint about the total uncompressed size for the next frame.
+    ///
+    /// Implementations may use this to select smaller hash tables and windows
+    /// for small inputs, matching the C zstd source-size-class behavior.
+    /// Called before [`reset`](Self::reset) when the caller knows the input
+    /// size (e.g. from pledged content size or file metadata).
+    ///
+    /// The default implementation is a no-op for custom matchers and
+    /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
+    /// overrides this hook and applies the hint during level resolution.
+    fn set_source_size_hint(&mut self, _size: u64) {}
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}
