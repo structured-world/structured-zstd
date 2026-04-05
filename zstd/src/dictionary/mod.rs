@@ -115,7 +115,8 @@ pub(super) struct DictParams {
 ///
 /// # Errors
 /// This function returns `Ok(())` if the dictionary was created successfully, and an
-/// `Err(io::Error)` if an error was encountered reading the input directory.
+/// `Err(io::Error)` if an error was encountered reading the input directory or
+/// writing dictionary bytes to `output`.
 ///
 /// # Examples
 /// ```no_run
@@ -160,7 +161,7 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
         .fold(empty_reader, |acc, reader| Box::new(acc.chain(reader)));
 
     // Create a dict using the new reader
-    create_raw_dict_from_source(chained_files, total_file_len as usize, output, dict_size);
+    create_raw_dict_from_source(chained_files, total_file_len as usize, output, dict_size)?;
     Ok(())
 }
 
@@ -182,25 +183,21 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     source_size: usize,
     output: &mut W,
     dict_size: usize,
-) {
+) -> io::Result<()> {
     if dict_size == 0 {
-        return;
+        return Ok(());
     }
     let prealloc = source_size.min(MAX_TRAINING_PREALLOC_BYTES);
     let mut all = Vec::with_capacity(prealloc);
-    source
-        .read_to_end(&mut all)
-        .expect("can read full source for dictionary training");
+    source.read_to_end(&mut all)?;
     if all.is_empty() {
-        return;
+        return Ok(());
     }
 
     if all.len() < K {
         let keep = usize::min(all.len(), dict_size);
-        output
-            .write_all(&all[all.len() - keep..])
-            .expect("can write tiny dictionary");
-        return;
+        output.write_all(&all[all.len() - keep..])?;
+        return Ok(());
     }
 
     let source_size = all.len();
@@ -252,10 +249,9 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     // Write the dictionary with the highest scoring segment last because
     // closer items can be represented with a smaller offset
     while let Some(segment) = pool.pop() {
-        output
-            .write_all(&segment.0.raw)
-            .expect("can write to output");
+        output.write_all(&segment.0.raw)?;
     }
+    Ok(())
 }
 
 fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
@@ -488,7 +484,7 @@ fn train_fastcover_internal(
                 k: params.k,
                 d: params.d,
                 f: params.f,
-                accel: options.accel,
+                accel: params.accel,
                 score: 0,
             },
         )
@@ -678,7 +674,8 @@ mod tests {
     fn create_raw_dict_from_source_early_returns_on_zero_dict_size() {
         let sample = training_data();
         let mut out = Vec::new();
-        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 0);
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 0)
+            .expect("zero dict size should no-op");
         assert!(out.is_empty());
     }
 
@@ -686,7 +683,8 @@ mod tests {
     fn create_raw_dict_from_source_treats_source_size_as_hint() {
         let sample = training_data();
         let mut out = Vec::new();
-        create_raw_dict_from_source(Cursor::new(sample.as_slice()), 0, &mut out, 1024);
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), 0, &mut out, 1024)
+            .expect("raw dictionary training should succeed");
         assert!(!out.is_empty());
     }
 
@@ -694,8 +692,46 @@ mod tests {
     fn create_raw_dict_from_source_handles_tiny_source_without_epochs() {
         let sample = b"short";
         let mut out = Vec::new();
-        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 3);
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 3)
+            .expect("tiny source path should succeed");
         assert_eq!(out, b"ort");
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_propagates_read_error() {
+        struct FailingReader;
+        impl io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("read failed"))
+            }
+        }
+
+        let mut out = Vec::new();
+        let err = create_raw_dict_from_source(FailingReader, 1024, &mut out, 1024)
+            .expect_err("read failures must be returned");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "read failed");
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_propagates_write_error() {
+        struct FailingWriter;
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("write failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sample = b"short";
+        let mut out = FailingWriter;
+        let err =
+            create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 3)
+                .expect_err("write failures must be returned");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "write failed");
     }
 
     #[test]

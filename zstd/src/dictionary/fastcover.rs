@@ -40,6 +40,7 @@ pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCov
     params.d = params.d.clamp(4, 32);
     params.k = params.k.max(params.d).max(16);
     params.f = clamp_table_bits(params.f);
+    params.accel = params.accel.clamp(1, 10);
     params
 }
 
@@ -176,7 +177,7 @@ pub fn optimize_fastcover_raw(
                 k: params.k,
                 d: params.d,
                 f: params.f,
-                accel,
+                accel: params.accel,
                 score: 0,
             },
         );
@@ -192,7 +193,7 @@ pub fn optimize_fastcover_raw(
         k: 0,
         d: 0,
         f: 0,
-        accel,
+        accel: accel.clamp(1, 10),
         score: 0,
     };
 
@@ -201,12 +202,13 @@ pub fn optimize_fastcover_raw(
             for &k in k_candidates {
                 let params = normalize_fastcover_params(FastCoverParams { k, d, f, accel });
                 let dict = build_raw_dict(train, dict_size, params);
-                let score = coverage_score(dict.as_slice(), eval, params.d, accel);
+                let score = coverage_score(dict.as_slice(), eval, params.d, params.accel);
                 if best_dict.is_empty() || score > best.score {
                     best.score = score;
                     best.k = params.k;
                     best.d = params.d;
                     best.f = params.f;
+                    best.accel = params.accel;
                     best_dict = dict;
                 }
             }

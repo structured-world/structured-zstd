@@ -195,9 +195,9 @@ fn bench_dictionary(c: &mut Criterion) {
         }
 
         let training_samples = split_training_samples(&scenario.bytes);
-        let sample_refs: Vec<&[u8]> = training_samples.iter().map(Vec::as_slice).collect();
         let training_blob: Vec<u8> = training_samples.concat();
-        let total_training_bytes = sample_refs.iter().map(|sample| sample.len()).sum::<usize>();
+        let total_training_bytes = training_blob.len();
+        let ffi_samples = [training_blob.as_slice()];
         let dict_size = dictionary_size_for(scenario.len())
             .min(total_training_bytes.saturating_sub(64))
             .max(256);
@@ -210,7 +210,7 @@ fn bench_dictionary(c: &mut Criterion) {
             eprintln!(
                 "BENCH_WARN skipping Rust FastCOVER dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
                 scenario.id,
-                sample_refs.len(),
+                training_samples.len(),
                 total_training_bytes,
                 dict_size
             );
@@ -219,11 +219,11 @@ fn bench_dictionary(c: &mut Criterion) {
         let rust_train_ms = rust_train_started.elapsed().as_secs_f64() * 1_000.0;
 
         let ffi_train_started = Instant::now();
-        let Ok(ffi_dictionary) = zstd::dict::from_samples(&sample_refs, dict_size) else {
+        let Ok(ffi_dictionary) = zstd::dict::from_samples(&ffi_samples, dict_size) else {
             eprintln!(
                 "BENCH_WARN skipping dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
                 scenario.id,
-                sample_refs.len(),
+                ffi_samples.len(),
                 total_training_bytes,
                 dict_size
             );
@@ -234,12 +234,15 @@ fn bench_dictionary(c: &mut Criterion) {
         if emit_reports {
             emit_dictionary_training_report(
                 scenario,
-                dict_size,
-                rust_train_ms,
-                ffi_train_ms,
-                rust_dictionary.len(),
-                ffi_dictionary.len(),
-                rust_tuned.score,
+                DictTrainingMetrics {
+                    training_bytes: total_training_bytes,
+                    dict_bytes_requested: dict_size,
+                    rust_train_ms,
+                    ffi_train_ms,
+                    rust_dict_bytes: rust_dictionary.len(),
+                    ffi_dict_bytes: ffi_dictionary.len(),
+                    rust_fastcover_score: rust_tuned.score,
+                },
             );
         }
 
@@ -263,7 +266,7 @@ fn bench_dictionary(c: &mut Criterion) {
         group.bench_function("c_ffi", |b| {
             b.iter(|| {
                 black_box(
-                    zstd::dict::from_samples(&sample_refs, dict_size)
+                    zstd::dict::from_samples(&ffi_samples, dict_size)
                         .expect("ffi dictionary training should succeed")
                         .len(),
                 )
@@ -416,29 +419,30 @@ fn emit_dictionary_report(
     );
 }
 
-fn emit_dictionary_training_report(
-    scenario: &Scenario,
+fn emit_dictionary_training_report(scenario: &Scenario, metrics: DictTrainingMetrics) {
+    let escaped_label = escape_report_label(&scenario.label);
+    println!(
+        "REPORT_DICT_TRAIN scenario={} label=\"{}\" training_bytes={} dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
+        scenario.id,
+        escaped_label,
+        metrics.training_bytes,
+        metrics.dict_bytes_requested,
+        metrics.rust_train_ms,
+        metrics.ffi_train_ms,
+        metrics.rust_dict_bytes,
+        metrics.ffi_dict_bytes,
+        metrics.rust_fastcover_score
+    );
+}
+
+struct DictTrainingMetrics {
+    training_bytes: usize,
     dict_bytes_requested: usize,
     rust_train_ms: f64,
     ffi_train_ms: f64,
     rust_dict_bytes: usize,
     ffi_dict_bytes: usize,
     rust_fastcover_score: usize,
-) {
-    let escaped_label = escape_report_label(&scenario.label);
-    let training_bytes = scenario.len();
-    println!(
-        "REPORT_DICT_TRAIN scenario={} label=\"{}\" training_bytes={} dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
-        scenario.id,
-        escaped_label,
-        training_bytes,
-        dict_bytes_requested,
-        rust_train_ms,
-        ffi_train_ms,
-        rust_dict_bytes,
-        ffi_dict_bytes,
-        rust_fastcover_score
-    );
 }
 
 fn split_training_samples(source: &[u8]) -> Vec<Vec<u8>> {

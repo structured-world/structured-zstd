@@ -30,7 +30,8 @@ fn bench_dict_builder(c: &mut Criterion) {
                 data.len(),
                 &mut out,
                 black_box(dict_size),
-            );
+            )
+            .expect("cover training should succeed");
             black_box(out.len());
         })
     });
