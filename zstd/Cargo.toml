@@ -21,7 +21,6 @@ categories = ["compression"]
 # Locked behind the `hash` feature flag
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"], optional = true }
 fastrand = {version = "2.3.0", optional = true }
-zstd-sys = { version = "2.0.16", default-features = false, features = ["std", "zdict_builder", "experimental"], optional = true }
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
@@ -37,7 +36,6 @@ zstd = { version = "0.13.3", features = ["zdict_builder"] }
 [features]
 default = ["hash", "std"]
 dict_builder = ["std", "dep:fastrand"]
-dict_builder_ffi = ["dict_builder", "dep:zstd-sys"]
 hash = ["dep:twox-hash"]
 bench_internals = []
 fuzz_exports = []

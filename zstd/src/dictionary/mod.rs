@@ -23,8 +23,6 @@
 //    the frequency of w in the reservoir using a rolling karp-rabin hash
 //  - The score of a segment is the sum of `f(w)` called on every kmer within the segment
 mod cover;
-#[cfg(feature = "dict_builder_ffi")]
-mod ffi_builder;
 mod frequency;
 mod reservoir;
 
@@ -40,9 +38,6 @@ use std::{
     path::{Path, PathBuf},
     vec::Vec,
 };
-
-#[cfg(feature = "dict_builder_ffi")]
-pub use ffi_builder::*;
 
 /// A set of values that are used during dictionary construction.
 ///
