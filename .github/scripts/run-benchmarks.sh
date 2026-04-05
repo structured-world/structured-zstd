@@ -474,6 +474,8 @@ delta_lines.extend(
         "",
         "### Rust/FFI ratio delta",
         "",
+        f"Reference band: `{DELTA_LOW:.2f}–{DELTA_HIGH:.2f}` (near parity).",
+        "",
         "| Key | Delta | Status |",
         "| --- | ---: | --- |",
     ]
@@ -531,6 +533,8 @@ delta_lines.extend(
     [
         "",
         "### Rust/FFI speed delta",
+        "",
+        f"Reference band: `{DELTA_LOW:.2f}–{DELTA_HIGH:.2f}` (near parity).",
         "",
         "| Key | Delta | Status |",
         "| --- | ---: | --- |",
