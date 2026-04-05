@@ -13,11 +13,10 @@ mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
-use structured_zstd::dictionary::{FastCoverOptions, create_fastcover_raw_dict_from_source};
+use structured_zstd::dictionary::{FastCoverOptions, train_fastcover_raw_from_slice};
 use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -205,13 +204,9 @@ fn bench_dictionary(c: &mut Criterion) {
         let fastcover_options = fastcover_fixed_options();
 
         let rust_train_started = Instant::now();
-        let mut rust_dictionary = Vec::new();
-        let Ok(rust_tuned) = create_fastcover_raw_dict_from_source(
-            Cursor::new(training_blob.as_slice()),
-            &mut rust_dictionary,
-            dict_size,
-            &fastcover_options,
-        ) else {
+        let Ok((rust_dictionary, rust_tuned)) =
+            train_fastcover_raw_from_slice(training_blob.as_slice(), dict_size, &fastcover_options)
+        else {
             eprintln!(
                 "BENCH_WARN skipping Rust FastCOVER dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
                 scenario.id,
@@ -255,15 +250,13 @@ fn bench_dictionary(c: &mut Criterion) {
 
         group.bench_function("pure_rust", |b| {
             b.iter(|| {
-                let mut out = Vec::new();
-                let tuned = create_fastcover_raw_dict_from_source(
-                    Cursor::new(training_blob.as_slice()),
-                    &mut out,
+                let (dict, tuned) = train_fastcover_raw_from_slice(
+                    training_blob.as_slice(),
                     dict_size,
                     &fastcover_options,
                 )
                 .expect("fastcover training should succeed");
-                black_box((out.len(), tuned.score));
+                black_box((dict.len(), tuned.score));
             })
         });
 

@@ -121,11 +121,7 @@ fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
     hits
 }
 
-pub fn train_fastcover_raw(
-    sample: &[u8],
-    dict_size: usize,
-    params: FastCoverParams,
-) -> Vec<u8> {
+pub fn train_fastcover_raw(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
     build_raw_dict(sample, dict_size, params)
 }
 
@@ -153,6 +149,11 @@ pub fn optimize_fastcover_raw(
     } else {
         f_candidates
     };
+    let k_candidates = if k_values.is_empty() {
+        DEFAULT_K_CANDIDATES
+    } else {
+        k_values
+    };
 
     let mut best_dict = Vec::new();
     let mut best = FastCoverTuned {
@@ -165,7 +166,7 @@ pub fn optimize_fastcover_raw(
 
     for &f in f_values {
         for &d in d_values {
-            for &k in k_values {
+            for &k in k_candidates {
                 let params = FastCoverParams { k, d, f, accel };
                 let dict = build_raw_dict(train, dict_size, params);
                 let score = coverage_score(dict.as_slice(), eval, d, accel);
@@ -232,5 +233,14 @@ mod tests {
         assert!([6, 8].contains(&tuned.d));
         assert!([18, 20].contains(&tuned.f));
         assert!([128, 256].contains(&tuned.k));
+    }
+
+    #[test]
+    fn fastcover_optimizer_falls_back_when_k_candidates_empty() {
+        let sample = corpus();
+        let (dict, tuned) =
+            optimize_fastcover_raw(sample.as_slice(), 4096, 0.75, 1, &[6, 8], &[18, 20], &[]);
+        assert!(!dict.is_empty());
+        assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
     }
 }

@@ -70,9 +70,7 @@ pub fn pick_best_segment(
     epoch: &'_ [u8],
     collection_sample: &'_ [u8],
 ) -> Segment {
-    let mut segments = epoch
-        .chunks(params.segment_size as usize)
-        .peekable();
+    let mut segments = epoch.chunks(params.segment_size as usize).peekable();
     let mut best_segment: &[u8] = segments.peek().expect("at least one segment");
     let mut top_segment_score: usize = 0;
     // Iterate over segments and score each segment, keeping track of the best segment

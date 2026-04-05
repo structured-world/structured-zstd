@@ -268,7 +268,7 @@ with open(raw_path) as f:
                 "rust_dict_bytes": int(rust_dict_bytes),
                 "ffi_dict_bytes": int(ffi_dict_bytes),
                 "rust_fastcover_score": int(rust_fastcover_score),
-                "delta_rust_over_ffi": delta,
+                "delta_ffi_over_rust": delta,
                 "status": classify_speed_delta(delta),
             })
 
@@ -485,7 +485,7 @@ lines.extend([
 
 for row in sorted(dictionary_training_rows, key=lambda item: item["scenario"]):
     label = markdown_table_escape(row["label"])
-    delta = row["delta_rust_over_ffi"]
+    delta = row["delta_ffi_over_rust"]
     delta_cell = f"{delta:.4f}" if delta is not None else "n/a"
     lines.append(
         f'| {row["scenario"]} | {label} | {row["dict_bytes_requested"]} | {row["rust_train_ms"]:.3f} | {row["ffi_train_ms"]:.3f} | {row["rust_dict_bytes"]} | {row["ffi_dict_bytes"]} | {row["rust_fastcover_score"]} | {delta_cell} | {row["status"]} |'

@@ -29,10 +29,10 @@ mod reservoir;
 
 use crate::bit_io::BitWriter;
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
+use crate::dictionary::reservoir::create_sample;
 use crate::fse::fse_encoder;
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
-use crate::dictionary::reservoir::create_sample;
 use core::cmp::Reverse;
 use cover::*;
 pub use fastcover::{
@@ -48,6 +48,9 @@ use std::{
     path::{Path, PathBuf},
     vec::Vec,
 };
+
+const MAX_TRAINING_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 
 /// Tuning knobs for pure-Rust FastCOVER training.
 #[derive(Debug, Clone)]
@@ -168,17 +171,20 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// - `dict_size` determines how large the complete dictionary should be. The completed
 ///   dictionary will be this size or smaller.
 ///
-/// This function uses `BufRead` internally, the provided reader need not be buffered.
+/// This function reads the entire `source` into an in-memory `Vec<u8>` before building
+/// the dictionary. The provided reader need not be buffered, but callers should avoid
+/// sources too large to fit comfortably in memory.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     source_size: usize,
     output: &mut W,
     dict_size: usize,
 ) {
-    if source_size == 0 || dict_size == 0 {
+    if dict_size == 0 {
         return;
     }
-    let mut all = Vec::with_capacity(source_size);
+    let prealloc = source_size.min(MAX_TRAINING_PREALLOC_BYTES);
+    let mut all = Vec::with_capacity(prealloc);
     source
         .read_to_end(&mut all)
         .expect("can read full source for dictionary training");
@@ -216,8 +222,8 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     // Reverse is used because we want a min heap, where
     // the lowest scoring items come first
     let mut pool: BinaryHeap<Reverse<Segment>> = BinaryHeap::new();
-    let (_, epoch_size) = compute_epoch_info(&params, dict_size, source_size / K);
-    let num_epochs = source_size / epoch_size;
+    let (num_epochs, epoch_size_kmers) = compute_epoch_info(&params, dict_size, source_size / K);
+    let epoch_size = usize::max(K, epoch_size_kmers.saturating_mul(K));
     vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
     let mut epoch_counter = 0;
     let mut ctx = Context {
@@ -250,11 +256,25 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
 }
 
 fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
-    let mut stats = if sample_data.len() >= 2 {
-        sample_data.to_vec()
+    fn bounded_huffman_stats(data: &[u8]) -> Vec<u8> {
+        if data.len() <= MAX_HUFFMAN_STATS_BYTES {
+            return data.to_vec();
+        }
+
+        let mut stats = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
+        for i in 0..MAX_HUFFMAN_STATS_BYTES {
+            let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
+            stats.push(data[idx]);
+        }
+        stats
+    }
+
+    let source = if sample_data.len() >= 2 {
+        sample_data
     } else {
-        raw_content.to_vec()
+        raw_content
     };
+    let mut stats = bounded_huffman_stats(source);
     if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
         stats = (0u8..=255).collect();
     }
@@ -304,7 +324,9 @@ pub fn finalize_raw_dict(
     }
     let mut out = Vec::with_capacity(dict_size.max(256));
     out.extend_from_slice(&DICT_MAGIC_NUM);
-    let dict_id = options.dict_id.unwrap_or_else(|| derive_dict_id(raw_content));
+    let dict_id = options
+        .dict_id
+        .unwrap_or_else(|| derive_dict_id(raw_content));
     out.extend_from_slice(&dict_id.to_le_bytes());
     out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
     out.extend_from_slice(serialize_fse_table(&fse_encoder::default_of_table()).as_slice());
@@ -338,32 +360,21 @@ pub fn finalize_raw_dict(
 }
 
 /// Train a raw FastCOVER dictionary from a source stream.
-pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
-    mut source: R,
-    output: &mut W,
+fn train_fastcover_internal(
+    sample: &[u8],
     dict_size: usize,
     options: &FastCoverOptions,
-) -> io::Result<FastCoverTuned> {
-    let mut sample = Vec::new();
-    source.read_to_end(&mut sample)?;
-    if sample.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source stream is empty",
-        ));
-    }
-
-    let (dict, tuned) = if options.optimize {
-        let (dict, tuned) = fastcover::optimize_fastcover_raw(
-            sample.as_slice(),
+) -> (Vec<u8>, FastCoverTuned) {
+    if options.optimize {
+        fastcover::optimize_fastcover_raw(
+            sample,
             dict_size,
             options.split_point,
             options.accel,
             options.d_candidates.as_slice(),
             options.f_candidates.as_slice(),
             options.k_candidates.as_slice(),
-        );
-        (dict, tuned)
+        )
     } else {
         let params = FastCoverParams {
             k: options.k,
@@ -371,9 +382,8 @@ pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
             f: options.f,
             accel: options.accel,
         };
-        let dict = fastcover::train_fastcover_raw(sample.as_slice(), dict_size, params);
         (
-            dict,
+            fastcover::train_fastcover_raw(sample, dict_size, params),
             FastCoverTuned {
                 k: options.k,
                 d: options.d,
@@ -382,7 +392,34 @@ pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
                 score: 0,
             },
         )
-    };
+    }
+}
+
+/// Train a raw FastCOVER dictionary directly from an in-memory sample.
+pub fn train_fastcover_raw_from_slice(
+    sample: &[u8],
+    dict_size: usize,
+    options: &FastCoverOptions,
+) -> io::Result<(Vec<u8>, FastCoverTuned)> {
+    if sample.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source stream is empty",
+        ));
+    }
+    Ok(train_fastcover_internal(sample, dict_size, options))
+}
+
+/// Train a raw FastCOVER dictionary from a source stream.
+pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
+    mut source: R,
+    output: &mut W,
+    dict_size: usize,
+    options: &FastCoverOptions,
+) -> io::Result<FastCoverTuned> {
+    let mut sample = Vec::new();
+    source.read_to_end(&mut sample)?;
+    let (dict, tuned) = train_fastcover_raw_from_slice(sample.as_slice(), dict_size, options)?;
     output.write_all(dict.as_slice())?;
     Ok(tuned)
 }
@@ -397,41 +434,8 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
-    if sample.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source stream is empty",
-        ));
-    }
-
-    let (raw_dict, tuned) = if fastcover.optimize {
-        fastcover::optimize_fastcover_raw(
-            sample.as_slice(),
-            dict_size,
-            fastcover.split_point,
-            fastcover.accel,
-            fastcover.d_candidates.as_slice(),
-            fastcover.f_candidates.as_slice(),
-            fastcover.k_candidates.as_slice(),
-        )
-    } else {
-        let params = FastCoverParams {
-            k: fastcover.k,
-            d: fastcover.d,
-            f: fastcover.f,
-            accel: fastcover.accel,
-        };
-        (
-            fastcover::train_fastcover_raw(sample.as_slice(), dict_size, params),
-            FastCoverTuned {
-                k: fastcover.k,
-                d: fastcover.d,
-                f: fastcover.f,
-                accel: fastcover.accel,
-                score: 0,
-            },
-        )
-    };
+    let (raw_dict, tuned) =
+        train_fastcover_raw_from_slice(sample.as_slice(), dict_size, fastcover)?;
 
     let finalized = finalize_raw_dict(raw_dict.as_slice(), sample.as_slice(), dict_size, finalize)?;
     output.write_all(finalized.as_slice())?;
@@ -449,8 +453,10 @@ mod tests {
         let mut data = Vec::new();
         for i in 0..512u32 {
             data.extend_from_slice(
-                format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n")
-                    .as_bytes(),
+                format!(
+                    "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n"
+                )
+                .as_bytes(),
             );
         }
         data
@@ -483,7 +489,8 @@ mod tests {
         let mut payload = Vec::new();
         for idx in 0..96u32 {
             payload.extend_from_slice(
-                format!("tenant=demo op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n").as_bytes(),
+                format!("tenant=demo op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n")
+                    .as_bytes(),
             );
         }
 
@@ -521,5 +528,13 @@ mod tests {
         assert!(!out.is_empty());
         assert!(tuned.k > 0);
         assert!(tuned.d > 0);
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_treats_source_size_as_hint() {
+        let sample = training_data();
+        let mut out = Vec::new();
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), 0, &mut out, 1024);
+        assert!(!out.is_empty());
     }
 }
