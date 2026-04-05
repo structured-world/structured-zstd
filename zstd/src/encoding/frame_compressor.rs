@@ -188,19 +188,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming();
         if let Some(size_hint) = self.source_size_hint.take() {
-            let effective_hint = if use_dictionary_state {
-                let dict_floor = self
-                    .dictionary
-                    .as_ref()
-                    .map(|dict| dict.dict_content.len() as u64)
-                    .unwrap_or(0);
-                // Dictionary priming extends matcher history beyond payload bytes,
-                // so the advertised hint must cover both dictionary and payload.
-                size_hint.saturating_add(dict_floor)
-            } else {
-                size_hint
-            };
-            self.state.matcher.set_source_size_hint(effective_hint);
+            // Keep source-size hint scoped to payload bytes; dictionary priming
+            // is applied separately and should not force larger matcher sizing.
+            self.state.matcher.set_source_size_hint(size_hint);
         }
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
@@ -966,73 +956,109 @@ mod tests {
     }
 
     #[test]
-    fn source_size_hint_does_not_shrink_window_below_dictionary_history() {
+    fn source_size_hint_with_dictionary_keeps_roundtrip_and_nonincreasing_window() {
         let dict_id = 0xABCD_0004;
         let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
-        let dict_len = dict_content.len() as u64;
         let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
         let dict_for_decoder =
             crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
         let payload = b"abcdabcdabcdabcd".repeat(128);
 
-        let mut output = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-        compressor.set_dictionary(dict).unwrap();
-        compressor.set_source_size_hint(1); // would clamp to MIN_WINDOW_LOG without dictionary guard
-        compressor.set_source(payload.as_slice());
-        compressor.set_drain(&mut output);
-        compressor.compress();
+        let mut hinted_output = Vec::new();
+        let mut hinted = FrameCompressor::new(super::CompressionLevel::Fastest);
+        hinted.set_dictionary(dict).unwrap();
+        hinted.set_source_size_hint(1);
+        hinted.set_source(payload.as_slice());
+        hinted.set_drain(&mut hinted_output);
+        hinted.compress();
 
-        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
-            .expect("encoded frame should have a header");
-        let advertised_window = frame_header
+        let mut no_hint_output = Vec::new();
+        let mut no_hint = FrameCompressor::new(super::CompressionLevel::Fastest);
+        no_hint
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024))
+                    .unwrap(),
+            )
+            .unwrap();
+        no_hint.set_source(payload.as_slice());
+        no_hint.set_drain(&mut no_hint_output);
+        no_hint.compress();
+
+        let hinted_window = crate::decoding::frame::read_frame_header(hinted_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        let no_hint_window = crate::decoding::frame::read_frame_header(no_hint_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
             .window_size()
             .expect("window size should be present");
         assert!(
-            advertised_window >= dict_len,
-            "window_size ({advertised_window}) must cover dictionary history ({dict_len})",
+            hinted_window <= no_hint_window,
+            "source-size hint should not increase advertised window with dictionary priming",
         );
 
         let mut decoder = FrameDecoder::new();
         decoder.add_dict(dict_for_decoder).unwrap();
         let mut decoded = Vec::with_capacity(payload.len());
-        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        decoder
+            .decode_all_to_vec(&hinted_output, &mut decoded)
+            .unwrap();
         assert_eq!(decoded, payload);
     }
 
     #[test]
-    fn source_size_hint_with_dictionary_covers_dictionary_plus_payload() {
+    fn source_size_hint_with_dictionary_keeps_roundtrip_for_larger_payload() {
         let dict_id = 0xABCD_0005;
         let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
-        let dict_len = dict_content.len() as u64;
         let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
         let dict_for_decoder =
             crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024)).unwrap();
         let payload = b"abcd".repeat(1024); // 4 KiB payload
         let payload_len = payload.len() as u64;
 
-        let mut output = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-        compressor.set_dictionary(dict).unwrap();
-        compressor.set_source_size_hint(payload_len);
-        compressor.set_source(payload.as_slice());
-        compressor.set_drain(&mut output);
-        compressor.compress();
+        let mut hinted_output = Vec::new();
+        let mut hinted = FrameCompressor::new(super::CompressionLevel::Fastest);
+        hinted.set_dictionary(dict).unwrap();
+        hinted.set_source_size_hint(payload_len);
+        hinted.set_source(payload.as_slice());
+        hinted.set_drain(&mut hinted_output);
+        hinted.compress();
 
-        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
-            .expect("encoded frame should have a header");
-        let advertised_window = frame_header
+        let mut no_hint_output = Vec::new();
+        let mut no_hint = FrameCompressor::new(super::CompressionLevel::Fastest);
+        no_hint
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, b"abcd".repeat(1024))
+                    .unwrap(),
+            )
+            .unwrap();
+        no_hint.set_source(payload.as_slice());
+        no_hint.set_drain(&mut no_hint_output);
+        no_hint.compress();
+
+        let hinted_window = crate::decoding::frame::read_frame_header(hinted_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
+            .window_size()
+            .expect("window size should be present");
+        let no_hint_window = crate::decoding::frame::read_frame_header(no_hint_output.as_slice())
+            .expect("encoded frame should have a header")
+            .0
             .window_size()
             .expect("window size should be present");
         assert!(
-            advertised_window >= dict_len + payload_len,
-            "window_size ({advertised_window}) must cover dictionary ({dict_len}) + payload ({payload_len})"
+            hinted_window <= no_hint_window,
+            "source-size hint should not increase advertised window with dictionary priming",
         );
 
         let mut decoder = FrameDecoder::new();
         decoder.add_dict(dict_for_decoder).unwrap();
         let mut decoded = Vec::with_capacity(payload.len());
-        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
+        decoder
+            .decode_all_to_vec(&hinted_output, &mut decoded)
+            .unwrap();
         assert_eq!(decoded, payload);
     }
 

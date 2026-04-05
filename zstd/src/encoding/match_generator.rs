@@ -2196,6 +2196,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let hinted_tables = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
+    assert_eq!(hinted_tables, 1 << MIN_WINDOW_LOG);
     assert!(
         hinted_tables < full_tables,
         "tiny source hint should reduce dfast table footprint"

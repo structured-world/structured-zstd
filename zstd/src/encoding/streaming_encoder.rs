@@ -105,8 +105,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     ///
     /// Unlike [`set_pledged_content_size`](Self::set_pledged_content_size),
     /// this does **not** enforce that exactly `size` bytes are written; it
-    /// only optimises matcher parameters for small inputs.  Must be called
-    /// before the first [`write`](Write::write).
+    /// may reduce matcher tables, advertised frame window, and block sizing
+    /// for small inputs. Must be called before the first
+    /// [`write`](Write::write).
     pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
         self.ensure_open()?;
         if self.frame_started {
