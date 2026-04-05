@@ -538,11 +538,112 @@ mod tests {
     }
 
     #[test]
+    fn create_fastcover_raw_dict_from_source_rejects_empty_source() {
+        let mut out = Vec::new();
+        let err = create_fastcover_raw_dict_from_source(
+            Cursor::new(Vec::<u8>::new()),
+            &mut out,
+            1024,
+            &FastCoverOptions::default(),
+        )
+        .expect_err("empty source must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn create_fastcover_dict_from_source_propagates_finalize_error() {
+        let sample = training_data();
+        let mut out = Vec::new();
+        let err = create_fastcover_dict_from_source(
+            Cursor::new(sample.as_slice()),
+            &mut out,
+            32,
+            &FastCoverOptions::default(),
+            FinalizeOptions::default(),
+        )
+        .expect_err("too-small dictionary budget must fail during finalize");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("dictionary size too small"));
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_early_returns_on_zero_dict_size() {
+        let sample = training_data();
+        let mut out = Vec::new();
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn create_raw_dict_from_source_treats_source_size_as_hint() {
         let sample = training_data();
         let mut out = Vec::new();
         create_raw_dict_from_source(Cursor::new(sample.as_slice()), 0, &mut out, 1024);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_handles_tiny_source_without_epochs() {
+        let sample = b"short";
+        let mut out = Vec::new();
+        create_raw_dict_from_source(Cursor::new(sample.as_slice()), sample.len(), &mut out, 3);
+        assert_eq!(out, b"ort");
+    }
+
+    #[test]
+    fn train_fastcover_raw_from_slice_rejects_empty_sample() {
+        let err = train_fastcover_raw_from_slice(&[], 1024, &FastCoverOptions::default())
+            .expect_err("empty sample must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn train_fastcover_raw_from_slice_supports_non_optimized_params() {
+        let sample = training_data();
+        let options = FastCoverOptions {
+            optimize: false,
+            k: 128,
+            d: 6,
+            f: 18,
+            ..FastCoverOptions::default()
+        };
+        let (dict, tuned) =
+            train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
+        assert!(!dict.is_empty());
+        assert!(dict.len() <= 2048);
+        assert_eq!(tuned.k, 128);
+        assert_eq!(tuned.d, 6);
+        assert_eq!(tuned.f, 18);
+        assert_eq!(tuned.score, 0);
+    }
+
+    #[test]
+    fn finalize_raw_dict_rejects_empty_raw_content() {
+        let sample = training_data();
+        let err = finalize_raw_dict(&[], sample.as_slice(), 4096, FinalizeOptions::default())
+            .expect_err("empty raw dictionary must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn finalize_raw_dict_rejects_too_small_budget() {
+        let sample = training_data();
+        let raw = b"some-raw-bytes";
+        let err = finalize_raw_dict(raw, sample.as_slice(), 32, FinalizeOptions::default())
+            .expect_err("tiny dict_size must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("dictionary size too small"));
+    }
+
+    #[test]
+    fn finalize_raw_dict_pads_to_minimum_content_size() {
+        let sample = training_data();
+        let raw = b"x";
+        let finalized = finalize_raw_dict(raw, sample.as_slice(), 4096, FinalizeOptions::default())
+            .expect("finalize should pad small raw content");
+        let parsed = Dictionary::decode_dict(finalized.as_slice()).expect("finalized dict parses");
+        assert!(parsed.dict_content.len() >= 8);
+        assert_eq!(parsed.dict_content.last(), Some(&b'x'));
     }
 
     #[test]

@@ -242,6 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn fastcover_raw_returns_empty_for_empty_or_zero_budget() {
+        let sample = corpus();
+        let params = FastCoverParams {
+            k: 256,
+            d: 8,
+            f: 20,
+            accel: 1,
+        };
+        assert!(train_fastcover_raw(&[], 1024, params).is_empty());
+        assert!(train_fastcover_raw(sample.as_slice(), 0, params).is_empty());
+    }
+
+    #[test]
     fn fastcover_optimizer_selects_valid_params() {
         let sample = corpus();
         let (dict, tuned) = optimize_fastcover_raw(
@@ -288,5 +301,36 @@ mod tests {
         assert_eq!(tuned.d, 6);
         assert_eq!(tuned.f, 16);
         assert_eq!(tuned.score, 0);
+    }
+
+    #[test]
+    fn fastcover_optimizer_handles_zero_dict_budget() {
+        let sample = corpus();
+        let (dict, tuned) = optimize_fastcover_raw(
+            sample.as_slice(),
+            0,
+            0.75,
+            1,
+            &[6, 8],
+            &[18, 20],
+            &[128, 256],
+        );
+        assert!(dict.is_empty());
+        assert!([6, 8].contains(&tuned.d));
+        assert!([18, 20].contains(&tuned.f));
+        assert!([128, 256].contains(&tuned.k));
+    }
+
+    #[test]
+    fn fastcover_optimizer_clamps_extreme_split_points() {
+        let sample = corpus();
+        let (dict_low, tuned_low) =
+            optimize_fastcover_raw(sample.as_slice(), 2048, 0.0, 1, &[6], &[18], &[128]);
+        let (dict_high, tuned_high) =
+            optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]);
+        assert!(!dict_low.is_empty());
+        assert!(!dict_high.is_empty());
+        assert_eq!(tuned_low.k, 128);
+        assert_eq!(tuned_high.k, 128);
     }
 }
