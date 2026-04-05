@@ -190,7 +190,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     .as_ref()
                     .map(|dict| dict.dict_content.len() as u64)
                     .unwrap_or(0);
-                size_hint.max(dict_floor)
+                // Dictionary priming extends matcher history beyond payload bytes,
+                // so the advertised hint must cover both dictionary and payload.
+                size_hint.saturating_add(dict_floor)
             } else {
                 size_hint
             };
@@ -983,6 +985,34 @@ mod tests {
         assert!(
             advertised_window >= dict_len,
             "window_size ({advertised_window}) must cover dictionary history ({dict_len})",
+        );
+    }
+
+    #[test]
+    fn source_size_hint_with_dictionary_covers_dictionary_plus_payload() {
+        let dict_id = 0xABCD_0005;
+        let dict_content = b"abcd".repeat(1024); // 4 KiB dictionary history
+        let dict_len = dict_content.len() as u64;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, dict_content).unwrap();
+        let payload = b"abcd".repeat(1024); // 4 KiB payload
+        let payload_len = payload.len() as u64;
+
+        let mut output = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor.set_dictionary(dict).unwrap();
+        compressor.set_source_size_hint(payload_len);
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a header");
+        let advertised_window = frame_header
+            .window_size()
+            .expect("window size should be present");
+        assert!(
+            advertised_window >= dict_len + payload_len,
+            "window_size ({advertised_window}) must cover dictionary ({dict_len}) + payload ({payload_len})"
         );
     }
 
