@@ -352,7 +352,7 @@ for key in all_keys:
     scenario = meta["scenario"] if meta else key.split(" + ")[0]
     level = meta["level"] if meta else "unknown"
     source = meta["source"] if meta else None
-    input_bytes = scenario_input_bytes.get(scenario)
+    input_bytes = None if stage == "dict-train" else scenario_input_bytes.get(scenario)
 
     speed_series = {}
     for impl_name, impl_row in speed_index.get(key, {}).items():

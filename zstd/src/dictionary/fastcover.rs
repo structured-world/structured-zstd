@@ -134,11 +134,6 @@ pub fn optimize_fastcover_raw(
     f_candidates: &[u32],
     k_values: &[usize],
 ) -> (Vec<u8>, FastCoverTuned) {
-    let split = split_point.clamp(0.1, 0.95);
-    let split_idx = ((sample.len() as f64) * split) as usize;
-    let split_idx = split_idx.clamp(1, sample.len().saturating_sub(1));
-    let (train, eval) = sample.split_at(split_idx);
-
     let d_values = if d_candidates.is_empty() {
         DEFAULT_D_CANDIDATES
     } else {
@@ -155,6 +150,35 @@ pub fn optimize_fastcover_raw(
         k_values
     };
 
+    if sample.len() < 2 {
+        let params = FastCoverParams {
+            k: k_candidates[0],
+            d: d_values[0],
+            f: f_values[0],
+            accel,
+        };
+        let mut dict = build_raw_dict(sample, dict_size, params);
+        if dict.is_empty() && dict_size > 0 {
+            let take = sample.len().min(dict_size);
+            dict.extend_from_slice(&sample[..take]);
+        }
+        return (
+            dict,
+            FastCoverTuned {
+                k: params.k,
+                d: params.d,
+                f: params.f,
+                accel,
+                score: 0,
+            },
+        );
+    }
+
+    let split = split_point.clamp(0.1, 0.95);
+    let split_idx = ((sample.len() as f64) * split) as usize;
+    let split_idx = split_idx.clamp(1, sample.len().saturating_sub(1));
+    let (train, eval) = sample.split_at(split_idx);
+
     let mut best_dict = Vec::new();
     let mut best = FastCoverTuned {
         k: 0,
@@ -170,7 +194,7 @@ pub fn optimize_fastcover_raw(
                 let params = FastCoverParams { k, d, f, accel };
                 let dict = build_raw_dict(train, dict_size, params);
                 let score = coverage_score(dict.as_slice(), eval, d, accel);
-                if score > best.score {
+                if best_dict.is_empty() || score > best.score {
                     best.score = score;
                     best.k = k;
                     best.d = d;
@@ -242,5 +266,27 @@ mod tests {
             optimize_fastcover_raw(sample.as_slice(), 4096, 0.75, 1, &[6, 8], &[18, 20], &[]);
         assert!(!dict.is_empty());
         assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
+    }
+
+    #[test]
+    fn fastcover_optimizer_handles_one_byte_sample_without_panic() {
+        let sample = [0xAB];
+        let (dict, tuned) = optimize_fastcover_raw(&sample, 16, 0.75, 1, &[], &[], &[]);
+        assert!(!dict.is_empty());
+        assert!(dict.len() <= 16);
+        assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
+        assert!(DEFAULT_D_CANDIDATES.contains(&tuned.d));
+        assert!(DEFAULT_F_CANDIDATES.contains(&tuned.f));
+    }
+
+    #[test]
+    fn fastcover_optimizer_seeds_winner_when_all_scores_are_zero() {
+        let sample = b"abcdefghijklmnopqrst";
+        let (dict, tuned) = optimize_fastcover_raw(sample, 16, 0.9, 1, &[6], &[16], &[8]);
+        assert!(!dict.is_empty());
+        assert_eq!(tuned.k, 8);
+        assert_eq!(tuned.d, 6);
+        assert_eq!(tuned.f, 16);
+        assert_eq!(tuned.score, 0);
     }
 }

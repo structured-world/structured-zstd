@@ -327,6 +327,12 @@ pub fn finalize_raw_dict(
     let dict_id = options
         .dict_id
         .unwrap_or_else(|| derive_dict_id(raw_content));
+    if dict_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dictionary id must be non-zero",
+        ));
+    }
     out.extend_from_slice(&dict_id.to_le_bytes());
     out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
     out.extend_from_slice(serialize_fse_table(&fse_encoder::default_of_table()).as_slice());
@@ -448,6 +454,7 @@ mod tests {
     use crate::decoding::Dictionary;
     use crate::encoding::{CompressionLevel, FrameCompressor};
     use std::io::Cursor;
+    use std::string::ToString;
 
     fn training_data() -> Vec<u8> {
         let mut data = Vec::new();
@@ -536,5 +543,20 @@ mod tests {
         let mut out = Vec::new();
         create_raw_dict_from_source(Cursor::new(sample.as_slice()), 0, &mut out, 1024);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn finalize_raw_dict_rejects_zero_dict_id() {
+        let sample = training_data();
+        let raw = b"raw-fastcover-bytes";
+        let err = finalize_raw_dict(
+            raw,
+            sample.as_slice(),
+            4096,
+            FinalizeOptions { dict_id: Some(0) },
+        )
+        .expect_err("dict_id=0 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "dictionary id must be non-zero");
     }
 }
