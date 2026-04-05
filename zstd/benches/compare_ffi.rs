@@ -16,7 +16,9 @@ use std::hint::black_box;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
-use structured_zstd::dictionary::{FastCoverOptions, train_fastcover_raw_from_slice};
+use structured_zstd::dictionary::{
+    FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
+};
 use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -204,11 +206,26 @@ fn bench_dictionary(c: &mut Criterion) {
         let fastcover_options = fastcover_fixed_options();
 
         let rust_train_started = Instant::now();
-        let Ok((rust_dictionary, rust_tuned)) =
+        let Ok((rust_raw_dictionary, rust_tuned)) =
             train_fastcover_raw_from_slice(training_blob.as_slice(), dict_size, &fastcover_options)
         else {
             eprintln!(
                 "BENCH_WARN skipping Rust FastCOVER dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
+                scenario.id,
+                training_samples.len(),
+                total_training_bytes,
+                dict_size
+            );
+            continue;
+        };
+        let Ok(rust_dictionary) = finalize_raw_dict(
+            rust_raw_dictionary.as_slice(),
+            training_blob.as_slice(),
+            dict_size,
+            FinalizeOptions::default(),
+        ) else {
+            eprintln!(
+                "BENCH_WARN skipping Rust FastCOVER finalization benchmark for {} (samples={}, total_training_bytes={}, dict_size={})",
                 scenario.id,
                 training_samples.len(),
                 total_training_bytes,
@@ -253,12 +270,19 @@ fn bench_dictionary(c: &mut Criterion) {
 
         group.bench_function("pure_rust", |b| {
             b.iter(|| {
-                let (dict, tuned) = train_fastcover_raw_from_slice(
+                let (raw_dict, tuned) = train_fastcover_raw_from_slice(
                     training_blob.as_slice(),
                     dict_size,
                     &fastcover_options,
                 )
                 .expect("fastcover training should succeed");
+                let dict = finalize_raw_dict(
+                    raw_dict.as_slice(),
+                    training_blob.as_slice(),
+                    dict_size,
+                    FinalizeOptions::default(),
+                )
+                .expect("fastcover dictionary finalization should succeed");
                 black_box((dict.len(), tuned.score));
             })
         });

@@ -21,6 +21,15 @@ fn corpus() -> Vec<u8> {
 fn bench_dict_builder(c: &mut Criterion) {
     let data = corpus();
     let dict_size = 8 * 1024;
+    let fastcover_opt = FastCoverOptions::default();
+    let fastcover_fixed = FastCoverOptions {
+        optimize: false,
+        accel: 4,
+        k: 256,
+        d: 8,
+        f: 20,
+        ..FastCoverOptions::default()
+    };
 
     c.bench_function("dict_builder/cover_raw", |b| {
         b.iter(|| {
@@ -43,7 +52,7 @@ fn bench_dict_builder(c: &mut Criterion) {
                 Cursor::new(data.as_slice()),
                 &mut out,
                 black_box(dict_size),
-                &FastCoverOptions::default(),
+                &fastcover_opt,
             )
             .expect("fastcover training should succeed");
             black_box((out.len(), tuned.score));
@@ -53,19 +62,11 @@ fn bench_dict_builder(c: &mut Criterion) {
     c.bench_function("dict_builder/fastcover_raw_fixed", |b| {
         b.iter(|| {
             let mut out = Vec::new();
-            let opts = FastCoverOptions {
-                optimize: false,
-                accel: 4,
-                k: 256,
-                d: 8,
-                f: 20,
-                ..FastCoverOptions::default()
-            };
             let tuned = create_fastcover_raw_dict_from_source(
                 Cursor::new(data.as_slice()),
                 &mut out,
                 black_box(dict_size),
-                &opts,
+                &fastcover_fixed,
             )
             .expect("fastcover training should succeed");
             black_box((out.len(), tuned.score));
