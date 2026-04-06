@@ -178,5 +178,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md
-          git diff --cached --quiet || git commit -m "chore(bench): publish delta reports"
+          git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages

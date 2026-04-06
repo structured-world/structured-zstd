@@ -296,7 +296,7 @@ if not dictionary_rows:
 
 if not dictionary_training_rows:
     print(
-        "WARN: No REPORT_DICT_TRAIN lines parsed; dictionary training section will be empty.",
+        "WARN: No REPORT_DICT_TRAIN lines parsed; dictionary training section has no data rows; writing _n/a_ placeholder.",
         file=sys.stderr,
     )
 
