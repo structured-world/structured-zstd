@@ -292,7 +292,10 @@ if not memory_rows:
     sys.exit(1)
 
 if not dictionary_rows:
-    print("WARN: No REPORT_DICT lines parsed; dictionary section will be empty.", file=sys.stderr)
+    print(
+        "WARN: No REPORT_DICT lines parsed; dictionary section has no data rows; writing _n/a_ placeholder.",
+        file=sys.stderr,
+    )
 
 if not dictionary_training_rows:
     print(
