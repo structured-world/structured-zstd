@@ -230,9 +230,20 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let mut ctx = Context {
         frequencies: HashMap::with_capacity(epoch_size / K),
     };
-    // Score each segment in the epoch and select the highest scoring segment
-    // for the pool
-    for epoch in all.chunks(epoch_size) {
+    // Score each segment in each planned epoch and select the highest-scoring
+    // segment for the pool. Keep exactly `num_epochs` windows to avoid
+    // emitting more segments than the requested dictionary budget allows.
+    for epoch_idx in 0..num_epochs {
+        let start = epoch_idx.saturating_mul(epoch_size);
+        if start >= all.len() {
+            break;
+        }
+        let end = if epoch_idx + 1 == num_epochs {
+            all.len()
+        } else {
+            usize::min(start.saturating_add(epoch_size), all.len())
+        };
+        let epoch = &all[start..end];
         epoch_counter += 1;
         let best_segment = pick_best_segment(&params, &mut ctx, epoch, &collection_sample);
         vprintln!(
@@ -733,6 +744,26 @@ mod tests {
                 .expect_err("write failures must be returned");
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "write failed");
+    }
+
+    #[test]
+    fn create_raw_dict_from_source_never_exceeds_requested_size() {
+        let dict_size = 4096usize;
+        let source: Vec<u8> = core::iter::repeat_n(b'a', 320_001).collect();
+        let mut out = Vec::new();
+        create_raw_dict_from_source(
+            Cursor::new(source.as_slice()),
+            source.len(),
+            &mut out,
+            dict_size,
+        )
+        .expect("raw dictionary training should succeed");
+        assert!(
+            out.len() <= dict_size,
+            "raw dictionary exceeded requested size: {} > {}",
+            out.len(),
+            dict_size
+        );
     }
 
     #[test]

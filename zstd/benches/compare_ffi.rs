@@ -203,12 +203,21 @@ fn bench_dictionary(c: &mut Criterion) {
         let dict_size = dictionary_size_for(scenario.len())
             .max(256)
             .min(max_dict_size);
+        let Ok(rust_content_budget) =
+            finalized_training_content_budget(scenario.bytes.as_slice(), dict_size)
+        else {
+            eprintln!(
+                "BENCH_WARN skipping Rust FastCOVER dictionary benchmark for {} (samples={}, total_training_bytes={}, dict_size={}) due to finalized content budget error",
+                scenario.id, sample_count, total_training_bytes, dict_size
+            );
+            continue;
+        };
         let fastcover_options = fastcover_fixed_options();
 
         let rust_train_started = Instant::now();
-        let Ok((rust_raw_dictionary, _rust_tuned)) = train_fastcover_raw_from_slice(
+        let Ok((rust_raw_dictionary, rust_tuned)) = train_fastcover_raw_from_slice(
             scenario.bytes.as_slice(),
-            dict_size,
+            rust_content_budget,
             &fastcover_options,
         ) else {
             eprintln!(
@@ -254,6 +263,7 @@ fn bench_dictionary(c: &mut Criterion) {
                     ffi_train_ms,
                     rust_dict_bytes: rust_dictionary.len(),
                     ffi_dict_bytes: ffi_dictionary.len(),
+                    rust_fastcover_score: rust_tuned.score,
                 },
             );
         }
@@ -267,7 +277,7 @@ fn bench_dictionary(c: &mut Criterion) {
             b.iter(|| {
                 let (raw_dict, tuned) = train_fastcover_raw_from_slice(
                     scenario.bytes.as_slice(),
-                    dict_size,
+                    rust_content_budget,
                     &fastcover_options,
                 )
                 .expect("fastcover training should succeed");
@@ -441,7 +451,7 @@ fn emit_dictionary_report(
 fn emit_dictionary_training_report(scenario: &Scenario, metrics: DictTrainingMetrics) {
     let escaped_label = escape_report_label(&scenario.label);
     println!(
-        "REPORT_DICT_TRAIN scenario={} label=\"{}\" training_bytes={} dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={}",
+        "REPORT_DICT_TRAIN scenario={} label=\"{}\" training_bytes={} dict_bytes_requested={} rust_train_ms={:.3} ffi_train_ms={:.3} rust_dict_bytes={} ffi_dict_bytes={} rust_fastcover_score={}",
         scenario.id,
         escaped_label,
         metrics.training_bytes,
@@ -449,7 +459,8 @@ fn emit_dictionary_training_report(scenario: &Scenario, metrics: DictTrainingMet
         metrics.rust_train_ms,
         metrics.ffi_train_ms,
         metrics.rust_dict_bytes,
-        metrics.ffi_dict_bytes
+        metrics.ffi_dict_bytes,
+        metrics.rust_fastcover_score
     );
 }
 
@@ -460,6 +471,19 @@ struct DictTrainingMetrics {
     ffi_train_ms: f64,
     rust_dict_bytes: usize,
     ffi_dict_bytes: usize,
+    rust_fastcover_score: usize,
+}
+
+fn finalized_training_content_budget(sample: &[u8], dict_size: usize) -> std::io::Result<usize> {
+    let probe = [0u8; 8];
+    let finalized = finalize_raw_dict(
+        probe.as_slice(),
+        sample,
+        dict_size,
+        FinalizeOptions::default(),
+    )?;
+    let header_bytes = finalized.len().saturating_sub(probe.len());
+    Ok(dict_size.saturating_sub(header_bytes))
 }
 
 fn training_sample_count(source: &[u8]) -> usize {
