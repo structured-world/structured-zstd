@@ -158,3 +158,25 @@ jobs:
           fail-on-alert: ${{ github.event_name == 'pull_request' }}
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
+
+      - name: Checkout gh-pages
+        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          token: ${{ steps.bot-token.outputs.token }}
+          path: gh-pages
+
+      - name: Publish benchmark reports to gh-pages
+        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p gh-pages/dev/bench
+          cp benchmark-report.md gh-pages/dev/bench/benchmark-report.md
+          cp benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
+          cp benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md
+          git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
+          git push origin gh-pages
