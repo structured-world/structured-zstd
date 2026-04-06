@@ -12,6 +12,8 @@ Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/Ki
 Historical benchmark charts are published to GitHub Pages:
 
 - [Performance dashboard](https://structured-world.github.io/structured-zstd/dev/bench/)
+- [Latest benchmark delta report](https://structured-world.github.io/structured-zstd/dev/bench/benchmark-delta.md)
+- [Latest full benchmark report](https://structured-world.github.io/structured-zstd/dev/bench/benchmark-report.md)
 
 Note: the root Pages URL can be empty; benchmark charts live under `/dev/bench/`.
 

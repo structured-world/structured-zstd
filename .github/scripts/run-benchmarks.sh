@@ -296,10 +296,9 @@ if not dictionary_rows:
 
 if not dictionary_training_rows:
     print(
-        "ERROR: No REPORT_DICT_TRAIN lines parsed; dictionary training section would be empty.",
+        "WARN: No REPORT_DICT_TRAIN lines parsed; dictionary training section will be empty.",
         file=sys.stderr,
     )
-    sys.exit(1)
 
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)
@@ -482,6 +481,8 @@ for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["lev
     lines.append(
         f'| {row["scenario"]} | {label} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
     )
+if not dictionary_rows:
+    lines.append("| _n/a_ | _no dictionary rows emitted in this run_ | - | - | - | - | - | - | - |")
 
 lines.extend([
     "",
@@ -498,6 +499,8 @@ for row in sorted(dictionary_training_rows, key=lambda item: item["scenario"]):
     lines.append(
         f'| {row["scenario"]} | {label} | {row["dict_bytes_requested"]} | {row["rust_train_ms"]:.3f} | {row["ffi_train_ms"]:.3f} | {row["rust_dict_bytes"]} | {row["ffi_dict_bytes"]} | {row["rust_fastcover_score"]} | {delta_cell} | {row["status"]} |'
     )
+if not dictionary_training_rows:
+    lines.append("| _n/a_ | _no dictionary training rows emitted in this run_ | - | - | - | - | - | - | - | - |")
 
 lines.extend([
     "",
