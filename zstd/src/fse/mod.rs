@@ -41,7 +41,7 @@ fn build_from_probabilities_rejects_acc_log_over_entry_limit() {
 #[test]
 fn build_decoder_clamps_max_log_over_entry_limit() {
     let mut dec_table = FSETable::new(255);
-    let err = dec_table.build_decoder(&[], 16).unwrap_err();
+    let err = dec_table.build_decoder(&[], 17).unwrap_err();
     assert!(matches!(
         err,
         crate::decoding::errors::FSETableError::GetBitsError(_)

@@ -413,6 +413,15 @@ pub struct Entry {
     pub num_bits: u8,
 }
 
+#[cfg(target_endian = "little")]
+const _: [(); 0] = [(); core::mem::offset_of!(Entry, new_state)];
+#[cfg(target_endian = "little")]
+const _: [(); 2] = [(); core::mem::offset_of!(Entry, symbol)];
+#[cfg(target_endian = "little")]
+const _: [(); 3] = [(); core::mem::offset_of!(Entry, num_bits)];
+#[cfg(target_endian = "little")]
+const _: [(); 4] = [(); core::mem::size_of::<Entry>()];
+
 /// This value is added to the first 4 bits of the stream to determine the
 /// `Accuracy_Log`
 const ACC_LOG_OFFSET: u8 = 5;
