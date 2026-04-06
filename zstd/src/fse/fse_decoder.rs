@@ -1,6 +1,8 @@
 use crate::bit_io::{BitReader, BitReaderReversed};
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
+use alloc::vec;
 use alloc::vec::Vec;
+use core::ptr;
 
 pub struct FSEDecoder<'table> {
     /// An FSE state value represents an index in the FSE table.
@@ -15,8 +17,8 @@ impl<'t> FSEDecoder<'t> {
         FSEDecoder {
             state: table.decode.first().copied().unwrap_or(Entry {
                 new_state: 0,
-                num_bits: 0,
                 symbol: 0,
+                num_bits: 0,
             }),
             table,
         }
@@ -183,21 +185,19 @@ impl FSETable {
             table_size,
             Entry {
                 new_state: 0,
-                num_bits: 0,
                 symbol: 0,
+                num_bits: 0,
             },
         );
 
+        let mut table_symbols = vec![0u8; table_size];
         let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
 
         //first scan for all -1 probabilities and place them at the top of the table
         for symbol in 0..self.symbol_probabilities.len() {
             if self.symbol_probabilities[symbol] == -1 {
                 negative_idx -= 1;
-                let entry = &mut self.decode[negative_idx];
-                entry.symbol = symbol as u8;
-                entry.new_state = 0;
-                entry.num_bits = self.accuracy_log;
+                table_symbols[negative_idx] = symbol as u8;
             }
         }
 
@@ -212,8 +212,7 @@ impl FSETable {
             //for each probability point the symbol gets on slot
             let prob = self.symbol_probabilities[idx];
             for _ in 0..prob {
-                let entry = &mut self.decode[position];
-                entry.symbol = symbol;
+                table_symbols[position] = symbol;
 
                 position = next_position(position, table_size);
                 while position >= negative_idx {
@@ -221,6 +220,11 @@ impl FSETable {
                     //everything above negative_idx is already taken
                 }
             }
+        }
+
+        self.copy_symbols_into_decode(&table_symbols);
+        for idx in negative_idx..table_size {
+            self.decode[idx].num_bits = self.accuracy_log;
         }
 
         // baselines and num_bits can only be calculated when all symbols have been spread
@@ -245,6 +249,36 @@ impl FSETable {
             entry.num_bits = nb;
         }
         Ok(())
+    }
+
+    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8]) {
+        debug_assert_eq!(table_symbols.len(), self.decode.len());
+
+        #[cfg(target_endian = "little")]
+        {
+            // Write two packed entries (8 bytes) at once:
+            // Entry bytes are [new_state_lo, new_state_hi, symbol, num_bits].
+            let mut idx = 0usize;
+            while idx + 1 < table_symbols.len() {
+                let packed =
+                    ((table_symbols[idx] as u64) << 16) | ((table_symbols[idx + 1] as u64) << 48);
+                // SAFETY: `idx + 1 < len`, so at least 8 bytes remain. Unaligned writes are intentional.
+                unsafe {
+                    ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u64>(), packed);
+                }
+                idx += 2;
+            }
+            if idx < table_symbols.len() {
+                self.decode[idx].symbol = table_symbols[idx];
+            }
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
+                entry.symbol = symbol;
+            }
+        }
     }
 
     /// Read the accuracy log and the probability table from the source and return the number of bytes
@@ -339,13 +373,13 @@ impl FSETable {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
-    /// This value is used as an offset value, and it is added to the bits read
-    /// from the stream to determine the next state value.
+    /// Base index for the next state. The low bits read from the bitstream are
+    /// added to this value to produce the final state index.
     pub new_state: u16,
-    /// How many bits should be read from the stream when decoding this entry.
-    pub num_bits: u8,
     /// The byte that should be put in the decode output when encountering this state.
     pub symbol: u8,
+    /// How many bits should be read from the stream when decoding this entry.
+    pub num_bits: u8,
 }
 
 /// This value is added to the first 4 bits of the stream to determine the

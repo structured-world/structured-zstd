@@ -21,6 +21,9 @@ pub mod fse_encoder;
 #[test]
 fn decoder_entry_is_packed_4_bytes() {
     assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, new_state), 0);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, symbol), 2);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, num_bits), 3);
 }
 
 #[test]
