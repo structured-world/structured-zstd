@@ -46,8 +46,6 @@ impl<'t> FSEDecoder<'t> {
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
         self.state = self.table.decode[next_state];
-
-        //println!("Update: {}, {} -> {}", self.state.new_state, add, self.state);
     }
 
     /// Advance the internal state **without** an individual refill check.
