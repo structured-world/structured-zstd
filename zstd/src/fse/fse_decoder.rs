@@ -146,12 +146,7 @@ impl FSETable {
 
     /// returns how many BYTEs (not bits) were read while building the decoder
     pub fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
-        if max_log > ENTRY_MAX_ACCURACY_LOG {
-            return Err(FSETableError::AccLogTooBig {
-                got: max_log,
-                max: ENTRY_MAX_ACCURACY_LOG,
-            });
-        }
+        let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
         self.accuracy_log = 0;
 
         let bytes_read = self.read_probabilities(source, max_log)?;
@@ -280,13 +275,19 @@ impl FSETable {
 
         #[cfg(target_endian = "little")]
         {
+            debug_assert_eq!(core::mem::size_of::<Entry>(), 4);
+            debug_assert_eq!(core::mem::offset_of!(Entry, new_state), 0);
+            debug_assert_eq!(core::mem::offset_of!(Entry, symbol), 2);
+            debug_assert_eq!(core::mem::offset_of!(Entry, num_bits), 3);
             // Write two packed entries (8 bytes) at once:
             // Entry bytes are [new_state_lo, new_state_hi, symbol, num_bits].
             let mut idx = 0usize;
             while idx + 1 < table_symbols.len() {
                 let packed =
                     ((table_symbols[idx] as u64) << 16) | ((table_symbols[idx + 1] as u64) << 48);
-                // SAFETY: `idx + 1 < len`, so at least 8 bytes remain. Unaligned writes are intentional.
+                // SAFETY: `idx + 1 < table_symbols.len()` and `table_symbols.len() == self.decode.len()`
+                // ensure `idx` and `idx + 1` are valid `self.decode` entries (2 x 4 bytes = 8 bytes).
+                // Unaligned writes are intentional because `Entry` alignment may be < 8.
                 unsafe {
                     ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u64>(), packed);
                 }
