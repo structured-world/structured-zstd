@@ -119,6 +119,8 @@ impl FSETable {
         self.symbol_counter.extend_from_slice(&other.symbol_counter);
         self.symbol_probabilities
             .extend_from_slice(&other.symbol_probabilities);
+        self.symbol_spread_buffer
+            .extend_from_slice(&other.symbol_spread_buffer);
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
     }
