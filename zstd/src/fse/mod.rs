@@ -19,6 +19,11 @@ pub use fse_decoder::*;
 pub mod fse_encoder;
 
 #[test]
+fn decoder_entry_is_packed_4_bytes() {
+    assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);
+}
+
+#[test]
 fn tables_equal() {
     let probs = &[0, 0, -1, 3, 2, 2, (1 << 6) - 8];
     let mut dec_table = FSETable::new(255);
@@ -37,7 +42,7 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
             .iter()
             .find(|state| state.index == idx)
             .unwrap();
-        assert_eq!(enc_state.baseline, dec_state.base_line as usize);
+        assert_eq!(enc_state.baseline, dec_state.new_state as usize);
         assert_eq!(enc_state.num_bits, dec_state.num_bits);
     }
 }

@@ -14,7 +14,7 @@ impl<'t> FSEDecoder<'t> {
     pub fn new(table: &'t FSETable) -> FSEDecoder<'t> {
         FSEDecoder {
             state: table.decode.first().copied().unwrap_or(Entry {
-                base_line: 0,
+                new_state: 0,
                 num_bits: 0,
                 symbol: 0,
             }),
@@ -43,11 +43,10 @@ impl<'t> FSEDecoder<'t> {
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
-        let base_line = self.state.base_line;
-        let new_state = base_line + add as u32;
-        self.state = self.table.decode[new_state as usize];
+        let next_state = self.state.new_state + add as u16;
+        self.state = self.table.decode[next_state as usize];
 
-        //println!("Update: {}, {} -> {}", base_line, add,  self.state);
+        //println!("Update: {}, {} -> {}", self.state.new_state, add, self.state);
     }
 
     /// Advance the internal state **without** an individual refill check.
@@ -62,8 +61,8 @@ impl<'t> FSEDecoder<'t> {
     pub fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
-        let new_state = self.state.base_line + add as u32;
-        self.state = self.table.decode[new_state as usize];
+        let next_state = self.state.new_state + add as u16;
+        self.state = self.table.decode[next_state as usize];
     }
 }
 
@@ -183,7 +182,7 @@ impl FSETable {
         self.decode.resize(
             table_size,
             Entry {
-                base_line: 0,
+                new_state: 0,
                 num_bits: 0,
                 symbol: 0,
             },
@@ -197,7 +196,7 @@ impl FSETable {
                 negative_idx -= 1;
                 let entry = &mut self.decode[negative_idx];
                 entry.symbol = symbol as u8;
-                entry.base_line = 0;
+                entry.new_state = 0;
                 entry.num_bits = self.accuracy_log;
             }
         }
@@ -241,7 +240,8 @@ impl FSETable {
             assert!(nb <= self.accuracy_log);
             self.symbol_counter[symbol as usize] += 1;
 
-            entry.base_line = bl;
+            assert!(u16::try_from(bl).is_ok(), "next_state must fit in u16");
+            entry.new_state = bl as u16;
             entry.num_bits = nb;
         }
         Ok(())
@@ -336,11 +336,12 @@ impl FSETable {
 }
 
 /// A single entry in an FSE table.
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
-    /// This value is used as an offset value, and it is added
-    /// to a value read from the stream to determine the next state value.
-    pub base_line: u32,
+    /// This value is used as an offset value, and it is added to the bits read
+    /// from the stream to determine the next state value.
+    pub new_state: u16,
     /// How many bits should be read from the stream when decoding this entry.
     pub num_bits: u8,
     /// The byte that should be put in the decode output when encountering this state.
