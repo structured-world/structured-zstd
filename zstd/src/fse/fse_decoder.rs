@@ -1,6 +1,5 @@
 use crate::bit_io::{BitReader, BitReaderReversed};
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr;
 
@@ -45,8 +44,8 @@ impl<'t> FSEDecoder<'t> {
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
-        let next_state = self.state.new_state + add as u16;
-        self.state = self.table.decode[next_state as usize];
+        let next_state = usize::from(self.state.new_state) + add as usize;
+        self.state = self.table.decode[next_state];
 
         //println!("Update: {}, {} -> {}", self.state.new_state, add, self.state);
     }
@@ -63,8 +62,8 @@ impl<'t> FSEDecoder<'t> {
     pub fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
-        let next_state = self.state.new_state + add as u16;
-        self.state = self.table.decode[next_state as usize];
+        let next_state = usize::from(self.state.new_state) + add as usize;
+        self.state = self.table.decode[next_state];
     }
 }
 
@@ -79,6 +78,8 @@ pub struct FSETable {
     /// The actual table containing the decoded symbol and the compression data
     /// connected to that symbol.
     pub decode: Vec<Entry>, //used to decode symbols, and calculate the next state
+    /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
+    symbol_spread_buffer: Vec<u8>,
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
     /// This value is used so that the decoder knows how many bits to read from the bitstream.
@@ -106,7 +107,8 @@ impl FSETable {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             symbol_counter: Vec::with_capacity(256), //will never be more than 256 symbols because u8
-            decode: Vec::new(),                      //depending on acc_log.
+            symbol_spread_buffer: Vec::new(),
+            decode: Vec::new(), //depending on acc_log.
             accuracy_log: 0,
         }
     }
@@ -125,6 +127,7 @@ impl FSETable {
     pub fn reset(&mut self) {
         self.symbol_counter.clear();
         self.symbol_probabilities.clear();
+        self.symbol_spread_buffer.clear();
         self.decode.clear();
         self.accuracy_log = 0;
     }
@@ -143,6 +146,12 @@ impl FSETable {
 
     /// returns how many BYTEs (not bits) were read while building the decoder
     pub fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
+        if max_log > ENTRY_MAX_ACCURACY_LOG {
+            return Err(FSETableError::AccLogTooBig {
+                got: max_log,
+                max: ENTRY_MAX_ACCURACY_LOG,
+            });
+        }
         self.accuracy_log = 0;
 
         let bytes_read = self.read_probabilities(source, max_log)?;
@@ -159,6 +168,12 @@ impl FSETable {
     ) -> Result<(), FSETableError> {
         if acc_log == 0 {
             return Err(FSETableError::AccLogIsZero);
+        }
+        if acc_log > ENTRY_MAX_ACCURACY_LOG {
+            return Err(FSETableError::AccLogTooBig {
+                got: acc_log,
+                max: ENTRY_MAX_ACCURACY_LOG,
+            });
         }
         self.symbol_probabilities = probs.to_vec();
         self.accuracy_log = acc_log;
@@ -190,39 +205,46 @@ impl FSETable {
             },
         );
 
-        let mut table_symbols = vec![0u8; table_size];
-        let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
+        let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
+        table_symbols.clear();
+        table_symbols.resize(table_size, 0);
+        let negative_idx = {
+            let table_symbols = &mut table_symbols;
+            let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
 
-        //first scan for all -1 probabilities and place them at the top of the table
-        for symbol in 0..self.symbol_probabilities.len() {
-            if self.symbol_probabilities[symbol] == -1 {
-                negative_idx -= 1;
-                table_symbols[negative_idx] = symbol as u8;
-            }
-        }
-
-        //then place in a semi-random order all of the other symbols
-        let mut position = 0;
-        for idx in 0..self.symbol_probabilities.len() {
-            let symbol = idx as u8;
-            if self.symbol_probabilities[idx] <= 0 {
-                continue;
-            }
-
-            //for each probability point the symbol gets on slot
-            let prob = self.symbol_probabilities[idx];
-            for _ in 0..prob {
-                table_symbols[position] = symbol;
-
-                position = next_position(position, table_size);
-                while position >= negative_idx {
-                    position = next_position(position, table_size);
-                    //everything above negative_idx is already taken
+            //first scan for all -1 probabilities and place them at the top of the table
+            for symbol in 0..self.symbol_probabilities.len() {
+                if self.symbol_probabilities[symbol] == -1 {
+                    negative_idx -= 1;
+                    table_symbols[negative_idx] = symbol as u8;
                 }
             }
-        }
+
+            //then place in a semi-random order all of the other symbols
+            let mut position = 0;
+            for idx in 0..self.symbol_probabilities.len() {
+                let symbol = idx as u8;
+                if self.symbol_probabilities[idx] <= 0 {
+                    continue;
+                }
+
+                //for each probability point the symbol gets on slot
+                let prob = self.symbol_probabilities[idx];
+                for _ in 0..prob {
+                    table_symbols[position] = symbol;
+
+                    position = next_position(position, table_size);
+                    while position >= negative_idx {
+                        position = next_position(position, table_size);
+                        //everything above negative_idx is already taken
+                    }
+                }
+            }
+            negative_idx
+        };
 
         self.copy_symbols_into_decode(&table_symbols);
+        self.symbol_spread_buffer = table_symbols;
         for idx in negative_idx..table_size {
             self.decode[idx].num_bits = self.accuracy_log;
         }
@@ -244,8 +266,10 @@ impl FSETable {
             assert!(nb <= self.accuracy_log);
             self.symbol_counter[symbol as usize] += 1;
 
-            assert!(u16::try_from(bl).is_ok(), "next_state must fit in u16");
-            entry.new_state = bl as u16;
+            entry.new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
+                got: self.accuracy_log,
+                max: ENTRY_MAX_ACCURACY_LOG,
+            })?;
             entry.num_bits = nb;
         }
         Ok(())
@@ -288,6 +312,12 @@ impl FSETable {
 
         let mut br = BitReader::new(source);
         self.accuracy_log = ACC_LOG_OFFSET + (br.get_bits(4)? as u8);
+        if self.accuracy_log > ENTRY_MAX_ACCURACY_LOG {
+            return Err(FSETableError::AccLogTooBig {
+                got: self.accuracy_log,
+                max: ENTRY_MAX_ACCURACY_LOG,
+            });
+        }
         if self.accuracy_log > max_log {
             return Err(FSETableError::AccLogTooBig {
                 got: self.accuracy_log,
@@ -385,6 +415,7 @@ pub struct Entry {
 /// This value is added to the first 4 bits of the stream to determine the
 /// `Accuracy_Log`
 const ACC_LOG_OFFSET: u8 = 5;
+const ENTRY_MAX_ACCURACY_LOG: u8 = 16;
 
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);

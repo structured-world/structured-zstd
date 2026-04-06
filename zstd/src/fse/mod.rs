@@ -27,6 +27,28 @@ fn decoder_entry_is_packed_4_bytes() {
 }
 
 #[test]
+fn build_from_probabilities_rejects_acc_log_over_entry_limit() {
+    let mut dec_table = FSETable::new(255);
+    let err = dec_table
+        .build_from_probabilities(17, &[1, 1, 1, 1])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::decoding::errors::FSETableError::AccLogTooBig { got: 17, max: 16 }
+    ));
+}
+
+#[test]
+fn build_decoder_rejects_max_log_over_entry_limit() {
+    let mut dec_table = FSETable::new(255);
+    let err = dec_table.build_decoder(&[], 17).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::decoding::errors::FSETableError::AccLogTooBig { got: 17, max: 16 }
+    ));
+}
+
+#[test]
 fn tables_equal() {
     let probs = &[0, 0, -1, 3, 2, 2, (1 << 6) - 8];
     let mut dec_table = FSETable::new(255);

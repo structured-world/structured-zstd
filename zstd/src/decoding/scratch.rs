@@ -134,8 +134,9 @@ impl Default for FSEScratch {
     }
 }
 
-// Keep LL/ML/OF table objects cache-line aligned to avoid cross-table placement
-// effects when they are accessed in the same decode hot loop.
+// Keep LL/ML/OF table *objects* cache-line aligned to avoid cross-table placement
+// effects in DecoderScratch when they are accessed in the same decode hot loop.
+// Note: this aligns the table containers, not the `Vec<Entry>` backing allocations.
 #[cfg_attr(target_arch = "aarch64", repr(align(128)))]
 #[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
 pub struct AlignedFSETable(FSETable);
