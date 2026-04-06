@@ -59,6 +59,7 @@ When the `dict_builder` feature is enabled, the `dictionary` module can:
 - build raw dictionaries with FastCOVER (`create_fastcover_raw_dict_from_source`)
 - finalize raw content into full zstd dictionary format (`finalize_raw_dict`)
 - train+finalize in one pure-Rust flow (`create_fastcover_dict_from_source`)
+- propagate I/O failures from dictionary-building APIs via `io::Result` return values
 
 ## Benchmarking
 

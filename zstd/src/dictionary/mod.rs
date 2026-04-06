@@ -111,7 +111,7 @@ pub(super) struct DictParams {
 /// Creates a "raw content" dictionary, training off of every file in this directory and all
 /// sub-directories.
 ///
-/// The resulting dictionary will be approxamitely `dict_size` or less, and written to `output`.
+/// The resulting dictionary will be approximately `dict_size` or less, and written to `output`.
 ///
 /// # Errors
 /// This function returns `Ok(())` if the dictionary was created successfully, and an
@@ -179,6 +179,9 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// This function reads the entire `source` into an in-memory `Vec<u8>` before building
 /// the dictionary. The provided reader need not be buffered, but callers should avoid
 /// sources too large to fit comfortably in memory.
+///
+/// # API note
+/// This public API returns `io::Result<()>` and propagates source/output I/O failures.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     source_size: usize,
@@ -588,9 +591,13 @@ mod tests {
     #[test]
     fn finalize_raw_dict_roundtrips_with_ffi_decoder() {
         let sample = training_data();
+        let dict_size = 4096usize;
+        let content_budget =
+            finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)
+                .expect("content budget should be computable");
         let raw = fastcover::train_fastcover_raw(
             sample.as_slice(),
-            4096,
+            content_budget,
             FastCoverParams {
                 k: 256,
                 d: 8,
@@ -601,7 +608,7 @@ mod tests {
         let finalized = finalize_raw_dict(
             raw.as_slice(),
             sample.as_slice(),
-            4096,
+            dict_size,
             FinalizeOptions::default(),
         )
         .expect("finalization should succeed");
