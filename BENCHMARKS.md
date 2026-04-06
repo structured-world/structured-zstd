@@ -38,9 +38,10 @@ encoder:
 - `structured-zstd::Better` vs `zstd` level `7`
 - `structured-zstd::Best` vs `zstd` level `11`
 
-Dictionary benchmarks are tracked separately with C FFI `with_dict` vs `without_dict` runs, using a
-dictionary trained from scenario samples. Pure Rust dictionary compression is still pending and is
-therefore not part of the pure-Rust-vs-C timing matrix yet.
+Dictionary benchmarks currently include:
+
+- C FFI `with_dict` vs `without_dict` compression runs
+- dictionary training timing comparison (`dict-train`) between Rust FastCOVER and C FFI trainer
 
 ## Issue #24 Acceptance Mapping
 
@@ -55,7 +56,7 @@ therefore not part of the pure-Rust-vs-C timing matrix yet.
 Run the full Criterion matrix:
 
 ```bash
-cargo bench --bench compare_ffi -p structured-zstd -- --output-format bencher
+cargo bench --bench compare_ffi -p structured-zstd --features dict_builder -- --output-format bencher
 ```
 
 Generate the CI-style JSON and markdown report locally:
@@ -85,6 +86,7 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
   - compression ratio tables (`REPORT`)
   - input+output buffer size estimate tables (`REPORT_MEM`)
   - dictionary compression tables (`REPORT_DICT`)
+  - dictionary training comparison tables (`REPORT_DICT_TRAIN`)
   - timing rows for all benchmark functions
 - `benchmark-delta.json` with canonical `(scenario + params)` rows including:
   - raw Rust/FFI ratio values and `rust/ffi` ratio delta
@@ -96,7 +98,9 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
 Delta interpretation (direct same-run comparison on the same environment):
 
 - **Ratio delta** (`rust_ratio / ffi_ratio`): lower is better for Rust
-- **Speed delta** (`rust_bytes_per_sec / ffi_bytes_per_sec`): higher is better for Rust
+- **Speed delta**: higher is better for Rust
+  - throughput form: `rust_bytes_per_sec / ffi_bytes_per_sec`
+  - fallback form (when throughput is unavailable): `ffi_ms_per_iter / rust_ms_per_iter`
 
 Status labels in `benchmark-delta` are derived directly from the same-run deltas (no environment
 calibration/pre-test coefficients):

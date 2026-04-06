@@ -54,7 +54,12 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 
 ### Dictionary Generation
 
-When the `dict_builder` feature is enabled, the `dictionary` module can create raw content dictionaries. Within 0.2% of the official implementation on the `github-users` sample set.
+When the `dict_builder` feature is enabled, the `dictionary` module can:
+- build raw dictionaries with COVER (`create_raw_dict_from_source`)
+- build raw dictionaries with FastCOVER (`create_fastcover_raw_dict_from_source`)
+- finalize raw content into full zstd dictionary format (`finalize_raw_dict`)
+- train+finalize in one pure-Rust flow (`create_fastcover_dict_from_source`)
+- propagate I/O failures from dictionary-building APIs via `io::Result` return values
 
 ## Benchmarking
 

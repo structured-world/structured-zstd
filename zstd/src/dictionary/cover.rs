@@ -67,11 +67,10 @@ pub struct Context {
 pub fn pick_best_segment(
     params: &DictParams,
     ctx: &mut Context,
+    epoch: &'_ [u8],
     collection_sample: &'_ [u8],
 ) -> Segment {
-    let mut segments = collection_sample
-        .chunks(params.segment_size as usize)
-        .peekable();
+    let mut segments = epoch.chunks(params.segment_size as usize).peekable();
     let mut best_segment: &[u8] = segments.peek().expect("at least one segment");
     let mut top_segment_score: usize = 0;
     // Iterate over segments and score each segment, keeping track of the best segment
@@ -93,9 +92,12 @@ pub fn pick_best_segment(
 ///
 /// `score_segment` modifies `ctx.frequencies`.
 fn score_segment(ctx: &mut Context, collection_sample: &[u8], segment: &[u8]) -> usize {
+    if segment.len() < K {
+        return 0;
+    }
     let mut segment_score = 0;
     // Determine the score of each overlapping k-mer
-    for i in 0..(segment.len() - K - 1) {
+    for i in 0..=(segment.len() - K) {
         let kmer: &KMer = (&segment[i..i + K])
             .try_into()
             .expect("Failed to make kmer");

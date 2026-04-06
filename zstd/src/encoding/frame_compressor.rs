@@ -730,7 +730,8 @@ mod tests {
             training.len(),
             &mut raw_dict,
             4096,
-        );
+        )
+        .expect("dict_builder training should succeed");
         assert!(
             !raw_dict.is_empty(),
             "dict_builder produced an empty dictionary"
