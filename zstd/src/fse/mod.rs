@@ -39,7 +39,7 @@ fn build_from_probabilities_rejects_acc_log_over_entry_limit() {
 }
 
 #[test]
-fn build_decoder_clamps_max_log_over_entry_limit() {
+fn build_decoder_empty_input_reports_bits_error_with_large_max_log() {
     let mut dec_table = FSETable::new(255);
     let err = dec_table.build_decoder(&[], 17).unwrap_err();
     assert!(matches!(
