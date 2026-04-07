@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775522255850,
+  "lastUpdate": 1775592876704,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -14568,6 +14568,212 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/best/large-log-stream/c_stream/matrix/c_ffi",
             "value": 0.666,
+            "unit": "ms"
+          }
+        ]
+      }
+    ],
+    "structured-zstd vs C FFI (x86_64-gnu)": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6ee8b0952421b012f4afb4412cd2c36f96f3cb22",
+          "message": "perf(bench): multi-arch relative Rust-vs-FFI dashboard (#78)\n\n* perf(bench): publish multi-target relative dashboard\n\n- add target-aware benchmark generation and benchmark-relative.json\n- run CI benchmark matrix for x86_64-gnu, i686-gnu, x86_64-musl\n- publish relative-first gh-pages dashboard with filters and merged payloads\n- document relative metrics and matrix coverage in benchmark docs\n\nCloses #77\n\n* fix(bench): align target ids and preserve report payloads\n\n- use stable short target id in benchmark artifacts and metadata\n- merge markdown report bodies per target instead of replacing with counts-only summary\n- add target filter and parity-band rendering in dashboard\n- load reference band from payload and remove JSON-driven innerHTML rendering\n\n* fix(bench): preserve relative series and reference bands\n\n- make dashboard parity-band copy data-driven from payload\n- group chart/status by target+benchmark key to avoid row overwrite\n- preserve reference_band when merging benchmark-relative payloads\n\n* ci(bench): parallelize matrix benchmark jobs\n\n* ci(bench): align alerts with persisted baseline\n\n* fix(bench-ui): fallback default metric selection\n\n* ci(bench): trim report headings and retain recent payload\n\n* ci(workflow): keep main pushes from mid-flight cancellation\n\n* ci(workflow): gate benchmark action to canonical target\n\n* ci(bench): relax noisy regression checks\n\n* ci(bench): validate merge path and preserve target metadata\n\n* ci(bench): keep benchmark series names stable\n\n* ci(bench): extract benchmark merge script\n\n* fix(bench-dashboard): stabilize snapshot ordering\n\n* fix(ci): harden benchmark merge and gating\n\n* chore(review): address final nitpick threads\n\n* fix(bench): harden smoke-set result handling\n\n* fix(bench): tighten merge artifact validation",
+          "timestamp": "2026-04-07T22:49:06+03:00",
+          "tree_id": "bac9a2b55f46538e73dd24c098c2757d9d27f5af",
+          "url": "https://github.com/structured-world/structured-zstd/commit/6ee8b0952421b012f4afb4412cd2c36f96f3cb22"
+        },
+        "date": 1775592875663,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 5.608,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.151,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.098,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 112.626,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.677,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 56.409,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 12.196,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 11.896,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.21,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 4.598,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.557,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.75,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.499,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.763,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.333,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.622,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.65,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.988,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.307,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.326,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.326,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
