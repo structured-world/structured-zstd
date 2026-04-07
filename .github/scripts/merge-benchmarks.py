@@ -172,16 +172,19 @@ if existing_relative_path.exists():
             continue
         register_target(target_id, target_meta)
 
-key = lambda row: (
-    row.get("commit_sha"),
-    row.get("target"),
-    row.get("metric"),
-    row.get("key"),
-    row.get("generated_at"),
-)
+def record_key(row):
+    return (
+        row.get("commit_sha"),
+        row.get("target"),
+        row.get("metric"),
+        row.get("key"),
+        row.get("generated_at"),
+    )
+
+
 merged = {}
 for row in existing_records + relative_records:
-    merged[key(row)] = row
+    merged[record_key(row)] = row
 merged_values = sorted(
     merged.values(),
     key=lambda row: (
