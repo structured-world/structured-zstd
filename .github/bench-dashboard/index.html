@@ -80,6 +80,15 @@
       #status {
         margin-top: 8px;
         font-size: 0.88rem;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      #status ul {
+        margin: 6px 0 0;
+        padding-left: 18px;
+      }
+      #status li {
+        margin: 2px 0;
       }
       .near-parity {
         color: var(--ok);
@@ -340,11 +349,23 @@
         return rows.reduce((latest, row) => (compareByGeneratedAt(row, latest) > 0 ? row : latest));
       }
 
+      function setStatusText(message, className) {
+        const status = el("status");
+        status.replaceChildren(document.createTextNode(message));
+        status.className = className || "";
+      }
+
+      function compactSeriesLabel(seriesId) {
+        const [target, rawKey] = String(seriesId || "").split(":", 2);
+        if (!rawKey) return String(seriesId || "unknown-series");
+        const [metric, stage, scenario, level, source] = rawKey.split("|");
+        return `${target} • ${scenario || "scenario"} • ${stage || "stage"}:${level || "level"} • ${source || "none"} • ${metric || "metric"}`;
+      }
+
       function updateStatus(filtered) {
         const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
         if (!numericRows.length) {
-          el("status").textContent = "No matching points for current filter.";
-          el("status").className = "";
+          setStatusText("No matching points for current filter.", "");
           return;
         }
 
@@ -364,17 +385,42 @@
           const latest = latestPerSeries[0].row;
           const pct = ((latest.delta_ratio - 1) * 100).toFixed(2);
           const inBand = latest.delta_ratio >= BAND_LOW && latest.delta_ratio <= BAND_HIGH;
-          el("status").textContent = `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`;
-          el("status").className = inBand ? "near-parity" : "outside-band";
+          setStatusText(
+            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`,
+            inBand ? "near-parity" : "outside-band",
+          );
           return;
         }
         const perSeries = latestPerSeries.map(({ seriesId, row }) => {
           const pct = ((row.delta_ratio - 1) * 100).toFixed(2);
           const inBand = row.delta_ratio >= BAND_LOW && row.delta_ratio <= BAND_HIGH;
-          return { seriesId, inBand, text: `${seriesId}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} band` };
+          const deviation = Math.abs(row.delta_ratio - 1);
+          return {
+            seriesId,
+            inBand,
+            deviation,
+            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} band`,
+          };
         });
-        el("status").textContent = `Latest deltas by series: ${perSeries.map((item) => item.text).join("; ")}`;
-        el("status").className = perSeries.every((item) => item.inBand) ? "near-parity" : "outside-band";
+        const status = el("status");
+        status.replaceChildren();
+        const outsideBand = perSeries.filter((item) => !item.inBand);
+        const focus = (outsideBand.length ? outsideBand : perSeries)
+          .sort((a, b) => b.deviation - a.deviation)
+          .slice(0, 8);
+        const summary = document.createElement("div");
+        summary.textContent = `Latest series: ${perSeries.length}. Outside parity band: ${outsideBand.length}. Showing top ${focus.length} by deviation.`;
+        status.appendChild(summary);
+        if (focus.length > 0) {
+          const list = document.createElement("ul");
+          for (const item of focus) {
+            const li = document.createElement("li");
+            li.textContent = item.text;
+            list.appendChild(li);
+          }
+          status.appendChild(list);
+        }
+        status.className = outsideBand.length === 0 ? "near-parity" : "outside-band";
       }
 
       function renderChart(filtered) {
@@ -543,8 +589,7 @@
       }
 
       main().catch((err) => {
-        el("status").textContent = String(err);
-        el("status").className = "outside-band";
+        setStatusText(String(err), "outside-band");
       });
     </script>
   </body>
