@@ -236,9 +236,10 @@ jobs:
 
           relative_records = []
           delta_records = []
-          targets = []
+          target_order = []
+          target_counts = {}
           summary_lines = [
-              "# Benchmark Report (multi-target)",
+              "# Benchmark Summary (multi-target)",
               "",
               "Generated from CI benchmark matrix artifacts.",
               "",
@@ -248,35 +249,47 @@ jobs:
               "| --- | ---: | ---: |",
           ]
           delta_md_lines = [
-              "# Benchmark Delta Report (multi-target)",
+              "# Benchmark Delta Summary (multi-target)",
               "",
               "Canonical rows merged across benchmark targets.",
               "",
           ]
+          report_bodies = {}
+          delta_md_bodies = {}
+
+          def register_target(target):
+              if target not in target_order:
+                  target_order.append(target)
+              if target not in target_counts:
+                  target_counts[target] = {"relative": 0, "delta": 0}
 
           for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
               payload = json.loads(rel_path.read_text())
               target = payload.get("target", {}).get("id", "unknown")
               rows = payload.get("records", [])
               relative_records.extend(rows)
-              targets.append(target)
-              summary_lines.append(f"| `{target}` | {len(rows)} | 0 |")
-              delta_md_lines.append(f"- `{target}`: {len(rows)} relative rows")
+              register_target(target)
+              target_counts[target]["relative"] += len(rows)
+
+          for report_path in sorted(root.rglob("benchmark-report.*.md")):
+              target = report_path.name.replace("benchmark-report.", "").replace(".md", "")
+              register_target(target)
+              report_bodies[target] = report_path.read_text().strip()
 
           for delta_path in sorted(root.rglob("benchmark-delta.*.json")):
               rows = json.loads(delta_path.read_text())
               delta_records.extend(rows)
-              target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
-              matched = False
-              for idx, line in enumerate(summary_lines):
-                  if line.startswith(f"| `{target}` | "):
-                      parts = line.split("|")
-                      parts[-2] = f" {len(rows)} "
-                      summary_lines[idx] = "|".join(parts)
-                      matched = True
-                      break
-              if not matched:
-                  summary_lines.append(f"| `{target}` | 0 | {len(rows)} |")
+              if rows:
+                  target = rows[0].get("target") or "unknown"
+              else:
+                  target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
+              register_target(target)
+              target_counts[target]["delta"] += len(rows)
+
+          for delta_md_path in sorted(root.rglob("benchmark-delta.*.md")):
+              target = delta_md_path.name.replace("benchmark-delta.", "").replace(".md", "")
+              register_target(target)
+              delta_md_bodies[target] = delta_md_path.read_text().strip()
 
           if not relative_records:
               raise SystemExit("No relative records found in benchmark artifacts")
@@ -302,7 +315,7 @@ jobs:
 
           merged_relative_payload = {
               "version": 1,
-              "targets": sorted(set(targets)),
+              "targets": sorted(set(target_order)),
               "records": sorted(
                   merged.values(),
                   key=lambda row: (
@@ -314,10 +327,41 @@ jobs:
               ),
           }
 
+          for target in target_order:
+              counts = target_counts.get(target, {"relative": 0, "delta": 0})
+              summary_lines.append(f"| `{target}` | {counts['relative']} | {counts['delta']} |")
+              delta_md_lines.append(f"- `{target}`: {counts['delta']} delta rows, {counts['relative']} relative rows")
+
+          report_lines = ["# Benchmark Report (multi-target)", ""]
+          for target in target_order:
+              body = report_bodies.get(target)
+              if not body:
+                  continue
+              report_lines.append(f"## Target `{target}`")
+              report_lines.append("")
+              report_lines.append(body)
+              report_lines.append("")
+          if len(report_lines) == 2:
+              raise SystemExit("No benchmark-report.*.md artifacts found")
+
+          delta_lines = ["# Benchmark Delta Report (multi-target)", ""]
+          for target in target_order:
+              body = delta_md_bodies.get(target)
+              if not body:
+                  continue
+              delta_lines.append(f"## Target `{target}`")
+              delta_lines.append("")
+              delta_lines.append(body)
+              delta_lines.append("")
+          if len(delta_lines) == 2:
+              raise SystemExit("No benchmark-delta.*.md artifacts found")
+
           (out / "benchmark-relative.json").write_text(json.dumps(merged_relative_payload, indent=2) + "\n")
           (out / "benchmark-delta.json").write_text(json.dumps(delta_records, indent=2) + "\n")
-          (out / "benchmark-report.md").write_text("\n".join(summary_lines) + "\n")
-          (out / "benchmark-delta.md").write_text("\n".join(delta_md_lines) + "\n")
+          (out / "benchmark-summary.md").write_text("\n".join(summary_lines) + "\n")
+          (out / "benchmark-delta-summary.md").write_text("\n".join(delta_md_lines) + "\n")
+          (out / "benchmark-report.md").write_text("\n".join(report_lines).strip() + "\n")
+          (out / "benchmark-delta.md").write_text("\n".join(delta_lines).strip() + "\n")
           PY
 
       - name: Publish benchmark reports to gh-pages
@@ -326,11 +370,13 @@ jobs:
           cp merged/benchmark-report.md gh-pages/dev/bench/benchmark-report.md
           cp merged/benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
           cp merged/benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cp merged/benchmark-summary.md gh-pages/dev/bench/benchmark-summary.md
+          cp merged/benchmark-delta-summary.md gh-pages/dev/bench/benchmark-delta-summary.md
           cp merged/benchmark-relative.json gh-pages/dev/bench/benchmark-relative.json
           cp .github/bench-dashboard/index.html gh-pages/dev/bench/index.html
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json
+          git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json dev/bench/benchmark-summary.md dev/bench/benchmark-delta-summary.md
           git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages

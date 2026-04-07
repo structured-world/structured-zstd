@@ -141,6 +141,9 @@
 
       <section class="card" style="margin-top: 14px">
         <div class="filters">
+          <label>Target
+            <select id="f-target"></select>
+          </label>
           <label>Metric
             <select id="f-metric"></select>
           </label>
@@ -190,11 +193,11 @@
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <script src="data.js"></script>
-    <script>
+      <script>
       "use strict";
 
-      const BAND_LOW = 0.99;
-      const BAND_HIGH = 1.05;
+      let BAND_LOW = 0.99;
+      let BAND_HIGH = 1.05;
       const ALWAYS = "__all__";
 
       const state = {
@@ -205,6 +208,7 @@
       const el = (id) => document.getElementById(id);
 
       const selectors = {
+        target: el("f-target"),
         metric: el("f-metric"),
         stage: el("f-stage"),
         scenario: el("f-scenario"),
@@ -217,13 +221,23 @@
       }
 
       function renderOptions(select, values) {
-        const opts = [`<option value="${ALWAYS}">all</option>`]
-          .concat(values.map((v) => `<option value="${String(v)}">${String(v)}</option>`))
-          .join("");
-        select.innerHTML = opts;
+        const fragment = document.createDocumentFragment();
+        const allOption = document.createElement("option");
+        allOption.value = ALWAYS;
+        allOption.textContent = "all";
+        fragment.appendChild(allOption);
+        for (const value of values) {
+          const option = document.createElement("option");
+          const text = String(value);
+          option.value = text;
+          option.textContent = text;
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
       }
 
       function matchesFilter(record, filter) {
+        if (filter.target !== ALWAYS && record.target !== filter.target) return false;
         if (filter.metric !== ALWAYS && record.metric !== filter.metric) return false;
         if (filter.stage !== ALWAYS && record.stage !== filter.stage) return false;
         if (filter.scenario !== ALWAYS && record.scenario !== filter.scenario) return false;
@@ -259,26 +273,85 @@
         return { labels, datasets };
       }
 
+      function parseGeneratedAt(label) {
+        const parsed = Date.parse(label);
+        return Number.isNaN(parsed) ? null : parsed;
+      }
+
+      function compareByGeneratedAt(a, b) {
+        const aLabel = a.generated_at || "";
+        const bLabel = b.generated_at || "";
+        const aTs = parseGeneratedAt(aLabel);
+        const bTs = parseGeneratedAt(bLabel);
+        if (aTs !== null && bTs !== null) return aTs - bTs;
+        if (aTs !== null) return 1;
+        if (bTs !== null) return -1;
+        return aLabel.localeCompare(bLabel);
+      }
+
+      function latestRow(rows) {
+        return rows.reduce((latest, row) => (compareByGeneratedAt(row, latest) > 0 ? row : latest));
+      }
+
       function updateStatus(filtered) {
-        const values = filtered.map((row) => row.delta_ratio).filter((v) => typeof v === "number");
-        if (!values.length) {
+        const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
+        if (!numericRows.length) {
           el("status").textContent = "No matching points for current filter.";
           el("status").className = "";
           return;
         }
-        const latest = values[values.length - 1];
-        const pct = ((latest - 1) * 100).toFixed(2);
-        const inBand = latest >= BAND_LOW && latest <= BAND_HIGH;
-        el("status").textContent = `Latest delta: ${latest.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`;
-        el("status").className = inBand ? "near-parity" : "outside-band";
+
+        const targets = uniq(numericRows.map((row) => row.target || "unknown-target"));
+        if (targets.length === 1) {
+          const latest = latestRow(numericRows);
+          const pct = ((latest.delta_ratio - 1) * 100).toFixed(2);
+          const inBand = latest.delta_ratio >= BAND_LOW && latest.delta_ratio <= BAND_HIGH;
+          el("status").textContent = `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`;
+          el("status").className = inBand ? "near-parity" : "outside-band";
+          return;
+        }
+
+        const perTarget = targets.map((target) => {
+          const latest = latestRow(numericRows.filter((row) => (row.target || "unknown-target") === target));
+          const pct = ((latest.delta_ratio - 1) * 100).toFixed(2);
+          const inBand = latest.delta_ratio >= BAND_LOW && latest.delta_ratio <= BAND_HIGH;
+          return { target, inBand, text: `${target}: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} band` };
+        });
+        el("status").textContent = `Latest deltas by target: ${perTarget.map((item) => item.text).join("; ")}`;
+        el("status").className = perTarget.every((item) => item.inBand) ? "near-parity" : "outside-band";
       }
 
       function renderChart(filtered) {
         const data = buildChart(filtered);
         if (state.chart) state.chart.destroy();
+        const parityBandPlugin = {
+          id: "parityBand",
+          beforeDatasetsDraw(chart) {
+            const yScale = chart.scales.y;
+            const { left, right } = chart.chartArea;
+            const yLow = yScale.getPixelForValue(BAND_LOW);
+            const yHigh = yScale.getPixelForValue(BAND_HIGH);
+            const top = Math.min(yLow, yHigh);
+            const bottom = Math.max(yLow, yHigh);
+            const ctx = chart.ctx;
+            ctx.save();
+            ctx.fillStyle = "rgba(15, 138, 95, 0.12)";
+            ctx.fillRect(left, top, right - left, bottom - top);
+            ctx.strokeStyle = "rgba(15, 138, 95, 0.55)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(left, yLow);
+            ctx.lineTo(right, yLow);
+            ctx.moveTo(left, yHigh);
+            ctx.lineTo(right, yHigh);
+            ctx.stroke();
+            ctx.restore();
+          },
+        };
         state.chart = new Chart(el("chart"), {
           type: "line",
           data,
+          plugins: [parityBandPlugin],
           options: {
             responsive: true,
             scales: {
@@ -298,6 +371,7 @@
 
       function currentFilter() {
         return {
+          target: selectors.target.value,
           metric: selectors.metric.value,
           stage: selectors.stage.value,
           scenario: selectors.scenario.value,
@@ -323,23 +397,58 @@
         const body = el("raw-body");
         const data = window.BENCHMARK_DATA;
         if (!data || !data.entries) {
-          body.innerHTML = "<tr><td colspan='3'>No raw benchmark data available.</td></tr>";
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 3;
+          cell.textContent = "No raw benchmark data available.";
+          row.appendChild(cell);
+          body.replaceChildren(row);
           return;
         }
-        const rows = [];
+        const fragment = document.createDocumentFragment();
         for (const [name, entryList] of Object.entries(data.entries)) {
           const latest = entryList[entryList.length - 1];
           const commit = latest?.commit?.id?.slice(0, 12) || "n/a";
           const benches = latest?.benches?.length || 0;
-          rows.push(`<tr><td>${name}</td><td><code>${commit}</code></td><td>${benches}</td></tr>`);
+          const row = document.createElement("tr");
+
+          const seriesCell = document.createElement("td");
+          seriesCell.textContent = name;
+          row.appendChild(seriesCell);
+
+          const commitCell = document.createElement("td");
+          const code = document.createElement("code");
+          code.textContent = commit;
+          commitCell.appendChild(code);
+          row.appendChild(commitCell);
+
+          const benchCell = document.createElement("td");
+          benchCell.textContent = String(benches);
+          row.appendChild(benchCell);
+
+          fragment.appendChild(row);
         }
-        body.innerHTML = rows.length ? rows.join("") : "<tr><td colspan='3'>No raw benchmark series found.</td></tr>";
+        if (fragment.childNodes.length === 0) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 3;
+          cell.textContent = "No raw benchmark series found.";
+          row.appendChild(cell);
+          body.replaceChildren(row);
+          return;
+        }
+        body.replaceChildren(fragment);
       }
 
       async function main() {
         const response = await fetch("./benchmark-relative.json", { cache: "no-store" });
         if (!response.ok) throw new Error(`Unable to load benchmark-relative.json (${response.status})`);
         const payload = await response.json();
+        const band = payload.reference_band || {};
+        if (typeof band.delta_low === "number" && typeof band.delta_high === "number" && band.delta_low > 0 && band.delta_high >= band.delta_low) {
+          BAND_LOW = band.delta_low;
+          BAND_HIGH = band.delta_high;
+        }
 
         state.records = payload.records || [];
         if (!state.records.length) throw new Error("benchmark-relative.json has no records");
@@ -348,10 +457,18 @@
         const latest = state.records[state.records.length - 1];
 
         el("stat-records").textContent = String(state.records.length);
-        el("stat-targets").innerHTML = targets.map((t) => `<span class="chip">${t}</span>`).join("");
+        const targetsContainer = el("stat-targets");
+        targetsContainer.replaceChildren();
+        for (const target of targets) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = target;
+          targetsContainer.appendChild(chip);
+        }
         el("stat-commit").textContent = (latest.commit_sha || "local-run").slice(0, 12);
         el("stat-snapshot").textContent = latest.generated_at || "n/a";
 
+        renderOptions(selectors.target, targets);
         renderOptions(selectors.metric, uniq(state.records.map((r) => r.metric)));
         renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
         renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));

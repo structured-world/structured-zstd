@@ -17,11 +17,8 @@ fi
 BENCH_TARGET_LABEL="${STRUCTURED_ZSTD_BENCH_TARGET:-host}"
 BENCH_TARGET_TRIPLE="${STRUCTURED_ZSTD_BENCH_TRIPLE:-}"
 
-if [ -n "$BENCH_TARGET_TRIPLE" ]; then
-  BENCH_TARGET_ID="$BENCH_TARGET_TRIPLE"
-else
-  BENCH_TARGET_ID="$BENCH_TARGET_LABEL"
-fi
+# Keep emitted target IDs stable across artifacts and docs.
+BENCH_TARGET_ID="$BENCH_TARGET_LABEL"
 
 BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
