@@ -99,7 +99,7 @@ bench_target_label = os.environ.get("BENCH_TARGET_LABEL", "host")
 bench_target_triple = os.environ.get("BENCH_TARGET_TRIPLE", "")
 bench_target_id = os.environ.get("BENCH_TARGET_ID", bench_target_label)
 commit_sha = os.environ.get("GITHUB_SHA")
-generated_at = datetime.now(timezone.utc).isoformat()
+generated_at = os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT") or datetime.now(timezone.utc).isoformat()
 timing_point_count = 0
 
 DELTA_LOW = 0.99

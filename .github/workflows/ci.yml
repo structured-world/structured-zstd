@@ -156,6 +156,7 @@ jobs:
         env:
           STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
           STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
+          STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: bash .github/scripts/run-benchmarks.sh
 
@@ -202,7 +203,7 @@ jobs:
   benchmark-pages:
     name: Publish benchmark pages payloads
     needs: benchmark
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
@@ -210,12 +211,14 @@ jobs:
 
       - name: Generate bot token
         id: bot-token
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Checkout gh-pages with push token
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/checkout@v6
         with:
           ref: gh-pages
@@ -262,14 +265,23 @@ jobs:
           ]
           report_bodies = {}
           delta_md_bodies = {}
+          targets_meta = {}
           RELATIVE_RETENTION_DAYS = 180
           RELATIVE_MAX_RECORDS = 20000
 
-          def register_target(target):
+          def register_target(target, target_meta=None):
               if target not in target_order:
                   target_order.append(target)
               if target not in target_counts:
                   target_counts[target] = {"relative": 0, "delta": 0}
+              if target_meta:
+                  existing = targets_meta.get(target, {})
+                  merged_meta = {
+                      "id": target,
+                      "label": target_meta.get("label") or existing.get("label") or target,
+                      "triple": target_meta.get("triple") if target_meta.get("triple") is not None else existing.get("triple"),
+                  }
+                  targets_meta[target] = merged_meta
 
           def trim_leading_h1(markdown):
               lines = markdown.splitlines()
@@ -295,10 +307,19 @@ jobs:
                   if reference_band is not None and reference_band != band:
                       raise SystemExit(f"Inconsistent reference_band in {rel_path}")
                   reference_band = band
-              target = payload.get("target", {}).get("id", "unknown")
+              target_payload = payload.get("target") or {}
+              target = target_payload.get("id", "unknown")
               rows = payload.get("records", [])
-              relative_records.extend(rows)
-              register_target(target)
+              register_target(target, target_payload)
+              for row in rows:
+                  enriched = dict(row)
+                  if not enriched.get("target"):
+                      enriched["target"] = target
+                  if target_payload.get("label") and not enriched.get("target_label"):
+                      enriched["target_label"] = target_payload["label"]
+                  if target_payload.get("triple") and not enriched.get("target_triple"):
+                      enriched["target_triple"] = target_payload["triple"]
+                  relative_records.append(enriched)
               target_counts[target]["relative"] += len(rows)
 
           for report_path in sorted(root.rglob("benchmark-report.*.md")):
@@ -342,6 +363,13 @@ jobs:
               existing_band = existing_payload.get("reference_band")
               if reference_band is None and existing_band:
                   reference_band = existing_band
+              for target_meta in existing_payload.get("targets_meta", []):
+                  if not isinstance(target_meta, dict):
+                      continue
+                  target_id = target_meta.get("id")
+                  if not target_id:
+                      continue
+                  register_target(target_id, target_meta)
 
           key = lambda row: (
               row.get("commit_sha"),
@@ -356,12 +384,20 @@ jobs:
           merged_values = sorted(
               merged.values(),
               key=lambda row: (
-                  row.get("generated_at") or "",
+                  parse_generated_at(row) or datetime.max.replace(tzinfo=timezone.utc),
                   row.get("target") or "",
                   row.get("metric") or "",
                   row.get("key") or "",
               ),
           )
+          for row in merged_values:
+              target = row.get("target")
+              target_meta = targets_meta.get(target) if target else None
+              if target_meta:
+                  if target_meta.get("label") and not row.get("target_label"):
+                      row["target_label"] = target_meta["label"]
+                  if "target_triple" not in row:
+                      row["target_triple"] = target_meta.get("triple")
           cutoff = datetime.now(timezone.utc) - timedelta(days=RELATIVE_RETENTION_DAYS)
           retained_values = []
           for row in merged_values:
@@ -374,6 +410,10 @@ jobs:
           merged_relative_payload = {
               "version": 1,
               "targets": sorted(set(target_order)),
+              "targets_meta": [
+                  targets_meta.get(target, {"id": target, "label": target, "triple": None})
+                  for target in target_order
+              ],
               "reference_band": reference_band or {
                   "delta_low": 0.99,
                   "delta_high": 1.05,
@@ -419,6 +459,7 @@ jobs:
           PY
 
       - name: Publish benchmark reports to gh-pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           mkdir -p gh-pages/dev/bench
           cp merged/benchmark-report.md gh-pages/dev/bench/benchmark-report.md
