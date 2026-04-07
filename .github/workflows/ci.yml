@@ -115,7 +115,6 @@ jobs:
     timeout-minutes: 40
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         bench:
           - id: x86_64-gnu
@@ -186,13 +185,14 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: benchmark-results.${{ matrix.bench.id }}.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # gh-pages writes are centralized in benchmark-pages after artifact merge.
+          auto-push: false
           comment-on-alert: true
           alert-comment-cc-users: "@polaz"
           alert-threshold: "115%"
           fail-threshold: "125%"
           fail-on-alert: ${{ github.event_name == 'pull_request' }}
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-data-file: false
           benchmark-data-dir-path: dev/bench
 
   benchmark-pages:
