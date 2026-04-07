@@ -6,6 +6,7 @@ use crate::decoding::dictionary::Dictionary;
 use crate::fse::FSETable;
 use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
@@ -33,11 +34,11 @@ impl DecoderScratch {
                 table: HuffmanTable::new(),
             },
             fse: FSEScratch {
-                offsets: FSETable::new(MAX_OFFSET_CODE),
+                offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
                 of_rle: None,
-                literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
+                literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
                 ll_rle: None,
-                match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
+                match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
             },
             buffer: DecodeBuffer::new(window_size),
@@ -97,22 +98,22 @@ impl Default for HuffmanScratch {
 }
 
 pub struct FSEScratch {
-    pub offsets: FSETable,
+    pub offsets: AlignedFSETable,
     pub of_rle: Option<u8>,
-    pub literal_lengths: FSETable,
+    pub literal_lengths: AlignedFSETable,
     pub ll_rle: Option<u8>,
-    pub match_lengths: FSETable,
+    pub match_lengths: AlignedFSETable,
     pub ml_rle: Option<u8>,
 }
 
 impl FSEScratch {
     pub fn new() -> FSEScratch {
         FSEScratch {
-            offsets: FSETable::new(MAX_OFFSET_CODE),
+            offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
             of_rle: None,
-            literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
+            literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
             ll_rle: None,
-            match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
+            match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
         }
     }
@@ -130,5 +131,32 @@ impl FSEScratch {
 impl Default for FSEScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Keep LL/ML/OF table *objects* cache-line aligned to avoid cross-table placement
+// effects in DecoderScratch when they are accessed in the same decode hot loop.
+// Note: this aligns the table containers, not the `Vec<Entry>` backing allocations.
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
+pub struct AlignedFSETable(FSETable);
+
+impl AlignedFSETable {
+    fn new(max_symbol: u8) -> Self {
+        Self(FSETable::new(max_symbol))
+    }
+}
+
+impl Deref for AlignedFSETable {
+    type Target = FSETable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for AlignedFSETable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }

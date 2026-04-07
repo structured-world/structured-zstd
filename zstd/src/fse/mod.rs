@@ -19,6 +19,36 @@ pub use fse_decoder::*;
 pub mod fse_encoder;
 
 #[test]
+fn decoder_entry_is_packed_4_bytes() {
+    assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, new_state), 0);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, symbol), 2);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, num_bits), 3);
+}
+
+#[test]
+fn build_from_probabilities_rejects_acc_log_over_entry_limit() {
+    let mut dec_table = FSETable::new(255);
+    let err = dec_table
+        .build_from_probabilities(17, &[1, 1, 1, 1])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::decoding::errors::FSETableError::AccLogTooBig { got: 17, max: 16 }
+    ));
+}
+
+#[test]
+fn build_decoder_empty_input_reports_bits_error_with_large_max_log() {
+    let mut dec_table = FSETable::new(255);
+    let err = dec_table.build_decoder(&[], 17).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::decoding::errors::FSETableError::GetBitsError(_)
+    ));
+}
+
+#[test]
 fn tables_equal() {
     let probs = &[0, 0, -1, 3, 2, 2, (1 << 6) - 8];
     let mut dec_table = FSETable::new(255);
@@ -37,7 +67,7 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
             .iter()
             .find(|state| state.index == idx)
             .unwrap();
-        assert_eq!(enc_state.baseline, dec_state.base_line as usize);
+        assert_eq!(enc_state.baseline, dec_state.new_state as usize);
         assert_eq!(enc_state.num_bits, dec_state.num_bits);
     }
 }
