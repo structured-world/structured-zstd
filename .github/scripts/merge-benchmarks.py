@@ -110,7 +110,10 @@ for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
 for report_path in sorted(root.rglob("benchmark-report.*.md")):
     target = report_path.name.replace("benchmark-report.", "").replace(".md", "")
     register_target(target)
-    report_bodies[target] = report_path.read_text().strip()
+    body = report_path.read_text().strip()
+    if not body:
+        raise SystemExit(f"Empty benchmark report artifact: {report_path.name}")
+    report_bodies[target] = body
 
 for delta_path in sorted(root.rglob("benchmark-delta.*.json")):
     rows = json.loads(delta_path.read_text())
@@ -144,7 +147,10 @@ for delta_path in sorted(root.rglob("benchmark-delta.*.json")):
 for delta_md_path in sorted(root.rglob("benchmark-delta.*.md")):
     target = delta_md_path.name.replace("benchmark-delta.", "").replace(".md", "")
     register_target(target)
-    delta_md_bodies[target] = delta_md_path.read_text().strip()
+    body = delta_md_path.read_text().strip()
+    if not body:
+        raise SystemExit(f"Empty benchmark delta report artifact: {delta_md_path.name}")
+    delta_md_bodies[target] = body
 
 if not relative_records:
     raise SystemExit("No relative records found in benchmark artifacts")
@@ -153,8 +159,8 @@ if not delta_records:
 current_targets = list(target_order)
 missing_relative = sorted(target for target in current_targets if target_counts[target]["relative"] == 0)
 missing_delta = sorted(target for target in current_targets if target_counts[target]["delta"] == 0)
-missing_reports = sorted(target for target in current_targets if target not in report_bodies)
-missing_delta_reports = sorted(target for target in current_targets if target not in delta_md_bodies)
+missing_reports = sorted(target for target in current_targets if not report_bodies.get(target))
+missing_delta_reports = sorted(target for target in current_targets if not delta_md_bodies.get(target))
 if missing_relative or missing_delta or missing_reports or missing_delta_reports:
     raise SystemExit(
         "Incomplete benchmark artifacts: "
@@ -196,7 +202,7 @@ for row in existing_records + relative_records:
 merged_values = sorted(
     merged.values(),
     key=lambda row: (
-        parse_generated_at(row) or datetime.max.replace(tzinfo=timezone.utc),
+        parse_generated_at(row) or datetime.min.replace(tzinfo=timezone.utc),
         row.get("target") or "",
         row.get("metric") or "",
         row.get("key") or "",
