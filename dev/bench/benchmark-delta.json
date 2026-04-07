@@ -23,20 +23,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
-          "ms_per_iter": 61.678263,
-          "bytes_per_sec": 16570424.494606795
+          "ms_per_iter": 72.848174,
+          "bytes_per_sec": 14029658.451013474
         },
         "ffi": {
           "benchmark_name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
-          "ms_per_iter": 17.563295,
-          "bytes_per_sec": 58191529.5506908
+          "ms_per_iter": 18.230407,
+          "bytes_per_sec": 56062105.470272824
         }
       },
-      "rust_ms_per_iter": 61.678263,
-      "ffi_ms_per_iter": 17.563295,
-      "rust_bytes_per_sec": 16570424.494606795,
-      "ffi_bytes_per_sec": 58191529.5506908,
-      "delta_rust_over_ffi": 0.28475664108763893,
+      "rust_ms_per_iter": 72.848174,
+      "ffi_ms_per_iter": 18.230407,
+      "rust_bytes_per_sec": 14029658.451013474,
+      "ffi_bytes_per_sec": 56062105.470272824,
+      "delta_rust_over_ffi": 0.25025207907064356,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -69,20 +69,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
-          "ms_per_iter": 56.947436,
-          "bytes_per_sec": 17946988.86882282
+          "ms_per_iter": 59.279124,
+          "bytes_per_sec": 17241061.11959414
         },
         "ffi": {
           "benchmark_name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
-          "ms_per_iter": 12.198399,
-          "bytes_per_sec": 83784355.63552234
+          "ms_per_iter": 12.217545,
+          "bytes_per_sec": 83653057.95886162
         }
       },
-      "rust_ms_per_iter": 56.947436,
-      "ffi_ms_per_iter": 12.198399,
-      "rust_bytes_per_sec": 17946988.86882282,
-      "ffi_bytes_per_sec": 83784355.63552234,
-      "delta_rust_over_ffi": 0.21420453416023857,
+      "rust_ms_per_iter": 59.279124,
+      "ffi_ms_per_iter": 12.217545,
+      "rust_bytes_per_sec": 17241061.11959414,
+      "ffi_bytes_per_sec": 83653057.95886162,
+      "delta_rust_over_ffi": 0.20610198288355272,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -115,20 +115,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
-          "ms_per_iter": 104.595033,
-          "bytes_per_sec": 9771353.100486139
+          "ms_per_iter": 103.575934,
+          "bytes_per_sec": 9867494.895097928
         },
         "ffi": {
           "benchmark_name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
-          "ms_per_iter": 4.670626,
-          "bytes_per_sec": 218821845.29439947
+          "ms_per_iter": 4.755246,
+          "bytes_per_sec": 214927892.26887527
         }
       },
-      "rust_ms_per_iter": 104.595033,
-      "ffi_ms_per_iter": 4.670626,
-      "rust_bytes_per_sec": 9771353.100486139,
-      "ffi_bytes_per_sec": 218821845.29439947,
-      "delta_rust_over_ffi": 0.04465437665668121,
+      "rust_ms_per_iter": 103.575934,
+      "ffi_ms_per_iter": 4.755246,
+      "rust_bytes_per_sec": 9867494.895097928,
+      "ffi_bytes_per_sec": 214927892.26887527,
+      "delta_rust_over_ffi": 0.04591072285189337,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -161,20 +161,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
-          "ms_per_iter": 16.568329,
-          "bytes_per_sec": 61686063.81488441
+          "ms_per_iter": 16.763706,
+          "bytes_per_sec": 60967127.4359023
         },
         "ffi": {
           "benchmark_name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
-          "ms_per_iter": 2.693369,
-          "bytes_per_sec": 379463415.5216014
+          "ms_per_iter": 2.695066,
+          "bytes_per_sec": 379224479.1036657
         }
       },
-      "rust_ms_per_iter": 16.568329,
-      "ffi_ms_per_iter": 2.693369,
-      "rust_bytes_per_sec": 61686063.81488441,
-      "ffi_bytes_per_sec": 379463415.5216014,
-      "delta_rust_over_ffi": 0.16256129389994609,
+      "rust_ms_per_iter": 16.763706,
+      "ffi_ms_per_iter": 2.695066,
+      "rust_bytes_per_sec": 60967127.4359023,
+      "ffi_bytes_per_sec": 379224479.1036657,
+      "delta_rust_over_ffi": 0.16076791134370885,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -207,20 +207,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
-          "ms_per_iter": 4.510335,
-          "bytes_per_sec": 226598467.74130964
+          "ms_per_iter": 4.542699,
+          "bytes_per_sec": 224984089.8549519
         },
         "ffi": {
           "benchmark_name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.967045,
-          "bytes_per_sec": 1056863951.5224214
+          "ms_per_iter": 0.967611,
+          "bytes_per_sec": 1056245743.382413
         }
       },
-      "rust_ms_per_iter": 4.510335,
-      "ffi_ms_per_iter": 0.967045,
-      "rust_bytes_per_sec": 226598467.74130964,
-      "ffi_bytes_per_sec": 1056863951.5224214,
-      "delta_rust_over_ffi": 0.2144064686991099,
+      "rust_ms_per_iter": 4.542699,
+      "ffi_ms_per_iter": 0.967611,
+      "rust_bytes_per_sec": 224984089.8549519,
+      "ffi_bytes_per_sec": 1056245743.382413,
+      "delta_rust_over_ffi": 0.21300354701026858,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -253,20 +253,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.303413,
-          "bytes_per_sec": 443704624.3986641
+          "ms_per_iter": 2.292045,
+          "bytes_per_sec": 445905294.1805244
         },
         "ffi": {
           "benchmark_name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.61432,
-          "bytes_per_sec": 1663685050.1367366
+          "ms_per_iter": 0.613534,
+          "bytes_per_sec": 1665816401.373029
         }
       },
-      "rust_ms_per_iter": 2.303413,
-      "ffi_ms_per_iter": 0.61432,
-      "rust_bytes_per_sec": 443704624.3986641,
-      "ffi_bytes_per_sec": 1663685050.1367366,
-      "delta_rust_over_ffi": 0.2666998927244051,
+      "rust_ms_per_iter": 2.292045,
+      "ffi_ms_per_iter": 0.613534,
+      "rust_bytes_per_sec": 445905294.1805244,
+      "ffi_bytes_per_sec": 1665816401.373029,
+      "delta_rust_over_ffi": 0.2676797357818019,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -299,20 +299,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
-          "ms_per_iter": 4.579008,
-          "bytes_per_sec": 223200090.4999511
+          "ms_per_iter": 4.616778,
+          "bytes_per_sec": 221374083.83075815
         },
         "ffi": {
           "benchmark_name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.992684,
-          "bytes_per_sec": 1029567314.4726821
+          "ms_per_iter": 0.993053,
+          "bytes_per_sec": 1029184746.4334733
         }
       },
-      "rust_ms_per_iter": 4.579008,
-      "ffi_ms_per_iter": 0.992684,
-      "rust_bytes_per_sec": 223200090.4999511,
-      "ffi_bytes_per_sec": 1029567314.4726821,
-      "delta_rust_over_ffi": 0.21679018687016927,
+      "rust_ms_per_iter": 4.616778,
+      "ffi_ms_per_iter": 0.993053,
+      "rust_bytes_per_sec": 221374083.83075815,
+      "ffi_bytes_per_sec": 1029184746.4334733,
+      "delta_rust_over_ffi": 0.21509654568619066,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -345,20 +345,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.325662,
-          "bytes_per_sec": 439459818.3226969
+          "ms_per_iter": 2.32452,
+          "bytes_per_sec": 439675717.99769413
         },
         "ffi": {
           "benchmark_name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.626308,
-          "bytes_per_sec": 1631840883.3992221
+          "ms_per_iter": 0.623992,
+          "bytes_per_sec": 1637897601.2512982
         }
       },
-      "rust_ms_per_iter": 2.325662,
-      "ffi_ms_per_iter": 0.626308,
-      "rust_bytes_per_sec": 439459818.3226969,
-      "ffi_bytes_per_sec": 1631840883.3992221,
-      "delta_rust_over_ffi": 0.2693031059543476,
+      "rust_ms_per_iter": 2.32452,
+      "ffi_ms_per_iter": 0.623992,
+      "rust_bytes_per_sec": 439675717.99769413,
+      "ffi_bytes_per_sec": 1637897601.2512982,
+      "delta_rust_over_ffi": 0.26843907559410113,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -391,20 +391,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
-          "ms_per_iter": 4.728339,
-          "bytes_per_sec": 216150957.02740434
+          "ms_per_iter": 4.765177,
+          "bytes_per_sec": 214479965.80189988
         },
         "ffi": {
           "benchmark_name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
-          "ms_per_iter": 1.034685,
-          "bytes_per_sec": 987774056.8385547
+          "ms_per_iter": 1.030712,
+          "bytes_per_sec": 991581547.5127872
         }
       },
-      "rust_ms_per_iter": 4.728339,
-      "ffi_ms_per_iter": 1.034685,
-      "rust_bytes_per_sec": 216150957.02740434,
-      "ffi_bytes_per_sec": 987774056.8385547,
-      "delta_rust_over_ffi": 0.2188263151182688,
+      "rust_ms_per_iter": 4.765177,
+      "ffi_ms_per_iter": 1.030712,
+      "rust_bytes_per_sec": 214479965.80189988,
+      "ffi_bytes_per_sec": 991581547.5127872,
+      "delta_rust_over_ffi": 0.21630088452118357,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -437,20 +437,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 1.749318,
-          "bytes_per_sec": 584247689.6710604
+          "ms_per_iter": 1.739357,
+          "bytes_per_sec": 587593576.2468544
         },
         "ffi": {
           "benchmark_name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.500589,
-          "bytes_per_sec": 2041664918.7257411
+          "ms_per_iter": 0.499676,
+          "bytes_per_sec": 2045395416.2297168
         }
       },
-      "rust_ms_per_iter": 1.749318,
-      "ffi_ms_per_iter": 0.500589,
-      "rust_bytes_per_sec": 584247689.6710604,
-      "ffi_bytes_per_sec": 2041664918.7257411,
-      "delta_rust_over_ffi": 0.2861623787098744,
+      "rust_ms_per_iter": 1.739357,
+      "ffi_ms_per_iter": 0.499676,
+      "rust_bytes_per_sec": 587593576.2468544,
+      "ffi_bytes_per_sec": 2045395416.2297168,
+      "delta_rust_over_ffi": 0.28727627508326353,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -483,20 +483,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
-          "ms_per_iter": 4.491212,
-          "bytes_per_sec": 227563294.71866393
+          "ms_per_iter": 4.589904,
+          "bytes_per_sec": 222670234.49727926
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.966666,
-          "bytes_per_sec": 1057278315.3643554
+          "ms_per_iter": 0.959647,
+          "bytes_per_sec": 1065011405.2354668
         }
       },
-      "rust_ms_per_iter": 4.491212,
-      "ffi_ms_per_iter": 0.966666,
-      "rust_bytes_per_sec": 227563294.71866393,
-      "ffi_bytes_per_sec": 1057278315.3643554,
-      "delta_rust_over_ffi": 0.21523499670022259,
+      "rust_ms_per_iter": 4.589904,
+      "ffi_ms_per_iter": 0.959647,
+      "rust_bytes_per_sec": 222670234.49727926,
+      "ffi_bytes_per_sec": 1065011405.2354668,
+      "delta_rust_over_ffi": 0.20907779334818333,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -529,20 +529,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.247031,
-          "bytes_per_sec": 454837961.73706555
+          "ms_per_iter": 2.225578,
+          "bytes_per_sec": 459222278.43733174
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.614445,
-          "bytes_per_sec": 1663346597.335807
+          "ms_per_iter": 0.608423,
+          "bytes_per_sec": 1679809934.8643951
         }
       },
-      "rust_ms_per_iter": 2.247031,
-      "ffi_ms_per_iter": 0.614445,
-      "rust_bytes_per_sec": 454837961.73706555,
-      "ffi_bytes_per_sec": 1663346597.335807,
-      "delta_rust_over_ffi": 0.27344749582894057,
+      "rust_ms_per_iter": 2.225578,
+      "ffi_ms_per_iter": 0.608423,
+      "rust_bytes_per_sec": 459222278.43733174,
+      "ffi_bytes_per_sec": 1679809934.8643951,
+      "delta_rust_over_ffi": 0.27337752260311704,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -575,20 +575,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/high-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 59.393668,
-          "bytes_per_sec": 17654676.589430377
+          "ms_per_iter": 65.699276,
+          "bytes_per_sec": 15960236.761208754
         },
         "ffi": {
           "benchmark_name": "compress/best/high-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.911677,
-          "bytes_per_sec": 1150161734.912694
+          "ms_per_iter": 1.004884,
+          "bytes_per_sec": 1043479645.4118086
         }
       },
-      "rust_ms_per_iter": 59.393668,
-      "ffi_ms_per_iter": 0.911677,
-      "rust_bytes_per_sec": 17654676.589430377,
-      "ffi_bytes_per_sec": 1150161734.912694,
-      "delta_rust_over_ffi": 0.015349733914396396,
+      "rust_ms_per_iter": 65.699276,
+      "ffi_ms_per_iter": 1.004884,
+      "rust_bytes_per_sec": 15960236.761208754,
+      "ffi_bytes_per_sec": 1043479645.4118086,
+      "delta_rust_over_ffi": 0.015295206601667881,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -621,20 +621,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/high-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 68.918827,
-          "bytes_per_sec": 15214652.449032543
+          "ms_per_iter": 73.74333,
+          "bytes_per_sec": 14219265.661043515
         },
         "ffi": {
           "benchmark_name": "compress/better/high-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.565564,
-          "bytes_per_sec": 1854035971.17214
+          "ms_per_iter": 0.664447,
+          "bytes_per_sec": 1578118345.0297768
         }
       },
-      "rust_ms_per_iter": 68.918827,
-      "ffi_ms_per_iter": 0.565564,
-      "rust_bytes_per_sec": 15214652.449032543,
-      "ffi_bytes_per_sec": 1854035971.17214,
-      "delta_rust_over_ffi": 0.00820623368996109,
+      "rust_ms_per_iter": 73.74333,
+      "ffi_ms_per_iter": 0.664447,
+      "rust_bytes_per_sec": 14219265.661043515,
+      "ffi_bytes_per_sec": 1578118345.0297768,
+      "delta_rust_over_ffi": 0.009010265741999987,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -667,20 +667,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/high-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 163.429642,
-          "bytes_per_sec": 6416069.858367553
+          "ms_per_iter": 174.400564,
+          "bytes_per_sec": 6012457.6202632
         },
         "ffi": {
           "benchmark_name": "compress/default/high-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.271722,
-          "bytes_per_sec": 3859002951.5460653
+          "ms_per_iter": 0.34324,
+          "bytes_per_sec": 3054935322.2235174
         }
       },
-      "rust_ms_per_iter": 163.429642,
-      "ffi_ms_per_iter": 0.271722,
-      "rust_bytes_per_sec": 6416069.858367553,
-      "ffi_bytes_per_sec": 3859002951.5460653,
-      "delta_rust_over_ffi": 0.0016626237240365488,
+      "rust_ms_per_iter": 174.400564,
+      "ffi_ms_per_iter": 0.34324,
+      "rust_bytes_per_sec": 6012457.6202632,
+      "ffi_bytes_per_sec": 3054935322.2235174,
+      "delta_rust_over_ffi": 0.0019681129012862593,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -713,20 +713,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/high-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 23.530071,
-          "bytes_per_sec": 44563231.44966286
+          "ms_per_iter": 23.564187,
+          "bytes_per_sec": 44498713.23801666
         },
         "ffi": {
           "benchmark_name": "compress/fastest/high-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.234348,
-          "bytes_per_sec": 4474439722.122655
+          "ms_per_iter": 0.267209,
+          "bytes_per_sec": 3924179200.55088
         }
       },
-      "rust_ms_per_iter": 23.530071,
-      "ffi_ms_per_iter": 0.234348,
-      "rust_bytes_per_sec": 44563231.44966286,
-      "ffi_bytes_per_sec": 4474439722.122655,
-      "delta_rust_over_ffi": 0.009959510959401695,
+      "rust_ms_per_iter": 23.564187,
+      "ffi_ms_per_iter": 0.267209,
+      "rust_bytes_per_sec": 44498713.23801666,
+      "ffi_bytes_per_sec": 3924179200.55088,
+      "delta_rust_over_ffi": 0.011339623132340614,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -759,20 +759,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/high-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173874,
-          "bytes_per_sec": 6030665884.491069
+          "ms_per_iter": 0.182856,
+          "bytes_per_sec": 5734435840.224002
         },
         "ffi": {
           "benchmark_name": "decompress/best/high-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.167295,
-          "bytes_per_sec": 6267826294.868346
+          "ms_per_iter": 0.035339,
+          "bytes_per_sec": 29671920541.045303
         }
       },
-      "rust_ms_per_iter": 0.173874,
-      "ffi_ms_per_iter": 0.167295,
-      "rust_bytes_per_sec": 6030665884.491069,
-      "ffi_bytes_per_sec": 6267826294.868346,
-      "delta_rust_over_ffi": 0.9621622554263434,
+      "rust_ms_per_iter": 0.182856,
+      "ffi_ms_per_iter": 0.035339,
+      "rust_bytes_per_sec": 5734435840.224002,
+      "ffi_bytes_per_sec": 29671920541.045303,
+      "delta_rust_over_ffi": 0.19326136413352585,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -805,20 +805,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/high-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173606,
-          "bytes_per_sec": 6039975576.880983
+          "ms_per_iter": 0.182661,
+          "bytes_per_sec": 5740557645.036434
         },
         "ffi": {
           "benchmark_name": "decompress/best/high-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.109222,
-          "bytes_per_sec": 9600410173.774513
+          "ms_per_iter": 0.118237,
+          "bytes_per_sec": 8868425281.426289
         }
       },
-      "rust_ms_per_iter": 0.173606,
-      "ffi_ms_per_iter": 0.109222,
-      "rust_bytes_per_sec": 6039975576.880983,
-      "ffi_bytes_per_sec": 9600410173.774513,
-      "delta_rust_over_ffi": 0.6291372418003986,
+      "rust_ms_per_iter": 0.182661,
+      "ffi_ms_per_iter": 0.118237,
+      "rust_bytes_per_sec": 5740557645.036434,
+      "ffi_bytes_per_sec": 8868425281.426289,
+      "delta_rust_over_ffi": 0.6473029272805908,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -851,20 +851,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/high-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173999,
-          "bytes_per_sec": 6026333484.6751995
+          "ms_per_iter": 0.18341,
+          "bytes_per_sec": 5717114661.141705
         },
         "ffi": {
           "benchmark_name": "decompress/better/high-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.026431,
-          "bytes_per_sec": 39672203094.850746
+          "ms_per_iter": 0.035308,
+          "bytes_per_sec": 29697972130.96182
         }
       },
-      "rust_ms_per_iter": 0.173999,
-      "ffi_ms_per_iter": 0.026431,
-      "rust_bytes_per_sec": 6026333484.6751995,
-      "ffi_bytes_per_sec": 39672203094.850746,
-      "delta_rust_over_ffi": 0.15190317185730953,
+      "rust_ms_per_iter": 0.18341,
+      "ffi_ms_per_iter": 0.035308,
+      "rust_bytes_per_sec": 5717114661.141705,
+      "ffi_bytes_per_sec": 29697972130.96182,
+      "delta_rust_over_ffi": 0.19250858731803067,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -897,20 +897,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/high-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.174268,
-          "bytes_per_sec": 6017031239.240709
+          "ms_per_iter": 0.183126,
+          "bytes_per_sec": 5725981018.533687
         },
         "ffi": {
           "benchmark_name": "decompress/better/high-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.109109,
-          "bytes_per_sec": 9610352949.80249
+          "ms_per_iter": 0.118348,
+          "bytes_per_sec": 8860107479.636328
         }
       },
-      "rust_ms_per_iter": 0.174268,
-      "ffi_ms_per_iter": 0.109109,
-      "rust_bytes_per_sec": 6017031239.240709,
-      "ffi_bytes_per_sec": 9610352949.80249,
-      "delta_rust_over_ffi": 0.6260988821814676,
+      "rust_ms_per_iter": 0.183126,
+      "ffi_ms_per_iter": 0.118348,
+      "rust_bytes_per_sec": 5725981018.533687,
+      "ffi_bytes_per_sec": 8860107479.636328,
+      "delta_rust_over_ffi": 0.6462654128851172,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -943,20 +943,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/high-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173853,
-          "bytes_per_sec": 6031394338.895503
+          "ms_per_iter": 0.182829,
+          "bytes_per_sec": 5735282695.852408
         },
         "ffi": {
           "benchmark_name": "decompress/default/high-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.026492,
-          "bytes_per_sec": 39580854597.61437
+          "ms_per_iter": 0.154909,
+          "bytes_per_sec": 6768980498.227992
         }
       },
-      "rust_ms_per_iter": 0.173853,
-      "ffi_ms_per_iter": 0.026492,
-      "rust_bytes_per_sec": 6031394338.895503,
-      "ffi_bytes_per_sec": 39580854597.61437,
-      "delta_rust_over_ffi": 0.15238160975076645,
+      "rust_ms_per_iter": 0.182829,
+      "ffi_ms_per_iter": 0.154909,
+      "rust_bytes_per_sec": 5735282695.852408,
+      "ffi_bytes_per_sec": 6768980498.227992,
+      "delta_rust_over_ffi": 0.8472889968221671,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -989,20 +989,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/high-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173008,
-          "bytes_per_sec": 6060852677.33284
+          "ms_per_iter": 0.182264,
+          "bytes_per_sec": 5753061493.218627
         },
         "ffi": {
           "benchmark_name": "decompress/default/high-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.109347,
-          "bytes_per_sec": 9589435466.9081
+          "ms_per_iter": 0.117919,
+          "bytes_per_sec": 8892341352.962627
         }
       },
-      "rust_ms_per_iter": 0.173008,
-      "ffi_ms_per_iter": 0.109347,
-      "rust_bytes_per_sec": 6060852677.33284,
-      "ffi_bytes_per_sec": 9589435466.9081,
-      "delta_rust_over_ffi": 0.6320343567927494,
+      "rust_ms_per_iter": 0.182264,
+      "ffi_ms_per_iter": 0.117919,
+      "rust_bytes_per_sec": 5753061493.218627,
+      "ffi_bytes_per_sec": 8892341352.962627,
+      "delta_rust_over_ffi": 0.6469681341351006,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1035,20 +1035,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/high-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.173986,
-          "bytes_per_sec": 6026783764.210914
+          "ms_per_iter": 0.18363,
+          "bytes_per_sec": 5710265207.210152
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/high-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.026453,
-          "bytes_per_sec": 39639209163.42191
+          "ms_per_iter": 0.035349,
+          "bytes_per_sec": 29663526549.548786
         }
       },
-      "rust_ms_per_iter": 0.173986,
-      "ffi_ms_per_iter": 0.026453,
-      "rust_bytes_per_sec": 6026783764.210914,
-      "ffi_bytes_per_sec": 39639209163.42191,
-      "delta_rust_over_ffi": 0.15204096881358273,
+      "rust_ms_per_iter": 0.18363,
+      "ffi_ms_per_iter": 0.035349,
+      "rust_bytes_per_sec": 5710265207.210152,
+      "ffi_bytes_per_sec": 29663526549.548786,
+      "delta_rust_over_ffi": 0.1925012252899853,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1081,20 +1081,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/high-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.174409,
-          "bytes_per_sec": 6012166803.318636
+          "ms_per_iter": 0.18271,
+          "bytes_per_sec": 5739018116.140331
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/high-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.109203,
-          "bytes_per_sec": 9602080528.923199
+          "ms_per_iter": 0.118013,
+          "bytes_per_sec": 8885258403.735182
         }
       },
-      "rust_ms_per_iter": 0.174409,
-      "ffi_ms_per_iter": 0.109203,
-      "rust_bytes_per_sec": 6012166803.318636,
-      "ffi_bytes_per_sec": 9602080528.923199,
-      "delta_rust_over_ffi": 0.626131678984456,
+      "rust_ms_per_iter": 0.18271,
+      "ffi_ms_per_iter": 0.118013,
+      "rust_bytes_per_sec": 5739018116.140331,
+      "ffi_bytes_per_sec": 8885258403.735182,
+      "delta_rust_over_ffi": 0.6459033440972032,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1127,20 +1127,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/large-log-stream/matrix/pure_rust",
-          "ms_per_iter": 80.598801,
-          "bytes_per_sec": 208157141.1961823
+          "ms_per_iter": 71.097402,
+          "bytes_per_sec": 235975092.31068668
         },
         "ffi": {
           "benchmark_name": "compress/best/large-log-stream/matrix/c_ffi",
-          "ms_per_iter": 14.974927,
-          "bytes_per_sec": 1120353775.3472855
+          "ms_per_iter": 10.801736,
+          "bytes_per_sec": 1553196264.0079336
         }
       },
-      "rust_ms_per_iter": 80.598801,
-      "ffi_ms_per_iter": 14.974927,
-      "rust_bytes_per_sec": 208157141.1961823,
-      "ffi_bytes_per_sec": 1120353775.3472855,
-      "delta_rust_over_ffi": 0.1857959028447582,
+      "rust_ms_per_iter": 71.097402,
+      "ffi_ms_per_iter": 10.801736,
+      "rust_bytes_per_sec": 235975092.31068668,
+      "ffi_bytes_per_sec": 1553196264.0079336,
+      "delta_rust_over_ffi": 0.15192870197985572,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1173,20 +1173,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/large-log-stream/matrix/pure_rust",
-          "ms_per_iter": 78.701195,
-          "bytes_per_sec": 213176127.75765347
+          "ms_per_iter": 81.634175,
+          "bytes_per_sec": 205517064.39123076
         },
         "ffi": {
           "benchmark_name": "compress/better/large-log-stream/matrix/c_ffi",
-          "ms_per_iter": 10.106397,
-          "bytes_per_sec": 1660059069.5180488
+          "ms_per_iter": 10.756918,
+          "bytes_per_sec": 1559667555.3350875
         }
       },
-      "rust_ms_per_iter": 78.701195,
-      "ffi_ms_per_iter": 10.106397,
-      "rust_bytes_per_sec": 213176127.75765347,
-      "ffi_bytes_per_sec": 1660059069.5180488,
-      "delta_rust_over_ffi": 0.12841478455314434,
+      "rust_ms_per_iter": 81.634175,
+      "ffi_ms_per_iter": 10.756918,
+      "rust_bytes_per_sec": 205517064.39123076,
+      "ffi_bytes_per_sec": 1559667555.3350875,
+      "delta_rust_over_ffi": 0.13176978881699974,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1219,20 +1219,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/large-log-stream/matrix/pure_rust",
-          "ms_per_iter": 98.413394,
-          "bytes_per_sec": 170476957.63851005
+          "ms_per_iter": 101.680642,
+          "bytes_per_sec": 164999115.56419954
         },
         "ffi": {
           "benchmark_name": "compress/default/large-log-stream/matrix/c_ffi",
-          "ms_per_iter": 3.192129,
-          "bytes_per_sec": 5255807644.36525
+          "ms_per_iter": 3.335954,
+          "bytes_per_sec": 5029210834.441962
         }
       },
-      "rust_ms_per_iter": 98.413394,
-      "ffi_ms_per_iter": 3.192129,
-      "rust_bytes_per_sec": 170476957.63851005,
-      "ffi_bytes_per_sec": 5255807644.36525,
-      "delta_rust_over_ffi": 0.032435920256952015,
+      "rust_ms_per_iter": 101.680642,
+      "ffi_ms_per_iter": 3.335954,
+      "rust_bytes_per_sec": 164999115.56419954,
+      "ffi_bytes_per_sec": 5029210834.441962,
+      "delta_rust_over_ffi": 0.03280815241115413,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1265,20 +1265,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/large-log-stream/matrix/pure_rust",
-          "ms_per_iter": 22.172192,
-          "bytes_per_sec": 756678275.201658
+          "ms_per_iter": 22.428189,
+          "bytes_per_sec": 748041493.6756597
         },
         "ffi": {
           "benchmark_name": "compress/fastest/large-log-stream/matrix/c_ffi",
-          "ms_per_iter": 2.569607,
-          "bytes_per_sec": 6529098029.387374
+          "ms_per_iter": 2.669848,
+          "bytes_per_sec": 6283959236.6307
         }
       },
-      "rust_ms_per_iter": 22.172192,
-      "ffi_ms_per_iter": 2.569607,
-      "rust_bytes_per_sec": 756678275.201658,
-      "ffi_bytes_per_sec": 6529098029.387374,
-      "delta_rust_over_ffi": 0.11589323238766829,
+      "rust_ms_per_iter": 22.428189,
+      "ffi_ms_per_iter": 2.669848,
+      "rust_bytes_per_sec": 748041493.6756597,
+      "ffi_bytes_per_sec": 6283959236.6307,
+      "delta_rust_over_ffi": 0.11903983866017892,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1311,20 +1311,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/large-log-stream/c_stream/matrix/pure_rust",
-          "ms_per_iter": 3.047485,
-          "bytes_per_sec": 5505266145.690627
+          "ms_per_iter": 3.169095,
+          "bytes_per_sec": 5294008541.870787
         },
         "ffi": {
           "benchmark_name": "decompress/best/large-log-stream/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.662568,
-          "bytes_per_sec": 25321500585.600266
+          "ms_per_iter": 0.665509,
+          "bytes_per_sec": 25209600471.21827
         }
       },
-      "rust_ms_per_iter": 3.047485,
-      "ffi_ms_per_iter": 0.662568,
-      "rust_bytes_per_sec": 5505266145.690627,
-      "ffi_bytes_per_sec": 25321500585.600266,
-      "delta_rust_over_ffi": 0.2174146878491609,
+      "rust_ms_per_iter": 3.169095,
+      "ffi_ms_per_iter": 0.665509,
+      "rust_bytes_per_sec": 5294008541.870787,
+      "ffi_bytes_per_sec": 25209600471.21827,
+      "delta_rust_over_ffi": 0.20999970022987638,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1357,20 +1357,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/large-log-stream/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.851095,
-          "bytes_per_sec": 5884481576.376796
+          "ms_per_iter": 2.815835,
+          "bytes_per_sec": 5958167293.183017
         },
         "ffi": {
           "benchmark_name": "decompress/best/large-log-stream/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 1.80432,
-          "bytes_per_sec": 9298359492.772902
+          "ms_per_iter": 1.823476,
+          "bytes_per_sec": 9200678265.027891
         }
       },
-      "rust_ms_per_iter": 2.851095,
-      "ffi_ms_per_iter": 1.80432,
-      "rust_bytes_per_sec": 5884481576.376796,
-      "ffi_bytes_per_sec": 9298359492.772902,
-      "delta_rust_over_ffi": 0.6328515886001693,
+      "rust_ms_per_iter": 2.815835,
+      "ffi_ms_per_iter": 1.823476,
+      "rust_bytes_per_sec": 5958167293.183017,
+      "ffi_bytes_per_sec": 9200678265.027891,
+      "delta_rust_over_ffi": 0.6475791372718928,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1403,20 +1403,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/large-log-stream/c_stream/matrix/pure_rust",
-          "ms_per_iter": 2.746724,
-          "bytes_per_sec": 6108082209.934453
+          "ms_per_iter": 2.888869,
+          "bytes_per_sec": 5807537828.818129
         },
         "ffi": {
           "benchmark_name": "decompress/better/large-log-stream/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.654281,
-          "bytes_per_sec": 25642217946.111835
+          "ms_per_iter": 0.655568,
+          "bytes_per_sec": 25591877577.917164
         }
       },
-      "rust_ms_per_iter": 2.746724,
-      "ffi_ms_per_iter": 0.654281,
-      "rust_bytes_per_sec": 6108082209.934453,
-      "ffi_bytes_per_sec": 25642217946.111835,
-      "delta_rust_over_ffi": 0.2382041297196224,
+      "rust_ms_per_iter": 2.888869,
+      "ffi_ms_per_iter": 0.655568,
+      "rust_bytes_per_sec": 5807537828.818129,
+      "ffi_bytes_per_sec": 25591877577.917164,
+      "delta_rust_over_ffi": 0.2269289469339039,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1449,20 +1449,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/large-log-stream/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.845796,
-          "bytes_per_sec": 5895438745.433616
+          "ms_per_iter": 3.018103,
+          "bytes_per_sec": 5558861311.227615
         },
         "ffi": {
           "benchmark_name": "decompress/better/large-log-stream/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 1.799328,
-          "bytes_per_sec": 9324156574.009853
+          "ms_per_iter": 1.832979,
+          "bytes_per_sec": 9152977748.244797
         }
       },
-      "rust_ms_per_iter": 2.845796,
-      "ffi_ms_per_iter": 1.799328,
-      "rust_bytes_per_sec": 5895438745.433616,
-      "ffi_bytes_per_sec": 9324156574.009853,
-      "delta_rust_over_ffi": 0.6322758201923118,
+      "rust_ms_per_iter": 3.018103,
+      "ffi_ms_per_iter": 1.832979,
+      "rust_bytes_per_sec": 5558861311.227615,
+      "ffi_bytes_per_sec": 9152977748.244797,
+      "delta_rust_over_ffi": 0.6073281793232371,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1495,20 +1495,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/large-log-stream/c_stream/matrix/pure_rust",
-          "ms_per_iter": 2.760767,
-          "bytes_per_sec": 6077012656.265451
+          "ms_per_iter": 2.903599,
+          "bytes_per_sec": 5778076104.861588
         },
         "ffi": {
           "benchmark_name": "decompress/default/large-log-stream/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.65198,
-          "bytes_per_sec": 25732715727.476303
+          "ms_per_iter": 0.654074,
+          "bytes_per_sec": 25650333142.73308
         }
       },
-      "rust_ms_per_iter": 2.760767,
-      "ffi_ms_per_iter": 0.65198,
-      "rust_bytes_per_sec": 6077012656.265451,
-      "ffi_bytes_per_sec": 25732715727.476303,
-      "delta_rust_over_ffi": 0.23615900943469698,
+      "rust_ms_per_iter": 2.903599,
+      "ffi_ms_per_iter": 0.654074,
+      "rust_bytes_per_sec": 5778076104.861588,
+      "ffi_bytes_per_sec": 25650333142.73308,
+      "delta_rust_over_ffi": 0.22526319922275773,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1541,20 +1541,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/large-log-stream/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.886075,
-          "bytes_per_sec": 5813160087.66231
+          "ms_per_iter": 2.693824,
+          "bytes_per_sec": 6228029745.076144
         },
         "ffi": {
           "benchmark_name": "decompress/default/large-log-stream/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 1.794347,
-          "bytes_per_sec": 9350039875.230377
+          "ms_per_iter": 1.824621,
+          "bytes_per_sec": 9194904585.664639
         }
       },
-      "rust_ms_per_iter": 2.886075,
-      "ffi_ms_per_iter": 1.794347,
-      "rust_bytes_per_sec": 5813160087.66231,
-      "ffi_bytes_per_sec": 9350039875.230377,
-      "delta_rust_over_ffi": 0.621725700129068,
+      "rust_ms_per_iter": 2.693824,
+      "ffi_ms_per_iter": 1.824621,
+      "rust_bytes_per_sec": 6228029745.076144,
+      "ffi_bytes_per_sec": 9194904585.664639,
+      "delta_rust_over_ffi": 0.6773348964149106,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1587,20 +1587,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/large-log-stream/c_stream/matrix/pure_rust",
-          "ms_per_iter": 3.064818,
-          "bytes_per_sec": 5474131253.470842
+          "ms_per_iter": 2.892708,
+          "bytes_per_sec": 5799830470.272146
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/large-log-stream/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.66262,
-          "bytes_per_sec": 25319513446.62099
+          "ms_per_iter": 0.655723,
+          "bytes_per_sec": 25585828162.196537
         }
       },
-      "rust_ms_per_iter": 3.064818,
-      "ffi_ms_per_iter": 0.66262,
-      "rust_bytes_per_sec": 5474131253.470842,
-      "ffi_bytes_per_sec": 25319513446.62099,
-      "delta_rust_over_ffi": 0.21620207137911615,
+      "rust_ms_per_iter": 2.892708,
+      "ffi_ms_per_iter": 0.655723,
+      "rust_bytes_per_sec": 5799830470.272146,
+      "ffi_bytes_per_sec": 25585828162.196537,
+      "delta_rust_over_ffi": 0.22668136569608824,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1633,20 +1633,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/large-log-stream/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 2.795566,
-          "bytes_per_sec": 6001366449.584806
+          "ms_per_iter": 2.734493,
+          "bytes_per_sec": 6135402796.789021
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/large-log-stream/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 1.993713,
-          "bytes_per_sec": 8415060743.447024
+          "ms_per_iter": 1.946447,
+          "bytes_per_sec": 8619405511.683596
         }
       },
-      "rust_ms_per_iter": 2.795566,
-      "ffi_ms_per_iter": 1.993713,
-      "rust_bytes_per_sec": 6001366449.584806,
-      "ffi_bytes_per_sec": 8415060743.447024,
-      "delta_rust_over_ffi": 0.7131697123230144,
+      "rust_ms_per_iter": 2.734493,
+      "ffi_ms_per_iter": 1.946447,
+      "rust_bytes_per_sec": 6135402796.789021,
+      "ffi_bytes_per_sec": 8619405511.683596,
+      "delta_rust_over_ffi": 0.7118127565146446,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1679,20 +1679,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/low-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 5.222102,
-          "bytes_per_sec": 200795771.51116544
+          "ms_per_iter": 4.941524,
+          "bytes_per_sec": 212196885.00956383
         },
         "ffi": {
           "benchmark_name": "compress/best/low-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 1.076882,
-          "bytes_per_sec": 973714854.5523094
+          "ms_per_iter": 1.190085,
+          "bytes_per_sec": 881093367.2804884
         }
       },
-      "rust_ms_per_iter": 5.222102,
-      "ffi_ms_per_iter": 1.076882,
-      "rust_bytes_per_sec": 200795771.51116544,
-      "ffi_bytes_per_sec": 973714854.5523094,
-      "delta_rust_over_ffi": 0.2062161941685551,
+      "rust_ms_per_iter": 4.941524,
+      "ffi_ms_per_iter": 1.190085,
+      "rust_bytes_per_sec": 212196885.00956383,
+      "ffi_bytes_per_sec": 881093367.2804884,
+      "delta_rust_over_ffi": 0.24083359708462407,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1725,20 +1725,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/low-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 5.139684,
-          "bytes_per_sec": 204015655.43718252
+          "ms_per_iter": 5.304886,
+          "bytes_per_sec": 197662306.03258958
         },
         "ffi": {
           "benchmark_name": "compress/better/low-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.558144,
-          "bytes_per_sec": 1878683637.1975691
+          "ms_per_iter": 0.58666,
+          "bytes_per_sec": 1787365765.520063
         }
       },
-      "rust_ms_per_iter": 5.139684,
-      "ffi_ms_per_iter": 0.558144,
-      "rust_bytes_per_sec": 204015655.43718252,
-      "ffi_bytes_per_sec": 1878683637.1975691,
-      "delta_rust_over_ffi": 0.10859500311692313,
+      "rust_ms_per_iter": 5.304886,
+      "ffi_ms_per_iter": 0.58666,
+      "rust_bytes_per_sec": 197662306.03258958,
+      "ffi_bytes_per_sec": 1787365765.520063,
+      "delta_rust_over_ffi": 0.11058861585338496,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1771,20 +1771,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/low-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 11.330414,
-          "bytes_per_sec": 92545250.33242388
+          "ms_per_iter": 10.603647,
+          "bytes_per_sec": 98888240.99859227
         },
         "ffi": {
           "benchmark_name": "compress/default/low-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.229659,
-          "bytes_per_sec": 4565795374.88189
+          "ms_per_iter": 0.221689,
+          "bytes_per_sec": 4729941494.616332
         }
       },
-      "rust_ms_per_iter": 11.330414,
-      "ffi_ms_per_iter": 0.229659,
-      "rust_bytes_per_sec": 92545250.33242388,
-      "ffi_bytes_per_sec": 4565795374.88189,
-      "delta_rust_over_ffi": 0.020269250532240043,
+      "rust_ms_per_iter": 10.603647,
+      "ffi_ms_per_iter": 0.221689,
+      "rust_bytes_per_sec": 98888240.99859227,
+      "ffi_bytes_per_sec": 4729941494.616332,
+      "delta_rust_over_ffi": 0.020906863459336206,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1817,20 +1817,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
-          "ms_per_iter": 1.336206,
-          "bytes_per_sec": 784741274.9231781
+          "ms_per_iter": 1.346301,
+          "bytes_per_sec": 778857031.2285291
         },
         "ffi": {
           "benchmark_name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
-          "ms_per_iter": 0.180215,
-          "bytes_per_sec": 5818472380.212524
+          "ms_per_iter": 0.158162,
+          "bytes_per_sec": 6629759360.655531
         }
       },
-      "rust_ms_per_iter": 1.336206,
-      "ffi_ms_per_iter": 0.180215,
-      "rust_bytes_per_sec": 784741274.9231781,
-      "ffi_bytes_per_sec": 5818472380.212524,
-      "delta_rust_over_ffi": 0.13487067113903095,
+      "rust_ms_per_iter": 1.346301,
+      "ffi_ms_per_iter": 0.158162,
+      "rust_bytes_per_sec": 778857031.2285291,
+      "ffi_bytes_per_sec": 6629759360.655531,
+      "delta_rust_over_ffi": 0.11747892930332814,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1863,20 +1863,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.318647,
-          "bytes_per_sec": 3290713548.2210717
+          "ms_per_iter": 0.328468,
+          "bytes_per_sec": 3192323148.678106
         },
         "ffi": {
           "benchmark_name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.187397,
-          "bytes_per_sec": 5595479116.528012
+          "ms_per_iter": 0.187773,
+          "bytes_per_sec": 5584274629.472821
         }
       },
-      "rust_ms_per_iter": 0.318647,
-      "ffi_ms_per_iter": 0.187397,
-      "rust_bytes_per_sec": 3290713548.2210717,
-      "ffi_bytes_per_sec": 5595479116.528012,
-      "delta_rust_over_ffi": 0.5881021945915071,
+      "rust_ms_per_iter": 0.328468,
+      "ffi_ms_per_iter": 0.187773,
+      "rust_bytes_per_sec": 3192323148.678106,
+      "ffi_bytes_per_sec": 5584274629.472821,
+      "delta_rust_over_ffi": 0.5716629930465068,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1909,20 +1909,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.30774,
-          "bytes_per_sec": 3407343861.701436
+          "ms_per_iter": 0.316884,
+          "bytes_per_sec": 3309021597.8086615
         },
         "ffi": {
           "benchmark_name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.236969,
-          "bytes_per_sec": 4424950098.958092
+          "ms_per_iter": 0.237574,
+          "bytes_per_sec": 4413681631.828399
         }
       },
-      "rust_ms_per_iter": 0.30774,
-      "ffi_ms_per_iter": 0.236969,
-      "rust_bytes_per_sec": 3407343861.701436,
-      "ffi_bytes_per_sec": 4424950098.958092,
-      "delta_rust_over_ffi": 0.7700298953662181,
+      "rust_ms_per_iter": 0.316884,
+      "ffi_ms_per_iter": 0.237574,
+      "rust_bytes_per_sec": 3309021597.8086615,
+      "ffi_bytes_per_sec": 4413681631.828399,
+      "delta_rust_over_ffi": 0.7497191401269865,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -1955,20 +1955,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.311128,
-          "bytes_per_sec": 3370239901.2625027
+          "ms_per_iter": 0.32005,
+          "bytes_per_sec": 3276288079.987502
         },
         "ffi": {
           "benchmark_name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.187454,
-          "bytes_per_sec": 5593777673.455888
+          "ms_per_iter": 0.187759,
+          "bytes_per_sec": 5584691013.480045
         }
       },
-      "rust_ms_per_iter": 0.311128,
-      "ffi_ms_per_iter": 0.187454,
-      "rust_bytes_per_sec": 3370239901.2625027,
-      "ffi_bytes_per_sec": 5593777673.455888,
-      "delta_rust_over_ffi": 0.6024980072510349,
+      "rust_ms_per_iter": 0.32005,
+      "ffi_ms_per_iter": 0.187759,
+      "rust_bytes_per_sec": 3276288079.987502,
+      "ffi_bytes_per_sec": 5584691013.480045,
+      "delta_rust_over_ffi": 0.5866552101234184,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2001,20 +2001,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.300836,
-          "bytes_per_sec": 3485540294.379662
+          "ms_per_iter": 0.31603,
+          "bytes_per_sec": 3317963484.479322
         },
         "ffi": {
           "benchmark_name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.236945,
-          "bytes_per_sec": 4425398299.183355
+          "ms_per_iter": 0.23739,
+          "bytes_per_sec": 4417102658.073213
         }
       },
-      "rust_ms_per_iter": 0.300836,
-      "ffi_ms_per_iter": 0.236945,
-      "rust_bytes_per_sec": 3485540294.379662,
-      "ffi_bytes_per_sec": 4425398299.183355,
-      "delta_rust_over_ffi": 0.7876218271749391,
+      "rust_ms_per_iter": 0.31603,
+      "ffi_ms_per_iter": 0.23739,
+      "rust_bytes_per_sec": 3317963484.479322,
+      "ffi_bytes_per_sec": 4417102658.073213,
+      "delta_rust_over_ffi": 0.7511628642850363,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2047,20 +2047,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.311782,
-          "bytes_per_sec": 3363170420.3578143
+          "ms_per_iter": 0.327256,
+          "bytes_per_sec": 3204145989.683917
         },
         "ffi": {
           "benchmark_name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.187393,
-          "bytes_per_sec": 5595598554.908668
+          "ms_per_iter": 0.187713,
+          "bytes_per_sec": 5586059569.662197
         }
       },
-      "rust_ms_per_iter": 0.311782,
-      "ffi_ms_per_iter": 0.187393,
-      "rust_bytes_per_sec": 3363170420.3578143,
-      "ffi_bytes_per_sec": 5595598554.908668,
-      "delta_rust_over_ffi": 0.6010385461636657,
+      "rust_ms_per_iter": 0.327256,
+      "ffi_ms_per_iter": 0.187713,
+      "rust_bytes_per_sec": 3204145989.683917,
+      "ffi_bytes_per_sec": 5586059569.662197,
+      "delta_rust_over_ffi": 0.5735968171706554,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2093,20 +2093,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.307447,
-          "bytes_per_sec": 3410591093.7494917
+          "ms_per_iter": 0.315287,
+          "bytes_per_sec": 3325782540.9864664
         },
         "ffi": {
           "benchmark_name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.236699,
-          "bytes_per_sec": 4429997591.878293
+          "ms_per_iter": 0.237682,
+          "bytes_per_sec": 4411676105.047921
         }
       },
-      "rust_ms_per_iter": 0.307447,
-      "ffi_ms_per_iter": 0.236699,
-      "rust_bytes_per_sec": 3410591093.7494917,
-      "ffi_bytes_per_sec": 4429997591.878293,
-      "delta_rust_over_ffi": 0.7698855412477597,
+      "rust_ms_per_iter": 0.315287,
+      "ffi_ms_per_iter": 0.237682,
+      "rust_bytes_per_sec": 3325782540.9864664,
+      "ffi_bytes_per_sec": 4411676105.047921,
+      "delta_rust_over_ffi": 0.7538591822688535,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2139,20 +2139,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.317181,
-          "bytes_per_sec": 3305923116.4540124
+          "ms_per_iter": 0.327164,
+          "bytes_per_sec": 3205047010.0622315
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.187299,
-          "bytes_per_sec": 5598406825.450216
+          "ms_per_iter": 0.187892,
+          "bytes_per_sec": 5580737870.691674
         }
       },
-      "rust_ms_per_iter": 0.317181,
-      "ffi_ms_per_iter": 0.187299,
-      "rust_bytes_per_sec": 3305923116.4540124,
-      "ffi_bytes_per_sec": 5598406825.450216,
-      "delta_rust_over_ffi": 0.5905114114653779,
+      "rust_ms_per_iter": 0.327164,
+      "ffi_ms_per_iter": 0.187892,
+      "rust_bytes_per_sec": 3205047010.0622315,
+      "ffi_bytes_per_sec": 5580737870.691674,
+      "delta_rust_over_ffi": 0.5743052414079788,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2185,20 +2185,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.307891,
-          "bytes_per_sec": 3405672786.797925
+          "ms_per_iter": 0.315534,
+          "bytes_per_sec": 3323179118.573593
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.269733,
-          "bytes_per_sec": 3887459079.9049435
+          "ms_per_iter": 0.272125,
+          "bytes_per_sec": 3853288011.0243454
         }
       },
-      "rust_ms_per_iter": 0.307891,
-      "ffi_ms_per_iter": 0.269733,
-      "rust_bytes_per_sec": 3405672786.797925,
-      "ffi_bytes_per_sec": 3887459079.9049435,
-      "delta_rust_over_ffi": 0.8760665300382277,
+      "rust_ms_per_iter": 0.315534,
+      "ffi_ms_per_iter": 0.272125,
+      "rust_bytes_per_sec": 3323179118.573593,
+      "ffi_bytes_per_sec": 3853288011.0243454,
+      "delta_rust_over_ffi": 0.8624268700045005,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2231,20 +2231,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/small-10k-random/matrix/pure_rust",
-          "ms_per_iter": 0.640061,
-          "bytes_per_sec": 15998475.145337708
+          "ms_per_iter": 0.769673,
+          "bytes_per_sec": 13304351.328421291
         },
         "ffi": {
           "benchmark_name": "compress/best/small-10k-random/matrix/c_ffi",
-          "ms_per_iter": 0.293138,
-          "bytes_per_sec": 34932352.68030757
+          "ms_per_iter": 0.393955,
+          "bytes_per_sec": 25992816.43842571
         }
       },
-      "rust_ms_per_iter": 0.640061,
-      "ffi_ms_per_iter": 0.293138,
-      "rust_bytes_per_sec": 15998475.145337708,
-      "ffi_bytes_per_sec": 34932352.68030757,
-      "delta_rust_over_ffi": 0.45798447335488335,
+      "rust_ms_per_iter": 0.769673,
+      "ffi_ms_per_iter": 0.393955,
+      "rust_bytes_per_sec": 13304351.328421291,
+      "ffi_bytes_per_sec": 25992816.43842571,
+      "delta_rust_over_ffi": 0.5118472390222861,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2277,20 +2277,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/small-10k-random/matrix/pure_rust",
-          "ms_per_iter": 0.60307,
-          "bytes_per_sec": 16979786.757756148
+          "ms_per_iter": 0.665342,
+          "bytes_per_sec": 15390581.08461513
         },
         "ffi": {
           "benchmark_name": "compress/better/small-10k-random/matrix/c_ffi",
-          "ms_per_iter": 0.095813,
-          "bytes_per_sec": 106874849.96816716
+          "ms_per_iter": 0.117808,
+          "bytes_per_sec": 86921091.94621758
         }
       },
-      "rust_ms_per_iter": 0.60307,
-      "ffi_ms_per_iter": 0.095813,
-      "rust_bytes_per_sec": 16979786.757756148,
-      "ffi_bytes_per_sec": 106874849.96816716,
-      "delta_rust_over_ffi": 0.15887542076375877,
+      "rust_ms_per_iter": 0.665342,
+      "ffi_ms_per_iter": 0.117808,
+      "rust_bytes_per_sec": 15390581.08461513,
+      "ffi_bytes_per_sec": 86921091.94621758,
+      "delta_rust_over_ffi": 0.1770638258219081,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2323,20 +2323,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/small-10k-random/matrix/pure_rust",
-          "ms_per_iter": 6.838559,
-          "bytes_per_sec": 1497391.482620827
+          "ms_per_iter": 6.705476,
+          "bytes_per_sec": 1527110.0813722992
         },
         "ffi": {
           "benchmark_name": "compress/default/small-10k-random/matrix/c_ffi",
-          "ms_per_iter": 0.024686,
-          "bytes_per_sec": 414810013.77298874
+          "ms_per_iter": 0.024669,
+          "bytes_per_sec": 415095869.3096599
         }
       },
-      "rust_ms_per_iter": 6.838559,
-      "ffi_ms_per_iter": 0.024686,
-      "rust_bytes_per_sec": 1497391.482620827,
-      "ffi_bytes_per_sec": 414810013.77298874,
-      "delta_rust_over_ffi": 0.0036098248183572003,
+      "rust_ms_per_iter": 6.705476,
+      "ffi_ms_per_iter": 0.024669,
+      "rust_bytes_per_sec": 1527110.0813722992,
+      "ffi_bytes_per_sec": 415095869.3096599,
+      "delta_rust_over_ffi": 0.0036789334567747314,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2369,20 +2369,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/small-10k-random/matrix/pure_rust",
-          "ms_per_iter": 0.207734,
-          "bytes_per_sec": 49293808.428085916
+          "ms_per_iter": 0.20773,
+          "bytes_per_sec": 49294757.61806191
         },
         "ffi": {
           "benchmark_name": "compress/fastest/small-10k-random/matrix/c_ffi",
-          "ms_per_iter": 0.00929,
-          "bytes_per_sec": 1102260495.156082
+          "ms_per_iter": 0.009241,
+          "bytes_per_sec": 1108105183.4217079
         }
       },
-      "rust_ms_per_iter": 0.207734,
-      "ffi_ms_per_iter": 0.00929,
-      "rust_bytes_per_sec": 49293808.428085916,
-      "ffi_bytes_per_sec": 1102260495.156082,
-      "delta_rust_over_ffi": 0.04472065237274591,
+      "rust_ms_per_iter": 0.20773,
+      "ffi_ms_per_iter": 0.009241,
+      "rust_bytes_per_sec": 49294757.61806191,
+      "ffi_bytes_per_sec": 1108105183.4217079,
+      "delta_rust_over_ffi": 0.04448563038559668,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2415,20 +2415,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-10k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.003066,
-          "bytes_per_sec": 3339856490.541422
+          "ms_per_iter": 0.003052,
+          "bytes_per_sec": 3355176933.158584
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-10k-random/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000189,
-          "bytes_per_sec": 54179894179.89418
+          "ms_per_iter": 0.000185,
+          "bytes_per_sec": 55351351351.35135
         }
       },
-      "rust_ms_per_iter": 0.003066,
-      "ffi_ms_per_iter": 0.000189,
-      "rust_bytes_per_sec": 3339856490.541422,
-      "ffi_bytes_per_sec": 54179894179.89418,
-      "delta_rust_over_ffi": 0.06164383561643835,
+      "rust_ms_per_iter": 0.003052,
+      "ffi_ms_per_iter": 0.000185,
+      "rust_bytes_per_sec": 3355176933.158584,
+      "ffi_bytes_per_sec": 55351351351.35135,
+      "delta_rust_over_ffi": 0.06061598951507208,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2461,20 +2461,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-10k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.00187,
-          "bytes_per_sec": 5475935828.877006
+          "ms_per_iter": 0.001801,
+          "bytes_per_sec": 5685730149.916713
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-10k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001263,
-          "bytes_per_sec": 8107680126.682502
+          "ms_per_iter": 0.001188,
+          "bytes_per_sec": 8619528619.528618
         }
       },
-      "rust_ms_per_iter": 0.00187,
-      "ffi_ms_per_iter": 0.001263,
-      "rust_bytes_per_sec": 5475935828.877006,
-      "ffi_bytes_per_sec": 8107680126.682502,
-      "delta_rust_over_ffi": 0.6754010695187166,
+      "rust_ms_per_iter": 0.001801,
+      "ffi_ms_per_iter": 0.001188,
+      "rust_bytes_per_sec": 5685730149.916713,
+      "ffi_bytes_per_sec": 8619528619.528618,
+      "delta_rust_over_ffi": 0.6596335369239312,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2507,20 +2507,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-10k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.003067,
-          "bytes_per_sec": 3338767525.2689924
+          "ms_per_iter": 0.003052,
+          "bytes_per_sec": 3355176933.158584
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-10k-random/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000189,
-          "bytes_per_sec": 54179894179.89418
+          "ms_per_iter": 0.000186,
+          "bytes_per_sec": 55053763440.860214
         }
       },
-      "rust_ms_per_iter": 0.003067,
-      "ffi_ms_per_iter": 0.000189,
-      "rust_bytes_per_sec": 3338767525.2689924,
-      "ffi_bytes_per_sec": 54179894179.89418,
-      "delta_rust_over_ffi": 0.06162373655037496,
+      "rust_ms_per_iter": 0.003052,
+      "ffi_ms_per_iter": 0.000186,
+      "rust_bytes_per_sec": 3355176933.158584,
+      "ffi_bytes_per_sec": 55053763440.860214,
+      "delta_rust_over_ffi": 0.060943643512450844,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2553,20 +2553,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-10k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.00187,
-          "bytes_per_sec": 5475935828.877006
+          "ms_per_iter": 0.001801,
+          "bytes_per_sec": 5685730149.916713
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-10k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001263,
-          "bytes_per_sec": 8107680126.682502
+          "ms_per_iter": 0.001188,
+          "bytes_per_sec": 8619528619.528618
         }
       },
-      "rust_ms_per_iter": 0.00187,
-      "ffi_ms_per_iter": 0.001263,
-      "rust_bytes_per_sec": 5475935828.877006,
-      "ffi_bytes_per_sec": 8107680126.682502,
-      "delta_rust_over_ffi": 0.6754010695187166,
+      "rust_ms_per_iter": 0.001801,
+      "ffi_ms_per_iter": 0.001188,
+      "rust_bytes_per_sec": 5685730149.916713,
+      "ffi_bytes_per_sec": 8619528619.528618,
+      "delta_rust_over_ffi": 0.6596335369239312,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2599,20 +2599,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-10k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.003066,
-          "bytes_per_sec": 3339856490.541422
+          "ms_per_iter": 0.003053,
+          "bytes_per_sec": 3354077956.108745
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-10k-random/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000189,
-          "bytes_per_sec": 54179894179.89418
+          "ms_per_iter": 0.000186,
+          "bytes_per_sec": 55053763440.860214
         }
       },
-      "rust_ms_per_iter": 0.003066,
-      "ffi_ms_per_iter": 0.000189,
-      "rust_bytes_per_sec": 3339856490.541422,
-      "ffi_bytes_per_sec": 54179894179.89418,
-      "delta_rust_over_ffi": 0.06164383561643835,
+      "rust_ms_per_iter": 0.003053,
+      "ffi_ms_per_iter": 0.000186,
+      "rust_bytes_per_sec": 3354077956.108745,
+      "ffi_bytes_per_sec": 55053763440.860214,
+      "delta_rust_over_ffi": 0.06092368162463151,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2645,20 +2645,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-10k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.00187,
-          "bytes_per_sec": 5475935828.877006
+          "ms_per_iter": 0.0018,
+          "bytes_per_sec": 5688888888.888889
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-10k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001262,
-          "bytes_per_sec": 8114104595.879556
+          "ms_per_iter": 0.001188,
+          "bytes_per_sec": 8619528619.528618
         }
       },
-      "rust_ms_per_iter": 0.00187,
-      "ffi_ms_per_iter": 0.001262,
-      "rust_bytes_per_sec": 5475935828.877006,
-      "ffi_bytes_per_sec": 8114104595.879556,
-      "delta_rust_over_ffi": 0.6748663101604279,
+      "rust_ms_per_iter": 0.0018,
+      "ffi_ms_per_iter": 0.001188,
+      "rust_bytes_per_sec": 5688888888.888889,
+      "ffi_bytes_per_sec": 8619528619.528618,
+      "delta_rust_over_ffi": 0.6600000000000001,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2691,20 +2691,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/small-10k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.003082,
-          "bytes_per_sec": 3322517845.5548344
+          "ms_per_iter": 0.003045,
+          "bytes_per_sec": 3362889983.5796385
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/small-10k-random/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000188,
-          "bytes_per_sec": 54468085106.38298
+          "ms_per_iter": 0.000187,
+          "bytes_per_sec": 54759358288.77006
         }
       },
-      "rust_ms_per_iter": 0.003082,
-      "ffi_ms_per_iter": 0.000188,
-      "rust_bytes_per_sec": 3322517845.5548344,
-      "ffi_bytes_per_sec": 54468085106.38298,
-      "delta_rust_over_ffi": 0.06099935107073329,
+      "rust_ms_per_iter": 0.003045,
+      "ffi_ms_per_iter": 0.000187,
+      "rust_bytes_per_sec": 3362889983.5796385,
+      "ffi_bytes_per_sec": 54759358288.77006,
+      "delta_rust_over_ffi": 0.06141215106732347,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2737,20 +2737,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/small-10k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.001771,
-          "bytes_per_sec": 5782044042.913608
+          "ms_per_iter": 0.001769,
+          "bytes_per_sec": 5788581119.276427
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/small-10k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001204,
-          "bytes_per_sec": 8504983388.704319
+          "ms_per_iter": 0.001212,
+          "bytes_per_sec": 8448844884.488449
         }
       },
-      "rust_ms_per_iter": 0.001771,
-      "ffi_ms_per_iter": 0.001204,
-      "rust_bytes_per_sec": 5782044042.913608,
-      "ffi_bytes_per_sec": 8504983388.704319,
-      "delta_rust_over_ffi": 0.6798418972332015,
+      "rust_ms_per_iter": 0.001769,
+      "ffi_ms_per_iter": 0.001212,
+      "rust_bytes_per_sec": 5788581119.276427,
+      "ffi_bytes_per_sec": 8448844884.488449,
+      "delta_rust_over_ffi": 0.6851328434143583,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2783,20 +2783,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/small-1k-random/matrix/pure_rust",
-          "ms_per_iter": 0.255543,
-          "bytes_per_sec": 4007153.3949276637
+          "ms_per_iter": 0.300894,
+          "bytes_per_sec": 3403191.8217046536
         },
         "ffi": {
           "benchmark_name": "compress/best/small-1k-random/matrix/c_ffi",
-          "ms_per_iter": 0.340068,
-          "bytes_per_sec": 3011162.473387676
+          "ms_per_iter": 0.403686,
+          "bytes_per_sec": 2536625.000619293
         }
       },
-      "rust_ms_per_iter": 0.255543,
-      "ffi_ms_per_iter": 0.340068,
-      "rust_bytes_per_sec": 4007153.3949276637,
-      "ffi_bytes_per_sec": 3011162.473387676,
-      "delta_rust_over_ffi": 1.3307662506897076,
+      "rust_ms_per_iter": 0.300894,
+      "ffi_ms_per_iter": 0.403686,
+      "rust_bytes_per_sec": 3403191.8217046536,
+      "ffi_bytes_per_sec": 2536625.000619293,
+      "delta_rust_over_ffi": 1.3416219665397118,
       "status": "rust_faster",
       "reference_band": {
         "delta_low": 0.99,
@@ -2829,20 +2829,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/small-1k-random/matrix/pure_rust",
-          "ms_per_iter": 0.15688,
-          "bytes_per_sec": 6527281.998980112
+          "ms_per_iter": 0.18264,
+          "bytes_per_sec": 5606657.906263689
         },
         "ffi": {
           "benchmark_name": "compress/better/small-1k-random/matrix/c_ffi",
-          "ms_per_iter": 0.09229,
-          "bytes_per_sec": 11095459.963159606
+          "ms_per_iter": 0.108691,
+          "bytes_per_sec": 9421203.227498138
         }
       },
-      "rust_ms_per_iter": 0.15688,
-      "ffi_ms_per_iter": 0.09229,
-      "rust_bytes_per_sec": 6527281.998980112,
-      "ffi_bytes_per_sec": 11095459.963159606,
-      "delta_rust_over_ffi": 0.5882840387557369,
+      "rust_ms_per_iter": 0.18264,
+      "ffi_ms_per_iter": 0.108691,
+      "rust_bytes_per_sec": 5606657.906263689,
+      "ffi_bytes_per_sec": 9421203.227498138,
+      "delta_rust_over_ffi": 0.595110600087604,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2875,20 +2875,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/small-1k-random/matrix/pure_rust",
-          "ms_per_iter": 5.387241,
-          "bytes_per_sec": 190078.7434607065
+          "ms_per_iter": 5.372599,
+          "bytes_per_sec": 190596.76703956502
         },
         "ffi": {
           "benchmark_name": "compress/default/small-1k-random/matrix/c_ffi",
-          "ms_per_iter": 0.018062,
-          "bytes_per_sec": 56693610.89580334
+          "ms_per_iter": 0.019544,
+          "bytes_per_sec": 52394596.80720426
         }
       },
-      "rust_ms_per_iter": 5.387241,
-      "ffi_ms_per_iter": 0.018062,
-      "rust_bytes_per_sec": 190078.7434607065,
-      "ffi_bytes_per_sec": 56693610.89580334,
-      "delta_rust_over_ffi": 0.003352736586315704,
+      "rust_ms_per_iter": 5.372599,
+      "ffi_ms_per_iter": 0.019544,
+      "rust_bytes_per_sec": 190596.76703956502,
+      "ffi_bytes_per_sec": 52394596.80720426,
+      "delta_rust_over_ffi": 0.0036377179834191976,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2921,20 +2921,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/small-1k-random/matrix/pure_rust",
-          "ms_per_iter": 0.023632,
-          "bytes_per_sec": 43331076.50643196
+          "ms_per_iter": 0.023019,
+          "bytes_per_sec": 44484990.65988965
         },
         "ffi": {
           "benchmark_name": "compress/fastest/small-1k-random/matrix/c_ffi",
-          "ms_per_iter": 0.004637,
-          "bytes_per_sec": 220832434.76385596
+          "ms_per_iter": 0.004651,
+          "bytes_per_sec": 220167705.86970544
         }
       },
-      "rust_ms_per_iter": 0.023632,
-      "ffi_ms_per_iter": 0.004637,
-      "rust_bytes_per_sec": 43331076.50643196,
-      "ffi_bytes_per_sec": 220832434.76385596,
-      "delta_rust_over_ffi": 0.19621699390656736,
+      "rust_ms_per_iter": 0.023019,
+      "ffi_ms_per_iter": 0.004651,
+      "rust_bytes_per_sec": 44484990.65988965,
+      "ffi_bytes_per_sec": 220167705.86970544,
+      "delta_rust_over_ffi": 0.20205048003822929,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -2967,8 +2967,8 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-1k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.001785,
-          "bytes_per_sec": 573669467.7871149
+          "ms_per_iter": 0.001786,
+          "bytes_per_sec": 573348264.2777156
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-1k-random/c_stream/matrix/c_ffi",
@@ -2976,11 +2976,11 @@
           "bytes_per_sec": 24975609756.09756
         }
       },
-      "rust_ms_per_iter": 0.001785,
+      "rust_ms_per_iter": 0.001786,
       "ffi_ms_per_iter": 4.1e-05,
-      "rust_bytes_per_sec": 573669467.7871149,
+      "rust_bytes_per_sec": 573348264.2777156,
       "ffi_bytes_per_sec": 24975609756.09756,
-      "delta_rust_over_ffi": 0.02296918767507003,
+      "delta_rust_over_ffi": 0.02295632698768197,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3013,20 +3013,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-1k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.000352,
-          "bytes_per_sec": 2909090909.0909095
+          "ms_per_iter": 0.00036,
+          "bytes_per_sec": 2844444444.444444
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-1k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000173,
-          "bytes_per_sec": 5919075144.508671
+          "ms_per_iter": 0.000174,
+          "bytes_per_sec": 5885057471.264368
         }
       },
-      "rust_ms_per_iter": 0.000352,
-      "ffi_ms_per_iter": 0.000173,
-      "rust_bytes_per_sec": 2909090909.0909095,
-      "ffi_bytes_per_sec": 5919075144.508671,
-      "delta_rust_over_ffi": 0.49147727272727276,
+      "rust_ms_per_iter": 0.00036,
+      "ffi_ms_per_iter": 0.000174,
+      "rust_bytes_per_sec": 2844444444.444444,
+      "ffi_bytes_per_sec": 5885057471.264368,
+      "delta_rust_over_ffi": 0.4833333333333333,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3059,8 +3059,8 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-1k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.001786,
-          "bytes_per_sec": 573348264.2777156
+          "ms_per_iter": 0.001784,
+          "bytes_per_sec": 573991031.3901346
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-1k-random/c_stream/matrix/c_ffi",
@@ -3068,11 +3068,11 @@
           "bytes_per_sec": 24975609756.09756
         }
       },
-      "rust_ms_per_iter": 0.001786,
+      "rust_ms_per_iter": 0.001784,
       "ffi_ms_per_iter": 4.1e-05,
-      "rust_bytes_per_sec": 573348264.2777156,
+      "rust_bytes_per_sec": 573991031.3901346,
       "ffi_bytes_per_sec": 24975609756.09756,
-      "delta_rust_over_ffi": 0.02295632698768197,
+      "delta_rust_over_ffi": 0.02298206278026906,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3105,20 +3105,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-1k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.000347,
-          "bytes_per_sec": 2951008645.5331416
+          "ms_per_iter": 0.000359,
+          "bytes_per_sec": 2852367688.0222845
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-1k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000173,
-          "bytes_per_sec": 5919075144.508671
+          "ms_per_iter": 0.000172,
+          "bytes_per_sec": 5953488372.093023
         }
       },
-      "rust_ms_per_iter": 0.000347,
-      "ffi_ms_per_iter": 0.000173,
-      "rust_bytes_per_sec": 2951008645.5331416,
-      "ffi_bytes_per_sec": 5919075144.508671,
-      "delta_rust_over_ffi": 0.4985590778097983,
+      "rust_ms_per_iter": 0.000359,
+      "ffi_ms_per_iter": 0.000172,
+      "rust_bytes_per_sec": 2852367688.0222845,
+      "ffi_bytes_per_sec": 5953488372.093023,
+      "delta_rust_over_ffi": 0.4791086350974931,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3151,8 +3151,8 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-1k-random/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.001786,
-          "bytes_per_sec": 573348264.2777156
+          "ms_per_iter": 0.001785,
+          "bytes_per_sec": 573669467.7871149
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-1k-random/c_stream/matrix/c_ffi",
@@ -3160,11 +3160,11 @@
           "bytes_per_sec": 24975609756.09756
         }
       },
-      "rust_ms_per_iter": 0.001786,
+      "rust_ms_per_iter": 0.001785,
       "ffi_ms_per_iter": 4.1e-05,
-      "rust_bytes_per_sec": 573348264.2777156,
+      "rust_bytes_per_sec": 573669467.7871149,
       "ffi_bytes_per_sec": 24975609756.09756,
-      "delta_rust_over_ffi": 0.02295632698768197,
+      "delta_rust_over_ffi": 0.02296918767507003,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3197,20 +3197,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-1k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.00035,
-          "bytes_per_sec": 2925714285.714286
+          "ms_per_iter": 0.000357,
+          "bytes_per_sec": 2868347338.9355745
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-1k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000173,
-          "bytes_per_sec": 5919075144.508671
+          "ms_per_iter": 0.000172,
+          "bytes_per_sec": 5953488372.093023
         }
       },
-      "rust_ms_per_iter": 0.00035,
-      "ffi_ms_per_iter": 0.000173,
-      "rust_bytes_per_sec": 2925714285.714286,
-      "ffi_bytes_per_sec": 5919075144.508671,
-      "delta_rust_over_ffi": 0.4942857142857143,
+      "rust_ms_per_iter": 0.000357,
+      "ffi_ms_per_iter": 0.000172,
+      "rust_bytes_per_sec": 2868347338.9355745,
+      "ffi_bytes_per_sec": 5953488372.093023,
+      "delta_rust_over_ffi": 0.4817927170868348,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3289,20 +3289,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/small-1k-random/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.000352,
-          "bytes_per_sec": 2909090909.0909095
+          "ms_per_iter": 0.000365,
+          "bytes_per_sec": 2805479452.0547943
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/small-1k-random/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000173,
-          "bytes_per_sec": 5919075144.508671
+          "ms_per_iter": 0.000172,
+          "bytes_per_sec": 5953488372.093023
         }
       },
-      "rust_ms_per_iter": 0.000352,
-      "ffi_ms_per_iter": 0.000173,
-      "rust_bytes_per_sec": 2909090909.0909095,
-      "ffi_bytes_per_sec": 5919075144.508671,
-      "delta_rust_over_ffi": 0.49147727272727276,
+      "rust_ms_per_iter": 0.000365,
+      "ffi_ms_per_iter": 0.000172,
+      "rust_bytes_per_sec": 2805479452.0547943,
+      "ffi_bytes_per_sec": 5953488372.093023,
+      "delta_rust_over_ffi": 0.4712328767123287,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3335,20 +3335,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/best/small-4k-log-lines/matrix/pure_rust",
-          "ms_per_iter": 0.202921,
-          "bytes_per_sec": 20185195.223757032
+          "ms_per_iter": 0.256805,
+          "bytes_per_sec": 15949845.213294132
         },
         "ffi": {
           "benchmark_name": "compress/best/small-4k-log-lines/matrix/c_ffi",
-          "ms_per_iter": 0.27387,
-          "bytes_per_sec": 14956001.022382881
+          "ms_per_iter": 0.373348,
+          "bytes_per_sec": 10970997.567952687
         }
       },
-      "rust_ms_per_iter": 0.202921,
-      "ffi_ms_per_iter": 0.27387,
-      "rust_bytes_per_sec": 20185195.223757032,
-      "ffi_bytes_per_sec": 14956001.022382881,
-      "delta_rust_over_ffi": 1.3496385292798678,
+      "rust_ms_per_iter": 0.256805,
+      "ffi_ms_per_iter": 0.373348,
+      "rust_bytes_per_sec": 15949845.213294132,
+      "ffi_bytes_per_sec": 10970997.567952687,
+      "delta_rust_over_ffi": 1.4538190455793305,
       "status": "rust_faster",
       "reference_band": {
         "delta_low": 0.99,
@@ -3381,20 +3381,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/better/small-4k-log-lines/matrix/pure_rust",
-          "ms_per_iter": 0.124928,
-          "bytes_per_sec": 32786885.245901637
+          "ms_per_iter": 0.151431,
+          "bytes_per_sec": 27048622.80510595
         },
         "ffi": {
           "benchmark_name": "compress/better/small-4k-log-lines/matrix/c_ffi",
-          "ms_per_iter": 0.07633,
-          "bytes_per_sec": 53661731.95336041
+          "ms_per_iter": 0.098023,
+          "bytes_per_sec": 41786111.42282934
         }
       },
-      "rust_ms_per_iter": 0.124928,
-      "ffi_ms_per_iter": 0.07633,
-      "rust_bytes_per_sec": 32786885.245901637,
-      "ffi_bytes_per_sec": 53661731.95336041,
-      "delta_rust_over_ffi": 0.610991931352459,
+      "rust_ms_per_iter": 0.151431,
+      "ffi_ms_per_iter": 0.098023,
+      "rust_bytes_per_sec": 27048622.80510595,
+      "ffi_bytes_per_sec": 41786111.42282934,
+      "delta_rust_over_ffi": 0.647311316705298,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3427,20 +3427,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/default/small-4k-log-lines/matrix/pure_rust",
-          "ms_per_iter": 4.968755,
-          "bytes_per_sec": 824351.37172189
+          "ms_per_iter": 4.77811,
+          "bytes_per_sec": 857242.7173087267
         },
         "ffi": {
           "benchmark_name": "compress/default/small-4k-log-lines/matrix/c_ffi",
-          "ms_per_iter": 0.017832,
-          "bytes_per_sec": 229699416.77882457
+          "ms_per_iter": 0.021218,
+          "bytes_per_sec": 193043642.1905929
         }
       },
-      "rust_ms_per_iter": 4.968755,
-      "ffi_ms_per_iter": 0.017832,
-      "rust_bytes_per_sec": 824351.37172189,
-      "ffi_bytes_per_sec": 229699416.77882457,
-      "delta_rust_over_ffi": 0.0035888265772814317,
+      "rust_ms_per_iter": 4.77811,
+      "ffi_ms_per_iter": 0.021218,
+      "rust_bytes_per_sec": 857242.7173087267,
+      "ffi_bytes_per_sec": 193043642.1905929,
+      "delta_rust_over_ffi": 0.004440667962855606,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3473,20 +3473,20 @@
       "series": {
         "rust": {
           "benchmark_name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
-          "ms_per_iter": 0.026507,
-          "bytes_per_sec": 154525219.75327274
+          "ms_per_iter": 0.025719,
+          "bytes_per_sec": 159259691.2788211
         },
         "ffi": {
           "benchmark_name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
-          "ms_per_iter": 0.007495,
-          "bytes_per_sec": 546497665.1100733
+          "ms_per_iter": 0.007078,
+          "bytes_per_sec": 578694546.4820571
         }
       },
-      "rust_ms_per_iter": 0.026507,
-      "ffi_ms_per_iter": 0.007495,
-      "rust_bytes_per_sec": 154525219.75327274,
-      "ffi_bytes_per_sec": 546497665.1100733,
-      "delta_rust_over_ffi": 0.28275549854755355,
+      "rust_ms_per_iter": 0.025719,
+      "ffi_ms_per_iter": 0.007078,
+      "rust_bytes_per_sec": 159259691.2788211,
+      "ffi_bytes_per_sec": 578694546.4820571,
+      "delta_rust_over_ffi": 0.2752051012869863,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3519,20 +3519,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.004704,
-          "bytes_per_sec": 870748299.3197279
+          "ms_per_iter": 0.004674,
+          "bytes_per_sec": 876337184.4244758
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001729,
-          "bytes_per_sec": 2368999421.6310005
+          "ms_per_iter": 0.001776,
+          "bytes_per_sec": 2306306306.3063064
         }
       },
-      "rust_ms_per_iter": 0.004704,
-      "ffi_ms_per_iter": 0.001729,
-      "rust_bytes_per_sec": 870748299.3197279,
-      "ffi_bytes_per_sec": 2368999421.6310005,
-      "delta_rust_over_ffi": 0.36755952380952384,
+      "rust_ms_per_iter": 0.004674,
+      "ffi_ms_per_iter": 0.001776,
+      "rust_bytes_per_sec": 876337184.4244758,
+      "ffi_bytes_per_sec": 2306306306.3063064,
+      "delta_rust_over_ffi": 0.37997432605905,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3565,20 +3565,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.002557,
-          "bytes_per_sec": 1601877199.843567
+          "ms_per_iter": 0.002626,
+          "bytes_per_sec": 1559786747.9055598
         },
         "ffi": {
           "benchmark_name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000649,
-          "bytes_per_sec": 6311248073.959939
+          "ms_per_iter": 0.000696,
+          "bytes_per_sec": 5885057471.264368
         }
       },
-      "rust_ms_per_iter": 0.002557,
-      "ffi_ms_per_iter": 0.000649,
-      "rust_bytes_per_sec": 1601877199.843567,
-      "ffi_bytes_per_sec": 6311248073.959939,
-      "delta_rust_over_ffi": 0.2538130621822448,
+      "rust_ms_per_iter": 0.002626,
+      "ffi_ms_per_iter": 0.000696,
+      "rust_bytes_per_sec": 1559786747.9055598,
+      "ffi_bytes_per_sec": 5885057471.264368,
+      "delta_rust_over_ffi": 0.26504188880426505,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3611,20 +3611,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.004708,
-          "bytes_per_sec": 870008496.1767204
+          "ms_per_iter": 0.004668,
+          "bytes_per_sec": 877463581.8337618
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001733,
-          "bytes_per_sec": 2363531448.355453
+          "ms_per_iter": 0.001777,
+          "bytes_per_sec": 2305008441.1930223
         }
       },
-      "rust_ms_per_iter": 0.004708,
-      "ffi_ms_per_iter": 0.001733,
-      "rust_bytes_per_sec": 870008496.1767204,
-      "ffi_bytes_per_sec": 2363531448.355453,
-      "delta_rust_over_ffi": 0.36809685641461337,
+      "rust_ms_per_iter": 0.004668,
+      "ffi_ms_per_iter": 0.001777,
+      "rust_bytes_per_sec": 877463581.8337618,
+      "ffi_bytes_per_sec": 2305008441.1930223,
+      "delta_rust_over_ffi": 0.3806769494430162,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3657,20 +3657,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.002533,
-          "bytes_per_sec": 1617054875.6415317
+          "ms_per_iter": 0.002615,
+          "bytes_per_sec": 1566347992.3518164
         },
         "ffi": {
           "benchmark_name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000615,
-          "bytes_per_sec": 6660162601.626017
+          "ms_per_iter": 0.00067,
+          "bytes_per_sec": 6113432835.820895
         }
       },
-      "rust_ms_per_iter": 0.002533,
-      "ffi_ms_per_iter": 0.000615,
-      "rust_bytes_per_sec": 1617054875.6415317,
-      "ffi_bytes_per_sec": 6660162601.626017,
-      "delta_rust_over_ffi": 0.24279510461902878,
+      "rust_ms_per_iter": 0.002615,
+      "ffi_ms_per_iter": 0.00067,
+      "rust_bytes_per_sec": 1566347992.3518164,
+      "ffi_bytes_per_sec": 6113432835.820895,
+      "delta_rust_over_ffi": 0.25621414913957935,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3703,20 +3703,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.004665,
-          "bytes_per_sec": 878027867.0953912
+          "ms_per_iter": 0.004644,
+          "bytes_per_sec": 881998277.3471146
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001698,
-          "bytes_per_sec": 2412249705.5359244
+          "ms_per_iter": 0.00177,
+          "bytes_per_sec": 2314124293.7853107
         }
       },
-      "rust_ms_per_iter": 0.004665,
-      "ffi_ms_per_iter": 0.001698,
-      "rust_bytes_per_sec": 878027867.0953912,
-      "ffi_bytes_per_sec": 2412249705.5359244,
-      "delta_rust_over_ffi": 0.3639871382636656,
+      "rust_ms_per_iter": 0.004644,
+      "ffi_ms_per_iter": 0.00177,
+      "rust_bytes_per_sec": 881998277.3471146,
+      "ffi_bytes_per_sec": 2314124293.7853107,
+      "delta_rust_over_ffi": 0.38113695090439276,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3749,20 +3749,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.002505,
-          "bytes_per_sec": 1635129740.5189621
+          "ms_per_iter": 0.002569,
+          "bytes_per_sec": 1594394706.1113272
         },
         "ffi": {
           "benchmark_name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000608,
-          "bytes_per_sec": 6736842105.263158
+          "ms_per_iter": 0.000654,
+          "bytes_per_sec": 6262996941.896025
         }
       },
-      "rust_ms_per_iter": 0.002505,
-      "ffi_ms_per_iter": 0.000608,
-      "rust_bytes_per_sec": 1635129740.5189621,
-      "ffi_bytes_per_sec": 6736842105.263158,
-      "delta_rust_over_ffi": 0.24271457085828343,
+      "rust_ms_per_iter": 0.002569,
+      "ffi_ms_per_iter": 0.000654,
+      "rust_bytes_per_sec": 1594394706.1113272,
+      "ffi_bytes_per_sec": 6262996941.896025,
+      "delta_rust_over_ffi": 0.25457376411054883,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3795,20 +3795,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
-          "ms_per_iter": 0.004751,
-          "bytes_per_sec": 862134287.5184172
+          "ms_per_iter": 0.00468,
+          "bytes_per_sec": 875213675.2136751
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
-          "ms_per_iter": 0.001738,
-          "bytes_per_sec": 2356731875.719218
+          "ms_per_iter": 0.001789,
+          "bytes_per_sec": 2289547233.0911126
         }
       },
-      "rust_ms_per_iter": 0.004751,
-      "ffi_ms_per_iter": 0.001738,
-      "rust_bytes_per_sec": 862134287.5184172,
-      "ffi_bytes_per_sec": 2356731875.719218,
-      "delta_rust_over_ffi": 0.365817722584719,
+      "rust_ms_per_iter": 0.00468,
+      "ffi_ms_per_iter": 0.001789,
+      "rust_bytes_per_sec": 875213675.2136751,
+      "ffi_bytes_per_sec": 2289547233.0911126,
+      "delta_rust_over_ffi": 0.3822649572649572,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
@@ -3841,20 +3841,20 @@
       "series": {
         "rust": {
           "benchmark_name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
-          "ms_per_iter": 0.002571,
-          "bytes_per_sec": 1593154414.6246595
+          "ms_per_iter": 0.002646,
+          "bytes_per_sec": 1547996976.5684054
         },
         "ffi": {
           "benchmark_name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
-          "ms_per_iter": 0.000649,
-          "bytes_per_sec": 6311248073.959939
+          "ms_per_iter": 0.00071,
+          "bytes_per_sec": 5769014084.507043
         }
       },
-      "rust_ms_per_iter": 0.002571,
-      "ffi_ms_per_iter": 0.000649,
-      "rust_bytes_per_sec": 1593154414.6246595,
-      "ffi_bytes_per_sec": 6311248073.959939,
-      "delta_rust_over_ffi": 0.2524309607156748,
+      "rust_ms_per_iter": 0.002646,
+      "ffi_ms_per_iter": 0.00071,
+      "rust_bytes_per_sec": 1547996976.5684054,
+      "ffi_bytes_per_sec": 5769014084.507043,
+      "delta_rust_over_ffi": 0.2683295540438398,
       "status": "rust_slower",
       "reference_band": {
         "delta_low": 0.99,
