@@ -100,9 +100,18 @@ bench_target_triple = os.environ.get("BENCH_TARGET_TRIPLE", "")
 bench_target_id = os.environ.get("BENCH_TARGET_ID", bench_target_label)
 commit_sha = os.environ.get("GITHUB_SHA")
 generated_at = datetime.now(timezone.utc).isoformat()
+timing_point_count = 0
 
 DELTA_LOW = 0.99
 DELTA_HIGH = 1.05
+REGRESSION_STAGES = {"compress", "decompress"}
+REGRESSION_LEVELS = {"default", "better"}
+REGRESSION_SCENARIOS = {
+    "small-4k-log-lines",
+    "decodecorpus-z000033",
+    "decodecorpus-synthetic-1m",
+    "low-entropy-1m",
+}
 
 def parse_benchmark_name(name):
     parts = name.split("/")
@@ -153,6 +162,13 @@ def normalize_impl(impl):
         return "ffi"
     return impl
 
+def include_in_regression_set(parsed_name):
+    return (
+        parsed_name["stage"] in REGRESSION_STAGES
+        and parsed_name["level"] in REGRESSION_LEVELS
+        and parsed_name["scenario"] in REGRESSION_SCENARIOS
+    )
+
 def classify_ratio_delta(delta):
     if delta is None:
         return "insufficient-data"
@@ -180,13 +196,15 @@ with open(raw_path) as f:
             name = bench_match.group(1)
             ns = int(bench_match.group(2).replace(",", ""))
             ms = ns / 1_000_000
-            benchmark_results.append({
-                "name": f"{bench_target_id}/{name}",
-                "unit": "ms",
-                "value": round(ms, 3),
-            })
             timings.append((name, ms))
             parsed = parse_benchmark_name(name)
+            timing_point_count += 1
+            if include_in_regression_set(parsed):
+                benchmark_results.append({
+                    "name": f"{bench_target_id}/{name}",
+                    "unit": "ms",
+                    "value": round(ms, 3),
+                })
             timing_rows.append({
                 "name": name,
                 "stage": parsed["stage"],
@@ -744,7 +762,10 @@ for row in delta_rows:
 with open("benchmark-delta.md", "w") as f:
     f.write("\n".join(delta_lines) + "\n")
 
-print(f"Wrote {len(benchmark_results)} timing results to benchmark-results.json", file=sys.stderr)
+print(
+    f"Wrote {len(benchmark_results)} regression timing results to benchmark-results.json (selected from {timing_point_count} total timings)",
+    file=sys.stderr,
+)
 print(f"Wrote {len(ratios)} ratio rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(memory_rows)} memory rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(dictionary_rows)} dictionary rows to benchmark-report.md", file=sys.stderr)

@@ -192,9 +192,10 @@ jobs:
           auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           comment-on-alert: ${{ matrix.bench.id == 'x86_64-gnu' }}
           alert-comment-cc-users: "@polaz"
-          alert-threshold: "115%"
-          fail-threshold: "125%"
-          fail-on-alert: ${{ github.event_name == 'pull_request' && matrix.bench.id == 'x86_64-gnu' }}
+          # GitHub-hosted runners are noisy across runs; keep perf checks advisory on PRs.
+          alert-threshold: "130%"
+          fail-threshold: "160%"
+          fail-on-alert: false
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           benchmark-data-dir-path: dev/bench
 
