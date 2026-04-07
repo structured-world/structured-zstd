@@ -94,6 +94,22 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
 - `benchmark-delta.md` with two packs:
   - Ratio pack: Rust ratio, FFI ratio, Rust/FFI ratio delta
   - Speed pack: Rust speed, FFI speed, Rust/FFI speed delta
+- `benchmark-relative.json` with normalized relative rows:
+  - dimensions: `target`, `stage`, `scenario`, `level`, optional `source`
+  - metrics: `rust_value`, `ffi_value`, `delta_ratio`, `delta_percent`, `status_band`
+  - metric kinds: `compression_ratio`, `throughput_bytes_per_sec`
+
+## CI Target Matrix
+
+GitHub Actions runs the benchmark suite in an explicit target matrix:
+
+- `x86_64-unknown-linux-gnu` (`x86_64-gnu`)
+- `i686-unknown-linux-gnu` (`i686-gnu`)
+- `x86_64-unknown-linux-musl` (`x86_64-musl`)
+
+Each matrix run tags output rows with target metadata and publishes target-scoped artifacts. On `main`,
+the pipeline merges matrix artifacts into canonical `gh-pages/dev/bench/benchmark-relative.json` and
+`benchmark-delta.json`.
 
 Delta interpretation (direct same-run comparison on the same environment):
 

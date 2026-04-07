@@ -110,9 +110,23 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   benchmark:
-    name: Performance regression check
+    name: Performance regression check (${{ matrix.bench.id }})
     needs: lint
-    timeout-minutes: 30
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        bench:
+          - id: x86_64-gnu
+            target_triple: x86_64-unknown-linux-gnu
+            setup_command: ""
+          - id: i686-gnu
+            target_triple: i686-unknown-linux-gnu
+            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
+          - id: x86_64-musl
+            target_triple: x86_64-unknown-linux-musl
+            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -126,29 +140,51 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark target
+        run: rustup target add ${{ matrix.bench.target_triple }}
+
+      - name: Install target toolchain dependencies
+        if: matrix.bench.setup_command != ''
+        run: ${{ matrix.bench.setup_command }}
+
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: bench
+          prefix-key: bench-${{ matrix.bench.id }}
 
       - name: Run benchmarks
+        env:
+          STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
+          STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: bash .github/scripts/run-benchmarks.sh
 
-      - name: Upload benchmark delta artifacts
+      - name: Rename benchmark outputs for matrix artifact
+        run: |
+          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.json
+          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.md
+          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.json
+          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.md
+          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.json
+
+      - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-delta
+          name: benchmark-${{ matrix.bench.id }}
           path: |
-            benchmark-delta.json
-            benchmark-delta.md
+            benchmark-results.${{ matrix.bench.id }}.json
+            benchmark-report.${{ matrix.bench.id }}.md
+            benchmark-delta.${{ matrix.bench.id }}.json
+            benchmark-delta.${{ matrix.bench.id }}.md
+            benchmark-relative.${{ matrix.bench.id }}.json
           if-no-files-found: error
 
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: "structured-zstd vs C FFI"
+          name: "structured-zstd vs C FFI (${{ matrix.bench.id }})"
           tool: customSmallerIsBetter
-          output-file-path: benchmark-results.json
+          output-file-path: benchmark-results.${{ matrix.bench.id }}.json
           github-token: ${{ steps.bot-token.outputs.token }}
           auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           comment-on-alert: true
@@ -159,24 +195,142 @@ jobs:
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
-      - name: Checkout gh-pages
-        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+  benchmark-pages:
+    name: Publish benchmark pages payloads
+    needs: benchmark
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout gh-pages with push token
         uses: actions/checkout@v6
         with:
           ref: gh-pages
           token: ${{ steps.bot-token.outputs.token }}
           path: gh-pages
 
+      - name: Download benchmark matrix artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: benchmark-*
+          path: benchmark-artifacts
+
+      - name: Merge relative/delta payloads
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("benchmark-artifacts")
+          out = Path("merged")
+          out.mkdir(parents=True, exist_ok=True)
+
+          relative_records = []
+          delta_records = []
+          targets = []
+          summary_lines = [
+              "# Benchmark Report (multi-target)",
+              "",
+              "Generated from CI benchmark matrix artifacts.",
+              "",
+              "## Targets",
+              "",
+              "| Target | Relative rows | Delta rows |",
+              "| --- | ---: | ---: |",
+          ]
+          delta_md_lines = [
+              "# Benchmark Delta Report (multi-target)",
+              "",
+              "Canonical rows merged across benchmark targets.",
+              "",
+          ]
+
+          for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
+              payload = json.loads(rel_path.read_text())
+              target = payload.get("target", {}).get("id", "unknown")
+              rows = payload.get("records", [])
+              relative_records.extend(rows)
+              targets.append(target)
+              summary_lines.append(f"| `{target}` | {len(rows)} | 0 |")
+              delta_md_lines.append(f"- `{target}`: {len(rows)} relative rows")
+
+          for delta_path in sorted(root.rglob("benchmark-delta.*.json")):
+              rows = json.loads(delta_path.read_text())
+              delta_records.extend(rows)
+              target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
+              matched = False
+              for idx, line in enumerate(summary_lines):
+                  if line.startswith(f"| `{target}` | "):
+                      parts = line.split("|")
+                      parts[-2] = f" {len(rows)} "
+                      summary_lines[idx] = "|".join(parts)
+                      matched = True
+                      break
+              if not matched:
+                  summary_lines.append(f"| `{target}` | 0 | {len(rows)} |")
+
+          if not relative_records:
+              raise SystemExit("No relative records found in benchmark artifacts")
+          if not delta_records:
+              raise SystemExit("No delta records found in benchmark artifacts")
+
+          existing_relative_path = Path("gh-pages/dev/bench/benchmark-relative.json")
+          existing_records = []
+          if existing_relative_path.exists():
+              existing_payload = json.loads(existing_relative_path.read_text())
+              existing_records = existing_payload.get("records", [])
+
+          key = lambda row: (
+              row.get("commit_sha"),
+              row.get("target"),
+              row.get("metric"),
+              row.get("key"),
+              row.get("generated_at"),
+          )
+          merged = {}
+          for row in existing_records + relative_records:
+              merged[key(row)] = row
+
+          merged_relative_payload = {
+              "version": 1,
+              "targets": sorted(set(targets)),
+              "records": sorted(
+                  merged.values(),
+                  key=lambda row: (
+                      row.get("generated_at") or "",
+                      row.get("target") or "",
+                      row.get("metric") or "",
+                      row.get("key") or "",
+                  ),
+              ),
+          }
+
+          (out / "benchmark-relative.json").write_text(json.dumps(merged_relative_payload, indent=2) + "\n")
+          (out / "benchmark-delta.json").write_text(json.dumps(delta_records, indent=2) + "\n")
+          (out / "benchmark-report.md").write_text("\n".join(summary_lines) + "\n")
+          (out / "benchmark-delta.md").write_text("\n".join(delta_md_lines) + "\n")
+          PY
+
       - name: Publish benchmark reports to gh-pages
-        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           mkdir -p gh-pages/dev/bench
-          cp benchmark-report.md gh-pages/dev/bench/benchmark-report.md
-          cp benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
-          cp benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cp merged/benchmark-report.md gh-pages/dev/bench/benchmark-report.md
+          cp merged/benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
+          cp merged/benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cp merged/benchmark-relative.json gh-pages/dev/bench/benchmark-relative.json
+          cp .github/bench-dashboard/index.html gh-pages/dev/bench/index.html
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md
+          git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json
           git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages

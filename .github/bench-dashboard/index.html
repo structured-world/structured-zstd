@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>structured-zstd Benchmark Dashboard</title>
+    <style>
+      :root {
+        --bg: #f4f7f5;
+        --surface: #ffffff;
+        --ink: #10211c;
+        --muted: #4e635c;
+        --accent: #0f8a5f;
+        --accent-soft: #d7f2e8;
+        --warn: #9d3f3f;
+        --ok: #186a3b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at top right, #e9f6f0, var(--bg) 42%);
+        color: var(--ink);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 1240px;
+        margin: 0 auto;
+        padding: 20px 16px 28px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 2rem;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .card {
+        background: var(--surface);
+        border-radius: 16px;
+        padding: 14px;
+        box-shadow: 0 12px 28px rgba(12, 39, 31, 0.08);
+      }
+      .stats {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .label {
+        font-size: 0.75rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .value {
+        margin-top: 4px;
+        font-size: 1.1rem;
+        font-weight: 600;
+      }
+      .filters {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      select {
+        width: 100%;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid #d8e3de;
+        font: inherit;
+        color: var(--ink);
+      }
+      .chart-wrap {
+        margin-top: 14px;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 0.88rem;
+      }
+      .near-parity {
+        color: var(--ok);
+      }
+      .outside-band {
+        color: var(--warn);
+      }
+      details {
+        margin-top: 16px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+        font-size: 0.92rem;
+      }
+      th, td {
+        padding: 8px;
+        border-bottom: 1px solid #e4ece8;
+        text-align: left;
+      }
+      .chip {
+        display: inline-block;
+        background: var(--accent-soft);
+        color: #0f5e43;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 0.72rem;
+        margin-left: 6px;
+      }
+      a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Rust vs C FFI Relative Dashboard</h1>
+      <p>Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is 0.99..1.05.</p>
+
+      <section class="stats">
+        <div class="card">
+          <div class="label">Relative Records</div>
+          <div class="value" id="stat-records">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Targets</div>
+          <div class="value" id="stat-targets">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Latest Commit</div>
+          <div class="value" id="stat-commit">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Latest Snapshot</div>
+          <div class="value" id="stat-snapshot">-</div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top: 14px">
+        <div class="filters">
+          <label>Metric
+            <select id="f-metric"></select>
+          </label>
+          <label>Stage
+            <select id="f-stage"></select>
+          </label>
+          <label>Scenario
+            <select id="f-scenario"></select>
+          </label>
+          <label>Level
+            <select id="f-level"></select>
+          </label>
+          <label>Source
+            <select id="f-source"></select>
+          </label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart" height="120"></canvas>
+        </div>
+        <div id="status"></div>
+      </section>
+
+      <details class="card">
+        <summary><strong>Raw timings (secondary view)</strong></summary>
+        <p style="margin-top: 8px">
+          Canonical raw series are still available from <code>data.js</code> via github-action-benchmark.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Series</th>
+              <th>Latest commit</th>
+              <th>Bench count</th>
+            </tr>
+          </thead>
+          <tbody id="raw-body"></tbody>
+        </table>
+        <p style="margin-top: 8px">
+          Reports:
+          <a href="./benchmark-report.md">benchmark-report.md</a>,
+          <a href="./benchmark-delta.md">benchmark-delta.md</a>,
+          <a href="./benchmark-delta.json">benchmark-delta.json</a>,
+          <a href="./benchmark-relative.json">benchmark-relative.json</a>
+        </p>
+      </details>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script src="data.js"></script>
+    <script>
+      "use strict";
+
+      const BAND_LOW = 0.99;
+      const BAND_HIGH = 1.05;
+      const ALWAYS = "__all__";
+
+      const state = {
+        records: [],
+        chart: null,
+      };
+
+      const el = (id) => document.getElementById(id);
+
+      const selectors = {
+        metric: el("f-metric"),
+        stage: el("f-stage"),
+        scenario: el("f-scenario"),
+        level: el("f-level"),
+        source: el("f-source"),
+      };
+
+      function uniq(values) {
+        return Array.from(new Set(values)).sort();
+      }
+
+      function renderOptions(select, values) {
+        const opts = [`<option value="${ALWAYS}">all</option>`]
+          .concat(values.map((v) => `<option value="${String(v)}">${String(v)}</option>`))
+          .join("");
+        select.innerHTML = opts;
+      }
+
+      function matchesFilter(record, filter) {
+        if (filter.metric !== ALWAYS && record.metric !== filter.metric) return false;
+        if (filter.stage !== ALWAYS && record.stage !== filter.stage) return false;
+        if (filter.scenario !== ALWAYS && record.scenario !== filter.scenario) return false;
+        if (filter.level !== ALWAYS && record.level !== filter.level) return false;
+        if (filter.source !== ALWAYS && (record.source || "none") !== filter.source) return false;
+        return true;
+      }
+
+      function buildChart(records) {
+        const grouped = new Map();
+        for (const row of records) {
+          const runKey = row.generated_at || "local-run";
+          const target = row.target || "unknown-target";
+          const id = `${target}`;
+          if (!grouped.has(id)) grouped.set(id, new Map());
+          grouped.get(id).set(runKey, row.delta_ratio);
+        }
+
+        const labels = uniq(records.map((r) => r.generated_at || "local-run"));
+        const datasets = Array.from(grouped.entries()).map(([target, timeline], idx) => {
+          const hue = 35 + idx * 55;
+          return {
+            label: target,
+            data: labels.map((label) => timeline.get(label) ?? null),
+            spanGaps: true,
+            borderWidth: 2,
+            pointRadius: 3,
+            borderColor: `hsl(${hue} 70% 42%)`,
+            backgroundColor: `hsla(${hue} 70% 42% / 0.2)`,
+          };
+        });
+
+        return { labels, datasets };
+      }
+
+      function updateStatus(filtered) {
+        const values = filtered.map((row) => row.delta_ratio).filter((v) => typeof v === "number");
+        if (!values.length) {
+          el("status").textContent = "No matching points for current filter.";
+          el("status").className = "";
+          return;
+        }
+        const latest = values[values.length - 1];
+        const pct = ((latest - 1) * 100).toFixed(2);
+        const inBand = latest >= BAND_LOW && latest <= BAND_HIGH;
+        el("status").textContent = `Latest delta: ${latest.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`;
+        el("status").className = inBand ? "near-parity" : "outside-band";
+      }
+
+      function renderChart(filtered) {
+        const data = buildChart(filtered);
+        if (state.chart) state.chart.destroy();
+        state.chart = new Chart(el("chart"), {
+          type: "line",
+          data,
+          options: {
+            responsive: true,
+            scales: {
+              y: {
+                title: { display: true, text: "Rust/FFI delta ratio" },
+              },
+              x: {
+                title: { display: true, text: "Generated at (UTC)" },
+              },
+            },
+            plugins: {
+              legend: { position: "bottom" },
+            },
+          },
+        });
+      }
+
+      function currentFilter() {
+        return {
+          metric: selectors.metric.value,
+          stage: selectors.stage.value,
+          scenario: selectors.scenario.value,
+          level: selectors.level.value,
+          source: selectors.source.value,
+        };
+      }
+
+      function rerender() {
+        const filter = currentFilter();
+        const filtered = state.records.filter((row) => matchesFilter(row, filter));
+        renderChart(filtered);
+        updateStatus(filtered);
+      }
+
+      function bindFilters() {
+        for (const control of Object.values(selectors)) {
+          control.addEventListener("change", rerender);
+        }
+      }
+
+      function renderRawSummary() {
+        const body = el("raw-body");
+        const data = window.BENCHMARK_DATA;
+        if (!data || !data.entries) {
+          body.innerHTML = "<tr><td colspan='3'>No raw benchmark data available.</td></tr>";
+          return;
+        }
+        const rows = [];
+        for (const [name, entryList] of Object.entries(data.entries)) {
+          const latest = entryList[entryList.length - 1];
+          const commit = latest?.commit?.id?.slice(0, 12) || "n/a";
+          const benches = latest?.benches?.length || 0;
+          rows.push(`<tr><td>${name}</td><td><code>${commit}</code></td><td>${benches}</td></tr>`);
+        }
+        body.innerHTML = rows.length ? rows.join("") : "<tr><td colspan='3'>No raw benchmark series found.</td></tr>";
+      }
+
+      async function main() {
+        const response = await fetch("./benchmark-relative.json", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Unable to load benchmark-relative.json (${response.status})`);
+        const payload = await response.json();
+
+        state.records = payload.records || [];
+        if (!state.records.length) throw new Error("benchmark-relative.json has no records");
+
+        const targets = uniq(state.records.map((r) => r.target));
+        const latest = state.records[state.records.length - 1];
+
+        el("stat-records").textContent = String(state.records.length);
+        el("stat-targets").innerHTML = targets.map((t) => `<span class="chip">${t}</span>`).join("");
+        el("stat-commit").textContent = (latest.commit_sha || "local-run").slice(0, 12);
+        el("stat-snapshot").textContent = latest.generated_at || "n/a";
+
+        renderOptions(selectors.metric, uniq(state.records.map((r) => r.metric)));
+        renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
+        renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));
+        renderOptions(selectors.level, uniq(state.records.map((r) => r.level)));
+        renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
+
+        selectors.metric.value = "throughput_bytes_per_sec";
+        bindFilters();
+        rerender();
+        renderRawSummary();
+      }
+
+      main().catch((err) => {
+        el("status").textContent = String(err);
+        el("status").className = "outside-band";
+      });
+    </script>
+  </body>
+</html>
