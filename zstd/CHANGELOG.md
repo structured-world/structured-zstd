@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/structured-world/structured-zstd/compare/v0.0.7...v0.0.8) - 2026-04-07
+
+### Fixed
+
+- *(ci)* publish benchmark delta reports ([#75](https://github.com/structured-world/structured-zstd/pull/75))
+
+### Performance
+
+- *(bench)* multi-arch relative Rust-vs-FFI dashboard ([#78](https://github.com/structured-world/structured-zstd/pull/78))
+- *(fse)* pack decoder entries and align decode tables ([#76](https://github.com/structured-world/structured-zstd/pull/76))
+- *(bench)* add fastcover vs ffi dict-training delta ([#73](https://github.com/structured-world/structured-zstd/pull/73))
+
 ## [0.0.7](https://github.com/structured-world/structured-zstd/compare/v0.0.6...v0.0.7) - 2026-04-05
 
 ### Added
