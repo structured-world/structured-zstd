@@ -10,6 +10,7 @@ benchmark-results.json
 benchmark-report.md
 benchmark-delta.json
 benchmark-delta.md
+benchmark-relative.json
 fuzz/corpus
 .idea
 /=

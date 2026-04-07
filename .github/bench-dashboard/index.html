@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>structured-zstd Benchmark Dashboard</title>
+    <style>
+      :root {
+        --bg: #f4f7f5;
+        --surface: #ffffff;
+        --ink: #10211c;
+        --muted: #4e635c;
+        --accent: #0f8a5f;
+        --accent-soft: #d7f2e8;
+        --warn: #9d3f3f;
+        --ok: #186a3b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at top right, #e9f6f0, var(--bg) 42%);
+        color: var(--ink);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 1240px;
+        margin: 0 auto;
+        padding: 20px 16px 28px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 2rem;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .card {
+        background: var(--surface);
+        border-radius: 16px;
+        padding: 14px;
+        box-shadow: 0 12px 28px rgba(12, 39, 31, 0.08);
+      }
+      .stats {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .label {
+        font-size: 0.75rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .value {
+        margin-top: 4px;
+        font-size: 1.1rem;
+        font-weight: 600;
+      }
+      .filters {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      select {
+        width: 100%;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid #d8e3de;
+        font: inherit;
+        color: var(--ink);
+      }
+      .chart-wrap {
+        margin-top: 14px;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 0.88rem;
+      }
+      .near-parity {
+        color: var(--ok);
+      }
+      .outside-band {
+        color: var(--warn);
+      }
+      details {
+        margin-top: 16px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+        font-size: 0.92rem;
+      }
+      th, td {
+        padding: 8px;
+        border-bottom: 1px solid #e4ece8;
+        text-align: left;
+      }
+      .chip {
+        display: inline-block;
+        background: var(--accent-soft);
+        color: #0f5e43;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 0.72rem;
+        margin-left: 6px;
+      }
+      a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Rust vs C FFI Relative Dashboard</h1>
+      <p id="intro-copy">Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is loading from payload.</p>
+
+      <section class="stats">
+        <div class="card">
+          <div class="label">Relative Records</div>
+          <div class="value" id="stat-records">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Targets</div>
+          <div class="value" id="stat-targets">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Latest Commit</div>
+          <div class="value" id="stat-commit">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Latest Snapshot</div>
+          <div class="value" id="stat-snapshot">-</div>
+        </div>
+      </section>
+
+      <section class="card" style="margin-top: 14px">
+        <div class="filters">
+          <label>Target
+            <select id="f-target"></select>
+          </label>
+          <label>Metric
+            <select id="f-metric"></select>
+          </label>
+          <label>Stage
+            <select id="f-stage"></select>
+          </label>
+          <label>Scenario
+            <select id="f-scenario"></select>
+          </label>
+          <label>Level
+            <select id="f-level"></select>
+          </label>
+          <label>Source
+            <select id="f-source"></select>
+          </label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart" height="120"></canvas>
+        </div>
+        <div id="status"></div>
+      </section>
+
+      <details class="card">
+        <summary><strong>Raw timings (secondary view)</strong></summary>
+        <p style="margin-top: 8px">
+          Canonical raw series are still available from <code>data.js</code> via github-action-benchmark.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Series</th>
+              <th>Latest commit</th>
+              <th>Bench count</th>
+            </tr>
+          </thead>
+          <tbody id="raw-body"></tbody>
+        </table>
+        <p style="margin-top: 8px">
+          Reports:
+          <a href="./benchmark-report.md">benchmark-report.md</a>,
+          <a href="./benchmark-delta.md">benchmark-delta.md</a>,
+          <a href="./benchmark-delta.json">benchmark-delta.json</a>,
+          <a href="./benchmark-relative.json">benchmark-relative.json</a>
+        </p>
+      </details>
+    </main>
+
+    <script
+      src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+      integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+      crossorigin="anonymous"
+    ></script>
+    <!-- Optional github-action-benchmark payload; renderRawSummary() falls back when window.BENCHMARK_DATA is missing. -->
+    <script src="data.js"></script>
+      <script>
+      "use strict";
+
+      let BAND_LOW = 0.99;
+      let BAND_HIGH = 1.05;
+      const ALWAYS = "__all__";
+
+      const state = {
+        records: [],
+        chart: null,
+      };
+
+      const el = (id) => document.getElementById(id);
+
+      const selectors = {
+        target: el("f-target"),
+        metric: el("f-metric"),
+        stage: el("f-stage"),
+        scenario: el("f-scenario"),
+        level: el("f-level"),
+        source: el("f-source"),
+      };
+
+      function parseTimestamp(value) {
+        const parsed = Date.parse(String(value || ""));
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function compareUniqValues(left, right) {
+        const leftText = String(left.value);
+        const rightText = String(right.value);
+        const leftTime = parseTimestamp(leftText);
+        const rightTime = parseTimestamp(rightText);
+
+        if (leftTime !== null && rightTime !== null && leftTime !== rightTime) {
+          return leftTime - rightTime;
+        }
+
+        const lexical = leftText.localeCompare(rightText);
+        if (lexical !== 0) {
+          return lexical;
+        }
+
+        return left.index - right.index;
+      }
+
+      function uniq(values) {
+        return Array.from(new Set(values))
+          .map((value, index) => ({ value, index }))
+          .sort(compareUniqValues)
+          .map((entry) => entry.value);
+      }
+
+      function latestRecord(records) {
+        if (!records.length) return null;
+        return records.reduce((best, record, index) => {
+          if (!best) return { record, index };
+          const bestTime = parseTimestamp(best.record.generated_at);
+          const recordTime = parseTimestamp(record.generated_at);
+
+          if (recordTime !== null && bestTime !== null) {
+            if (recordTime > bestTime) return { record, index };
+            if (recordTime < bestTime) return best;
+          } else if (recordTime !== null && bestTime === null) {
+            return { record, index };
+          } else if (recordTime === null && bestTime !== null) {
+            return best;
+          }
+
+          return index >= best.index ? { record, index } : best;
+        }, null)?.record ?? null;
+      }
+
+      function renderOptions(select, values) {
+        const fragment = document.createDocumentFragment();
+        const allOption = document.createElement("option");
+        allOption.value = ALWAYS;
+        allOption.textContent = "all";
+        fragment.appendChild(allOption);
+        for (const value of values) {
+          const option = document.createElement("option");
+          const text = String(value);
+          option.value = text;
+          option.textContent = text;
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
+      }
+
+      function matchesFilter(record, filter) {
+        if (filter.target !== ALWAYS && record.target !== filter.target) return false;
+        if (filter.metric !== ALWAYS && record.metric !== filter.metric) return false;
+        if (filter.stage !== ALWAYS && record.stage !== filter.stage) return false;
+        if (filter.scenario !== ALWAYS && record.scenario !== filter.scenario) return false;
+        if (filter.level !== ALWAYS && record.level !== filter.level) return false;
+        if (filter.source !== ALWAYS && (record.source || "none") !== filter.source) return false;
+        return true;
+      }
+
+      function buildChart(records) {
+        const grouped = new Map();
+        for (const row of records) {
+          const runKey = row.generated_at || "local-run";
+          const target = row.target || "unknown-target";
+          const seriesKey = row.key || `${row.metric || "metric"}|${row.stage || "stage"}|${row.scenario || "scenario"}|${row.level || "level"}|${row.source || "none"}`;
+          const id = `${target}:${seriesKey}`;
+          if (!grouped.has(id)) grouped.set(id, new Map());
+          grouped.get(id).set(runKey, row.delta_ratio);
+        }
+
+        const labels = uniq(records.map((r) => r.generated_at || "local-run"));
+        const datasets = Array.from(grouped.entries()).map(([seriesId, timeline], idx) => {
+          const hue = 35 + idx * 55;
+          return {
+            label: seriesId,
+            data: labels.map((label) => timeline.get(label) ?? null),
+            spanGaps: true,
+            borderWidth: 2,
+            pointRadius: 3,
+            borderColor: `hsl(${hue} 70% 42%)`,
+            backgroundColor: `hsla(${hue} 70% 42% / 0.2)`,
+          };
+        });
+
+        return { labels, datasets };
+      }
+
+      function compareByGeneratedAt(a, b) {
+        const aLabel = a.generated_at || "";
+        const bLabel = b.generated_at || "";
+        const aTs = parseTimestamp(aLabel);
+        const bTs = parseTimestamp(bLabel);
+        if (aTs !== null && bTs !== null) return aTs - bTs;
+        if (aTs !== null) return 1;
+        if (bTs !== null) return -1;
+        return aLabel.localeCompare(bLabel);
+      }
+
+      function latestRow(rows) {
+        return rows.reduce((latest, row) => (compareByGeneratedAt(row, latest) > 0 ? row : latest));
+      }
+
+      function updateStatus(filtered) {
+        const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
+        if (!numericRows.length) {
+          el("status").textContent = "No matching points for current filter.";
+          el("status").className = "";
+          return;
+        }
+
+        const rowBySeries = new Map();
+        for (const row of numericRows) {
+          const target = row.target || "unknown-target";
+          const seriesKey = row.key || `${row.metric || "metric"}|${row.stage || "stage"}|${row.scenario || "scenario"}|${row.level || "level"}|${row.source || "none"}`;
+          const id = `${target}:${seriesKey}`;
+          if (!rowBySeries.has(id)) rowBySeries.set(id, []);
+          rowBySeries.get(id).push(row);
+        }
+        const latestPerSeries = Array.from(rowBySeries.entries()).map(([seriesId, rows]) => ({
+          seriesId,
+          row: latestRow(rows),
+        }));
+        if (latestPerSeries.length === 1) {
+          const latest = latestPerSeries[0].row;
+          const pct = ((latest.delta_ratio - 1) * 100).toFixed(2);
+          const inBand = latest.delta_ratio >= BAND_LOW && latest.delta_ratio <= BAND_HIGH;
+          el("status").textContent = `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`;
+          el("status").className = inBand ? "near-parity" : "outside-band";
+          return;
+        }
+        const perSeries = latestPerSeries.map(({ seriesId, row }) => {
+          const pct = ((row.delta_ratio - 1) * 100).toFixed(2);
+          const inBand = row.delta_ratio >= BAND_LOW && row.delta_ratio <= BAND_HIGH;
+          return { seriesId, inBand, text: `${seriesId}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} band` };
+        });
+        el("status").textContent = `Latest deltas by series: ${perSeries.map((item) => item.text).join("; ")}`;
+        el("status").className = perSeries.every((item) => item.inBand) ? "near-parity" : "outside-band";
+      }
+
+      function renderChart(filtered) {
+        const data = buildChart(filtered);
+        if (state.chart) state.chart.destroy();
+        const parityBandPlugin = {
+          id: "parityBand",
+          beforeDatasetsDraw(chart) {
+            const yScale = chart.scales.y;
+            const { left, right } = chart.chartArea;
+            const yLow = yScale.getPixelForValue(BAND_LOW);
+            const yHigh = yScale.getPixelForValue(BAND_HIGH);
+            const top = Math.min(yLow, yHigh);
+            const bottom = Math.max(yLow, yHigh);
+            const ctx = chart.ctx;
+            ctx.save();
+            ctx.fillStyle = "rgba(15, 138, 95, 0.12)";
+            ctx.fillRect(left, top, right - left, bottom - top);
+            ctx.strokeStyle = "rgba(15, 138, 95, 0.55)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(left, yLow);
+            ctx.lineTo(right, yLow);
+            ctx.moveTo(left, yHigh);
+            ctx.lineTo(right, yHigh);
+            ctx.stroke();
+            ctx.restore();
+          },
+        };
+        state.chart = new Chart(el("chart"), {
+          type: "line",
+          data,
+          plugins: [parityBandPlugin],
+          options: {
+            responsive: true,
+            scales: {
+              y: {
+                title: { display: true, text: "Rust/FFI delta ratio" },
+              },
+              x: {
+                title: { display: true, text: "Generated at (UTC)" },
+              },
+            },
+            plugins: {
+              legend: { position: "bottom" },
+            },
+          },
+        });
+      }
+
+      function currentFilter() {
+        return {
+          target: selectors.target.value,
+          metric: selectors.metric.value,
+          stage: selectors.stage.value,
+          scenario: selectors.scenario.value,
+          level: selectors.level.value,
+          source: selectors.source.value,
+        };
+      }
+
+      function rerender() {
+        const filter = currentFilter();
+        const filtered = state.records.filter((row) => matchesFilter(row, filter));
+        renderChart(filtered);
+        updateStatus(filtered);
+      }
+
+      function bindFilters() {
+        for (const control of Object.values(selectors)) {
+          control.addEventListener("change", rerender);
+        }
+      }
+
+      function renderRawSummary() {
+        const body = el("raw-body");
+        const data = window.BENCHMARK_DATA;
+        if (!data || !data.entries) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 3;
+          cell.textContent = "No raw benchmark data available.";
+          row.appendChild(cell);
+          body.replaceChildren(row);
+          return;
+        }
+        const fragment = document.createDocumentFragment();
+        for (const [name, entryList] of Object.entries(data.entries)) {
+          const latest = entryList[entryList.length - 1];
+          const commit = latest?.commit?.id?.slice(0, 12) || "n/a";
+          const benches = latest?.benches?.length || 0;
+          const row = document.createElement("tr");
+
+          const seriesCell = document.createElement("td");
+          seriesCell.textContent = name;
+          row.appendChild(seriesCell);
+
+          const commitCell = document.createElement("td");
+          const code = document.createElement("code");
+          code.textContent = commit;
+          commitCell.appendChild(code);
+          row.appendChild(commitCell);
+
+          const benchCell = document.createElement("td");
+          benchCell.textContent = String(benches);
+          row.appendChild(benchCell);
+
+          fragment.appendChild(row);
+        }
+        if (fragment.childNodes.length === 0) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 3;
+          cell.textContent = "No raw benchmark series found.";
+          row.appendChild(cell);
+          body.replaceChildren(row);
+          return;
+        }
+        body.replaceChildren(fragment);
+      }
+
+      async function main() {
+        const response = await fetch("./benchmark-relative.json", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Unable to load benchmark-relative.json (${response.status})`);
+        const payload = await response.json();
+        const band = payload.reference_band || {};
+        if (typeof band.delta_low === "number" && typeof band.delta_high === "number" && band.delta_low > 0 && band.delta_high >= band.delta_low) {
+          BAND_LOW = band.delta_low;
+          BAND_HIGH = band.delta_high;
+        }
+        el("intro-copy").textContent = `Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
+
+        state.records = payload.records || [];
+        if (!state.records.length) throw new Error("benchmark-relative.json has no records");
+
+        const targets = uniq(state.records.map((r) => r.target));
+        const latest = latestRecord(state.records);
+        if (!latest) throw new Error("Unable to determine latest benchmark snapshot");
+
+        el("stat-records").textContent = String(state.records.length);
+        const targetsContainer = el("stat-targets");
+        targetsContainer.replaceChildren();
+        for (const target of targets) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = target;
+          targetsContainer.appendChild(chip);
+        }
+        el("stat-commit").textContent = (latest.commit_sha || "local-run").slice(0, 12);
+        el("stat-snapshot").textContent = latest.generated_at || "n/a";
+
+        renderOptions(selectors.target, targets);
+        const metricValues = uniq(state.records.map((r) => r.metric).filter((value) => value));
+        renderOptions(selectors.metric, metricValues);
+        renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
+        renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));
+        renderOptions(selectors.level, uniq(state.records.map((r) => r.level)));
+        renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
+
+        const defaultMetric = "throughput_bytes_per_sec";
+        const availableMetrics = metricValues.map((value) => String(value));
+        selectors.metric.value = availableMetrics.includes(defaultMetric) ? defaultMetric : (availableMetrics[0] || ALWAYS);
+        bindFilters();
+        rerender();
+        renderRawSummary();
+      }
+
+      main().catch((err) => {
+        el("status").textContent = String(err);
+        el("status").className = "outside-band";
+      });
+    </script>
+  </body>
+</html>

@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep cancellation for PR churn, but never cancel main pushes mid-flight:
+  # benchmark baseline + gh-pages merge must complete atomically.
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -110,9 +112,22 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   benchmark:
-    name: Performance regression check
+    name: Performance regression check (${{ matrix.bench.id }})
     needs: lint
-    timeout-minutes: 30
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        bench:
+          - id: x86_64-gnu
+            target_triple: x86_64-unknown-linux-gnu
+            setup_command: ""
+          - id: i686-gnu
+            target_triple: i686-unknown-linux-gnu
+            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
+          - id: x86_64-musl
+            target_triple: x86_64-unknown-linux-musl
+            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -126,57 +141,113 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark target
+        run: rustup target add ${{ matrix.bench.target_triple }}
+
+      - name: Install target toolchain dependencies
+        if: matrix.bench.setup_command != ''
+        run: ${{ matrix.bench.setup_command }}
+
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: bench
+          prefix-key: bench-${{ matrix.bench.id }}
 
       - name: Run benchmarks
+        env:
+          STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
+          STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
+          STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: bash .github/scripts/run-benchmarks.sh
 
-      - name: Upload benchmark delta artifacts
+      - name: Rename benchmark outputs for matrix artifact
+        run: |
+          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.json
+          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.md
+          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.json
+          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.md
+          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.json
+
+      - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-delta
+          name: benchmark-${{ matrix.bench.id }}
           path: |
-            benchmark-delta.json
-            benchmark-delta.md
+            benchmark-results.${{ matrix.bench.id }}.json
+            benchmark-report.${{ matrix.bench.id }}.md
+            benchmark-delta.${{ matrix.bench.id }}.json
+            benchmark-delta.${{ matrix.bench.id }}.md
+            benchmark-relative.${{ matrix.bench.id }}.json
           if-no-files-found: error
 
       - name: Store benchmark results
-        if: steps.bot-token.outputs.token != ''
+        if: steps.bot-token.outputs.token != '' && matrix.bench.id == 'x86_64-gnu'
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: "structured-zstd vs C FFI"
+          name: "structured-zstd vs C FFI (${{ matrix.bench.id }})"
           tool: customSmallerIsBetter
-          output-file-path: benchmark-results.json
+          output-file-path: benchmark-results.${{ matrix.bench.id }}.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          comment-on-alert: true
+          # Keep matrix execution parallel; persist benchmark baseline only for one
+          # canonical target to avoid concurrent gh-pages writes from matrix jobs.
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
+          comment-on-alert: ${{ matrix.bench.id == 'x86_64-gnu' }}
           alert-comment-cc-users: "@polaz"
-          alert-threshold: "115%"
-          fail-threshold: "125%"
-          fail-on-alert: ${{ github.event_name == 'pull_request' }}
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # GitHub-hosted runners are noisy across runs; keep perf checks advisory on PRs.
+          alert-threshold: "130%"
+          fail-threshold: "160%"
+          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           benchmark-data-dir-path: dev/bench
 
-      - name: Checkout gh-pages
-        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+  benchmark-pages:
+    name: Publish benchmark pages payloads
+    needs: benchmark
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout gh-pages with push token
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/checkout@v6
         with:
           ref: gh-pages
           token: ${{ steps.bot-token.outputs.token }}
           path: gh-pages
 
+      - name: Download benchmark matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*
+          path: benchmark-artifacts
+
+      - name: Merge relative/delta payloads
+        run: python3 .github/scripts/merge-benchmarks.py
+
       - name: Publish benchmark reports to gh-pages
-        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           mkdir -p gh-pages/dev/bench
-          cp benchmark-report.md gh-pages/dev/bench/benchmark-report.md
-          cp benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
-          cp benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cp merged/benchmark-report.md gh-pages/dev/bench/benchmark-report.md
+          cp merged/benchmark-delta.json gh-pages/dev/bench/benchmark-delta.json
+          cp merged/benchmark-delta.md gh-pages/dev/bench/benchmark-delta.md
+          cp merged/benchmark-summary.md gh-pages/dev/bench/benchmark-summary.md
+          cp merged/benchmark-delta-summary.md gh-pages/dev/bench/benchmark-delta-summary.md
+          cp merged/benchmark-relative.json gh-pages/dev/bench/benchmark-relative.json
+          cp .github/bench-dashboard/index.html gh-pages/dev/bench/index.html
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md
+          git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json dev/bench/benchmark-summary.md dev/bench/benchmark-delta-summary.md
           git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages

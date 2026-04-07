@@ -13,19 +13,35 @@ echo "Running benchmark matrix..." >&2
 if [ -n "${GITHUB_ACTIONS:-}" ] && [ -z "${STRUCTURED_ZSTD_BENCH_LARGE_BYTES:-}" ]; then
   export STRUCTURED_ZSTD_BENCH_LARGE_BYTES=16777216
 fi
+
+BENCH_TARGET_LABEL="${STRUCTURED_ZSTD_BENCH_TARGET:-host}"
+BENCH_TARGET_TRIPLE="${STRUCTURED_ZSTD_BENCH_TRIPLE:-}"
+
+# Keep emitted target IDs stable across artifacts and docs.
+BENCH_TARGET_ID="$BENCH_TARGET_LABEL"
+
 BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
 export STRUCTURED_ZSTD_EMIT_REPORT=1
-cargo bench --bench compare_ffi -p structured-zstd --features dict_builder -- --output-format bencher | tee "$BENCH_RAW_FILE"
+BENCH_CMD=(cargo bench --bench compare_ffi -p structured-zstd --features dict_builder)
+if [ -n "$BENCH_TARGET_TRIPLE" ]; then
+  BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
+fi
+"${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
 
 echo "Parsing results..." >&2
 
-BENCH_RAW_FILE="$BENCH_RAW_FILE" python3 - <<'PYEOF'
+BENCH_RAW_FILE="$BENCH_RAW_FILE" \
+BENCH_TARGET_LABEL="$BENCH_TARGET_LABEL" \
+BENCH_TARGET_TRIPLE="$BENCH_TARGET_TRIPLE" \
+BENCH_TARGET_ID="$BENCH_TARGET_ID" \
+python3 - <<'PYEOF'
 import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from collections import defaultdict
 
 BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
@@ -79,9 +95,23 @@ timing_rows = []
 scenario_input_bytes = {}
 scenario_training_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
+bench_target_label = os.environ.get("BENCH_TARGET_LABEL", "host")
+bench_target_triple = os.environ.get("BENCH_TARGET_TRIPLE", "")
+bench_target_id = os.environ.get("BENCH_TARGET_ID", bench_target_label)
+commit_sha = os.environ.get("GITHUB_SHA")
+generated_at = os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT") or datetime.now(timezone.utc).isoformat()
+timing_point_count = 0
 
 DELTA_LOW = 0.99
 DELTA_HIGH = 1.05
+REGRESSION_STAGES = {"compress", "decompress"}
+REGRESSION_LEVELS = {"default", "better"}
+REGRESSION_SCENARIOS = {
+    "small-4k-log-lines",
+    "decodecorpus-z000033",
+    "decodecorpus-synthetic-1m",
+    "low-entropy-1m",
+}
 
 def parse_benchmark_name(name):
     parts = name.split("/")
@@ -132,6 +162,13 @@ def normalize_impl(impl):
         return "ffi"
     return impl
 
+def include_in_regression_set(parsed_name):
+    return (
+        parsed_name["stage"] in REGRESSION_STAGES
+        and parsed_name["level"] in REGRESSION_LEVELS
+        and parsed_name["scenario"] in REGRESSION_SCENARIOS
+    )
+
 def classify_ratio_delta(delta):
     if delta is None:
         return "insufficient-data"
@@ -159,13 +196,15 @@ with open(raw_path) as f:
             name = bench_match.group(1)
             ns = int(bench_match.group(2).replace(",", ""))
             ms = ns / 1_000_000
-            benchmark_results.append({
-                "name": name,
-                "unit": "ms",
-                "value": round(ms, 3),
-            })
             timings.append((name, ms))
             parsed = parse_benchmark_name(name)
+            timing_point_count += 1
+            if include_in_regression_set(parsed):
+                benchmark_results.append({
+                    "name": name,
+                    "unit": "ms",
+                    "value": round(ms, 3),
+                })
             timing_rows.append({
                 "name": name,
                 "stage": parsed["stage"],
@@ -173,6 +212,7 @@ with open(raw_path) as f:
                 "scenario": parsed["scenario"],
                 "source": parsed["source"],
                 "implementation": normalize_impl(parsed["implementation"]),
+                "target": bench_target_id,
                 "ms_per_iter": ms,
             })
             continue
@@ -276,9 +316,24 @@ with open(raw_path) as f:
             })
             scenario_training_bytes[scenario] = int(training_bytes)
 
-if not benchmark_results:
-    print("ERROR: No benchmark results parsed!", file=sys.stderr)
+if timing_point_count == 0:
+    print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
     sys.exit(1)
+
+if not benchmark_results:
+    print(
+        "WARN: No regression-set benchmark rows matched smoke filter; "
+        "falling back to all parsed timings for benchmark-results.json.",
+        file=sys.stderr,
+    )
+    benchmark_results = [
+        {
+            "name": name,
+            "unit": "ms",
+            "value": round(ms, 3),
+        }
+        for name, ms in timings
+    ]
 
 if not ratios:
     print(
@@ -408,6 +463,7 @@ for key in all_keys:
                 "level": level,
                 "source": source,
             },
+            "target": bench_target_id,
             "input_bytes": input_bytes,
             "ratio": {
                 "rust": ratio_pack["rust_ratio"],
@@ -434,11 +490,88 @@ for key in all_keys:
                 },
                 "interpretation": "delta>1 means Rust faster than FFI; throughput ratio uses rust_bytes_per_sec/ffi_bytes_per_sec when available, otherwise fallback is ffi_ms_per_iter/rust_ms_per_iter",
             },
+            "meta": {
+                "target_label": bench_target_label,
+                "target_triple": bench_target_triple or None,
+                "commit_sha": commit_sha,
+                "generated_at": generated_at,
+            },
         }
     )
 
 with open("benchmark-delta.json", "w") as f:
     json.dump(delta_rows, f, indent=2)
+
+relative_rows = []
+for row in delta_rows:
+    params = row["params"]
+    common = {
+        "target": row["target"],
+        "stage": params["stage"],
+        "scenario": row["scenario"],
+        "level": params["level"],
+        "source": params["source"],
+        "key": row["key"],
+        "commit_sha": row["meta"]["commit_sha"],
+        "generated_at": row["meta"]["generated_at"],
+    }
+
+    ratio_delta = row["ratio"]["delta_rust_over_ffi"]
+    if (
+        ratio_delta is not None
+        and row["ratio"]["rust"] is not None
+        and row["ratio"]["ffi"] is not None
+    ):
+        relative_rows.append(
+            {
+                **common,
+                "metric": "compression_ratio",
+                "rust_value": row["ratio"]["rust"],
+                "ffi_value": row["ratio"]["ffi"],
+                "delta_ratio": ratio_delta,
+                "delta_percent": (ratio_delta - 1.0) * 100.0,
+                "status_band": row["ratio"]["status"],
+                "interpretation": row["ratio"]["interpretation"],
+            }
+        )
+
+    speed_delta = row["speed"]["delta_rust_over_ffi"]
+    if (
+        speed_delta is not None
+        and row["speed"]["rust_bytes_per_sec"] is not None
+        and row["speed"]["ffi_bytes_per_sec"] is not None
+    ):
+        relative_rows.append(
+            {
+                **common,
+                "metric": "throughput_bytes_per_sec",
+                "rust_value": row["speed"]["rust_bytes_per_sec"],
+                "ffi_value": row["speed"]["ffi_bytes_per_sec"],
+                "delta_ratio": speed_delta,
+                "delta_percent": (speed_delta - 1.0) * 100.0,
+                "status_band": row["speed"]["status"],
+                "interpretation": "delta>1 means Rust faster than FFI",
+            }
+        )
+
+relative_payload = {
+    "version": 1,
+    "target": {
+        "id": bench_target_id,
+        "label": bench_target_label,
+        "triple": bench_target_triple or None,
+    },
+    "reference_band": {
+        "delta_low": DELTA_LOW,
+        "delta_high": DELTA_HIGH,
+    },
+    "commit_sha": commit_sha,
+    "generated_at": generated_at,
+    "records": relative_rows,
+}
+
+with open("benchmark-relative.json", "w") as f:
+    json.dump(relative_payload, f, indent=2)
 
 lines = [
     "# Benchmark Report",
@@ -644,11 +777,15 @@ for row in delta_rows:
 with open("benchmark-delta.md", "w") as f:
     f.write("\n".join(delta_lines) + "\n")
 
-print(f"Wrote {len(benchmark_results)} timing results to benchmark-results.json", file=sys.stderr)
+print(
+    f"Wrote {len(benchmark_results)} regression timing results to benchmark-results.json (selected from {timing_point_count} total timings)",
+    file=sys.stderr,
+)
 print(f"Wrote {len(ratios)} ratio rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(memory_rows)} memory rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(dictionary_rows)} dictionary rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(dictionary_training_rows)} dictionary training rows to benchmark-report.md", file=sys.stderr)
 print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.json", file=sys.stderr)
 print(f"Wrote {len(delta_rows)} canonical rows to benchmark-delta.md", file=sys.stderr)
+print(f"Wrote {len(relative_rows)} relative rows to benchmark-relative.json", file=sys.stderr)
 PYEOF
