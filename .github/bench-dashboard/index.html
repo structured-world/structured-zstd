@@ -191,7 +191,11 @@
       </details>
     </main>
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
+      integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"
+      crossorigin="anonymous"
+    ></script>
     <script src="data.js"></script>
       <script>
       "use strict";
@@ -260,7 +264,6 @@
         const labels = uniq(records.map((r) => r.generated_at || "local-run"));
         const datasets = Array.from(grouped.entries()).map(([seriesId, timeline], idx) => {
           const hue = 35 + idx * 55;
-          const [target] = seriesId.split(":", 2);
           return {
             label: seriesId,
             data: labels.map((label) => timeline.get(label) ?? null),

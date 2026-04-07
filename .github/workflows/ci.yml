@@ -185,14 +185,15 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: benchmark-results.${{ matrix.bench.id }}.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          # gh-pages writes are centralized in benchmark-pages after artifact merge.
-          auto-push: false
-          comment-on-alert: true
+          # Keep matrix execution parallel; persist benchmark baseline only for one
+          # canonical target to avoid concurrent gh-pages writes from matrix jobs.
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
+          comment-on-alert: ${{ matrix.bench.id == 'x86_64-gnu' }}
           alert-comment-cc-users: "@polaz"
           alert-threshold: "115%"
           fail-threshold: "125%"
-          fail-on-alert: ${{ github.event_name == 'pull_request' }}
-          save-data-file: false
+          fail-on-alert: ${{ github.event_name == 'pull_request' && matrix.bench.id == 'x86_64-gnu' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           benchmark-data-dir-path: dev/bench
 
   benchmark-pages:
@@ -286,7 +287,15 @@ jobs:
               rows = json.loads(delta_path.read_text())
               delta_records.extend(rows)
               if rows:
-                  target = rows[0].get("target") or "unknown"
+                  raw_target = rows[0].get("target")
+                  if raw_target:
+                      target = raw_target
+                  else:
+                      target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
+                      print(
+                          f"Warning: missing delta target field in {delta_path.name}; "
+                          f"falling back to filename target={target}"
+                      )
               else:
                   target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
               register_target(target)
