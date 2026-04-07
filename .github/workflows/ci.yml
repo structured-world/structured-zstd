@@ -180,7 +180,7 @@ jobs:
           if-no-files-found: error
 
       - name: Store benchmark results
-        if: steps.bot-token.outputs.token != ''
+        if: steps.bot-token.outputs.token != '' && matrix.bench.id == 'x86_64-gnu'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "structured-zstd vs C FFI (${{ matrix.bench.id }})"
