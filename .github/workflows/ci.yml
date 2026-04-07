@@ -235,6 +235,7 @@ jobs:
           out.mkdir(parents=True, exist_ok=True)
 
           relative_records = []
+          reference_band = None
           delta_records = []
           target_order = []
           target_counts = {}
@@ -265,6 +266,11 @@ jobs:
 
           for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
               payload = json.loads(rel_path.read_text())
+              band = payload.get("reference_band")
+              if band:
+                  if reference_band is not None and reference_band != band:
+                      raise SystemExit(f"Inconsistent reference_band in {rel_path}")
+                  reference_band = band
               target = payload.get("target", {}).get("id", "unknown")
               rows = payload.get("records", [])
               relative_records.extend(rows)
@@ -301,6 +307,9 @@ jobs:
           if existing_relative_path.exists():
               existing_payload = json.loads(existing_relative_path.read_text())
               existing_records = existing_payload.get("records", [])
+              existing_band = existing_payload.get("reference_band")
+              if reference_band is None and existing_band:
+                  reference_band = existing_band
 
           key = lambda row: (
               row.get("commit_sha"),
@@ -316,6 +325,10 @@ jobs:
           merged_relative_payload = {
               "version": 1,
               "targets": sorted(set(target_order)),
+              "reference_band": reference_band or {
+                  "delta_low": 0.99,
+                  "delta_high": 1.05,
+              },
               "records": sorted(
                   merged.values(),
                   key=lambda row: (
