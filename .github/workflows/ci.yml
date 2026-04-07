@@ -196,7 +196,7 @@ jobs:
           # GitHub-hosted runners are noisy across runs; keep perf checks advisory on PRs.
           alert-threshold: "130%"
           fail-threshold: "160%"
-          fail-on-alert: false
+          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
           benchmark-data-dir-path: dev/bench
 
@@ -226,7 +226,7 @@ jobs:
           path: gh-pages
 
       - name: Download benchmark matrix artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           pattern: benchmark-*
           path: benchmark-artifacts

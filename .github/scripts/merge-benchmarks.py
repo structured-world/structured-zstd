@@ -78,13 +78,20 @@ for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
             raise SystemExit(f"Inconsistent reference_band in {rel_path}")
         reference_band = band
     target_payload = payload.get("target") or {}
-    target = target_payload.get("id", "unknown")
+    filename_target = rel_path.name.replace("benchmark-relative.", "").replace(".json", "")
+    target = target_payload.get("id") or filename_target
+    if not target:
+        raise SystemExit(f"Unable to determine relative target in {rel_path.name}")
     rows = payload.get("records", [])
     register_target(target, target_payload)
     for row in rows:
         enriched = dict(row)
         if not enriched.get("target"):
             enriched["target"] = target
+        elif enriched["target"] != target:
+            raise SystemExit(
+                f"Inconsistent relative target in {rel_path.name}: expected {target}, got {enriched['target']}"
+            )
         if target_payload.get("label") and not enriched.get("target_label"):
             enriched["target_label"] = target_payload["label"]
         if target_payload.get("triple") and not enriched.get("target_triple"):
@@ -99,21 +106,32 @@ for report_path in sorted(root.rglob("benchmark-report.*.md")):
 
 for delta_path in sorted(root.rglob("benchmark-delta.*.json")):
     rows = json.loads(delta_path.read_text())
-    delta_records.extend(rows)
+    normalized_rows = []
+    filename_target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
     if rows:
         raw_target = rows[0].get("target")
         if raw_target:
             target = raw_target
         else:
-            target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
+            target = filename_target
             print(
                 f"Warning: missing delta target field in {delta_path.name}; "
                 f"falling back to filename target={target}"
             )
     else:
-        target = delta_path.name.replace("benchmark-delta.", "").replace(".json", "")
+        target = filename_target
+    for row in rows:
+        enriched = dict(row)
+        if not enriched.get("target"):
+            enriched["target"] = target
+        elif enriched["target"] != target:
+            raise SystemExit(
+                f"Inconsistent delta target in {delta_path.name}: expected {target}, got {enriched['target']}"
+            )
+        normalized_rows.append(enriched)
+    delta_records.extend(normalized_rows)
     register_target(target)
-    target_counts[target]["delta"] += len(rows)
+    target_counts[target]["delta"] += len(normalized_rows)
 
 for delta_md_path in sorted(root.rglob("benchmark-delta.*.md")):
     target = delta_md_path.name.replace("benchmark-delta.", "").replace(".md", "")
@@ -124,6 +142,19 @@ if not relative_records:
     raise SystemExit("No relative records found in benchmark artifacts")
 if not delta_records:
     raise SystemExit("No delta records found in benchmark artifacts")
+current_targets = list(target_order)
+missing_relative = sorted(target for target in current_targets if target_counts[target]["relative"] == 0)
+missing_delta = sorted(target for target in current_targets if target_counts[target]["delta"] == 0)
+missing_reports = sorted(target for target in current_targets if target not in report_bodies)
+missing_delta_reports = sorted(target for target in current_targets if target not in delta_md_bodies)
+if missing_relative or missing_delta or missing_reports or missing_delta_reports:
+    raise SystemExit(
+        "Incomplete benchmark artifacts: "
+        f"missing_relative={missing_relative}, "
+        f"missing_delta={missing_delta}, "
+        f"missing_reports={missing_reports}, "
+        f"missing_delta_reports={missing_delta_reports}"
+    )
 
 existing_relative_path = Path("gh-pages/dev/bench/benchmark-relative.json")
 existing_records = []
@@ -179,7 +210,7 @@ if len(retained_values) > RELATIVE_MAX_RECORDS:
 
 merged_relative_payload = {
     "version": 1,
-    "targets": sorted(set(target_order)),
+    "targets": list(target_order),
     "targets_meta": [
         targets_meta.get(target, {"id": target, "label": target, "triple": None})
         for target in target_order

@@ -221,8 +221,7 @@
       };
 
       function parseTimestamp(value) {
-        const text = String(value || "");
-        const parsed = Date.parse(text);
+        const parsed = Date.parse(String(value || ""));
         return Number.isFinite(parsed) ? parsed : null;
       }
 
@@ -252,6 +251,7 @@
       }
 
       function latestRecord(records) {
+        if (!records.length) return null;
         return records.reduce((best, record, index) => {
           if (!best) return { record, index };
           const bestTime = parseTimestamp(best.record.generated_at);
@@ -267,7 +267,7 @@
           }
 
           return index >= best.index ? { record, index } : best;
-        }, null).record;
+        }, null)?.record ?? null;
       }
 
       function renderOptions(select, values) {
@@ -324,16 +324,11 @@
         return { labels, datasets };
       }
 
-      function parseGeneratedAt(label) {
-        const parsed = Date.parse(label);
-        return Number.isNaN(parsed) ? null : parsed;
-      }
-
       function compareByGeneratedAt(a, b) {
         const aLabel = a.generated_at || "";
         const bLabel = b.generated_at || "";
-        const aTs = parseGeneratedAt(aLabel);
-        const bTs = parseGeneratedAt(bLabel);
+        const aTs = parseTimestamp(aLabel);
+        const bTs = parseTimestamp(bLabel);
         if (aTs !== null && bTs !== null) return aTs - bTs;
         if (aTs !== null) return 1;
         if (bTs !== null) return -1;
@@ -516,6 +511,7 @@
 
         const targets = uniq(state.records.map((r) => r.target));
         const latest = latestRecord(state.records);
+        if (!latest) throw new Error("Unable to determine latest benchmark snapshot");
 
         el("stat-records").textContent = String(state.records.length);
         const targetsContainer = el("stat-targets");
@@ -530,15 +526,16 @@
         el("stat-snapshot").textContent = latest.generated_at || "n/a";
 
         renderOptions(selectors.target, targets);
-        renderOptions(selectors.metric, uniq(state.records.map((r) => r.metric)));
+        const metricValues = uniq(state.records.map((r) => r.metric).filter((value) => value));
+        renderOptions(selectors.metric, metricValues);
         renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
         renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));
         renderOptions(selectors.level, uniq(state.records.map((r) => r.level)));
         renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
 
         const defaultMetric = "throughput_bytes_per_sec";
-        const availableMetrics = Array.from(selectors.metric.options).map((option) => option.value);
-        selectors.metric.value = availableMetrics.includes(defaultMetric) ? defaultMetric : (availableMetrics[1] || ALWAYS);
+        const availableMetrics = metricValues.map((value) => String(value));
+        selectors.metric.value = availableMetrics.includes(defaultMetric) ? defaultMetric : (availableMetrics[0] || ALWAYS);
         bindFilters();
         rerender();
         renderRawSummary();
