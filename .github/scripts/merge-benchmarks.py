@@ -75,13 +75,21 @@ for rel_path in sorted(root.rglob("benchmark-relative.*.json")):
     band = payload.get("reference_band")
     if band:
         if reference_band is not None and reference_band != band:
-            raise SystemExit(f"Inconsistent reference_band in {rel_path}")
+            raise SystemExit(
+                "Inconsistent reference_band in "
+                f"{rel_path.name}: expected={reference_band}, actual={band}"
+            )
         reference_band = band
     target_payload = payload.get("target") or {}
     filename_target = rel_path.name.replace("benchmark-relative.", "").replace(".json", "")
     target = target_payload.get("id") or filename_target
     if not target:
-        raise SystemExit(f"Unable to determine relative target in {rel_path.name}")
+        raise SystemExit(
+            "Unable to determine relative target in "
+            f"{rel_path.name}: target.id={target_payload.get('id')!r}, "
+            f"filename_target={filename_target!r}, "
+            f"target_payload_keys={sorted(target_payload.keys())}"
+        )
     rows = payload.get("records", [])
     register_target(target, target_payload)
     for row in rows:

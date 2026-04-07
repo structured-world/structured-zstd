@@ -316,9 +316,24 @@ with open(raw_path) as f:
             })
             scenario_training_bytes[scenario] = int(training_bytes)
 
-if not benchmark_results:
-    print("ERROR: No benchmark results parsed!", file=sys.stderr)
+if timing_point_count == 0:
+    print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
     sys.exit(1)
+
+if not benchmark_results:
+    print(
+        "WARN: No regression-set benchmark rows matched smoke filter; "
+        "falling back to all parsed timings for benchmark-results.json.",
+        file=sys.stderr,
+    )
+    benchmark_results = [
+        {
+            "name": name,
+            "unit": "ms",
+            "value": round(ms, 3),
+        }
+        for name, ms in timings
+    ]
 
 if not ratios:
     print(
