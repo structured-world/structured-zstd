@@ -201,7 +201,7 @@ with open(raw_path) as f:
             timing_point_count += 1
             if include_in_regression_set(parsed):
                 benchmark_results.append({
-                    "name": f"{bench_target_id}/{name}",
+                    "name": name,
                     "unit": "ms",
                     "value": round(ms, 3),
                 })
