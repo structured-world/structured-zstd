@@ -490,7 +490,9 @@
         renderOptions(selectors.level, uniq(state.records.map((r) => r.level)));
         renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
 
-        selectors.metric.value = "throughput_bytes_per_sec";
+        const defaultMetric = "throughput_bytes_per_sec";
+        const availableMetrics = Array.from(selectors.metric.options).map((option) => option.value);
+        selectors.metric.value = availableMetrics.includes(defaultMetric) ? defaultMetric : (availableMetrics[1] || ALWAYS);
         bindFilters();
         rerender();
         renderRawSummary();
