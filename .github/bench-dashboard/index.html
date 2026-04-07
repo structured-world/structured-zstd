@@ -220,8 +220,54 @@
         source: el("f-source"),
       };
 
+      function parseTimestamp(value) {
+        const text = String(value || "");
+        const parsed = Date.parse(text);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function compareUniqValues(left, right) {
+        const leftText = String(left.value);
+        const rightText = String(right.value);
+        const leftTime = parseTimestamp(leftText);
+        const rightTime = parseTimestamp(rightText);
+
+        if (leftTime !== null && rightTime !== null && leftTime !== rightTime) {
+          return leftTime - rightTime;
+        }
+
+        const lexical = leftText.localeCompare(rightText);
+        if (lexical !== 0) {
+          return lexical;
+        }
+
+        return left.index - right.index;
+      }
+
       function uniq(values) {
-        return Array.from(new Set(values)).sort();
+        return Array.from(new Set(values))
+          .map((value, index) => ({ value, index }))
+          .sort(compareUniqValues)
+          .map((entry) => entry.value);
+      }
+
+      function latestRecord(records) {
+        return records.reduce((best, record, index) => {
+          if (!best) return { record, index };
+          const bestTime = parseTimestamp(best.record.generated_at);
+          const recordTime = parseTimestamp(record.generated_at);
+
+          if (recordTime !== null && bestTime !== null) {
+            if (recordTime > bestTime) return { record, index };
+            if (recordTime < bestTime) return best;
+          } else if (recordTime !== null && bestTime === null) {
+            return { record, index };
+          } else if (recordTime === null && bestTime !== null) {
+            return best;
+          }
+
+          return index >= best.index ? { record, index } : best;
+        }, null).record;
       }
 
       function renderOptions(select, values) {
@@ -469,7 +515,7 @@
         if (!state.records.length) throw new Error("benchmark-relative.json has no records");
 
         const targets = uniq(state.records.map((r) => r.target));
-        const latest = state.records[state.records.length - 1];
+        const latest = latestRecord(state.records);
 
         el("stat-records").textContent = String(state.records.length);
         const targetsContainer = el("stat-targets");
