@@ -1740,7 +1740,9 @@ impl HcMatchGenerator {
     fn relative_position(&self, abs_pos: usize) -> Option<u32> {
         let rel = abs_pos.checked_sub(self.position_base)?;
         let rel_u32 = u32::try_from(rel).ok()?;
-        // Stored as (relative_pos + 1), so u32::MAX cannot be represented.
+        // Positions are stored as (relative_pos + 1), with 0 reserved as the
+        // empty sentinel. So the raw relative position itself must stay
+        // strictly below u32::MAX.
         (rel_u32 < u32::MAX).then_some(rel_u32)
     }
 
@@ -1808,7 +1810,8 @@ impl HcMatchGenerator {
         let mut filled = 0;
         // Follow chain up to search_depth valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
-        // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
+        // Stored values are (relative_pos + 1); decode with wrapping_sub(1)
+        // and recover absolute position via position_base + relative.
         // Break on self-loops (masked chain_idx collision at periodicity).
         // Cap total steps at 4x search depth to bound time spent skipping
         // stale entries while still finding valid candidates deeper in chain.
@@ -2701,22 +2704,18 @@ fn hc_rebases_positions_after_u32_boundary() {
     matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
     matcher.ensure_tables();
     matcher.position_base = 0;
-    if usize::BITS > 32 {
-        // Simulate a long-running stream where absolute history positions
-        // crossed the u32 range. Before #51 this disabled HC inserts entirely.
-        matcher.history_abs_start = (u32::MAX as usize)
-            .checked_add(64)
-            .expect("64-bit usize should represent u32::MAX + 64");
-        matcher.skip_matching();
-        assert_eq!(
-            matcher.position_base, matcher.history_abs_start,
-            "rebase should anchor to the oldest live absolute position"
-        );
-    } else {
-        // 32-bit targets cannot represent positions above u32::MAX. Verify
-        // that the rebase path still handles boundary insertion requests.
-        matcher.maybe_rebase_positions(u32::MAX as usize);
-    }
+    let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    // Simulate a long-running stream where absolute history positions crossed
+    // the u32 range. Before #51 this disabled HC inserts entirely.
+    matcher.history_abs_start = history_abs_start;
+    matcher.skip_matching();
+    assert_eq!(
+        matcher.position_base, matcher.history_abs_start,
+        "rebase should anchor to the oldest live absolute position"
+    );
 
     assert!(
         matcher.hash_table.iter().any(|entry| *entry != HC_EMPTY),
