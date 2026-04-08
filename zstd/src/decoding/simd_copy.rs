@@ -1,9 +1,9 @@
-#[cfg(all(feature = "std", target_arch = "x86"))]
+#[cfg(target_arch = "x86")]
 use core::arch::x86::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
 };
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
@@ -100,6 +100,29 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
         scalar_strategy()
     }
 
+    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if cfg!(target_feature = "avx512f") && copy_at_least >= 64 {
+            return CopyStrategy {
+                chunk: 64,
+                copy: copy_avx512,
+            };
+        }
+        if cfg!(target_feature = "avx2") && copy_at_least >= 32 {
+            return CopyStrategy {
+                chunk: 32,
+                copy: copy_avx2,
+            };
+        }
+        if cfg!(target_feature = "sse2") {
+            return CopyStrategy {
+                chunk: 16,
+                copy: copy_sse2,
+            };
+        }
+        scalar_strategy()
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         if copy_at_least >= 16 {
@@ -114,6 +137,7 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
 
     #[cfg(not(any(
         all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")),
+        all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")),
         all(target_arch = "aarch64", target_feature = "neon")
     )))]
     {
@@ -160,7 +184,7 @@ fn detect_x86_caps() -> X86Caps {
     })
 }
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
 unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
@@ -174,7 +198,7 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
@@ -188,7 +212,7 @@ unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
