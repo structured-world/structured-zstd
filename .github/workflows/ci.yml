@@ -114,19 +114,22 @@ jobs:
   benchmark:
     name: Performance regression check (${{ matrix.bench.id }})
     needs: lint
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.bench.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         bench:
           - id: x86_64-gnu
             target_triple: x86_64-unknown-linux-gnu
+            timeout_minutes: 40
             setup_command: ""
           - id: i686-gnu
             target_triple: i686-unknown-linux-gnu
+            timeout_minutes: 55
             setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
           - id: x86_64-musl
             target_triple: x86_64-unknown-linux-musl
+            timeout_minutes: 40
             setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
     runs-on: ubuntu-latest
     steps:
