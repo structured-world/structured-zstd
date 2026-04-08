@@ -1760,8 +1760,9 @@ impl HcMatchGenerator {
         self.chain_table.fill(HC_EMPTY);
 
         let history_start = self.history_abs_start;
-        let history_end = self.history_abs_end();
-        for pos in history_start..history_end {
+        // Rebuild only the already-inserted prefix. The caller inserts abs_pos
+        // immediately after this, and later positions are added in-order.
+        for pos in history_start..abs_pos {
             self.insert_position_no_rebase(pos);
         }
     }
@@ -2728,6 +2729,46 @@ fn hc_rebases_positions_after_u32_boundary() {
     assert!(
         candidates.iter().any(|candidate| *candidate != usize::MAX),
         "chain_candidates should return valid matches after rebase"
+    );
+}
+
+#[test]
+fn hc_rebase_rebuilds_only_inserted_prefix() {
+    let mut matcher = HcMatchGenerator::new(64);
+    matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    matcher.ensure_tables();
+    matcher.position_base = 0;
+    let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    matcher.history_abs_start = history_abs_start;
+    let abs_pos = matcher.history_abs_start + 6;
+
+    let mut expected = HcMatchGenerator::new(64);
+    expected.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    expected.ensure_tables();
+    expected.history_abs_start = history_abs_start;
+    expected.position_base = expected.history_abs_start;
+    expected.hash_table.fill(HC_EMPTY);
+    expected.chain_table.fill(HC_EMPTY);
+    for pos in expected.history_abs_start..abs_pos {
+        expected.insert_position_no_rebase(pos);
+    }
+
+    matcher.maybe_rebase_positions(abs_pos);
+
+    assert_eq!(
+        matcher.position_base, matcher.history_abs_start,
+        "rebase should still anchor to the oldest live absolute position"
+    );
+    assert_eq!(
+        matcher.hash_table, expected.hash_table,
+        "rebase must rebuild only positions already inserted before abs_pos"
+    );
+    assert_eq!(
+        matcher.chain_table, expected.chain_table,
+        "future positions must not be pre-seeded into HC chains during rebase"
     );
 }
 
