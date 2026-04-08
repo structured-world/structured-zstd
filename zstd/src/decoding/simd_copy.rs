@@ -241,3 +241,77 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn copy_bytes_overshooting_zero_len_is_noop() {
+        let src = [1_u8, 2, 3, 4];
+        let mut dst = [9_u8, 9, 9, 9];
+        unsafe {
+            copy_bytes_overshooting((src.as_ptr(), src.len()), (dst.as_mut_ptr(), dst.len()), 0);
+        }
+        assert_eq!(dst, [9_u8, 9, 9, 9]);
+    }
+
+    #[test]
+    fn copy_bytes_overshooting_fallback_exact_copy_when_caps_are_tight() {
+        let chunk = active_chunk_size_for_tests();
+        let len = chunk + 1;
+        let src = vec![5_u8; len];
+        let mut dst = vec![0_u8; len];
+
+        unsafe {
+            copy_bytes_overshooting((src.as_ptr(), len), (dst.as_mut_ptr(), len), len);
+        }
+
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn copy_scalar_copies_requested_bytes() {
+        let src = [11_u8, 12, 13, 14, 15, 16, 17, 18];
+        let mut dst = [0_u8; 8];
+        unsafe { copy_scalar(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+        assert_eq!(dst, src);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn copy_sse2_copies_full_chunk_when_available() {
+        if !std::arch::is_x86_feature_detected!("sse2") {
+            return;
+        }
+        let src = [7_u8; 16];
+        let mut dst = [0_u8; 16];
+        unsafe { copy_sse2(src.as_ptr(), dst.as_mut_ptr(), 16) };
+        assert_eq!(dst, src);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn copy_avx2_copies_full_chunk_when_available() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src = [8_u8; 32];
+        let mut dst = [0_u8; 32];
+        unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 32) };
+        assert_eq!(dst, src);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn copy_avx512_copies_full_chunk_when_available() {
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let src = [9_u8; 64];
+        let mut dst = [0_u8; 64];
+        unsafe { copy_avx512(src.as_ptr(), dst.as_mut_ptr(), 64) };
+        assert_eq!(dst, src);
+    }
+}
