@@ -18,6 +18,7 @@ use super::blocks::encode_offset_with_history;
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
 const DFAST_MIN_MATCH_LEN: usize = 6;
+const ROW_MIN_MATCH_LEN: usize = 6;
 const DFAST_TARGET_LEN: usize = 48;
 // Keep these aligned with the issue's zstd level-3/dfast target unless ratio
 // measurements show we can shrink them without regressing acceptance tests.
@@ -115,8 +116,8 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
 const LEVEL_TABLE: [LevelParams; 22] = [
-    // Lvl  Strategy       wlog  step  lazy  HC config
-    // ---  -------------- ----  ----  ----  ------------------------------------------
+    // Lvl  Strategy       wlog  step  lazy  HC config                                   row config
+    // ---  -------------- ----  ----  ----  ------------------------------------------  ----------
     /* 1 */ LevelParams { backend: MatcherBackend::Simple,    window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 2 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
@@ -1763,7 +1764,7 @@ impl RowMatchGenerator {
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
-        while pos + DFAST_MIN_MATCH_LEN <= current_len {
+        while pos + ROW_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
@@ -1868,7 +1869,7 @@ impl RowMatchGenerator {
     ) -> Option<MatchCandidate> {
         let best = best?;
         if best.match_len >= self.target_len
-            || abs_pos + 1 + DFAST_MIN_MATCH_LEN > self.history_abs_end()
+            || abs_pos + 1 + ROW_MIN_MATCH_LEN > self.history_abs_end()
         {
             return Some(best);
         }
@@ -1881,7 +1882,7 @@ impl RowMatchGenerator {
             return None;
         }
 
-        if self.lazy_depth >= 2 && abs_pos + 2 + DFAST_MIN_MATCH_LEN <= self.history_abs_end() {
+        if self.lazy_depth >= 2 && abs_pos + 2 + ROW_MIN_MATCH_LEN <= self.history_abs_end() {
             let next2 = self.best_match(abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2
                 && next2.match_len > best.match_len + 1
@@ -1920,12 +1921,12 @@ impl RowMatchGenerator {
             let concat = self.live_history();
             let candidate_idx = candidate_pos - self.history_abs_start;
             let current_idx = abs_pos - self.history_abs_start;
-            if current_idx + DFAST_MIN_MATCH_LEN > concat.len() {
+            if current_idx + ROW_MIN_MATCH_LEN > concat.len() {
                 continue;
             }
             let match_len =
                 MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
+            if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = Self::better_candidate(best, Some(candidate));
             }
@@ -1936,7 +1937,7 @@ impl RowMatchGenerator {
     fn row_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
-        if current_idx + DFAST_MIN_MATCH_LEN > concat.len() {
+        if current_idx + ROW_MIN_MATCH_LEN > concat.len() {
             return None;
         }
 
@@ -1964,7 +1965,7 @@ impl RowMatchGenerator {
             let candidate_idx = candidate_pos - self.history_abs_start;
             let match_len =
                 MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
+            if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = Self::better_candidate(best, Some(candidate));
                 if best.is_some_and(|best| best.match_len >= self.target_len) {
@@ -2758,6 +2759,36 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
 }
 
 #[test]
+fn driver_small_source_hint_shrinks_row_hash_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+
+    driver.reset(CompressionLevel::Level(4));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+    let full_rows = driver.row_matcher().row_heads.len();
+    assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_LOG));
+
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(4));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching();
+    let hinted_rows = driver.row_matcher().row_heads.len();
+
+    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
+    assert_eq!(hinted_rows, 1 << ((MIN_WINDOW_LOG as usize) - ROW_LOG));
+    assert!(
+        hinted_rows < full_rows,
+        "tiny source hint should reduce row hash table footprint"
+    );
+}
+
+#[test]
 fn row_matches_roundtrip_multi_block_pattern() {
     let pattern = [7, 13, 44, 184, 19, 96, 171, 109, 141, 251];
     let first_block: Vec<u8> = pattern.iter().copied().cycle().take(128 * 1024).collect();
@@ -2792,6 +2823,47 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
+}
+
+#[test]
+fn row_short_block_emits_literals_only() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+
+    matcher.add_data(b"abcde".to_vec(), |_| {});
+
+    let mut saw_triple = false;
+    let mut reconstructed = Vec::new();
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple { .. } => saw_triple = true,
+    });
+
+    assert!(
+        !saw_triple,
+        "row backend must not emit triples for short blocks"
+    );
+    assert_eq!(reconstructed, b"abcde");
+}
+
+#[test]
+fn row_pick_lazy_returns_best_when_lookahead_is_out_of_bounds() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.add_data(b"abcabc".to_vec(), |_| {});
+
+    let best = MatchCandidate {
+        start: 0,
+        offset: 1,
+        match_len: ROW_MIN_MATCH_LEN,
+    };
+    let picked = matcher
+        .pick_lazy_match(0, 0, Some(best))
+        .expect("best candidate must survive");
+
+    assert_eq!(picked.start, best.start);
+    assert_eq!(picked.offset, best.offset);
+    assert_eq!(picked.match_len, best.match_len);
 }
 
 #[test]
