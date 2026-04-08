@@ -36,6 +36,7 @@ struct CopyStrategy {
 /// - `src.1` and `dst.1` are large enough for the selected strategy:
 ///   if `min(src.1, dst.1) >= next_multiple_of(copy_at_least, active_chunk)`,
 ///   the SIMD/scalar chunk loop may copy that rounded-up amount.
+///   Otherwise the function copies exactly `copy_at_least` bytes.
 /// - Source and destination regions do not overlap.
 #[inline(always)]
 pub(crate) unsafe fn copy_bytes_overshooting(
@@ -96,7 +97,7 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
                 copy: copy_sse2,
             };
         }
-        return scalar_strategy();
+        scalar_strategy()
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]

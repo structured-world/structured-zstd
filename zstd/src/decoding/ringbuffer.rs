@@ -1029,7 +1029,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_bytes_overshooting_covers_all_copy_strategies() {
+    fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
+        // Validate correctness for lengths derived from the active runtime chunk:
+        // - single chunk (`chunk`)
+        // - multi chunk (`2 * chunk`)
+        // - fallback shape (`chunk + 1`)
+        // This checks copy semantics across runtime-selected strategies.
         let chunk = simd_copy::active_chunk_size_for_tests();
         let single_len = chunk;
         let multi_len = chunk * 2;
