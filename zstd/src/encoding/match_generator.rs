@@ -449,6 +449,9 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherBackend::Row => {
                     if let Some(row) = self.row_match_generator.as_mut() {
+                        row.row_heads = Vec::new();
+                        row.row_positions = Vec::new();
+                        row.row_tags = Vec::new();
                         let vec_pool = &mut self.vec_pool;
                         row.reset(|mut data| {
                             data.resize(data.capacity(), 0);
@@ -1855,9 +1858,11 @@ impl RowMatchGenerator {
             u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
         let hash = value.wrapping_mul(PRIME);
+        let total_bits = self.row_hash_log + ROW_TAG_BITS;
+        let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
-        let row = ((hash >> ROW_TAG_BITS) as usize) & row_mask;
-        let tag = hash as u8;
+        let row = ((combined >> ROW_TAG_BITS) as usize) & row_mask;
+        let tag = combined as u8;
         Some((row, tag))
     }
 
@@ -3401,6 +3406,13 @@ fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     driver.reset(CompressionLevel::Fastest);
 
     assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    let row = driver
+        .row_match_generator
+        .as_ref()
+        .expect("row matcher should remain allocated after switch");
+    assert!(row.row_heads.is_empty());
+    assert!(row.row_positions.is_empty());
+    assert!(row.row_tags.is_empty());
     assert!(
         driver.vec_pool.len() >= before_pool,
         "row reset should recycle row history buffers"
@@ -3512,6 +3524,39 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
     assert_eq!(chosen.start, best.start);
     assert_eq!(chosen.offset, best.offset);
     assert_eq!(chosen.match_len, best.match_len);
+}
+
+#[test]
+fn row_hash_and_row_extracts_high_bits() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.add_data(
+        alloc::vec![
+            0xAA, 0xBB, 0xCC, 0x11, 0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0x22, 0x50, 0x60,
+            0x70, 0x80,
+        ],
+        |_| {},
+    );
+    matcher.ensure_tables();
+
+    let pos = matcher.history_abs_start + 8;
+    let (row, tag) = matcher
+        .hash_and_row(pos)
+        .expect("row hash should be available");
+
+    let idx = pos - matcher.history_abs_start;
+    let concat = matcher.live_history();
+    let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
+    const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+    let hash = value.wrapping_mul(PRIME);
+    let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
+    let combined = hash >> (u64::BITS as usize - total_bits);
+    let expected_row =
+        ((combined >> ROW_TAG_BITS) as usize) & ((1usize << matcher.row_hash_log) - 1);
+    let expected_tag = combined as u8;
+
+    assert_eq!(row, expected_row);
+    assert_eq!(tag, expected_tag);
 }
 
 #[test]
