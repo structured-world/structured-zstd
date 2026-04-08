@@ -2721,6 +2721,14 @@ fn hc_rebases_positions_after_u32_boundary() {
         matcher.hash_table.iter().any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
     );
+
+    // Verify rebasing preserves candidate lookup, not just table population.
+    let abs_pos = matcher.history_abs_start + 10;
+    let candidates = matcher.chain_candidates(abs_pos);
+    assert!(
+        candidates.iter().any(|candidate| *candidate != usize::MAX),
+        "chain_candidates should return valid matches after rebase"
+    );
 }
 
 #[test]
