@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_sse2_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("sse2") {
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx2_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx512_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("avx512f") {
