@@ -3266,6 +3266,87 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
 }
 
 #[test]
+fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(4));
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"abcdefgh");
+    driver.commit_space(space);
+
+    let mut saw_match = false;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 8
+            && match_len >= ROW_MIN_MATCH_LEN
+        {
+            saw_match = true;
+        }
+    });
+
+    assert!(
+        saw_match,
+        "row backend should match dictionary-primed history in first full block"
+    );
+}
+
+#[test]
+fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(4));
+    // Keep live window tiny so dictionary-primed slices are evicted quickly.
+    driver.row_matcher_mut().max_window_size = 8;
+    driver.reported_window_size = 8;
+
+    let base_window = driver.row_matcher().max_window_size;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    assert_eq!(driver.row_matcher().max_window_size, base_window + 24);
+
+    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(block);
+        driver.commit_space(space);
+        driver.skip_matching();
+    }
+
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "dictionary budget should be fully retired once primed dict slices are evicted"
+    );
+    assert_eq!(
+        driver.row_matcher().max_window_size,
+        base_window,
+        "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn row_get_last_space_and_reset_to_fastest_clears_window() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(4));
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"row-data");
+    driver.commit_space(space);
+
+    assert_eq!(driver.get_last_space(), b"row-data");
+
+    driver.reset(CompressionLevel::Fastest);
+    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    assert!(driver.row_matcher().window.is_empty());
+}
+
+#[test]
 fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Fastest);
