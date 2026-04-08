@@ -31,6 +31,7 @@ const ROW_SEARCH_DEPTH: usize = 16;
 const ROW_TARGET_LEN: usize = 48;
 const ROW_TAG_BITS: usize = 8;
 const ROW_EMPTY_SLOT: usize = usize::MAX;
+const ROW_HASH_KEY_LEN: usize = 4;
 
 const HC_HASH_LOG: usize = 20;
 const HC_CHAIN_LOG: usize = 19;
@@ -1750,6 +1751,10 @@ impl RowMatchGenerator {
         self.ensure_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let backfill_start = self.backfill_start(current_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
         self.insert_positions(current_abs_start, current_abs_start + current_len);
     }
 
@@ -1761,6 +1766,10 @@ impl RowMatchGenerator {
             return;
         }
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let backfill_start = self.backfill_start(current_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
@@ -1792,7 +1801,7 @@ impl RowMatchGenerator {
             }
         }
 
-        while pos + 4 <= current_len {
+        while pos + ROW_HASH_KEY_LEN <= current_len {
             self.insert_position(current_abs_start + pos);
             pos += 1;
         }
@@ -1839,20 +1848,23 @@ impl RowMatchGenerator {
     fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
-        if idx + 4 > concat.len() {
+        if idx + ROW_HASH_KEY_LEN > concat.len() {
             return None;
         }
-        let value = if idx + 8 <= concat.len() {
-            u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
-        } else {
-            u32::from_le_bytes(concat[idx..idx + 4].try_into().unwrap()) as u64
-        };
+        let value =
+            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
         const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
         let hash = value.wrapping_mul(PRIME);
         let row_mask = (1usize << self.row_hash_log) - 1;
         let row = ((hash >> ROW_TAG_BITS) as usize) & row_mask;
         let tag = hash as u8;
         Some((row, tag))
+    }
+
+    fn backfill_start(&self, current_abs_start: usize) -> usize {
+        current_abs_start
+            .saturating_sub(ROW_HASH_KEY_LEN - 1)
+            .max(self.history_abs_start)
     }
 
     fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
@@ -2864,6 +2876,61 @@ fn row_pick_lazy_returns_best_when_lookahead_is_out_of_bounds() {
     assert_eq!(picked.start, best.start);
     assert_eq!(picked.offset, best.offset);
     assert_eq!(picked.match_len, best.match_len);
+}
+
+#[test]
+fn row_backfills_previous_block_tail_for_cross_boundary_match() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+
+    let mut first_block = alloc::vec![0xA5; 64];
+    first_block.extend_from_slice(b"XYZ");
+    let second_block = b"XYZXYZtail".to_vec();
+
+    let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
+        Sequence::Literals { literals } => decoded.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            decoded.extend_from_slice(literals);
+            let start = decoded.len() - offset;
+            for i in 0..match_len {
+                let byte = decoded[start + i];
+                decoded.push(byte);
+            }
+        }
+    };
+
+    matcher.add_data(first_block.clone(), |_| {});
+    let mut reconstructed = Vec::new();
+    matcher.start_matching(|seq| replay_sequence(&mut reconstructed, seq));
+    assert_eq!(reconstructed, first_block);
+
+    matcher.add_data(second_block.clone(), |_| {});
+    let mut saw_cross_boundary = false;
+    let prefix_len = reconstructed.len();
+    matcher.start_matching(|seq| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+            && literals.is_empty()
+            && offset == 3
+            && match_len >= ROW_MIN_MATCH_LEN
+        {
+            saw_cross_boundary = true;
+        }
+        replay_sequence(&mut reconstructed, seq);
+    });
+
+    assert!(
+        saw_cross_boundary,
+        "row matcher should reuse the 3-byte previous-block tail"
+    );
+    assert_eq!(&reconstructed[prefix_len..], second_block.as_slice());
 }
 
 #[test]
