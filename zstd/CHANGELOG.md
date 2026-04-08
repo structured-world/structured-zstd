@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/structured-world/structured-zstd/compare/v0.0.9...v0.0.10) - 2026-04-08
+
+### Performance
+
+- *(encoding)* add row-based match finder backend ([#84](https://github.com/structured-world/structured-zstd/pull/84))
+- *(encoding)* rebase hc positions past u32 boundary ([#82](https://github.com/structured-world/structured-zstd/pull/82))
+
 ## [0.0.9](https://github.com/structured-world/structured-zstd/compare/v0.0.8...v0.0.9) - 2026-04-08
 
 ### Performance
