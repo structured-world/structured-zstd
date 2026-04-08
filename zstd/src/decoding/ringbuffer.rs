@@ -1048,6 +1048,7 @@ mod tests {
         let single_len = chunk;
         let multi_len = chunk * 2;
         let fallback_len = chunk + 1;
+        let overshoot_cap = chunk * 2;
         let cap = multi_len + chunk;
 
         let src_single = vec![1_u8; cap];
@@ -1082,5 +1083,19 @@ mod tests {
             );
         }
         assert_eq!(&dst_fallback[..fallback_len], &src_fallback[..fallback_len]);
+
+        let src_overshoot = vec![4_u8; cap + 1];
+        let mut dst_overshoot = vec![0_u8; cap + 1];
+        unsafe {
+            simd_copy::copy_bytes_overshooting(
+                (src_overshoot.as_ptr().add(1), overshoot_cap),
+                (dst_overshoot.as_mut_ptr().add(1), overshoot_cap),
+                fallback_len,
+            );
+        }
+        assert_eq!(
+            &dst_overshoot[1..1 + fallback_len],
+            &src_overshoot[1..1 + fallback_len]
+        );
     }
 }

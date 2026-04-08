@@ -26,13 +26,16 @@ struct CopyStrategy {
 
 /// Copies at least `copy_at_least` bytes from `src` to `dst`.
 ///
-/// This helper may over-copy up to `next_multiple_of(active_chunk)`,
-/// mirroring zstd wildcopy semantics for faster inner loops.
+/// This helper may over-copy up to
+/// `copy_at_least.next_multiple_of(active_chunk)`, i.e. at most
+/// `active_chunk - 1` extra bytes, mirroring zstd wildcopy semantics for
+/// faster inner loops.
 ///
 /// # Safety
 /// Caller must guarantee:
 /// - `src.0` points to at least `src.1` readable bytes.
 /// - `dst.0` points to at least `dst.1` writable bytes.
+/// - `copy_at_least <= src.1` and `copy_at_least <= dst.1`.
 /// - `src.1` and `dst.1` are large enough for the selected strategy:
 ///   if `min(src.1, dst.1) >= next_multiple_of(copy_at_least, active_chunk)`,
 ///   the SIMD/scalar chunk loop may copy that rounded-up amount.
