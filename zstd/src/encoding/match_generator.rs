@@ -30,8 +30,8 @@ const HC_CHAIN_LOG: usize = 19;
 const HC_SEARCH_DEPTH: usize = 16;
 const HC_MIN_MATCH_LEN: usize = 5;
 const HC_TARGET_LEN: usize = 48;
-// Positions are stored as (abs_pos + 1) so that 0 is a safe empty sentinel
-// that can never collide with any valid position, even at the 4 GiB boundary.
+// Positions are stored as (relative_pos + 1) so that 0 is a safe empty
+// sentinel that can never collide with any valid position.
 const HC_EMPTY: u32 = 0;
 
 // Maximum search depth across all HC-based levels. Used to size the
@@ -1535,6 +1535,7 @@ struct HcMatchGenerator {
     history: Vec<u8>,
     history_start: usize,
     history_abs_start: usize,
+    position_base: usize,
     offset_hist: [u32; 3],
     hash_table: Vec<u32>,
     chain_table: Vec<u32>,
@@ -1554,6 +1555,7 @@ impl HcMatchGenerator {
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
+            position_base: 0,
             offset_hist: [1, 4, 8],
             hash_table: Vec::new(),
             chain_table: Vec::new(),
@@ -1583,6 +1585,7 @@ impl HcMatchGenerator {
         self.history.clear();
         self.history_start = 0;
         self.history_abs_start = 0;
+        self.position_base = 0;
         self.offset_hist = [1, 4, 8];
         if !self.hash_table.is_empty() {
             self.hash_table.fill(HC_EMPTY);
@@ -1734,23 +1737,53 @@ impl HcMatchGenerator {
         ((value.wrapping_mul(PRIME)) >> (64 - self.hash_log)) as usize
     }
 
+    fn relative_position(&self, abs_pos: usize) -> Option<u32> {
+        let rel = abs_pos.checked_sub(self.position_base)?;
+        let rel_u32 = u32::try_from(rel).ok()?;
+        // Positions are stored as (relative_pos + 1), with 0 reserved as the
+        // empty sentinel. So the raw relative position itself must stay
+        // strictly below u32::MAX.
+        (rel_u32 < u32::MAX).then_some(rel_u32)
+    }
+
+    fn maybe_rebase_positions(&mut self, abs_pos: usize) {
+        let needs_rebase = self
+            .relative_position(abs_pos)
+            .is_none_or(|relative| relative >= u32::MAX - 1);
+        if !needs_rebase {
+            return;
+        }
+
+        // Keep all live history addressable after rebase.
+        self.position_base = self.history_abs_start;
+        self.hash_table.fill(HC_EMPTY);
+        self.chain_table.fill(HC_EMPTY);
+
+        let history_start = self.history_abs_start;
+        // Rebuild only the already-inserted prefix. The caller inserts abs_pos
+        // immediately after this, and later positions are added in-order.
+        for pos in history_start..abs_pos {
+            self.insert_position_no_rebase(pos);
+        }
+    }
+
     fn insert_position(&mut self, abs_pos: usize) {
+        self.maybe_rebase_positions(abs_pos);
+        self.insert_position_no_rebase(abs_pos);
+    }
+
+    fn insert_position_no_rebase(&mut self, abs_pos: usize) {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
         if idx + 4 > concat.len() {
             return;
         }
         let hash = self.hash_position(&concat[idx..]);
-        // Store as (abs_pos + 1) so HC_EMPTY (0) never collides with a valid
-        // position. Guard on usize before cast to avoid silent u32 truncation.
-        // Streams >4 GiB stop inserting; matches degrade to repcodes-only.
-        // TODO(#51): rebase table positions to avoid 4 GiB cutoff
-        if abs_pos >= u32::MAX as usize {
+        let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
-        }
-        let pos_u32 = abs_pos as u32;
-        let stored = pos_u32 + 1;
-        let chain_idx = pos_u32 as usize & ((1 << self.chain_log) - 1);
+        };
+        let stored = relative_pos + 1;
+        let chain_idx = relative_pos as usize & ((1 << self.chain_log) - 1);
         let prev = self.hash_table[hash];
         self.chain_table[chain_idx] = prev;
         self.hash_table[hash] = stored;
@@ -1778,7 +1811,8 @@ impl HcMatchGenerator {
         let mut filled = 0;
         // Follow chain up to search_depth valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
-        // Stored values are (abs_pos + 1); decode with wrapping_sub(1).
+        // Stored values are (relative_pos + 1); decode with wrapping_sub(1)
+        // and recover absolute position via position_base + relative.
         // Break on self-loops (masked chain_idx collision at periodicity).
         // Cap total steps at 4x search depth to bound time spent skipping
         // stale entries while still finding valid candidates deeper in chain.
@@ -1788,8 +1822,9 @@ impl HcMatchGenerator {
             if cur == HC_EMPTY {
                 break;
             }
-            let candidate_abs = cur.wrapping_sub(1) as usize;
-            let next = self.chain_table[candidate_abs & chain_mask];
+            let candidate_rel = cur.wrapping_sub(1) as usize;
+            let candidate_abs = self.position_base + candidate_rel;
+            let next = self.chain_table[candidate_rel & chain_mask];
             steps += 1;
             if next == cur {
                 // Self-loop: two positions share chain_idx, stop to avoid
@@ -2661,6 +2696,79 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         driver.hc_matcher().max_window_size,
         base_window,
         "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn hc_rebases_positions_after_u32_boundary() {
+    let mut matcher = HcMatchGenerator::new(64);
+    matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    matcher.ensure_tables();
+    matcher.position_base = 0;
+    let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    // Simulate a long-running stream where absolute history positions crossed
+    // the u32 range. Before #51 this disabled HC inserts entirely.
+    matcher.history_abs_start = history_abs_start;
+    matcher.skip_matching();
+    assert_eq!(
+        matcher.position_base, matcher.history_abs_start,
+        "rebase should anchor to the oldest live absolute position"
+    );
+
+    assert!(
+        matcher.hash_table.iter().any(|entry| *entry != HC_EMPTY),
+        "HC hash table should still be populated after crossing u32 boundary"
+    );
+
+    // Verify rebasing preserves candidate lookup, not just table population.
+    let abs_pos = matcher.history_abs_start + 10;
+    let candidates = matcher.chain_candidates(abs_pos);
+    assert!(
+        candidates.iter().any(|candidate| *candidate != usize::MAX),
+        "chain_candidates should return valid matches after rebase"
+    );
+}
+
+#[test]
+fn hc_rebase_rebuilds_only_inserted_prefix() {
+    let mut matcher = HcMatchGenerator::new(64);
+    matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    matcher.ensure_tables();
+    matcher.position_base = 0;
+    let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    matcher.history_abs_start = history_abs_start;
+    let abs_pos = matcher.history_abs_start + 6;
+
+    let mut expected = HcMatchGenerator::new(64);
+    expected.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    expected.ensure_tables();
+    expected.history_abs_start = history_abs_start;
+    expected.position_base = expected.history_abs_start;
+    expected.hash_table.fill(HC_EMPTY);
+    expected.chain_table.fill(HC_EMPTY);
+    for pos in expected.history_abs_start..abs_pos {
+        expected.insert_position_no_rebase(pos);
+    }
+
+    matcher.maybe_rebase_positions(abs_pos);
+
+    assert_eq!(
+        matcher.position_base, matcher.history_abs_start,
+        "rebase should still anchor to the oldest live absolute position"
+    );
+    assert_eq!(
+        matcher.hash_table, expected.hash_table,
+        "rebase must rebuild only positions already inserted before abs_pos"
+    );
+    assert_eq!(
+        matcher.chain_table, expected.chain_table,
+        "future positions must not be pre-seeded into HC chains during rebase"
     );
 }
 

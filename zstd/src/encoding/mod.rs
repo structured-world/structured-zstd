@@ -64,13 +64,6 @@ pub enum CompressionLevel {
     /// Uses the hash-chain matcher with a lazy2 matching strategy: the encoder
     /// evaluates up to two positions ahead before committing to a match,
     /// trading speed for a better compression ratio than [`CompressionLevel::Default`].
-    ///
-    /// **Limitation:** hash-chain tables use 32-bit positions. For single-frame
-    /// inputs exceeding ~4 GiB, matches can still be found for roughly one
-    /// window past that point; once all in-window positions exceed `u32::MAX`
-    /// (≈4 GiB + window size), matching becomes effectively repcode-only.
-    /// Prefer [`CompressionLevel::Default`] for very large single-frame streams
-    /// until table rebasing is implemented.
     Better,
     /// This level is roughly equivalent to Zstd level 11.
     ///
@@ -80,13 +73,6 @@ pub enum CompressionLevel {
     /// a deeper search (32 candidates vs 16), and a higher target match
     /// length (128 vs 48), trading speed for the best compression ratio
     /// available in this crate.
-    ///
-    /// **Limitation:** hash-chain tables use 32-bit positions. For single-frame
-    /// inputs exceeding ~4 GiB, matches can still be found for roughly one
-    /// window past that point; once all in-window positions exceed `u32::MAX`
-    /// (≈4 GiB + window size), matching becomes effectively repcode-only.
-    /// Prefer [`CompressionLevel::Default`] for very large single-frame
-    /// streams until table rebasing is implemented.
     Best,
     /// Numeric compression level.
     ///
@@ -107,13 +93,6 @@ pub enum CompressionLevel {
     /// with the lazy2 hash-chain backend.  Levels that require strategies
     /// this crate has not yet implemented (btopt, btultra) are approximated
     /// with the closest available matcher.
-    ///
-    /// **Limitation:** large hash-chain levels still use 32-bit positions.
-    /// For single-frame inputs exceeding ~4 GiB, matches can still be found
-    /// for roughly one window past that point; once all in-window positions
-    /// exceed `u32::MAX` (≈4 GiB + window size), matching becomes effectively
-    /// repcode-only. Prefer [`CompressionLevel::Default`] for very large
-    /// single-frame streams until table rebasing is implemented.
     ///
     /// Semver note: this variant was added after the initial enum shape and
     /// is a breaking API change for downstream crates that exhaustively
