@@ -105,7 +105,6 @@ timing_point_count = 0
 DELTA_LOW = 0.99
 DELTA_HIGH = 1.05
 REGRESSION_STAGES = {"compress", "decompress"}
-REGRESSION_LEVELS = {"default", "better", "level4-row"}
 REGRESSION_SCENARIOS = {
     "small-4k-log-lines",
     "decodecorpus-z000033",
@@ -162,10 +161,10 @@ def normalize_impl(impl):
         return "ffi"
     return impl
 
-def include_in_regression_set(parsed_name):
+def include_in_regression_set(parsed_name, regression_levels):
     return (
         parsed_name["stage"] in REGRESSION_STAGES
-        and parsed_name["level"] in REGRESSION_LEVELS
+        and parsed_name["level"] in regression_levels
         and parsed_name["scenario"] in REGRESSION_SCENARIOS
     )
 
@@ -199,12 +198,6 @@ with open(raw_path) as f:
             timings.append((name, ms))
             parsed = parse_benchmark_name(name)
             timing_point_count += 1
-            if include_in_regression_set(parsed):
-                benchmark_results.append({
-                    "name": name,
-                    "unit": "ms",
-                    "value": round(ms, 3),
-                })
             timing_rows.append({
                 "name": name,
                 "stage": parsed["stage"],
@@ -319,6 +312,17 @@ with open(raw_path) as f:
 if timing_point_count == 0:
     print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
     sys.exit(1)
+
+regression_levels = {row["level"] for row in ratios}
+benchmark_results = [
+    {
+        "name": row["name"],
+        "unit": "ms",
+        "value": round(row["ms_per_iter"], 3),
+    }
+    for row in timing_rows
+    if include_in_regression_set(row, regression_levels)
+]
 
 if not benchmark_results:
     print(
