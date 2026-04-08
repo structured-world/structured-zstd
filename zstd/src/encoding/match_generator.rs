@@ -1253,6 +1253,144 @@ struct MatchCandidate {
     match_len: usize,
 }
 
+fn best_len_offset_candidate(
+    lhs: Option<MatchCandidate>,
+    rhs: Option<MatchCandidate>,
+) -> Option<MatchCandidate> {
+    match (lhs, rhs) {
+        (None, other) | (other, None) => other,
+        (Some(lhs), Some(rhs)) => {
+            if rhs.match_len > lhs.match_len
+                || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
+            {
+                Some(rhs)
+            } else {
+                Some(lhs)
+            }
+        }
+    }
+}
+
+fn extend_backwards_shared(
+    concat: &[u8],
+    history_abs_start: usize,
+    mut candidate_pos: usize,
+    mut abs_pos: usize,
+    mut match_len: usize,
+    lit_len: usize,
+) -> MatchCandidate {
+    let min_abs_pos = abs_pos - lit_len;
+    while abs_pos > min_abs_pos
+        && candidate_pos > history_abs_start
+        && concat[candidate_pos - history_abs_start - 1] == concat[abs_pos - history_abs_start - 1]
+    {
+        candidate_pos -= 1;
+        abs_pos -= 1;
+        match_len += 1;
+    }
+    MatchCandidate {
+        start: abs_pos,
+        offset: abs_pos - candidate_pos,
+        match_len,
+    }
+}
+
+fn repcode_candidate_shared(
+    concat: &[u8],
+    history_abs_start: usize,
+    offset_hist: [u32; 3],
+    abs_pos: usize,
+    lit_len: usize,
+    min_match_len: usize,
+) -> Option<MatchCandidate> {
+    let reps = if lit_len == 0 {
+        [
+            Some(offset_hist[1] as usize),
+            Some(offset_hist[2] as usize),
+            (offset_hist[0] > 1).then_some((offset_hist[0] - 1) as usize),
+        ]
+    } else {
+        [
+            Some(offset_hist[0] as usize),
+            Some(offset_hist[1] as usize),
+            Some(offset_hist[2] as usize),
+        ]
+    };
+
+    let current_idx = abs_pos - history_abs_start;
+    if current_idx + min_match_len > concat.len() {
+        return None;
+    }
+
+    let mut best = None;
+    for rep in reps.into_iter().flatten() {
+        if rep == 0 || rep > abs_pos {
+            continue;
+        }
+        let candidate_pos = abs_pos - rep;
+        if candidate_pos < history_abs_start {
+            continue;
+        }
+        let candidate_idx = candidate_pos - history_abs_start;
+        let match_len =
+            MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        if match_len >= min_match_len {
+            let candidate = extend_backwards_shared(
+                concat,
+                history_abs_start,
+                candidate_pos,
+                abs_pos,
+                match_len,
+                lit_len,
+            );
+            best = best_len_offset_candidate(best, Some(candidate));
+        }
+    }
+    best
+}
+
+#[derive(Copy, Clone)]
+struct LazyMatchConfig {
+    target_len: usize,
+    min_match_len: usize,
+    lazy_depth: u8,
+    history_abs_end: usize,
+}
+
+fn pick_lazy_match_shared(
+    abs_pos: usize,
+    lit_len: usize,
+    best: Option<MatchCandidate>,
+    config: LazyMatchConfig,
+    mut best_match_at: impl FnMut(usize, usize) -> Option<MatchCandidate>,
+) -> Option<MatchCandidate> {
+    let best = best?;
+    if best.match_len >= config.target_len
+        || abs_pos + 1 + config.min_match_len > config.history_abs_end
+    {
+        return Some(best);
+    }
+
+    let next = best_match_at(abs_pos + 1, lit_len + 1);
+    if let Some(next) = next
+        && (next.match_len > best.match_len
+            || (next.match_len == best.match_len && next.offset < best.offset))
+    {
+        return None;
+    }
+
+    if config.lazy_depth >= 2 && abs_pos + 2 + config.min_match_len <= config.history_abs_end {
+        let next2 = best_match_at(abs_pos + 2, lit_len + 2);
+        if let Some(next2) = next2
+            && next2.match_len > best.match_len + 1
+        {
+            return None;
+        }
+    }
+
+    Some(best)
+}
+
 impl DfastMatchGenerator {
     fn new(max_window_size: usize) -> Self {
         Self {
@@ -1421,7 +1559,7 @@ impl DfastMatchGenerator {
     fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         let hash = self.hash_candidate(abs_pos, lit_len);
-        Self::better_candidate(rep, hash)
+        best_len_offset_candidate(rep, hash)
     }
 
     fn pick_lazy_match(
@@ -1430,73 +1568,29 @@ impl DfastMatchGenerator {
         lit_len: usize,
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
-        let best = best?;
-        if best.match_len >= DFAST_TARGET_LEN
-            || abs_pos + 1 + DFAST_MIN_MATCH_LEN > self.history_abs_end()
-        {
-            return Some(best);
-        }
-
-        // Lazy check: evaluate pos+1
-        let next = self.best_match(abs_pos + 1, lit_len + 1);
-        if let Some(next) = next
-            && (next.match_len > best.match_len
-                || (next.match_len == best.match_len && next.offset < best.offset))
-        {
-            return None;
-        }
-
-        // Lazy2 check: also evaluate pos+2
-        if self.lazy_depth >= 2 && abs_pos + 2 + DFAST_MIN_MATCH_LEN <= self.history_abs_end() {
-            let next2 = self.best_match(abs_pos + 2, lit_len + 2);
-            if let Some(next2) = next2
-                && next2.match_len > best.match_len + 1
-            {
-                return None;
-            }
-        }
-
-        Some(best)
+        pick_lazy_match_shared(
+            abs_pos,
+            lit_len,
+            best,
+            LazyMatchConfig {
+                target_len: DFAST_TARGET_LEN,
+                min_match_len: DFAST_MIN_MATCH_LEN,
+                lazy_depth: self.lazy_depth,
+                history_abs_end: self.history_abs_end(),
+            },
+            |next_pos, next_lit_len| self.best_match(next_pos, next_lit_len),
+        )
     }
 
     fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let reps = if lit_len == 0 {
-            [
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
-                (self.offset_hist[0] > 1).then_some((self.offset_hist[0] - 1) as usize),
-            ]
-        } else {
-            [
-                Some(self.offset_hist[0] as usize),
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
-            ]
-        };
-
-        let mut best = None;
-        for rep in reps.into_iter().flatten() {
-            if rep == 0 || rep > abs_pos {
-                continue;
-            }
-            let candidate_pos = abs_pos - rep;
-            if candidate_pos < self.history_abs_start {
-                continue;
-            }
-            let concat = self.live_history();
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let current_idx = abs_pos - self.history_abs_start;
-            if current_idx + DFAST_MIN_MATCH_LEN > concat.len() {
-                continue;
-            }
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
-            }
-        }
-        best
+        repcode_candidate_shared(
+            self.live_history(),
+            self.history_abs_start,
+            self.offset_hist,
+            abs_pos,
+            lit_len,
+            DFAST_MIN_MATCH_LEN,
+        )
     }
 
     fn hash_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
@@ -1512,7 +1606,7 @@ impl DfastMatchGenerator {
                 MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= DFAST_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                best = best_len_offset_candidate(best, Some(candidate));
                 if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
                     return best;
                 }
@@ -1528,7 +1622,7 @@ impl DfastMatchGenerator {
                 MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= DFAST_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                best = best_len_offset_candidate(best, Some(candidate));
                 if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
                     return best;
                 }
@@ -1539,45 +1633,19 @@ impl DfastMatchGenerator {
 
     fn extend_backwards(
         &self,
-        mut candidate_pos: usize,
-        mut abs_pos: usize,
-        mut match_len: usize,
+        candidate_pos: usize,
+        abs_pos: usize,
+        match_len: usize,
         lit_len: usize,
     ) -> MatchCandidate {
-        let concat = self.live_history();
-        let min_abs_pos = abs_pos - lit_len;
-        while abs_pos > min_abs_pos
-            && candidate_pos > self.history_abs_start
-            && concat[candidate_pos - self.history_abs_start - 1]
-                == concat[abs_pos - self.history_abs_start - 1]
-        {
-            candidate_pos -= 1;
-            abs_pos -= 1;
-            match_len += 1;
-        }
-        MatchCandidate {
-            start: abs_pos,
-            offset: abs_pos - candidate_pos,
+        extend_backwards_shared(
+            self.live_history(),
+            self.history_abs_start,
+            candidate_pos,
+            abs_pos,
             match_len,
-        }
-    }
-
-    fn better_candidate(
-        lhs: Option<MatchCandidate>,
-        rhs: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        match (lhs, rhs) {
-            (None, other) | (other, None) => other,
-            (Some(lhs), Some(rhs)) => {
-                if rhs.match_len > lhs.match_len
-                    || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
-                {
-                    Some(rhs)
-                } else {
-                    Some(lhs)
-                }
-            }
-        }
+            lit_len,
+        )
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
@@ -1875,7 +1943,7 @@ impl RowMatchGenerator {
     fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         let row = self.row_candidate(abs_pos, lit_len);
-        Self::better_candidate(rep, row)
+        best_len_offset_candidate(rep, row)
     }
 
     fn pick_lazy_match(
@@ -1884,71 +1952,29 @@ impl RowMatchGenerator {
         lit_len: usize,
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
-        let best = best?;
-        if best.match_len >= self.target_len
-            || abs_pos + 1 + ROW_MIN_MATCH_LEN > self.history_abs_end()
-        {
-            return Some(best);
-        }
-
-        let next = self.best_match(abs_pos + 1, lit_len + 1);
-        if let Some(next) = next
-            && (next.match_len > best.match_len
-                || (next.match_len == best.match_len && next.offset < best.offset))
-        {
-            return None;
-        }
-
-        if self.lazy_depth >= 2 && abs_pos + 2 + ROW_MIN_MATCH_LEN <= self.history_abs_end() {
-            let next2 = self.best_match(abs_pos + 2, lit_len + 2);
-            if let Some(next2) = next2
-                && next2.match_len > best.match_len + 1
-            {
-                return None;
-            }
-        }
-
-        Some(best)
+        pick_lazy_match_shared(
+            abs_pos,
+            lit_len,
+            best,
+            LazyMatchConfig {
+                target_len: self.target_len,
+                min_match_len: ROW_MIN_MATCH_LEN,
+                lazy_depth: self.lazy_depth,
+                history_abs_end: self.history_abs_end(),
+            },
+            |next_pos, next_lit_len| self.best_match(next_pos, next_lit_len),
+        )
     }
 
     fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let reps = if lit_len == 0 {
-            [
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
-                (self.offset_hist[0] > 1).then_some((self.offset_hist[0] - 1) as usize),
-            ]
-        } else {
-            [
-                Some(self.offset_hist[0] as usize),
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
-            ]
-        };
-
-        let mut best = None;
-        for rep in reps.into_iter().flatten() {
-            if rep == 0 || rep > abs_pos {
-                continue;
-            }
-            let candidate_pos = abs_pos - rep;
-            if candidate_pos < self.history_abs_start {
-                continue;
-            }
-            let concat = self.live_history();
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let current_idx = abs_pos - self.history_abs_start;
-            if current_idx + ROW_MIN_MATCH_LEN > concat.len() {
-                continue;
-            }
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= ROW_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
-            }
-        }
-        best
+        repcode_candidate_shared(
+            self.live_history(),
+            self.history_abs_start,
+            self.offset_hist,
+            abs_pos,
+            lit_len,
+            ROW_MIN_MATCH_LEN,
+        )
     }
 
     fn row_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
@@ -1984,7 +2010,7 @@ impl RowMatchGenerator {
                 MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                best = best_len_offset_candidate(best, Some(candidate));
                 if best.is_some_and(|best| best.match_len >= self.target_len) {
                     return best;
                 }
@@ -1995,45 +2021,19 @@ impl RowMatchGenerator {
 
     fn extend_backwards(
         &self,
-        mut candidate_pos: usize,
-        mut abs_pos: usize,
-        mut match_len: usize,
+        candidate_pos: usize,
+        abs_pos: usize,
+        match_len: usize,
         lit_len: usize,
     ) -> MatchCandidate {
-        let concat = self.live_history();
-        let min_abs_pos = abs_pos - lit_len;
-        while abs_pos > min_abs_pos
-            && candidate_pos > self.history_abs_start
-            && concat[candidate_pos - self.history_abs_start - 1]
-                == concat[abs_pos - self.history_abs_start - 1]
-        {
-            candidate_pos -= 1;
-            abs_pos -= 1;
-            match_len += 1;
-        }
-        MatchCandidate {
-            start: abs_pos,
-            offset: abs_pos - candidate_pos,
+        extend_backwards_shared(
+            self.live_history(),
+            self.history_abs_start,
+            candidate_pos,
+            abs_pos,
             match_len,
-        }
-    }
-
-    fn better_candidate(
-        lhs: Option<MatchCandidate>,
-        rhs: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        match (lhs, rhs) {
-            (None, other) | (other, None) => other,
-            (Some(lhs), Some(rhs)) => {
-                if rhs.match_len > lhs.match_len
-                    || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
-                {
-                    Some(rhs)
-                } else {
-                    Some(lhs)
-                }
-            }
-        }
+            lit_len,
+        )
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
