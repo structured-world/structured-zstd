@@ -1,5 +1,3 @@
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-use core::arch::is_x86_feature_detected;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
@@ -10,6 +8,8 @@ use core::arch::x86_64::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
 };
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+use std::arch::is_x86_feature_detected;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
