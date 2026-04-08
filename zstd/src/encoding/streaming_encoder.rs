@@ -345,7 +345,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         encoded.clear();
         let needed_capacity = self.block_capacity() + 3;
         if encoded.capacity() < needed_capacity {
-            encoded.reserve(needed_capacity - encoded.capacity());
+            encoded.reserve(needed_capacity.saturating_sub(encoded.len()));
         }
         let mut moved_into_matcher = false;
         if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
