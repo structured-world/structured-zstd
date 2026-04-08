@@ -72,7 +72,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
     scenarios
 }
 
-pub(crate) fn supported_levels() -> [LevelConfig; 4] {
+pub(crate) fn supported_levels() -> [LevelConfig; 5] {
     [
         LevelConfig {
             name: "fastest",
@@ -88,6 +88,11 @@ pub(crate) fn supported_levels() -> [LevelConfig; 4] {
             name: "better",
             rust_level: CompressionLevel::Better,
             ffi_level: 7,
+        },
+        LevelConfig {
+            name: "level4-row",
+            rust_level: CompressionLevel::Level(4),
+            ffi_level: 4,
         },
         LevelConfig {
             name: "best",

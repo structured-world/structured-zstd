@@ -105,7 +105,7 @@ timing_point_count = 0
 DELTA_LOW = 0.99
 DELTA_HIGH = 1.05
 REGRESSION_STAGES = {"compress", "decompress"}
-REGRESSION_LEVELS = {"default", "better"}
+REGRESSION_LEVELS = {"default", "better", "level4-row"}
 REGRESSION_SCENARIOS = {
     "small-4k-log-lines",
     "decodecorpus-z000033",
