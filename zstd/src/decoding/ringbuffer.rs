@@ -585,12 +585,21 @@ unsafe fn copy_with_checks(
     m2_in_f2: usize,
 ) {
     unsafe {
+        let m1_src_cap = m1_in_f1 + m1_in_f2;
+        let m2_src_cap = m2_in_f1 + m2_in_f2;
+        let f1_dst_cap = m1_in_f1 + m2_in_f1;
+        let f2_dst_cap = m1_in_f2 + m2_in_f2;
+
         if m1_in_f1 != 0 {
-            simd_copy::copy_bytes_overshooting((m1_ptr, m1_in_f1), (f1_ptr, m1_in_f1), m1_in_f1);
+            simd_copy::copy_bytes_overshooting(
+                (m1_ptr, m1_src_cap),
+                (f1_ptr, f1_dst_cap),
+                m1_in_f1,
+            );
         }
         if m2_in_f1 != 0 {
             simd_copy::copy_bytes_overshooting(
-                (m2_ptr, m2_in_f1),
+                (m2_ptr, m2_src_cap),
                 (f1_ptr.add(m1_in_f1), m2_in_f1),
                 m2_in_f1,
             );
@@ -599,7 +608,7 @@ unsafe fn copy_with_checks(
         if m1_in_f2 != 0 {
             simd_copy::copy_bytes_overshooting(
                 (m1_ptr.add(m1_in_f1), m1_in_f2),
-                (f2_ptr, m1_in_f2),
+                (f2_ptr, f2_dst_cap),
                 m1_in_f2,
             );
         }
