@@ -72,6 +72,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
     scenarios
 }
 
+/// Benchmark levels mapped to comparable Rust and FFI compression settings.
 pub(crate) fn supported_levels() -> [LevelConfig; 5] {
     [
         LevelConfig {

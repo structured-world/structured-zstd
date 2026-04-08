@@ -3389,6 +3389,7 @@ fn row_get_last_space_and_reset_to_fastest_clears_window() {
     assert!(driver.row_matcher().window.is_empty());
 }
 
+/// Ensures switching from Row to Simple returns pooled buffers and row tables.
 #[test]
 fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -3419,6 +3420,7 @@ fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     );
 }
 
+/// Guards the optional row backend retirement path when no row matcher was allocated.
 #[test]
 fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -3526,6 +3528,7 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
     assert_eq!(chosen.match_len, best.match_len);
 }
 
+/// Verifies row/tag extraction uses the high bits of the multiplicative hash.
 #[test]
 fn row_hash_and_row_extracts_high_bits() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
