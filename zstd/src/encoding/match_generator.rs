@@ -2858,10 +2858,9 @@ fn row_short_block_emits_literals_only() {
 
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
-    matcher.start_matching(|seq| {
-        if let Sequence::Literals { literals } = seq {
-            reconstructed.extend_from_slice(literals);
-        }
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple { .. } => saw_triple = true,
     });
 
     assert!(
