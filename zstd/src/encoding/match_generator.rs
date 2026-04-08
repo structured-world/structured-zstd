@@ -2700,18 +2700,24 @@ fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
     matcher.ensure_tables();
-
-    // Simulate a long-running stream where absolute history positions crossed
-    // the u32 range. Before #51 this disabled HC inserts entirely.
-    matcher.history_abs_start = u32::MAX as usize + 64;
     matcher.position_base = 0;
+    if usize::BITS > 32 {
+        // Simulate a long-running stream where absolute history positions
+        // crossed the u32 range. Before #51 this disabled HC inserts entirely.
+        matcher.history_abs_start = (u32::MAX as usize)
+            .checked_add(64)
+            .expect("64-bit usize should represent u32::MAX + 64");
+        matcher.skip_matching();
+        assert_eq!(
+            matcher.position_base, matcher.history_abs_start,
+            "rebase should anchor to the oldest live absolute position"
+        );
+    } else {
+        // 32-bit targets cannot represent positions above u32::MAX. Verify
+        // that the rebase path still handles boundary insertion requests.
+        matcher.maybe_rebase_positions(u32::MAX as usize);
+    }
 
-    matcher.skip_matching();
-
-    assert_eq!(
-        matcher.position_base, matcher.history_abs_start,
-        "rebase should anchor to the oldest live absolute position"
-    );
     assert!(
         matcher.hash_table.iter().any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
