@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/structured-world/structured-zstd/compare/v0.0.8...v0.0.9) - 2026-04-08
+
+### Performance
+
+- *(encoding)* reuse streaming encoded scratch buffer ([#80](https://github.com/structured-world/structured-zstd/pull/80))
+
 ## [0.0.8](https://github.com/structured-world/structured-zstd/compare/v0.0.7...v0.0.8) - 2026-04-07
 
 ### Fixed
