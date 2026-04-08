@@ -773,6 +773,8 @@ unsafe fn copy_with_nobranch_check(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::{RingBuffer, copy_with_checks, copy_with_nobranch_check};
     use crate::decoding::simd_copy;
 
@@ -1028,20 +1030,25 @@ mod tests {
 
     #[test]
     fn copy_bytes_overshooting_covers_all_copy_strategies() {
-        let src_single = [1_u8; 64];
-        let mut dst_single = [0_u8; 64];
+        let chunk = simd_copy::active_chunk_size_for_tests();
+        let single_len = chunk;
+        let multi_len = chunk * 2;
+        let fallback_len = chunk + 1;
+        let cap = multi_len + chunk;
+
+        let src_single = vec![1_u8; cap];
+        let mut dst_single = vec![0_u8; cap];
         unsafe {
             simd_copy::copy_bytes_overshooting(
-                (src_single.as_ptr(), 16),
-                (dst_single.as_mut_ptr(), 16),
-                16,
+                (src_single.as_ptr(), single_len),
+                (dst_single.as_mut_ptr(), single_len),
+                single_len,
             );
         }
-        assert_eq!(&dst_single[..16], &src_single[..16]);
+        assert_eq!(&dst_single[..single_len], &src_single[..single_len]);
 
-        let multi_len = 32;
-        let src_multi = [2_u8; 64];
-        let mut dst_multi = [0_u8; 64];
+        let src_multi = vec![2_u8; cap];
+        let mut dst_multi = vec![0_u8; cap];
         unsafe {
             simd_copy::copy_bytes_overshooting(
                 (src_multi.as_ptr(), multi_len),
@@ -1051,9 +1058,8 @@ mod tests {
         }
         assert_eq!(&dst_multi[..multi_len], &src_multi[..multi_len]);
 
-        let fallback_len = 17;
-        let src_fallback = [3_u8; 64];
-        let mut dst_fallback = [0_u8; 64];
+        let src_fallback = vec![3_u8; cap];
+        let mut dst_fallback = vec![0_u8; cap];
         unsafe {
             simd_copy::copy_bytes_overshooting(
                 (src_fallback.as_ptr(), fallback_len),

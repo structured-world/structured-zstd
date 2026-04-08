@@ -24,6 +24,19 @@ struct CopyStrategy {
     copy: CopyFn,
 }
 
+/// Copies at least `copy_at_least` bytes from `src` to `dst`.
+///
+/// This helper may over-copy up to `next_multiple_of(active_chunk)`,
+/// mirroring zstd wildcopy semantics for faster inner loops.
+///
+/// # Safety
+/// Caller must guarantee:
+/// - `src.0` points to at least `src.1` readable bytes.
+/// - `dst.0` points to at least `dst.1` writable bytes.
+/// - `src.1` and `dst.1` are large enough for the selected strategy:
+///   if `min(src.1, dst.1) >= next_multiple_of(copy_at_least, active_chunk)`,
+///   the SIMD/scalar chunk loop may copy that rounded-up amount.
+/// - Source and destination regions do not overlap.
 #[inline(always)]
 pub(crate) unsafe fn copy_bytes_overshooting(
     src: (*const u8, usize),
@@ -43,6 +56,13 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     } else {
         unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
     }
+
+    #[cfg(debug_assertions)]
+    unsafe {
+        let src_bytes = core::slice::from_raw_parts(src.0, copy_at_least);
+        let dst_bytes = core::slice::from_raw_parts(dst.0, copy_at_least);
+        debug_assert_eq!(dst_bytes, src_bytes);
+    }
 }
 
 #[inline(always)]
@@ -58,13 +78,13 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         let caps = detect_x86_caps();
-        if caps.avx512f && copy_at_least >= 256 {
+        if caps.avx512f && copy_at_least >= 64 {
             return CopyStrategy {
                 chunk: 64,
                 copy: copy_avx512,
             };
         }
-        if caps.avx2 && copy_at_least >= 64 {
+        if caps.avx2 && copy_at_least >= 32 {
             return CopyStrategy {
                 chunk: 32,
                 copy: copy_avx2,
@@ -99,6 +119,12 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
         let _ = copy_at_least;
         scalar_strategy()
     }
+}
+
+#[cfg(test)]
+#[inline]
+pub(crate) fn active_chunk_size_for_tests() -> usize {
+    copy_strategy(usize::MAX / 2).chunk
 }
 
 #[inline(always)]
