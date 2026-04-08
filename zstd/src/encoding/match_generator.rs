@@ -2835,6 +2835,13 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
+
+    // Force a literals-only pass so the Sequence::Literals arm is exercised.
+    let third_block: Vec<u8> = (0u8..=255).collect();
+    matcher.add_data(third_block.clone(), |_| {});
+    let third_prefix = history.len();
+    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    assert_eq!(&history[third_prefix..], third_block.as_slice());
 }
 
 #[test]
@@ -2846,9 +2853,10 @@ fn row_short_block_emits_literals_only() {
 
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-        Sequence::Triple { .. } => saw_triple = true,
+    matcher.start_matching(|seq| {
+        if let Sequence::Literals { literals } = seq {
+            reconstructed.extend_from_slice(literals);
+        }
     });
 
     assert!(
@@ -2856,6 +2864,19 @@ fn row_short_block_emits_literals_only() {
         "row backend must not emit triples for short blocks"
     );
     assert_eq!(reconstructed, b"abcde");
+
+    // Then feed a clearly matchable block and ensure the Triple arm is reachable.
+    saw_triple = false;
+    matcher.add_data(b"abcdeabcde".to_vec(), |_| {});
+    matcher.start_matching(|seq| {
+        if let Sequence::Triple { .. } = seq {
+            saw_triple = true;
+        }
+    });
+    assert!(
+        saw_triple,
+        "row backend should emit triples on repeated data"
+    );
 }
 
 #[test]
@@ -3299,6 +3320,23 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
 }
 
 #[test]
+fn row_prime_with_dictionary_subtracts_uncommitted_tail_budget() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(4));
+
+    let base_window = driver.row_matcher().max_window_size;
+    // Slice size is 8. The trailing byte cannot be committed (<4 tail),
+    // so it must be subtracted from retained budget.
+    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
+
+    assert_eq!(
+        driver.row_matcher().max_window_size,
+        base_window + 8,
+        "row retained window must exclude uncommitted 1-byte tail"
+    );
+}
+
+#[test]
 fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(4));
@@ -3344,6 +3382,234 @@ fn row_get_last_space_and_reset_to_fastest_clears_window() {
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.active_backend, MatcherBackend::Simple);
     assert!(driver.row_matcher().window.is_empty());
+}
+
+#[test]
+fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(4));
+    assert_eq!(driver.active_backend, MatcherBackend::Row);
+
+    // Ensure the row matcher option is initialized so reset() executes
+    // the Row backend retirement path.
+    let _ = driver.row_matcher();
+    let mut space = driver.get_next_space();
+    space.extend_from_slice(b"row-data-to-recycle");
+    driver.commit_space(space);
+
+    let before_pool = driver.vec_pool.len();
+    driver.reset(CompressionLevel::Fastest);
+
+    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    assert!(
+        driver.vec_pool.len() >= before_pool,
+        "row reset should recycle row history buffers"
+    );
+}
+
+#[test]
+fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.active_backend = MatcherBackend::Row;
+    driver.row_match_generator = None;
+
+    driver.reset(CompressionLevel::Fastest);
+
+    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+}
+
+#[test]
+fn adjust_params_for_zero_source_size_uses_min_window_floor() {
+    let mut params = resolve_level_params(CompressionLevel::Level(4), None);
+    params.window_log = 22;
+    let adjusted = adjust_params_for_source_size(params, 0);
+    assert_eq!(adjusted.window_log, MIN_WINDOW_LOG);
+}
+
+#[test]
+fn row_pick_lazy_returns_none_when_next_is_better() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.add_data(alloc::vec![b'a'; 64], |_| {});
+    matcher.ensure_tables();
+
+    let abs_pos = matcher.history_abs_start + 16;
+    let best = MatchCandidate {
+        start: abs_pos,
+        offset: 8,
+        match_len: ROW_MIN_MATCH_LEN,
+    };
+    assert!(
+        matcher.pick_lazy_match(abs_pos, 0, Some(best)).is_none(),
+        "lazy picker should defer when next position is clearly better"
+    );
+}
+
+#[test]
+fn row_pick_lazy_depth2_returns_none_when_next2_significantly_better() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.lazy_depth = 2;
+    matcher.search_depth = 0;
+    matcher.offset_hist = [6, 9, 1];
+
+    let mut data = alloc::vec![b'x'; 40];
+    data[11..30].copy_from_slice(b"EFABCABCAEFABCAEFAB");
+    matcher.add_data(data, |_| {});
+    matcher.ensure_tables();
+
+    let abs_pos = matcher.history_abs_start + 20;
+    let best = matcher
+        .best_match(abs_pos, 0)
+        .expect("expected baseline repcode match");
+    assert_eq!(best.offset, 9);
+    assert_eq!(best.match_len, ROW_MIN_MATCH_LEN);
+
+    if let Some(next) = matcher.best_match(abs_pos + 1, 1) {
+        assert!(next.match_len <= best.match_len);
+    }
+
+    let next2 = matcher
+        .best_match(abs_pos + 2, 2)
+        .expect("expected +2 candidate");
+    assert!(
+        next2.match_len > best.match_len + 1,
+        "+2 candidate must be significantly better for depth-2 lazy skip"
+    );
+    assert!(
+        matcher.pick_lazy_match(abs_pos, 0, Some(best)).is_none(),
+        "lazy picker should defer when +2 candidate is significantly better"
+    );
+}
+
+#[test]
+fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.lazy_depth = 2;
+    matcher.search_depth = 0;
+    matcher.offset_hist = [6, 9, 1];
+
+    let mut data = alloc::vec![b'x'; 40];
+    data[11..30].copy_from_slice(b"EFABCABCAEFABCAEFAZ");
+    matcher.add_data(data, |_| {});
+    matcher.ensure_tables();
+
+    let abs_pos = matcher.history_abs_start + 20;
+    let best = matcher
+        .best_match(abs_pos, 0)
+        .expect("expected baseline repcode match");
+    assert_eq!(best.offset, 9);
+    assert_eq!(best.match_len, ROW_MIN_MATCH_LEN);
+
+    let next2 = matcher
+        .best_match(abs_pos + 2, 2)
+        .expect("expected +2 candidate");
+    assert_eq!(next2.match_len, best.match_len + 1);
+    let chosen = matcher
+        .pick_lazy_match(abs_pos, 0, Some(best))
+        .expect("lazy picker should keep current best");
+    assert_eq!(chosen.start, best.start);
+    assert_eq!(chosen.offset, best.offset);
+    assert_eq!(chosen.match_len, best.match_len);
+}
+
+#[test]
+fn row_repcode_skips_candidate_before_history_start() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.history = alloc::vec![b'a'; 20];
+    matcher.history_start = 0;
+    matcher.history_abs_start = 10;
+    matcher.offset_hist = [3, 0, 0];
+
+    assert!(matcher.repcode_candidate(12, 1).is_none());
+}
+
+#[test]
+fn row_repcode_returns_none_when_position_too_close_to_history_end() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.history = b"abcde".to_vec();
+    matcher.history_start = 0;
+    matcher.history_abs_start = 0;
+    matcher.offset_hist = [1, 0, 0];
+
+    assert!(matcher.repcode_candidate(4, 1).is_none());
+}
+
+#[test]
+fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
+    let mut matcher = RowMatchGenerator::new(1 << 22);
+    matcher.configure(ROW_CONFIG);
+    matcher.history = b"abcde".to_vec();
+    matcher.history_start = 0;
+    matcher.history_abs_start = 0;
+
+    assert!(matcher.row_candidate(0, 0).is_none());
+}
+
+#[test]
+fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
+    let mut hc = HcMatchGenerator::new(32);
+    hc.history = b"abc".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.ensure_tables();
+
+    let candidates = hc.chain_candidates(0);
+    assert!(candidates.iter().all(|&pos| pos == usize::MAX));
+}
+
+#[test]
+fn hc_reset_refills_existing_tables_with_empty_sentinel() {
+    let mut hc = HcMatchGenerator::new(32);
+    hc.add_data(b"abcdeabcde".to_vec(), |_| {});
+    hc.ensure_tables();
+    assert!(!hc.hash_table.is_empty());
+    assert!(!hc.chain_table.is_empty());
+    hc.hash_table.fill(123);
+    hc.chain_table.fill(456);
+
+    hc.reset(|_| {});
+
+    assert!(hc.hash_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(hc.chain_table.iter().all(|&v| v == HC_EMPTY));
+}
+
+#[test]
+fn hc_start_matching_returns_early_for_empty_current_block() {
+    let mut hc = HcMatchGenerator::new(32);
+    hc.add_data(Vec::new(), |_| {});
+    let mut called = false;
+    hc.start_matching(|_| called = true);
+    assert!(!called, "empty current block should not emit sequences");
+}
+
+#[test]
+fn hc_compact_history_drains_when_threshold_crossed() {
+    let mut hc = HcMatchGenerator::new(8);
+    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.history_start = 16;
+    hc.compact_history();
+    assert_eq!(hc.history_start, 0);
+    assert_eq!(hc.history, b"qrstuvwxyz");
+}
+
+#[test]
+fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
+    let mut hc = HcMatchGenerator::new(32);
+    hc.history = b"abcdefghijklmnop".to_vec();
+    hc.history_abs_start = 0;
+    hc.position_base = 1;
+    hc.ensure_tables();
+    let before_hash = hc.hash_table.clone();
+    let before_chain = hc.chain_table.clone();
+
+    hc.insert_position_no_rebase(0);
+
+    assert_eq!(hc.hash_table, before_hash);
+    assert_eq!(hc.chain_table, before_chain);
 }
 
 #[test]
