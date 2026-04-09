@@ -1,4 +1,6 @@
 use core::convert::TryInto;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use std::sync::OnceLock;
 
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
 /// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
@@ -42,6 +44,84 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
     {
         value & BIT_MASK[n as usize]
     }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[derive(Copy, Clone)]
+struct TripleExtractDispatch {
+    use_pext: bool,
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+static TRIPLE_EXTRACT_DISPATCH: OnceLock<TripleExtractDispatch> = OnceLock::new();
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn triple_extract_dispatch() -> &'static TripleExtractDispatch {
+    TRIPLE_EXTRACT_DISPATCH.get_or_init(detect_triple_extract_dispatch)
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
+    use core::arch::x86_64::__cpuid;
+    use std::arch::is_x86_feature_detected;
+
+    if !is_x86_feature_detected!("bmi2") {
+        return TripleExtractDispatch { use_pext: false };
+    }
+
+    // AMD Zen1/Zen2 execute PEXT/PDEP through a slow microcode path.
+    // Keep scalar extraction there and enable PEXT on Intel and newer AMD.
+    let vendor = unsafe {
+        let leaf0 = __cpuid(0);
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+        vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+        vendor
+    };
+    let is_amd = vendor == *b"AuthenticAMD";
+    if !is_amd {
+        return TripleExtractDispatch { use_pext: true };
+    }
+
+    let eax = unsafe { __cpuid(1).eax };
+    let base_family = (eax >> 8) & 0xF;
+    let ext_family = (eax >> 20) & 0xFF;
+    let family = if base_family == 0xF {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+
+    TripleExtractDispatch {
+        use_pext: family != 0x17,
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
+    if !triple_extract_dispatch().use_pext {
+        return None;
+    }
+
+    Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::_pext_u64;
+
+    let mask3 = BIT_MASK[n3 as usize];
+    let mask2 = BIT_MASK[n2 as usize].wrapping_shl(u32::from(n3));
+    let mask1 = BIT_MASK[n1 as usize].wrapping_shl(u32::from(n2) + u32::from(n3));
+
+    let val1 = _pext_u64(all_three, mask1);
+    let val2 = _pext_u64(all_three, mask2);
+    let val3 = _pext_u64(all_three, mask3);
+    (val1, val2, val3)
 }
 
 /// Zstandard encodes some types of data in a way that the data must be read
@@ -224,6 +304,11 @@ impl<'s> BitReaderReversed<'s> {
         // Lower bits are to the right
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
+
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if let Some(values) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
+            return values;
+        }
 
         let val1 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
         let val2 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
