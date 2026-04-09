@@ -3443,7 +3443,7 @@ fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
 }
 
 #[test]
-fn adjust_params_for_zero_source_size_uses_min_window_floor() {
+fn adjust_params_for_zero_source_size_uses_min_hinted_window_floor() {
     let mut params = resolve_level_params(CompressionLevel::Level(4), None);
     params.window_log = 22;
     let adjusted = adjust_params_for_source_size(params, 0);

@@ -73,7 +73,9 @@ fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
     rust_decoder.read_to_end(&mut rust_result).unwrap();
     assert_eq!(data, rust_result, "rust decoder must accept hinted stream");
 
-    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    let result = zstd::decode_all(compressed.as_slice()).unwrap_or_else(|e| {
+        panic!("hinted rust→ffi decode failed at iteration {i}, len={len}: {e}");
+    });
     assert_eq!(data, result, "ffi decoder must accept hinted stream");
 }
 
