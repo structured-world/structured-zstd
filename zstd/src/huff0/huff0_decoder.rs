@@ -263,6 +263,10 @@ impl<'t> HuffmanDecoder<'t> {
     ///
     /// All decoders must reference the same table and kernel.
     /// SIMD kernels read packed entries through `decoders[0].table` for all states.
+    ///
+    /// The selected kernel must also be supported by the running CPU (that is,
+    /// chosen via runtime/static feature detection, not manually fabricated on
+    /// a machine lacking the kernel's required instruction set).
     pub(crate) unsafe fn decode4_symbols_and_num_bits_unchecked(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
