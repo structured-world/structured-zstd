@@ -397,7 +397,7 @@ impl<'t> HuffmanDecoder<'t> {
                 lateout("z1") _,
                 lateout("z2") _,
                 lateout("p0") _,
-                options(nostack, preserves_flags),
+                options(nostack),
             );
         }
 
@@ -433,12 +433,14 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
+            unsafe {
+                _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
+            }
         }
         #[cfg(target_arch = "x86")]
         {
             let shifted = ((self.state << num_bits) & u64::from(u32::MAX)) as u32;
-            u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits
+            unsafe { u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits }
         }
     }
 
@@ -847,4 +849,179 @@ pub struct Entry {
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn test_table() -> HuffmanTable {
+        let decode = vec![
+            Entry {
+                symbol: b'A',
+                num_bits: 1,
+            },
+            Entry {
+                symbol: b'B',
+                num_bits: 2,
+            },
+            Entry {
+                symbol: b'C',
+                num_bits: 1,
+            },
+            Entry {
+                symbol: b'D',
+                num_bits: 2,
+            },
+        ];
+        let packed_decode = decode
+            .iter()
+            .map(|e| u32::from(e.symbol) | (u32::from(e.num_bits) << 8))
+            .collect::<Vec<_>>();
+
+        HuffmanTable {
+            decode,
+            packed_decode,
+            weights: Vec::new(),
+            max_num_bits: 2,
+            state_mask: 0b11,
+            bits: Vec::new(),
+            bit_ranks: Vec::new(),
+            rank_indexes: Vec::new(),
+            fse_table: FSETable::new(255),
+        }
+    }
+
+    #[test]
+    fn decode_symbol_and_advance_scalar_matches_manual_transition() {
+        let table = test_table();
+        let initial_state = 1_u64;
+        let entry = table.decode[initial_state as usize];
+        let mut manual_br = BitReaderReversed::new(&[0b10101010, 0b01010101]);
+        let expected_new_bits = manual_br.get_bits(entry.num_bits);
+        let expected_state =
+            ((initial_state << entry.num_bits) & table.state_mask) | expected_new_bits;
+
+        let mut decoder = HuffmanDecoder {
+            table: &table,
+            kernel: HuffmanDecodeKernel::Scalar,
+            state: initial_state,
+        };
+        let mut br = BitReaderReversed::new(&[0b10101010, 0b01010101]);
+        let symbol = decoder.decode_symbol_and_advance(&mut br);
+
+        assert_eq!(symbol, entry.symbol);
+        assert_eq!(decoder.state, expected_state);
+    }
+
+    #[test]
+    fn decode4_scalar_reads_symbols_and_num_bits_from_each_state() {
+        let table = test_table();
+        let decoders = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 3,
+            },
+        ];
+
+        let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&decoders);
+        assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
+        assert_eq!(bits, [1, 2, 1, 2]);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn bmi2_advance_matches_scalar_formula_when_available() {
+        if !is_x86_feature_detected!("bmi2") {
+            return;
+        }
+
+        let table = test_table();
+        let decoder = HuffmanDecoder {
+            table: &table,
+            kernel: HuffmanDecodeKernel::X86Bmi2,
+            state: 3,
+        };
+
+        let num_bits = 2_u8;
+        let new_bits = 1_u64;
+        let expected = ((decoder.state << num_bits) & table.state_mask) | new_bits;
+        let actual = unsafe { decoder.advance_state_x86_bmi2(num_bits, new_bits) };
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn decode4_avx2_matches_scalar_when_available() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let table = test_table();
+        let scalar = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 3,
+            },
+        ];
+        let avx2 = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::X86Avx2,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::X86Avx2,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::X86Avx2,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::X86Avx2,
+                state: 3,
+            },
+        ];
+
+        let expected = HuffmanDecoder::decode4_symbols_and_num_bits(&scalar);
+        let actual = HuffmanDecoder::decode4_symbols_and_num_bits(&avx2);
+        assert_eq!(actual, expected);
+    }
 }
