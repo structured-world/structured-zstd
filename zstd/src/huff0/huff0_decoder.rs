@@ -342,8 +342,8 @@ impl<'t> HuffmanDecoder<'t> {
         );
 
         // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
-        let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
-        let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
+        let symbols_bytes = unsafe { _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed) };
+        let bits_bytes = unsafe { _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed) };
 
         let symbols_word = _mm_cvtsi128_si32(symbols_bytes) as u32;
         let bits_word = _mm_cvtsi128_si32(bits_bytes) as u32;
@@ -499,7 +499,8 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
+            (unsafe { _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) })
+                | new_bits
         }
         #[cfg(target_arch = "x86")]
         {
