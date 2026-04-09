@@ -1,5 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::hint::black_box;
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 
@@ -27,17 +28,23 @@ fn bench_decode(c: &mut Criterion) {
 
     let corpus_src = include_bytes!("../decodecorpus_files/z000033.zst").as_slice();
     let mut corpus_decoder = FrameDecoder::new();
-    let mut corpus_target = vec![0u8; 1024 * 1024 * 200];
-    let corpus_decoded = corpus_decoder
-        .decode_all(corpus_src, &mut corpus_target)
-        .unwrap();
+    let corpus_decoded = {
+        let mut corpus_probe_target = vec![0u8; 1024 * 1024 * 200];
+        corpus_decoder
+            .decode_all(corpus_src, &mut corpus_probe_target)
+            .unwrap()
+    };
+    let mut corpus_target = vec![0u8; corpus_decoded];
     group.throughput(Throughput::Bytes(corpus_decoded as u64));
     group.bench_with_input(
         BenchmarkId::new("corpus_reference", "z000033.zst"),
         &corpus_src,
         |b, src| {
             b.iter(|| {
-                corpus_decoder.decode_all(src, &mut corpus_target).unwrap();
+                let decoded = corpus_decoder
+                    .decode_all(black_box(src), &mut corpus_target)
+                    .unwrap();
+                black_box(decoded);
             })
         },
     );

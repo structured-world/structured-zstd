@@ -149,60 +149,45 @@ fn decompress_literals(
         // (which may use packed/SIMD gather+unpack kernels), then advance the
         // 4 stream states independently. This gives the CPU's out-of-order
         // engine more independent work to schedule, hiding decode latency.
-        if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
-            while brs[0].bits_remaining() > -max_bits
-                && brs[1].bits_remaining() > -max_bits
-                && brs[2].bits_remaining() > -max_bits
-                && brs[3].bits_remaining() > -max_bits
-                && cursors[0] < ends[0]
-                && cursors[1] < ends[1]
-                && cursors[2] < ends[2]
-                && cursors[3] < ends[3]
-            {
-                // SAFETY: guarded by decode4_has_shared_table_and_kernel above.
-                let (symbols, bits) =
-                    unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) };
-
-                target[cursors[0]] = symbols[0];
-                target[cursors[1]] = symbols[1];
-                target[cursors[2]] = symbols[2];
-                target[cursors[3]] = symbols[3];
-                cursors[0] += 1;
-                cursors[1] += 1;
-                cursors[2] += 1;
-                cursors[3] += 1;
-
-                decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
-                decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
-                decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
-                decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
-            }
+        enum Decode4Mode {
+            Unchecked,
+            Checked,
+        }
+        let decode4_mode = if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
+            Decode4Mode::Unchecked
         } else {
-            while brs[0].bits_remaining() > -max_bits
-                && brs[1].bits_remaining() > -max_bits
-                && brs[2].bits_remaining() > -max_bits
-                && brs[3].bits_remaining() > -max_bits
-                && cursors[0] < ends[0]
-                && cursors[1] < ends[1]
-                && cursors[2] < ends[2]
-                && cursors[3] < ends[3]
-            {
-                let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&decoders);
+            Decode4Mode::Checked
+        };
+        while brs[0].bits_remaining() > -max_bits
+            && brs[1].bits_remaining() > -max_bits
+            && brs[2].bits_remaining() > -max_bits
+            && brs[3].bits_remaining() > -max_bits
+            && cursors[0] < ends[0]
+            && cursors[1] < ends[1]
+            && cursors[2] < ends[2]
+            && cursors[3] < ends[3]
+        {
+            let (symbols, bits) = match decode4_mode {
+                Decode4Mode::Unchecked => {
+                    // SAFETY: guarded by decode4_has_shared_table_and_kernel above.
+                    unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
+                }
+                Decode4Mode::Checked => HuffmanDecoder::decode4_symbols_and_num_bits(&decoders),
+            };
 
-                target[cursors[0]] = symbols[0];
-                target[cursors[1]] = symbols[1];
-                target[cursors[2]] = symbols[2];
-                target[cursors[3]] = symbols[3];
-                cursors[0] += 1;
-                cursors[1] += 1;
-                cursors[2] += 1;
-                cursors[3] += 1;
+            target[cursors[0]] = symbols[0];
+            target[cursors[1]] = symbols[1];
+            target[cursors[2]] = symbols[2];
+            target[cursors[3]] = symbols[3];
+            cursors[0] += 1;
+            cursors[1] += 1;
+            cursors[2] += 1;
+            cursors[3] += 1;
 
-                decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
-                decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
-                decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
-                decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
-            }
+            decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
+            decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
+            decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
+            decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
