@@ -7,6 +7,18 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{uint8x16_t, vceqq_u8, vld1q_u8, vst1q_u8};
+#[cfg(target_arch = "x86")]
+use core::arch::x86::{
+    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
+    _mm256_loadu_si256, _mm256_movemask_epi8,
+};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
+    _mm256_loadu_si256, _mm256_movemask_epi8,
+};
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
@@ -14,6 +26,12 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use std::arch::is_aarch64_feature_detected;
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+use std::arch::is_x86_feature_detected;
+#[cfg(feature = "std")]
+use std::sync::OnceLock;
 
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
@@ -45,6 +63,17 @@ const HC_EMPTY: u32 = 0;
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 32;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PrefixKernel {
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Sse42,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Aarch64Neon,
+}
 
 /// Bundled tuning knobs for the hash-chain matcher. Using a typed config
 /// instead of positional `usize` args eliminates parameter-order hazards.
@@ -852,6 +881,65 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline(always)]
+    const fn select_x86_prefix_kernel(has_avx2: bool, has_sse42: bool) -> PrefixKernel {
+        if has_avx2 {
+            return PrefixKernel::X86Avx2;
+        }
+        if has_sse42 {
+            return PrefixKernel::X86Sse42;
+        }
+        PrefixKernel::Scalar
+    }
+
+    #[cfg(feature = "std")]
+    #[inline(always)]
+    fn detect_prefix_kernel() -> PrefixKernel {
+        static KERNEL: OnceLock<PrefixKernel> = OnceLock::new();
+        *KERNEL.get_or_init(|| {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                let kernel = Self::select_x86_prefix_kernel(
+                    is_x86_feature_detected!("avx2"),
+                    is_x86_feature_detected!("sse4.2"),
+                );
+                if kernel != PrefixKernel::Scalar {
+                    return kernel;
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if is_aarch64_feature_detected!("neon") {
+                    return PrefixKernel::Aarch64Neon;
+                }
+            }
+            PrefixKernel::Scalar
+        })
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[inline(always)]
+    fn detect_prefix_kernel() -> PrefixKernel {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            let kernel = Self::select_x86_prefix_kernel(
+                cfg!(target_feature = "avx2"),
+                cfg!(target_feature = "sse4.2"),
+            );
+            if kernel != PrefixKernel::Scalar {
+                return kernel;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if cfg!(target_feature = "neon") {
+                return PrefixKernel::Aarch64Neon;
+            }
+        }
+        PrefixKernel::Scalar
+    }
+
     #[inline(always)]
     #[cfg(target_endian = "little")]
     fn mismatch_byte_index(diff: usize) -> usize {
@@ -1003,11 +1091,34 @@ impl MatchGenerator {
     #[inline(always)]
     fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
         let max = a.len().min(b.len());
-        let chunk = core::mem::size_of::<usize>();
         let mut off = 0usize;
         let lhs = a.as_ptr();
         let rhs = b.as_ptr();
 
+        match Self::detect_prefix_kernel() {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            PrefixKernel::X86Avx2 => {
+                off = unsafe { Self::prefix_len_simd_avx2(lhs, rhs, max) };
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            PrefixKernel::X86Sse42 => {
+                off = unsafe { Self::prefix_len_simd_sse42(lhs, rhs, max) };
+            }
+            #[cfg(target_arch = "aarch64")]
+            PrefixKernel::Aarch64Neon => {
+                off = unsafe { Self::prefix_len_simd_neon(lhs, rhs, max) };
+            }
+            PrefixKernel::Scalar => {}
+        }
+
+        Self::common_prefix_len_scalar(a, b, off, max)
+    }
+
+    #[inline(always)]
+    fn common_prefix_len_scalar(a: &[u8], b: &[u8], mut off: usize, max: usize) -> usize {
+        let chunk = core::mem::size_of::<usize>();
+        let lhs = a.as_ptr();
+        let rhs = b.as_ptr();
         while off + chunk <= max {
             let lhs_word = unsafe { core::ptr::read_unaligned(lhs.add(off) as *const usize) };
             let rhs_word = unsafe { core::ptr::read_unaligned(rhs.add(off) as *const usize) };
@@ -1017,10 +1128,61 @@ impl MatchGenerator {
             }
             off += chunk;
         }
-
         off + core::iter::zip(&a[off..max], &b[off..max])
             .take_while(|(x, y)| x == y)
             .count()
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn prefix_len_simd_sse42(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
+        let mut off = 0usize;
+        while off + 16 <= max {
+            let a: __m128i = unsafe { _mm_loadu_si128(lhs.add(off).cast::<__m128i>()) };
+            let b: __m128i = unsafe { _mm_loadu_si128(rhs.add(off).cast::<__m128i>()) };
+            let eq = _mm_cmpeq_epi8(a, b);
+            let mask = _mm_movemask_epi8(eq) as u32;
+            if mask != 0xFFFF {
+                return off + (!mask).trailing_zeros() as usize;
+            }
+            off += 16;
+        }
+        off
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn prefix_len_simd_avx2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
+        let mut off = 0usize;
+        while off + 32 <= max {
+            let a: __m256i = unsafe { _mm256_loadu_si256(lhs.add(off).cast::<__m256i>()) };
+            let b: __m256i = unsafe { _mm256_loadu_si256(rhs.add(off).cast::<__m256i>()) };
+            let eq = _mm256_cmpeq_epi8(a, b);
+            let mask = _mm256_movemask_epi8(eq) as u32;
+            if mask != u32::MAX {
+                return off + (!mask).trailing_zeros() as usize;
+            }
+            off += 32;
+        }
+        off
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn prefix_len_simd_neon(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
+        let mut off = 0usize;
+        while off + 16 <= max {
+            let a: uint8x16_t = unsafe { vld1q_u8(lhs.add(off)) };
+            let b: uint8x16_t = unsafe { vld1q_u8(rhs.add(off)) };
+            let eq = vceqq_u8(a, b);
+            let mut bytes = [0u8; 16];
+            unsafe { vst1q_u8(bytes.as_mut_ptr(), eq) };
+            if let Some(idx) = bytes.iter().position(|&v| v != u8::MAX) {
+                return off + idx;
+            }
+            off += 16;
+        }
+        off
     }
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
@@ -3448,6 +3610,45 @@ fn adjust_params_for_zero_source_size_uses_min_hinted_window_floor() {
     params.window_log = 22;
     let adjusted = adjust_params_for_source_size(params, 0);
     assert_eq!(adjusted.window_log, MIN_HINTED_WINDOW_LOG);
+}
+
+#[test]
+fn common_prefix_len_matches_scalar_reference_across_offsets() {
+    fn scalar_reference(a: &[u8], b: &[u8]) -> usize {
+        a.iter()
+            .zip(b.iter())
+            .take_while(|(lhs, rhs)| lhs == rhs)
+            .count()
+    }
+
+    for len in [0usize, 1, 5, 15, 16, 17, 31, 32, 33, 64, 65, 127, 191] {
+        let a: Vec<u8> = (0..len).map(|i| ((i * 13 + 7) & 0xFF) as u8).collect();
+        let b = a.clone();
+        assert_eq!(
+            MatchGenerator::common_prefix_len(&a, &b),
+            scalar_reference(&a, &b)
+        );
+
+        for mismatch in [0usize, 1, 7, 15, 16, 31, 32, 47, 63, 95, 127] {
+            if mismatch >= len {
+                continue;
+            }
+            let mut altered = b.clone();
+            altered[mismatch] ^= 0x5A;
+            assert_eq!(
+                MatchGenerator::common_prefix_len(&a, &altered),
+                scalar_reference(&a, &altered),
+                "len={len} mismatch={mismatch}"
+            );
+        }
+    }
+
+    let long = alloc::vec![0xAB; 320];
+    let shorter = alloc::vec![0xAB; 137];
+    assert_eq!(
+        MatchGenerator::common_prefix_len(&long, &shorter),
+        scalar_reference(&long, &shorter)
+    );
 }
 
 #[test]
