@@ -709,7 +709,7 @@ mod tests {
             self.last_space = space;
         }
 
-        fn skip_matching(&mut self) {}
+        fn skip_matching(&mut self, _incompressible_hint: Option<bool>) {}
 
         fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
             handle_sequence(Sequence::Literals {

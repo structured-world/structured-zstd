@@ -791,10 +791,10 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::HashChain => self.hc_matcher_mut().start_matching(&mut handle_sequence),
         }
     }
-    fn skip_matching(&mut self) {
+    fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.skip_matching(),
-            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(),
+            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(incompressible_hint),
             MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
         }
@@ -1650,13 +1650,15 @@ impl DfastMatchGenerator {
         }
     }
 
-    fn skip_matching(&mut self) {
+    fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_hash_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
 
-        if self.block_looks_incompressible(current_abs_start, current_abs_end) {
+        let used_sparse = incompressible_hint
+            .unwrap_or_else(|| self.block_looks_incompressible(current_abs_start, current_abs_end));
+        if used_sparse {
             self.insert_positions_with_step(
                 current_abs_start,
                 current_abs_end,
@@ -1666,12 +1668,14 @@ impl DfastMatchGenerator {
             self.insert_positions(current_abs_start, current_abs_end);
         }
 
-        // Always seed the tail densely so the next block can match immediately
-        // across the boundary even when we used sparse insertion above.
-        let dense_tail = DFAST_MIN_MATCH_LEN + 3;
-        let tail_start = current_abs_end.saturating_sub(dense_tail);
-        if tail_start < current_abs_end {
-            self.insert_positions(tail_start, current_abs_end);
+        // Seed the tail densely only after sparse insertion so the next block
+        // can match across the boundary without rehashing the full block twice.
+        if used_sparse {
+            let dense_tail = DFAST_MIN_MATCH_LEN + 3;
+            let tail_start = current_abs_end.saturating_sub(dense_tail);
+            if tail_start < current_abs_end {
+                self.insert_positions(tail_start, current_abs_end);
+            }
         }
     }
 
@@ -2953,7 +2957,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     first.truncate(12);
     driver.commit_space(first);
     assert_eq!(driver.get_last_space(), b"abcabcabcabc");
-    driver.skip_matching();
+    driver.skip_matching(None);
 
     let mut second = driver.get_next_space();
     second[..12].copy_from_slice(b"abcabcabcabc");
@@ -2998,7 +3002,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
     let full_tables = driver.dfast_matcher().short_hash.len();
     assert_eq!(full_tables, 1 << DFAST_HASH_BITS);
 
@@ -3008,7 +3012,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
     let hinted_tables = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
@@ -3028,7 +3032,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
     let full_rows = driver.row_matcher().row_heads.len();
     assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_LOG));
 
@@ -3038,7 +3042,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
     let hinted_rows = driver.row_matcher().row_heads.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
@@ -3214,7 +3218,7 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
 
     let table_len = driver.dfast_matcher().short_hash.len();
     assert_eq!(
@@ -3299,7 +3303,7 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
 
     // Switch to Fastest — must release HC tables.
     driver.reset(CompressionLevel::Fastest);
@@ -3329,7 +3333,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
     let better_hash_len = hc.hash_table.len();
@@ -3344,7 +3348,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching();
+    driver.skip_matching(None);
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
     assert!(
@@ -3604,7 +3608,7 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching();
+        driver.skip_matching(None);
     }
 
     assert_eq!(
@@ -3987,7 +3991,7 @@ fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching();
+        driver.skip_matching(None);
     }
 
     assert_eq!(
@@ -4018,7 +4022,7 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching();
+        driver.skip_matching(None);
     }
 
     assert_eq!(
@@ -4084,7 +4088,7 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching();
+        driver.skip_matching(None);
     }
 
     assert_eq!(
@@ -4397,9 +4401,9 @@ fn dfast_skip_matching_handles_window_eviction() {
     let mut matcher = DfastMatchGenerator::new(16);
 
     matcher.add_data(alloc::vec![1, 2, 3, 4, 5, 6], |_| {});
-    matcher.skip_matching();
+    matcher.skip_matching(None);
     matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
-    matcher.skip_matching();
+    matcher.skip_matching(None);
     matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
@@ -4514,6 +4518,70 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
         "expected tail-anchored cross-block match"
     );
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
+}
+
+#[test]
+fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
+    fn high_entropy_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 40) as u8);
+        }
+        out
+    }
+
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    let tail = b"Qz9kLm2Rp";
+    let mut first = high_entropy_bytes(4096);
+    let tail_start = first.len() - tail.len();
+    first[tail_start..].copy_from_slice(tail);
+    matcher.add_data(first.clone(), |_| {});
+
+    let current_abs_start = matcher.history_abs_start + matcher.window_size - first.len();
+    let current_abs_end = current_abs_start + first.len();
+    assert!(
+        matcher.block_looks_incompressible(current_abs_start, current_abs_end),
+        "test fixture must take the sparse incompressible branch"
+    );
+    matcher.skip_matching(None);
+
+    let mut second = tail.to_vec();
+    second.extend_from_slice(b"after-tail-literals");
+    matcher.add_data(second, |_| {});
+
+    let mut first_sequence = None;
+    matcher.start_matching(|seq| {
+        if first_sequence.is_some() {
+            return;
+        }
+        first_sequence = Some(match seq {
+            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => (literals.len(), offset, match_len),
+        });
+    });
+
+    let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
+    assert_eq!(
+        lit_len, 0,
+        "expected immediate cross-block match at block start"
+    );
+    assert_eq!(
+        offset,
+        tail.len(),
+        "expected match against densely seeded tail"
+    );
+    assert!(
+        match_len >= DFAST_MIN_MATCH_LEN,
+        "match length should satisfy dfast minimum match length"
+    );
 }
 
 #[test]

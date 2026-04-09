@@ -37,7 +37,7 @@ pub fn compress_block_encoded<M: Matcher>(
     if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
         let rle_byte = uncompressed_data[0];
         state.matcher.commit_space(uncompressed_data);
-        state.matcher.skip_matching();
+        state.matcher.skip_matching(None);
         let header = BlockHeader {
             last_block,
             block_type: crate::blocks::block::BlockType::RLE,
@@ -48,7 +48,7 @@ pub fn compress_block_encoded<M: Matcher>(
         output.push(rle_byte);
     } else if should_emit_raw_fast_path(compression_level, &uncompressed_data) {
         state.matcher.commit_space(uncompressed_data);
-        state.matcher.skip_matching();
+        state.matcher.skip_matching(Some(true));
         let header = BlockHeader {
             last_block,
             block_type: crate::blocks::block::BlockType::Raw,

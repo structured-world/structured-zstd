@@ -163,8 +163,11 @@ pub trait Matcher {
     fn get_last_space(&mut self) -> &[u8];
     /// Commit a space to the matcher so it can be matched against
     fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
-    /// Just process the data in the last commited space for future matching
-    fn skip_matching(&mut self);
+    /// Just process the data in the last committed space for future matching.
+    ///
+    /// `incompressible_hint` lets callers thread a precomputed block verdict
+    /// to avoid repeating expensive sampling in matcher backends.
+    fn skip_matching(&mut self, incompressible_hint: Option<bool>);
     /// Process the data in the last commited space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
