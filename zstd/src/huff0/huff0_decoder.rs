@@ -10,7 +10,7 @@ use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_
 use core::arch::asm;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
-    _bzhi_u64, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
+    _bzhi_u32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
@@ -49,6 +49,7 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if is_x86_feature_detected!("avx512vbmi2")
+                && is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512vl")
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("bmi2")
@@ -82,6 +83,7 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
     {
         if cfg!(all(
             target_feature = "avx512vbmi2",
+            target_feature = "avx512f",
             target_feature = "avx512vl",
             target_feature = "avx512bw",
             target_feature = "bmi2"
@@ -213,6 +215,12 @@ impl<'t> HuffmanDecoder<'t> {
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
         let kernel = decoders[0].kernel;
+        debug_assert!(decoders.iter().all(|d| d.kernel == kernel));
+        debug_assert!(
+            decoders
+                .iter()
+                .all(|d| core::ptr::eq(d.table, decoders[0].table))
+        );
         match kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HuffmanDecodeKernel::X86Vbmi2 => {
@@ -250,7 +258,7 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx512vbmi2,avx512vl,avx512bw")]
+    #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw")]
     unsafe fn decode4_symbols_and_num_bits_vbmi2(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
@@ -423,7 +431,15 @@ impl<'t> HuffmanDecoder<'t> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "bmi2")]
     unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
-        _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
+        #[cfg(target_arch = "x86_64")]
+        {
+            _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let shifted = ((self.state << num_bits) & u64::from(u32::MAX)) as u32;
+            u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
