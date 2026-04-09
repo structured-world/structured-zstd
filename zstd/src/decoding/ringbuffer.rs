@@ -1,6 +1,8 @@
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
+use super::simd_copy;
+
 pub struct RingBuffer {
     // Safety invariants:
     //
@@ -322,9 +324,11 @@ impl RingBuffer {
                 self.cap - self.tail,
             );
 
-            // SAFETY: `src` points at initialized data, `dst` points to writable memory
-            // and does not overlap `src`.
-            unsafe { copy_bytes_overshooting(src, dst, after_tail) }
+            // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+            // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+            // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+            // and source/destination regions do not overlap.
+            unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_tail) }
 
             if after_tail < len {
                 // The write section was not continuous:
@@ -352,9 +356,11 @@ impl RingBuffer {
                     self.head,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
-                unsafe { copy_bytes_overshooting(src, dst, len - after_tail) }
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
+                unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_tail) }
             }
         } else {
             #[allow(clippy::collapsible_else_if)]
@@ -388,9 +394,11 @@ impl RingBuffer {
                     self.head - self.tail,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
-                unsafe { copy_bytes_overshooting(src, dst, len) }
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
+                unsafe { simd_copy::copy_bytes_overshooting(src, dst, len) }
             } else {
                 // Possibly non continuous read section and continuous destination section:
                 //
@@ -421,9 +429,11 @@ impl RingBuffer {
                     self.head - self.tail,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
-                unsafe { copy_bytes_overshooting(src, dst, after_start) }
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
+                unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_start) }
 
                 if after_start < len {
                     // The read section was not continuous:
@@ -452,9 +462,11 @@ impl RingBuffer {
                         dst.1 - after_start,
                     );
 
-                    // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                    // and does not overlap `src`.
-                    unsafe { copy_bytes_overshooting(src, dst, len - after_start) }
+                    // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                    // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                    // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                    // and source/destination regions do not overlap.
+                    unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_start) }
                 }
             }
         }
@@ -543,70 +555,6 @@ impl Drop for RingBuffer {
     }
 }
 
-/// Similar to ptr::copy_nonoverlapping
-///
-/// But it might overshoot the desired copy length if deemed useful
-///
-/// src and dst specify the entire length they are eligible for reading/writing respectively
-/// in addition to the desired copy length.
-///
-/// This function will then copy in chunks and might copy up to chunk size - 1 more bytes from src to dst
-/// if that operation does not read/write memory that does not belong to src/dst.
-///
-/// The chunk size is not part of the contract and may change depending on the target platform.
-///
-/// If that isn't possible we just fall back to ptr::copy_nonoverlapping
-#[inline(always)]
-unsafe fn copy_bytes_overshooting(
-    src: (*const u8, usize),
-    dst: (*mut u8, usize),
-    copy_at_least: usize,
-) {
-    // By default use usize as the copy size
-    #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]
-    type CopyType = usize;
-
-    // Use u128 if we detect a simd feature
-    #[cfg(target_feature = "neon")]
-    type CopyType = u128;
-    #[cfg(target_feature = "sse2")]
-    type CopyType = u128;
-
-    const COPY_AT_ONCE_SIZE: usize = core::mem::size_of::<CopyType>();
-    let min_buffer_size = usize::min(src.1, dst.1);
-
-    // Can copy in just one read+write, very common case
-    unsafe {
-        if min_buffer_size >= COPY_AT_ONCE_SIZE && copy_at_least <= COPY_AT_ONCE_SIZE {
-            dst.0
-                .cast::<CopyType>()
-                .write_unaligned(src.0.cast::<CopyType>().read_unaligned())
-        } else {
-            let copy_multiple = copy_at_least.next_multiple_of(COPY_AT_ONCE_SIZE);
-            // Can copy in multiple simple instructions
-            if min_buffer_size >= copy_multiple {
-                let mut src_ptr = src.0.cast::<CopyType>();
-                let src_ptr_end = src.0.add(copy_multiple).cast::<CopyType>();
-                let mut dst_ptr = dst.0.cast::<CopyType>();
-
-                while src_ptr < src_ptr_end {
-                    dst_ptr.write_unaligned(src_ptr.read_unaligned());
-                    src_ptr = src_ptr.add(1);
-                    dst_ptr = dst_ptr.add(1);
-                }
-            } else {
-                // Fall back to standard memcopy
-                dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
-            }
-        }
-
-        debug_assert_eq!(
-            slice::from_raw_parts(src.0, copy_at_least),
-            slice::from_raw_parts(dst.0, copy_at_least)
-        );
-    }
-}
-
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -647,22 +595,39 @@ unsafe fn copy_with_checks(
     m2_in_f2: usize,
 ) {
     unsafe {
+        let m1_src_cap = m1_in_f1 + m1_in_f2;
+        let m2_src_cap = m2_in_f1 + m2_in_f2;
+        let f1_dst_cap = m1_in_f1 + m2_in_f1;
+        let f2_dst_cap = m1_in_f2 + m2_in_f2;
+
         if m1_in_f1 != 0 {
-            f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+            simd_copy::copy_bytes_overshooting(
+                (m1_ptr, m1_src_cap),
+                (f1_ptr, f1_dst_cap),
+                m1_in_f1,
+            );
         }
         if m2_in_f1 != 0 {
-            f1_ptr
-                .add(m1_in_f1)
-                .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+            simd_copy::copy_bytes_overshooting(
+                (m2_ptr, m2_src_cap),
+                (f1_ptr.add(m1_in_f1), m2_in_f1),
+                m2_in_f1,
+            );
         }
 
         if m1_in_f2 != 0 {
-            f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+            simd_copy::copy_bytes_overshooting(
+                (m1_ptr.add(m1_in_f1), m1_in_f2),
+                (f2_ptr, f2_dst_cap),
+                m1_in_f2,
+            );
         }
         if m2_in_f2 != 0 {
-            f2_ptr
-                .add(m1_in_f2)
-                .copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+            simd_copy::copy_bytes_overshooting(
+                (m2_ptr.add(m2_in_f1), m2_in_f2),
+                (f2_ptr.add(m1_in_f2), m2_in_f2),
+                m2_in_f2,
+            );
         }
     }
 }
@@ -681,6 +646,11 @@ unsafe fn copy_with_nobranch_check(
     m2_in_f2: usize,
 ) {
     unsafe {
+        let m1_src_cap = m1_in_f1 + m1_in_f2;
+        let m2_src_cap = m2_in_f1 + m2_in_f2;
+        let f1_dst_cap = m1_in_f1 + m2_in_f1;
+        let f2_dst_cap = m1_in_f2 + m2_in_f2;
+
         let case = (m1_in_f1 > 0) as usize
             | (((m2_in_f1 > 0) as usize) << 1)
             | (((m1_in_f2 > 0) as usize) << 2)
@@ -691,60 +661,132 @@ unsafe fn copy_with_nobranch_check(
 
             // one bit set
             1 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
             }
             2 => {
-                f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m2_in_f1,
+                );
             }
             4 => {
-                f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f2_ptr, f2_dst_cap),
+                    m1_in_f2,
+                );
             }
             8 => {
-                f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr, f2_dst_cap),
+                    m2_in_f2,
+                );
             }
 
             // two bit set
             3 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-                f1_ptr
-                    .add(m1_in_f1)
-                    .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr.add(m1_in_f1), m2_in_f1),
+                    m2_in_f1,
+                );
             }
             5 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-                f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr.add(m1_in_f1), m1_in_f2),
+                    (f2_ptr, f2_dst_cap),
+                    m1_in_f2,
+                );
             }
             6 => core::hint::unreachable_unchecked(),
             7 => core::hint::unreachable_unchecked(),
             9 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-                f2_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr, f2_dst_cap),
+                    m2_in_f2,
+                );
             }
             10 => {
-                f1_ptr.copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-                f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m2_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr.add(m2_in_f1), m2_in_f2),
+                    (f2_ptr, f2_dst_cap),
+                    m2_in_f2,
+                );
             }
             12 => {
-                f2_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f2);
-                f2_ptr
-                    .add(m1_in_f2)
-                    .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f2_ptr, f2_dst_cap),
+                    m1_in_f2,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr.add(m1_in_f2), m2_in_f2),
+                    m2_in_f2,
+                );
             }
 
             // three bit set
             11 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-                f1_ptr
-                    .add(m1_in_f1)
-                    .copy_from_nonoverlapping(m2_ptr, m2_in_f1);
-                f2_ptr.copy_from_nonoverlapping(m2_ptr.add(m2_in_f1), m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr.add(m1_in_f1), m2_in_f1),
+                    m2_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr.add(m2_in_f1), m2_in_f2),
+                    (f2_ptr, f2_dst_cap),
+                    m2_in_f2,
+                );
             }
             13 => {
-                f1_ptr.copy_from_nonoverlapping(m1_ptr, m1_in_f1);
-                f2_ptr.copy_from_nonoverlapping(m1_ptr.add(m1_in_f1), m1_in_f2);
-                f2_ptr
-                    .add(m1_in_f2)
-                    .copy_from_nonoverlapping(m2_ptr, m2_in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
+                    m1_in_f1,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m1_ptr.add(m1_in_f1), m1_in_f2),
+                    (f2_ptr, f2_dst_cap),
+                    m1_in_f2,
+                );
+                simd_copy::copy_bytes_overshooting(
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr.add(m1_in_f2), m2_in_f2),
+                    m2_in_f2,
+                );
             }
             14 => core::hint::unreachable_unchecked(),
             15 => core::hint::unreachable_unchecked(),
@@ -755,8 +797,10 @@ unsafe fn copy_with_nobranch_check(
 
 #[cfg(test)]
 mod tests {
-    use super::{RingBuffer, copy_bytes_overshooting, copy_with_checks, copy_with_nobranch_check};
-    use core::mem::size_of;
+    use alloc::vec;
+
+    use super::{RingBuffer, copy_with_checks, copy_with_nobranch_check};
+    use crate::decoding::simd_copy;
 
     fn assert_buffers_equal(expected: &RingBuffer, actual: &RingBuffer) {
         assert_eq!(expected.len(), actual.len());
@@ -782,11 +826,6 @@ mod tests {
 
         assert_buffers_equal(&checked, &branchless);
     }
-
-    #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]
-    const COPY_CHUNK_SIZE: usize = size_of::<usize>();
-    #[cfg(any(target_feature = "sse2", target_feature = "neon"))]
-    const COPY_CHUNK_SIZE: usize = size_of::<u128>();
 
     #[test]
     fn smoke() {
@@ -1014,26 +1053,34 @@ mod tests {
     }
 
     #[test]
-    fn copy_bytes_overshooting_covers_all_copy_strategies() {
-        let src_single = [1_u8; 64];
-        let mut dst_single = [0_u8; 64];
+    fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
+        // Validate correctness for lengths derived from the active runtime chunk:
+        // - single chunk (`chunk`)
+        // - multi chunk (`2 * chunk`)
+        // - fallback shape (`chunk + 1`)
+        // This checks copy semantics across runtime-selected strategies.
+        let chunk = simd_copy::active_chunk_size_for_tests();
+        let single_len = chunk;
+        let multi_len = chunk * 2;
+        let fallback_len = chunk + 1;
+        let overshoot_cap = chunk * 2;
+        let cap = multi_len + chunk;
+
+        let src_single = vec![1_u8; cap];
+        let mut dst_single = vec![0_u8; cap];
         unsafe {
-            copy_bytes_overshooting(
-                (src_single.as_ptr(), COPY_CHUNK_SIZE),
-                (dst_single.as_mut_ptr(), COPY_CHUNK_SIZE),
-                COPY_CHUNK_SIZE,
+            simd_copy::copy_bytes_overshooting(
+                (src_single.as_ptr(), single_len),
+                (dst_single.as_mut_ptr(), single_len),
+                single_len,
             );
         }
-        assert_eq!(
-            &dst_single[..COPY_CHUNK_SIZE],
-            &src_single[..COPY_CHUNK_SIZE]
-        );
+        assert_eq!(&dst_single[..single_len], &src_single[..single_len]);
 
-        let multi_len = COPY_CHUNK_SIZE * 2;
-        let src_multi = [2_u8; 64];
-        let mut dst_multi = [0_u8; 64];
+        let src_multi = vec![2_u8; cap];
+        let mut dst_multi = vec![0_u8; cap];
         unsafe {
-            copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting(
                 (src_multi.as_ptr(), multi_len),
                 (dst_multi.as_mut_ptr(), multi_len),
                 multi_len,
@@ -1041,16 +1088,29 @@ mod tests {
         }
         assert_eq!(&dst_multi[..multi_len], &src_multi[..multi_len]);
 
-        let fallback_len = COPY_CHUNK_SIZE + 1;
-        let src_fallback = [3_u8; 64];
-        let mut dst_fallback = [0_u8; 64];
+        let src_fallback = vec![3_u8; cap];
+        let mut dst_fallback = vec![0_u8; cap];
         unsafe {
-            copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting(
                 (src_fallback.as_ptr(), fallback_len),
                 (dst_fallback.as_mut_ptr(), fallback_len),
                 fallback_len,
             );
         }
         assert_eq!(&dst_fallback[..fallback_len], &src_fallback[..fallback_len]);
+
+        let src_overshoot = vec![4_u8; cap + 1];
+        let mut dst_overshoot = vec![0_u8; cap + 1];
+        unsafe {
+            simd_copy::copy_bytes_overshooting(
+                (src_overshoot.as_ptr().add(1), overshoot_cap),
+                (dst_overshoot.as_mut_ptr().add(1), overshoot_cap),
+                fallback_len,
+            );
+        }
+        assert_eq!(
+            &dst_overshoot[1..1 + fallback_len],
+            &src_overshoot[1..1 + fallback_len]
+        );
     }
 }
