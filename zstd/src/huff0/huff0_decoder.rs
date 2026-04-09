@@ -263,13 +263,15 @@ impl<'t> HuffmanDecoder<'t> {
         );
 
         // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
-        let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
-        let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
+        let symbols_bytes = unsafe { _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed) };
+        let bits_bytes = unsafe { _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed) };
 
         let mut symbols_tmp = [0_u8; 16];
         let mut bits_tmp = [0_u8; 16];
-        _mm_storeu_si128(symbols_tmp.as_mut_ptr().cast(), symbols_bytes);
-        _mm_storeu_si128(bits_tmp.as_mut_ptr().cast(), bits_bytes);
+        unsafe {
+            _mm_storeu_si128(symbols_tmp.as_mut_ptr().cast(), symbols_bytes);
+            _mm_storeu_si128(bits_tmp.as_mut_ptr().cast(), bits_bytes);
+        }
         (
             [
                 symbols_tmp[0],
@@ -293,10 +295,13 @@ impl<'t> HuffmanDecoder<'t> {
             decoders[1].state as i32,
             decoders[0].state as i32,
         );
-        let gathered = _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4);
+        let gathered =
+            unsafe { _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4) };
 
         let mut packed = [0_i32; 4];
-        _mm_storeu_si128(packed.as_mut_ptr().cast(), gathered);
+        unsafe {
+            _mm_storeu_si128(packed.as_mut_ptr().cast(), gathered);
+        }
 
         let mut symbols = [0_u8; 4];
         let mut num_bits = [0_u8; 4];
@@ -372,14 +377,18 @@ impl<'t> HuffmanDecoder<'t> {
                 "ld1w z0.s, p0/z, [{inptr}]",
                 "mov z1.d, z0.d",
                 "lsr z2.s, z0.s, #8",
-                "and z1.d, z1.d, #0xff",
-                "and z2.d, z2.d, #0xff",
+                "and z1.s, z1.s, #0xff",
+                "and z2.s, z2.s, #0xff",
                 "st1w z1.s, p0, [{symptr}]",
                 "st1w z2.s, p0, [{bitptr}]",
                 inptr = in(reg) packed_scalar.as_ptr(),
                 symptr = in(reg) symbols_u32.as_mut_ptr(),
                 bitptr = in(reg) bits_u32.as_mut_ptr(),
                 lanes = in(reg) lanes,
+                lateout("z0") _,
+                lateout("z1") _,
+                lateout("z2") _,
+                lateout("p0") _,
                 options(nostack, preserves_flags),
             );
         }
@@ -407,7 +416,7 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode_symbol_and_advance_x86_bmi2(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
-        self.state = self.advance_state_x86_bmi2(entry.num_bits, new_bits);
+        self.state = unsafe { self.advance_state_x86_bmi2(entry.num_bits, new_bits) };
         entry.symbol
     }
 

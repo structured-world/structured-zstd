@@ -41,7 +41,7 @@ fn bench_decode(c: &mut Criterion) {
 
     let literals_heavy = make_literals_heavy_payload(16 * 1024 * 1024);
     let compressed = compress_to_vec(&literals_heavy[..], CompressionLevel::Default);
-    group.throughput(Throughput::Bytes(literals_heavy.len() as u64));
+    group.throughput(Throughput::Bytes(compressed.len() as u64));
 
     let mut heavy_decoder = FrameDecoder::new();
     let mut heavy_target = vec![0u8; literals_heavy.len()];
