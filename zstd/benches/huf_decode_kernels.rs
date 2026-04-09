@@ -26,14 +26,12 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_huf_kernels");
 
     let corpus_src = include_bytes!("../decodecorpus_files/z000033.zst").as_slice();
-    let mut corpus_probe_decoder = FrameDecoder::new();
-    let mut corpus_probe_target = vec![0u8; 1024 * 1024 * 200];
-    let corpus_decoded = corpus_probe_decoder
-        .decode_all(corpus_src, &mut corpus_probe_target)
-        .unwrap();
-    group.throughput(Throughput::Bytes(corpus_decoded as u64));
     let mut corpus_decoder = FrameDecoder::new();
     let mut corpus_target = vec![0u8; 1024 * 1024 * 200];
+    let corpus_decoded = corpus_decoder
+        .decode_all(corpus_src, &mut corpus_target)
+        .unwrap();
+    group.throughput(Throughput::Bytes(corpus_decoded as u64));
     group.bench_with_input(
         BenchmarkId::new("corpus_reference", "z000033.zst"),
         &corpus_src,

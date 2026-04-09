@@ -469,7 +469,7 @@ impl<'t> HuffmanDecoder<'t> {
                 lateout("z1") _,
                 lateout("z2") _,
                 lateout("p0") _,
-                options(nostack),
+                options(nostack, preserves_flags),
             );
         }
 
