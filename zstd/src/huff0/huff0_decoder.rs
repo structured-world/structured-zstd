@@ -204,15 +204,9 @@ impl<'t> HuffmanDecoder<'t> {
                 unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
             }
             #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Neon => {
-                // SAFETY: This path is selected only after runtime/static feature checks.
-                unsafe { self.decode_symbol_and_advance_aarch64_neon(br) }
-            }
+            HuffmanDecodeKernel::Aarch64Neon => self.decode_symbol_and_advance_aarch64_neon(br),
             #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Sve => {
-                // SAFETY: This path is selected only after runtime/static feature checks.
-                unsafe { self.decode_symbol_and_advance_aarch64_sve(br) }
-            }
+            HuffmanDecodeKernel::Aarch64Sve => self.decode_symbol_and_advance_aarch64_sve(br),
         }
     }
 
@@ -520,11 +514,7 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
-    unsafe fn decode_symbol_and_advance_aarch64_neon(
-        &mut self,
-        br: &mut BitReaderReversed<'_>,
-    ) -> u8 {
+    fn decode_symbol_and_advance_aarch64_neon(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
         self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
@@ -532,11 +522,7 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "sve")]
-    unsafe fn decode_symbol_and_advance_aarch64_sve(
-        &mut self,
-        br: &mut BitReaderReversed<'_>,
-    ) -> u8 {
+    fn decode_symbol_and_advance_aarch64_sve(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
         self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
