@@ -42,7 +42,9 @@ fn cross_rust_compress_ffi_decompress_1000() {
         let data = generate_data(i, len);
 
         let compressed = compress_to_vec(&data[..], CompressionLevel::Fastest);
-        let result = zstd::decode_all(compressed.as_slice()).unwrap();
+        let result = zstd::decode_all(compressed.as_slice()).unwrap_or_else(|e| {
+            panic!("rust→ffi decode failed at iteration {i}, len={len}: {e}");
+        });
         assert_eq!(
             data, result,
             "rust→ffi roundtrip failed at iteration {i}, len={len}"

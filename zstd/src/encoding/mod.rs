@@ -37,8 +37,28 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 /// ```
 pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
+    let mut source = source;
+    let mut input = Vec::new();
+    source.read_to_end(&mut input).unwrap();
+
     let mut vec = Vec::new();
-    compress(source, &mut vec, level);
+    let mut frame_enc = FrameCompressor::new(level);
+    // Keep one-shot source-size adaptation scoped to default-level (dfast)
+    // behavior for now. Applying it to all levels currently regresses
+    // Fastest↔FFI cross-validation.
+    let should_hint = matches!(
+        level,
+        CompressionLevel::Default
+            | CompressionLevel::Level(0)
+            | CompressionLevel::Level(2)
+            | CompressionLevel::Level(3)
+    );
+    if should_hint {
+        frame_enc.set_source_size_hint(input.len() as u64);
+    }
+    frame_enc.set_source(input.as_slice());
+    frame_enc.set_drain(&mut vec);
+    frame_enc.compress();
     vec
 }
 
