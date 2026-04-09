@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/structured-world/structured-zstd/compare/v0.0.12...v0.0.13) - 2026-04-09
+
+### Performance
+
+- *(decoding)* SIMD HUF kernels with runtime dispatch ([#92](https://github.com/structured-world/structured-zstd/pull/92))
+
 ## [0.0.12](https://github.com/structured-world/structured-zstd/compare/v0.0.11...v0.0.12) - 2026-04-09
 
 ### Performance
