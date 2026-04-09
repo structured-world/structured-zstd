@@ -6,6 +6,8 @@ use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
+#[cfg(target_arch = "aarch64")]
+use core::arch::asm;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
     _bzhi_u64, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
@@ -349,17 +351,45 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode4_symbols_and_num_bits_sve(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
-        // Stable Rust does not currently expose portable SVE vector intrinsics
-        // in core::arch; keep a dedicated SVE dispatch target and reuse the
-        // packed decode layout with scalar extraction.
         let table = decoders[0].table;
+        let packed_scalar = [
+            table.packed_decode[decoders[0].state as usize],
+            table.packed_decode[decoders[1].state as usize],
+            table.packed_decode[decoders[2].state as usize],
+            table.packed_decode[decoders[3].state as usize],
+        ];
+
+        let mut symbols_u32 = [0_u32; 4];
+        let mut bits_u32 = [0_u32; 4];
+        let lanes = 4_usize;
+
+        // Stable Rust does not yet expose SVE intrinsics in core::arch.
+        // Use SVE inline asm for 4-lane packed-entry unpack:
+        // symbol = packed & 0xff; bits = (packed >> 8) & 0xff.
+        unsafe {
+            asm!(
+                "whilelt p0.s, xzr, {lanes}",
+                "ld1w z0.s, p0/z, [{inptr}]",
+                "mov z1.d, z0.d",
+                "lsr z2.s, z0.s, #8",
+                "and z1.d, z1.d, #0xff",
+                "and z2.d, z2.d, #0xff",
+                "st1w z1.s, p0, [{symptr}]",
+                "st1w z2.s, p0, [{bitptr}]",
+                inptr = in(reg) packed_scalar.as_ptr(),
+                symptr = in(reg) symbols_u32.as_mut_ptr(),
+                bitptr = in(reg) bits_u32.as_mut_ptr(),
+                lanes = in(reg) lanes,
+                options(nostack, preserves_flags),
+            );
+        }
+
         let mut symbols = [0_u8; 4];
         let mut bits = [0_u8; 4];
         let mut i = 0;
         while i < 4 {
-            let packed = table.packed_decode[decoders[i].state as usize];
-            symbols[i] = (packed & 0xFF) as u8;
-            bits[i] = ((packed >> 8) & 0xFF) as u8;
+            symbols[i] = symbols_u32[i] as u8;
+            bits[i] = bits_u32[i] as u8;
             i += 1;
         }
         (symbols, bits)
