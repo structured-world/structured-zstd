@@ -263,8 +263,8 @@ impl<'t> HuffmanDecoder<'t> {
         );
 
         // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
-        let symbols_bytes = unsafe { _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed) };
-        let bits_bytes = unsafe { _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed) };
+        let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
+        let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
 
         let mut symbols_tmp = [0_u8; 16];
         let mut bits_tmp = [0_u8; 16];
