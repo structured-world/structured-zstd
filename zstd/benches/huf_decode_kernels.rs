@@ -26,7 +26,12 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_huf_kernels");
 
     let corpus_src = include_bytes!("../decodecorpus_files/z000033.zst").as_slice();
-    group.throughput(Throughput::Bytes(corpus_src.len() as u64));
+    let mut corpus_probe_decoder = FrameDecoder::new();
+    let mut corpus_probe_target = vec![0u8; 1024 * 1024 * 200];
+    let corpus_decoded = corpus_probe_decoder
+        .decode_all(corpus_src, &mut corpus_probe_target)
+        .unwrap();
+    group.throughput(Throughput::Bytes(corpus_decoded as u64));
     let mut corpus_decoder = FrameDecoder::new();
     let mut corpus_target = vec![0u8; 1024 * 1024 * 200];
     group.bench_with_input(
@@ -41,7 +46,7 @@ fn bench_decode(c: &mut Criterion) {
 
     let literals_heavy = make_literals_heavy_payload(16 * 1024 * 1024);
     let compressed = compress_to_vec(&literals_heavy[..], CompressionLevel::Default);
-    group.throughput(Throughput::Bytes(compressed.len() as u64));
+    group.throughput(Throughput::Bytes(literals_heavy.len() as u64));
 
     let mut heavy_decoder = FrameDecoder::new();
     let mut heavy_target = vec![0u8; literals_heavy.len()];

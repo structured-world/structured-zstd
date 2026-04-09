@@ -10,11 +10,13 @@ use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_
 use core::arch::asm;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
-    _bzhi_u32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
+    _bzhi_u32, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
+    _mm_srli_si128,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    _bzhi_u64, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
+    _bzhi_u64, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
+    _mm_srli_si128,
 };
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
@@ -296,20 +298,13 @@ impl<'t> HuffmanDecoder<'t> {
         let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
         let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
 
-        let mut symbols_tmp = [0_u8; 16];
-        let mut bits_tmp = [0_u8; 16];
-        unsafe {
-            _mm_storeu_si128(symbols_tmp.as_mut_ptr().cast(), symbols_bytes);
-            _mm_storeu_si128(bits_tmp.as_mut_ptr().cast(), bits_bytes);
-        }
+        let symbols_word = _mm_cvtsi128_si32(symbols_bytes) as u32;
+        let bits_word = _mm_cvtsi128_si32(bits_bytes) as u32;
+        let symbols = symbols_word.to_le_bytes();
+        let bits = bits_word.to_le_bytes();
         (
-            [
-                symbols_tmp[0],
-                symbols_tmp[1],
-                symbols_tmp[2],
-                symbols_tmp[3],
-            ],
-            [bits_tmp[0], bits_tmp[1], bits_tmp[2], bits_tmp[3]],
+            [symbols[0], symbols[1], symbols[2], symbols[3]],
+            [bits[0], bits[1], bits[2], bits[3]],
         )
     }
 
@@ -328,16 +323,18 @@ impl<'t> HuffmanDecoder<'t> {
         let gathered =
             unsafe { _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4) };
 
-        let mut packed = [0_i32; 4];
-        unsafe {
-            _mm_storeu_si128(packed.as_mut_ptr().cast(), gathered);
-        }
+        let packed = [
+            _mm_cvtsi128_si32(gathered) as u32,
+            _mm_cvtsi128_si32(_mm_srli_si128::<4>(gathered)) as u32,
+            _mm_cvtsi128_si32(_mm_srli_si128::<8>(gathered)) as u32,
+            _mm_cvtsi128_si32(_mm_srli_si128::<12>(gathered)) as u32,
+        ];
 
         let mut symbols = [0_u8; 4];
         let mut num_bits = [0_u8; 4];
         let mut i = 0;
         while i < 4 {
-            let v = packed[i] as u32;
+            let v = packed[i];
             symbols[i] = (v & 0xFF) as u8;
             num_bits[i] = ((v >> 8) & 0xFF) as u8;
             i += 1;
