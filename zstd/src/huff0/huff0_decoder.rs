@@ -158,9 +158,9 @@ impl<'t> HuffmanDecoder<'t> {
         self.decode_symbol()
     }
 
-    /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
-    /// to read the byte the internal cursor is pointing at, and `next_state` can be called to advance
-    /// the cursor until the max number of bits has been read.
+    /// Initialize internal state and prepare to decode data.
+    /// Then `decode_symbol_and_advance` can be used for full decode steps, or
+    /// `decode_symbol_and_num_bits` + `advance_state_by_bits` can be used for batched decode loops.
     #[inline(always)]
     pub fn init_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let num_bits = self.table.max_num_bits;

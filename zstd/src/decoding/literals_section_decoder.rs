@@ -145,10 +145,10 @@ fn decompress_literals(
         let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
-        // Fast interleaved loop: while all 4 streams have bits remaining,
-        // issue 4 independent table lookups then 4 independent state advances
-        // per iteration. This gives the CPU's out-of-order engine more
-        // independent work to schedule, hiding table-lookup latency.
+        // Fast interleaved loop: decode 4 symbols/bit-counts via decode4 helper
+        // (which may use packed/SIMD gather+unpack kernels), then advance the
+        // 4 stream states independently. This gives the CPU's out-of-order
+        // engine more independent work to schedule, hiding decode latency.
         if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
             while brs[0].bits_remaining() > -max_bits
                 && brs[1].bits_remaining() > -max_bits
