@@ -1,4 +1,6 @@
 use core::convert::TryInto;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+use std::sync::OnceLock;
 
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
 /// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
@@ -42,6 +44,82 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
     {
         value & BIT_MASK[n as usize]
     }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[derive(Copy, Clone)]
+struct TripleExtractDispatch {
+    use_pext: bool,
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+static TRIPLE_EXTRACT_DISPATCH: OnceLock<TripleExtractDispatch> = OnceLock::new();
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn should_use_pext(vendor: [u8; 12], family: u32) -> bool {
+    vendor != *b"AuthenticAMD" || family != 0x17
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn triple_extract_dispatch() -> &'static TripleExtractDispatch {
+    TRIPLE_EXTRACT_DISPATCH.get_or_init(detect_triple_extract_dispatch)
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
+    use core::arch::x86_64::__cpuid;
+    use std::arch::is_x86_feature_detected;
+
+    if !is_x86_feature_detected!("bmi2") {
+        return TripleExtractDispatch { use_pext: false };
+    }
+
+    // AMD Zen1/Zen2 execute PEXT/PDEP through a slow microcode path.
+    // Keep scalar extraction there and enable PEXT on Intel and newer AMD.
+    let leaf0 = __cpuid(0);
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+    let eax = __cpuid(1).eax;
+    let base_family = (eax >> 8) & 0xF;
+    let ext_family = (eax >> 20) & 0xFF;
+    let family = if base_family == 0xF {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+
+    TripleExtractDispatch {
+        use_pext: should_use_pext(vendor, family),
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
+fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
+    if !triple_extract_dispatch().use_pext {
+        return None;
+    }
+
+    Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::_pext_u64;
+
+    let mask3 = BIT_MASK[n3 as usize];
+    let mask2 = BIT_MASK[n2 as usize].wrapping_shl(u32::from(n3));
+    let mask1 = BIT_MASK[n1 as usize].wrapping_shl(u32::from(n2) + u32::from(n3));
+
+    let val1 = _pext_u64(all_three, mask1);
+    let val2 = _pext_u64(all_three, mask2);
+    let val3 = _pext_u64(all_three, mask3);
+    (val1, val2, val3)
 }
 
 /// Zstandard encodes some types of data in a way that the data must be read
@@ -225,6 +303,11 @@ impl<'s> BitReaderReversed<'s> {
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if let Some(values) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
+            return values;
+        }
+
         let val1 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
         let val2 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
         let val3 = mask_lower_bits(all_three, n3);
@@ -264,6 +347,29 @@ impl<'s> BitReaderReversed<'s> {
 
 #[cfg(test)]
 mod test {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    use std::arch::is_x86_feature_detected;
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[inline]
+    fn scalar_extract_triple(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        let val3 = all_three & super::BIT_MASK[n3 as usize];
+        let val2 = all_three.wrapping_shr(u32::from(n3)) & super::BIT_MASK[n2 as usize];
+        let val1 =
+            all_three.wrapping_shr(u32::from(n2) + u32::from(n3)) & super::BIT_MASK[n1 as usize];
+        (val1, val2, val3)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[inline]
+    fn next_test_value(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
 
     #[test]
     fn it_works() {
@@ -441,5 +547,79 @@ mod test {
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn should_use_pext_policy_table() {
+        let cases = [
+            (*b"AuthenticAMD", 0x17, false),
+            (*b"AuthenticAMD", 0x19, true),
+            (*b"GenuineIntel", 0x06, true),
+        ];
+
+        for (vendor, family, expected) in cases {
+            assert_eq!(super::should_use_pext(vendor, family), expected);
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn bmi2_triple_extract_matches_scalar_reference() {
+        if !is_x86_feature_detected!("bmi2") {
+            return;
+        }
+
+        let widths = [
+            (0, 0, 0),
+            (1, 1, 1),
+            (3, 5, 7),
+            (8, 8, 8),
+            (15, 16, 17),
+            (21, 21, 21),
+            (0, 13, 27),
+            (31, 0, 1),
+            (1, 31, 0),
+            (20, 20, 24),
+        ];
+        let fixed_values = [
+            0,
+            1,
+            u64::MAX,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            1u64 << 63,
+            (1u64 << 32) - 1,
+        ];
+
+        for &(n1, n2, n3) in &widths {
+            for &all_three in &fixed_values {
+                let expected = scalar_extract_triple(all_three, n1, n2, n3);
+                let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
+                assert_eq!(pext, expected);
+
+                if let Some(dispatched) = super::try_extract_triple_with_pext(all_three, n1, n2, n3)
+                {
+                    assert_eq!(dispatched, expected);
+                }
+            }
+        }
+
+        let mut state = 0xD6E8_FD9D_5A2C_19B7u64;
+        for &(n1, n2, n3) in &widths {
+            for _ in 0..64 {
+                let all_three = next_test_value(&mut state);
+                let expected = scalar_extract_triple(all_three, n1, n2, n3);
+                let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
+                assert_eq!(pext, expected);
+
+                if let Some(dispatched) = super::try_extract_triple_with_pext(all_three, n1, n2, n3)
+                {
+                    assert_eq!(dispatched, expected);
+                }
+            }
+        }
     }
 }

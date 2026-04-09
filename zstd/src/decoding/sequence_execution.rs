@@ -17,6 +17,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 
     for idx in 0..scratch.sequences.len() {
         let seq = scratch.sequences[idx];
+        prefetch_literals_n_plus_two(scratch, idx, literals_copy_counter);
 
         if seq.ll > 0 {
             let high = literals_copy_counter + seq.ll as usize;
@@ -27,7 +28,6 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
                 });
             }
             let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            prefetch_literals(literals);
             literals_copy_counter += seq.ll as usize;
 
             scratch.buffer.push(literals);
@@ -66,64 +66,208 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
 fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let actual_offset = if lit_len > 0 {
-        match offset_value {
-            1..=3 => scratch[offset_value as usize - 1],
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
-    } else {
-        match offset_value {
-            1..=2 => scratch[offset_value as usize],
-            3 => scratch[0] - 1,
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
-    };
-
-    //update history
-    if lit_len > 0 {
-        match offset_value {
-            1 => {
-                //nothing
-            }
-            2 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
-    } else {
-        match offset_value {
-            1 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            2 => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
+    #[derive(Copy, Clone)]
+    struct Rule {
+        scratch_idx: usize,
+        use_new_offset: bool,
+        subtract_one: bool,
+        update_mode: u8,
     }
+
+    // update_mode:
+    // 0 = no history update
+    // 1 = [actual, old0, old2]
+    // 2 = [actual, old0, old1]
+    // Indexing: class * 2 + lit_is_zero
+    const RULES: [Rule; 8] = [
+        // class=0 (offset_value=1)
+        Rule {
+            // lit_len > 0
+            scratch_idx: 0,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 0,
+        },
+        Rule {
+            // lit_len == 0
+            scratch_idx: 1,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 1,
+        },
+        // class=1 (offset_value=2)
+        Rule {
+            // lit_len > 0
+            scratch_idx: 1,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 1,
+        },
+        Rule {
+            // lit_len == 0
+            scratch_idx: 2,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 2,
+        },
+        // class=2 (offset_value=3)
+        Rule {
+            // lit_len > 0
+            scratch_idx: 2,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 2,
+        },
+        Rule {
+            // lit_len == 0
+            scratch_idx: 0,
+            use_new_offset: false,
+            subtract_one: true,
+            update_mode: 2,
+        },
+        // class=3 (offset_value>=4)
+        Rule {
+            // lit_len > 0
+            scratch_idx: 0,
+            use_new_offset: true,
+            subtract_one: false,
+            update_mode: 2,
+        },
+        Rule {
+            // lit_len == 0
+            scratch_idx: 0,
+            use_new_offset: true,
+            subtract_one: false,
+            update_mode: 2,
+        },
+    ];
+
+    #[inline(always)]
+    fn mask_from_bool(cond: bool) -> u32 {
+        0u32.wrapping_sub(u32::from(cond))
+    }
+
+    #[inline(always)]
+    fn select_u32(a: u32, b: u32, choose_b: bool) -> u32 {
+        let mask = mask_from_bool(choose_b);
+        (a & !mask) | (b & mask)
+    }
+
+    let valid_offset = offset_value != 0;
+    let class = offset_value.saturating_sub(1).min(3) as usize;
+    let lit_is_zero = usize::from(lit_len == 0);
+    let rule = RULES[class * 2 + lit_is_zero];
+
+    let from_history = scratch[rule.scratch_idx];
+    let from_new = offset_value.wrapping_sub(3);
+    let mut actual_offset = select_u32(from_new, from_history, !rule.use_new_offset);
+    actual_offset = actual_offset.wrapping_sub(u32::from(rule.subtract_one));
+    actual_offset = select_u32(actual_offset, 0, !valid_offset);
+
+    let old0 = scratch[0];
+    let old1 = scratch[1];
+    let old2 = scratch[2];
+
+    let update_none = rule.update_mode == 0 || !valid_offset;
+    let update_b = rule.update_mode == 2 && valid_offset;
+    let update_any = !update_none;
+
+    scratch[0] = select_u32(old0, actual_offset, update_any);
+    scratch[1] = select_u32(old0, old1, update_none);
+    scratch[2] = select_u32(old2, old1, update_b);
 
     actual_offset
 }
 
 #[inline(always)]
-fn prefetch_literals(slice: &[u8]) {
-    prefetch::prefetch_slice(slice);
+fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_cursor: usize) {
+    if idx + 2 >= scratch.sequences.len() {
+        return;
+    }
+
+    let ll_curr = scratch.sequences[idx].ll as usize;
+    let ll_next = scratch.sequences[idx + 1].ll as usize;
+    let ll_n2 = scratch.sequences[idx + 2].ll as usize;
+    if ll_n2 < 64 {
+        return;
+    }
+
+    let (start, overflow_a) = literals_cursor.overflowing_add(ll_curr);
+    let (start, overflow_b) = start.overflowing_add(ll_next);
+    let (end, overflow_c) = start.overflowing_add(ll_n2);
+    if !(overflow_a || overflow_b || overflow_c)
+        && start <= end
+        && end <= scratch.literals_buffer.len()
+    {
+        prefetch::prefetch_slice(&scratch.literals_buffer[start..end]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::do_offset_history;
+
+    #[test]
+    fn offset_history_lit_non_zero_rep1_keeps_history() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(1, 5, &mut hist);
+        assert_eq!(actual, 10);
+        assert_eq!(hist, [10, 20, 30]);
+    }
+
+    #[test]
+    fn offset_history_lit_non_zero_rep2_rotates_first_two() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(2, 5, &mut hist);
+        assert_eq!(actual, 20);
+        assert_eq!(hist, [20, 10, 30]);
+    }
+
+    #[test]
+    fn offset_history_lit_non_zero_rep3_full_rotate() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(3, 5, &mut hist);
+        assert_eq!(actual, 30);
+        assert_eq!(hist, [30, 10, 20]);
+    }
+
+    #[test]
+    fn offset_history_lit_zero_rep1_uses_second_history() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(1, 0, &mut hist);
+        assert_eq!(actual, 20);
+        assert_eq!(hist, [20, 10, 30]);
+    }
+
+    #[test]
+    fn offset_history_lit_zero_rep2_uses_third_history() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(2, 0, &mut hist);
+        assert_eq!(actual, 30);
+        assert_eq!(hist, [30, 10, 20]);
+    }
+
+    #[test]
+    fn offset_history_lit_zero_rep3_minus_one() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(3, 0, &mut hist);
+        assert_eq!(actual, 9);
+        assert_eq!(hist, [9, 10, 20]);
+    }
+
+    #[test]
+    fn offset_history_new_offset_path() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(9, 1, &mut hist);
+        assert_eq!(actual, 6);
+        assert_eq!(hist, [6, 10, 20]);
+    }
+
+    #[test]
+    fn offset_history_zero_offset_preserves_error_path() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(0, 1, &mut hist);
+        assert_eq!(actual, 0);
+        assert_eq!(hist, [10, 20, 30]);
+    }
 }

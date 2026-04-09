@@ -91,7 +91,7 @@ impl DecodeBuffer {
             let end_idx = start_idx + match_length;
 
             self.buffer.reserve(match_length);
-            self.prefetch_match_source(start_idx);
+            self.prefetch_match_source(start_idx, match_length);
             if end_idx > buf_len {
                 self.repeat_overlapping(offset, match_length, start_idx);
             } else {
@@ -205,14 +205,17 @@ impl DecodeBuffer {
     }
 
     #[inline(always)]
-    fn prefetch_match_source(&self, start_idx: usize) {
+    fn prefetch_match_source(&self, start_idx: usize, match_length: usize) {
+        if match_length < 64 {
+            return;
+        }
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {
-            prefetch::prefetch_slice(&s1[start_idx..]);
+            prefetch::prefetch_slice_t1(&s1[start_idx..]);
         } else {
             let idx = start_idx - s1.len();
             if idx < s2.len() {
-                prefetch::prefetch_slice(&s2[idx..]);
+                prefetch::prefetch_slice_t1(&s2[idx..]);
             }
         }
     }
