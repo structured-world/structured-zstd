@@ -298,6 +298,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => compress_block_encoded(
                     &mut self.state,
+                    self.compression_level,
                     last_block,
                     uncompressed_data,
                     &mut all_blocks,
@@ -461,10 +462,32 @@ mod tests {
     use alloc::vec;
 
     use super::FrameCompressor;
+    use crate::blocks::block::BlockType;
     use crate::common::MAGIC_NUM;
-    use crate::decoding::FrameDecoder;
+    use crate::decoding::{FrameDecoder, block_decoder, frame::read_frame_header};
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    fn generate_data(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.push((state >> 33) as u8);
+        }
+        data
+    }
+
+    fn first_block_type(frame: &[u8]) -> BlockType {
+        let (_, header_size) = read_frame_header(frame).expect("frame header should parse");
+        let mut decoder = block_decoder::new();
+        let (header, _) = decoder
+            .read_block_header(&frame[header_size as usize..])
+            .expect("block header should parse");
+        header.block_type
+    }
 
     /// Frame content size is written correctly and C zstd can decompress the output.
     #[cfg(feature = "std")]
@@ -601,6 +624,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn fastest_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xC0FF_EE11, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Fastest);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn default_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xD15E_A5ED, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Default);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compressible_logs_do_not_fall_back_to_raw_fast_path() {
+        let mut data = Vec::with_capacity(16 * 1024);
+        const LINE: &[u8] =
+            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
+        while data.len() < 16 * 1024 {
+            let remaining = 16 * 1024 - data.len();
+            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
+        }
+
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Fastest);
+        assert_ne!(first_block_type(&compressed), BlockType::Raw);
+        assert!(
+            compressed.len() < data.len(),
+            "compressible input should remain compressible"
+        );
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
     }
 
     struct NoDictionaryMatcher {

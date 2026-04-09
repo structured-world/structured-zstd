@@ -374,7 +374,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
-                    compress_block_encoded(&mut self.state, last_block, block, &mut encoded);
+                    compress_block_encoded(
+                        &mut self.state,
+                        self.compression_level,
+                        last_block,
+                        block,
+                        &mut encoded,
+                    );
                     moved_into_matcher = true;
                 }
             }

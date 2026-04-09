@@ -1568,6 +1568,8 @@ fn pick_lazy_match_shared(
 }
 
 impl DfastMatchGenerator {
+    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+
     fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
@@ -1642,7 +1644,25 @@ impl DfastMatchGenerator {
         self.ensure_hash_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        self.insert_positions(current_abs_start, current_abs_start + current_len);
+        let current_abs_end = current_abs_start + current_len;
+
+        if self.block_looks_incompressible(current_abs_start, current_abs_end) {
+            self.insert_positions_with_step(
+                current_abs_start,
+                current_abs_end,
+                Self::INCOMPRESSIBLE_SKIP_STEP,
+            );
+        } else {
+            self.insert_positions(current_abs_start, current_abs_end);
+        }
+
+        // Always seed the tail densely so the next block can match immediately
+        // across the boundary even when we used sparse insertion above.
+        let dense_tail = DFAST_MIN_MATCH_LEN + 3;
+        let tail_start = current_abs_end.saturating_sub(dense_tail);
+        if tail_start < current_abs_end {
+            self.insert_positions(tail_start, current_abs_end);
+        }
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -1825,8 +1845,24 @@ impl DfastMatchGenerator {
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
+        let start = start.max(self.history_abs_start);
+        let end = end.min(self.history_abs_end());
         for pos in start..end {
             self.insert_position(pos);
+        }
+    }
+
+    fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        let start = start.max(self.history_abs_start);
+        let end = end.min(self.history_abs_end());
+        if step <= 1 {
+            self.insert_positions(start, end);
+            return;
+        }
+        let mut pos = start;
+        while pos < end {
+            self.insert_position(pos);
+            pos = pos.saturating_add(step);
         }
     }
 
@@ -1885,6 +1921,60 @@ impl DfastMatchGenerator {
     fn hash8(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
         self.hash_index(value)
+    }
+
+    fn block_looks_incompressible(&self, start: usize, end: usize) -> bool {
+        let live = self.live_history();
+        if start >= end || start < self.history_abs_start {
+            return false;
+        }
+        let start_idx = start - self.history_abs_start;
+        let end_idx = end - self.history_abs_start;
+        if end_idx > live.len() {
+            return false;
+        }
+        let block = &live[start_idx..end_idx];
+        if block.len() < 1024 {
+            return false;
+        }
+
+        let sample_len = block.len().min(4096);
+        let sample = &block[..sample_len];
+        let mut counts = [0u16; 256];
+        for &byte in sample {
+            counts[byte as usize] += 1;
+        }
+        let distinct = counts.iter().filter(|&&count| count != 0).count();
+        let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
+
+        // Cheap repeat-rate estimate on 4-byte quads.
+        const TABLE_BITS: usize = 11;
+        const TABLE_LEN: usize = 1 << TABLE_BITS;
+        let mut table = [u32::MAX; TABLE_LEN];
+        let mut repeats = 0usize;
+        let mut quads = 0usize;
+        let mut idx = 0usize;
+        while idx + 4 <= sample.len() {
+            let quad = u32::from_le_bytes([
+                sample[idx],
+                sample[idx + 1],
+                sample[idx + 2],
+                sample[idx + 3],
+            ]);
+            let slot =
+                ((quad.wrapping_mul(0x9E37_79B1) as usize) >> (32 - TABLE_BITS)) & (TABLE_LEN - 1);
+            quads += 1;
+            if table[slot] == quad {
+                repeats += 1;
+            } else {
+                table[slot] = quad;
+            }
+            idx += 4;
+        }
+
+        let max_symbol_guard = sample_len / 24;
+        let repeat_guard = quads / 64 + 1;
+        distinct >= 200 && max_freq <= max_symbol_guard && repeats <= repeat_guard
     }
 
     fn hash_index(&self, value: u64) -> usize {
