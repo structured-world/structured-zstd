@@ -145,10 +145,19 @@ fn decompress_literals(
         let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
-        // Fast interleaved loop: while all 4 streams have bits remaining,
-        // issue 4 independent table lookups then 4 independent state advances
-        // per iteration. This gives the CPU's out-of-order engine more
-        // independent work to schedule, hiding table-lookup latency.
+        // Fast interleaved loop: decode 4 symbols/bit-counts via decode4 helper
+        // (which may use packed/SIMD gather+unpack kernels), then advance the
+        // 4 stream states independently. This gives the CPU's out-of-order
+        // engine more independent work to schedule, hiding decode latency.
+        enum Decode4Mode {
+            Unchecked,
+            Checked,
+        }
+        let decode4_mode = if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
+            Decode4Mode::Unchecked
+        } else {
+            Decode4Mode::Checked
+        };
         while brs[0].bits_remaining() > -max_bits
             && brs[1].bits_remaining() > -max_bits
             && brs[2].bits_remaining() > -max_bits
@@ -158,34 +167,34 @@ fn decompress_literals(
             && cursors[2] < ends[2]
             && cursors[3] < ends[3]
         {
-            // Decode phase: 4 independent table lookups
-            let s0 = decoders[0].decode_symbol();
-            let s1 = decoders[1].decode_symbol();
-            let s2 = decoders[2].decode_symbol();
-            let s3 = decoders[3].decode_symbol();
+            let (symbols, bits) = match decode4_mode {
+                Decode4Mode::Unchecked => {
+                    // SAFETY: guarded by decode4_has_shared_table_and_kernel above.
+                    unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
+                }
+                Decode4Mode::Checked => HuffmanDecoder::decode4_symbols_and_num_bits(&decoders),
+            };
 
-            target[cursors[0]] = s0;
-            target[cursors[1]] = s1;
-            target[cursors[2]] = s2;
-            target[cursors[3]] = s3;
+            target[cursors[0]] = symbols[0];
+            target[cursors[1]] = symbols[1];
+            target[cursors[2]] = symbols[2];
+            target[cursors[3]] = symbols[3];
             cursors[0] += 1;
             cursors[1] += 1;
             cursors[2] += 1;
             cursors[3] += 1;
 
-            // State advance phase: 4 independent bit reads + state updates
-            decoders[0].next_state(&mut brs[0]);
-            decoders[1].next_state(&mut brs[1]);
-            decoders[2].next_state(&mut brs[2]);
-            decoders[3].next_state(&mut brs[3]);
+            decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
+            decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
+            decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
+            decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
         for i in 0..4 {
             while brs[i].bits_remaining() > -max_bits && cursors[i] < ends[i] {
-                target[cursors[i]] = decoders[i].decode_symbol();
+                target[cursors[i]] = decoders[i].decode_symbol_and_advance(&mut brs[i]);
                 cursors[i] += 1;
-                decoders[i].next_state(&mut brs[i]);
             }
             if brs[i].bits_remaining() != -max_bits {
                 target.truncate(base);
@@ -229,8 +238,15 @@ fn decompress_literals(
         }
         decoder.init_state(&mut br);
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-            target.push(decoder.decode_symbol());
-            decoder.next_state(&mut br);
+            target.push(decoder.decode_symbol_and_advance(&mut br));
+        }
+        let expected = -(scratch.table.max_num_bits as isize);
+        if br.bits_remaining() != expected {
+            target.truncate(base);
+            return Err(DecompressLiteralsError::BitstreamReadMismatch {
+                read_til: br.bits_remaining(),
+                expected,
+            });
         }
         bytes_read += source.len() as u32;
     }
