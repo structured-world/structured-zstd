@@ -8,7 +8,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::{uint8x16_t, vceqq_u8, vld1q_u8, vst1q_u8};
+use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
     __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
@@ -68,7 +68,7 @@ const MAX_HC_SEARCH_DEPTH: usize = 32;
 enum PrefixKernel {
     Scalar,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Sse42,
+    X86Sse2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     X86Avx2,
     #[cfg(target_arch = "aarch64")]
@@ -883,12 +883,12 @@ pub(crate) struct MatchGenerator {
 impl MatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline(always)]
-    const fn select_x86_prefix_kernel(has_avx2: bool, has_sse42: bool) -> PrefixKernel {
+    const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
         if has_avx2 {
             return PrefixKernel::X86Avx2;
         }
-        if has_sse42 {
-            return PrefixKernel::X86Sse42;
+        if has_sse2 {
+            return PrefixKernel::X86Sse2;
         }
         PrefixKernel::Scalar
     }
@@ -902,7 +902,7 @@ impl MatchGenerator {
             {
                 let kernel = Self::select_x86_prefix_kernel(
                     is_x86_feature_detected!("avx2"),
-                    is_x86_feature_detected!("sse4.2"),
+                    is_x86_feature_detected!("sse2"),
                 );
                 if kernel != PrefixKernel::Scalar {
                     return kernel;
@@ -925,7 +925,7 @@ impl MatchGenerator {
         {
             let kernel = Self::select_x86_prefix_kernel(
                 cfg!(target_feature = "avx2"),
-                cfg!(target_feature = "sse4.2"),
+                cfg!(target_feature = "sse2"),
             );
             if kernel != PrefixKernel::Scalar {
                 return kernel;
@@ -1101,8 +1101,8 @@ impl MatchGenerator {
                 off = unsafe { Self::prefix_len_simd_avx2(lhs, rhs, max) };
             }
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            PrefixKernel::X86Sse42 => {
-                off = unsafe { Self::prefix_len_simd_sse42(lhs, rhs, max) };
+            PrefixKernel::X86Sse2 => {
+                off = unsafe { Self::prefix_len_simd_sse2(lhs, rhs, max) };
             }
             #[cfg(target_arch = "aarch64")]
             PrefixKernel::Aarch64Neon => {
@@ -1134,8 +1134,8 @@ impl MatchGenerator {
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn prefix_len_simd_sse42(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
+    #[target_feature(enable = "sse2")]
+    unsafe fn prefix_len_simd_sse2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
         let mut off = 0usize;
         while off + 16 <= max {
             let a: __m128i = unsafe { _mm_loadu_si128(lhs.add(off).cast::<__m128i>()) };
@@ -1175,10 +1175,16 @@ impl MatchGenerator {
             let a: uint8x16_t = unsafe { vld1q_u8(lhs.add(off)) };
             let b: uint8x16_t = unsafe { vld1q_u8(rhs.add(off)) };
             let eq = vceqq_u8(a, b);
-            let mut bytes = [0u8; 16];
-            unsafe { vst1q_u8(bytes.as_mut_ptr(), eq) };
-            if let Some(idx) = bytes.iter().position(|&v| v != u8::MAX) {
-                return off + idx;
+            let lanes = vreinterpretq_u64_u8(eq);
+            let low = vgetq_lane_u64(lanes, 0);
+            if low != u64::MAX {
+                let diff = low ^ u64::MAX;
+                return off + (diff.trailing_zeros() as usize / 8);
+            }
+            let high = vgetq_lane_u64(lanes, 1);
+            if high != u64::MAX {
+                let diff = high ^ u64::MAX;
+                return off + 8 + (diff.trailing_zeros() as usize / 8);
             }
             off += 16;
         }
@@ -3621,25 +3627,49 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
             .count()
     }
 
-    for len in [0usize, 1, 5, 15, 16, 17, 31, 32, 33, 64, 65, 127, 191] {
-        let a: Vec<u8> = (0..len).map(|i| ((i * 13 + 7) & 0xFF) as u8).collect();
-        let b = a.clone();
-        assert_eq!(
-            MatchGenerator::common_prefix_len(&a, &b),
-            scalar_reference(&a, &b)
-        );
+    for total_len in [
+        0usize, 1, 5, 15, 16, 17, 31, 32, 33, 64, 65, 127, 191, 257, 320,
+    ] {
+        let base: Vec<u8> = (0..total_len)
+            .map(|i| ((i * 13 + 7) & 0xFF) as u8)
+            .collect();
 
-        for mismatch in [0usize, 1, 7, 15, 16, 31, 32, 47, 63, 95, 127] {
-            if mismatch >= len {
+        for start in [0usize, 1, 3] {
+            if start > total_len {
                 continue;
             }
-            let mut altered = b.clone();
-            altered[mismatch] ^= 0x5A;
+            let a = &base[start..];
+            let b = a.to_vec();
             assert_eq!(
-                MatchGenerator::common_prefix_len(&a, &altered),
-                scalar_reference(&a, &altered),
-                "len={len} mismatch={mismatch}"
+                MatchGenerator::common_prefix_len(a, &b),
+                scalar_reference(a, &b),
+                "equal slices total_len={total_len} start={start}"
             );
+
+            let len = a.len();
+            for mismatch in [0usize, 1, 7, 15, 16, 31, 32, 47, 63, 95, 127, 128, 129, 191] {
+                if mismatch >= len {
+                    continue;
+                }
+                let mut altered = b.clone();
+                altered[mismatch] ^= 0x5A;
+                assert_eq!(
+                    MatchGenerator::common_prefix_len(a, &altered),
+                    scalar_reference(a, &altered),
+                    "total_len={total_len} start={start} mismatch={mismatch}"
+                );
+            }
+
+            if len > 0 {
+                let mismatch = len - 1;
+                let mut altered = b.clone();
+                altered[mismatch] ^= 0xA5;
+                assert_eq!(
+                    MatchGenerator::common_prefix_len(a, &altered),
+                    scalar_reference(a, &altered),
+                    "tail mismatch total_len={total_len} start={start} mismatch={mismatch}"
+                );
+            }
         }
     }
 
