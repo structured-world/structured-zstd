@@ -7,7 +7,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
@@ -26,7 +26,7 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
@@ -71,7 +71,7 @@ enum PrefixKernel {
     X86Sse2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     X86Avx2,
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Aarch64Neon,
 }
 
@@ -908,7 +908,7 @@ impl MatchGenerator {
                     return kernel;
                 }
             }
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             {
                 if is_aarch64_feature_detected!("neon") {
                     return PrefixKernel::Aarch64Neon;
@@ -931,7 +931,7 @@ impl MatchGenerator {
                 return kernel;
             }
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         {
             if cfg!(target_feature = "neon") {
                 return PrefixKernel::Aarch64Neon;
@@ -1104,7 +1104,7 @@ impl MatchGenerator {
             PrefixKernel::X86Sse2 => {
                 off = unsafe { Self::prefix_len_simd_sse2(lhs, rhs, max) };
             }
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             PrefixKernel::Aarch64Neon => {
                 off = unsafe { Self::prefix_len_simd_neon(lhs, rhs, max) };
             }
@@ -1167,7 +1167,7 @@ impl MatchGenerator {
         off
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
     unsafe fn prefix_len_simd_neon(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
         let mut off = 0usize;
@@ -1179,12 +1179,12 @@ impl MatchGenerator {
             let low = vgetq_lane_u64(lanes, 0);
             if low != u64::MAX {
                 let diff = low ^ u64::MAX;
-                return off + (diff.trailing_zeros() as usize / 8);
+                return off + Self::mismatch_byte_index(diff as usize);
             }
             let high = vgetq_lane_u64(lanes, 1);
             if high != u64::MAX {
                 let diff = high ^ u64::MAX;
-                return off + 8 + (diff.trailing_zeros() as usize / 8);
+                return off + 8 + Self::mismatch_byte_index(diff as usize);
             }
             off += 16;
         }
