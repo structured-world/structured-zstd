@@ -1078,6 +1078,15 @@ mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn decode4_vbmi2_matches_scalar_when_available() {
+        if !(is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("bmi2"))
+        {
+            return;
+        }
+
         let table = test_table();
         let scalar = [
             HuffmanDecoder {
