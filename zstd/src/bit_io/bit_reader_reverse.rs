@@ -57,6 +57,12 @@ static TRIPLE_EXTRACT_DISPATCH: OnceLock<TripleExtractDispatch> = OnceLock::new(
 
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[inline(always)]
+fn should_use_pext(vendor: [u8; 12], family: u32) -> bool {
+    vendor != *b"AuthenticAMD" || family != 0x17
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline(always)]
 fn triple_extract_dispatch() -> &'static TripleExtractDispatch {
     TRIPLE_EXTRACT_DISPATCH.get_or_init(detect_triple_extract_dispatch)
 }
@@ -77,11 +83,6 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
     vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
     vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
-    let is_amd = vendor == *b"AuthenticAMD";
-    if !is_amd {
-        return TripleExtractDispatch { use_pext: true };
-    }
-
     let eax = __cpuid(1).eax;
     let base_family = (eax >> 8) & 0xF;
     let ext_family = (eax >> 20) & 0xFF;
@@ -92,7 +93,7 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
     };
 
     TripleExtractDispatch {
-        use_pext: family != 0x17,
+        use_pext: should_use_pext(vendor, family),
     }
 }
 
@@ -546,6 +547,20 @@ mod test {
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn should_use_pext_policy_table() {
+        let cases = [
+            (*b"AuthenticAMD", 0x17, false),
+            (*b"AuthenticAMD", 0x19, true),
+            (*b"GenuineIntel", 0x06, true),
+        ];
+
+        for (vendor, family, expected) in cases {
+            assert_eq!(super::should_use_pext(vendor, family), expected);
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
