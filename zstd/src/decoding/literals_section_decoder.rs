@@ -158,11 +158,11 @@ fn decompress_literals(
             && cursors[2] < ends[2]
             && cursors[3] < ends[3]
         {
-            // Decode phase: 4 independent table lookups
-            let s0 = decoders[0].decode_symbol();
-            let s1 = decoders[1].decode_symbol();
-            let s2 = decoders[2].decode_symbol();
-            let s3 = decoders[3].decode_symbol();
+            // Decode+advance phase: one table lookup per stream, then state update.
+            let s0 = decoders[0].decode_symbol_and_advance(&mut brs[0]);
+            let s1 = decoders[1].decode_symbol_and_advance(&mut brs[1]);
+            let s2 = decoders[2].decode_symbol_and_advance(&mut brs[2]);
+            let s3 = decoders[3].decode_symbol_and_advance(&mut brs[3]);
 
             target[cursors[0]] = s0;
             target[cursors[1]] = s1;
@@ -172,20 +172,13 @@ fn decompress_literals(
             cursors[1] += 1;
             cursors[2] += 1;
             cursors[3] += 1;
-
-            // State advance phase: 4 independent bit reads + state updates
-            decoders[0].next_state(&mut brs[0]);
-            decoders[1].next_state(&mut brs[1]);
-            decoders[2].next_state(&mut brs[2]);
-            decoders[3].next_state(&mut brs[3]);
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
         for i in 0..4 {
             while brs[i].bits_remaining() > -max_bits && cursors[i] < ends[i] {
-                target[cursors[i]] = decoders[i].decode_symbol();
+                target[cursors[i]] = decoders[i].decode_symbol_and_advance(&mut brs[i]);
                 cursors[i] += 1;
-                decoders[i].next_state(&mut brs[i]);
             }
             if brs[i].bits_remaining() != -max_bits {
                 target.truncate(base);
@@ -229,8 +222,7 @@ fn decompress_literals(
         }
         decoder.init_state(&mut br);
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-            target.push(decoder.decode_symbol());
-            decoder.next_state(&mut br);
+            target.push(decoder.decode_symbol_and_advance(&mut br));
         }
         bytes_read += source.len() as u32;
     }

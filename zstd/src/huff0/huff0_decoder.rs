@@ -4,12 +4,75 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use std::arch::is_aarch64_feature_detected;
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+use std::arch::is_x86_feature_detected;
+#[cfg(feature = "std")]
+use std::sync::OnceLock;
 
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HuffmanDecodeKernel {
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Bmi2,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Aarch64Neon,
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
+    static KERNEL: OnceLock<HuffmanDecodeKernel> = OnceLock::new();
+    *KERNEL.get_or_init(|| {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
+                return HuffmanDecodeKernel::X86Avx2;
+            }
+            if is_x86_feature_detected!("bmi2") {
+                return HuffmanDecodeKernel::X86Bmi2;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if is_aarch64_feature_detected!("neon") {
+                return HuffmanDecodeKernel::Aarch64Neon;
+            }
+        }
+        HuffmanDecodeKernel::Scalar
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if cfg!(all(target_feature = "avx2", target_feature = "bmi2")) {
+            return HuffmanDecodeKernel::X86Avx2;
+        }
+        if cfg!(target_feature = "bmi2") {
+            return HuffmanDecodeKernel::X86Bmi2;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "neon") {
+            return HuffmanDecodeKernel::Aarch64Neon;
+        }
+    }
+    HuffmanDecodeKernel::Scalar
+}
+
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
+    kernel: HuffmanDecodeKernel,
     /// State is used to index into the table.
     pub state: u64,
 }
@@ -17,11 +80,16 @@ pub struct HuffmanDecoder<'table> {
 impl<'t> HuffmanDecoder<'t> {
     /// Create a new decoder with the provided table
     pub fn new(table: &'t HuffmanTable) -> HuffmanDecoder<'t> {
-        HuffmanDecoder { table, state: 0 }
+        HuffmanDecoder {
+            table,
+            kernel: detect_huffman_decode_kernel(),
+            state: 0,
+        }
     }
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
+    #[cfg(any(test, feature = "fuzz_exports"))]
     #[inline(always)]
     pub fn decode_symbol(&mut self) -> u8 {
         self.table.decode[self.state as usize].symbol
@@ -40,6 +108,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
+    #[cfg(any(test, feature = "fuzz_exports"))]
     #[inline(always)]
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
@@ -48,11 +117,55 @@ impl<'t> HuffmanDecoder<'t> {
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
         // Shift and mask out the bits that identify the current symbol
-        self.state <<= num_bits;
-        self.state &= self.table.decode.len() as u64 - 1;
-        // The new bits are appended at the end of the current state.
-        self.state |= new_bits;
+        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
         num_bits
+    }
+
+    /// Decode symbol and advance state in one table lookup.
+    #[inline(always)]
+    pub fn decode_symbol_and_advance(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        match self.kernel {
+            HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Bmi2 | HuffmanDecodeKernel::X86Avx2 => {
+                // SAFETY: This path is selected only after runtime/static feature checks.
+                unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Neon => {
+                // SAFETY: This path is selected only after runtime/static feature checks.
+                unsafe { self.decode_symbol_and_advance_aarch64_neon(br) }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        let entry = self.table.decode[self.state as usize];
+        let new_bits = br.get_bits(entry.num_bits);
+        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        entry.symbol
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "bmi2")]
+    unsafe fn decode_symbol_and_advance_x86_bmi2(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        let entry = self.table.decode[self.state as usize];
+        let new_bits = br.get_bits(entry.num_bits);
+        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        entry.symbol
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn decode_symbol_and_advance_aarch64_neon(
+        &mut self,
+        br: &mut BitReaderReversed<'_>,
+    ) -> u8 {
+        let entry = self.table.decode[self.state as usize];
+        let new_bits = br.get_bits(entry.num_bits);
+        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        entry.symbol
     }
 }
 
@@ -69,6 +182,7 @@ pub struct HuffmanTable {
     /// to read from the bitstream before checking the table. This
     /// value must be 11 or lower.
     pub max_num_bits: u8,
+    state_mask: u64,
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     rank_indexes: Vec<usize>,
@@ -84,6 +198,7 @@ impl HuffmanTable {
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
+            state_mask: 0,
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
             rank_indexes: Vec::with_capacity(11),
@@ -98,6 +213,7 @@ impl HuffmanTable {
         self.decode.extend_from_slice(&other.decode);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
+        self.state_mask = other.state_mask;
         self.bits.extend_from_slice(&other.bits);
         self.rank_indexes.extend_from_slice(&other.rank_indexes);
         self.fse_table.reinit_from(&other.fse_table);
@@ -108,6 +224,7 @@ impl HuffmanTable {
         self.decode.clear();
         self.weights.clear();
         self.max_num_bits = 0;
+        self.state_mask = 0;
         self.bits.clear();
         self.bit_ranks.clear();
         self.rank_indexes.clear();
@@ -345,6 +462,7 @@ impl HuffmanTable {
 
         self.bits[self.weights.len()] = max_bits + 1 - last_weight;
         self.max_num_bits = max_bits;
+        self.state_mask = (1_u64 << max_bits) - 1;
 
         if max_bits > MAX_MAX_NUM_BITS {
             return Err(err::MaxBitsTooHigh { got: max_bits });
