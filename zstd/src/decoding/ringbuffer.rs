@@ -646,6 +646,11 @@ unsafe fn copy_with_nobranch_check(
     m2_in_f2: usize,
 ) {
     unsafe {
+        let m1_src_cap = m1_in_f1 + m1_in_f2;
+        let m2_src_cap = m2_in_f1 + m2_in_f2;
+        let f1_dst_cap = m1_in_f1 + m2_in_f1;
+        let f2_dst_cap = m1_in_f2 + m2_in_f2;
+
         let case = (m1_in_f1 > 0) as usize
             | (((m2_in_f1 > 0) as usize) << 1)
             | (((m1_in_f2 > 0) as usize) << 2)
@@ -657,29 +662,29 @@ unsafe fn copy_with_nobranch_check(
             // one bit set
             1 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
             }
             2 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f1),
-                    (f1_ptr, m2_in_f1),
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m2_in_f1,
                 );
             }
             4 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f2),
-                    (f2_ptr, m1_in_f2),
+                    (m1_ptr, m1_src_cap),
+                    (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
             }
             8 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f2),
-                    (f2_ptr, m2_in_f2),
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
@@ -687,25 +692,25 @@ unsafe fn copy_with_nobranch_check(
             // two bit set
             3 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f1),
+                    (m2_ptr, m2_src_cap),
                     (f1_ptr.add(m1_in_f1), m2_in_f1),
                     m2_in_f1,
                 );
             }
             5 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
                     (m1_ptr.add(m1_in_f1), m1_in_f2),
-                    (f2_ptr, m1_in_f2),
+                    (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
             }
@@ -713,36 +718,36 @@ unsafe fn copy_with_nobranch_check(
             7 => core::hint::unreachable_unchecked(),
             9 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f2),
-                    (f2_ptr, m2_in_f2),
+                    (m2_ptr, m2_src_cap),
+                    (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             10 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f1),
-                    (f1_ptr, m2_in_f1),
+                    (m2_ptr, m2_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m2_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
                     (m2_ptr.add(m2_in_f1), m2_in_f2),
-                    (f2_ptr, m2_in_f2),
+                    (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             12 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f2),
-                    (f2_ptr, m1_in_f2),
+                    (m1_ptr, m1_src_cap),
+                    (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f2),
+                    (m2_ptr, m2_src_cap),
                     (f2_ptr.add(m1_in_f2), m2_in_f2),
                     m2_in_f2,
                 );
@@ -751,34 +756,34 @@ unsafe fn copy_with_nobranch_check(
             // three bit set
             11 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f1),
+                    (m2_ptr, m2_src_cap),
                     (f1_ptr.add(m1_in_f1), m2_in_f1),
                     m2_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
                     (m2_ptr.add(m2_in_f1), m2_in_f2),
-                    (f2_ptr, m2_in_f2),
+                    (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             13 => {
                 simd_copy::copy_bytes_overshooting(
-                    (m1_ptr, m1_in_f1),
-                    (f1_ptr, m1_in_f1),
+                    (m1_ptr, m1_src_cap),
+                    (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
                 simd_copy::copy_bytes_overshooting(
                     (m1_ptr.add(m1_in_f1), m1_in_f2),
-                    (f2_ptr, m1_in_f2),
+                    (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
                 simd_copy::copy_bytes_overshooting(
-                    (m2_ptr, m2_in_f2),
+                    (m2_ptr, m2_src_cap),
                     (f2_ptr.add(m1_in_f2), m2_in_f2),
                     m2_in_f2,
                 );
