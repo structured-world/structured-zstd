@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/structured-world/structured-zstd/compare/v0.0.11...v0.0.12) - 2026-04-09
+
+### Performance
+
+- *(decoding)* branchless offset history, prefetch pipeline, and BMI2 triple extract ([#90](https://github.com/structured-world/structured-zstd/pull/90))
+
 ## [0.0.11](https://github.com/structured-world/structured-zstd/compare/v0.0.10...v0.0.11) - 2026-04-09
 
 ### Performance
