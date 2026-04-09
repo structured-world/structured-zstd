@@ -26,6 +26,7 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
+use super::incompressible::block_looks_incompressible;
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -445,6 +446,15 @@ impl MatchGeneratorDriver {
             self.retire_dictionary_budget(evicted_bytes);
         }
     }
+
+    fn skip_matching_for_dictionary_priming(&mut self) {
+        match self.active_backend {
+            MatcherBackend::Simple => self.match_generator.skip_matching(),
+            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
+            MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
+            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
+        }
+    }
 }
 
 impl Matcher for MatchGeneratorDriver {
@@ -635,7 +645,7 @@ impl Matcher for MatchGeneratorDriver {
             space.clear();
             space.extend_from_slice(&dict_content[start..end]);
             self.commit_space(space);
-            self.skip_matching();
+            self.skip_matching_for_dictionary_priming();
             committed_dict_budget += end - start;
             start = end;
         }
@@ -1665,6 +1675,14 @@ impl DfastMatchGenerator {
         }
     }
 
+    fn skip_matching_dense(&mut self) {
+        self.ensure_hash_tables();
+        let current_len = self.window.back().unwrap().len();
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        self.insert_positions(current_abs_start, current_abs_end);
+    }
+
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_hash_tables();
 
@@ -1934,47 +1952,7 @@ impl DfastMatchGenerator {
             return false;
         }
         let block = &live[start_idx..end_idx];
-        if block.len() < 1024 {
-            return false;
-        }
-
-        let sample_len = block.len().min(4096);
-        let sample = &block[..sample_len];
-        let mut counts = [0u16; 256];
-        for &byte in sample {
-            counts[byte as usize] += 1;
-        }
-        let distinct = counts.iter().filter(|&&count| count != 0).count();
-        let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
-
-        // Cheap repeat-rate estimate on 4-byte quads.
-        const TABLE_BITS: usize = 11;
-        const TABLE_LEN: usize = 1 << TABLE_BITS;
-        let mut table = [u32::MAX; TABLE_LEN];
-        let mut repeats = 0usize;
-        let mut quads = 0usize;
-        let mut idx = 0usize;
-        while idx + 4 <= sample.len() {
-            let quad = u32::from_le_bytes([
-                sample[idx],
-                sample[idx + 1],
-                sample[idx + 2],
-                sample[idx + 3],
-            ]);
-            let slot =
-                ((quad.wrapping_mul(0x9E37_79B1) as usize) >> (32 - TABLE_BITS)) & (TABLE_LEN - 1);
-            quads += 1;
-            if table[slot] == quad {
-                repeats += 1;
-            } else {
-                table[slot] = quad;
-            }
-            idx += 4;
-        }
-
-        let max_symbol_guard = sample_len / 24;
-        let repeat_guard = quads / 64 + 1;
-        distinct >= 200 && max_freq <= max_symbol_guard && repeats <= repeat_guard
+        block_looks_incompressible(block)
     }
 
     fn hash_index(&self, value: u64) -> usize {

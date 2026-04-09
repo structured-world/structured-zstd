@@ -665,17 +665,21 @@ mod tests {
             data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
         }
 
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Fastest);
-        assert_ne!(first_block_type(&compressed), BlockType::Raw);
-        assert!(
-            compressed.len() < data.len(),
-            "compressible input should remain compressible"
-        );
+        fn assert_not_raw_for_level(data: &[u8], level: super::CompressionLevel) {
+            let compressed = crate::encoding::compress_to_vec(data, level);
+            assert_ne!(first_block_type(&compressed), BlockType::Raw);
+            assert!(
+                compressed.len() < data.len(),
+                "compressible input should remain compressible for level={level:?}"
+            );
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+            assert_eq!(decoded, data);
+        }
 
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Fastest);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Default);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
     }
 
     struct NoDictionaryMatcher {
