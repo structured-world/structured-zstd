@@ -1129,9 +1129,20 @@ mod tests {
             },
         ];
 
-        let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
-        assert_eq!(symbols, [b'A', b'Z', b'B', b'B']);
-        assert_eq!(bits, [1, 2, 2, 2]);
+        #[cfg(debug_assertions)]
+        {
+            let panicked = std::panic::catch_unwind(|| {
+                let _ = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
+            });
+            assert!(panicked.is_err());
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
+            assert_eq!(symbols, [b'A', b'Z', b'B', b'B']);
+            assert_eq!(bits, [1, 2, 2, 2]);
+        }
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1161,9 +1172,20 @@ mod tests {
             },
         ];
 
-        let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
-        assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
-        assert_eq!(bits, [1, 2, 1, 2]);
+        #[cfg(debug_assertions)]
+        {
+            let panicked = std::panic::catch_unwind(|| {
+                let _ = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
+            });
+            assert!(panicked.is_err());
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
+            assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
+            assert_eq!(bits, [1, 2, 1, 2]);
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
