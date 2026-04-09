@@ -522,6 +522,87 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn source_size_hint_fastest_remains_ffi_compatible_small_input() {
+        let data = vec![0xAB; 2047];
+        let compressed = {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
+        fn generate_data(seed: u64, len: usize) -> Vec<u8> {
+            let mut state = seed;
+            let mut data = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                data.push((state >> 33) as u8);
+            }
+            data
+        }
+
+        let levels = [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(-1),
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ];
+        let sizes = [513usize, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191];
+
+        for (seed_idx, seed) in [11u64, 23, 41].into_iter().enumerate() {
+            for &size in &sizes {
+                let data = generate_data(seed + seed_idx as u64, size);
+                for &level in &levels {
+                    let compressed = {
+                        let mut compressor = FrameCompressor::new(level);
+                        compressor.set_source_size_hint(data.len() as u64);
+                        compressor.set_source(data.as_slice());
+                        let mut out = Vec::new();
+                        compressor.set_drain(&mut out);
+                        compressor.compress();
+                        out
+                    };
+
+                    let mut decoded = Vec::new();
+                    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "ffi decode failed with source-size hint: level={level:?} size={size} seed={} err={e}",
+                                seed + seed_idx as u64
+                            )
+                        },
+                    );
+                    assert_eq!(
+                        decoded,
+                        data,
+                        "hinted ffi roundtrip mismatch: level={level:?} size={size} seed={}",
+                        seed + seed_idx as u64
+                    );
+                }
+            }
+        }
+    }
+
     struct NoDictionaryMatcher {
         last_space: Vec<u8>,
         window_size: u64,

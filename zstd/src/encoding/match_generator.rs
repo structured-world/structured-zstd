@@ -145,25 +145,33 @@ const LEVEL_TABLE: [LevelParams; 22] = [
 
 /// Smallest window_log the encoder will use regardless of source size.
 const MIN_WINDOW_LOG: u8 = 10;
+/// Conservative floor for source-size-hinted window tuning.
+///
+/// Hinted windows below 16 KiB (`window_log < 14`) currently regress C-FFI
+/// interoperability on certain compressed-block patterns. Keep hinted
+/// windows at 16 KiB or larger until that compatibility gap is closed.
+const MIN_HINTED_WINDOW_LOG: u8 = 14;
 
 /// Adjust level parameters for a known source size.
 ///
 /// This derives a cap from `ceil(log2(src_size))`, then clamps it to
-/// [`MIN_WINDOW_LOG`]. A zero-byte size hint is treated as
-/// [`MIN_WINDOW_LOG`]. This keeps tables bounded for
-/// small inputs while preserving the encoder's minimum supported window.
+/// [`MIN_HINTED_WINDOW_LOG`] (16 KiB). A zero-byte size hint is treated as
+/// [`MIN_WINDOW_LOG`] for the raw ceil-log step and then promoted to the hinted
+/// floor. This keeps tables bounded for small inputs while preserving the
+/// encoder's baseline minimum supported window.
 /// For the HC backend, `hash_log` and `chain_log` are reduced
 /// proportionally.
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     // Derive a source-size-based cap from ceil(log2(src_size)), then
-    // clamp to MIN_WINDOW_LOG. For inputs smaller than 1 KiB (or zero) we keep the
-    // 1 KiB minimum window instead of shrinking below that floor.
+    // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
+    // MIN_HINTED_WINDOW_LOG (16 KiB hinted floor). For tiny or zero hints we
+    // therefore keep a 16 KiB effective minimum window in hinted mode.
     let src_log = if src_size == 0 {
         MIN_WINDOW_LOG
     } else {
         (64 - (src_size - 1).leading_zeros()) as u8 // ceil_log2
     };
-    let src_log = src_log.max(MIN_WINDOW_LOG);
+    let src_log = src_log.max(MIN_WINDOW_LOG).max(MIN_HINTED_WINDOW_LOG);
     if src_log < params.window_log {
         params.window_log = src_log;
     }
@@ -2767,8 +2775,8 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     driver.skip_matching();
     let hinted_tables = driver.dfast_matcher().short_hash.len();
 
-    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
-    assert_eq!(hinted_tables, 1 << MIN_WINDOW_LOG);
+    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    assert_eq!(hinted_tables, 1 << MIN_HINTED_WINDOW_LOG);
     assert!(
         hinted_tables < full_tables,
         "tiny source hint should reduce dfast table footprint"
@@ -2797,8 +2805,11 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.skip_matching();
     let hinted_rows = driver.row_matcher().row_heads.len();
 
-    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
-    assert_eq!(hinted_rows, 1 << ((MIN_WINDOW_LOG as usize) - ROW_LOG));
+    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    assert_eq!(
+        hinted_rows,
+        1 << ((MIN_HINTED_WINDOW_LOG as usize) - ROW_LOG)
+    );
     assert!(
         hinted_rows < full_rows,
         "tiny source hint should reduce row hash table footprint"
@@ -3010,7 +3021,7 @@ fn source_hint_clamps_driver_slice_size_to_window() {
     driver.reset(CompressionLevel::Default);
 
     let window = driver.window_size() as usize;
-    assert_eq!(window, 1024);
+    assert_eq!(window, 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(driver.slice_size, window);
 
     let space = driver.get_next_space();
@@ -3032,7 +3043,7 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
     driver.reset(CompressionLevel::Default);
 
     let small = driver.get_next_space();
-    assert_eq!(small.len(), 1024);
+    assert_eq!(small.len(), 1 << MIN_HINTED_WINDOW_LOG);
     assert!(
         small.capacity() >= large_capacity,
         "pooled buffer capacity should be preserved to avoid shrink/grow churn"
@@ -3432,11 +3443,11 @@ fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
 }
 
 #[test]
-fn adjust_params_for_zero_source_size_uses_min_window_floor() {
+fn adjust_params_for_zero_source_size_uses_min_hinted_window_floor() {
     let mut params = resolve_level_params(CompressionLevel::Level(4), None);
     params.window_log = 22;
     let adjusted = adjust_params_for_source_size(params, 0);
-    assert_eq!(adjusted.window_log, MIN_WINDOW_LOG);
+    assert_eq!(adjusted.window_log, MIN_HINTED_WINDOW_LOG);
 }
 
 #[test]
@@ -4204,4 +4215,65 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
         "expected tail-anchored cross-block match"
     );
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
+}
+
+#[test]
+fn fastest_hint_iteration_23_sequences_reconstruct_source() {
+    fn generate_data(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.push((state >> 33) as u8);
+        }
+        data
+    }
+
+    let i = 23u64;
+    let len = (i * 89 % 16384) as usize;
+    let mut data = generate_data(i, len);
+    // Append a repeated slice so the fixture deterministically exercises
+    // the match path (Sequence::Triple) instead of only literals.
+    let repeat = data[128..256].to_vec();
+    data.extend_from_slice(&repeat);
+    data.extend_from_slice(&repeat);
+
+    let mut driver = MatchGeneratorDriver::new(1024 * 128, 1);
+    driver.set_source_size_hint(data.len() as u64);
+    driver.reset(CompressionLevel::Fastest);
+    let mut space = driver.get_next_space();
+    space[..data.len()].copy_from_slice(&data);
+    space.truncate(data.len());
+    driver.commit_space(space);
+
+    let mut rebuilt = Vec::with_capacity(data.len());
+    let mut saw_triple = false;
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => rebuilt.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            saw_triple = true;
+            rebuilt.extend_from_slice(literals);
+            assert!(offset > 0, "offset must be non-zero");
+            assert!(
+                offset <= rebuilt.len(),
+                "offset must reference already-produced bytes: offset={} produced={}",
+                offset,
+                rebuilt.len()
+            );
+            let start = rebuilt.len() - offset;
+            for idx in 0..match_len {
+                let b = rebuilt[start + idx];
+                rebuilt.push(b);
+            }
+        }
+    });
+
+    assert!(saw_triple, "fixture must emit at least one match");
+    assert_eq!(rebuilt, data);
 }
