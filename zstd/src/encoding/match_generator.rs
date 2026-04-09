@@ -1684,6 +1684,12 @@ impl DfastMatchGenerator {
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
+        let backfill_start = current_abs_start
+            .saturating_sub(3)
+            .max(self.history_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
         self.insert_positions(current_abs_start, current_abs_end);
     }
 

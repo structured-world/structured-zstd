@@ -567,18 +567,6 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
-        fn generate_data(seed: u64, len: usize) -> Vec<u8> {
-            let mut state = seed;
-            let mut data = Vec::with_capacity(len);
-            for _ in 0..len {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                data.push((state >> 33) as u8);
-            }
-            data
-        }
-
         let levels = [
             super::CompressionLevel::Fastest,
             super::CompressionLevel::Default,
