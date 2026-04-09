@@ -1165,4 +1165,120 @@ mod tests {
         assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
         assert_eq!(bits, [1, 2, 1, 2]);
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn decode4_neon_matches_scalar_when_available() {
+        if !is_aarch64_feature_detected!("neon") {
+            return;
+        }
+
+        let table = test_table();
+        let scalar = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 3,
+            },
+        ];
+        let neon = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Neon,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Neon,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Neon,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Neon,
+                state: 3,
+            },
+        ];
+
+        let expected = HuffmanDecoder::decode4_symbols_and_num_bits(&scalar);
+        let actual = HuffmanDecoder::decode4_symbols_and_num_bits(&neon);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn decode4_sve_matches_scalar_when_available() {
+        if !is_aarch64_feature_detected!("sve") {
+            return;
+        }
+
+        let table = test_table();
+        let scalar = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Scalar,
+                state: 3,
+            },
+        ];
+        let sve = [
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Sve,
+                state: 0,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Sve,
+                state: 1,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Sve,
+                state: 2,
+            },
+            HuffmanDecoder {
+                table: &table,
+                kernel: HuffmanDecodeKernel::Aarch64Sve,
+                state: 3,
+            },
+        ];
+
+        let expected = HuffmanDecoder::decode4_symbols_and_num_bits(&scalar);
+        let actual = HuffmanDecoder::decode4_symbols_and_num_bits(&sve);
+        assert_eq!(actual, expected);
+    }
 }
