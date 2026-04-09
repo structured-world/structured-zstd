@@ -433,9 +433,7 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe {
-                _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
-            }
+            _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
         }
         #[cfg(target_arch = "x86")]
         {
