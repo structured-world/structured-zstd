@@ -5,7 +5,7 @@
 //! - C FFI compress → Pure Rust decompress
 
 use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
 use structured_zstd::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -50,6 +50,31 @@ fn cross_rust_compress_ffi_decompress_1000() {
             "rust→ffi roundtrip failed at iteration {i}, len={len}"
         );
     }
+}
+
+#[test]
+fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
+    let i = 23u64;
+    let len = (i * 89 % 16384) as usize;
+    let data = generate_data(i, len);
+
+    let compressed = {
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        let mut out = Vec::new();
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    };
+
+    let mut rust_decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut rust_result = Vec::new();
+    rust_decoder.read_to_end(&mut rust_result).unwrap();
+    assert_eq!(data, rust_result, "rust decoder must accept hinted stream");
+
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(data, result, "ffi decoder must accept hinted stream");
 }
 
 #[test]
