@@ -60,7 +60,8 @@ fn bench_decode(c: &mut Criterion) {
         &compressed,
         |b, src| {
             b.iter(|| {
-                heavy_decoder.decode_all(src, &mut heavy_target).unwrap();
+                let decoded = heavy_decoder.decode_all(src, &mut heavy_target).unwrap();
+                black_box(decoded);
             })
         },
     );
