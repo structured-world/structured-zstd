@@ -49,8 +49,7 @@ pub fn round_trip(data: &[u8]) {
     decoder.init_state(&mut br);
     let mut decoded = Vec::new();
     while br.bits_remaining() > -(decoder_table.max_num_bits as isize) {
-        decoded.push(decoder.decode_symbol());
-        decoder.next_state(&mut br);
+        decoded.push(decoder.decode_symbol_and_advance(&mut br));
     }
     assert_eq!(&decoded, data);
 }

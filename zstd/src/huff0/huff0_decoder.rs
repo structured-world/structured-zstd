@@ -128,10 +128,16 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
-    #[cfg(any(test, feature = "fuzz_exports"))]
     #[inline(always)]
-    pub fn decode_symbol(&mut self) -> u8 {
+    fn decode_symbol(&mut self) -> u8 {
         self.table.decode[self.state as usize].symbol
+    }
+
+    /// Fuzz-only shim for reading the symbol at the current state.
+    #[cfg(feature = "fuzz_exports")]
+    #[inline(always)]
+    pub fn fuzz_decode_symbol(&mut self) -> u8 {
+        self.decode_symbol()
     }
 
     /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
@@ -147,9 +153,8 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
-    #[cfg(any(test, feature = "fuzz_exports"))]
     #[inline(always)]
-    pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+    fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
         let num_bits = self.table.decode[self.state as usize].num_bits;
@@ -158,6 +163,13 @@ impl<'t> HuffmanDecoder<'t> {
         // Shift and mask out the bits that identify the current symbol
         self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
         num_bits
+    }
+
+    /// Fuzz-only shim for advancing to the next decoding state.
+    #[cfg(feature = "fuzz_exports")]
+    #[inline(always)]
+    pub fn fuzz_next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        self.next_state(br)
     }
 
     /// Decode symbol and advance state in one table lookup.
@@ -424,9 +436,9 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let entry = self.table.decode[self.state as usize];
-        self.advance_state_by_bits(br, entry.num_bits);
-        entry.symbol
+        let symbol = self.decode_symbol();
+        self.next_state(br);
+        symbol
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
