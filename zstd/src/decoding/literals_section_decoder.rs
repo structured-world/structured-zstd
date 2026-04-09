@@ -149,6 +149,11 @@ fn decompress_literals(
         // issue 4 independent table lookups then 4 independent state advances
         // per iteration. This gives the CPU's out-of-order engine more
         // independent work to schedule, hiding table-lookup latency.
+        let decode4 = if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
+            HuffmanDecoder::decode4_symbols_and_num_bits_unchecked
+        } else {
+            HuffmanDecoder::decode4_symbols_and_num_bits
+        };
         while brs[0].bits_remaining() > -max_bits
             && brs[1].bits_remaining() > -max_bits
             && brs[2].bits_remaining() > -max_bits
@@ -158,7 +163,7 @@ fn decompress_literals(
             && cursors[2] < ends[2]
             && cursors[3] < ends[3]
         {
-            let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&decoders);
+            let (symbols, bits) = decode4(&decoders);
 
             target[cursors[0]] = symbols[0];
             target[cursors[1]] = symbols[1];

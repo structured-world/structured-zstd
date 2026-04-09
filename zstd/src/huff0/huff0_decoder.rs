@@ -253,6 +253,40 @@ impl<'t> HuffmanDecoder<'t> {
         if !(same_kernel && same_table) {
             return Self::decode4_symbols_and_num_bits_scalar(decoders);
         }
+        Self::decode4_symbols_and_num_bits_for_kernel(decoders, kernel)
+    }
+
+    #[inline(always)]
+    pub(crate) fn decode4_symbols_and_num_bits_unchecked(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        debug_assert!(
+            decoders
+                .iter()
+                .all(|d| core::ptr::eq(d.table, decoders[0].table)),
+            "decode4_symbols_and_num_bits_unchecked requires a shared table",
+        );
+        debug_assert!(
+            decoders.iter().all(|d| d.kernel == decoders[0].kernel),
+            "decode4_symbols_and_num_bits_unchecked requires a shared kernel",
+        );
+        Self::decode4_symbols_and_num_bits_for_kernel(decoders, decoders[0].kernel)
+    }
+
+    #[inline(always)]
+    pub(crate) fn decode4_has_shared_table_and_kernel(decoders: &[HuffmanDecoder<'_>; 4]) -> bool {
+        let kernel = decoders[0].kernel;
+        decoders.iter().all(|d| d.kernel == kernel)
+            && decoders
+                .iter()
+                .all(|d| core::ptr::eq(d.table, decoders[0].table))
+    }
+
+    #[inline(always)]
+    fn decode4_symbols_and_num_bits_for_kernel(
+        decoders: &[HuffmanDecoder<'_>; 4],
+        kernel: HuffmanDecodeKernel,
+    ) -> ([u8; 4], [u8; 4]) {
         match kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HuffmanDecodeKernel::X86Vbmi2 => {
@@ -996,10 +1030,10 @@ mod tests {
         assert_eq!(bits, [1, 2, 1, 2]);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn bmi2_advance_matches_scalar_formula_when_available() {
-        if !is_x86_feature_detected!("bmi2") {
+        if !std::arch::is_x86_feature_detected!("bmi2") {
             return;
         }
 
@@ -1017,10 +1051,10 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_avx2_matches_scalar_when_available() {
-        if !is_x86_feature_detected!("avx2") {
+        if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
 
@@ -1075,14 +1109,14 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_vbmi2_matches_scalar_when_available() {
-        if !(is_x86_feature_detected!("avx512vbmi2")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("bmi2"))
+        if !(std::arch::is_x86_feature_detected!("avx512vbmi2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("bmi2"))
         {
             return;
         }
@@ -1230,10 +1264,10 @@ mod tests {
         assert_eq!(bits, [1, 2, 1, 2]);
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
     fn decode4_neon_matches_scalar_when_available() {
-        if !is_aarch64_feature_detected!("neon") {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
             return;
         }
 
@@ -1288,10 +1322,10 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
     fn decode4_sve_matches_scalar_when_available() {
-        if !is_aarch64_feature_detected!("sve") {
+        if !std::arch::is_aarch64_feature_detected!("sve") {
             return;
         }
 
