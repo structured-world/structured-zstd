@@ -142,6 +142,7 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
         (a & !mask) | (b & mask)
     }
 
+    let valid_offset = offset_value != 0;
     let class = offset_value.saturating_sub(1).min(3) as usize;
     let rule = if lit_len > 0 {
         RULES_LIT_NON_ZERO[class]
@@ -153,13 +154,14 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
     let from_new = offset_value.wrapping_sub(3);
     let mut actual_offset = select_u32(from_new, from_history, !rule.use_new_offset);
     actual_offset = actual_offset.wrapping_sub(u32::from(rule.subtract_one));
+    actual_offset = select_u32(actual_offset, 0, !valid_offset);
 
     let old0 = scratch[0];
     let old1 = scratch[1];
     let old2 = scratch[2];
 
-    let update_none = rule.update_mode == 0;
-    let update_b = rule.update_mode == 2;
+    let update_none = rule.update_mode == 0 || !valid_offset;
+    let update_b = rule.update_mode == 2 && valid_offset;
     let update_any = !update_none;
 
     scratch[0] = select_u32(old0, actual_offset, update_any);
@@ -247,5 +249,13 @@ mod tests {
         let actual = do_offset_history(9, 1, &mut hist);
         assert_eq!(actual, 6);
         assert_eq!(hist, [6, 10, 20]);
+    }
+
+    #[test]
+    fn offset_history_zero_offset_preserves_error_path() {
+        let mut hist = [10, 20, 30];
+        let actual = do_offset_history(0, 1, &mut hist);
+        assert_eq!(actual, 0);
+        assert_eq!(hist, [10, 20, 30]);
     }
 }

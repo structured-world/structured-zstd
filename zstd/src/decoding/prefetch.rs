@@ -12,19 +12,19 @@ pub(crate) fn prefetch_slice_t1(slice: &[u8]) {
 #[inline(always)]
 fn prefetch_slice_impl_l1(slice: &[u8]) {
     use core::arch::x86_64::_MM_HINT_T0;
-    prefetch_stride_x86_64(slice, _MM_HINT_T0);
+    prefetch_stride_x86_64::<{ _MM_HINT_T0 }>(slice);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_slice_impl_t1(slice: &[u8]) {
     use core::arch::x86_64::_MM_HINT_T1;
-    prefetch_stride_x86_64(slice, _MM_HINT_T1);
+    prefetch_stride_x86_64::<{ _MM_HINT_T1 }>(slice);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn prefetch_stride_x86_64(slice: &[u8], hint: i32) {
+fn prefetch_stride_x86_64<const HINT: i32>(slice: &[u8]) {
     use core::arch::x86_64::_mm_prefetch;
     const CACHE_LINE: usize = 64;
     const MAX_LINES: usize = 4;
@@ -37,7 +37,7 @@ fn prefetch_stride_x86_64(slice: &[u8], hint: i32) {
     let base = slice.as_ptr();
     for i in 0..line_count {
         let ptr = unsafe { base.add(i * CACHE_LINE) };
-        unsafe { _mm_prefetch(ptr.cast(), hint) };
+        unsafe { _mm_prefetch(ptr.cast(), HINT) };
     }
 }
 
@@ -45,19 +45,19 @@ fn prefetch_stride_x86_64(slice: &[u8], hint: i32) {
 #[inline(always)]
 fn prefetch_slice_impl_l1(slice: &[u8]) {
     use core::arch::x86::_MM_HINT_T0;
-    prefetch_stride_x86(slice, _MM_HINT_T0);
+    prefetch_stride_x86::<{ _MM_HINT_T0 }>(slice);
 }
 
 #[cfg(all(target_arch = "x86", target_feature = "sse"))]
 #[inline(always)]
 fn prefetch_slice_impl_t1(slice: &[u8]) {
     use core::arch::x86::_MM_HINT_T1;
-    prefetch_stride_x86(slice, _MM_HINT_T1);
+    prefetch_stride_x86::<{ _MM_HINT_T1 }>(slice);
 }
 
 #[cfg(all(target_arch = "x86", target_feature = "sse"))]
 #[inline(always)]
-fn prefetch_stride_x86(slice: &[u8], hint: i32) {
+fn prefetch_stride_x86<const HINT: i32>(slice: &[u8]) {
     use core::arch::x86::_mm_prefetch;
     const CACHE_LINE: usize = 64;
     const MAX_LINES: usize = 4;
@@ -70,7 +70,7 @@ fn prefetch_stride_x86(slice: &[u8], hint: i32) {
     let base = slice.as_ptr();
     for i in 0..line_count {
         let ptr = unsafe { base.add(i * CACHE_LINE) };
-        unsafe { _mm_prefetch(ptr.cast(), hint) };
+        unsafe { _mm_prefetch(ptr.cast(), HINT) };
     }
 }
 
@@ -119,10 +119,18 @@ fn prefetch_stride_aarch64(slice: &[u8], hint: PrefetchHintAarch64) {
     }
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64",)))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", target_feature = "sse"),
+    target_arch = "aarch64",
+)))]
 #[inline(always)]
 fn prefetch_slice_impl_l1(_slice: &[u8]) {}
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64",)))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", target_feature = "sse"),
+    target_arch = "aarch64",
+)))]
 #[inline(always)]
 fn prefetch_slice_impl_t1(_slice: &[u8]) {}
