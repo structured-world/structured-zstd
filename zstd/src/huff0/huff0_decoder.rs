@@ -4,6 +4,10 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
+#[cfg(target_arch = "x86")]
+use core::arch::x86::{_mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{_mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -140,6 +144,73 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[inline(always)]
+    pub(crate) fn decode_symbol_and_num_bits(&self) -> (u8, u8) {
+        let entry = self.table.decode[self.state as usize];
+        (entry.symbol, entry.num_bits)
+    }
+
+    #[inline(always)]
+    pub(crate) fn advance_state_by_bits(&mut self, br: &mut BitReaderReversed<'_>, num_bits: u8) {
+        let new_bits = br.get_bits(num_bits);
+        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+    }
+
+    #[inline(always)]
+    pub(crate) fn decode4_symbols_and_num_bits(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        let kernel = decoders[0].kernel;
+        match kernel {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Avx2 => {
+                // SAFETY: AVX2 kernel is selected only after runtime/static feature checks.
+                unsafe { Self::decode4_symbols_and_num_bits_avx2(decoders) }
+            }
+            _ => {
+                let mut symbols = [0_u8; 4];
+                let mut num_bits = [0_u8; 4];
+                let mut i = 0;
+                while i < 4 {
+                    let (sym, bits) = decoders[i].decode_symbol_and_num_bits();
+                    symbols[i] = sym;
+                    num_bits[i] = bits;
+                    i += 1;
+                }
+                (symbols, num_bits)
+            }
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn decode4_symbols_and_num_bits_avx2(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        let table = decoders[0].table;
+        let states = _mm_set_epi32(
+            decoders[3].state as i32,
+            decoders[2].state as i32,
+            decoders[1].state as i32,
+            decoders[0].state as i32,
+        );
+        let gathered = _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4);
+
+        let mut packed = [0_i32; 4];
+        _mm_storeu_si128(packed.as_mut_ptr().cast(), gathered);
+
+        let mut symbols = [0_u8; 4];
+        let mut num_bits = [0_u8; 4];
+        let mut i = 0;
+        while i < 4 {
+            let v = packed[i] as u32;
+            symbols[i] = (v & 0xFF) as u8;
+            num_bits[i] = ((v >> 8) & 0xFF) as u8;
+            i += 1;
+        }
+        (symbols, num_bits)
+    }
+
+    #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
@@ -172,6 +243,7 @@ impl<'t> HuffmanDecoder<'t> {
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
+    packed_decode: Vec<u32>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
@@ -195,6 +267,7 @@ impl HuffmanTable {
     pub fn new() -> HuffmanTable {
         HuffmanTable {
             decode: Vec::new(),
+            packed_decode: Vec::new(),
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
@@ -211,6 +284,7 @@ impl HuffmanTable {
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.decode.extend_from_slice(&other.decode);
+        self.packed_decode.extend_from_slice(&other.packed_decode);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.state_mask = other.state_mask;
@@ -222,6 +296,7 @@ impl HuffmanTable {
     /// Completely empty the table of all data.
     pub fn reset(&mut self) {
         self.decode.clear();
+        self.packed_decode.clear();
         self.weights.clear();
         self.max_num_bits = 0;
         self.state_mask = 0;
@@ -482,6 +557,7 @@ impl HuffmanTable {
                 num_bits: 0,
             },
         );
+        self.packed_decode.resize(1 << self.max_num_bits, 0);
 
         //starting codes for each rank
         self.rank_indexes.clear();
@@ -514,6 +590,8 @@ impl HuffmanTable {
                     num_bits: bits_for_symbol,
                 };
                 self.decode[base_idx..base_idx + len].fill(entry);
+                let packed = u32::from(entry.symbol) | (u32::from(entry.num_bits) << 8);
+                self.packed_decode[base_idx..base_idx + len].fill(packed);
             }
         }
 

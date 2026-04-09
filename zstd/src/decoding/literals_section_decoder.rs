@@ -158,20 +158,21 @@ fn decompress_literals(
             && cursors[2] < ends[2]
             && cursors[3] < ends[3]
         {
-            // Decode+advance phase: one table lookup per stream, then state update.
-            let s0 = decoders[0].decode_symbol_and_advance(&mut brs[0]);
-            let s1 = decoders[1].decode_symbol_and_advance(&mut brs[1]);
-            let s2 = decoders[2].decode_symbol_and_advance(&mut brs[2]);
-            let s3 = decoders[3].decode_symbol_and_advance(&mut brs[3]);
+            let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&decoders);
 
-            target[cursors[0]] = s0;
-            target[cursors[1]] = s1;
-            target[cursors[2]] = s2;
-            target[cursors[3]] = s3;
+            target[cursors[0]] = symbols[0];
+            target[cursors[1]] = symbols[1];
+            target[cursors[2]] = symbols[2];
+            target[cursors[3]] = symbols[3];
             cursors[0] += 1;
             cursors[1] += 1;
             cursors[2] += 1;
             cursors[3] += 1;
+
+            decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
+            decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
+            decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
+            decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
