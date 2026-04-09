@@ -78,52 +78,63 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
     // 0 = no history update
     // 1 = [actual, old0, old2]
     // 2 = [actual, old0, old1]
-    const RULES_LIT_NON_ZERO: [Rule; 4] = [
+    // Indexing: class * 2 + lit_is_zero
+    const RULES: [Rule; 8] = [
+        // class=0 (offset_value=1)
         Rule {
+            // lit_len > 0
             scratch_idx: 0,
             use_new_offset: false,
             subtract_one: false,
             update_mode: 0,
         },
         Rule {
+            // lit_len == 0
+            scratch_idx: 1,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 1,
+        },
+        // class=1 (offset_value=2)
+        Rule {
+            // lit_len > 0
             scratch_idx: 1,
             use_new_offset: false,
             subtract_one: false,
             update_mode: 1,
         },
         Rule {
+            // lit_len == 0
+            scratch_idx: 2,
+            use_new_offset: false,
+            subtract_one: false,
+            update_mode: 2,
+        },
+        // class=2 (offset_value=3)
+        Rule {
+            // lit_len > 0
             scratch_idx: 2,
             use_new_offset: false,
             subtract_one: false,
             update_mode: 2,
         },
         Rule {
-            scratch_idx: 0,
-            use_new_offset: true,
-            subtract_one: false,
-            update_mode: 2,
-        },
-    ];
-    const RULES_LIT_ZERO: [Rule; 4] = [
-        Rule {
-            scratch_idx: 1,
-            use_new_offset: false,
-            subtract_one: false,
-            update_mode: 1,
-        },
-        Rule {
-            scratch_idx: 2,
-            use_new_offset: false,
-            subtract_one: false,
-            update_mode: 2,
-        },
-        Rule {
+            // lit_len == 0
             scratch_idx: 0,
             use_new_offset: false,
             subtract_one: true,
             update_mode: 2,
         },
+        // class=3 (offset_value>=4)
         Rule {
+            // lit_len > 0
+            scratch_idx: 0,
+            use_new_offset: true,
+            subtract_one: false,
+            update_mode: 2,
+        },
+        Rule {
+            // lit_len == 0
             scratch_idx: 0,
             use_new_offset: true,
             subtract_one: false,
@@ -144,11 +155,8 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
 
     let valid_offset = offset_value != 0;
     let class = offset_value.saturating_sub(1).min(3) as usize;
-    let rule = if lit_len > 0 {
-        RULES_LIT_NON_ZERO[class]
-    } else {
-        RULES_LIT_ZERO[class]
-    };
+    let lit_is_zero = usize::from(lit_len == 0);
+    let rule = RULES[class * 2 + lit_is_zero];
 
     let from_history = scratch[rule.scratch_idx];
     let from_new = offset_value.wrapping_sub(3);
@@ -184,9 +192,13 @@ fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_c
         return;
     }
 
-    let start = literals_cursor + ll_curr + ll_next;
-    let end = start + ll_n2;
-    if end <= scratch.literals_buffer.len() {
+    let (start, overflow_a) = literals_cursor.overflowing_add(ll_curr);
+    let (start, overflow_b) = start.overflowing_add(ll_next);
+    let (end, overflow_c) = start.overflowing_add(ll_n2);
+    if !(overflow_a || overflow_b || overflow_c)
+        && start <= end
+        && end <= scratch.literals_buffer.len()
+    {
         prefetch::prefetch_slice(&scratch.literals_buffer[start..end]);
     }
 }

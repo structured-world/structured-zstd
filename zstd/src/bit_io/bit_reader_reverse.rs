@@ -346,6 +346,29 @@ impl<'s> BitReaderReversed<'s> {
 
 #[cfg(test)]
 mod test {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    use std::arch::is_x86_feature_detected;
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[inline]
+    fn scalar_extract_triple(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        let val3 = all_three & super::BIT_MASK[n3 as usize];
+        let val2 = all_three.wrapping_shr(u32::from(n3)) & super::BIT_MASK[n2 as usize];
+        let val1 =
+            all_three.wrapping_shr(u32::from(n2) + u32::from(n3)) & super::BIT_MASK[n1 as usize];
+        (val1, val2, val3)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[inline]
+    fn next_test_value(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
 
     #[test]
     fn it_works() {
@@ -523,5 +546,65 @@ mod test {
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn bmi2_triple_extract_matches_scalar_reference() {
+        if !is_x86_feature_detected!("bmi2") {
+            return;
+        }
+
+        let widths = [
+            (0, 0, 0),
+            (1, 1, 1),
+            (3, 5, 7),
+            (8, 8, 8),
+            (15, 16, 17),
+            (21, 21, 21),
+            (0, 13, 27),
+            (31, 0, 1),
+            (1, 31, 0),
+            (20, 20, 24),
+        ];
+        let fixed_values = [
+            0,
+            1,
+            u64::MAX,
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            1u64 << 63,
+            (1u64 << 32) - 1,
+        ];
+
+        for &(n1, n2, n3) in &widths {
+            for &all_three in &fixed_values {
+                let expected = scalar_extract_triple(all_three, n1, n2, n3);
+                let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
+                assert_eq!(pext, expected);
+
+                if let Some(dispatched) = super::try_extract_triple_with_pext(all_three, n1, n2, n3)
+                {
+                    assert_eq!(dispatched, expected);
+                }
+            }
+        }
+
+        let mut state = 0xD6E8_FD9D_5A2C_19B7u64;
+        for &(n1, n2, n3) in &widths {
+            for _ in 0..64 {
+                let all_three = next_test_value(&mut state);
+                let expected = scalar_extract_triple(all_three, n1, n2, n3);
+                let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
+                assert_eq!(pext, expected);
+
+                if let Some(dispatched) = super::try_extract_triple_with_pext(all_three, n1, n2, n3)
+                {
+                    assert_eq!(dispatched, expected);
+                }
+            }
+        }
     }
 }
