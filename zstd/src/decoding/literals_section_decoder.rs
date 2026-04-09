@@ -240,6 +240,14 @@ fn decompress_literals(
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
             target.push(decoder.decode_symbol_and_advance(&mut br));
         }
+        let expected = -(scratch.table.max_num_bits as isize);
+        if br.bits_remaining() != expected {
+            target.truncate(base);
+            return Err(DecompressLiteralsError::BitstreamReadMismatch {
+                read_til: br.bits_remaining(),
+                expected,
+            });
+        }
         bytes_read += source.len() as u32;
     }
 
