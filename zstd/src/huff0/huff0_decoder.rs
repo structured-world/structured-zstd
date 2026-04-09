@@ -4,6 +4,8 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{_bzhi_u64, _mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
 #[cfg(target_arch = "x86_64")]
@@ -177,6 +179,11 @@ impl<'t> HuffmanDecoder<'t> {
                 // SAFETY: AVX2 kernel is selected only after runtime/static feature checks.
                 unsafe { Self::decode4_symbols_and_num_bits_avx2(decoders) }
             }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Neon => {
+                // SAFETY: NEON kernel is selected only after runtime/static feature checks.
+                unsafe { Self::decode4_symbols_and_num_bits_neon(decoders) }
+            }
             _ => {
                 let mut symbols = [0_u8; 4];
                 let mut num_bits = [0_u8; 4];
@@ -219,6 +226,42 @@ impl<'t> HuffmanDecoder<'t> {
             i += 1;
         }
         (symbols, num_bits)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn decode4_symbols_and_num_bits_neon(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        let table = decoders[0].table;
+        let packed_scalar = [
+            table.packed_decode[decoders[0].state as usize],
+            table.packed_decode[decoders[1].state as usize],
+            table.packed_decode[decoders[2].state as usize],
+            table.packed_decode[decoders[3].state as usize],
+        ];
+
+        let packed = unsafe { vld1q_u32(packed_scalar.as_ptr()) };
+        let mask = vdupq_n_u32(0xFF);
+        let symbols_v = vandq_u32(packed, mask);
+        let bits_v = vandq_u32(vshrq_n_u32::<8>(packed), mask);
+
+        let mut symbols_u32 = [0_u32; 4];
+        let mut bits_u32 = [0_u32; 4];
+        unsafe {
+            vst1q_u32(symbols_u32.as_mut_ptr(), symbols_v);
+            vst1q_u32(bits_u32.as_mut_ptr(), bits_v);
+        }
+
+        let mut symbols = [0_u8; 4];
+        let mut bits = [0_u8; 4];
+        let mut i = 0;
+        while i < 4 {
+            symbols[i] = symbols_u32[i] as u8;
+            bits[i] = bits_u32[i] as u8;
+            i += 1;
+        }
+        (symbols, bits)
     }
 
     #[inline(always)]
