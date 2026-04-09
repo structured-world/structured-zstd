@@ -5,9 +5,9 @@ use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{_mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
+use core::arch::x86::{_bzhi_u64, _mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
+use core::arch::x86_64::{_bzhi_u64, _mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -152,7 +152,18 @@ impl<'t> HuffmanDecoder<'t> {
     #[inline(always)]
     pub(crate) fn advance_state_by_bits(&mut self, br: &mut BitReaderReversed<'_>, num_bits: u8) {
         let new_bits = br.get_bits(num_bits);
-        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+        match self.kernel {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Bmi2 | HuffmanDecodeKernel::X86Avx2 => {
+                // SAFETY: Kernel dispatch guarantees BMI2 on this path.
+                unsafe {
+                    self.state = self.advance_state_x86_bmi2(num_bits, new_bits);
+                }
+            }
+            _ => {
+                self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+            }
+        }
     }
 
     #[inline(always)]
@@ -213,8 +224,7 @@ impl<'t> HuffmanDecoder<'t> {
     #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
-        let new_bits = br.get_bits(entry.num_bits);
-        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        self.advance_state_by_bits(br, entry.num_bits);
         entry.symbol
     }
 
@@ -223,8 +233,14 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode_symbol_and_advance_x86_bmi2(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
-        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        self.state = self.advance_state_x86_bmi2(entry.num_bits, new_bits);
         entry.symbol
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "bmi2")]
+    unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
+        _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
     }
 
     #[cfg(target_arch = "aarch64")]
