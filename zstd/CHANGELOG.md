@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/structured-world/structured-zstd/compare/v0.0.13...v0.0.14) - 2026-04-09
+
+### Performance
+
+- *(encoding)* enable one-shot size hint across levels safely ([#94](https://github.com/structured-world/structured-zstd/pull/94))
+
 ## [0.0.13](https://github.com/structured-world/structured-zstd/compare/v0.0.12...v0.0.13) - 2026-04-09
 
 ### Performance
