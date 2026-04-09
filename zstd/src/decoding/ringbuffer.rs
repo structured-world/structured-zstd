@@ -324,8 +324,10 @@ impl RingBuffer {
                 self.cap - self.tail,
             );
 
-            // SAFETY: `src` points at initialized data, `dst` points to writable memory
-            // and does not overlap `src`.
+            // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+            // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+            // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+            // and source/destination regions do not overlap.
             unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_tail) }
 
             if after_tail < len {
@@ -354,8 +356,10 @@ impl RingBuffer {
                     self.head,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
                 unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_tail) }
             }
         } else {
@@ -390,8 +394,10 @@ impl RingBuffer {
                     self.head - self.tail,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
                 unsafe { simd_copy::copy_bytes_overshooting(src, dst, len) }
             } else {
                 // Possibly non continuous read section and continuous destination section:
@@ -423,8 +429,10 @@ impl RingBuffer {
                     self.head - self.tail,
                 );
 
-                // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                // and does not overlap `src`.
+                // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                // and source/destination regions do not overlap.
                 unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_start) }
 
                 if after_start < len {
@@ -454,8 +462,10 @@ impl RingBuffer {
                         dst.1 - after_start,
                     );
 
-                    // SAFETY: `src` points at initialized data, `dst` points to writable memory
-                    // and does not overlap `src`.
+                    // SAFETY: `src` points at initialized data, `dst` points to writable memory,
+                    // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+                    // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
+                    // and source/destination regions do not overlap.
                     unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_start) }
                 }
             }

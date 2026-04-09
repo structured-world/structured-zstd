@@ -27,8 +27,8 @@ struct CopyStrategy {
 /// Copies at least `copy_at_least` bytes from `src` to `dst`.
 ///
 /// This helper may over-copy up to
-/// `copy_at_least.next_multiple_of(active_chunk)`, i.e. at most
-/// `active_chunk - 1` extra bytes, mirroring zstd wildcopy semantics for
+/// `copy_at_least.next_multiple_of(strategy.chunk)`, i.e. at most
+/// `strategy.chunk - 1` extra bytes, mirroring zstd wildcopy semantics for
 /// faster inner loops.
 ///
 /// # Safety
@@ -37,7 +37,7 @@ struct CopyStrategy {
 /// - `dst.0` points to at least `dst.1` writable bytes.
 /// - `copy_at_least <= src.1` and `copy_at_least <= dst.1`.
 /// - `src.1` and `dst.1` are large enough for the selected strategy:
-///   if `min(src.1, dst.1) >= next_multiple_of(copy_at_least, active_chunk)`,
+///   if `min(src.1, dst.1) >= copy_at_least.next_multiple_of(strategy.chunk)`,
 ///   the SIMD/scalar chunk loop may copy that rounded-up amount.
 ///   Otherwise the function copies exactly `copy_at_least` bytes.
 /// - Source and destination regions do not overlap.
@@ -94,7 +94,7 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
                 copy: copy_avx2,
             };
         }
-        if caps.sse2 {
+        if caps.sse2 && copy_at_least >= 16 {
             return CopyStrategy {
                 chunk: 16,
                 copy: copy_sse2,
@@ -117,7 +117,7 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
                 copy: copy_avx2,
             };
         }
-        if cfg!(target_feature = "sse2") {
+        if cfg!(target_feature = "sse2") && copy_at_least >= 16 {
             return CopyStrategy {
                 chunk: 16,
                 copy: copy_sse2,
@@ -277,6 +277,13 @@ mod tests {
         let mut dst = [0_u8; 8];
         unsafe { copy_scalar(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
         assert_eq!(dst, src);
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn copy_strategy_uses_scalar_chunk_for_sub_sse_sizes() {
+        let strategy = copy_strategy(15);
+        assert_eq!(strategy.chunk, core::mem::size_of::<usize>());
     }
 
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
