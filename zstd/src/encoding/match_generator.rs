@@ -155,15 +155,17 @@ const MIN_HINTED_WINDOW_LOG: u8 = 14;
 /// Adjust level parameters for a known source size.
 ///
 /// This derives a cap from `ceil(log2(src_size))`, then clamps it to
-/// [`MIN_WINDOW_LOG`]. A zero-byte size hint is treated as
-/// [`MIN_WINDOW_LOG`]. This keeps tables bounded for
-/// small inputs while preserving the encoder's minimum supported window.
+/// [`MIN_HINTED_WINDOW_LOG`] (16 KiB). A zero-byte size hint is treated as
+/// [`MIN_WINDOW_LOG`] for the raw ceil-log step and then promoted to the hinted
+/// floor. This keeps tables bounded for small inputs while preserving the
+/// encoder's baseline minimum supported window.
 /// For the HC backend, `hash_log` and `chain_log` are reduced
 /// proportionally.
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     // Derive a source-size-based cap from ceil(log2(src_size)), then
-    // clamp to MIN_WINDOW_LOG. For inputs smaller than 1 KiB (or zero) we keep the
-    // 1 KiB minimum window instead of shrinking below that floor.
+    // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
+    // MIN_HINTED_WINDOW_LOG (16 KiB hinted floor). For tiny or zero hints we
+    // therefore keep a 16 KiB effective minimum window in hinted mode.
     let src_log = if src_size == 0 {
         MIN_WINDOW_LOG
     } else {
@@ -4231,7 +4233,12 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
 
     let i = 23u64;
     let len = (i * 89 % 16384) as usize;
-    let data = generate_data(i, len);
+    let mut data = generate_data(i, len);
+    // Append a repeated slice so the fixture deterministically exercises
+    // the match path (Sequence::Triple) instead of only literals.
+    let repeat = data[128..256].to_vec();
+    data.extend_from_slice(&repeat);
+    data.extend_from_slice(&repeat);
 
     let mut driver = MatchGeneratorDriver::new(1024 * 128, 1);
     driver.set_source_size_hint(data.len() as u64);
@@ -4242,6 +4249,7 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
     driver.commit_space(space);
 
     let mut rebuilt = Vec::with_capacity(data.len());
+    let mut saw_triple = false;
     driver.start_matching(|seq| match seq {
         Sequence::Literals { literals } => rebuilt.extend_from_slice(literals),
         Sequence::Triple {
@@ -4249,6 +4257,7 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
             offset,
             match_len,
         } => {
+            saw_triple = true;
             rebuilt.extend_from_slice(literals);
             assert!(offset > 0, "offset must be non-zero");
             assert!(
@@ -4265,5 +4274,6 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
         }
     });
 
+    assert!(saw_triple, "fixture must emit at least one match");
     assert_eq!(rebuilt, data);
 }

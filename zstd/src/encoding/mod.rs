@@ -30,7 +30,12 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
     frame_enc.compress();
 }
 
-/// Convenience function to compress some source into a Vec without reusing any resources of the compressor
+/// Convenience function to compress some source into a Vec without reusing any resources of the compressor.
+///
+/// This helper eagerly buffers the full input (`Read`) before compression so it
+/// can provide a source-size hint to the one-shot encoder path. Peak memory can
+/// therefore be roughly `input_size + output_size`. For very large payloads or
+/// tighter memory budgets, prefer streaming APIs such as [`StreamingEncoder`].
 /// ```rust
 /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
