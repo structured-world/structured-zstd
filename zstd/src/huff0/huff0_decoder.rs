@@ -145,6 +145,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
+    #[cfg(feature = "fuzz_exports")]
     #[inline(always)]
     fn decode_symbol(&mut self) -> u8 {
         self.table.decode[self.state as usize].symbol
@@ -170,6 +171,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
+    #[cfg(feature = "fuzz_exports")]
     #[inline(always)]
     fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
@@ -257,7 +259,11 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[inline(always)]
-    pub(crate) fn decode4_symbols_and_num_bits_unchecked(
+    /// # Safety
+    ///
+    /// All decoders must reference the same table and kernel.
+    /// SIMD kernels read packed entries through `decoders[0].table` for all states.
+    pub(crate) unsafe fn decode4_symbols_and_num_bits_unchecked(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
         debug_assert!(
@@ -480,9 +486,10 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let symbol = self.decode_symbol();
-        self.next_state(br);
-        symbol
+        let entry = self.table.decode[self.state as usize];
+        let new_bits = br.get_bits(entry.num_bits);
+        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        entry.symbol
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -504,7 +511,7 @@ impl<'t> HuffmanDecoder<'t> {
         #[cfg(target_arch = "x86")]
         {
             let shifted = ((self.state << num_bits) & u64::from(u32::MAX)) as u32;
-            unsafe { u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits }
+            u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits
         }
     }
 
