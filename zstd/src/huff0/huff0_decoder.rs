@@ -7,9 +7,13 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{_bzhi_u64, _mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
+use core::arch::x86::{
+    _bzhi_u64, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
+};
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_bzhi_u64, _mm_i32gather_epi32, _mm_set_epi32, _mm_storeu_si128};
+use core::arch::x86_64::{
+    _bzhi_u64, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32, _mm_storeu_si128,
+};
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -27,8 +31,12 @@ pub(crate) enum HuffmanDecodeKernel {
     X86Bmi2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     X86Avx2,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Vbmi2,
     #[cfg(target_arch = "aarch64")]
     Aarch64Neon,
+    #[cfg(target_arch = "aarch64")]
+    Aarch64Sve,
 }
 
 #[cfg(feature = "std")]
@@ -38,6 +46,13 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
     *KERNEL.get_or_init(|| {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
+            if is_x86_feature_detected!("avx512vbmi2")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("bmi2")
+            {
+                return HuffmanDecodeKernel::X86Vbmi2;
+            }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2") {
                 return HuffmanDecodeKernel::X86Avx2;
             }
@@ -47,6 +62,9 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
         }
         #[cfg(target_arch = "aarch64")]
         {
+            if is_aarch64_feature_detected!("sve") {
+                return HuffmanDecodeKernel::Aarch64Sve;
+            }
             if is_aarch64_feature_detected!("neon") {
                 return HuffmanDecodeKernel::Aarch64Neon;
             }
@@ -60,6 +78,14 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
 pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if cfg!(all(
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "bmi2"
+        )) {
+            return HuffmanDecodeKernel::X86Vbmi2;
+        }
         if cfg!(all(target_feature = "avx2", target_feature = "bmi2")) {
             return HuffmanDecodeKernel::X86Avx2;
         }
@@ -69,6 +95,9 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if cfg!(target_feature = "sve") {
+            return HuffmanDecodeKernel::Aarch64Sve;
+        }
         if cfg!(target_feature = "neon") {
             return HuffmanDecodeKernel::Aarch64Neon;
         }
@@ -133,7 +162,9 @@ impl<'t> HuffmanDecoder<'t> {
         match self.kernel {
             HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            HuffmanDecodeKernel::X86Bmi2 | HuffmanDecodeKernel::X86Avx2 => {
+            HuffmanDecodeKernel::X86Bmi2
+            | HuffmanDecodeKernel::X86Avx2
+            | HuffmanDecodeKernel::X86Vbmi2 => {
                 // SAFETY: This path is selected only after runtime/static feature checks.
                 unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
             }
@@ -141,6 +172,11 @@ impl<'t> HuffmanDecoder<'t> {
             HuffmanDecodeKernel::Aarch64Neon => {
                 // SAFETY: This path is selected only after runtime/static feature checks.
                 unsafe { self.decode_symbol_and_advance_aarch64_neon(br) }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Sve => {
+                // SAFETY: This path is selected only after runtime/static feature checks.
+                unsafe { self.decode_symbol_and_advance_aarch64_sve(br) }
             }
         }
     }
@@ -156,7 +192,9 @@ impl<'t> HuffmanDecoder<'t> {
         let new_bits = br.get_bits(num_bits);
         match self.kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            HuffmanDecodeKernel::X86Bmi2 | HuffmanDecodeKernel::X86Avx2 => {
+            HuffmanDecodeKernel::X86Bmi2
+            | HuffmanDecodeKernel::X86Avx2
+            | HuffmanDecodeKernel::X86Vbmi2 => {
                 // SAFETY: Kernel dispatch guarantees BMI2 on this path.
                 unsafe {
                     self.state = self.advance_state_x86_bmi2(num_bits, new_bits);
@@ -175,6 +213,11 @@ impl<'t> HuffmanDecoder<'t> {
         let kernel = decoders[0].kernel;
         match kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Vbmi2 => {
+                // SAFETY: VBMI2 kernel is selected only after runtime/static feature checks.
+                unsafe { Self::decode4_symbols_and_num_bits_vbmi2(decoders) }
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HuffmanDecodeKernel::X86Avx2 => {
                 // SAFETY: AVX2 kernel is selected only after runtime/static feature checks.
                 unsafe { Self::decode4_symbols_and_num_bits_avx2(decoders) }
@@ -183,6 +226,11 @@ impl<'t> HuffmanDecoder<'t> {
             HuffmanDecodeKernel::Aarch64Neon => {
                 // SAFETY: NEON kernel is selected only after runtime/static feature checks.
                 unsafe { Self::decode4_symbols_and_num_bits_neon(decoders) }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Sve => {
+                // SAFETY: SVE kernel is selected only after runtime/static feature checks.
+                unsafe { Self::decode4_symbols_and_num_bits_sve(decoders) }
             }
             _ => {
                 let mut symbols = [0_u8; 4];
@@ -197,6 +245,38 @@ impl<'t> HuffmanDecoder<'t> {
                 (symbols, num_bits)
             }
         }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx512vbmi2,avx512vl,avx512bw")]
+    unsafe fn decode4_symbols_and_num_bits_vbmi2(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        let table = decoders[0].table;
+        let packed = _mm_set_epi32(
+            table.packed_decode[decoders[3].state as usize] as i32,
+            table.packed_decode[decoders[2].state as usize] as i32,
+            table.packed_decode[decoders[1].state as usize] as i32,
+            table.packed_decode[decoders[0].state as usize] as i32,
+        );
+
+        // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
+        let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
+        let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
+
+        let mut symbols_tmp = [0_u8; 16];
+        let mut bits_tmp = [0_u8; 16];
+        _mm_storeu_si128(symbols_tmp.as_mut_ptr().cast(), symbols_bytes);
+        _mm_storeu_si128(bits_tmp.as_mut_ptr().cast(), bits_bytes);
+        (
+            [
+                symbols_tmp[0],
+                symbols_tmp[1],
+                symbols_tmp[2],
+                symbols_tmp[3],
+            ],
+            [bits_tmp[0], bits_tmp[1], bits_tmp[2], bits_tmp[3]],
+        )
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -264,6 +344,27 @@ impl<'t> HuffmanDecoder<'t> {
         (symbols, bits)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sve")]
+    unsafe fn decode4_symbols_and_num_bits_sve(
+        decoders: &[HuffmanDecoder<'_>; 4],
+    ) -> ([u8; 4], [u8; 4]) {
+        // Stable Rust does not currently expose portable SVE vector intrinsics
+        // in core::arch; keep a dedicated SVE dispatch target and reuse the
+        // packed decode layout with scalar extraction.
+        let table = decoders[0].table;
+        let mut symbols = [0_u8; 4];
+        let mut bits = [0_u8; 4];
+        let mut i = 0;
+        while i < 4 {
+            let packed = table.packed_decode[decoders[i].state as usize];
+            symbols[i] = (packed & 0xFF) as u8;
+            bits[i] = ((packed >> 8) & 0xFF) as u8;
+            i += 1;
+        }
+        (symbols, bits)
+    }
+
     #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
@@ -289,6 +390,18 @@ impl<'t> HuffmanDecoder<'t> {
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     unsafe fn decode_symbol_and_advance_aarch64_neon(
+        &mut self,
+        br: &mut BitReaderReversed<'_>,
+    ) -> u8 {
+        let entry = self.table.decode[self.state as usize];
+        let new_bits = br.get_bits(entry.num_bits);
+        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
+        entry.symbol
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sve")]
+    unsafe fn decode_symbol_and_advance_aarch64_sve(
         &mut self,
         br: &mut BitReaderReversed<'_>,
     ) -> u8 {
