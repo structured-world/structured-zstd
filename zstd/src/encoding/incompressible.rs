@@ -20,13 +20,14 @@ const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StrictProbeSelection {
     probe_len: usize,
+    tail_start: Option<usize>,
     mid_start: Option<usize>,
 }
 
 impl StrictProbeSelection {
     #[inline]
     const fn is_full_block(self) -> bool {
-        self.mid_start.is_none()
+        self.tail_start.is_none()
     }
 }
 
@@ -36,12 +37,34 @@ fn select_strict_probes(block_len: usize) -> StrictProbeSelection {
     if probe_len == block_len {
         StrictProbeSelection {
             probe_len,
+            tail_start: None,
             mid_start: None,
         }
     } else {
-        StrictProbeSelection {
-            probe_len,
-            mid_start: Some((block_len - probe_len) / 2),
+        let tail_start = block_len - probe_len;
+        if tail_start < probe_len {
+            // For [probe_len + 1, 2 * probe_len), head/tail would heavily overlap.
+            // Reuse the full-block classification computed by the caller.
+            StrictProbeSelection {
+                probe_len,
+                tail_start: None,
+                mid_start: None,
+            }
+        } else if tail_start < 2 * probe_len {
+            // For [2 * probe_len, 3 * probe_len), head/tail are separable but a
+            // distinct non-overlapping middle probe is not.
+            StrictProbeSelection {
+                probe_len,
+                tail_start: Some(tail_start),
+                mid_start: None,
+            }
+        } else {
+            // Once we can separate all windows, use head/mid/tail probing.
+            StrictProbeSelection {
+                probe_len,
+                tail_start: Some(tail_start),
+                mid_start: Some(tail_start / 2),
+            }
         }
     }
 }
@@ -117,19 +140,23 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     let selection = select_strict_probes(block.len());
     if selection.is_full_block() {
         // The full-block sample above already classified this input. For
-        // minimum-size blocks, head/mid/tail probes would be identical.
+        // minimum and near-min blocks, split probes would overlap too heavily.
         return true;
     }
     let probe_len = selection.probe_len;
-    let mid_start = selection
-        .mid_start
-        .expect("strict probe mid_start should be present for split probes");
+    let tail_start = selection
+        .tail_start
+        .expect("strict probe tail_start should be present for split probes");
     let head = &block[..probe_len];
-    let mid = &block[mid_start..mid_start + probe_len];
-    let tail = &block[block.len() - probe_len..];
-    sample_looks_incompressible(head)
-        && sample_looks_incompressible(mid)
-        && sample_looks_incompressible(tail)
+    let tail = &block[tail_start..tail_start + probe_len];
+    if let Some(mid_start) = selection.mid_start {
+        let mid = &block[mid_start..mid_start + probe_len];
+        sample_looks_incompressible(head)
+            && sample_looks_incompressible(mid)
+            && sample_looks_incompressible(tail)
+    } else {
+        sample_looks_incompressible(head) && sample_looks_incompressible(tail)
+    }
 }
 
 #[inline]
@@ -234,7 +261,7 @@ mod tests {
         let block = vec![0xA5; RAW_FAST_PATH_MIN_BLOCK_LEN];
         let probes = select_strict_probes(block.len());
         assert_eq!(
-            probes.mid_start, None,
+            probes.tail_start, None,
             "minimum-size strict blocks must reuse the full-block sample"
         );
         assert_eq!(
@@ -242,5 +269,23 @@ mod tests {
             sample_looks_incompressible(&block),
             "strict path should not re-score identical probes for minimum-size blocks"
         );
+    }
+
+    #[test]
+    fn strict_probe_selector_avoids_overlap_on_small_non_min_blocks() {
+        let near_min = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN + 1);
+        assert_eq!(near_min.tail_start, None);
+        assert_eq!(near_min.mid_start, None);
+
+        let two_probe = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN * 2);
+        assert_eq!(two_probe.tail_start, Some(RAW_FAST_PATH_MIN_BLOCK_LEN));
+        assert_eq!(two_probe.mid_start, None);
+
+        let three_probe = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN * 3);
+        assert_eq!(
+            three_probe.tail_start,
+            Some(RAW_FAST_PATH_MIN_BLOCK_LEN * 2)
+        );
+        assert_eq!(three_probe.mid_start, Some(RAW_FAST_PATH_MIN_BLOCK_LEN));
     }
 }
