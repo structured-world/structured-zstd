@@ -794,7 +794,11 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::HashChain => self.hc_matcher_mut().start_matching(&mut handle_sequence),
         }
     }
-    fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+    fn skip_matching(&mut self) {
+        self.skip_matching_with_hint(None);
+    }
+
+    fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend {
             MatcherBackend::Simple => self
                 .match_generator
@@ -3033,7 +3037,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     first.truncate(12);
     driver.commit_space(first);
     assert_eq!(driver.get_last_space(), b"abcabcabcabc");
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
 
     let mut second = driver.get_next_space();
     second[..12].copy_from_slice(b"abcabcabcabc");
@@ -3078,7 +3082,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
     let full_tables = driver.dfast_matcher().short_hash.len();
     assert_eq!(full_tables, 1 << DFAST_HASH_BITS);
 
@@ -3088,7 +3092,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
     let hinted_tables = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
@@ -3108,7 +3112,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
     let full_rows = driver.row_matcher().row_heads.len();
     assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_LOG));
 
@@ -3118,7 +3122,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
     let hinted_rows = driver.row_matcher().row_heads.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
@@ -3294,7 +3298,7 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
 
     let table_len = driver.dfast_matcher().short_hash.len();
     assert_eq!(
@@ -3379,7 +3383,7 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
 
     // Switch to Fastest — must release HC tables.
     driver.reset(CompressionLevel::Fastest);
@@ -3409,7 +3413,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
     let better_hash_len = hc.hash_table.len();
@@ -3424,7 +3428,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
-    driver.skip_matching(None);
+    driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
     assert!(
@@ -3684,7 +3688,7 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching(None);
+        driver.skip_matching_with_hint(None);
     }
 
     assert_eq!(
@@ -4159,7 +4163,7 @@ fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching(None);
+        driver.skip_matching_with_hint(None);
     }
 
     assert_eq!(
@@ -4190,7 +4194,7 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching(None);
+        driver.skip_matching_with_hint(None);
     }
 
     assert_eq!(
@@ -4256,7 +4260,7 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
-        driver.skip_matching(None);
+        driver.skip_matching_with_hint(None);
     }
 
     assert_eq!(

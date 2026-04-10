@@ -17,6 +17,35 @@ const INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR: usize = 24;
 // Allow limited 4-byte hash-bucket repeats before treating the sample as structured.
 const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictProbeSelection {
+    probe_len: usize,
+    mid_start: Option<usize>,
+}
+
+impl StrictProbeSelection {
+    #[inline]
+    const fn is_full_block(self) -> bool {
+        self.mid_start.is_none()
+    }
+}
+
+#[inline]
+fn select_strict_probes(block_len: usize) -> StrictProbeSelection {
+    let probe_len = RAW_FAST_PATH_MIN_BLOCK_LEN.min(block_len);
+    if probe_len == block_len {
+        StrictProbeSelection {
+            probe_len,
+            mid_start: None,
+        }
+    } else {
+        StrictProbeSelection {
+            probe_len,
+            mid_start: Some((block_len - probe_len) / 2),
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn compression_level_allows_raw_fast_path(
     level: CompressionLevel,
@@ -85,13 +114,16 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     }
     // Best level should only early-exit on strongly random data. Probe head,
     // middle, and tail so mixed-entropy blocks do not get misclassified.
-    let probe_len = RAW_FAST_PATH_MIN_BLOCK_LEN.min(block.len());
-    if probe_len == block.len() {
+    let selection = select_strict_probes(block.len());
+    if selection.is_full_block() {
         // The full-block sample above already classified this input. For
         // minimum-size blocks, head/mid/tail probes would be identical.
         return true;
     }
-    let mid_start = (block.len() - probe_len) / 2;
+    let probe_len = selection.probe_len;
+    let mid_start = selection
+        .mid_start
+        .expect("strict probe mid_start should be present for split probes");
     let head = &block[..probe_len];
     let mid = &block[mid_start..mid_start + probe_len];
     let tail = &block[block.len() - probe_len..];
@@ -200,6 +232,11 @@ mod tests {
     #[test]
     fn strict_incompressible_reuses_full_block_classification_for_min_block() {
         let block = vec![0xA5; RAW_FAST_PATH_MIN_BLOCK_LEN];
+        let probes = select_strict_probes(block.len());
+        assert_eq!(
+            probes.mid_start, None,
+            "minimum-size strict blocks must reuse the full-block sample"
+        );
         assert_eq!(
             block_looks_incompressible_strict(&block),
             sample_looks_incompressible(&block),

@@ -40,7 +40,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
         let rle_byte = uncompressed_data[0];
         state.matcher.commit_space(uncompressed_data);
-        state.matcher.skip_matching(Some(false));
+        state.matcher.skip_matching_with_hint(Some(false));
         let header = BlockHeader {
             last_block,
             block_type: crate::blocks::block::BlockType::RLE,
@@ -55,7 +55,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         &uncompressed_data,
     ) {
         state.matcher.commit_space(uncompressed_data);
-        state.matcher.skip_matching(Some(true));
+        state.matcher.skip_matching_with_hint(Some(true));
         let header = BlockHeader {
             last_block,
             block_type: crate::blocks::block::BlockType::Raw,
@@ -131,7 +131,11 @@ mod tests {
             self.last_space = space;
         }
 
-        fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+        fn skip_matching(&mut self) {
+            self.skip_hints.push(None);
+        }
+
+        fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
             self.skip_hints.push(incompressible_hint);
         }
 

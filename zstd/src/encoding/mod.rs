@@ -164,10 +164,15 @@ pub trait Matcher {
     /// Commit a space to the matcher so it can be matched against
     fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
     /// Just process the data in the last committed space for future matching.
+    fn skip_matching(&mut self);
+    /// Hint-aware skip path used internally to thread a precomputed block
+    /// incompressibility verdict to matcher backends.
     ///
-    /// `incompressible_hint` lets callers thread a precomputed block verdict
-    /// to avoid repeating expensive sampling in matcher backends.
-    fn skip_matching(&mut self, incompressible_hint: Option<bool>);
+    /// Default implementation preserves backwards compatibility for external
+    /// custom matchers by delegating to [`skip_matching`](Self::skip_matching).
+    fn skip_matching_with_hint(&mut self, _incompressible_hint: Option<bool>) {
+        self.skip_matching();
+    }
     /// Process the data in the last committed space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
