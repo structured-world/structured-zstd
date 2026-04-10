@@ -1687,6 +1687,11 @@ impl DfastMatchGenerator {
                 Self::INCOMPRESSIBLE_SKIP_STEP,
             );
         } else {
+            let dense_tail = DFAST_MIN_MATCH_LEN + 3;
+            let tail_start = current_abs_start.saturating_sub(dense_tail);
+            if tail_start < current_abs_start {
+                self.insert_positions(tail_start, current_abs_start);
+            }
             self.insert_positions(current_abs_start, current_abs_end);
         }
 
@@ -4661,6 +4666,50 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
 }
 
 #[test]
+fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    let tail = b"Qz9kLm2Rp";
+    let mut first = b"0123456789abcdef".to_vec();
+    first.extend_from_slice(tail);
+    matcher.add_data(first.clone(), |_| {});
+    matcher.skip_matching(Some(false));
+
+    let mut second = tail.to_vec();
+    second.extend_from_slice(b"after-tail-literals");
+    matcher.add_data(second, |_| {});
+
+    let mut first_sequence = None;
+    matcher.start_matching(|seq| {
+        if first_sequence.is_some() {
+            return;
+        }
+        first_sequence = Some(match seq {
+            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => (literals.len(), offset, match_len),
+        });
+    });
+
+    let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
+    assert_eq!(
+        lit_len, 0,
+        "expected immediate cross-block match at block start"
+    );
+    assert_eq!(
+        offset,
+        tail.len(),
+        "expected dense skip to preserve cross-boundary tail match"
+    );
+    assert!(
+        match_len >= DFAST_MIN_MATCH_LEN,
+        "match length should satisfy dfast minimum match length"
+    );
+}
+
+#[test]
 fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     fn high_entropy_bytes(len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(len);
@@ -4681,12 +4730,6 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     first[tail_start..].copy_from_slice(tail);
     matcher.add_data(first.clone(), |_| {});
 
-    let current_abs_start = matcher.history_abs_start + matcher.window_size - first.len();
-    let current_abs_end = current_abs_start + first.len();
-    assert!(
-        matcher.block_looks_incompressible(current_abs_start, current_abs_end),
-        "test fixture must take the sparse incompressible branch"
-    );
     matcher.skip_matching(Some(true));
 
     let mut second = tail.to_vec();

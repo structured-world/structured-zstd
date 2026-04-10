@@ -98,6 +98,8 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
 
     let mut counts = [0u16; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    // Bitset occupancy keeps this path no_std-friendly while avoiding the
+    // larger per-slot bool map (and extra matcher-level scratch state).
     let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
     let mut sampled_quads = 0usize;
