@@ -184,13 +184,25 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
             &mut sampled_quads,
         );
     } else {
-        // Probe both ends to avoid classifying mixed-entropy blocks from prefix only.
-        let head_len = sample_len / 2;
-        let tail_len = sample_len - head_len;
+        // Probe head, middle, and tail so capped samples can still reject
+        // mixed-entropy blocks whose center is compressible.
+        let head_len = sample_len / 3;
+        let mid_len = sample_len / 3;
+        let tail_len = sample_len - head_len - mid_len;
         let head = &block[..head_len];
+        let mid_start = (block.len() - mid_len) / 2;
+        let mid = &block[mid_start..mid_start + mid_len];
         let tail = &block[block.len() - tail_len..];
         update_sample_metrics(
             head,
+            &mut counts,
+            &mut repeat_table,
+            &mut repeat_occupied,
+            &mut repeats,
+            &mut sampled_quads,
+        );
+        update_sample_metrics(
+            mid,
             &mut counts,
             &mut repeat_table,
             &mut repeat_occupied,
@@ -221,6 +233,19 @@ mod tests {
     use super::*;
     use crate::encoding::CompressionLevel;
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        let mut out = vec![0u8; len];
+        for byte in &mut out {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        out
+    }
 
     #[test]
     fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
@@ -287,5 +312,25 @@ mod tests {
             Some(RAW_FAST_PATH_MIN_BLOCK_LEN * 2)
         );
         assert_eq!(three_probe.mid_start, Some(RAW_FAST_PATH_MIN_BLOCK_LEN));
+    }
+
+    #[test]
+    fn capped_sample_probes_middle_and_blocks_raw_fast_path_for_mixed_entropy() {
+        let mut block =
+            deterministic_bytes(0x9E37_79B9_7F4A_7C15, RAW_FAST_PATH_MAX_SAMPLE_LEN * 2);
+        let mid_start = block.len() / 3;
+        let mid_end = block.len() - (block.len() / 3);
+        for byte in &mut block[mid_start..mid_end] {
+            *byte = 0;
+        }
+
+        assert!(
+            !sample_looks_incompressible(&block),
+            "capped sampling must account for middle-region compressibility"
+        );
+        assert!(
+            !block_looks_incompressible(&block),
+            "mixed-entropy block should not look incompressible for default fast-path gate"
+        );
     }
 }
