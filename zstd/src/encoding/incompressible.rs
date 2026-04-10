@@ -1,8 +1,9 @@
-use super::{BETTER_WINDOW_SIZE_BYTES, CompressionLevel};
+use super::{BETTER_WINDOW_LOG, CompressionLevel};
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
+const BETTER_WINDOW_SIZE_BYTES: u64 = 1u64 << BETTER_WINDOW_LOG;
 
 // Keep classifier scratch modest for no_std/small-stack targets: 1024 slots
 // cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
@@ -75,10 +76,10 @@ pub(crate) fn compression_level_allows_raw_fast_path(
     window_size: u64,
 ) -> bool {
     match level {
-        CompressionLevel::Fastest | CompressionLevel::Default => true,
+        CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
         CompressionLevel::Best => window_size <= BETTER_WINDOW_SIZE_BYTES,
-        CompressionLevel::Level(level) => (0..=3).contains(&level),
-        CompressionLevel::Uncompressed | CompressionLevel::Better => false,
+        CompressionLevel::Level(_) => window_size <= BETTER_WINDOW_SIZE_BYTES,
+        CompressionLevel::Uncompressed => false,
     }
 }
 
@@ -278,6 +279,14 @@ mod tests {
         assert!(!compression_level_allows_raw_fast_path(
             CompressionLevel::Best,
             BETTER_WINDOW_SIZE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn level4_row_raw_fast_path_allowed_with_better_window_reach() {
+        assert!(compression_level_allows_raw_fast_path(
+            CompressionLevel::Level(4),
+            BETTER_WINDOW_SIZE_BYTES
         ));
     }
 
