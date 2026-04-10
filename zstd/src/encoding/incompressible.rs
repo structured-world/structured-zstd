@@ -1,4 +1,4 @@
-use super::CompressionLevel;
+use super::{CompressionLevel, match_generator::BETTER_WINDOW_SIZE_BYTES};
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
@@ -16,9 +16,13 @@ const INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR: usize = 24;
 const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
 
 #[inline]
-pub(crate) fn compression_level_allows_raw_fast_path(level: CompressionLevel) -> bool {
+pub(crate) fn compression_level_allows_raw_fast_path(
+    level: CompressionLevel,
+    window_size: u64,
+) -> bool {
     match level {
-        CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Best => true,
+        CompressionLevel::Fastest | CompressionLevel::Default => true,
+        CompressionLevel::Best => window_size <= BETTER_WINDOW_SIZE_BYTES,
         CompressionLevel::Level(level) => (0..=3).contains(&level),
         CompressionLevel::Uncompressed | CompressionLevel::Better => false,
     }
@@ -80,6 +84,11 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     // Best level should only early-exit on strongly random data. Probe head,
     // middle, and tail so mixed-entropy blocks do not get misclassified.
     let probe_len = RAW_FAST_PATH_MIN_BLOCK_LEN.min(block.len());
+    if probe_len == block.len() {
+        // The full-block sample above already classified this input. For
+        // minimum-size blocks, head/mid/tail probes would be identical.
+        return true;
+    }
     let mid_start = (block.len() - probe_len) / 2;
     let head = &block[..probe_len];
     let mid = &block[mid_start..mid_start + probe_len];
@@ -149,6 +158,8 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::CompressionLevel;
+    use alloc::vec;
 
     #[test]
     fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
@@ -170,5 +181,27 @@ mod tests {
 
         assert_eq!(sampled_quads, 1);
         assert_eq!(repeats, 0, "first quad must not be miscounted as a repeat");
+    }
+
+    #[test]
+    fn best_raw_fast_path_requires_better_sized_window() {
+        assert!(compression_level_allows_raw_fast_path(
+            CompressionLevel::Best,
+            BETTER_WINDOW_SIZE_BYTES
+        ));
+        assert!(!compression_level_allows_raw_fast_path(
+            CompressionLevel::Best,
+            BETTER_WINDOW_SIZE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn strict_incompressible_reuses_full_block_classification_for_min_block() {
+        let block = vec![0xA5; RAW_FAST_PATH_MIN_BLOCK_LEN];
+        assert_eq!(
+            block_looks_incompressible_strict(&block),
+            sample_looks_incompressible(&block),
+            "strict path should not re-score identical probes for minimum-size blocks"
+        );
     }
 }

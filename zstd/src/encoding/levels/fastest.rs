@@ -95,7 +95,7 @@ pub fn compress_block_encoded<M: Matcher>(
 
 #[inline]
 fn should_emit_raw_fast_path(level: CompressionLevel, window_size: u64, block: &[u8]) -> bool {
-    if !compression_level_allows_raw_fast_path(level) {
+    if !compression_level_allows_raw_fast_path(level, window_size) {
         return false;
     }
     if matches!(level, CompressionLevel::Best) {

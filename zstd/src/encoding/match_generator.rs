@@ -2631,7 +2631,11 @@ impl HcMatchGenerator {
         let mut pos = start;
         while pos < end {
             self.insert_position(pos);
-            pos += step;
+            let next = pos.saturating_add(step);
+            if next <= pos {
+                break;
+            }
+            pos = next;
         }
     }
 
@@ -4464,27 +4468,46 @@ fn simple_matcher_skip_matching_seeds_every_position_even_with_fast_step() {
 #[test]
 fn simple_matcher_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     let mut matcher = MatchGenerator::new(128);
+    let first = b"abcdefghijklmnopqrstuvwxyz012345".to_vec();
+    let sparse_probe = first[3..3 + MIN_MATCH_LEN].to_vec();
+    let tail_start = first.len() - MIN_MATCH_LEN;
+    let tail_probe = first[tail_start..tail_start + MIN_MATCH_LEN].to_vec();
+    matcher.add_data(first, SuffixStore::with_capacity(256), |_, _| {});
+
+    matcher.skip_matching_with_hint(Some(true));
+
+    // Observable behavior check: sparse-prefix probe should not immediately match.
+    matcher.add_data(sparse_probe, SuffixStore::with_capacity(256), |_, _| {});
+    let mut sparse_first_is_literals = None;
+    assert!(matcher.next_sequence(|seq| {
+        if sparse_first_is_literals.is_none() {
+            sparse_first_is_literals = Some(matches!(seq, Sequence::Literals { .. }));
+        }
+    }));
+    assert!(
+        sparse_first_is_literals.unwrap_or(false),
+        "sparse-start probe should not produce an immediate match"
+    );
+
+    // Dense tail remains indexed for cross-block boundary matching.
+    let mut matcher = MatchGenerator::new(128);
     matcher.add_data(
         b"abcdefghijklmnopqrstuvwxyz012345".to_vec(),
         SuffixStore::with_capacity(256),
         |_, _| {},
     );
-
     matcher.skip_matching_with_hint(Some(true));
-
-    let last = matcher.window.last().unwrap();
-    assert_eq!(last.suffixes.get(&last.data[0..MIN_MATCH_LEN]), Some(0));
-    assert_eq!(
-        last.suffixes.get(&last.data[3..3 + MIN_MATCH_LEN]),
-        None,
-        "sparse prefix indexing should skip non-step starts"
-    );
-    let tail_start = last.data.len() - MIN_MATCH_LEN;
-    assert_eq!(
-        last.suffixes
-            .get(&last.data[tail_start..tail_start + MIN_MATCH_LEN]),
-        Some(tail_start),
-        "dense tail must stay indexed for cross-block boundary matches"
+    matcher.add_data(tail_probe, SuffixStore::with_capacity(256), |_, _| {});
+    let mut tail_first_is_immediate_match = None;
+    assert!(matcher.next_sequence(|seq| {
+        if tail_first_is_immediate_match.is_none() {
+            tail_first_is_immediate_match =
+                Some(matches!(seq, Sequence::Triple { literals, .. } if literals.is_empty()));
+        }
+    }));
+    assert!(
+        tail_first_is_immediate_match.unwrap_or(false),
+        "dense tail probe should match immediately at block start"
     );
 }
 
@@ -4763,6 +4786,71 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
         offset,
         tail.len(),
         "expected match against densely seeded tail"
+    );
+    assert!(
+        match_len >= DFAST_MIN_MATCH_LEN,
+        "match length should satisfy dfast minimum match length"
+    );
+}
+
+#[test]
+fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blocks() {
+    fn high_entropy_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 40) as u8);
+        }
+        out
+    }
+
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    let boundary_prefix = [0xFA, 0xFB, 0xFC];
+    let boundary_suffix = [0xFD, 0xEE, 0xAD, 0xBE, 0xEF, 0x11, 0x22, 0x33];
+
+    let mut first = high_entropy_bytes(4096);
+    let first_tail_start = first.len() - boundary_prefix.len();
+    first[first_tail_start..].copy_from_slice(&boundary_prefix);
+    matcher.add_data(first, |_| {});
+    matcher.skip_matching(Some(true));
+
+    let mut second = high_entropy_bytes(4096);
+    second[..boundary_suffix.len()].copy_from_slice(&boundary_suffix);
+    matcher.add_data(second.clone(), |_| {});
+    matcher.skip_matching(Some(true));
+
+    let mut third = boundary_prefix.to_vec();
+    third.extend_from_slice(&boundary_suffix);
+    third.extend_from_slice(b"-trailing-literals");
+    matcher.add_data(third, |_| {});
+
+    let mut first_sequence = None;
+    matcher.start_matching(|seq| {
+        if first_sequence.is_some() {
+            return;
+        }
+        first_sequence = Some(match seq {
+            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => (literals.len(), offset, match_len),
+        });
+    });
+
+    let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
+    assert_eq!(
+        lit_len, 0,
+        "expected immediate match from the prior sparse-skip boundary"
+    );
+    assert_eq!(
+        offset,
+        second.len() + boundary_prefix.len(),
+        "expected match against backfilled first→second boundary start"
     );
     assert!(
         match_len >= DFAST_MIN_MATCH_LEN,
