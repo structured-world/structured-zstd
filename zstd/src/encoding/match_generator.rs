@@ -1604,6 +1604,9 @@ fn pick_lazy_match_shared(
 
 impl DfastMatchGenerator {
     const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+    // insert_position() needs 4 bytes of lookahead. When a new block is appended,
+    // we must backfill starts from the previous block that have just become hashable.
+    const BOUNDARY_DENSE_TAIL_LEN: usize = DFAST_MIN_MATCH_LEN + 3;
 
     fn new(max_window_size: usize) -> Self {
         Self {
@@ -1680,6 +1683,10 @@ impl DfastMatchGenerator {
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
+        let tail_start = current_abs_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if tail_start < current_abs_start {
+            self.insert_positions(tail_start, current_abs_start);
+        }
 
         let used_sparse = incompressible_hint
             .unwrap_or_else(|| self.block_looks_incompressible(current_abs_start, current_abs_end));
@@ -1690,19 +1697,13 @@ impl DfastMatchGenerator {
                 Self::INCOMPRESSIBLE_SKIP_STEP,
             );
         } else {
-            let dense_tail = DFAST_MIN_MATCH_LEN + 3;
-            let tail_start = current_abs_start.saturating_sub(dense_tail);
-            if tail_start < current_abs_start {
-                self.insert_positions(tail_start, current_abs_start);
-            }
             self.insert_positions(current_abs_start, current_abs_end);
         }
 
         // Seed the tail densely only after sparse insertion so the next block
         // can match across the boundary without rehashing the full block twice.
         if used_sparse {
-            let dense_tail = DFAST_MIN_MATCH_LEN + 3;
-            let tail_start = current_abs_end.saturating_sub(dense_tail);
+            let tail_start = current_abs_end.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
             if tail_start < current_abs_end {
                 self.insert_positions(tail_start, current_abs_end);
             }

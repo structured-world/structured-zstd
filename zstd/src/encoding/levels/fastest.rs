@@ -9,7 +9,6 @@ use crate::{
             block_looks_incompressible, block_looks_incompressible_strict,
             compression_level_allows_raw_fast_path,
         },
-        match_generator::BETTER_WINDOW_SIZE_BYTES,
     },
 };
 use alloc::vec::Vec;
@@ -99,12 +98,6 @@ fn should_emit_raw_fast_path(level: CompressionLevel, window_size: u64, block: &
         return false;
     }
     if matches!(level, CompressionLevel::Best) {
-        // Keep Best's long-distance-match advantage when the effective window
-        // exceeds Better (8 MiB). Large-window data can look random locally
-        // while still being matchable against older history.
-        if window_size > BETTER_WINDOW_SIZE_BYTES {
-            return false;
-        }
         return block_looks_incompressible_strict(block);
     }
     block_looks_incompressible(block)
