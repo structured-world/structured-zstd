@@ -184,9 +184,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
+        let small_source_hint = self.source_size_hint.map(|size| size <= (1 << 14));
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
-                && self.state.matcher.supports_dictionary_priming();
+                && self.state.matcher.supports_dictionary_priming()
+                && self.dictionary.is_some();
         if let Some(size_hint) = self.source_size_hint.take() {
             // Keep source-size hint scoped to payload bytes; dictionary priming
             // is applied separately and should not force larger matcher sizing.
@@ -247,6 +249,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Accumulate all compressed blocks; the frame header is written after
         // all input has been read so that Frame_Content_Size is known.
         let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
+        let mut all_blocks_raw = true;
         let mut total_uncompressed: u64 = 0;
         // Compress block by block
         loop {
@@ -296,13 +299,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Default
                 | CompressionLevel::Better
                 | CompressionLevel::Best
-                | CompressionLevel::Level(_) => compress_block_encoded(
-                    &mut self.state,
-                    self.compression_level,
-                    last_block,
-                    uncompressed_data,
-                    &mut all_blocks,
-                ),
+                | CompressionLevel::Level(_) => {
+                    let block_start = all_blocks.len();
+                    compress_block_encoded(
+                        &mut self.state,
+                        self.compression_level,
+                        last_block,
+                        uncompressed_data,
+                        &mut all_blocks,
+                    );
+                    if let Some(&first_header_byte) = all_blocks.get(block_start) {
+                        let block_type = (first_header_byte >> 1) & 0b11;
+                        if block_type != 0 {
+                            all_blocks_raw = false;
+                        }
+                    } else {
+                        all_blocks_raw = false;
+                    }
+                }
             }
             if last_block {
                 break;
@@ -310,20 +324,31 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
 
         // Now that total_uncompressed is known, write the frame header with FCS.
-        // We always include the window descriptor (single_segment = false) because
-        // compressed blocks are encoded against the matcher's window, not the content
-        // size. Setting single_segment would tell the decoder to use FCS as window,
-        // which can be smaller than the encoder's actual window and trip up decoders.
+        // Keep one-shot small hinted frames in the same header mode as the FFI
+        // benchmark path (`single_segment=true`) for parity, but avoid enabling
+        // this globally across slower/deeper levels where it can regress C-FFI
+        // decode compatibility.
+        let level_supports_single_segment_parity =
+            matches!(self.compression_level, CompressionLevel::Default);
+        let single_segment = !use_dictionary_state
+            && small_source_hint == Some(true)
+            && level_supports_single_segment_parity
+            && all_blocks_raw
+            && total_uncompressed <= (1 << 14);
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
-            single_segment: false,
+            single_segment,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: if use_dictionary_state {
                 self.dictionary.as_ref().map(|dict| dict.id as u64)
             } else {
                 None
             },
-            window_size: Some(window_size),
+            window_size: if single_segment {
+                None
+            } else {
+                Some(window_size)
+            },
         };
         // Write the frame header and compressed blocks separately to avoid
         // shifting the entire `all_blocks` buffer to prepend the header.
@@ -534,7 +559,14 @@ mod tests {
                 );
                 // Verify C zstd can decompress
                 let mut decoded = Vec::new();
-                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "C zstd decode failed for len={} level={level:?}: {e}",
+                            data.len()
+                        )
+                    },
+                );
                 assert_eq!(
                     decoded.as_slice(),
                     *data,
@@ -561,6 +593,32 @@ mod tests {
 
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn small_hinted_default_frame_uses_single_segment_header() {
+        let data = generate_data(0xD15E_A5ED, 1024);
+        let compressed = {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+
+        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+        assert!(
+            frame_header.descriptor.single_segment_flag(),
+            "small hinted default frames should use single-segment header for Rust/FFI parity"
+        );
+        assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
+            .expect("ffi decoder must accept single-segment small hinted default frame");
         assert_eq!(decoded, data);
     }
 

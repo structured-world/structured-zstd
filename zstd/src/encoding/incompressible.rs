@@ -4,7 +4,9 @@ pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 
-const INCOMPRESSIBLE_REPEAT_TABLE_BITS: usize = 11;
+// Keep classifier scratch modest for no_std/small-stack targets: 1024 slots
+// cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
+const INCOMPRESSIBLE_REPEAT_TABLE_BITS: usize = 10;
 const INCOMPRESSIBLE_REPEAT_TABLE_LEN: usize = 1 << INCOMPRESSIBLE_REPEAT_TABLE_BITS;
 const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64;
 const INCOMPRESSIBLE_REPEAT_HASH_MULT: u32 = 0x9E37_79B1;

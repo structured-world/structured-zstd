@@ -172,6 +172,46 @@ mod tests {
     }
 
     #[test]
+    fn raw_fast_path_emits_raw_block_and_passes_incompressible_hint() {
+        let mut state = CompressState {
+            matcher: HintProbeMatcher::default(),
+            last_huff_table: None,
+            fse_tables: FseTables::new(),
+            offset_hist: [1, 4, 8],
+        };
+        let mut output = Vec::new();
+
+        let mut block = vec![0u8; 4096];
+        let mut x = 0x1234_5678u32;
+        for byte in &mut block {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *byte = x as u8;
+        }
+        assert!(
+            block_looks_incompressible(&block),
+            "fixture must look incompressible to hit raw fast-path success branch"
+        );
+
+        compress_block_encoded(
+            &mut state,
+            CompressionLevel::Fastest,
+            true,
+            block.clone(),
+            &mut output,
+        );
+
+        assert_eq!(state.matcher.skip_hints, vec![Some(true)]);
+        assert_eq!(state.matcher.get_last_space(), block.as_slice());
+        assert_eq!(
+            (output[0] >> 1) & 0b11,
+            0,
+            "raw fast-path should emit BlockType::Raw header"
+        );
+    }
+
+    #[test]
     fn best_raw_fast_path_disabled_when_window_exceeds_better_reach() {
         let mut block = vec![0u8; 4096];
         let mut x = 0x1234_5678u32;

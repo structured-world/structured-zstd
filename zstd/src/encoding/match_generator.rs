@@ -2475,8 +2475,11 @@ impl HcMatchGenerator {
             let tail_start = current_abs_end
                 .saturating_sub(dense_tail)
                 .max(self.history_abs_start);
-            if tail_start < current_abs_end {
-                self.insert_positions(tail_start, current_abs_end);
+            let tail_start = tail_start.max(current_abs_start);
+            for pos in tail_start..current_abs_end {
+                if (pos - current_abs_start) % Self::INCOMPRESSIBLE_SKIP_STEP != 0 {
+                    self.insert_position(pos);
+                }
             }
         } else {
             self.insert_positions(current_abs_start, current_abs_end);
@@ -4076,6 +4079,37 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
     assert!(
         match_len >= tail.len(),
         "tail-aligned cross-block match must be preserved"
+    );
+}
+
+#[test]
+fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
+    let mut matcher = HcMatchGenerator::new(1 << 22);
+    let first = deterministic_high_entropy_bytes(0xC2B2_AE3D_27D4_EB4F, 4096);
+    matcher.add_data(first.clone(), |_| {});
+    matcher.skip_matching(Some(true));
+
+    let current_len = first.len();
+    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
+    let current_abs_end = current_abs_start + current_len;
+    let dense_tail = HC_MIN_MATCH_LEN + HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP;
+    let tail_start = current_abs_end
+        .saturating_sub(dense_tail)
+        .max(matcher.history_abs_start)
+        .max(current_abs_start);
+
+    let overlap_pos = (tail_start..current_abs_end)
+        .find(|&pos| (pos - current_abs_start) % HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP == 0)
+        .expect("fixture should contain at least one sparse-grid overlap in dense tail");
+
+    let rel = matcher
+        .relative_position(overlap_pos)
+        .expect("overlap position should be representable as relative position");
+    let chain_idx = rel as usize & ((1 << matcher.chain_log) - 1);
+    assert_ne!(
+        matcher.chain_table[chain_idx],
+        rel + 1,
+        "sparse-grid tail positions must not be reinserted (self-loop chain entry)"
     );
 }
 
