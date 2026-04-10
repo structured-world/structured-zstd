@@ -1604,8 +1604,11 @@ fn pick_lazy_match_shared(
 
 impl DfastMatchGenerator {
     const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
-    // insert_position() needs 4 bytes of lookahead. When a new block is appended,
-    // we must backfill starts from the previous block that have just become hashable.
+    // Keep a short dense tail at block boundaries for two related reasons:
+    // 1) insert_position() needs 4 bytes of lookahead, so appending a new block can
+    //    make starts from the previous block newly hashable and require backfill;
+    // 2) we also need enough trailing bytes from the previous block to preserve
+    //    cross-block matching for the minimum match length.
     const BOUNDARY_DENSE_TAIL_LEN: usize = DFAST_MIN_MATCH_LEN + 3;
 
     fn new(max_window_size: usize) -> Self {
@@ -2469,7 +2472,9 @@ impl HcMatchGenerator {
                 Self::INCOMPRESSIBLE_SKIP_STEP,
             );
             let dense_tail = HC_MIN_MATCH_LEN + Self::INCOMPRESSIBLE_SKIP_STEP;
-            let tail_start = current_abs_end.saturating_sub(dense_tail);
+            let tail_start = current_abs_end
+                .saturating_sub(dense_tail)
+                .max(self.history_abs_start);
             if tail_start < current_abs_end {
                 self.insert_positions(tail_start, current_abs_end);
             }

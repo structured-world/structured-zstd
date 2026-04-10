@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 ///   larger input
 /// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
 #[inline]
-pub fn compress_block_encoded<M: Matcher>(
+pub(crate) fn compress_block_encoded<M: Matcher>(
     state: &mut CompressState<M>,
     compression_level: CompressionLevel,
     last_block: bool,
