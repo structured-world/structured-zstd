@@ -27,7 +27,7 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-use super::incompressible::block_looks_incompressible;
+use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -46,6 +46,11 @@ const DFAST_TARGET_LEN: usize = 48;
 const DFAST_HASH_BITS: usize = 20;
 const DFAST_SEARCH_DEPTH: usize = 4;
 const DFAST_EMPTY_SLOT: usize = usize::MAX;
+const DFAST_SKIP_SEARCH_STRENGTH: usize = 6;
+const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
+const DFAST_LOCAL_SKIP_TRIGGER: usize = 256;
+const DFAST_MAX_SKIP_STEP: usize = 8;
+const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize = 16;
 const ROW_HASH_BITS: usize = 20;
 const ROW_LOG: usize = 5;
 const ROW_SEARCH_DEPTH: usize = 16;
@@ -547,6 +552,10 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
+                dfast.use_donor_fast_loop = matches!(
+                    level,
+                    CompressionLevel::Default | CompressionLevel::Level(3)
+                );
                 dfast.set_hash_bits(if hinted {
                     dfast_hash_bits_for_window(max_window_size)
                 } else {
@@ -1454,6 +1463,7 @@ struct DfastMatchGenerator {
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     hash_bits: usize,
+    use_donor_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
 }
@@ -1623,6 +1633,7 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             hash_bits: DFAST_HASH_BITS,
+            use_donor_fast_loop: false,
             lazy_depth: 1,
         }
     }
@@ -1697,7 +1708,7 @@ impl DfastMatchGenerator {
             self.insert_positions_with_step(
                 current_abs_start,
                 current_abs_end,
-                INCOMPRESSIBLE_SKIP_STEP,
+                DFAST_INCOMPRESSIBLE_SKIP_STEP,
             );
         } else {
             self.insert_positions(current_abs_start, current_abs_end);
@@ -1738,46 +1749,191 @@ impl DfastMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        if self.use_donor_fast_loop {
+            self.start_matching_donor_fast(current_abs_start, current_len, &mut handle_sequence);
+            return;
+        }
+        self.start_matching_general(current_abs_start, current_len, &mut handle_sequence);
+    }
 
+    fn start_matching_general(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let use_adaptive_skip =
+            self.block_looks_incompressible(current_abs_start, current_abs_start + current_len);
         let mut pos = 0usize;
         let mut literals_start = 0usize;
+        let mut skip_step = 1usize;
+        let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
+        let mut miss_run = 0usize;
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
             let best = self.best_match(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
-                self.insert_positions(abs_pos, candidate.start + candidate.match_len);
-                let current = self.window.back().unwrap().as_slice();
-                let start = candidate.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: candidate.offset,
-                    match_len: candidate.match_len,
-                });
-                // The encoded offset value is irrelevant here; we only need the
-                // side effect on offset history for future rep-code matching.
-                let _ = encode_offset_with_history(
-                    candidate.offset as u32,
-                    literals.len() as u32,
-                    &mut self.offset_hist,
+                let start = self.emit_candidate(
+                    current_abs_start,
+                    &mut literals_start,
+                    candidate,
+                    handle_sequence,
                 );
                 pos = start + candidate.match_len;
-                literals_start = pos;
+                skip_step = 1;
+                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                miss_run = 0;
             } else {
                 self.insert_position(abs_pos);
-                pos += 1;
+                miss_run = miss_run.saturating_add(1);
+                let use_local_adaptive_skip = miss_run >= DFAST_LOCAL_SKIP_TRIGGER;
+                if use_adaptive_skip || use_local_adaptive_skip {
+                    let skip_cap = if use_adaptive_skip {
+                        DFAST_MAX_SKIP_STEP
+                    } else {
+                        2
+                    };
+                    if pos >= next_skip_growth_pos {
+                        skip_step = (skip_step + 1).min(skip_cap);
+                        next_skip_growth_pos =
+                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    }
+                    pos = pos.saturating_add(skip_step);
+                } else {
+                    pos += 1;
+                }
             }
         }
 
-        if literals_start < current_len {
-            // We stop inserting once fewer than DFAST_MIN_MATCH_LEN bytes remain.
-            // The last boundary-spanning start that can seed a dfast hash is
-            // still inserted by the loop above; `dfast_inserts_tail_positions_
-            // for_next_block_matching()` asserts that the next block can match
-            // immediately at the boundary without eagerly seeding the final
-            // DFAST_MIN_MATCH_LEN - 1 bytes here.
+        self.emit_trailing_literals(literals_start, handle_sequence);
+    }
+
+    fn start_matching_donor_fast(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let block_is_strict_incompressible = self
+            .block_looks_incompressible_strict(current_abs_start, current_abs_start + current_len);
+        if !block_is_strict_incompressible {
+            self.start_matching_general(current_abs_start, current_len, handle_sequence);
+            return;
+        }
+        let mut pos = 0usize;
+        let mut literals_start = 0usize;
+        let mut skip_step = 1usize;
+        let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
+        let mut miss_run = 0usize;
+        while pos + DFAST_MIN_MATCH_LEN <= current_len {
+            let ip0 = pos;
+            let ip1 = ip0.saturating_add(1);
+            let ip2 = ip0.saturating_add(2);
+            let ip3 = ip0.saturating_add(3);
+
+            let abs_ip0 = current_abs_start + ip0;
+            let lit_len_ip0 = ip0 - literals_start;
+
+            if ip2 + DFAST_MIN_MATCH_LEN <= current_len {
+                let abs_ip2 = current_abs_start + ip2;
+                let lit_len_ip2 = ip2 - literals_start;
+                if let Some(rep) = self.repcode_candidate(abs_ip2, lit_len_ip2)
+                    && rep.start >= current_abs_start + literals_start
+                    && rep.start <= abs_ip2
+                {
+                    let start = self.emit_candidate(
+                        current_abs_start,
+                        &mut literals_start,
+                        rep,
+                        handle_sequence,
+                    );
+                    pos = start + rep.match_len;
+                    skip_step = 1;
+                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    miss_run = 0;
+                    continue;
+                }
+            }
+
+            let best = self.best_match(abs_ip0, lit_len_ip0);
+            if let Some(candidate) = best {
+                let start = self.emit_candidate(
+                    current_abs_start,
+                    &mut literals_start,
+                    candidate,
+                    handle_sequence,
+                );
+                pos = start + candidate.match_len;
+                skip_step = 1;
+                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                miss_run = 0;
+            } else {
+                self.insert_position(abs_ip0);
+                if ip1 + 4 <= current_len {
+                    self.insert_position(current_abs_start + ip1);
+                }
+                if ip2 + 4 <= current_len {
+                    self.insert_position(current_abs_start + ip2);
+                }
+                if ip3 + 4 <= current_len {
+                    self.insert_position(current_abs_start + ip3);
+                }
+                miss_run = miss_run.saturating_add(1);
+                if block_is_strict_incompressible || miss_run >= DFAST_LOCAL_SKIP_TRIGGER {
+                    let skip_cap = DFAST_MAX_SKIP_STEP;
+                    if pos >= next_skip_growth_pos {
+                        skip_step = (skip_step + 1).min(skip_cap);
+                        next_skip_growth_pos =
+                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    }
+                    pos = pos.saturating_add(skip_step);
+                } else {
+                    skip_step = 1;
+                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    pos += 1;
+                }
+            }
+        }
+
+        self.emit_trailing_literals(literals_start, handle_sequence);
+    }
+
+    fn emit_candidate(
+        &mut self,
+        current_abs_start: usize,
+        literals_start: &mut usize,
+        candidate: MatchCandidate,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) -> usize {
+        self.insert_positions(
+            current_abs_start + *literals_start,
+            candidate.start + candidate.match_len,
+        );
+        let current = self.window.back().unwrap().as_slice();
+        let start = candidate.start - current_abs_start;
+        let literals = &current[*literals_start..start];
+        handle_sequence(Sequence::Triple {
+            literals,
+            offset: candidate.offset,
+            match_len: candidate.match_len,
+        });
+        let _ = encode_offset_with_history(
+            candidate.offset as u32,
+            literals.len() as u32,
+            &mut self.offset_hist,
+        );
+        *literals_start = start + candidate.match_len;
+        start
+    }
+
+    fn emit_trailing_literals(
+        &self,
+        literals_start: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        if literals_start < self.window.back().unwrap().len() {
             let current = self.window.back().unwrap().as_slice();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
@@ -1999,6 +2155,20 @@ impl DfastMatchGenerator {
         }
         let block = &live[start_idx..end_idx];
         block_looks_incompressible(block)
+    }
+
+    fn block_looks_incompressible_strict(&self, start: usize, end: usize) -> bool {
+        let live = self.live_history();
+        if start >= end || start < self.history_abs_start {
+            return false;
+        }
+        let start_idx = start - self.history_abs_start;
+        let end_idx = end - self.history_abs_start;
+        if end_idx > live.len() {
+            return false;
+        }
+        let block = &live[start_idx..end_idx];
+        block_looks_incompressible_strict(block)
     }
 
     fn hash_index(&self, value: u64) -> usize {
