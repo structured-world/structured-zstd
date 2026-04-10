@@ -672,7 +672,9 @@ mod tests {
             super::CompressionLevel::Level(4),
             super::CompressionLevel::Level(11),
         ];
-        let sizes = [513usize, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191];
+        let sizes = [
+            513usize, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191, 16_384, 16_385,
+        ];
 
         for (seed_idx, seed) in [11u64, 23, 41].into_iter().enumerate() {
             for &size in &sizes {
