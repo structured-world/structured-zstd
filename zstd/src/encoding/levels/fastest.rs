@@ -5,7 +5,10 @@ use crate::{
         block_header::BlockHeader,
         blocks::compress_block,
         frame_compressor::CompressState,
-        incompressible::{block_looks_incompressible, compression_level_allows_raw_fast_path},
+        incompressible::{
+            block_looks_incompressible, block_looks_incompressible_strict,
+            compression_level_allows_raw_fast_path,
+        },
     },
 };
 use alloc::vec::Vec;
@@ -46,7 +49,11 @@ pub fn compress_block_encoded<M: Matcher>(
         // Write the header, then the block
         header.serialize(output);
         output.push(rle_byte);
-    } else if should_emit_raw_fast_path(compression_level, &uncompressed_data) {
+    } else if should_emit_raw_fast_path(
+        compression_level,
+        state.matcher.window_size(),
+        &uncompressed_data,
+    ) {
         state.matcher.commit_space(uncompressed_data);
         state.matcher.skip_matching(Some(true));
         let header = BlockHeader {
@@ -86,9 +93,18 @@ pub fn compress_block_encoded<M: Matcher>(
 }
 
 #[inline]
-fn should_emit_raw_fast_path(level: CompressionLevel, block: &[u8]) -> bool {
+fn should_emit_raw_fast_path(level: CompressionLevel, window_size: u64, block: &[u8]) -> bool {
     if !compression_level_allows_raw_fast_path(level) {
         return false;
+    }
+    if matches!(level, CompressionLevel::Best) {
+        // Keep Best's long-distance-match advantage when the effective window
+        // exceeds Better (8 MiB). Large-window data can look random locally
+        // while still being matchable against older history.
+        if window_size > 8 * 1024 * 1024 {
+            return false;
+        }
+        return block_looks_incompressible_strict(block);
     }
     block_looks_incompressible(block)
 }
@@ -158,6 +174,26 @@ mod tests {
             state.matcher.skip_hints,
             vec![Some(false)],
             "RLE is already known compressible; skip_matching should bypass incompressible sampling"
+        );
+    }
+
+    #[test]
+    fn best_raw_fast_path_disabled_when_window_exceeds_better_reach() {
+        let mut block = vec![0u8; 4096];
+        let mut x = 0x1234_5678u32;
+        for byte in &mut block {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *byte = x as u8;
+        }
+        assert!(
+            block_looks_incompressible_strict(&block),
+            "fixture must look incompressible to exercise Best window guard"
+        );
+        assert!(
+            !should_emit_raw_fast_path(CompressionLevel::Best, 16 * 1024 * 1024, &block),
+            "Best should keep compressed path when large window can unlock long-distance matches"
         );
     }
 }

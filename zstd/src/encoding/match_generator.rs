@@ -452,7 +452,7 @@ impl MatchGeneratorDriver {
             MatcherBackend::Simple => self.match_generator.skip_matching_with_hint(Some(false)),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
             MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
-            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
+            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(Some(false)),
         }
     }
 }
@@ -798,7 +798,7 @@ impl Matcher for MatchGeneratorDriver {
                 .skip_matching_with_hint(incompressible_hint),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(incompressible_hint),
             MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
-            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
+            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(incompressible_hint),
         }
     }
 }
@@ -2352,6 +2352,8 @@ struct HcMatchGenerator {
 }
 
 impl HcMatchGenerator {
+    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+
     fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
@@ -2445,12 +2447,26 @@ impl HcMatchGenerator {
         }
     }
 
-    fn skip_matching(&mut self) {
+    fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
         self.backfill_boundary_positions(current_abs_start);
-        self.insert_positions(current_abs_start, current_abs_start + current_len);
+        if incompressible_hint == Some(true) {
+            self.insert_positions_with_step(
+                current_abs_start,
+                current_abs_end,
+                Self::INCOMPRESSIBLE_SKIP_STEP,
+            );
+            let dense_tail = HC_MIN_MATCH_LEN + Self::INCOMPRESSIBLE_SKIP_STEP;
+            let tail_start = current_abs_end.saturating_sub(dense_tail);
+            if tail_start < current_abs_end {
+                self.insert_positions(tail_start, current_abs_end);
+            }
+        } else {
+            self.insert_positions(current_abs_start, current_abs_end);
+        }
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -2597,6 +2613,17 @@ impl HcMatchGenerator {
     fn insert_positions(&mut self, start: usize, end: usize) {
         for pos in start..end {
             self.insert_position(pos);
+        }
+    }
+
+    fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        if step == 0 {
+            return;
+        }
+        let mut pos = start;
+        while pos < end {
+            self.insert_position(pos);
+            pos += step;
         }
     }
 
@@ -3976,6 +4003,64 @@ fn hc_start_matching_returns_early_for_empty_current_block() {
 }
 
 #[test]
+fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
+    fn high_entropy_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u64 = 0xD1B5_4A32_9C77_0E19;
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 40) as u8);
+        }
+        out
+    }
+
+    let mut matcher = HcMatchGenerator::new(1 << 22);
+    let tail = b"Qz9kLm2Rp";
+    let mut first = high_entropy_bytes(4096);
+    let tail_start = first.len() - tail.len();
+    first[tail_start..].copy_from_slice(tail);
+    matcher.add_data(first.clone(), |_| {});
+    matcher.skip_matching(Some(true));
+
+    let mut second = tail.to_vec();
+    second.extend_from_slice(b"after-tail-literals");
+    matcher.add_data(second, |_| {});
+
+    let mut first_sequence = None;
+    matcher.start_matching(|seq| {
+        if first_sequence.is_some() {
+            return;
+        }
+        first_sequence = Some(match seq {
+            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => (literals.len(), offset, match_len),
+        });
+    });
+
+    let (literals_len, offset, match_len) =
+        first_sequence.expect("expected at least one sequence after sparse skip");
+    assert_eq!(
+        literals_len, 0,
+        "first sequence should start at block boundary"
+    );
+    assert_eq!(
+        offset,
+        tail.len(),
+        "first match should reference previous tail"
+    );
+    assert!(
+        match_len >= tail.len(),
+        "tail-aligned cross-block match must be preserved"
+    );
+}
+
+#[test]
 fn hc_compact_history_drains_when_threshold_crossed() {
     let mut hc = HcMatchGenerator::new(8);
     hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
@@ -4143,7 +4228,7 @@ fn hc_rebases_positions_after_u32_boundary() {
     // Simulate a long-running stream where absolute history positions crossed
     // the u32 range. Before #51 this disabled HC inserts entirely.
     matcher.history_abs_start = history_abs_start;
-    matcher.skip_matching();
+    matcher.skip_matching(None);
     assert_eq!(
         matcher.position_base, matcher.history_abs_start,
         "rebase should anchor to the oldest live absolute position"

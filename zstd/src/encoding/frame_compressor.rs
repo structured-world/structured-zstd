@@ -644,6 +644,20 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn best_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xB35C_AFE1, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Best);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn level2_random_block_uses_raw_fast_path() {
         let data = generate_data(0xA11C_E222, 10 * 1024);
         let compressed =
@@ -682,6 +696,7 @@ mod tests {
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Fastest);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Default);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Best);
     }
 
     struct NoDictionaryMatcher {

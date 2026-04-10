@@ -6,6 +6,7 @@ pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 
 const INCOMPRESSIBLE_REPEAT_TABLE_BITS: usize = 11;
 const INCOMPRESSIBLE_REPEAT_TABLE_LEN: usize = 1 << INCOMPRESSIBLE_REPEAT_TABLE_BITS;
+const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64;
 const INCOMPRESSIBLE_REPEAT_HASH_MULT: u32 = 0x9E37_79B1;
 const INCOMPRESSIBLE_MIN_DISTINCT_BYTES: usize = 200;
 // Allow at most ~4.2% concentration for the most frequent symbol in sampled data.
@@ -17,9 +18,9 @@ const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
 #[inline]
 pub(crate) fn compression_level_allows_raw_fast_path(level: CompressionLevel) -> bool {
     match level {
-        CompressionLevel::Fastest | CompressionLevel::Default => true,
+        CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Best => true,
         CompressionLevel::Level(level) => (0..=3).contains(&level),
-        CompressionLevel::Uncompressed | CompressionLevel::Better | CompressionLevel::Best => false,
+        CompressionLevel::Uncompressed | CompressionLevel::Better => false,
     }
 }
 
@@ -28,7 +29,7 @@ fn update_sample_metrics(
     sample: &[u8],
     counts: &mut [u16; 256],
     repeat_table: &mut [u32; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
-    repeat_occupied: &mut [bool; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
+    repeat_occupied: &mut [u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
     repeats: &mut usize,
     sampled_quads: &mut usize,
 ) {
@@ -46,12 +47,15 @@ fn update_sample_metrics(
         let slot = ((quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
             >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS))
             & (INCOMPRESSIBLE_REPEAT_TABLE_LEN - 1);
+        let word = slot / 64;
+        let bit = 1_u64 << (slot % 64);
+        let occupied = (repeat_occupied[word] & bit) != 0;
         *sampled_quads += 1;
-        if repeat_occupied[slot] && repeat_table[slot] == quad {
+        if occupied && repeat_table[slot] == quad {
             *repeats += 1;
         } else {
             repeat_table[slot] = quad;
-            repeat_occupied[slot] = true;
+            repeat_occupied[word] |= bit;
         }
         idx += 4;
     }
@@ -62,7 +66,31 @@ pub(crate) fn block_looks_incompressible(block: &[u8]) -> bool {
     if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
         return false;
     }
+    sample_looks_incompressible(block)
+}
 
+#[inline]
+pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
+    if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
+        return false;
+    }
+    if !sample_looks_incompressible(block) {
+        return false;
+    }
+    // Best level should only early-exit on strongly random data. Probe head,
+    // middle, and tail so mixed-entropy blocks do not get misclassified.
+    let probe_len = RAW_FAST_PATH_MIN_BLOCK_LEN.min(block.len());
+    let mid_start = (block.len() - probe_len) / 2;
+    let head = &block[..probe_len];
+    let mid = &block[mid_start..mid_start + probe_len];
+    let tail = &block[block.len() - probe_len..];
+    sample_looks_incompressible(head)
+        && sample_looks_incompressible(mid)
+        && sample_looks_incompressible(tail)
+}
+
+#[inline]
+fn sample_looks_incompressible(block: &[u8]) -> bool {
     let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
     if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
         return false;
@@ -70,7 +98,7 @@ pub(crate) fn block_looks_incompressible(block: &[u8]) -> bool {
 
     let mut counts = [0u16; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [false; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
     let mut sampled_quads = 0usize;
 
@@ -125,7 +153,7 @@ mod tests {
         let sample = [0xFF_u8; 4];
         let mut counts = [0u16; 256];
         let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-        let mut repeat_occupied = [false; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+        let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
         let mut repeats = 0usize;
         let mut sampled_quads = 0usize;
 
