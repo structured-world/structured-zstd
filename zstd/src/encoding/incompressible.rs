@@ -27,7 +27,7 @@ struct StrictProbeSelection {
 
 impl StrictProbeSelection {
     #[inline]
-    const fn is_full_block(self) -> bool {
+    const fn reuses_full_block_classification(self) -> bool {
         self.tail_start.is_none()
     }
 }
@@ -139,7 +139,7 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     // Best level should only early-exit on strongly random data. Probe head,
     // middle, and tail so mixed-entropy blocks do not get misclassified.
     let selection = select_strict_probes(block.len());
-    if selection.is_full_block() {
+    if selection.reuses_full_block_classification() {
         // The full-block sample above already classified this input. For
         // minimum and near-min blocks, split probes would overlap too heavily.
         return true;

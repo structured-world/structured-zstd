@@ -328,8 +328,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // benchmark path (`single_segment=true`) for parity, but avoid enabling
         // this globally across slower/deeper levels where it can regress C-FFI
         // decode compatibility.
-        let level_supports_single_segment_parity =
-            matches!(self.compression_level, CompressionLevel::Default);
+        let level_supports_single_segment_parity = matches!(
+            self.compression_level,
+            CompressionLevel::Default | CompressionLevel::Level(0) | CompressionLevel::Level(3)
+        );
         let single_segment = !use_dictionary_state
             && small_source_hint == Some(true)
             && level_supports_single_segment_parity
@@ -620,6 +622,40 @@ mod tests {
         zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
             .expect("ffi decoder must accept single-segment small hinted default frame");
         assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn small_hinted_numeric_default_levels_use_single_segment_header() {
+        let data = generate_data(0xA11C_E003, 1024);
+        for level in [
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(3),
+        ] {
+            let compressed = {
+                let mut compressor = FrameCompressor::new(level);
+                compressor.set_source_size_hint(data.len() as u64);
+                compressor.set_source(data.as_slice());
+                let mut out = Vec::new();
+                compressor.set_drain(&mut out);
+                compressor.compress();
+                out
+            };
+
+            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+            assert!(
+                frame_header.descriptor.single_segment_flag(),
+                "small hinted numeric default level frames should use single-segment header (level={level:?})"
+            );
+            assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
+                panic!(
+                    "ffi decoder must accept single-segment small hinted numeric default level frame (level={level:?}): {e}"
+                )
+            });
+            assert_eq!(decoded, data);
+        }
     }
 
     #[cfg(feature = "std")]

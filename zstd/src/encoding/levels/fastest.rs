@@ -140,7 +140,7 @@ mod tests {
         }
 
         fn start_matching(&mut self, _handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-            panic!("start_matching must not run for RLE path");
+            panic!("start_matching must not run for early-exit paths");
         }
 
         fn reset(&mut self, _level: CompressionLevel) {}
