@@ -17,6 +17,9 @@ pub use streaming_encoder::StreamingEncoder;
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
 
+pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
+pub(crate) const BETTER_WINDOW_SIZE_BYTES: u64 = 1u64 << BETTER_WINDOW_LOG;
+
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
 /// use structured_zstd::encoding::{compress, CompressionLevel};

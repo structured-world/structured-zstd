@@ -22,6 +22,7 @@ use core::arch::x86_64::{
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
+use super::BETTER_WINDOW_LOG;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
@@ -36,6 +37,7 @@ use std::sync::OnceLock;
 
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
+const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
 const DFAST_MIN_MATCH_LEN: usize = 6;
 const ROW_MIN_MATCH_LEN: usize = 6;
 const DFAST_TARGET_LEN: usize = 48;
@@ -115,9 +117,6 @@ const ROW_CONFIG: RowConfig = RowConfig {
     search_depth: ROW_SEARCH_DEPTH,
     target_len: ROW_TARGET_LEN,
 };
-
-pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
-pub(crate) const BETTER_WINDOW_SIZE_BYTES: u64 = 1u64 << BETTER_WINDOW_LOG;
 
 /// Resolved tuning parameters for a compression level.
 #[derive(Copy, Clone)]
@@ -900,8 +899,6 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
-    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
-
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline(always)]
     const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
@@ -1374,9 +1371,9 @@ impl MatchGenerator {
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         let len = self.window.last().unwrap().data.len();
         if incompressible_hint == Some(true) {
-            let dense_tail = MIN_MATCH_LEN + Self::INCOMPRESSIBLE_SKIP_STEP;
+            let dense_tail = MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
             let sparse_end = len.saturating_sub(dense_tail);
-            self.add_suffixes_till(sparse_end, Self::INCOMPRESSIBLE_SKIP_STEP);
+            self.add_suffixes_till(sparse_end, INCOMPRESSIBLE_SKIP_STEP);
             self.suffix_idx = sparse_end;
             self.add_suffixes_till(len, 1);
         } else {
@@ -1607,7 +1604,6 @@ fn pick_lazy_match_shared(
 }
 
 impl DfastMatchGenerator {
-    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
     // Keep a short dense tail at block boundaries for two related reasons:
     // 1) insert_position() needs 4 bytes of lookahead, so appending a new block can
     //    make starts from the previous block newly hashable and require backfill;
@@ -1701,7 +1697,7 @@ impl DfastMatchGenerator {
             self.insert_positions_with_step(
                 current_abs_start,
                 current_abs_end,
-                Self::INCOMPRESSIBLE_SKIP_STEP,
+                INCOMPRESSIBLE_SKIP_STEP,
             );
         } else {
             self.insert_positions(current_abs_start, current_abs_end);
@@ -1710,7 +1706,9 @@ impl DfastMatchGenerator {
         // Seed the tail densely only after sparse insertion so the next block
         // can match across the boundary without rehashing the full block twice.
         if used_sparse {
-            let tail_start = current_abs_end.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+            let tail_start = current_abs_end
+                .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+                .max(current_abs_start);
             if tail_start < current_abs_end {
                 self.insert_positions(tail_start, current_abs_end);
             }
@@ -2368,8 +2366,6 @@ struct HcMatchGenerator {
 }
 
 impl HcMatchGenerator {
-    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
-
     fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
@@ -2473,15 +2469,15 @@ impl HcMatchGenerator {
             self.insert_positions_with_step(
                 current_abs_start,
                 current_abs_end,
-                Self::INCOMPRESSIBLE_SKIP_STEP,
+                INCOMPRESSIBLE_SKIP_STEP,
             );
-            let dense_tail = HC_MIN_MATCH_LEN + Self::INCOMPRESSIBLE_SKIP_STEP;
+            let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
             let tail_start = current_abs_end
                 .saturating_sub(dense_tail)
                 .max(self.history_abs_start);
             let tail_start = tail_start.max(current_abs_start);
             for pos in tail_start..current_abs_end {
-                if !(pos - current_abs_start).is_multiple_of(Self::INCOMPRESSIBLE_SKIP_STEP) {
+                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
                     self.insert_position(pos);
                 }
             }
@@ -4096,16 +4092,14 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     let current_len = first.len();
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     let current_abs_end = current_abs_start + current_len;
-    let dense_tail = HC_MIN_MATCH_LEN + HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP;
+    let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
     let tail_start = current_abs_end
         .saturating_sub(dense_tail)
         .max(matcher.history_abs_start)
         .max(current_abs_start);
 
     let overlap_pos = (tail_start..current_abs_end)
-        .find(|&pos| {
-            (pos - current_abs_start).is_multiple_of(HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP)
-        })
+        .find(|&pos| (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP))
         .expect("fixture should contain at least one sparse-grid overlap in dense tail");
 
     let rel = matcher

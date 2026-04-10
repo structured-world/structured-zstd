@@ -1,4 +1,4 @@
-use super::{CompressionLevel, match_generator::BETTER_WINDOW_SIZE_BYTES};
+use super::{BETTER_WINDOW_SIZE_BYTES, CompressionLevel};
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
