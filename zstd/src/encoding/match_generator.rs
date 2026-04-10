@@ -2477,7 +2477,7 @@ impl HcMatchGenerator {
                 .max(self.history_abs_start);
             let tail_start = tail_start.max(current_abs_start);
             for pos in tail_start..current_abs_end {
-                if (pos - current_abs_start) % Self::INCOMPRESSIBLE_SKIP_STEP != 0 {
+                if !(pos - current_abs_start).is_multiple_of(Self::INCOMPRESSIBLE_SKIP_STEP) {
                     self.insert_position(pos);
                 }
             }
@@ -4099,7 +4099,9 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
         .max(current_abs_start);
 
     let overlap_pos = (tail_start..current_abs_end)
-        .find(|&pos| (pos - current_abs_start) % HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP == 0)
+        .find(|&pos| {
+            (pos - current_abs_start).is_multiple_of(HcMatchGenerator::INCOMPRESSIBLE_SKIP_STEP)
+        })
         .expect("fixture should contain at least one sparse-grid overlap in dense tail");
 
     let rel = matcher
