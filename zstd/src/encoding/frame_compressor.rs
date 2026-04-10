@@ -644,6 +644,20 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn level2_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xA11C_E222, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Level(2));
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn compressible_logs_do_not_fall_back_to_raw_fast_path() {
         let mut data = Vec::with_capacity(16 * 1024);
         const LINE: &[u8] =

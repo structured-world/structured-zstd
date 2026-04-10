@@ -159,7 +159,7 @@ impl CompressionLevel {
 pub trait Matcher {
     /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
     fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
-    /// Get a reference to the last commited space
+    /// Get a reference to the last committed space
     fn get_last_space(&mut self) -> &[u8];
     /// Commit a space to the matcher so it can be matched against
     fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
@@ -168,7 +168,7 @@ pub trait Matcher {
     /// `incompressible_hint` lets callers thread a precomputed block verdict
     /// to avoid repeating expensive sampling in matcher backends.
     fn skip_matching(&mut self, incompressible_hint: Option<bool>);
-    /// Process the data in the last commited space for future matching AND generate matches for the data
+    /// Process the data in the last committed space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);

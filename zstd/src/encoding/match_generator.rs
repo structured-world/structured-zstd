@@ -449,7 +449,7 @@ impl MatchGeneratorDriver {
 
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.skip_matching(),
+            MatcherBackend::Simple => self.match_generator.skip_matching_with_hint(Some(false)),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
             MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
@@ -793,7 +793,9 @@ impl Matcher for MatchGeneratorDriver {
     }
     fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.skip_matching(),
+            MatcherBackend::Simple => self
+                .match_generator
+                .skip_matching_with_hint(incompressible_hint),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(incompressible_hint),
             MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(),
@@ -891,6 +893,8 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
+    const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline(always)]
     const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
@@ -1355,12 +1359,30 @@ impl MatchGenerator {
         Some(Self::common_prefix_len(match_slice, data_slice))
     }
 
-    /// Skip matching for the whole current window entry
-    fn skip_matching(&mut self) {
+    /// Skip matching for the whole current window entry.
+    ///
+    /// When callers already know the block is incompressible, index positions
+    /// sparsely and keep a dense tail so the next block still gets boundary
+    /// matches.
+    fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         let len = self.window.last().unwrap().data.len();
-        self.add_suffixes_till(len, 1);
+        if incompressible_hint == Some(true) {
+            let dense_tail = MIN_MATCH_LEN + Self::INCOMPRESSIBLE_SKIP_STEP;
+            let sparse_end = len.saturating_sub(dense_tail);
+            self.add_suffixes_till(sparse_end, Self::INCOMPRESSIBLE_SKIP_STEP);
+            self.suffix_idx = sparse_end;
+            self.add_suffixes_till(len, 1);
+        } else {
+            self.add_suffixes_till(len, 1);
+        }
         self.suffix_idx = len;
         self.last_idx_in_sequence = len;
+    }
+
+    /// Backward-compatible dense path used by tests.
+    #[cfg(test)]
+    fn skip_matching(&mut self) {
+        self.skip_matching_with_hint(None);
     }
 
     /// Add a new window entry. Will panic if the last window entry hasn't been processed properly.
@@ -4347,6 +4369,33 @@ fn simple_matcher_skip_matching_seeds_every_position_even_with_fast_step() {
 }
 
 #[test]
+fn simple_matcher_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
+    let mut matcher = MatchGenerator::new(128);
+    matcher.add_data(
+        b"abcdefghijklmnopqrstuvwxyz012345".to_vec(),
+        SuffixStore::with_capacity(256),
+        |_, _| {},
+    );
+
+    matcher.skip_matching_with_hint(Some(true));
+
+    let last = matcher.window.last().unwrap();
+    assert_eq!(last.suffixes.get(&last.data[0..MIN_MATCH_LEN]), Some(0));
+    assert_eq!(
+        last.suffixes.get(&last.data[3..3 + MIN_MATCH_LEN]),
+        None,
+        "sparse prefix indexing should skip non-step starts"
+    );
+    let tail_start = last.data.len() - MIN_MATCH_LEN;
+    assert_eq!(
+        last.suffixes
+            .get(&last.data[tail_start..tail_start + MIN_MATCH_LEN]),
+        Some(tail_start),
+        "dense tail must stay indexed for cross-block boundary matches"
+    );
+}
+
+#[test]
 fn simple_matcher_add_suffixes_till_backfills_last_searchable_anchor() {
     let mut matcher = MatchGenerator::new(64);
     matcher.hash_fill_step = FAST_HASH_FILL_STEP;
@@ -4553,7 +4602,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
         matcher.block_looks_incompressible(current_abs_start, current_abs_end),
         "test fixture must take the sparse incompressible branch"
     );
-    matcher.skip_matching(None);
+    matcher.skip_matching(Some(true));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");

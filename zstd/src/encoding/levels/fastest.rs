@@ -37,7 +37,7 @@ pub fn compress_block_encoded<M: Matcher>(
     if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
         let rle_byte = uncompressed_data[0];
         state.matcher.commit_space(uncompressed_data);
-        state.matcher.skip_matching(None);
+        state.matcher.skip_matching(Some(false));
         let header = BlockHeader {
             last_block,
             block_type: crate::blocks::block::BlockType::RLE,
@@ -91,4 +91,73 @@ fn should_emit_raw_fast_path(level: CompressionLevel, block: &[u8]) -> bool {
         return false;
     }
     block_looks_incompressible(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::{
+        Matcher, Sequence,
+        frame_compressor::{CompressState, FseTables},
+    };
+    use alloc::vec;
+
+    #[derive(Default)]
+    struct HintProbeMatcher {
+        last_space: Vec<u8>,
+        skip_hints: Vec<Option<bool>>,
+    }
+
+    impl Matcher for HintProbeMatcher {
+        fn get_next_space(&mut self) -> Vec<u8> {
+            vec![0; 1024]
+        }
+
+        fn get_last_space(&mut self) -> &[u8] {
+            &self.last_space
+        }
+
+        fn commit_space(&mut self, space: Vec<u8>) {
+            self.last_space = space;
+        }
+
+        fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+            self.skip_hints.push(incompressible_hint);
+        }
+
+        fn start_matching(&mut self, _handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+            panic!("start_matching must not run for RLE path");
+        }
+
+        fn reset(&mut self, _level: CompressionLevel) {}
+
+        fn window_size(&self) -> u64 {
+            128 * 1024
+        }
+    }
+
+    #[test]
+    fn rle_branch_passes_compressible_hint_to_skip_matching() {
+        let mut state = CompressState {
+            matcher: HintProbeMatcher::default(),
+            last_huff_table: None,
+            fse_tables: FseTables::new(),
+            offset_hist: [1, 4, 8],
+        };
+        let mut output = Vec::new();
+
+        compress_block_encoded(
+            &mut state,
+            CompressionLevel::Fastest,
+            true,
+            vec![0xAB; 1024],
+            &mut output,
+        );
+
+        assert_eq!(
+            state.matcher.skip_hints,
+            vec![Some(false)],
+            "RLE is already known compressible; skip_matching should bypass incompressible sampling"
+        );
+    }
 }
