@@ -36,12 +36,14 @@ fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
     encoder
         .set_pledged_src_size(Some(input.len() as u64))
         .expect("failed to configure zstd pledged source size");
-    // Keep framing comparable to the Rust path, which for hinted tiny sources
-    // currently floors the effective window to 16 KiB (window_log=14) and
-    // therefore emits a Window_Descriptor (single_segment=false).
-    encoder
-        .window_log(14)
-        .expect("failed to configure zstd window_log");
+    // Keep framing comparable to the Rust path only for tiny sources. For
+    // larger inputs, keep the level/default C sizing so parity benches compare
+    // similar compression settings.
+    if input.len() <= (1 << 14) {
+        encoder
+            .window_log(14)
+            .expect("failed to configure zstd window_log");
+    }
     encoder
         .write_all(input)
         .expect("failed to write zstd stream input");

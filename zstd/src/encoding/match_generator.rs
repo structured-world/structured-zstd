@@ -4020,23 +4020,24 @@ fn hc_start_matching_returns_early_for_empty_current_block() {
     assert!(!called, "empty current block should not emit sequences");
 }
 
+#[cfg(test)]
+fn deterministic_high_entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state = seed;
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state >> 40) as u8);
+    }
+    out
+}
+
 #[test]
 fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
-    fn high_entropy_bytes(len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
-        let mut state: u64 = 0xD1B5_4A32_9C77_0E19;
-        for _ in 0..len {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            out.push((state >> 40) as u8);
-        }
-        out
-    }
-
     let mut matcher = HcMatchGenerator::new(1 << 22);
     let tail = b"Qz9kLm2Rp";
-    let mut first = high_entropy_bytes(4096);
+    let mut first = deterministic_high_entropy_bytes(0xD1B5_4A32_9C77_0E19, 4096);
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
     matcher.add_data(first.clone(), |_| {});
@@ -4743,21 +4744,9 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
 
 #[test]
 fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
-    fn high_entropy_bytes(len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        for _ in 0..len {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            out.push((state >> 40) as u8);
-        }
-        out
-    }
-
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     let tail = b"Qz9kLm2Rp";
-    let mut first = high_entropy_bytes(4096);
+    let mut first = deterministic_high_entropy_bytes(0x9E37_79B9_7F4A_7C15, 4096);
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
     matcher.add_data(first.clone(), |_| {});
@@ -4801,29 +4790,17 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
 
 #[test]
 fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blocks() {
-    fn high_entropy_bytes(len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
-        let mut state: u64 = 0xA5A5_5A5A_C3C3_3C3C;
-        for _ in 0..len {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            out.push((state >> 40) as u8);
-        }
-        out
-    }
-
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     let boundary_prefix = [0xFA, 0xFB, 0xFC];
     let boundary_suffix = [0xFD, 0xEE, 0xAD, 0xBE, 0xEF, 0x11, 0x22, 0x33];
 
-    let mut first = high_entropy_bytes(4096);
+    let mut first = deterministic_high_entropy_bytes(0xA5A5_5A5A_C3C3_3C3C, 4096);
     let first_tail_start = first.len() - boundary_prefix.len();
     first[first_tail_start..].copy_from_slice(&boundary_prefix);
     matcher.add_data(first, |_| {});
     matcher.skip_matching(Some(true));
 
-    let mut second = high_entropy_bytes(4096);
+    let mut second = deterministic_high_entropy_bytes(0xA5A5_5A5A_C3C3_3C3C, 4096);
     second[..boundary_suffix.len()].copy_from_slice(&boundary_suffix);
     matcher.add_data(second.clone(), |_| {});
     matcher.skip_matching(Some(true));
