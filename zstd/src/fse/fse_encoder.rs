@@ -313,7 +313,15 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
+/// Builds an FSE table directly from a byte slice.
+///
+/// This path reuses the shared histogram counter to avoid repeated ad-hoc
+/// symbol scans in entropy-table construction call sites.
 pub fn build_table_from_bytes(data: &[u8], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+    assert!(
+        !data.is_empty(),
+        "cannot build an FSE table from empty data"
+    );
     let mut counts = [0; 256];
     let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
