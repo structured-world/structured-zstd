@@ -237,7 +237,7 @@ impl FrameDecoder {
                     .get(&dict_id)
                     .or_else(|| self.shared_dict(dict_id))
                     .ok_or(err::DictNotProvided { dict_id })?;
-                std::ptr::from_ref(dict)
+                core::ptr::from_ref(dict)
             };
             // Safe: dict lives in self-owned storage and outlives this call.
             let dict = unsafe { &*dict_ptr };
@@ -310,7 +310,7 @@ impl FrameDecoder {
                 .get(&dict_id)
                 .or_else(|| self.shared_dict(dict_id))
                 .ok_or(err::DictNotProvided { dict_id })?;
-            std::ptr::from_ref(dict)
+            core::ptr::from_ref(dict)
         };
         // Safe: dict lives in self-owned storage and outlives this call.
         let dict = unsafe { &*dict_ptr };

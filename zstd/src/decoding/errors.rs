@@ -576,7 +576,7 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::DictNotProvided { dict_id } => {
                 write!(
                     f,
-                    "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict() or reset_with_dict()"
+                    "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict(), add_dict_handle(), add_dict_from_bytes(), reset_with_dict(), or reset_with_dict_handle()"
                 )
             }
             FrameDecoderError::DictAlreadyRegistered { dict_id } => {
@@ -1236,7 +1236,7 @@ mod tests {
         );
         assert_eq!(
             FrameDecoderError::DictNotProvided { dict_id: 0xABCD }.to_string(),
-            "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict() or reset_with_dict()"
+            "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict(), add_dict_handle(), add_dict_from_bytes(), reset_with_dict(), or reset_with_dict_handle()"
         );
         assert_eq!(
             FrameDecoderError::DictAlreadyRegistered { dict_id: 0xABCD }.to_string(),
