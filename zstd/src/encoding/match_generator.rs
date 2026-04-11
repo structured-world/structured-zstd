@@ -2872,8 +2872,7 @@ impl HcMatchGenerator {
 
     fn hash_position(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
-        const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-        ((value.wrapping_mul(PRIME)) >> (64 - self.hash_log)) as usize
+        ((value.wrapping_mul(HASH_MIX_PRIME)) >> (64 - self.hash_log)) as usize
     }
 
     fn relative_position(&self, abs_pos: usize) -> Option<u32> {
@@ -4312,12 +4311,11 @@ fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported(
         return;
     }
 
+    let kernel = detect_hash_mix_kernel();
+    assert_eq!(kernel, HashMixKernel::X86Sse42);
     let v = 0x0123_4567_89AB_CDEFu64;
     let accelerated = unsafe { hash_mix_u64_sse42(v) };
-    assert_eq!(
-        hash_mix_u64_with_kernel(v, HashMixKernel::X86Sse42),
-        accelerated
-    );
+    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
 }
 
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
@@ -4336,12 +4334,11 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
         return;
     }
 
+    let kernel = detect_hash_mix_kernel();
+    assert_eq!(kernel, HashMixKernel::Aarch64Crc);
     let v = 0x0123_4567_89AB_CDEFu64;
     let accelerated = unsafe { hash_mix_u64_crc(v) };
-    assert_eq!(
-        hash_mix_u64_with_kernel(v, HashMixKernel::Aarch64Crc),
-        accelerated
-    );
+    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
