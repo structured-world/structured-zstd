@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use structured_zstd::decoding::{Dictionary, DictionaryHandle, FrameDecoder};
@@ -57,14 +57,16 @@ fn bench_decode_dict_handle(c: &mut Criterion) {
         BenchmarkId::new("prepared_handle", output_len),
         &output_len,
         |b, &len| {
-            b.iter(|| {
-                let mut decoder = FrameDecoder::new();
-                let mut output = vec![0u8; len];
-                decoder
-                    .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
-                    .expect("decode should succeed");
-                black_box(output);
-            });
+            b.iter_batched(
+                || (FrameDecoder::new(), vec![0u8; len]),
+                |(mut decoder, mut output)| {
+                    decoder
+                        .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
+                        .expect("decode should succeed");
+                    black_box(output);
+                },
+                BatchSize::SmallInput,
+            );
         },
     );
 
@@ -72,14 +74,16 @@ fn bench_decode_dict_handle(c: &mut Criterion) {
         BenchmarkId::new("raw_dict_each_call", output_len),
         &output_len,
         |b, &len| {
-            b.iter(|| {
-                let mut decoder = FrameDecoder::new();
-                let mut output = vec![0u8; len];
-                decoder
-                    .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, dict_raw)
-                    .expect("decode should succeed");
-                black_box(output);
-            });
+            b.iter_batched(
+                || (FrameDecoder::new(), vec![0u8; len]),
+                |(mut decoder, mut output)| {
+                    decoder
+                        .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, dict_raw)
+                        .expect("decode should succeed");
+                    black_box(output);
+                },
+                BatchSize::SmallInput,
+            );
         },
     );
     group.finish();

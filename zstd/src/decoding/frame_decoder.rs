@@ -72,7 +72,10 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
     owned_dicts: BTreeMap<u32, Dictionary>,
+    #[cfg(target_has_atomic = "ptr")]
     shared_dicts: BTreeMap<u32, DictionaryHandle>,
+    #[cfg(not(target_has_atomic = "ptr"))]
+    shared_dicts: (),
 }
 
 struct FrameDecoderState {
@@ -159,8 +162,33 @@ impl FrameDecoder {
         FrameDecoder {
             state: None,
             owned_dicts: BTreeMap::new(),
+            #[cfg(target_has_atomic = "ptr")]
             shared_dicts: BTreeMap::new(),
+            #[cfg(not(target_has_atomic = "ptr"))]
+            shared_dicts: (),
         }
+    }
+
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_dict(&self, dict_id: u32) -> Option<&Dictionary> {
+        self.shared_dicts
+            .get(&dict_id)
+            .map(|handle| handle.as_dict())
+    }
+
+    #[cfg(not(target_has_atomic = "ptr"))]
+    fn shared_dict(&self, _dict_id: u32) -> Option<&Dictionary> {
+        None
+    }
+
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_dict_exists(&self, dict_id: u32) -> bool {
+        self.shared_dicts.contains_key(&dict_id)
+    }
+
+    #[cfg(not(target_has_atomic = "ptr"))]
+    fn shared_dict_exists(&self, _dict_id: u32) -> bool {
+        false
     }
 
     /// init() will allocate all needed buffers if it is the first time this decoder is used
@@ -190,26 +218,30 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
-        let state = match &mut self.state {
+        let dict_id = match &mut self.state {
             Some(s) => {
                 s.reset(source)?;
-                s
+                s.frame_header.dictionary_id()
             }
             None => {
                 self.state = Some(FrameDecoderState::new(source)?);
-                self.state.as_mut().unwrap()
+                self.state
+                    .as_ref()
+                    .and_then(|state| state.frame_header.dictionary_id())
             }
         };
-        if let Some(dict_id) = state.frame_header.dictionary_id() {
-            let dict = self
-                .owned_dicts
-                .get(&dict_id)
-                .or_else(|| {
-                    self.shared_dicts
-                        .get(&dict_id)
-                        .map(|handle| handle.as_dict())
-                })
-                .ok_or(err::DictNotProvided { dict_id })?;
+        if let Some(dict_id) = dict_id {
+            let dict_ptr = {
+                let dict = self
+                    .owned_dicts
+                    .get(&dict_id)
+                    .or_else(|| self.shared_dict(dict_id))
+                    .ok_or(err::DictNotProvided { dict_id })?;
+                std::ptr::from_ref(dict)
+            };
+            // Safe: dict lives in self-owned storage and outlives this call.
+            let dict = unsafe { &*dict_ptr };
+            let state = self.state.as_mut().expect("state initialized");
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
         }
@@ -246,6 +278,9 @@ impl FrameDecoder {
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id;
+        if self.owned_dicts.contains_key(&dict_id) || self.shared_dict_exists(dict_id) {
+            return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
+        }
         self.owned_dicts.insert(dict_id, dict);
         Ok(())
     }
@@ -257,27 +292,31 @@ impl FrameDecoder {
     }
 
     /// Add a pre-parsed dictionary handle for reuse across decoders.
+    #[cfg(target_has_atomic = "ptr")]
     pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id();
+        if self.owned_dicts.contains_key(&dict_id) || self.shared_dicts.contains_key(&dict_id) {
+            return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
+        }
         self.shared_dicts.insert(dict_id, dict);
         Ok(())
     }
 
     pub fn force_dict(&mut self, dict_id: u32) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        let dict_ptr = {
+            let dict = self
+                .owned_dicts
+                .get(&dict_id)
+                .or_else(|| self.shared_dict(dict_id))
+                .ok_or(err::DictNotProvided { dict_id })?;
+            std::ptr::from_ref(dict)
+        };
+        // Safe: dict lives in self-owned storage and outlives this call.
+        let dict = unsafe { &*dict_ptr };
         let Some(state) = self.state.as_mut() else {
             return Err(err::NotYetInitialized);
         };
-
-        let dict = self
-            .owned_dicts
-            .get(&dict_id)
-            .or_else(|| {
-                self.shared_dicts
-                    .get(&dict_id)
-                    .map(|handle| handle.as_dict())
-            })
-            .ok_or(err::DictNotProvided { dict_id })?;
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
 

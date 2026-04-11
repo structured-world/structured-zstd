@@ -90,6 +90,7 @@ fn test_dictionary_handle_from_dictionary_roundtrips() {
     assert_eq!(handle.as_dict().dict_content, vec![4]);
 }
 
+#[cfg(target_has_atomic = "ptr")]
 #[test]
 fn test_dict_decoding() {
     extern crate std;
@@ -374,6 +375,8 @@ fn test_decode_all_with_dict_helpers() {
 fn test_add_dict_from_bytes_allows_decode_all() {
     extern crate std;
     use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::Dictionary;
+    use crate::decoding::errors::FrameDecoderError;
     use alloc::vec;
     use std::fs;
 
@@ -385,10 +388,45 @@ fn test_add_dict_from_bytes_allows_decode_all() {
     decoder
         .add_dict_from_bytes(&dict_raw)
         .expect("dict bytes should parse");
-    decoder
+    let written = decoder
         .decode_all(compressed.as_slice(), &mut output)
         .expect("decode_all should succeed");
+    assert_eq!(written, original.len());
     assert_eq!(output, original);
+
+    let mut decoder = FrameDecoder::new();
+    let dict = Dictionary::from_raw_content(7, vec![1u8]).expect("dict should build");
+    decoder.add_dict(dict).expect("dict should insert");
+    let dict = Dictionary::from_raw_content(7, vec![2u8]).expect("dict should build");
+    let result = decoder.add_dict(dict);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictAlreadyRegistered { dict_id }) if dict_id == 7
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_add_dict_handle_rejects_existing_owned_id() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::FrameDecoderError;
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+    let dict = Dictionary::from_raw_content(9, vec![1u8]).expect("dict should build");
+    decoder.add_dict(dict).expect("dict should insert");
+
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(9, vec![2u8]).expect("dict should build"),
+    );
+    let result = decoder.add_dict_handle(handle);
+
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictAlreadyRegistered { dict_id }) if dict_id == 9
+    ));
 }
 
 #[test]

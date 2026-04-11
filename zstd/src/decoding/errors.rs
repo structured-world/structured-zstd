@@ -500,6 +500,7 @@ pub enum FrameDecoderError {
     FailedToSkipFrame,
     TargetTooSmall,
     DictNotProvided { dict_id: u32 },
+    DictAlreadyRegistered { dict_id: u32 },
 }
 
 #[cfg(feature = "std")]
@@ -576,6 +577,12 @@ impl core::fmt::Display for FrameDecoderError {
                 write!(
                     f,
                     "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict() or reset_with_dict()"
+                )
+            }
+            FrameDecoderError::DictAlreadyRegistered { dict_id } => {
+                write!(
+                    f,
+                    "Dictionary id 0x{dict_id:X} already registered in decoder"
                 )
             }
         }
@@ -1230,6 +1237,10 @@ mod tests {
         assert_eq!(
             FrameDecoderError::DictNotProvided { dict_id: 0xABCD }.to_string(),
             "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict() or reset_with_dict()"
+        );
+        assert_eq!(
+            FrameDecoderError::DictAlreadyRegistered { dict_id: 0xABCD }.to_string(),
+            "Dictionary id 0xABCD already registered in decoder"
         );
     }
 
