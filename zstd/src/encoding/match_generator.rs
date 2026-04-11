@@ -1738,7 +1738,7 @@ impl DfastMatchGenerator {
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = current_abs_start
-            .saturating_sub(3)
+            .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
             .max(self.history_abs_start);
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
@@ -5070,6 +5070,33 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     assert!(
         match_len >= DFAST_MIN_MATCH_LEN,
         "match length should satisfy dfast minimum match length"
+    );
+}
+
+#[test]
+fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    let first = deterministic_high_entropy_bytes(0x7A64_0315_D4E1_91C3, 4096);
+    let first_len = first.len();
+    matcher.add_data(first, |_| {});
+    matcher.skip_matching_dense();
+
+    // Appending one byte makes exactly the previous block's last 7 starts
+    // newly eligible for 8-byte long-hash insertion.
+    matcher.add_data(alloc::vec![0xAB], |_| {});
+    matcher.skip_matching_dense();
+
+    let target_abs_pos = first_len - 7;
+    let target_rel = target_abs_pos - matcher.history_abs_start;
+    let live = matcher.live_history();
+    assert!(
+        target_rel + 8 <= live.len(),
+        "fixture must make the boundary start long-hashable"
+    );
+    let long_hash = matcher.hash8(&live[target_rel..]);
+    assert!(
+        matcher.long_hash[long_hash].contains(&target_abs_pos),
+        "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
 

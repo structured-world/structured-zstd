@@ -875,6 +875,15 @@ mod tests {
                 frame_header.descriptor.single_segment_flag(),
                 "hinted small compressible frame should use single-segment (level={level:?})"
             );
+            assert_ne!(
+                first_block_type(&compressed),
+                BlockType::Raw,
+                "compressible hinted frame should stay off raw fast path (level={level:?})"
+            );
+            assert!(
+                compressed.len() < data.len(),
+                "compressible hinted frame should still shrink (level={level:?})"
+            );
             let mut decoded = Vec::new();
             zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
                 .unwrap_or_else(|e| panic!("ffi decode failed (level={level:?}): {e}"));

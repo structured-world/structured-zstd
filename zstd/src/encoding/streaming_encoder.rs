@@ -244,6 +244,11 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
 
+        // FrameCompressor gates single-segment on dictionary usage state; the
+        // streaming encoder currently has no dictionary API/state, so we only
+        // gate on pledged size and window reach here.
+        // TODO: if streaming dictionary support is added, mirror the
+        // !use_dictionary_state guard from FrameCompressor.
         let single_segment = self
             .pledged_content_size
             .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
