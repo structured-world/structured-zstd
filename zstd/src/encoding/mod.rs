@@ -3,6 +3,7 @@
 pub(crate) mod block_header;
 pub(crate) mod blocks;
 pub(crate) mod frame_header;
+pub(crate) mod incompressible;
 pub(crate) mod match_generator;
 pub(crate) mod util;
 
@@ -15,6 +16,8 @@ pub use streaming_encoder::StreamingEncoder;
 
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
+
+pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
@@ -158,13 +161,21 @@ impl CompressionLevel {
 pub trait Matcher {
     /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
     fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
-    /// Get a reference to the last commited space
+    /// Get a reference to the last committed space
     fn get_last_space(&mut self) -> &[u8];
     /// Commit a space to the matcher so it can be matched against
     fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
-    /// Just process the data in the last commited space for future matching
+    /// Just process the data in the last committed space for future matching.
     fn skip_matching(&mut self);
-    /// Process the data in the last commited space for future matching AND generate matches for the data
+    /// Hint-aware skip path used internally to thread a precomputed block
+    /// incompressibility verdict to matcher backends.
+    ///
+    /// Default implementation preserves backwards compatibility for external
+    /// custom matchers by delegating to [`skip_matching`](Self::skip_matching).
+    fn skip_matching_with_hint(&mut self, _incompressible_hint: Option<bool>) {
+        self.skip_matching();
+    }
+    /// Process the data in the last committed space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);

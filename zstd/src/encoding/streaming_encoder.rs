@@ -244,12 +244,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
 
+        // FrameCompressor gates single-segment on dictionary usage state; the
+        // streaming encoder currently has no dictionary API/state, so we only
+        // gate on pledged size and window reach here.
+        // TODO: if streaming dictionary support is added, mirror the
+        // !use_dictionary_state guard from FrameCompressor.
+        let single_segment = self
+            .pledged_content_size
+            .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
+            .unwrap_or(false);
+
         let header = FrameHeader {
             frame_content_size: self.pledged_content_size,
-            single_segment: false,
+            single_segment,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: None,
-            window_size: Some(window_size),
+            window_size: if single_segment {
+                None
+            } else {
+                Some(window_size)
+            },
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
@@ -374,7 +388,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
-                    compress_block_encoded(&mut self.state, last_block, block, &mut encoded);
+                    compress_block_encoded(
+                        &mut self.state,
+                        self.compression_level,
+                        last_block,
+                        block,
+                        &mut encoded,
+                    );
                     moved_into_matcher = true;
                 }
             }
@@ -1121,6 +1141,34 @@ mod tests {
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn single_segment_requires_pledged_to_fit_matcher_window() {
+        let payload = b"streaming-window-gate-".repeat(60); // 1320 bytes
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(1024),
+            Vec::new(),
+            CompressionLevel::Fastest,
+        );
+        encoder
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        encoder.write_all(payload.as_slice()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        assert_eq!(header.frame_content_size(), payload.len() as u64);
+        assert!(
+            !header.descriptor.single_segment_flag(),
+            "single-segment must stay off when pledged content size exceeds matcher window"
+        );
+        assert!(
+            header.window_size().unwrap() >= 1024,
+            "window descriptor should be present when single-segment is disabled"
+        );
     }
 
     #[test]

@@ -184,9 +184,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
+        let small_source_hint = self.source_size_hint.map(|size| size <= (1 << 14));
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
-                && self.state.matcher.supports_dictionary_priming();
+                && self.state.matcher.supports_dictionary_priming()
+                && self.dictionary.is_some();
         if let Some(size_hint) = self.source_size_hint.take() {
             // Keep source-size hint scoped to payload bytes; dictionary priming
             // is applied separately and should not force larger matcher sizing.
@@ -296,12 +298,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Default
                 | CompressionLevel::Better
                 | CompressionLevel::Best
-                | CompressionLevel::Level(_) => compress_block_encoded(
-                    &mut self.state,
-                    last_block,
-                    uncompressed_data,
-                    &mut all_blocks,
-                ),
+                | CompressionLevel::Level(_) => {
+                    compress_block_encoded(
+                        &mut self.state,
+                        self.compression_level,
+                        last_block,
+                        uncompressed_data,
+                        &mut all_blocks,
+                    );
+                }
             }
             if last_block {
                 break;
@@ -309,20 +314,27 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
 
         // Now that total_uncompressed is known, write the frame header with FCS.
-        // We always include the window descriptor (single_segment = false) because
-        // compressed blocks are encoded against the matcher's window, not the content
-        // size. Setting single_segment would tell the decoder to use FCS as window,
-        // which can be smaller than the encoder's actual window and trip up decoders.
+        // Keep hinted tiny one-shot frames in single-segment mode to match the
+        // donor framing policy used by the FFI path across levels.
+        // Guard out sub-512 byte payloads for now: tiny compressed-path
+        // single-segment framing is not yet fully C-FFI compatible.
+        let single_segment = !use_dictionary_state
+            && small_source_hint == Some(true)
+            && (512..=(1 << 14)).contains(&total_uncompressed);
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
-            single_segment: false,
+            single_segment,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: if use_dictionary_state {
                 self.dictionary.as_ref().map(|dict| dict.id as u64)
             } else {
                 None
             },
-            window_size: Some(window_size),
+            window_size: if single_segment {
+                None
+            } else {
+                Some(window_size)
+            },
         };
         // Write the frame header and compressed blocks separately to avoid
         // shifting the entire `all_blocks` buffer to prepend the header.
@@ -461,10 +473,32 @@ mod tests {
     use alloc::vec;
 
     use super::FrameCompressor;
+    use crate::blocks::block::BlockType;
     use crate::common::MAGIC_NUM;
-    use crate::decoding::FrameDecoder;
+    use crate::decoding::{FrameDecoder, block_decoder, frame::read_frame_header};
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
+
+    fn generate_data(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.push((state >> 33) as u8);
+        }
+        data
+    }
+
+    fn first_block_type(frame: &[u8]) -> BlockType {
+        let (_, header_size) = read_frame_header(frame).expect("frame header should parse");
+        let mut decoder = block_decoder::new();
+        let (header, _) = decoder
+            .read_block_header(&frame[header_size as usize..])
+            .expect("block header should parse");
+        header.block_type
+    }
 
     /// Frame content size is written correctly and C zstd can decompress the output.
     #[cfg(feature = "std")]
@@ -511,7 +545,14 @@ mod tests {
                 );
                 // Verify C zstd can decompress
                 let mut decoded = Vec::new();
-                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "C zstd decode failed for len={} level={level:?}: {e}",
+                            data.len()
+                        )
+                    },
+                );
                 assert_eq!(
                     decoded.as_slice(),
                     *data,
@@ -543,19 +584,67 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
-        fn generate_data(seed: u64, len: usize) -> Vec<u8> {
-            let mut state = seed;
-            let mut data = Vec::with_capacity(len);
-            for _ in 0..len {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                data.push((state >> 33) as u8);
-            }
-            data
-        }
+    fn small_hinted_default_frame_uses_single_segment_header() {
+        let data = generate_data(0xD15E_A5ED, 1024);
+        let compressed = {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            let mut out = Vec::new();
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
 
+        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+        assert!(
+            frame_header.descriptor.single_segment_flag(),
+            "small hinted default frames should use single-segment header for Rust/FFI parity"
+        );
+        assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
+            .expect("ffi decoder must accept single-segment small hinted default frame");
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn small_hinted_numeric_default_levels_use_single_segment_header() {
+        let data = generate_data(0xA11C_E003, 1024);
+        for level in [
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(3),
+        ] {
+            let compressed = {
+                let mut compressor = FrameCompressor::new(level);
+                compressor.set_source_size_hint(data.len() as u64);
+                compressor.set_source(data.as_slice());
+                let mut out = Vec::new();
+                compressor.set_drain(&mut out);
+                compressor.compress();
+                out
+            };
+
+            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+            assert!(
+                frame_header.descriptor.single_segment_flag(),
+                "small hinted numeric default level frames should use single-segment header (level={level:?})"
+            );
+            assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
+                panic!(
+                    "ffi decoder must accept single-segment small hinted numeric default level frame (level={level:?}): {e}"
+                )
+            });
+            assert_eq!(decoded, data);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
         let levels = [
             super::CompressionLevel::Fastest,
             super::CompressionLevel::Default,
@@ -567,7 +656,9 @@ mod tests {
             super::CompressionLevel::Level(4),
             super::CompressionLevel::Level(11),
         ];
-        let sizes = [513usize, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191];
+        let sizes = [
+            511usize, 512, 513, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191, 16_384, 16_385,
+        ];
 
         for (seed_idx, seed) in [11u64, 23, 41].into_iter().enumerate() {
             for &size in &sizes {
@@ -582,6 +673,14 @@ mod tests {
                         compressor.compress();
                         out
                     };
+                    if matches!(size, 511 | 512) {
+                        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                        assert_eq!(
+                            frame_header.descriptor.single_segment_flag(),
+                            size == 512,
+                            "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
+                        );
+                    }
 
                     let mut decoded = Vec::new();
                     zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
@@ -600,6 +699,251 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_levels_use_single_segment_header_symmetrically() {
+        let levels = [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ];
+        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
+            let size = 1024 + seed_idx * 97;
+            let data = generate_data(seed, size);
+            for &level in &levels {
+                let compressed = {
+                    let mut compressor = FrameCompressor::new(level);
+                    compressor.set_source_size_hint(data.len() as u64);
+                    compressor.set_source(data.as_slice());
+                    let mut out = Vec::new();
+                    compressor.set_drain(&mut out);
+                    compressor.compress();
+                    out
+                };
+                let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                assert!(
+                    frame_header.descriptor.single_segment_flag(),
+                    "hinted frame should be single-segment for level={level:?} size={}",
+                    data.len()
+                );
+                assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+                let mut decoded = Vec::new();
+                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
+                    panic!(
+                        "ffi decode failed for hinted single-segment parity: level={level:?} size={} err={e}",
+                        data.len()
+                    )
+                });
+                assert_eq!(decoded, data);
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_levels_pin_511_512_single_segment_boundary() {
+        let levels = [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ];
+        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
+            for &size in &[511usize, 512] {
+                let data = generate_data(seed + seed_idx as u64, size);
+                for &level in &levels {
+                    let compressed = {
+                        let mut compressor = FrameCompressor::new(level);
+                        compressor.set_source_size_hint(data.len() as u64);
+                        compressor.set_source(data.as_slice());
+                        let mut out = Vec::new();
+                        compressor.set_drain(&mut out);
+                        compressor.compress();
+                        out
+                    };
+                    let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                    assert_eq!(
+                        frame_header.descriptor.single_segment_flag(),
+                        size == 512,
+                        "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
+                    );
+                    let mut decoded = Vec::new();
+                    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "ffi decode failed at single-segment boundary: level={level:?} size={size} seed={} err={e}",
+                                seed + seed_idx as u64
+                            )
+                        },
+                    );
+                    assert_eq!(decoded, data);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn fastest_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xC0FF_EE11, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Fastest);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn default_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xD15E_A5ED, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Default);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn best_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xB35C_AFE1, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Best);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn level2_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xA11C_E222, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Level(2));
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn better_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xBE77_E111, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Better);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compressible_logs_do_not_fall_back_to_raw_fast_path() {
+        let mut data = Vec::with_capacity(16 * 1024);
+        const LINE: &[u8] =
+            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
+        while data.len() < 16 * 1024 {
+            let remaining = 16 * 1024 - data.len();
+            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
+        }
+
+        fn assert_not_raw_for_level(data: &[u8], level: super::CompressionLevel) {
+            let compressed = crate::encoding::compress_to_vec(data, level);
+            assert_ne!(first_block_type(&compressed), BlockType::Raw);
+            assert!(
+                compressed.len() < data.len(),
+                "compressible input should remain compressible for level={level:?}"
+            );
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+            assert_eq!(decoded, data);
+        }
+
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Fastest);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Default);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Better);
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Best);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_small_compressible_frames_use_single_segment_across_levels() {
+        let mut data = Vec::with_capacity(4 * 1024);
+        const LINE: &[u8] =
+            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
+        while data.len() < 4 * 1024 {
+            let remaining = 4 * 1024 - data.len();
+            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
+        }
+
+        for level in [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ] {
+            let compressed = {
+                let mut compressor = FrameCompressor::new(level);
+                compressor.set_source_size_hint(data.len() as u64);
+                compressor.set_source(data.as_slice());
+                let mut out = Vec::new();
+                compressor.set_drain(&mut out);
+                compressor.compress();
+                out
+            };
+            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+            assert!(
+                frame_header.descriptor.single_segment_flag(),
+                "hinted small compressible frame should use single-segment (level={level:?})"
+            );
+            assert_ne!(
+                first_block_type(&compressed),
+                BlockType::Raw,
+                "compressible hinted frame should stay off raw fast path (level={level:?})"
+            );
+            assert!(
+                compressed.len() < data.len(),
+                "compressible hinted frame should still shrink (level={level:?})"
+            );
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
+                .unwrap_or_else(|e| panic!("ffi decode failed (level={level:?}): {e}"));
+            assert_eq!(decoded, data);
         }
     }
 

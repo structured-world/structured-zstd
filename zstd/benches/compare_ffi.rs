@@ -13,6 +13,7 @@ mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use structured_zstd::decoding::FrameDecoder;
@@ -22,6 +23,34 @@ use structured_zstd::dictionary::{
 use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
+
+fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)
+        .expect("failed to create zstd stream encoder");
+    encoder
+        .include_checksum(cfg!(feature = "hash"))
+        .expect("failed to configure zstd checksum flag");
+    encoder
+        .include_contentsize(true)
+        .expect("failed to configure zstd content-size flag");
+    encoder
+        .set_pledged_src_size(Some(input.len() as u64))
+        .expect("failed to configure zstd pledged source size");
+    // Keep framing comparable to the Rust path only for tiny sources. For
+    // larger inputs, keep the level/default C sizing so parity benches compare
+    // similar compression settings.
+    if input.len() <= (1 << 14) {
+        encoder
+            .window_log(14)
+            .expect("failed to configure zstd window_log");
+    }
+    encoder
+        .write_all(input)
+        .expect("failed to write zstd stream input");
+    encoder
+        .finish()
+        .expect("failed to finalize zstd stream encoding")
+}
 
 fn benchmark_scenarios_cached() -> &'static [Scenario] {
     BENCHMARK_SCENARIOS.get_or_init(benchmark_scenarios)
@@ -42,9 +71,10 @@ fn bench_compress(c: &mut Criterion) {
                     &scenario.bytes[..],
                     level.rust_level,
                 );
-                let ffi_compressed =
-                    zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
+                let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
+                emit_frame_header_report(scenario, level, "rust", &rust_compressed);
+                emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
                 emit_memory_report(
                     scenario,
                     level,
@@ -69,9 +99,7 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| {
-                    black_box(zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap())
-                })
+                b.iter(|| black_box(ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level)))
             });
 
             group.finish();
@@ -85,7 +113,7 @@ fn bench_decompress(c: &mut Criterion) {
         for level in supported_levels() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
-            let ffi_compressed = zstd::encode_all(&scenario.bytes[..], level.ffi_level).unwrap();
+            let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -366,6 +394,60 @@ fn configure_group<M: criterion::measurement::Measurement>(
             group.sampling_mode(SamplingMode::Flat);
         }
     }
+}
+
+fn emit_frame_header_report(
+    scenario: &Scenario,
+    level: LevelConfig,
+    encoder: &'static str,
+    compressed: &[u8],
+) {
+    if compressed.len() < 5 {
+        println!(
+            "REPORT_HDR scenario={} level={} encoder={} parse=error",
+            scenario.id, level.name, encoder
+        );
+        return;
+    }
+
+    let desc = compressed[4];
+    let frame_content_size_flag = desc >> 6;
+    let single_segment = ((desc >> 5) & 0x1) == 1;
+    let checksum = ((desc >> 2) & 0x1) == 1;
+    let dict_id_flag = desc & 0x3;
+    let dict_id_bytes: u8 = match dict_id_flag {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => unreachable!(),
+    };
+    let fcs_bytes: u8 = match frame_content_size_flag {
+        0 => {
+            if single_segment {
+                1
+            } else {
+                0
+            }
+        }
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+    let header_bytes =
+        4u16 + 1 + if single_segment { 0 } else { 1 } + dict_id_bytes as u16 + fcs_bytes as u16;
+    println!(
+        "REPORT_HDR scenario={} level={} encoder={} header_bytes={} single_segment={} checksum={} fcs_bytes={} dict_id_bytes={}",
+        scenario.id,
+        level.name,
+        encoder,
+        header_bytes,
+        single_segment,
+        checksum,
+        fcs_bytes,
+        dict_id_bytes,
+    );
 }
 
 fn emit_memory_report(
