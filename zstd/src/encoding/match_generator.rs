@@ -814,7 +814,9 @@ impl Matcher for MatchGeneratorDriver {
                 .match_generator
                 .skip_matching_with_hint(incompressible_hint),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(incompressible_hint),
-            MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
+            MatcherBackend::Row => self
+                .row_matcher_mut()
+                .skip_matching_with_hint(incompressible_hint),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(incompressible_hint),
         }
     }
@@ -2277,14 +2279,36 @@ impl RowMatchGenerator {
     }
 
     fn skip_matching(&mut self) {
+        self.skip_matching_with_hint(None);
+    }
+
+    fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
         }
-        self.insert_positions(current_abs_start, current_abs_start + current_len);
+        if incompressible_hint == Some(true) {
+            self.insert_positions_with_step(
+                current_abs_start,
+                current_abs_end,
+                INCOMPRESSIBLE_SKIP_STEP,
+            );
+            let dense_tail = ROW_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
+            let tail_start = current_abs_end
+                .saturating_sub(dense_tail)
+                .max(current_abs_start);
+            for pos in tail_start..current_abs_end {
+                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
+                    self.insert_position(pos);
+                }
+            }
+        } else {
+            self.insert_positions(current_abs_start, current_abs_end);
+        }
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -2497,6 +2521,22 @@ impl RowMatchGenerator {
     fn insert_positions(&mut self, start: usize, end: usize) {
         for pos in start..end {
             self.insert_position(pos);
+        }
+    }
+
+    fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        if step <= 1 {
+            self.insert_positions(start, end);
+            return;
+        }
+        let mut pos = start;
+        while pos < end {
+            self.insert_position(pos);
+            let next = pos.saturating_add(step);
+            if next <= pos {
+                break;
+            }
+            pos = next;
         }
     }
 
@@ -3451,6 +3491,36 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
         "row matcher should reuse the 3-byte previous-block tail"
     );
     assert_eq!(&reconstructed[prefix_len..], second_block.as_slice());
+}
+
+#[test]
+fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
+    let data = deterministic_high_entropy_bytes(0xA713_9C5D_44E2_10B1, 4096);
+
+    let mut dense = RowMatchGenerator::new(1 << 22);
+    dense.configure(ROW_CONFIG);
+    dense.add_data(data.clone(), |_| {});
+    dense.skip_matching_with_hint(Some(false));
+    let dense_slots = dense
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    let mut sparse = RowMatchGenerator::new(1 << 22);
+    sparse.configure(ROW_CONFIG);
+    sparse.add_data(data, |_| {});
+    sparse.skip_matching_with_hint(Some(true));
+    let sparse_slots = sparse
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    assert!(
+        sparse_slots < dense_slots,
+        "incompressible hint should seed fewer row slots (sparse={sparse_slots}, dense={dense_slots})"
+    );
 }
 
 #[test]
