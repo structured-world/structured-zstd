@@ -18,8 +18,8 @@ use core::arch::x86::{
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
-    _mm256_loadu_si256, _mm256_movemask_epi8,
+    __m128i, __m256i, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_loadu_si128, _mm_movemask_epi8,
+    _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
 };
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
@@ -78,6 +78,14 @@ const MAX_HC_SEARCH_DEPTH: usize = 32;
 
 #[inline(always)]
 fn hash_mix_u64(value: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse42_crc_hash_available() {
+            // SAFETY: guarded by runtime/static `sse4.2` feature detection.
+            return unsafe { hash_mix_u64_sse42(value) };
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         if crc_hash_available() {
@@ -87,6 +95,28 @@ fn hash_mix_u64(value: u64) -> u64 {
     }
 
     value.wrapping_mul(HASH_MIX_PRIME)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn sse42_crc_hash_available() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static HAS_SSE42: OnceLock<bool> = OnceLock::new();
+        return *HAS_SSE42.get_or_init(|| is_x86_feature_detected!("sse4.2"));
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        cfg!(target_feature = "sse4.2")
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
+    let crc = _mm_crc32_u64(0, value);
+    ((crc as u64) << 32 ^ value.rotate_left(13)).wrapping_mul(HASH_MIX_PRIME)
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -4264,6 +4294,32 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     matcher.offset_hist = [1, 0, 0];
 
     assert!(matcher.repcode_candidate(4, 1).is_none());
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[test]
+fn hash_mix_sse42_path_is_available_and_deterministic_when_supported() {
+    if !is_x86_feature_detected!("sse4.2") {
+        return;
+    }
+
+    let v = 0x0123_4567_89AB_CDEFu64;
+    let a = hash_mix_u64(v);
+    let b = hash_mix_u64(v);
+    assert_eq!(a, b);
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+#[test]
+fn hash_mix_crc_path_is_available_and_deterministic_when_supported() {
+    if !is_aarch64_feature_detected!("crc") {
+        return;
+    }
+
+    let v = 0x0123_4567_89AB_CDEFu64;
+    let a = hash_mix_u64(v);
+    let b = hash_mix_u64(v);
+    assert_eq!(a, b);
 }
 
 #[test]
