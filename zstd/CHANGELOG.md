@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/structured-world/structured-zstd/compare/v0.0.16...v0.0.17) - 2026-04-11
+
+### Performance
+
+- *(encoding)* complete ARM histogram path for #71 ([#104](https://github.com/structured-world/structured-zstd/pull/104))
+- *(encoding)* CRC-gated hash mix for ARM and x86_64 ([#102](https://github.com/structured-world/structured-zstd/pull/102))
+
 ## [0.0.16](https://github.com/structured-world/structured-zstd/compare/v0.0.15...v0.0.16) - 2026-04-11
 
 ### Performance
