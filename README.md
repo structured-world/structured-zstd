@@ -49,11 +49,27 @@ Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depe
 - [x] Default (roughly level 3)
 - [x] Better (roughly level 7)
 - [x] Best (roughly level 11)
-- [x] Numeric levels `0` (default), `1–22`, and negative ultra-fast levels via `CompressionLevel::from_level(n)` (C zstd compatible numbering)
+- [x] Numeric levels `0` (default), `1–22`, and negative ultra-fast levels via `CompressionLevel::from_level(n)` (C zstd-compatible numbering)
 - [x] Checksums
 - [x] Frame Content Size — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before first write
 - [x] Dictionary compression
 - [x] Streaming encoder (`io::Write`)
+
+### Compression Strategy Coverage
+
+Implemented strategy/back-end coverage:
+- Level 1: simple matcher (`Simple`)
+- Levels 2-3: `Dfast`
+- Level 4: row matcher (`Row`)
+- Levels 5-22: hash-chain matcher (`HashChain`) with lazy/lazy2 style tuning
+
+Not yet implemented as dedicated strategy families:
+- `greedy`
+- `btopt`
+- `btultra`
+
+Current behavior for these missing families:
+- numeric levels that require them are mapped to the closest implemented matcher configuration
 
 ### Dictionary Generation
 
@@ -108,6 +124,35 @@ let mut decoder = StreamingDecoder::new(&mut source).unwrap();
 
 let mut result = Vec::new();
 decoder.read_to_end(&mut result).unwrap();
+```
+
+### Dictionary-backed Decompression API
+
+```rust,no_run
+use structured_zstd::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
+use structured_zstd::io::Read;
+
+let compressed: Vec<u8> = vec![];
+let dict_bytes: Vec<u8> = vec![];
+let mut output = vec![0u8; 1024];
+
+// Parse dictionary once, then reuse handle.
+let handle = DictionaryHandle::decode_dict(&dict_bytes).unwrap();
+let mut decoder = FrameDecoder::new();
+let _written = decoder
+    .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
+    .unwrap();
+
+// Compatibility path: pass raw dictionary bytes directly.
+let _written = FrameDecoder::new()
+    .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_bytes)
+    .unwrap();
+
+// Streaming helpers exist for both handle- and bytes-based paths.
+let mut source: &[u8] = &compressed;
+let mut stream = StreamingDecoder::new_with_dictionary_handle(&mut source, &handle).unwrap();
+let mut sink = Vec::new();
+stream.read_to_end(&mut sink).unwrap();
 ```
 
 ## Support the Project
