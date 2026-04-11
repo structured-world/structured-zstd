@@ -34,6 +34,24 @@ fn bench_decode_dict_handle(c: &mut Criterion) {
 
     let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
 
+    let mut output = vec![0u8; output_len];
+    FrameDecoder::new()
+        .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
+        .expect("decode should succeed");
+    assert_eq!(
+        output, payload,
+        "prepared_handle produced unexpected output"
+    );
+
+    output.fill(0);
+    FrameDecoder::new()
+        .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, dict_raw)
+        .expect("decode should succeed");
+    assert_eq!(
+        output, payload,
+        "raw_dict_each_call produced unexpected output"
+    );
+
     let mut group = c.benchmark_group("decode/dict_handle");
     group.bench_with_input(
         BenchmarkId::new("prepared_handle", output_len),

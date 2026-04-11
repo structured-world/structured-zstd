@@ -260,3 +260,81 @@ fn test_dict_decoding() {
 
     assert!(failed.is_empty());
 }
+
+#[test]
+fn test_decode_all_with_dict_helpers() {
+    extern crate std;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use crate::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
+    use std::fs;
+    use std::io::Read;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let (compressed, original) = load_sample_dict_frame();
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+
+    let mut output = vec![0u8; original.len()];
+    FrameDecoder::new()
+        .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
+        .expect("decode_all_with_dict_handle should succeed");
+    assert_eq!(output, original);
+
+    let mut output = vec![0u8; original.len()];
+    FrameDecoder::new()
+        .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_raw)
+        .expect("decode_all_with_dict_bytes should succeed");
+    assert_eq!(output, original);
+
+    let mut decoder =
+        StreamingDecoder::new_with_dictionary_handle(compressed.as_slice(), &handle)
+            .expect("streaming decoder should init");
+    let mut streamed = Vec::new();
+    Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
+    assert_eq!(streamed, original);
+
+    let mut decoder =
+        StreamingDecoder::new_with_dictionary_bytes(compressed.as_slice(), &dict_raw)
+            .expect("streaming decoder should init");
+    let mut streamed = Vec::new();
+    Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
+    assert_eq!(streamed, original);
+}
+
+#[cfg(test)]
+fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    extern crate std;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use std::fs;
+
+    let mut files: Vec<std::io::Result<std::fs::DirEntry>> = fs::read_dir("./dict_tests/files")
+        .expect("dict test files should exist")
+        .collect();
+    files.sort_by_key(|entry| match entry {
+        Err(_) => String::new(),
+        Ok(dir_entry) => dir_entry.path().to_string_lossy().to_string(),
+    });
+
+    let file_path = files
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "zst")
+                .unwrap_or(false)
+        })
+        .expect("expected at least one .zst file in dict_tests/files");
+
+    let compressed = fs::read(&file_path).expect("compressed data should load");
+    let original_path = file_path
+        .to_str()
+        .expect("dict test path should be utf-8")
+        .trim_end_matches(".zst")
+        .to_string();
+    let original = fs::read(original_path).expect("original data should load");
+
+    (compressed, original)
+}

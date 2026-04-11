@@ -1,4 +1,7 @@
+#[cfg(target_has_atomic = "ptr")]
 use alloc::sync::Arc;
+#[cfg(not(target_has_atomic = "ptr"))]
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
@@ -37,10 +40,17 @@ pub struct Dictionary {
     pub offset_hist: [u32; 3],
 }
 
+#[cfg(target_has_atomic = "ptr")]
+type SharedDictionary = Arc<Dictionary>;
+#[cfg(not(target_has_atomic = "ptr"))]
+type SharedDictionary = Rc<Dictionary>;
+
 /// Shared pre-parsed dictionary handle for repeated decoding.
+///
+/// Uses `Arc` on targets with atomics and falls back to `Rc` otherwise.
 #[derive(Clone)]
 pub struct DictionaryHandle {
-    inner: Arc<Dictionary>,
+    inner: SharedDictionary,
 }
 
 /// This 4 byte (little endian) magic number refers to the start of a dictionary
@@ -174,7 +184,7 @@ impl DictionaryHandle {
     /// Wrap an already-parsed dictionary in a shared handle.
     pub fn from_dictionary(dict: Dictionary) -> Self {
         Self {
-            inner: Arc::new(dict),
+            inner: SharedDictionary::new(dict),
         }
     }
 
@@ -309,6 +319,6 @@ mod tests {
         let clone = handle.clone();
 
         assert_eq!(handle.id(), clone.id());
-        assert!(Arc::ptr_eq(&handle.inner, &clone.inner));
+        assert!(SharedDictionary::ptr_eq(&handle.inner, &clone.inner));
     }
 }

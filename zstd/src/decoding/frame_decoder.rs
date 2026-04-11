@@ -69,9 +69,23 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 ///     std::io::stdout().write_all(data).unwrap();
 /// }
 /// ```
+enum StoredDictionary {
+    Owned(Dictionary),
+    Shared(DictionaryHandle),
+}
+
+impl StoredDictionary {
+    fn as_dict(&self) -> &Dictionary {
+        match self {
+            StoredDictionary::Owned(dict) => dict,
+            StoredDictionary::Shared(handle) => handle.as_dict(),
+        }
+    }
+}
+
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    dicts: BTreeMap<u32, DictionaryHandle>,
+    dicts: BTreeMap<u32, StoredDictionary>,
 }
 
 struct FrameDecoderState {
@@ -203,7 +217,7 @@ impl FrameDecoder {
                 .dicts
                 .get(&dict_id)
                 .ok_or(err::DictNotProvided { dict_id })?;
-            state.decoder_scratch.init_from_dict(dict.as_ref());
+            state.decoder_scratch.init_from_dict(dict.as_dict());
             state.using_dict = Some(dict_id);
         }
         Ok(())
@@ -238,18 +252,21 @@ impl FrameDecoder {
 
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
-        self.add_dict_handle(dict.into_handle())
+        let dict_id = dict.id;
+        self.dicts.insert(dict_id, StoredDictionary::Owned(dict));
+        Ok(())
     }
 
     /// Parse and add a serialized dictionary blob.
     pub fn add_dict_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), FrameDecoderError> {
-        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
-        self.add_dict_handle(dict)
+        let dict = Dictionary::decode_dict(raw_dictionary)?;
+        self.add_dict(dict)
     }
 
     /// Add a pre-parsed dictionary handle for reuse across decoders.
     pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
-        self.dicts.insert(dict.id(), dict);
+        let dict_id = dict.id();
+        self.dicts.insert(dict_id, StoredDictionary::Shared(dict));
         Ok(())
     }
 
@@ -263,7 +280,7 @@ impl FrameDecoder {
             .dicts
             .get(&dict_id)
             .ok_or(err::DictNotProvided { dict_id })?;
-        state.decoder_scratch.init_from_dict(dict.as_ref());
+        state.decoder_scratch.init_from_dict(dict.as_dict());
         state.using_dict = Some(dict_id);
 
         Ok(())
