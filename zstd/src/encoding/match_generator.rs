@@ -191,11 +191,24 @@ unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
 }
 
 #[cfg(all(test, feature = "std"))]
+static HASH_MIX_KERNEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, feature = "std"))]
 fn with_forced_hash_mix_kernel<T>(kernel: HashMixKernel, f: impl FnOnce() -> T) -> T {
+    let _lock = HASH_MIX_KERNEL_TEST_LOCK
+        .lock()
+        .expect("hash mix test lock poisoned");
+
+    struct RestoreHashMixKernel(u8);
+    impl Drop for RestoreHashMixKernel {
+        fn drop(&mut self) {
+            HASH_MIX_KERNEL.store(self.0, Ordering::Relaxed);
+        }
+    }
+
     let prev = HASH_MIX_KERNEL.swap(kernel as u8, Ordering::Relaxed);
-    let out = f();
-    HASH_MIX_KERNEL.store(prev, Ordering::Relaxed);
-    out
+    let _restore = RestoreHashMixKernel(prev);
+    f()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4357,6 +4370,9 @@ fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported(
         return;
     }
 
+    let _lock = HASH_MIX_KERNEL_TEST_LOCK
+        .lock()
+        .expect("hash mix test lock poisoned");
     let v = 0x0123_4567_89AB_CDEFu64;
     let accelerated = unsafe { hash_mix_u64_sse42(v) };
     assert_eq!(hash_mix_u64(v), accelerated);
@@ -4378,6 +4394,9 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
         return;
     }
 
+    let _lock = HASH_MIX_KERNEL_TEST_LOCK
+        .lock()
+        .expect("hash mix test lock poisoned");
     let v = 0x0123_4567_89AB_CDEFu64;
     let accelerated = unsafe { hash_mix_u64_crc(v) };
     assert_eq!(hash_mix_u64(v), accelerated);
