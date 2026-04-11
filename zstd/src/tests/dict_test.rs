@@ -75,6 +75,22 @@ fn test_dict_parsing() {
 }
 
 #[test]
+fn test_dictionary_handle_from_dictionary_roundtrips() {
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use alloc::vec;
+
+    let dict = Dictionary::from_raw_content(1, vec![1, 2, 3]).unwrap();
+    let handle = DictionaryHandle::from_dictionary(dict);
+    assert_eq!(handle.id(), 1);
+    assert_eq!(handle.as_dict().dict_content, vec![1, 2, 3]);
+
+    let dict = Dictionary::from_raw_content(2, vec![4]).unwrap();
+    let handle: DictionaryHandle = dict.into();
+    assert_eq!(handle.id(), 2);
+    assert_eq!(handle.as_dict().dict_content, vec![4]);
+}
+
+#[test]
 fn test_dict_decoding() {
     extern crate std;
     use crate::decoding::BlockDecodingStrategy;
@@ -259,6 +275,59 @@ fn test_dict_decoding() {
     }
 
     assert!(failed.is_empty());
+}
+
+#[test]
+fn test_decode_all_skips_skippable_frames() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"decode-all-skip-frame";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut input = Vec::new();
+    let magic = 0x184D2A50u32.to_le_bytes();
+    let skippable_payload = [0xAA, 0xBB, 0xCC, 0xDD];
+    let length = (skippable_payload.len() as u32).to_le_bytes();
+    input.extend_from_slice(&magic);
+    input.extend_from_slice(&length);
+    input.extend_from_slice(&skippable_payload);
+    input.extend_from_slice(&compressed);
+
+    let mut output = vec![0u8; payload.len()];
+    let written = FrameDecoder::new()
+        .decode_all(input.as_slice(), &mut output)
+        .expect("decode_all should succeed");
+    assert_eq!(written, payload.len());
+    assert_eq!(output, payload);
+}
+
+#[test]
+fn test_decode_all_reports_target_too_small() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"decode-all-target-too-small";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut output = vec![0u8; payload.len() - 1];
+    let result = FrameDecoder::new().decode_all(compressed.as_slice(), &mut output);
+    assert!(matches!(result, Err(FrameDecoderError::TargetTooSmall)));
 }
 
 #[test]
