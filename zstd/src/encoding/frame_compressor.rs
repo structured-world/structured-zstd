@@ -316,12 +316,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Now that total_uncompressed is known, write the frame header with FCS.
         // Keep hinted tiny one-shot frames in single-segment mode to match the
         // donor framing policy used by the FFI path across levels.
-        // Guard out sub-256 byte payloads for now: the 1-byte FCS single-segment
-        // form is still not fully C-FFI compatible on the compressed path.
+        // Guard out sub-512 byte payloads for now: tiny compressed-path
+        // single-segment framing is not yet fully C-FFI compatible.
         let single_segment = !use_dictionary_state
             && small_source_hint == Some(true)
-            && total_uncompressed >= 256
-            && total_uncompressed <= (1 << 14);
+            && (512..=(1 << 14)).contains(&total_uncompressed);
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
             single_segment,

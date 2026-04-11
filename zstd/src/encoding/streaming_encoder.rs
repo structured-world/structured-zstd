@@ -244,12 +244,21 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
 
+        let single_segment = self
+            .pledged_content_size
+            .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
+            .unwrap_or(false);
+
         let header = FrameHeader {
             frame_content_size: self.pledged_content_size,
-            single_segment: false,
+            single_segment,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: None,
-            window_size: Some(window_size),
+            window_size: if single_segment {
+                None
+            } else {
+                Some(window_size)
+            },
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
