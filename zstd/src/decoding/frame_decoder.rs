@@ -267,16 +267,16 @@ impl FrameDecoder {
                 self.state.as_mut().unwrap()
             }
         };
-        if let Some(dict_id) = state.frame_header.dictionary_id() {
-            if dict_id != dict.id() {
-                return Err(err::DictIdMismatch {
-                    expected: dict_id,
-                    provided: dict.id(),
-                });
-            }
-            state.decoder_scratch.init_from_dict(dict.as_ref());
-            state.using_dict = Some(dict_id);
+        if let Some(dict_id) = state.frame_header.dictionary_id()
+            && dict_id != dict.id()
+        {
+            return Err(err::DictIdMismatch {
+                expected: dict_id,
+                provided: dict.id(),
+            });
         }
+        state.decoder_scratch.init_from_dict(dict.as_ref());
+        state.using_dict = Some(dict.id());
         Ok(())
     }
 
@@ -772,7 +772,7 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
-    fn reset_with_dict_handle_skips_when_no_dict_id() {
+    fn reset_with_dict_handle_applies_dict_when_no_dict_id() {
         let payload = b"reset-without-dict-id";
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
         compressor.set_source(payload.as_slice());
@@ -789,6 +789,6 @@ mod tests {
             .expect("reset should succeed");
         let state = decoder.state.as_ref().expect("state should be initialized");
         assert!(state.frame_header.dictionary_id().is_none());
-        assert!(state.using_dict.is_none());
+        assert_eq!(state.using_dict, Some(handle.id()));
     }
 }
