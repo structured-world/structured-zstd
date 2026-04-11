@@ -4,6 +4,7 @@ use core::cmp::Ordering;
 use crate::{
     bit_io::BitWriter,
     fse::fse_encoder::{self, FSEEncoder},
+    histogram,
 };
 
 pub(crate) struct HuffmanEncoder<'output, 'table, V: AsMut<Vec<u8>>> {
@@ -122,7 +123,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             self.writer.write_bits(0u8, 8);
             let idx_before = self.writer.index();
             let mut encoder = FSEEncoder::new(
-                fse_encoder::build_table_from_data(weights.iter().copied(), 6, true),
+                fse_encoder::build_table_from_bytes(weights, 6, true),
                 self.writer,
             );
             encoder.encode_interleaved(weights);
@@ -159,13 +160,9 @@ pub struct HuffmanTable {
 impl HuffmanTable {
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
-        let mut max = 0;
-        for x in data {
-            counts[*x as usize] += 1;
-            max = max.max(*x);
-        }
+        let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
 
-        Self::build_from_counts(&counts[..=max as usize])
+        Self::build_from_counts(&counts[..=max_symbol])
     }
 
     pub fn build_from_counts(counts: &[usize]) -> Self {

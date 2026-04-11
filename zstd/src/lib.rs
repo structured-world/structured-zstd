@@ -39,6 +39,7 @@ pub mod decoding;
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
 pub mod dictionary;
 pub mod encoding;
+mod histogram;
 
 pub(crate) mod blocks;
 
