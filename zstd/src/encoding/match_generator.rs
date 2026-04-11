@@ -552,9 +552,11 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
-                dfast.use_donor_fast_loop = matches!(
+                dfast.use_fast_loop = matches!(
                     level,
-                    CompressionLevel::Default | CompressionLevel::Level(3)
+                    CompressionLevel::Default
+                        | CompressionLevel::Level(0)
+                        | CompressionLevel::Level(3)
                 );
                 dfast.set_hash_bits(if hinted {
                     dfast_hash_bits_for_window(max_window_size)
@@ -1463,7 +1465,7 @@ struct DfastMatchGenerator {
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     hash_bits: usize,
-    use_donor_fast_loop: bool,
+    use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
 }
@@ -1633,7 +1635,7 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             hash_bits: DFAST_HASH_BITS,
-            use_donor_fast_loop: false,
+            use_fast_loop: false,
             lazy_depth: 1,
         }
     }
@@ -1749,8 +1751,8 @@ impl DfastMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        if self.use_donor_fast_loop {
-            self.start_matching_donor_fast(current_abs_start, current_len, &mut handle_sequence);
+        if self.use_fast_loop {
+            self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
             return;
         }
         self.start_matching_general(current_abs_start, current_len, &mut handle_sequence);
@@ -1810,7 +1812,7 @@ impl DfastMatchGenerator {
         self.emit_trailing_literals(literals_start, handle_sequence);
     }
 
-    fn start_matching_donor_fast(
+    fn start_matching_fast_loop(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -1818,10 +1820,6 @@ impl DfastMatchGenerator {
     ) {
         let block_is_strict_incompressible = self
             .block_looks_incompressible_strict(current_abs_start, current_abs_start + current_len);
-        if !block_is_strict_incompressible {
-            self.start_matching_general(current_abs_start, current_len, handle_sequence);
-            return;
-        }
         let mut pos = 0usize;
         let mut literals_start = 0usize;
         let mut skip_step = 1usize;

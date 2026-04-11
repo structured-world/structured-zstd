@@ -768,6 +768,20 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
+    fn better_random_block_uses_raw_fast_path() {
+        let data = generate_data(0xBE77_E111, 10 * 1024);
+        let compressed =
+            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Better);
+
+        assert_eq!(first_block_type(&compressed), BlockType::Raw);
+
+        let mut decoded = Vec::new();
+        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
     fn compressible_logs_do_not_fall_back_to_raw_fast_path() {
         let mut data = Vec::with_capacity(16 * 1024);
         const LINE: &[u8] =
@@ -792,6 +806,7 @@ mod tests {
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Fastest);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Default);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
+        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Better);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Best);
     }
 
