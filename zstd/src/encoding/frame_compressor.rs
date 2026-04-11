@@ -318,17 +318,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
 
         // Now that total_uncompressed is known, write the frame header with FCS.
-        // Keep one-shot small hinted frames in the same header mode as the FFI
-        // benchmark path (`single_segment=true`) for parity, but avoid enabling
-        // this globally across slower/deeper levels where it can regress C-FFI
-        // decode compatibility.
-        let level_supports_single_segment_parity = matches!(
-            self.compression_level,
-            CompressionLevel::Default | CompressionLevel::Level(0) | CompressionLevel::Level(3)
-        );
+        // Keep hinted tiny raw-fast-path frames in single-segment mode for
+        // Rust/FFI parity across levels. We intentionally gate this on raw
+        // emission to avoid forcing single-segment for tiny compressed blocks
+        // until compressed-path window handling is fully donor-aligned.
         let single_segment = !use_dictionary_state
             && small_source_hint == Some(true)
-            && level_supports_single_segment_parity
             && all_blocks_raw
             && total_uncompressed <= (1 << 14);
         let header = FrameHeader {
@@ -700,6 +695,52 @@ mod tests {
                         seed + seed_idx as u64
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_levels_use_single_segment_header_symmetrically() {
+        let levels = [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ];
+        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
+            let size = 1024 + seed_idx * 97;
+            let data = generate_data(seed, size);
+            for &level in &levels {
+                let compressed = {
+                    let mut compressor = FrameCompressor::new(level);
+                    compressor.set_source_size_hint(data.len() as u64);
+                    compressor.set_source(data.as_slice());
+                    let mut out = Vec::new();
+                    compressor.set_drain(&mut out);
+                    compressor.compress();
+                    out
+                };
+                let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                assert!(
+                    frame_header.descriptor.single_segment_flag(),
+                    "hinted frame should be single-segment for level={level:?} size={}",
+                    data.len()
+                );
+                assert_eq!(frame_header.frame_content_size(), data.len() as u64);
+                let mut decoded = Vec::new();
+                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
+                    panic!(
+                        "ffi decode failed for hinted single-segment parity: level={level:?} size={} err={e}",
+                        data.len()
+                    )
+                });
+                assert_eq!(decoded, data);
             }
         }
     }
