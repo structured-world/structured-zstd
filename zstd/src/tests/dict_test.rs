@@ -368,6 +368,59 @@ fn test_decode_all_with_dict_helpers() {
     assert_eq!(streamed, original);
 }
 
+#[test]
+fn test_add_dict_from_bytes_allows_decode_all() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use alloc::vec;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let (compressed, original) = load_sample_dict_frame();
+
+    let mut output = vec![0u8; original.len()];
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict_from_bytes(&dict_raw)
+        .expect("dict bytes should parse");
+    decoder
+        .decode_all(compressed.as_slice(), &mut output)
+        .expect("decode_all should succeed");
+    assert_eq!(output, original);
+}
+
+#[test]
+fn test_reset_with_dict_handle_rejects_mismatched_id() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::FrameDecoderError;
+    use alloc::vec;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let expected_dict_id = DictionaryHandle::decode_dict(&dict_raw)
+        .expect("dictionary should parse")
+        .id();
+    let mismatched_id = if expected_dict_id == u32::MAX {
+        expected_dict_id - 1
+    } else {
+        expected_dict_id + 1
+    };
+    let mismatched = Dictionary::from_raw_content(mismatched_id, vec![1u8])
+        .expect("mismatched dictionary should build");
+    let handle = DictionaryHandle::from_dictionary(mismatched);
+
+    let (compressed, _original) = load_sample_dict_frame();
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.reset_with_dict_handle(compressed.as_slice(), &handle);
+
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictNotProvided { dict_id }) if dict_id == expected_dict_id
+    ));
+}
+
 #[cfg(test)]
 fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
     extern crate std;
@@ -383,26 +436,30 @@ fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
         Ok(dir_entry) => dir_entry.path().to_string_lossy().to_string(),
     });
 
-    let file_path = files
+    let (file_path, compressed) = files
         .into_iter()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
+        .find_map(|path| {
+            let is_zst = path
+                .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| ext == "zst")
-                .unwrap_or(false)
-        })
-        .expect("expected at least one .zst file in dict_tests/files");
+                .unwrap_or(false);
+            if !is_zst {
+                return None;
+            }
 
-    let compressed = fs::read(&file_path).expect("compressed data should load");
-    let mut header_src = compressed.as_slice();
-    let (header, _) = crate::decoding::frame::read_frame_header(&mut header_src)
-        .expect("sample frame header should parse");
-    assert!(
-        header.dictionary_id().is_some(),
-        "sample fixture must require a dictionary"
-    );
+            let compressed = fs::read(&path).ok()?;
+            let mut header_src = compressed.as_slice();
+            let (header, _) = crate::decoding::frame::read_frame_header(&mut header_src).ok()?;
+            if header.dictionary_id().is_some() {
+                Some((path, compressed))
+            } else {
+                None
+            }
+        })
+        .expect("expected at least one dictionary-backed .zst file in dict_tests/files");
     let original_path = file_path
         .to_str()
         .expect("dict test path should be utf-8")

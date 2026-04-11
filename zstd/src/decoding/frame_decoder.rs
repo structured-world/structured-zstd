@@ -233,13 +233,13 @@ impl FrameDecoder {
                 self.state.as_mut().unwrap()
             }
         };
-        if let Some(dict_id) = state.frame_header.dictionary_id()
-            && dict_id != dict.id()
-        {
-            return Err(err::DictNotProvided { dict_id });
+        if let Some(dict_id) = state.frame_header.dictionary_id() {
+            if dict_id != dict.id() {
+                return Err(err::DictNotProvided { dict_id });
+            }
+            state.decoder_scratch.init_from_dict(dict.as_ref());
+            state.using_dict = Some(dict_id);
         }
-        state.decoder_scratch.init_from_dict(dict.as_ref());
-        state.using_dict = Some(dict.id());
         Ok(())
     }
 
@@ -578,7 +578,8 @@ impl FrameDecoder {
 
     /// Decode multiple frames into the output slice.
     ///
-    /// `input` must contain an exact number of frames.
+    /// `input` must contain an exact number of frames. Skippable frames are allowed and will be
+    /// skipped during decode.
     ///
     /// `output` must be large enough to hold the decompressed data. If you don't know
     /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
@@ -596,7 +597,8 @@ impl FrameDecoder {
 
     /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
     ///
-    /// `input` must contain an exact number of frames.
+    /// `input` must contain an exact number of frames. Skippable frames are allowed and will be
+    /// skipped during decode.
     ///
     /// `output` must be large enough to hold the decompressed data. If you don't know
     /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
@@ -711,5 +713,35 @@ impl Read for FrameDecoder {
         } else {
             state.decoder_scratch.buffer.read(target)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{DictionaryHandle, FrameDecoder};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec::Vec;
+
+    #[test]
+    fn reset_with_dict_handle_skips_when_no_dict_id() {
+        let payload = b"reset-without-dict-id";
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
+
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .reset_with_dict_handle(compressed.as_slice(), &handle)
+            .expect("reset should succeed");
+        let state = decoder.state.as_ref().expect("state should be initialized");
+        assert!(state.frame_header.dictionary_id().is_none());
+        assert!(state.using_dict.is_none());
     }
 }

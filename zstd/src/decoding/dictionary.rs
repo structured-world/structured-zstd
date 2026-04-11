@@ -217,6 +217,7 @@ impl From<Dictionary> for DictionaryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn offset_history_start(raw: &[u8]) -> usize {
         let mut huf = crate::decoding::scratch::HuffmanScratch::new();
@@ -310,6 +311,15 @@ mod tests {
             result,
             Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 })
         ));
+    }
+
+    #[test]
+    fn dictionary_handle_from_raw_content_supports_as_ref() {
+        let dict = Dictionary::from_raw_content(7, vec![42]).expect("raw dict should build");
+        let handle = dict.into_handle();
+
+        assert_eq!(handle.as_ref().id, 7);
+        assert_eq!(handle.as_ref().dict_content, vec![42]);
     }
 
     #[test]
