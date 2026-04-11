@@ -40,35 +40,41 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
     let mut counting4 = [0u32; 256];
     let mut index = 0usize;
 
-    while index <= data.len().saturating_sub(16) {
-        // SAFETY: loop condition guarantees we can read 16 bytes starting at
-        // `index`; read_unaligned matches donor-style lane loads.
-        let ptr = unsafe { data.as_ptr().add(index) };
-        let lane0 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) });
-        let lane1 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) });
-        let lane2 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(8).cast::<u32>()) });
-        let lane3 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(12).cast::<u32>()) });
-        index += 16;
+    if data.len() >= 16 {
+        let end = data.len() - 16;
+        while index <= end {
+            // SAFETY: loop condition guarantees we can read 16 bytes starting at
+            // `index`; read_unaligned matches donor-style lane loads.
+            let ptr = unsafe { data.as_ptr().add(index) };
+            let lane0 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) });
+            let lane1 =
+                u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) });
+            let lane2 =
+                u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(8).cast::<u32>()) });
+            let lane3 =
+                u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(12).cast::<u32>()) });
+            index += 16;
 
-        counting1[(lane0 & 0xFF) as usize] += 1;
-        counting2[((lane0 >> 8) & 0xFF) as usize] += 1;
-        counting3[((lane0 >> 16) & 0xFF) as usize] += 1;
-        counting4[(lane0 >> 24) as usize] += 1;
+            counting1[(lane0 & 0xFF) as usize] += 1;
+            counting2[((lane0 >> 8) & 0xFF) as usize] += 1;
+            counting3[((lane0 >> 16) & 0xFF) as usize] += 1;
+            counting4[(lane0 >> 24) as usize] += 1;
 
-        counting1[(lane1 & 0xFF) as usize] += 1;
-        counting2[((lane1 >> 8) & 0xFF) as usize] += 1;
-        counting3[((lane1 >> 16) & 0xFF) as usize] += 1;
-        counting4[(lane1 >> 24) as usize] += 1;
+            counting1[(lane1 & 0xFF) as usize] += 1;
+            counting2[((lane1 >> 8) & 0xFF) as usize] += 1;
+            counting3[((lane1 >> 16) & 0xFF) as usize] += 1;
+            counting4[(lane1 >> 24) as usize] += 1;
 
-        counting1[(lane2 & 0xFF) as usize] += 1;
-        counting2[((lane2 >> 8) & 0xFF) as usize] += 1;
-        counting3[((lane2 >> 16) & 0xFF) as usize] += 1;
-        counting4[(lane2 >> 24) as usize] += 1;
+            counting1[(lane2 & 0xFF) as usize] += 1;
+            counting2[((lane2 >> 8) & 0xFF) as usize] += 1;
+            counting3[((lane2 >> 16) & 0xFF) as usize] += 1;
+            counting4[(lane2 >> 24) as usize] += 1;
 
-        counting1[(lane3 & 0xFF) as usize] += 1;
-        counting2[((lane3 >> 8) & 0xFF) as usize] += 1;
-        counting3[((lane3 >> 16) & 0xFF) as usize] += 1;
-        counting4[(lane3 >> 24) as usize] += 1;
+            counting1[(lane3 & 0xFF) as usize] += 1;
+            counting2[((lane3 >> 8) & 0xFF) as usize] += 1;
+            counting3[((lane3 >> 16) & 0xFF) as usize] += 1;
+            counting4[(lane3 >> 24) as usize] += 1;
+        }
     }
 
     while index < data.len() {
