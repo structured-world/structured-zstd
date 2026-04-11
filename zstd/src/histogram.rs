@@ -4,6 +4,7 @@
 //! a scalar path for small inputs and a striped counting path for larger inputs.
 
 const PARALLEL_COUNT_THRESHOLD: usize = 1500;
+type CountBytesFn = fn(&[u8], &mut [usize; 256]) -> (usize, usize);
 
 #[inline]
 fn count_bytes_scalar(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
@@ -27,6 +28,12 @@ fn count_bytes_scalar(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) 
 
 #[inline]
 fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
+    if data.len() > u32::MAX as usize {
+        // The striped counters are u32-based; preserve correctness for
+        // oversized inputs by using the scalar usize accumulator.
+        return count_bytes_scalar(data, counts);
+    }
+
     let mut counting1 = [0u32; 256];
     let mut counting2 = [0u32; 256];
     let mut counting3 = [0u32; 256];
@@ -34,10 +41,13 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
     let mut index = 0usize;
 
     while index + 16 <= data.len() {
-        let lane0 = u32::from_le_bytes(data[index..index + 4].try_into().unwrap());
-        let lane1 = u32::from_le_bytes(data[index + 4..index + 8].try_into().unwrap());
-        let lane2 = u32::from_le_bytes(data[index + 8..index + 12].try_into().unwrap());
-        let lane3 = u32::from_le_bytes(data[index + 12..index + 16].try_into().unwrap());
+        // SAFETY: loop condition guarantees we can read 16 bytes starting at
+        // `index`; read_unaligned matches donor-style lane loads.
+        let ptr = unsafe { data.as_ptr().add(index) };
+        let lane0 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) });
+        let lane1 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(4).cast::<u32>()) });
+        let lane2 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(8).cast::<u32>()) });
+        let lane3 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.add(12).cast::<u32>()) });
         index += 16;
 
         counting1[(lane0 & 0xFF) as usize] += 1;
@@ -69,8 +79,12 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
     let mut max_symbol = 0usize;
     let mut largest_count = 0usize;
     for symbol in 0..256 {
-        let value = (counting1[symbol] + counting2[symbol] + counting3[symbol] + counting4[symbol])
-            as usize;
+        let value = merge_lane_counts(
+            counting1[symbol],
+            counting2[symbol],
+            counting3[symbol],
+            counting4[symbol],
+        );
         counts[symbol] = value;
         if value > 0 {
             max_symbol = symbol;
@@ -81,6 +95,11 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
     (max_symbol, largest_count)
 }
 
+#[inline(always)]
+fn merge_lane_counts(c1: u32, c2: u32, c3: u32, c4: u32) -> usize {
+    (c1 as usize) + (c2 as usize) + (c3 as usize) + (c4 as usize)
+}
+
 /// Counts byte frequencies in `data` and writes them into `counts`.
 ///
 /// Returns `(max_symbol, largest_count)` where:
@@ -88,20 +107,42 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
 /// - `largest_count` is the highest observed frequency
 ///
 /// Uses a scalar path for small buffers and a striped-count path for larger
-/// buffers. On AArch64 + `std`, dispatches through an SVE2-gated variant when
+/// buffers. On AArch64 + `std`, dispatches through a cached SVE2-gated variant when
 /// the runtime reports `sve2` support.
 pub(crate) fn count_bytes(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
     if data.len() < PARALLEL_COUNT_THRESHOLD {
         return count_bytes_scalar(data, counts);
     }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
-    if std::arch::is_aarch64_feature_detected!("sve2") {
-        // SAFETY: runtime detection guarantees SVE2 support for this call site.
-        return unsafe { count_bytes_sve2(data, counts) };
-    }
+    count_bytes_dispatch()(data, counts)
+}
 
-    count_bytes_parallel(data, counts)
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[inline]
+fn count_bytes_dispatch() -> CountBytesFn {
+    static DISPATCH: std::sync::OnceLock<CountBytesFn> = std::sync::OnceLock::new();
+
+    *DISPATCH.get_or_init(|| {
+        if std::arch::is_aarch64_feature_detected!("sve2") {
+            count_bytes_sve2_wrapper
+        } else {
+            count_bytes_parallel
+        }
+    })
+}
+
+#[cfg(not(all(feature = "std", target_arch = "aarch64")))]
+#[inline]
+fn count_bytes_dispatch() -> CountBytesFn {
+    count_bytes_parallel
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[inline]
+fn count_bytes_sve2_wrapper(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
+    // SAFETY: dispatch cache selects this only when runtime detection reports
+    // SVE2 support for the current process.
+    unsafe { count_bytes_sve2(data, counts) }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
@@ -114,7 +155,7 @@ unsafe fn count_bytes_sve2(data: &[u8], counts: &mut [usize; 256]) -> (usize, us
 
 #[cfg(test)]
 mod tests {
-    use super::{PARALLEL_COUNT_THRESHOLD, count_bytes, count_bytes_scalar};
+    use super::{PARALLEL_COUNT_THRESHOLD, count_bytes, count_bytes_scalar, merge_lane_counts};
 
     fn make_data(len: usize, seed: u64) -> alloc::vec::Vec<u8> {
         let mut state = seed;
@@ -159,5 +200,11 @@ mod tests {
 
         assert_eq!(fast, scalar);
         assert_eq!(fast_meta, scalar_meta);
+    }
+
+    #[test]
+    fn merge_lane_counts_widens_before_sum() {
+        let sum = merge_lane_counts(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(sum, 4 * (u32::MAX as usize));
     }
 }
