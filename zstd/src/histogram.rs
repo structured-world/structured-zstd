@@ -26,7 +26,7 @@ fn count_bytes_scalar(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) 
     (max_symbol, largest_count)
 }
 
-#[inline]
+#[inline(always)]
 fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
     if data.len() > u32::MAX as usize {
         // The striped counters are u32-based; preserve correctness for
@@ -40,7 +40,7 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
     let mut counting4 = [0u32; 256];
     let mut index = 0usize;
 
-    while index + 16 <= data.len() {
+    while index <= data.len().saturating_sub(16) {
         // SAFETY: loop condition guarantees we can read 16 bytes starting at
         // `index`; read_unaligned matches donor-style lane loads.
         let ptr = unsafe { data.as_ptr().add(index) };
@@ -97,7 +97,16 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
 
 #[inline(always)]
 fn merge_lane_counts(c1: u32, c2: u32, c3: u32, c4: u32) -> usize {
-    (c1 as usize) + (c2 as usize) + (c3 as usize) + (c4 as usize)
+    #[cfg(target_pointer_width = "64")]
+    {
+        (c1 as usize) + (c2 as usize) + (c3 as usize) + (c4 as usize)
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    {
+        let sum = (c1 as u64) + (c2 as u64) + (c3 as u64) + (c4 as u64);
+        sum as usize
+    }
 }
 
 /// Counts byte frequencies in `data` and writes them into `counts`.
