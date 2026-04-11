@@ -1,4 +1,4 @@
-use crate::bit_io::BitWriter;
+use crate::{bit_io::BitWriter, histogram};
 use alloc::vec::Vec;
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
@@ -294,6 +294,7 @@ impl State {
     }
 }
 
+#[cfg(any(test, feature = "fuzz_exports"))]
 pub fn build_table_from_data(
     data: impl Iterator<Item = u8>,
     max_log: u8,
@@ -309,6 +310,12 @@ pub fn build_table_from_data(
             max_symbol = idx;
         }
     }
+    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
+}
+
+pub fn build_table_from_bytes(data: &[u8], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+    let mut counts = [0; 256];
+    let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
