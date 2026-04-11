@@ -67,3 +67,7 @@ required-features = ["bench_internals"]
 name = "dict_builder_fastcover"
 harness = false
 required-features = ["dict_builder"]
+
+[[bench]]
+name = "decode_dict_handle"
+harness = false

@@ -1,4 +1,6 @@
-//! Structures and utilities used for decoding zstd formatted data
+//! Structures and utilities used for decoding zstd formatted data.
+//!
+//! Use [`DictionaryHandle`] for pre-parsed dictionary reuse across repeated decode paths.
 
 pub mod errors;
 mod frame_decoder;

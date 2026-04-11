@@ -171,6 +171,15 @@ impl FrameDecoder {
         self.reset(source)
     }
 
+    /// Initialize the decoder for a new frame using a pre-parsed dictionary handle.
+    pub fn init_with_dict_handle(
+        &mut self,
+        source: impl Read,
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
+        self.reset_with_dict_handle(source, dict)
+    }
+
     /// reset() will allocate all needed buffers if it is the first time this decoder is used
     /// else they just reset these buffers with not further allocations
     ///
@@ -200,9 +209,42 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// Reset this decoder for a new frame using a pre-parsed dictionary handle.
+    pub fn reset_with_dict_handle(
+        &mut self,
+        source: impl Read,
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        let state = match &mut self.state {
+            Some(s) => {
+                s.reset(source)?;
+                s
+            }
+            None => {
+                self.state = Some(FrameDecoderState::new(source)?);
+                self.state.as_mut().unwrap()
+            }
+        };
+        if let Some(dict_id) = state.frame_header.dictionary_id()
+            && dict_id != dict.id()
+        {
+            return Err(err::DictNotProvided { dict_id });
+        }
+        state.decoder_scratch.init_from_dict(dict.as_ref());
+        state.using_dict = Some(dict.id());
+        Ok(())
+    }
+
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
         self.add_dict_handle(dict.into_handle())
+    }
+
+    /// Parse and add a serialized dictionary blob.
+    pub fn add_dict_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), FrameDecoderError> {
+        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
+        self.add_dict_handle(dict)
     }
 
     /// Add a pre-parsed dictionary handle for reuse across decoders.
@@ -565,6 +607,65 @@ impl FrameDecoder {
         }
 
         Ok(total_bytes_written)
+    }
+
+    /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
+    ///
+    /// `input` must contain an exact number of frames.
+    ///
+    /// `output` must be large enough to hold the decompressed data. If you don't know
+    /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
+    ///
+    /// This calls [`FrameDecoder::init_with_dict_handle`], and all bytes currently in the
+    /// decoder will be lost.
+    pub fn decode_all_with_dict_handle(
+        &mut self,
+        mut input: &[u8],
+        mut output: &mut [u8],
+        dict: &DictionaryHandle,
+    ) -> Result<usize, FrameDecoderError> {
+        let mut total_bytes_written = 0;
+        while !input.is_empty() {
+            match self.init_with_dict_handle(&mut input, dict) {
+                Ok(_) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
+                )) => {
+                    input = input
+                        .get(length as usize..)
+                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            loop {
+                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                let bytes_written = self
+                    .read(output)
+                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                output = &mut output[bytes_written..];
+                total_bytes_written += bytes_written;
+                if self.can_collect() != 0 {
+                    return Err(FrameDecoderError::TargetTooSmall);
+                }
+                if self.is_finished() {
+                    break;
+                }
+            }
+        }
+
+        Ok(total_bytes_written)
+    }
+
+    /// Decode multiple frames into the output slice using a serialized dictionary.
+    pub fn decode_all_with_dict_bytes(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        raw_dictionary: &[u8],
+    ) -> Result<usize, FrameDecoderError> {
+        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
+        self.decode_all_with_dict_handle(input, output, &dict)
     }
 
     /// Decode multiple frames into the extra capacity of the output vector.
