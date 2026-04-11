@@ -23,6 +23,8 @@ use core::arch::x86_64::{
 };
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::BETTER_WINDOW_LOG;
 use super::CompressionLevel;
@@ -76,38 +78,98 @@ const HC_EMPTY: u32 = 0;
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 32;
 
-#[inline(always)]
-fn hash_mix_u64(value: u64) -> u64 {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum HashMixKernel {
+    Scalar = 0,
     #[cfg(target_arch = "x86_64")]
-    {
-        if sse42_crc_hash_available() {
-            // SAFETY: guarded by runtime/static `sse4.2` feature detection.
-            return unsafe { hash_mix_u64_sse42(value) };
-        }
-    }
-
+    X86Sse42 = 1,
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    {
-        if crc_hash_available() {
-            // SAFETY: guarded by runtime/static `crc` feature detection.
-            return unsafe { hash_mix_u64_crc(value) };
-        }
-    }
-
-    value.wrapping_mul(HASH_MIX_PRIME)
+    Aarch64Crc = 2,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "std")]
+const HASH_MIX_KERNEL_UNINIT: u8 = u8::MAX;
+
+#[cfg(feature = "std")]
+static HASH_MIX_KERNEL: AtomicU8 = AtomicU8::new(HASH_MIX_KERNEL_UNINIT);
+
 #[inline(always)]
-fn sse42_crc_hash_available() -> bool {
+fn hash_mix_u64(value: u64) -> u64 {
+    match selected_hash_mix_kernel() {
+        HashMixKernel::Scalar => value.wrapping_mul(HASH_MIX_PRIME),
+        #[cfg(target_arch = "x86_64")]
+        HashMixKernel::X86Sse42 => {
+            // SAFETY: runtime/static detection selected this kernel.
+            unsafe { hash_mix_u64_sse42(value) }
+        }
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        HashMixKernel::Aarch64Crc => {
+            // SAFETY: runtime/static detection selected this kernel.
+            unsafe { hash_mix_u64_crc(value) }
+        }
+    }
+}
+
+#[inline(always)]
+fn selected_hash_mix_kernel() -> HashMixKernel {
     #[cfg(feature = "std")]
     {
-        is_x86_feature_detected!("sse4.2")
+        let cached = HASH_MIX_KERNEL.load(Ordering::Relaxed);
+        if cached != HASH_MIX_KERNEL_UNINIT {
+            return hash_mix_kernel_from_u8(cached);
+        }
+
+        let detected = detect_hash_mix_kernel();
+        HASH_MIX_KERNEL.store(detected as u8, Ordering::Relaxed);
+        detected
     }
 
     #[cfg(not(feature = "std"))]
     {
-        cfg!(target_feature = "sse4.2")
+        detect_hash_mix_kernel()
+    }
+}
+
+#[inline(always)]
+fn detect_hash_mix_kernel() -> HashMixKernel {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if is_x86_feature_detected!("sse4.2") {
+        return HashMixKernel::X86Sse42;
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+    if is_aarch64_feature_detected!("crc") {
+        return HashMixKernel::Aarch64Crc;
+    }
+
+    #[cfg(all(not(feature = "std"), target_arch = "x86_64"))]
+    if cfg!(target_feature = "sse4.2") {
+        return HashMixKernel::X86Sse42;
+    }
+
+    #[cfg(all(
+        not(feature = "std"),
+        target_arch = "aarch64",
+        target_endian = "little"
+    ))]
+    if cfg!(target_feature = "crc") {
+        return HashMixKernel::Aarch64Crc;
+    }
+
+    HashMixKernel::Scalar
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn hash_mix_kernel_from_u8(raw: u8) -> HashMixKernel {
+    match raw {
+        x if x == HashMixKernel::Scalar as u8 => HashMixKernel::Scalar,
+        #[cfg(target_arch = "x86_64")]
+        x if x == HashMixKernel::X86Sse42 as u8 => HashMixKernel::X86Sse42,
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        x if x == HashMixKernel::Aarch64Crc as u8 => HashMixKernel::Aarch64Crc,
+        _ => HashMixKernel::Scalar,
     }
 }
 
@@ -119,20 +181,6 @@ unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[inline(always)]
-fn crc_hash_available() -> bool {
-    #[cfg(feature = "std")]
-    {
-        is_aarch64_feature_detected!("crc")
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        cfg!(target_feature = "crc")
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "crc")]
 unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
     // Feed the full 64-bit lane through ARM CRC32 and then mix back with a
@@ -140,6 +188,14 @@ unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
     // hash table indexing.
     let crc = __crc32d(0, value) as u64;
     ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(HASH_MIX_PRIME)
+}
+
+#[cfg(all(test, feature = "std"))]
+fn with_forced_hash_mix_kernel<T>(kernel: HashMixKernel, f: impl FnOnce() -> T) -> T {
+    let prev = HASH_MIX_KERNEL.swap(kernel as u8, Ordering::Relaxed);
+    let out = f();
+    HASH_MIX_KERNEL.store(prev, Ordering::Relaxed);
+    out
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4306,6 +4362,15 @@ fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported(
     assert_eq!(hash_mix_u64(v), accelerated);
 }
 
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[test]
+fn hash_mix_scalar_path_can_be_forced_for_coverage_and_matches_formula() {
+    let v = 0x0123_4567_89AB_CDEFu64;
+    let expected = v.wrapping_mul(HASH_MIX_PRIME);
+    let mixed = with_forced_hash_mix_kernel(HashMixKernel::Scalar, || hash_mix_u64(v));
+    assert_eq!(mixed, expected);
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 #[test]
 fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() {
@@ -4316,6 +4381,15 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
     let v = 0x0123_4567_89AB_CDEFu64;
     let accelerated = unsafe { hash_mix_u64_crc(v) };
     assert_eq!(hash_mix_u64(v), accelerated);
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+#[test]
+fn hash_mix_scalar_path_can_be_forced_on_aarch64_and_matches_formula() {
+    let v = 0x0123_4567_89AB_CDEFu64;
+    let expected = v.wrapping_mul(HASH_MIX_PRIME);
+    let mixed = with_forced_hash_mix_kernel(HashMixKernel::Scalar, || hash_mix_u64(v));
+    assert_eq!(mixed, expected);
 }
 
 #[test]
