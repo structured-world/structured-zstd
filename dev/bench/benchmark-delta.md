@@ -138,221 +138,221 @@ Interpretation: higher speed is better; delta uses `rust_bytes_per_sec / ffi_byt
 
 | Key | Rust bytes/sec | Rust ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 7879555.24 | 129.707 |
-| decodecorpus-z000033 + stage=compress, level=better | 10324717.51 | 98.989 |
-| decodecorpus-z000033 + stage=compress, level=default | 7747865.44 | 131.912 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 40480091.71 | 25.248 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 11521146.55 | 88.709 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 118791110.54 | 8.604 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 262966005.73 | 3.887 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 117399234.24 | 8.706 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 259767244.32 | 3.934 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 114077037.31 | 8.959 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 335169817.38 | 3.049 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 115532129.89 | 8.846 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 265600437.84 | 3.848 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 113641076.62 | 8.994 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 330571228.22 | 3.092 |
-| high-entropy-1m + stage=compress, level=best | 183770450.98 | 5.706 |
-| high-entropy-1m + stage=compress, level=better | 150225852.53 | 6.980 |
-| high-entropy-1m + stage=compress, level=default | 101288027.59 | 10.352 |
-| high-entropy-1m + stage=compress, level=fastest | 247587349.38 | 4.235 |
-| high-entropy-1m + stage=compress, level=level4-row | 213018607.36 | 4.922 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1964626176.63 | 0.534 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1960383859.65 | 0.535 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1979831164.83 | 0.530 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1983662690.17 | 0.529 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 1953921722.08 | 0.537 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1968402715.20 | 0.533 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1946995790.63 | 0.539 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1951180299.44 | 0.537 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1984083073.79 | 0.528 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1965115865.03 | 0.534 |
-| large-log-stream + stage=compress, level=best | 134268587.87 | 124.953 |
-| large-log-stream + stage=compress, level=better | 146279113.82 | 114.693 |
-| large-log-stream + stage=compress, level=default | 77745543.76 | 215.796 |
-| large-log-stream + stage=compress, level=fastest | 457937231.28 | 36.636 |
-| large-log-stream + stage=compress, level=level4-row | 76102775.21 | 220.455 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 1731603561.71 | 9.689 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1805889554.65 | 9.290 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 1804922424.94 | 9.295 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1817279585.79 | 9.232 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 1819534282.44 | 9.221 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1846811404.53 | 9.084 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1823445333.70 | 9.201 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1843439228.55 | 9.101 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1792250914.03 | 9.361 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1830253259.41 | 9.167 |
-| low-entropy-1m + stage=compress, level=best | 113717081.78 | 9.221 |
-| low-entropy-1m + stage=compress, level=better | 118803369.13 | 8.826 |
-| low-entropy-1m + stage=compress, level=default | 74713332.86 | 14.035 |
-| low-entropy-1m + stage=compress, level=fastest | 334226345.20 | 3.137 |
-| low-entropy-1m + stage=compress, level=level4-row | 96127625.50 | 10.908 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1054729290.68 | 0.994 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1065801483.58 | 0.984 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1045082289.90 | 1.003 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1063623075.65 | 0.986 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1052110037.62 | 0.997 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1065883821.49 | 0.984 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1053725556.80 | 0.995 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1066884810.23 | 0.983 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1053627088.26 | 0.995 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1064910664.69 | 0.985 |
-| small-10k-random + stage=compress, level=best | 243317096.35 | 0.042 |
-| small-10k-random + stage=compress, level=better | 267014341.59 | 0.038 |
-| small-10k-random + stage=compress, level=default | 37342824.63 | 0.274 |
-| small-10k-random + stage=compress, level=fastest | 347342356.09 | 0.029 |
-| small-10k-random + stage=compress, level=level4-row | 291497053.72 | 0.035 |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 1359171754.71 | 0.008 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 1357910091.50 | 0.008 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 1352886775.00 | 0.008 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 1355214399.15 | 0.008 |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 1356111773.28 | 0.008 |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 1357370095.44 | 0.008 |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 1358630754.94 | 0.008 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 1357730045.08 | 0.008 |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 1354139116.64 | 0.008 |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 1355573206.25 | 0.008 |
-| small-1k-random + stage=compress, level=best | 45742875.01 | 0.022 |
-| small-1k-random + stage=compress, level=better | 49538000.10 | 0.021 |
-| small-1k-random + stage=compress, level=default | 4116500.17 | 0.249 |
-| small-1k-random + stage=compress, level=fastest | 76790401.20 | 0.013 |
-| small-1k-random + stage=compress, level=level4-row | 63924090.14 | 0.016 |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 313629402.76 | 0.003 |
-| small-1k-random + stage=decompress, level=best, source=rust\_stream | 313437404.35 | 0.003 |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 313437404.35 | 0.003 |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 313341493.27 | 0.003 |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 313533374.16 | 0.003 |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 313533374.16 | 0.003 |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 313437404.35 | 0.003 |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 313054111.89 | 0.003 |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 313629402.76 | 0.003 |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 313437404.35 | 0.003 |
-| small-4k-log-lines + stage=compress, level=best | 58240555.11 | 0.070 |
-| small-4k-log-lines + stage=compress, level=better | 59057615.78 | 0.069 |
-| small-4k-log-lines + stage=compress, level=default | 40280468.50 | 0.102 |
-| small-4k-log-lines + stage=compress, level=fastest | 111622836.90 | 0.037 |
-| small-4k-log-lines + stage=compress, level=level4-row | 44069547.25 | 0.093 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 581487791.03 | 0.007 |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 943126870.83 | 0.004 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 580498866.21 | 0.007 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 941609195.40 | 0.004 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 574474053.30 | 0.007 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 940312213.04 | 0.004 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 574393493.20 | 0.007 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 943778801.84 | 0.004 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 577552171.46 | 0.007 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 952115295.21 | 0.004 |
+| decodecorpus-z000033 + stage=compress, level=best | 10803886.83 | 94.599 |
+| decodecorpus-z000033 + stage=compress, level=better | 11551362.31 | 88.477 |
+| decodecorpus-z000033 + stage=compress, level=default | 9726167.51 | 105.081 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 41648569.99 | 24.539 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 13665140.28 | 74.791 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 119179971.92 | 8.576 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 263087579.68 | 3.885 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 117739890.84 | 8.680 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 260882738.76 | 3.918 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 114376460.92 | 8.936 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 336817173.53 | 3.034 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 115871991.91 | 8.820 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 267409824.23 | 3.822 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 114224714.57 | 8.948 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 333335072.79 | 3.066 |
+| high-entropy-1m + stage=compress, level=best | 200389781.00 | 5.233 |
+| high-entropy-1m + stage=compress, level=better | 210530923.11 | 4.981 |
+| high-entropy-1m + stage=compress, level=default | 116829517.92 | 8.975 |
+| high-entropy-1m + stage=compress, level=fastest | 263420469.74 | 3.981 |
+| high-entropy-1m + stage=compress, level=level4-row | 196263863.58 | 5.343 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1960772434.12 | 0.535 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1978643147.33 | 0.530 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1962166703.78 | 0.534 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1975586274.20 | 0.531 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 1982061610.52 | 0.529 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1979733977.78 | 0.530 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1977516223.51 | 0.530 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1981069265.33 | 0.529 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1967062301.74 | 0.533 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1981522250.59 | 0.529 |
+| large-log-stream + stage=compress, level=best | 145558064.84 | 115.261 |
+| large-log-stream + stage=compress, level=better | 147002549.10 | 114.129 |
+| large-log-stream + stage=compress, level=default | 106584371.40 | 157.408 |
+| large-log-stream + stage=compress, level=fastest | 470732564.86 | 35.641 |
+| large-log-stream + stage=compress, level=level4-row | 76781596.01 | 218.506 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 1773503936.50 | 9.460 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1830334327.09 | 9.166 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 1845189728.09 | 9.092 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1850884219.67 | 9.064 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 1846833563.88 | 9.084 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1843358616.15 | 9.101 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1805353600.27 | 9.293 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1857337462.37 | 9.033 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1821296003.09 | 9.212 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1843266872.43 | 9.102 |
+| low-entropy-1m + stage=compress, level=best | 119553934.81 | 8.771 |
+| low-entropy-1m + stage=compress, level=better | 123455694.16 | 8.494 |
+| low-entropy-1m + stage=compress, level=default | 77869010.72 | 13.466 |
+| low-entropy-1m + stage=compress, level=fastest | 344509278.24 | 3.044 |
+| low-entropy-1m + stage=compress, level=level4-row | 101004646.45 | 10.381 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1057160140.34 | 0.992 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1074984058.38 | 0.975 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1060359778.22 | 0.989 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1075268464.36 | 0.975 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1060174306.92 | 0.989 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1073543398.83 | 0.977 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1052395141.97 | 0.996 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1072378513.49 | 0.978 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1059482310.91 | 0.990 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1074551124.33 | 0.976 |
+| small-10k-random + stage=compress, level=best | 252590034.53 | 0.041 |
+| small-10k-random + stage=compress, level=better | 268343815.51 | 0.038 |
+| small-10k-random + stage=compress, level=default | 244199079.48 | 0.042 |
+| small-10k-random + stage=compress, level=fastest | 345805754.42 | 0.030 |
+| small-10k-random + stage=compress, level=level4-row | 290232979.99 | 0.035 |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 1359352183.72 | 0.008 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 1357730045.08 | 0.008 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 1358090185.68 | 0.008 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 1357370095.44 | 0.008 |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 1356471055.77 | 0.008 |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 1355752681.05 | 0.008 |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 1357730045.08 | 0.008 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 1356471055.77 | 0.008 |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 1357370095.44 | 0.008 |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 1357910091.50 | 0.008 |
+| small-1k-random + stage=compress, level=best | 45777638.70 | 0.022 |
+| small-1k-random + stage=compress, level=better | 51439192.24 | 0.020 |
+| small-1k-random + stage=compress, level=default | 40693053.57 | 0.025 |
+| small-1k-random + stage=compress, level=fastest | 77329708.50 | 0.013 |
+| small-1k-random + stage=compress, level=level4-row | 64888156.64 | 0.016 |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 313054111.89 | 0.003 |
+| small-1k-random + stage=decompress, level=best, source=rust\_stream | 312480927.68 | 0.003 |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 313054111.89 | 0.003 |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 312480927.68 | 0.003 |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 312958435.21 | 0.003 |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 312290332.42 | 0.003 |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 312958435.21 | 0.003 |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 312862816.99 | 0.003 |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 313054111.89 | 0.003 |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 312480927.68 | 0.003 |
+| small-4k-log-lines + stage=compress, level=best | 58681107.72 | 0.070 |
+| small-4k-log-lines + stage=compress, level=better | 59539210.70 | 0.069 |
+| small-4k-log-lines + stage=compress, level=default | 41149286.72 | 0.100 |
+| small-4k-log-lines + stage=compress, level=fastest | 111992125.55 | 0.037 |
+| small-4k-log-lines + stage=compress, level=level4-row | 57025115.55 | 0.072 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 578286036.99 | 0.007 |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 945085371.48 | 0.004 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 579431319.85 | 0.007 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 942909760.59 | 0.004 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 576414297.78 | 0.007 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 940960257.29 | 0.004 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 573589133.17 | 0.007 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 944213923.47 | 0.004 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 577226606.54 | 0.007 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 953445065.18 | 0.004 |
 
 ### FFI speed
 
 | Key | FFI bytes/sec | FFI ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 20253678.34 | 50.462 |
-| decodecorpus-z000033 + stage=compress, level=better | 37091232.42 | 27.555 |
-| decodecorpus-z000033 + stage=compress, level=default | 103464515.16 | 9.878 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 178147303.60 | 5.737 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 81667092.70 | 12.515 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 449400233.93 | 2.274 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 697711965.42 | 1.465 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 441732048.98 | 2.314 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 690868077.78 | 1.479 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 430957456.00 | 2.372 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 791608769.67 | 1.291 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 456575648.02 | 2.238 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 698408544.07 | 1.463 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 429366936.52 | 2.380 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 812724346.38 | 1.258 |
-| high-entropy-1m + stage=compress, level=best | 281702461.02 | 3.722 |
-| high-entropy-1m + stage=compress, level=better | 458950237.82 | 2.285 |
-| high-entropy-1m + stage=compress, level=default | 689742817.26 | 1.520 |
-| high-entropy-1m + stage=compress, level=fastest | 642820973.39 | 1.631 |
-| high-entropy-1m + stage=compress, level=level4-row | 476493985.52 | 2.201 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1952739130.35 | 0.537 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1941293324.18 | 0.540 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1951725062.17 | 0.537 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1949294140.83 | 0.538 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 1955116683.20 | 0.536 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1950839069.77 | 0.537 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1955080229.86 | 0.536 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1943333283.91 | 0.540 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1939207433.00 | 0.541 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1952815500.71 | 0.537 |
-| large-log-stream + stage=compress, level=best | 512200422.17 | 32.755 |
-| large-log-stream + stage=compress, level=better | 653806061.34 | 25.661 |
-| large-log-stream + stage=compress, level=default | 1255245221.94 | 13.366 |
-| large-log-stream + stage=compress, level=fastest | 1524048165.73 | 11.008 |
-| large-log-stream + stage=compress, level=level4-row | 1277453416.42 | 13.133 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 1711879414.71 | 9.800 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1789624302.14 | 9.375 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 1717704258.48 | 9.767 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1811502509.53 | 9.261 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 1719474040.60 | 9.757 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1800350879.87 | 9.319 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1716123817.50 | 9.776 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1757109567.36 | 9.548 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1716271986.48 | 9.775 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1804498442.58 | 9.297 |
-| low-entropy-1m + stage=compress, level=best | 295934629.86 | 3.543 |
-| low-entropy-1m + stage=compress, level=better | 486798435.49 | 2.154 |
-| low-entropy-1m + stage=compress, level=default | 993232113.41 | 1.056 |
-| low-entropy-1m + stage=compress, level=fastest | 1059486592.93 | 0.990 |
-| low-entropy-1m + stage=compress, level=level4-row | 636373401.82 | 1.648 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1539230279.17 | 0.681 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1639957960.06 | 0.639 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1537711154.16 | 0.682 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1643075062.01 | 0.638 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1536724091.19 | 0.682 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1644012762.32 | 0.638 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1538135214.07 | 0.682 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1516609174.21 | 0.691 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1536334572.86 | 0.683 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1636722359.58 | 0.641 |
-| small-10k-random + stage=compress, level=best | 49041440.98 | 0.209 |
-| small-10k-random + stage=compress, level=better | 386298475.93 | 0.027 |
-| small-10k-random + stage=compress, level=default | 534418871.67 | 0.019 |
-| small-10k-random + stage=compress, level=fastest | 610942067.90 | 0.017 |
-| small-10k-random + stage=compress, level=level4-row | 379807870.63 | 0.027 |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 1990668740.28 | 0.005 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 1990668740.28 | 0.005 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 1989895064.13 | 0.005 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 1989895064.13 | 0.005 |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 1990668740.28 | 0.005 |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 1989895064.13 | 0.005 |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 1988735676.83 | 0.005 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 1989121989.12 | 0.005 |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 1989895064.13 | 0.005 |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 1990668740.28 | 0.005 |
-| small-1k-random + stage=compress, level=best | 47017769.41 | 0.022 |
-| small-1k-random + stage=compress, level=better | 101698281.86 | 0.010 |
-| small-1k-random + stage=compress, level=default | 167374959.14 | 0.006 |
-| small-1k-random + stage=compress, level=fastest | 188408463.66 | 0.005 |
-| small-1k-random + stage=compress, level=level4-row | 99698179.34 | 0.010 |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 1723905723.91 | 0.001 |
+| decodecorpus-z000033 + stage=compress, level=best | 22791841.15 | 44.842 |
+| decodecorpus-z000033 + stage=compress, level=better | 39448333.56 | 25.908 |
+| decodecorpus-z000033 + stage=compress, level=default | 105473244.41 | 9.690 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 180693187.46 | 5.656 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 86837396.85 | 11.770 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 446818017.08 | 2.287 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 698145673.83 | 1.464 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 441085966.52 | 2.317 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 690939537.42 | 1.479 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 431065242.99 | 2.371 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 791529683.28 | 1.291 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 455597483.16 | 2.243 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 700063770.75 | 1.460 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 428848786.05 | 2.383 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 813722133.76 | 1.256 |
+| high-entropy-1m + stage=compress, level=best | 321749947.38 | 3.259 |
+| high-entropy-1m + stage=compress, level=better | 464599095.77 | 2.257 |
+| high-entropy-1m + stage=compress, level=default | 693738479.88 | 1.511 |
+| high-entropy-1m + stage=compress, level=fastest | 639868386.45 | 1.639 |
+| high-entropy-1m + stage=compress, level=level4-row | 499595254.74 | 2.099 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1955919000.79 | 0.536 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1952859143.60 | 0.537 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1953950850.10 | 0.537 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1941020215.88 | 0.540 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 1954482588.94 | 0.536 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1954934430.08 | 0.536 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1953081025.10 | 0.537 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1954715771.19 | 0.536 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1944392729.59 | 0.539 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1955824147.13 | 0.536 |
+| large-log-stream + stage=compress, level=best | 523940856.44 | 32.021 |
+| large-log-stream + stage=compress, level=better | 661433275.17 | 25.365 |
+| large-log-stream + stage=compress, level=default | 1280928407.28 | 13.098 |
+| large-log-stream + stage=compress, level=fastest | 1557105267.48 | 10.775 |
+| large-log-stream + stage=compress, level=level4-row | 1304360529.10 | 12.862 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 1716871418.97 | 9.772 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1809019512.62 | 9.274 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 1720843176.66 | 9.749 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1821856106.17 | 9.209 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 1726353140.61 | 9.718 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1822800279.31 | 9.204 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1725393178.28 | 9.724 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1752585571.03 | 9.573 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1718785622.95 | 9.761 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1808497684.57 | 9.277 |
+| low-entropy-1m + stage=compress, level=best | 316296298.53 | 3.315 |
+| low-entropy-1m + stage=compress, level=better | 495402328.72 | 2.117 |
+| low-entropy-1m + stage=compress, level=default | 999121484.75 | 1.049 |
+| low-entropy-1m + stage=compress, level=fastest | 1061934068.65 | 0.987 |
+| low-entropy-1m + stage=compress, level=level4-row | 643275664.59 | 1.630 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1497969994.20 | 0.700 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1592254475.00 | 0.659 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1497963574.34 | 0.700 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1599865733.92 | 0.655 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1497204278.97 | 0.700 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1600241735.74 | 0.655 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1497991394.14 | 0.700 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1499932768.97 | 0.699 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1496029424.77 | 0.701 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1599416716.62 | 0.656 |
+| small-10k-random + stage=compress, level=best | 48797457.20 | 0.210 |
+| small-10k-random + stage=compress, level=better | 385382559.93 | 0.027 |
+| small-10k-random + stage=compress, level=default | 535452834.14 | 0.019 |
+| small-10k-random + stage=compress, level=fastest | 609886837.40 | 0.017 |
+| small-10k-random + stage=compress, level=level4-row | 382789428.43 | 0.027 |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 1986806363.99 | 0.005 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 1986035686.58 | 0.005 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 1986806363.99 | 0.005 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 1986806363.99 | 0.005 |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 1986806363.99 | 0.005 |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 1986420950.53 | 0.005 |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 1989121989.12 | 0.005 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 1988349514.56 | 0.005 |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 1986035686.58 | 0.005 |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 1987577639.75 | 0.005 |
+| small-1k-random + stage=compress, level=best | 47501971.52 | 0.022 |
+| small-1k-random + stage=compress, level=better | 100234925.61 | 0.010 |
+| small-1k-random + stage=compress, level=default | 166395840.10 | 0.006 |
+| small-1k-random + stage=compress, level=fastest | 186997808.62 | 0.005 |
+| small-1k-random + stage=compress, level=level4-row | 99669067.55 | 0.010 |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 1721008403.36 | 0.001 |
 | small-1k-random + stage=decompress, level=best, source=rust\_stream | 1721008403.36 | 0.001 |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 1723905723.91 | 0.001 |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 1723905723.91 | 0.001 |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 1721008403.36 | 0.001 |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 1721008403.36 | 0.001 |
 | small-1k-random + stage=decompress, level=default, source=c\_stream | 1721008403.36 | 0.001 |
 | small-1k-random + stage=decompress, level=default, source=rust\_stream | 1721008403.36 | 0.001 |
 | small-1k-random + stage=decompress, level=fastest, source=c\_stream | 1721008403.36 | 0.001 |
 | small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 1721008403.36 | 0.001 |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 1723905723.91 | 0.001 |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 1721008403.36 | 0.001 |
-| small-4k-log-lines + stage=compress, level=best | 176856649.40 | 0.023 |
-| small-4k-log-lines + stage=compress, level=better | 282755764.19 | 0.014 |
-| small-4k-log-lines + stage=compress, level=default | 394149345.65 | 0.010 |
-| small-4k-log-lines + stage=compress, level=fastest | 407278512.48 | 0.010 |
-| small-4k-log-lines + stage=compress, level=level4-row | 353652218.96 | 0.012 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 891986062.72 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1538114908.00 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 891597736.18 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1587596899.22 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 903595852.64 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1583913379.74 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 903396559.33 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1540428732.61 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 904393905.94 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1595015576.32 | 0.003 |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 1721008403.36 | 0.001 |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 1718120805.37 | 0.001 |
+| small-4k-log-lines + stage=compress, level=best | 184222362.15 | 0.022 |
+| small-4k-log-lines + stage=compress, level=better | 282229725.07 | 0.015 |
+| small-4k-log-lines + stage=compress, level=default | 391849229.89 | 0.010 |
+| small-4k-log-lines + stage=compress, level=fastest | 404823087.57 | 0.010 |
+| small-4k-log-lines + stage=compress, level=level4-row | 353286182.51 | 0.012 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 887156162.01 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1539849624.06 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 887732986.56 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1588212485.46 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 895496283.34 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1585139318.89 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 901606867.71 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1545660377.36 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 902600264.43 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1596258768.51 | 0.003 |
 
 ### Rust/FFI speed delta
 
@@ -360,111 +360,111 @@ Reference band: `0.99–1.05` (near parity).
 
 | Key | Delta | Status |
 | --- | ---: | --- |
-| decodecorpus-z000033 + stage=compress, level=best | 0.3890 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=better | 0.2784 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=default | 0.0749 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=fastest | 0.2272 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 0.1411 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.2643 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.3769 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.2658 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.3760 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.2647 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.4234 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.2530 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.3803 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.2647 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.4067 | rust_slower |
-| high-entropy-1m + stage=compress, level=best | 0.6524 | rust_slower |
-| high-entropy-1m + stage=compress, level=better | 0.3273 | rust_slower |
-| high-entropy-1m + stage=compress, level=default | 0.1468 | rust_slower |
-| high-entropy-1m + stage=compress, level=fastest | 0.3852 | rust_slower |
-| high-entropy-1m + stage=compress, level=level4-row | 0.4471 | rust_slower |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1.0061 | near_parity |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1.0098 | near_parity |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1.0144 | near_parity |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1.0176 | near_parity |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.9994 | near_parity |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1.0090 | near_parity |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.9959 | near_parity |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1.0040 | near_parity |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1.0231 | near_parity |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1.0063 | near_parity |
-| large-log-stream + stage=compress, level=best | 0.2621 | rust_slower |
-| large-log-stream + stage=compress, level=better | 0.2237 | rust_slower |
-| large-log-stream + stage=compress, level=default | 0.0619 | rust_slower |
-| large-log-stream + stage=compress, level=fastest | 0.3005 | rust_slower |
-| large-log-stream + stage=compress, level=level4-row | 0.0596 | rust_slower |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 1.0115 | near_parity |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1.0091 | near_parity |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 1.0508 | rust_faster |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1.0032 | near_parity |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 1.0582 | rust_faster |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1.0258 | near_parity |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1.0625 | rust_faster |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1.0491 | near_parity |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1.0443 | near_parity |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1.0143 | near_parity |
-| low-entropy-1m + stage=compress, level=best | 0.3843 | rust_slower |
-| low-entropy-1m + stage=compress, level=better | 0.2441 | rust_slower |
-| low-entropy-1m + stage=compress, level=default | 0.0752 | rust_slower |
-| low-entropy-1m + stage=compress, level=fastest | 0.3155 | rust_slower |
-| low-entropy-1m + stage=compress, level=level4-row | 0.1511 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.6852 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6499 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.6796 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6473 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.6846 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6483 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.6851 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.7035 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.6858 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6506 | rust_slower |
-| small-10k-random + stage=compress, level=best | 4.9615 | rust_faster |
-| small-10k-random + stage=compress, level=better | 0.6912 | rust_slower |
-| small-10k-random + stage=compress, level=default | 0.0699 | rust_slower |
-| small-10k-random + stage=compress, level=fastest | 0.5685 | rust_slower |
-| small-10k-random + stage=compress, level=level4-row | 0.7675 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.6828 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.6821 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.6799 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.6810 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.6812 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.6821 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.6832 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.6826 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.6805 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.6810 | rust_slower |
-| small-1k-random + stage=compress, level=best | 0.9729 | rust_slower |
-| small-1k-random + stage=compress, level=better | 0.4871 | rust_slower |
-| small-1k-random + stage=compress, level=default | 0.0246 | rust_slower |
-| small-1k-random + stage=compress, level=fastest | 0.4076 | rust_slower |
-| small-1k-random + stage=compress, level=level4-row | 0.6412 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=best | 0.4740 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=better | 0.2928 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=default | 0.0922 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=fastest | 0.2305 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 0.1574 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.2667 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.3768 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.2669 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.3776 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.2653 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.4255 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.2543 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.3820 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.2664 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.4096 | rust_slower |
+| high-entropy-1m + stage=compress, level=best | 0.6228 | rust_slower |
+| high-entropy-1m + stage=compress, level=better | 0.4531 | rust_slower |
+| high-entropy-1m + stage=compress, level=default | 0.1684 | rust_slower |
+| high-entropy-1m + stage=compress, level=fastest | 0.4117 | rust_slower |
+| high-entropy-1m + stage=compress, level=level4-row | 0.3928 | rust_slower |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 1.0025 | near_parity |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1.0132 | near_parity |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1.0042 | near_parity |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1.0178 | near_parity |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 1.0141 | near_parity |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1.0127 | near_parity |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1.0125 | near_parity |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1.0135 | near_parity |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1.0117 | near_parity |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1.0131 | near_parity |
+| large-log-stream + stage=compress, level=best | 0.2778 | rust_slower |
+| large-log-stream + stage=compress, level=better | 0.2222 | rust_slower |
+| large-log-stream + stage=compress, level=default | 0.0832 | rust_slower |
+| large-log-stream + stage=compress, level=fastest | 0.3023 | rust_slower |
+| large-log-stream + stage=compress, level=level4-row | 0.0589 | rust_slower |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 1.0330 | near_parity |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 1.0118 | near_parity |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 1.0723 | rust_faster |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 1.0159 | near_parity |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 1.0698 | rust_faster |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 1.0113 | near_parity |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 1.0463 | near_parity |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 1.0598 | rust_faster |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 1.0596 | rust_faster |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 1.0192 | near_parity |
+| low-entropy-1m + stage=compress, level=best | 0.3780 | rust_slower |
+| low-entropy-1m + stage=compress, level=better | 0.2492 | rust_slower |
+| low-entropy-1m + stage=compress, level=default | 0.0779 | rust_slower |
+| low-entropy-1m + stage=compress, level=fastest | 0.3244 | rust_slower |
+| low-entropy-1m + stage=compress, level=level4-row | 0.1570 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.7057 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6751 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.7079 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6721 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.7081 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6709 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.7025 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.7150 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.7082 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6718 | rust_slower |
+| small-10k-random + stage=compress, level=best | 5.1763 | rust_faster |
+| small-10k-random + stage=compress, level=better | 0.6963 | rust_slower |
+| small-10k-random + stage=compress, level=default | 0.4561 | rust_slower |
+| small-10k-random + stage=compress, level=fastest | 0.5670 | rust_slower |
+| small-10k-random + stage=compress, level=level4-row | 0.7582 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.6842 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.6836 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.6836 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.6832 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.6827 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.6825 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.6826 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.6822 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.6835 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.6832 | rust_slower |
+| small-1k-random + stage=compress, level=best | 0.9637 | rust_slower |
+| small-1k-random + stage=compress, level=better | 0.5132 | rust_slower |
+| small-1k-random + stage=compress, level=default | 0.2446 | rust_slower |
+| small-1k-random + stage=compress, level=fastest | 0.4135 | rust_slower |
+| small-1k-random + stage=compress, level=level4-row | 0.6510 | rust_slower |
 | small-1k-random + stage=decompress, level=best, source=c\_stream | 0.1819 | rust_slower |
-| small-1k-random + stage=decompress, level=best, source=rust\_stream | 0.1821 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.1818 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.1818 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.1822 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.1822 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.1821 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.1819 | rust_slower |
+| small-1k-random + stage=decompress, level=best, source=rust\_stream | 0.1816 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.1819 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.1816 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.1818 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.1815 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.1818 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.1818 | rust_slower |
 | small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 0.1819 | rust_slower |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.1821 | rust_slower |
-| small-4k-log-lines + stage=compress, level=best | 0.3293 | rust_slower |
-| small-4k-log-lines + stage=compress, level=better | 0.2089 | rust_slower |
-| small-4k-log-lines + stage=compress, level=default | 0.1022 | rust_slower |
-| small-4k-log-lines + stage=compress, level=fastest | 0.2741 | rust_slower |
-| small-4k-log-lines + stage=compress, level=level4-row | 0.1246 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.6519 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.6132 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.6511 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.5931 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.6358 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.5937 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.6358 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.6127 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.6386 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.5969 | rust_slower |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.1819 | rust_slower |
+| small-4k-log-lines + stage=compress, level=best | 0.3185 | rust_slower |
+| small-4k-log-lines + stage=compress, level=better | 0.2110 | rust_slower |
+| small-4k-log-lines + stage=compress, level=default | 0.1050 | rust_slower |
+| small-4k-log-lines + stage=compress, level=fastest | 0.2766 | rust_slower |
+| small-4k-log-lines + stage=compress, level=level4-row | 0.1614 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.6518 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.6138 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.6527 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.5937 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.6437 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.5936 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.6362 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.6109 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.6395 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.5973 | rust_slower |
 
 ## Target `x86_64-gnu`
 
@@ -604,221 +604,221 @@ Interpretation: higher speed is better; delta uses `rust_bytes_per_sec / ffi_byt
 
 | Key | Rust bytes/sec | Rust ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 11908977.51 | 85.821 |
-| decodecorpus-z000033 + stage=compress, level=better | 13022513.98 | 78.482 |
-| decodecorpus-z000033 + stage=compress, level=default | 8082201.62 | 126.455 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 48162049.28 | 21.221 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 16069298.63 | 63.602 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 147350775.68 | 6.936 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 355258497.32 | 2.877 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 144936548.47 | 7.052 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 351818187.14 | 2.905 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 140432131.42 | 7.278 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 460908454.63 | 2.217 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 140090633.62 | 7.296 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 360419341.65 | 2.836 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 140335467.17 | 7.283 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 457162193.53 | 2.236 |
-| high-entropy-1m + stage=compress, level=best | 159020197.21 | 6.594 |
-| high-entropy-1m + stage=compress, level=better | 784308093.68 | 1.337 |
-| high-entropy-1m + stage=compress, level=default | 145388435.60 | 7.212 |
-| high-entropy-1m + stage=compress, level=fastest | 860263466.84 | 1.219 |
-| high-entropy-1m + stage=compress, level=level4-row | 694117343.34 | 1.511 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 5187349424.41 | 0.202 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 5201424645.57 | 0.202 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 5264860793.81 | 0.199 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 5263935742.97 | 0.199 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 5196295213.41 | 0.202 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 5206977887.47 | 0.201 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 5052988685.21 | 0.208 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 5141262938.03 | 0.204 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 5258260411.70 | 0.199 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 5257074100.07 | 0.199 |
-| large-log-stream + stage=compress, level=best | 206142082.59 | 81.387 |
-| large-log-stream + stage=compress, level=better | 207265226.57 | 80.946 |
-| large-log-stream + stage=compress, level=default | 179287812.62 | 93.577 |
-| large-log-stream + stage=compress, level=fastest | 637442075.95 | 26.320 |
-| large-log-stream + stage=compress, level=level4-row | 165226526.47 | 101.541 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 4811537676.18 | 3.487 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 5300196657.92 | 3.165 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 5283550127.10 | 3.175 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 5259640172.14 | 3.190 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 5244020574.47 | 3.199 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 5678124188.80 | 2.955 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 5011413760.85 | 3.348 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 5619564689.48 | 2.986 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 5098266089.17 | 3.291 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 5405171977.75 | 3.104 |
-| low-entropy-1m + stage=compress, level=best | 222035506.17 | 4.723 |
-| low-entropy-1m + stage=compress, level=better | 226348022.26 | 4.633 |
-| low-entropy-1m + stage=compress, level=default | 111799165.46 | 9.379 |
-| low-entropy-1m + stage=compress, level=fastest | 664932535.01 | 1.577 |
-| low-entropy-1m + stage=compress, level=level4-row | 189623045.50 | 5.530 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 2853897049.42 | 0.367 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 2935904758.70 | 0.357 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 2858284608.36 | 0.367 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 2940729730.49 | 0.357 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 2858728782.60 | 0.367 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 2936430947.77 | 0.357 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 2841276679.92 | 0.369 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 2937006683.06 | 0.357 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 2854938263.20 | 0.367 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 2936513181.85 | 0.357 |
-| small-10k-random + stage=compress, level=best | 339533804.17 | 0.030 |
-| small-10k-random + stage=compress, level=better | 362529207.68 | 0.028 |
-| small-10k-random + stage=compress, level=default | 264455979.96 | 0.039 |
-| small-10k-random + stage=compress, level=fastest | 468478360.33 | 0.022 |
-| small-10k-random + stage=compress, level=level4-row | 390601159.60 | 0.026 |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 3288375080.28 | 0.003 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 3280999679.59 | 0.003 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 3290488431.88 | 0.003 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 3284156510.58 | 0.003 |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 3289431416.64 | 0.003 |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 3282051282.05 | 0.003 |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 3280999679.59 | 0.003 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 3275751759.44 | 0.003 |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 3302160593.36 | 0.003 |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 3277848911.65 | 0.003 |
-| small-1k-random + stage=compress, level=best | 53590119.32 | 0.019 |
-| small-1k-random + stage=compress, level=better | 57557191.84 | 0.018 |
-| small-1k-random + stage=compress, level=default | 36464639.27 | 0.028 |
-| small-1k-random + stage=compress, level=fastest | 87082234.88 | 0.012 |
-| small-1k-random + stage=compress, level=level4-row | 71150639.24 | 0.014 |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 573027420.26 | 0.002 |
-| small-1k-random + stage=decompress, level=best, source=rust\_stream | 573348264.28 | 0.002 |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 573348264.28 | 0.002 |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 573027420.26 | 0.002 |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 573027420.26 | 0.002 |
+| decodecorpus-z000033 + stage=compress, level=best | 9084241.35 | 112.506 |
+| decodecorpus-z000033 + stage=compress, level=better | 12518567.60 | 81.642 |
+| decodecorpus-z000033 + stage=compress, level=default | 8491684.81 | 120.357 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 47890273.74 | 21.341 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 14839654.60 | 68.872 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 147490056.31 | 6.930 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 356023913.40 | 2.871 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 145596746.72 | 7.020 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 352101079.18 | 2.903 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 139886408.46 | 7.306 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 459159147.56 | 2.226 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 140046405.57 | 7.298 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 366803417.69 | 2.786 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 140469092.98 | 7.276 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 458468114.01 | 2.229 |
+| high-entropy-1m + stage=compress, level=best | 422162296.65 | 2.484 |
+| high-entropy-1m + stage=compress, level=better | 735106668.62 | 1.426 |
+| high-entropy-1m + stage=compress, level=default | 152232464.85 | 6.888 |
+| high-entropy-1m + stage=compress, level=fastest | 874466997.41 | 1.199 |
+| high-entropy-1m + stage=compress, level=level4-row | 615235494.61 | 1.704 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 5267055786.06 | 0.199 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 5260186011.98 | 0.199 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 5296373371.05 | 0.198 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 5299317733.87 | 0.198 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 5290307607.70 | 0.198 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 5298300220.30 | 0.198 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 5268855457.41 | 0.199 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 5287559880.99 | 0.198 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 5290627916.95 | 0.198 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 5300201681.18 | 0.198 |
+| large-log-stream + stage=compress, level=best | 203365148.65 | 82.498 |
+| large-log-stream + stage=compress, level=better | 209551883.12 | 80.062 |
+| large-log-stream + stage=compress, level=default | 167429610.74 | 100.205 |
+| large-log-stream + stage=compress, level=fastest | 635061860.10 | 26.418 |
+| large-log-stream + stage=compress, level=level4-row | 163873293.16 | 102.379 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 5036837157.97 | 3.331 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 5496115226.60 | 3.053 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 5489960834.18 | 3.056 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 5505829829.81 | 3.047 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 5525624477.77 | 3.036 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 5745694722.84 | 2.920 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 5540818466.47 | 3.028 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 5697286683.90 | 2.945 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 5286431939.13 | 3.174 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 5746161112.38 | 2.920 |
+| low-entropy-1m + stage=compress, level=best | 203839684.18 | 5.144 |
+| low-entropy-1m + stage=compress, level=better | 220906965.41 | 4.747 |
+| low-entropy-1m + stage=compress, level=default | 85338430.86 | 12.287 |
+| low-entropy-1m + stage=compress, level=fastest | 665679276.94 | 1.575 |
+| low-entropy-1m + stage=compress, level=level4-row | 188784816.21 | 5.554 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 2880007031.27 | 0.364 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 2966914999.87 | 0.353 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 2882382046.69 | 0.364 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 2966117708.29 | 0.354 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 2882176057.00 | 0.364 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 2964792635.07 | 0.354 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 2856026910.35 | 0.367 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 2961217498.86 | 0.354 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 2883769282.18 | 0.364 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 2966008638.56 | 0.354 |
+| small-10k-random + stage=compress, level=best | 339657688.74 | 0.030 |
+| small-10k-random + stage=compress, level=better | 365348936.78 | 0.028 |
+| small-10k-random + stage=compress, level=default | 272536129.67 | 0.038 |
+| small-10k-random + stage=compress, level=fastest | 446245696.61 | 0.023 |
+| small-10k-random + stage=compress, level=level4-row | 385571202.65 | 0.027 |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 3269476372.92 | 0.003 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 3274704189.32 | 0.003 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 3270520600.45 | 0.003 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 3275751759.44 | 0.003 |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 3267389917.04 | 0.003 |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 3273657289.00 | 0.003 |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 3269476372.92 | 0.003 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 3274704189.32 | 0.003 |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 3233343858.54 | 0.003 |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 3241532130.42 | 0.003 |
+| small-1k-random + stage=compress, level=best | 55181333.19 | 0.019 |
+| small-1k-random + stage=compress, level=better | 59680615.46 | 0.017 |
+| small-1k-random + stage=compress, level=default | 35774175.52 | 0.029 |
+| small-1k-random + stage=compress, level=fastest | 87060023.81 | 0.012 |
+| small-1k-random + stage=compress, level=level4-row | 69778534.92 | 0.015 |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 570155902.00 | 0.002 |
+| small-1k-random + stage=decompress, level=best, source=rust\_stream | 575604272.06 | 0.002 |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 575280898.88 | 0.002 |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 574312955.69 | 0.002 |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 572706935.12 | 0.002 |
 | small-1k-random + stage=decompress, level=default, source=rust\_stream | 573669467.79 | 0.002 |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 573991031.39 | 0.002 |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 575280898.88 | 0.002 |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 572706935.12 | 0.002 |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 573027420.26 | 0.002 |
-| small-4k-log-lines + stage=compress, level=best | 77473047.10 | 0.053 |
-| small-4k-log-lines + stage=compress, level=better | 77999733.40 | 0.053 |
-| small-4k-log-lines + stage=compress, level=default | 48782811.68 | 0.084 |
-| small-4k-log-lines + stage=compress, level=fastest | 137210237.17 | 0.030 |
-| small-4k-log-lines + stage=compress, level=level4-row | 75564984.78 | 0.054 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 828981987.45 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1541008276.90 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 819691815.09 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1543912551.83 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 820184221.07 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1546827794.56 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 818381618.38 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1552691432.90 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 821994782.26 | 0.005 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1558599695.59 | 0.003 |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 573348264.28 | 0.002 |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 574957888.83 | 0.002 |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 570791527.31 | 0.002 |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 572386808.27 | 0.002 |
+| small-4k-log-lines + stage=compress, level=best | 77525835.64 | 0.053 |
+| small-4k-log-lines + stage=compress, level=better | 77680213.92 | 0.053 |
+| small-4k-log-lines + stage=compress, level=default | 51330893.78 | 0.080 |
+| small-4k-log-lines + stage=compress, level=fastest | 135818025.07 | 0.030 |
+| small-4k-log-lines + stage=compress, level=level4-row | 77266982.32 | 0.053 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 838485158.65 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1560975609.76 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 837970540.10 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1561570720.55 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 827976551.45 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1558006846.71 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 825473599.36 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1563955708.29 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 828143954.71 | 0.005 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1575990765.68 | 0.003 |
 
 ### FFI speed
 
 | Key | FFI bytes/sec | FFI ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 53450699.80 | 19.121 |
-| decodecorpus-z000033 + stage=compress, level=better | 78342396.06 | 13.046 |
-| decodecorpus-z000033 + stage=compress, level=default | 212316114.99 | 4.814 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 344848005.52 | 2.964 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 192197933.77 | 5.318 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 993982816.94 | 1.028 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 1686891060.61 | 0.606 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 973300852.99 | 1.050 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 1642725802.77 | 0.622 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 933060241.49 | 1.095 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 1906778159.00 | 0.536 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 1024491731.17 | 0.998 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 1677791366.73 | 0.609 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 924767074.35 | 1.105 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 2070552364.75 | 0.494 |
-| high-entropy-1m + stage=compress, level=best | 1216025086.46 | 0.862 |
-| high-entropy-1m + stage=compress, level=better | 1411860383.39 | 0.743 |
-| high-entropy-1m + stage=compress, level=default | 2621059946.31 | 0.400 |
-| high-entropy-1m + stage=compress, level=fastest | 2691119819.94 | 0.390 |
-| high-entropy-1m + stage=compress, level=level4-row | 2492028937.29 | 0.421 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 8387198950.58 | 0.125 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 8402118606.72 | 0.125 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 8397139493.73 | 0.125 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 8383644882.23 | 0.125 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 8405553596.05 | 0.125 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 8393442622.95 | 0.125 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 8395525913.35 | 0.125 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 8393039524.87 | 0.125 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 8400503112.41 | 0.125 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 8384851586.49 | 0.125 |
-| large-log-stream + stage=compress, level=best | 1251555920.52 | 13.405 |
-| large-log-stream + stage=compress, level=better | 1476798315.71 | 11.361 |
-| large-log-stream + stage=compress, level=default | 3424147346.86 | 4.900 |
-| large-log-stream + stage=compress, level=fastest | 3984243714.69 | 4.211 |
-| large-log-stream + stage=compress, level=level4-row | 3413734769.43 | 4.915 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 8133390344.38 | 2.063 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 8156292325.69 | 2.057 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 7643754681.32 | 2.195 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 8450039789.27 | 1.985 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 8055918697.59 | 2.083 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 8545590497.44 | 1.963 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 7710599559.53 | 2.176 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 8066046788.91 | 2.080 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 7968867810.26 | 2.105 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 8386159241.50 | 2.001 |
-| low-entropy-1m + stage=compress, level=best | 841552421.26 | 1.246 |
-| low-entropy-1m + stage=compress, level=better | 1306760515.64 | 0.802 |
-| low-entropy-1m + stage=compress, level=default | 3402655728.77 | 0.308 |
-| low-entropy-1m + stage=compress, level=fastest | 3855569119.44 | 0.272 |
-| low-entropy-1m + stage=compress, level=level4-row | 3202296568.89 | 0.327 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 4028646073.46 | 0.260 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 3954413461.76 | 0.265 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 4028135360.12 | 0.260 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 3956099346.17 | 0.265 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 4028181783.26 | 0.260 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 3954219602.61 | 0.265 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 4028088938.06 | 0.260 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 4030209970.83 | 0.260 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 4026944199.09 | 0.260 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 3955442724.74 | 0.265 |
-| small-10k-random + stage=compress, level=best | 65430473.73 | 0.157 |
-| small-10k-random + stage=compress, level=better | 513206034.18 | 0.020 |
-| small-10k-random + stage=compress, level=default | 716484746.71 | 0.014 |
-| small-10k-random + stage=compress, level=fastest | 898324414.42 | 0.011 |
-| small-10k-random + stage=compress, level=level4-row | 529801324.50 | 0.019 |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 9437788018.43 | 0.001 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 8037676609.11 | 0.001 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 9446494464.94 | 0.001 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 8075709779.18 | 0.001 |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 9437788018.43 | 0.001 |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 8088467614.53 | 0.001 |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 9385884509.62 | 0.001 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 9394495412.84 | 0.001 |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 9403122130.39 | 0.001 |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 9377289377.29 | 0.001 |
-| small-1k-random + stage=compress, level=best | 56443611.51 | 0.018 |
-| small-1k-random + stage=compress, level=better | 121557454.89 | 0.008 |
-| small-1k-random + stage=compress, level=default | 192553591.58 | 0.005 |
-| small-1k-random + stage=compress, level=fastest | 231046931.41 | 0.004 |
-| small-1k-random + stage=compress, level=level4-row | 125444076.93 | 0.008 |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 6440251572.33 | 0.000 |
-| small-1k-random + stage=decompress, level=best, source=rust\_stream | 6440251572.33 | 0.000 |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 6692810457.52 | 0.000 |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 6522292993.63 | 0.000 |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 6564102564.10 | 0.000 |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 6481012658.23 | 0.000 |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 6606451612.90 | 0.000 |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 6564102564.10 | 0.000 |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 6440251572.33 | 0.000 |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 6522292993.63 | 0.000 |
-| small-4k-log-lines + stage=compress, level=best | 242754696.85 | 0.017 |
-| small-4k-log-lines + stage=compress, level=better | 367222521.07 | 0.011 |
-| small-4k-log-lines + stage=compress, level=default | 522782386.73 | 0.008 |
-| small-4k-log-lines + stage=compress, level=fastest | 553139770.43 | 0.007 |
-| small-4k-log-lines + stage=compress, level=level4-row | 467793513.02 | 0.009 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 2033763654.42 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 6150150150.15 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 2034773969.20 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 6206060606.06 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 2017733990.15 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 6224924012.16 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 2031746031.75 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 6077151335.31 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 2025717111.77 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 6272588055.13 | 0.001 |
+| decodecorpus-z000033 + stage=compress, level=best | 47066978.02 | 21.714 |
+| decodecorpus-z000033 + stage=compress, level=better | 80863948.69 | 12.639 |
+| decodecorpus-z000033 + stage=compress, level=default | 229294074.39 | 4.457 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 350005513.60 | 2.920 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 192029724.13 | 5.322 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 993000653.88 | 1.029 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 1661059563.69 | 0.615 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 969259774.54 | 1.054 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 1621613688.36 | 0.630 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 931003354.05 | 1.098 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 1871790410.61 | 0.546 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 1011580317.42 | 1.010 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 1636502360.20 | 0.625 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 924919389.07 | 1.105 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 2068662256.91 | 0.494 |
+| high-entropy-1m + stage=compress, level=best | 1363987106.48 | 0.769 |
+| high-entropy-1m + stage=compress, level=better | 1556205597.18 | 0.674 |
+| high-entropy-1m + stage=compress, level=default | 2628286686.82 | 0.399 |
+| high-entropy-1m + stage=compress, level=fastest | 2850801211.47 | 0.368 |
+| high-entropy-1m + stage=compress, level=level4-row | 2579040572.98 | 0.407 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 8382974641.04 | 0.125 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 8397475734.38 | 0.125 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 4892685999.58 | 0.214 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 8409935596.67 | 0.125 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 8437885249.86 | 0.124 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 8405216708.22 | 0.125 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 6188954534.99 | 0.169 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 8426899832.84 | 0.124 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 4885254914.02 | 0.215 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 8387735675.49 | 0.125 |
+| large-log-stream + stage=compress, level=best | 1122980850.94 | 14.940 |
+| large-log-stream + stage=compress, level=better | 1311800390.60 | 12.789 |
+| large-log-stream + stage=compress, level=default | 2939270687.63 | 5.708 |
+| large-log-stream + stage=compress, level=fastest | 4277151352.41 | 3.923 |
+| large-log-stream + stage=compress, level=level4-row | 2916715518.46 | 5.752 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 8145141573.23 | 2.060 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 8631125360.38 | 1.944 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 8170584133.00 | 2.053 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 8647563616.27 | 1.940 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 8183269314.72 | 2.050 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 8646939645.38 | 1.940 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 8175545118.66 | 2.052 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 8201266470.03 | 2.046 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 8124807681.78 | 2.065 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 8588694521.93 | 1.953 |
+| low-entropy-1m + stage=compress, level=best | 848381678.55 | 1.236 |
+| low-entropy-1m + stage=compress, level=better | 1310344913.77 | 0.800 |
+| low-entropy-1m + stage=compress, level=default | 2952213366.07 | 0.355 |
+| low-entropy-1m + stage=compress, level=fastest | 4332636415.47 | 0.242 |
+| low-entropy-1m + stage=compress, level=level4-row | 2810781252.09 | 0.373 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 4029203363.00 | 0.260 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 3957308696.77 | 0.265 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 4031682071.95 | 0.260 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 3958578563.69 | 0.265 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 4030457828.36 | 0.260 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 3958922314.85 | 0.265 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 4031279074.24 | 0.260 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 4033062174.27 | 0.260 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 4033248327.78 | 0.260 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 3959490382.36 | 0.265 |
+| small-10k-random + stage=compress, level=best | 65227500.02 | 0.157 |
+| small-10k-random + stage=compress, level=better | 509098140.60 | 0.020 |
+| small-10k-random + stage=compress, level=default | 712397384.17 | 0.014 |
+| small-10k-random + stage=compress, level=fastest | 892374727.67 | 0.011 |
+| small-10k-random + stage=compress, level=level4-row | 521305299.60 | 0.020 |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 9499072356.22 | 0.001 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 9525581395.35 | 0.001 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 9499072356.22 | 0.001 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 9516728624.54 | 0.001 |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 9472710453.28 | 0.001 |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 9516728624.54 | 0.001 |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 9499072356.22 | 0.001 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 9499072356.22 | 0.001 |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 9472710453.28 | 0.001 |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 9516728624.54 | 0.001 |
+| small-1k-random + stage=compress, level=best | 57216293.23 | 0.018 |
+| small-1k-random + stage=compress, level=better | 108543565.83 | 0.009 |
+| small-1k-random + stage=compress, level=default | 172245584.52 | 0.006 |
+| small-1k-random + stage=compress, level=fastest | 246985045.83 | 0.004 |
+| small-1k-random + stage=compress, level=level4-row | 112010500.98 | 0.009 |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 6872483221.48 | 0.000 |
+| small-1k-random + stage=decompress, level=best, source=rust\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 6872483221.48 | 0.000 |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 6095238095.24 | 0.000 |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 6918918918.92 | 0.000 |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 6918918918.92 | 0.000 |
+| small-4k-log-lines + stage=compress, level=best | 247342995.17 | 0.017 |
+| small-4k-log-lines + stage=compress, level=better | 404743083.00 | 0.010 |
+| small-4k-log-lines + stage=compress, level=default | 537039465.06 | 0.008 |
+| small-4k-log-lines + stage=compress, level=fastest | 553588322.75 | 0.007 |
+| small-4k-log-lines + stage=compress, level=level4-row | 488782816.23 | 0.008 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 2028727092.62 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 6224924012.16 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 2029732408.33 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 6272588055.13 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 2021717670.29 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 6291858678.96 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 2019723865.88 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 6206060606.06 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 2017733990.15 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 6330757341.58 | 0.001 |
 
 ### Rust/FFI speed delta
 
@@ -826,111 +826,111 @@ Reference band: `0.99–1.05` (near parity).
 
 | Key | Delta | Status |
 | --- | ---: | --- |
-| decodecorpus-z000033 + stage=compress, level=best | 0.2228 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=better | 0.1662 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=default | 0.0381 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=fastest | 0.1397 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 0.0836 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.1482 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.2106 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.1489 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.2142 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.1505 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.2417 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.1367 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.2148 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.1518 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.2208 | rust_slower |
-| high-entropy-1m + stage=compress, level=best | 0.1308 | rust_slower |
-| high-entropy-1m + stage=compress, level=better | 0.5555 | rust_slower |
-| high-entropy-1m + stage=compress, level=default | 0.0555 | rust_slower |
-| high-entropy-1m + stage=compress, level=fastest | 0.3197 | rust_slower |
-| high-entropy-1m + stage=compress, level=level4-row | 0.2785 | rust_slower |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.6185 | rust_slower |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6191 | rust_slower |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.6270 | rust_slower |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6279 | rust_slower |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.6182 | rust_slower |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6204 | rust_slower |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.6019 | rust_slower |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.6126 | rust_slower |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.6259 | rust_slower |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6270 | rust_slower |
-| large-log-stream + stage=compress, level=best | 0.1647 | rust_slower |
-| large-log-stream + stage=compress, level=better | 0.1403 | rust_slower |
-| large-log-stream + stage=compress, level=default | 0.0524 | rust_slower |
-| large-log-stream + stage=compress, level=fastest | 0.1600 | rust_slower |
-| large-log-stream + stage=compress, level=level4-row | 0.0484 | rust_slower |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 0.5916 | rust_slower |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 0.6498 | rust_slower |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 0.6912 | rust_slower |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 0.6224 | rust_slower |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 0.6510 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=best | 0.1930 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=better | 0.1548 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=default | 0.0370 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=fastest | 0.1368 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 0.0773 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.1485 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.2143 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.1502 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.2171 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.1503 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.2453 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.1384 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.2241 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.1519 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.2216 | rust_slower |
+| high-entropy-1m + stage=compress, level=best | 0.3095 | rust_slower |
+| high-entropy-1m + stage=compress, level=better | 0.4724 | rust_slower |
+| high-entropy-1m + stage=compress, level=default | 0.0579 | rust_slower |
+| high-entropy-1m + stage=compress, level=fastest | 0.3067 | rust_slower |
+| high-entropy-1m + stage=compress, level=level4-row | 0.2386 | rust_slower |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.6283 | rust_slower |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6264 | rust_slower |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 1.0825 | rust_faster |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6301 | rust_slower |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.6270 | rust_slower |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6304 | rust_slower |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.8513 | rust_slower |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.6275 | rust_slower |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1.0830 | rust_faster |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6319 | rust_slower |
+| large-log-stream + stage=compress, level=best | 0.1811 | rust_slower |
+| large-log-stream + stage=compress, level=better | 0.1597 | rust_slower |
+| large-log-stream + stage=compress, level=default | 0.0570 | rust_slower |
+| large-log-stream + stage=compress, level=fastest | 0.1485 | rust_slower |
+| large-log-stream + stage=compress, level=level4-row | 0.0562 | rust_slower |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 0.6184 | rust_slower |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 0.6368 | rust_slower |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 0.6719 | rust_slower |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 0.6367 | rust_slower |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 0.6752 | rust_slower |
 | large-log-stream + stage=decompress, level=default, source=rust\_stream | 0.6645 | rust_slower |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 0.6499 | rust_slower |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 0.6967 | rust_slower |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 0.6398 | rust_slower |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 0.6445 | rust_slower |
-| low-entropy-1m + stage=compress, level=best | 0.2638 | rust_slower |
-| low-entropy-1m + stage=compress, level=better | 0.1732 | rust_slower |
-| low-entropy-1m + stage=compress, level=default | 0.0329 | rust_slower |
-| low-entropy-1m + stage=compress, level=fastest | 0.1725 | rust_slower |
-| low-entropy-1m + stage=compress, level=level4-row | 0.0592 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.7084 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.7424 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.7096 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.7433 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.7097 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.7426 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.7054 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.7287 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.7090 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.7424 | rust_slower |
-| small-10k-random + stage=compress, level=best | 5.1892 | rust_faster |
-| small-10k-random + stage=compress, level=better | 0.7064 | rust_slower |
-| small-10k-random + stage=compress, level=default | 0.3691 | rust_slower |
-| small-10k-random + stage=compress, level=fastest | 0.5215 | rust_slower |
-| small-10k-random + stage=compress, level=level4-row | 0.7373 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.3484 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.4082 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.3483 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.4067 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.3485 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.4058 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.3496 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.3487 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.3512 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.3496 | rust_slower |
-| small-1k-random + stage=compress, level=best | 0.9494 | rust_slower |
-| small-1k-random + stage=compress, level=better | 0.4735 | rust_slower |
-| small-1k-random + stage=compress, level=default | 0.1894 | rust_slower |
-| small-1k-random + stage=compress, level=fastest | 0.3769 | rust_slower |
-| small-1k-random + stage=compress, level=level4-row | 0.5672 | rust_slower |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 0.0890 | rust_slower |
-| small-1k-random + stage=decompress, level=best, source=rust\_stream | 0.0890 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.0857 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.0879 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.0873 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.0885 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.0869 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.0876 | rust_slower |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 0.0889 | rust_slower |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.0879 | rust_slower |
-| small-4k-log-lines + stage=compress, level=best | 0.3191 | rust_slower |
-| small-4k-log-lines + stage=compress, level=better | 0.2124 | rust_slower |
-| small-4k-log-lines + stage=compress, level=default | 0.0933 | rust_slower |
-| small-4k-log-lines + stage=compress, level=fastest | 0.2481 | rust_slower |
-| small-4k-log-lines + stage=compress, level=level4-row | 0.1615 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.4076 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.2506 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.4028 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.2488 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.4065 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.2485 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.4028 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.2555 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.4058 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.2485 | rust_slower |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 0.6777 | rust_slower |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 0.6947 | rust_slower |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 0.6507 | rust_slower |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 0.6690 | rust_slower |
+| low-entropy-1m + stage=compress, level=best | 0.2403 | rust_slower |
+| low-entropy-1m + stage=compress, level=better | 0.1686 | rust_slower |
+| low-entropy-1m + stage=compress, level=default | 0.0289 | rust_slower |
+| low-entropy-1m + stage=compress, level=fastest | 0.1536 | rust_slower |
+| low-entropy-1m + stage=compress, level=level4-row | 0.0672 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.7148 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.7497 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.7149 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.7493 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.7151 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.7489 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.7085 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.7342 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.7150 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.7491 | rust_slower |
+| small-10k-random + stage=compress, level=best | 5.2073 | rust_faster |
+| small-10k-random + stage=compress, level=better | 0.7176 | rust_slower |
+| small-10k-random + stage=compress, level=default | 0.3826 | rust_slower |
+| small-10k-random + stage=compress, level=fastest | 0.5001 | rust_slower |
+| small-10k-random + stage=compress, level=level4-row | 0.7396 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.3442 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.3438 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.3443 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.3442 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.3449 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.3440 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.3442 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.3447 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.3413 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.3406 | rust_slower |
+| small-1k-random + stage=compress, level=best | 0.9644 | rust_slower |
+| small-1k-random + stage=compress, level=better | 0.5498 | rust_slower |
+| small-1k-random + stage=compress, level=default | 0.2077 | rust_slower |
+| small-1k-random + stage=compress, level=fastest | 0.3525 | rust_slower |
+| small-1k-random + stage=compress, level=level4-row | 0.6230 | rust_slower |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 0.0830 | rust_slower |
+| small-1k-random + stage=decompress, level=best, source=rust\_stream | 0.0832 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.0831 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.0836 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.0940 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.0829 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.0829 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.0831 | rust_slower |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 0.0825 | rust_slower |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.0827 | rust_slower |
+| small-4k-log-lines + stage=compress, level=best | 0.3134 | rust_slower |
+| small-4k-log-lines + stage=compress, level=better | 0.1919 | rust_slower |
+| small-4k-log-lines + stage=compress, level=default | 0.0956 | rust_slower |
+| small-4k-log-lines + stage=compress, level=fastest | 0.2453 | rust_slower |
+| small-4k-log-lines + stage=compress, level=level4-row | 0.1581 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.4133 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.2508 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.4128 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.2490 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.4095 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.2476 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.4087 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.2520 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.4104 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.2489 | rust_slower |
 
 ## Target `x86_64-musl`
 
@@ -1070,221 +1070,221 @@ Interpretation: higher speed is better; delta uses `rust_bytes_per_sec / ffi_byt
 
 | Key | Rust bytes/sec | Rust ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 11463566.32 | 89.155 |
-| decodecorpus-z000033 + stage=compress, level=better | 11875044.46 | 86.066 |
-| decodecorpus-z000033 + stage=compress, level=default | 9042956.52 | 113.020 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 39532150.32 | 25.853 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 15428216.54 | 66.245 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 130495131.63 | 7.832 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 249163308.03 | 4.102 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 128483648.19 | 7.955 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 246718181.20 | 4.143 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 126282661.08 | 8.093 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 321397787.21 | 3.180 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 133702113.52 | 7.644 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 258441283.24 | 3.955 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 125667045.38 | 8.133 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 317406806.87 | 3.220 |
-| high-entropy-1m + stage=compress, level=best | 149180647.16 | 7.029 |
-| high-entropy-1m + stage=compress, level=better | 159940549.44 | 6.556 |
-| high-entropy-1m + stage=compress, level=default | 91370182.40 | 11.476 |
-| high-entropy-1m + stage=compress, level=fastest | 215967635.83 | 4.855 |
-| high-entropy-1m + stage=compress, level=level4-row | 176430434.16 | 5.943 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 5573618523.16 | 0.188 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 5549636137.50 | 0.189 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 5573648149.43 | 0.188 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 5548226653.90 | 0.189 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 5547845041.96 | 0.189 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 5560023754.98 | 0.189 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 5524607351.91 | 0.190 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 5552839500.94 | 0.189 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 5562265271.91 | 0.189 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 5573322277.85 | 0.188 |
-| large-log-stream + stage=compress, level=best | 182313422.02 | 92.024 |
-| large-log-stream + stage=compress, level=better | 185781359.07 | 90.306 |
-| large-log-stream + stage=compress, level=default | 153269845.40 | 109.462 |
-| large-log-stream + stage=compress, level=fastest | 556734799.90 | 30.135 |
-| large-log-stream + stage=compress, level=level4-row | 108381774.29 | 154.797 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 3992339527.96 | 4.202 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 4491686190.54 | 3.735 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 4335272987.93 | 3.870 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 4433912639.01 | 3.784 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 4295556715.11 | 3.906 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 4569624387.00 | 3.671 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 4315512727.09 | 3.888 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 4505423786.89 | 3.724 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 4408356140.77 | 3.806 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 4627855375.11 | 3.625 |
-| low-entropy-1m + stage=compress, level=best | 141905702.14 | 7.389 |
-| low-entropy-1m + stage=compress, level=better | 144509624.87 | 7.256 |
-| low-entropy-1m + stage=compress, level=default | 76452304.40 | 13.715 |
-| low-entropy-1m + stage=compress, level=fastest | 326961807.95 | 3.207 |
-| low-entropy-1m + stage=compress, level=level4-row | 90653376.30 | 11.567 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1565349539.54 | 0.670 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1595537384.00 | 0.657 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1566933158.00 | 0.669 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1596353544.23 | 0.657 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1566469670.80 | 0.669 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1597309220.31 | 0.656 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1565164953.59 | 0.670 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1595952646.94 | 0.657 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1565774953.90 | 0.670 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1595872491.65 | 0.657 |
-| small-10k-random + stage=compress, level=best | 26324854.88 | 0.389 |
-| small-10k-random + stage=compress, level=better | 26659238.18 | 0.384 |
-| small-10k-random + stage=compress, level=default | 18330066.50 | 0.559 |
-| small-10k-random + stage=compress, level=fastest | 67349811.24 | 0.152 |
-| small-10k-random + stage=compress, level=level4-row | 62594365.28 | 0.164 |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 3349689237.81 | 0.003 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 3342036553.52 | 0.003 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 3296844816.48 | 0.003 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 3335504885.99 | 0.003 |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 3294723294.72 | 0.003 |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 3328998699.61 | 0.003 |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 3302160593.36 | 0.003 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 3322517845.55 | 0.003 |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 3302160593.36 | 0.003 |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 3345311989.55 | 0.003 |
-| small-1k-random + stage=compress, level=best | 3228175.92 | 0.317 |
-| small-1k-random + stage=compress, level=better | 3219073.01 | 0.318 |
-| small-1k-random + stage=compress, level=default | 1892812.12 | 0.541 |
-| small-1k-random + stage=compress, level=fastest | 9597540.63 | 0.107 |
-| small-1k-random + stage=compress, level=level4-row | 7468673.87 | 0.137 |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 566058595.91 | 0.002 |
+| decodecorpus-z000033 + stage=compress, level=best | 10906589.91 | 93.708 |
+| decodecorpus-z000033 + stage=compress, level=better | 11805658.58 | 86.572 |
+| decodecorpus-z000033 + stage=compress, level=default | 9006813.24 | 113.474 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 38939036.74 | 26.247 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 15175286.30 | 67.349 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 131243499.85 | 7.787 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 251450155.90 | 4.065 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 129391550.11 | 7.899 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 248219595.42 | 4.117 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 126988854.44 | 8.048 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 325440037.50 | 3.140 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 134075146.68 | 7.623 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 260689431.06 | 3.921 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 125635840.64 | 8.135 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 321220104.30 | 3.182 |
+| high-entropy-1m + stage=compress, level=best | 146084176.00 | 7.178 |
+| high-entropy-1m + stage=compress, level=better | 155115320.66 | 6.760 |
+| high-entropy-1m + stage=compress, level=default | 88254211.61 | 11.881 |
+| high-entropy-1m + stage=compress, level=fastest | 213023973.57 | 4.922 |
+| high-entropy-1m + stage=compress, level=level4-row | 177445434.62 | 5.909 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 5576375113.67 | 0.188 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 5589781862.38 | 0.188 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 5628276213.74 | 0.186 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 5593628473.43 | 0.187 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 5570420739.48 | 0.188 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 5573796285.47 | 0.188 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 5543006063.30 | 0.189 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 5564124741.98 | 0.188 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 5573974059.11 | 0.188 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 5588203004.67 | 0.188 |
+| large-log-stream + stage=compress, level=best | 181541313.41 | 92.415 |
+| large-log-stream + stage=compress, level=better | 184961783.07 | 90.706 |
+| large-log-stream + stage=compress, level=default | 153806712.03 | 109.080 |
+| large-log-stream + stage=compress, level=fastest | 546428497.22 | 30.703 |
+| large-log-stream + stage=compress, level=level4-row | 108483902.25 | 154.652 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 4113469188.61 | 4.079 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 4602013646.49 | 3.646 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 4441513065.32 | 3.777 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 4685696506.96 | 3.581 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 4415715713.37 | 3.799 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 4774059862.08 | 3.514 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 4416506153.47 | 3.799 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 4590381636.74 | 3.655 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 4408235677.43 | 3.806 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 4786480143.65 | 3.505 |
+| low-entropy-1m + stage=compress, level=best | 137954225.93 | 7.601 |
+| low-entropy-1m + stage=compress, level=better | 143776643.37 | 7.293 |
+| low-entropy-1m + stage=compress, level=default | 73565406.66 | 14.254 |
+| low-entropy-1m + stage=compress, level=fastest | 329169078.62 | 3.186 |
+| low-entropy-1m + stage=compress, level=level4-row | 90550299.53 | 11.580 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 1569771550.05 | 0.668 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 1601784213.98 | 0.655 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 1572875010.13 | 0.667 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 1602435341.80 | 0.654 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 1571199314.33 | 0.667 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 1602670465.31 | 0.654 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 1570794478.27 | 0.668 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 1602702310.26 | 0.654 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 1570839188.29 | 0.668 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 1601444173.44 | 0.655 |
+| small-10k-random + stage=compress, level=best | 26232867.94 | 0.390 |
+| small-10k-random + stage=compress, level=better | 26391004.38 | 0.388 |
+| small-10k-random + stage=compress, level=default | 18237027.93 | 0.561 |
+| small-10k-random + stage=compress, level=fastest | 66677953.30 | 0.154 |
+| small-10k-random + stage=compress, level=level4-row | 62572563.40 | 0.164 |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 3318211276.73 | 0.003 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 3328998699.61 | 0.003 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 3314988669.47 | 0.003 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 3330081300.81 | 0.003 |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 3344219464.40 | 0.003 |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 3318211276.73 | 0.003 |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 3317136378.36 | 0.003 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 3344219464.40 | 0.003 |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 3328998699.61 | 0.003 |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 3334418756.11 | 0.003 |
+| small-1k-random + stage=compress, level=best | 3195655.91 | 0.320 |
+| small-1k-random + stage=compress, level=better | 3217333.38 | 0.318 |
+| small-1k-random + stage=compress, level=default | 1896334.93 | 0.540 |
+| small-1k-random + stage=compress, level=fastest | 9540135.65 | 0.107 |
+| small-1k-random + stage=compress, level=level4-row | 7337240.80 | 0.140 |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 565745856.35 | 0.002 |
 | small-1k-random + stage=decompress, level=best, source=rust\_stream | 565121412.80 | 0.002 |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 563876651.98 | 0.002 |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 564498346.20 | 0.002 |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 563566318.11 | 0.002 |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 562019758.51 | 0.002 |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 564809707.67 | 0.002 |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 565121412.80 | 0.002 |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 563876651.98 | 0.002 |
-| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 565121412.80 | 0.002 |
-| small-4k-log-lines + stage=compress, level=best | 10385500.87 | 0.394 |
-| small-4k-log-lines + stage=compress, level=better | 10578485.08 | 0.387 |
-| small-4k-log-lines + stage=compress, level=default | 6838976.82 | 0.599 |
-| small-4k-log-lines + stage=compress, level=fastest | 25247326.41 | 0.162 |
-| small-4k-log-lines + stage=compress, level=level4-row | 20466696.65 | 0.200 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 714958980.62 | 0.006 |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1179044329.30 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 714834205.93 | 0.006 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1187590605.97 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 711481674.48 | 0.006 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1184499710.82 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 704264099.04 | 0.006 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1186558516.80 | 0.003 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 713464553.21 | 0.006 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1211117681.85 | 0.003 |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 565745856.35 | 0.002 |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 566998892.58 | 0.002 |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 556824361.07 | 0.002 |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 566371681.42 | 0.002 |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 566998892.58 | 0.002 |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 566685113.45 | 0.002 |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 566998892.58 | 0.002 |
+| small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 565433462.18 | 0.002 |
+| small-4k-log-lines + stage=compress, level=best | 10310835.44 | 0.397 |
+| small-4k-log-lines + stage=compress, level=better | 10512213.78 | 0.390 |
+| small-4k-log-lines + stage=compress, level=default | 6819449.42 | 0.601 |
+| small-4k-log-lines + stage=compress, level=fastest | 24102624.46 | 0.170 |
+| small-4k-log-lines + stage=compress, level=level4-row | 19946238.65 | 0.205 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 721126760.56 | 0.006 |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 1187935034.80 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 720619282.20 | 0.006 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 1197310727.86 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 717338003.50 | 0.006 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 1201525374.01 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 706450500.17 | 0.006 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 1202936857.56 | 0.003 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 716459681.65 | 0.006 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 1217960154.62 | 0.003 |
 
 ### FFI speed
 
 | Key | FFI bytes/sec | FFI ms/iter |
 | --- | ---: | ---: |
-| decodecorpus-z000033 + stage=compress, level=best | 50053369.66 | 20.419 |
-| decodecorpus-z000033 + stage=compress, level=better | 73465215.41 | 13.912 |
-| decodecorpus-z000033 + stage=compress, level=default | 159538565.33 | 6.406 |
-| decodecorpus-z000033 + stage=compress, level=fastest | 281553427.48 | 3.630 |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 142429510.61 | 7.176 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 965858724.85 | 1.058 |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 1642725802.77 | 0.622 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 943691609.93 | 1.083 |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 1608204710.21 | 0.636 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 908342332.01 | 1.125 |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 1828464750.48 | 0.559 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 972786700.50 | 1.051 |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 1651707001.74 | 0.619 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 906799789.54 | 1.127 |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 1982570658.18 | 0.516 |
-| high-entropy-1m + stage=compress, level=best | 316027474.46 | 3.318 |
-| high-entropy-1m + stage=compress, level=better | 430203380.99 | 2.437 |
-| high-entropy-1m + stage=compress, level=default | 558857529.64 | 1.876 |
-| high-entropy-1m + stage=compress, level=fastest | 764210850.06 | 1.372 |
-| high-entropy-1m + stage=compress, level=level4-row | 425494030.33 | 2.464 |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 9364041472.06 | 0.112 |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 8746880213.55 | 0.120 |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 8770144360.25 | 0.120 |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 8740245559.34 | 0.120 |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 8771758407.23 | 0.120 |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 8751479339.33 | 0.120 |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 9367554963.95 | 0.112 |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 8758643156.06 | 0.120 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 8761204505.20 | 0.120 |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 8775061718.06 | 0.119 |
-| large-log-stream + stage=compress, level=best | 1081708459.69 | 15.510 |
-| large-log-stream + stage=compress, level=better | 1269729943.11 | 13.213 |
-| large-log-stream + stage=compress, level=default | 2548828263.57 | 6.582 |
-| large-log-stream + stage=compress, level=fastest | 4348409456.95 | 3.858 |
-| large-log-stream + stage=compress, level=level4-row | 2619576007.95 | 6.405 |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 8398707445.70 | 1.998 |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 9033841064.17 | 1.857 |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 8411137231.07 | 1.995 |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 9066560025.94 | 1.850 |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 8441570412.77 | 1.987 |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 9060610855.64 | 1.852 |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 8400469462.88 | 1.997 |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 8501098789.74 | 1.974 |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 8408380306.29 | 1.995 |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 9048145415.64 | 1.854 |
-| low-entropy-1m + stage=compress, level=best | 349033312.71 | 3.004 |
-| low-entropy-1m + stage=compress, level=better | 567904484.14 | 1.846 |
-| low-entropy-1m + stage=compress, level=default | 918094564.33 | 1.142 |
-| low-entropy-1m + stage=compress, level=fastest | 1831768974.51 | 0.572 |
-| low-entropy-1m + stage=compress, level=level4-row | 618316649.53 | 1.696 |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 3879218367.33 | 0.270 |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 4419504259.02 | 0.237 |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 3874602775.77 | 0.271 |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 4411694666.38 | 0.238 |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 3875691179.51 | 0.271 |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 4413755945.62 | 0.238 |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 3877826799.26 | 0.270 |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 3850910599.98 | 0.272 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 3855540766.13 | 0.272 |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 4413737366.93 | 0.238 |
-| small-10k-random + stage=compress, level=best | 31738652.04 | 0.323 |
-| small-10k-random + stage=compress, level=better | 82295266.41 | 0.124 |
-| small-10k-random + stage=compress, level=default | 70663087.51 | 0.145 |
-| small-10k-random + stage=compress, level=fastest | 90599424.91 | 0.113 |
-| small-10k-random + stage=compress, level=level4-row | 84044648.72 | 0.122 |
+| decodecorpus-z000033 + stage=compress, level=best | 49460806.15 | 20.664 |
+| decodecorpus-z000033 + stage=compress, level=better | 72432749.17 | 14.110 |
+| decodecorpus-z000033 + stage=compress, level=default | 159232637.15 | 6.419 |
+| decodecorpus-z000033 + stage=compress, level=fastest | 282081380.18 | 3.623 |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 141153045.54 | 7.241 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 976520362.43 | 1.047 |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 1659390170.64 | 0.616 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 952990815.42 | 1.072 |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 1633032463.00 | 0.626 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 919190456.58 | 1.112 |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 1845474769.14 | 0.554 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 979204591.18 | 1.044 |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 1670805392.17 | 0.612 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 916419486.97 | 1.115 |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 2003267448.61 | 0.510 |
+| high-entropy-1m + stage=compress, level=best | 314343957.60 | 3.336 |
+| high-entropy-1m + stage=compress, level=better | 416936121.35 | 2.515 |
+| high-entropy-1m + stage=compress, level=default | 549372053.27 | 1.909 |
+| high-entropy-1m + stage=compress, level=fastest | 750365136.92 | 1.397 |
+| high-entropy-1m + stage=compress, level=level4-row | 423331997.02 | 2.477 |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 8853599020.56 | 0.118 |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 8783220532.06 | 0.119 |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 8892039720.83 | 0.118 |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 8885936069.96 | 0.118 |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 8824020465.87 | 0.119 |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 8781822902.27 | 0.119 |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 8761350913.25 | 0.120 |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 8813044209.11 | 0.119 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 8805495372.94 | 0.119 |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 8875256039.14 | 0.118 |
+| large-log-stream + stage=compress, level=best | 1070932587.91 | 15.666 |
+| large-log-stream + stage=compress, level=better | 1265345787.47 | 13.259 |
+| large-log-stream + stage=compress, level=default | 2531086538.30 | 6.628 |
+| large-log-stream + stage=compress, level=fastest | 4209263723.27 | 3.986 |
+| large-log-stream + stage=compress, level=level4-row | 2596514676.22 | 6.461 |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 8469149612.82 | 1.981 |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 9279490085.39 | 1.808 |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 8492462321.73 | 1.976 |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 9280968478.75 | 1.808 |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 8515324544.55 | 1.970 |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 9300024334.85 | 1.804 |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 8519471339.51 | 1.969 |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 8691538538.45 | 1.930 |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 8504378099.06 | 1.973 |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 9263355967.35 | 1.811 |
+| low-entropy-1m + stage=compress, level=best | 346835278.91 | 3.023 |
+| low-entropy-1m + stage=compress, level=better | 560567358.90 | 1.871 |
+| low-entropy-1m + stage=compress, level=default | 913094665.86 | 1.148 |
+| low-entropy-1m + stage=compress, level=fastest | 1801605778.47 | 0.582 |
+| low-entropy-1m + stage=compress, level=level4-row | 611654245.86 | 1.714 |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 3839489130.47 | 0.273 |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 4405948124.09 | 0.238 |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 3838013528.15 | 0.273 |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 4416191105.93 | 0.237 |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 3834644978.20 | 0.273 |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 4399459600.07 | 0.238 |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 3839362605.82 | 0.273 |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 3842359261.12 | 0.273 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 3840375036.62 | 0.273 |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 4415503040.31 | 0.237 |
+| small-10k-random + stage=compress, level=best | 31705142.18 | 0.323 |
+| small-10k-random + stage=compress, level=better | 82911623.01 | 0.124 |
+| small-10k-random + stage=compress, level=default | 70644075.28 | 0.145 |
+| small-10k-random + stage=compress, level=fastest | 90104359.15 | 0.114 |
+| small-10k-random + stage=compress, level=level4-row | 83602073.72 | 0.122 |
 | small-10k-random + stage=decompress, level=best, source=c\_stream | 10148662041.63 | 0.001 |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 10138613861.39 | 0.001 |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 10148662041.63 | 0.001 |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 10138613861.39 | 0.001 |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 10148662041.63 | 0.001 |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 10158730158.73 | 0.001 |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 10148662041.63 | 0.001 |
 | small-10k-random + stage=decompress, level=default, source=c\_stream | 10138613861.39 | 0.001 |
 | small-10k-random + stage=decompress, level=default, source=rust\_stream | 10138613861.39 | 0.001 |
 | small-10k-random + stage=decompress, level=fastest, source=c\_stream | 10148662041.63 | 0.001 |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 10138613861.39 | 0.001 |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 10148662041.63 | 0.001 |
 | small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 10138613861.39 | 0.001 |
 | small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 10138613861.39 | 0.001 |
-| small-1k-random + stage=compress, level=best | 17155877.23 | 0.060 |
-| small-1k-random + stage=compress, level=better | 22607850.93 | 0.045 |
-| small-1k-random + stage=compress, level=default | 24023460.41 | 0.043 |
-| small-1k-random + stage=compress, level=fastest | 26822432.35 | 0.038 |
-| small-1k-random + stage=compress, level=level4-row | 23056312.34 | 0.044 |
+| small-1k-random + stage=compress, level=best | 17009684.22 | 0.060 |
+| small-1k-random + stage=compress, level=better | 22653864.87 | 0.045 |
+| small-1k-random + stage=compress, level=default | 24387339.54 | 0.042 |
+| small-1k-random + stage=compress, level=fastest | 26708398.54 | 0.038 |
+| small-1k-random + stage=compress, level=level4-row | 22928281.95 | 0.045 |
 | small-1k-random + stage=decompress, level=best, source=c\_stream | 6606451612.90 | 0.000 |
 | small-1k-random + stage=decompress, level=best, source=rust\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=better, source=c\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=better, source=rust\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=default, source=c\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=default, source=rust\_stream | 6564102564.10 | 0.000 |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 6564102564.10 | 0.000 |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 6606451612.90 | 0.000 |
 | small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 6564102564.10 | 0.000 |
 | small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 6564102564.10 | 0.000 |
-| small-4k-log-lines + stage=compress, level=best | 46111586.44 | 0.089 |
-| small-4k-log-lines + stage=compress, level=better | 57395081.62 | 0.071 |
-| small-4k-log-lines + stage=compress, level=default | 58211585.47 | 0.070 |
-| small-4k-log-lines + stage=compress, level=fastest | 67352912.16 | 0.061 |
-| small-4k-log-lines + stage=compress, level=level4-row | 57629264.86 | 0.071 |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 1948620361.56 | 0.002 |
+| small-4k-log-lines + stage=compress, level=best | 45836037.69 | 0.089 |
+| small-4k-log-lines + stage=compress, level=better | 57745446.34 | 0.071 |
+| small-4k-log-lines + stage=compress, level=default | 59725867.60 | 0.069 |
+| small-4k-log-lines + stage=compress, level=fastest | 66566989.53 | 0.062 |
+| small-4k-log-lines + stage=compress, level=level4-row | 58891189.33 | 0.070 |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 1974927675.99 | 0.002 |
 | small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 6159398496.24 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 1945843230.40 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 6350387596.90 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 1957934990.44 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 6450393700.79 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 1970177970.18 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 1973975903.61 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 6420062695.92 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 1998048780.49 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 6501587301.59 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 1992217898.83 | 0.002 |
 | small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 6140929535.23 | 0.001 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 1954198473.28 | 0.002 |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 6564102564.10 | 0.001 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 2000000000.00 | 0.002 |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 6532695374.80 | 0.001 |
 
 ### Rust/FFI speed delta
 
@@ -1292,108 +1292,108 @@ Reference band: `0.99–1.05` (near parity).
 
 | Key | Delta | Status |
 | --- | ---: | --- |
-| decodecorpus-z000033 + stage=compress, level=best | 0.2290 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=better | 0.1616 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=default | 0.0567 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=fastest | 0.1404 | rust_slower |
-| decodecorpus-z000033 + stage=compress, level=level4-row | 0.1083 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.1351 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.1517 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.1362 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.1534 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.1390 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.1758 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.1374 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.1565 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.1386 | rust_slower |
-| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.1601 | rust_slower |
-| high-entropy-1m + stage=compress, level=best | 0.4720 | rust_slower |
-| high-entropy-1m + stage=compress, level=better | 0.3718 | rust_slower |
-| high-entropy-1m + stage=compress, level=default | 0.1635 | rust_slower |
-| high-entropy-1m + stage=compress, level=fastest | 0.2826 | rust_slower |
-| high-entropy-1m + stage=compress, level=level4-row | 0.4146 | rust_slower |
-| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.5952 | rust_slower |
-| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6345 | rust_slower |
-| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.6355 | rust_slower |
-| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6348 | rust_slower |
-| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.6325 | rust_slower |
-| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6353 | rust_slower |
-| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.5898 | rust_slower |
-| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.6340 | rust_slower |
-| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.6349 | rust_slower |
-| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6351 | rust_slower |
-| large-log-stream + stage=compress, level=best | 0.1685 | rust_slower |
-| large-log-stream + stage=compress, level=better | 0.1463 | rust_slower |
-| large-log-stream + stage=compress, level=default | 0.0601 | rust_slower |
-| large-log-stream + stage=compress, level=fastest | 0.1280 | rust_slower |
-| large-log-stream + stage=compress, level=level4-row | 0.0414 | rust_slower |
-| large-log-stream + stage=decompress, level=best, source=c\_stream | 0.4754 | rust_slower |
-| large-log-stream + stage=decompress, level=best, source=rust\_stream | 0.4972 | rust_slower |
-| large-log-stream + stage=decompress, level=better, source=c\_stream | 0.5154 | rust_slower |
-| large-log-stream + stage=decompress, level=better, source=rust\_stream | 0.4890 | rust_slower |
-| large-log-stream + stage=decompress, level=default, source=c\_stream | 0.5089 | rust_slower |
-| large-log-stream + stage=decompress, level=default, source=rust\_stream | 0.5043 | rust_slower |
-| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 0.5137 | rust_slower |
-| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 0.5300 | rust_slower |
-| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 0.5243 | rust_slower |
-| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 0.5115 | rust_slower |
-| low-entropy-1m + stage=compress, level=best | 0.4066 | rust_slower |
-| low-entropy-1m + stage=compress, level=better | 0.2545 | rust_slower |
-| low-entropy-1m + stage=compress, level=default | 0.0833 | rust_slower |
-| low-entropy-1m + stage=compress, level=fastest | 0.1785 | rust_slower |
-| low-entropy-1m + stage=compress, level=level4-row | 0.1466 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.4035 | rust_slower |
-| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.3610 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.4044 | rust_slower |
-| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.3618 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.4042 | rust_slower |
-| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.3619 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.4036 | rust_slower |
-| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.4144 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.4061 | rust_slower |
-| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.3616 | rust_slower |
-| small-10k-random + stage=compress, level=best | 0.8294 | rust_slower |
-| small-10k-random + stage=compress, level=better | 0.3239 | rust_slower |
-| small-10k-random + stage=compress, level=default | 0.2594 | rust_slower |
-| small-10k-random + stage=compress, level=fastest | 0.7434 | rust_slower |
-| small-10k-random + stage=compress, level=level4-row | 0.7448 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.3301 | rust_slower |
-| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.3296 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.3249 | rust_slower |
-| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.3290 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.3250 | rust_slower |
-| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.3283 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.3254 | rust_slower |
-| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.3277 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.3257 | rust_slower |
-| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.3300 | rust_slower |
-| small-1k-random + stage=compress, level=best | 0.1882 | rust_slower |
-| small-1k-random + stage=compress, level=better | 0.1424 | rust_slower |
-| small-1k-random + stage=compress, level=default | 0.0788 | rust_slower |
-| small-1k-random + stage=compress, level=fastest | 0.3578 | rust_slower |
-| small-1k-random + stage=compress, level=level4-row | 0.3239 | rust_slower |
-| small-1k-random + stage=decompress, level=best, source=c\_stream | 0.0857 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=best | 0.2205 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=better | 0.1630 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=default | 0.0566 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=fastest | 0.1380 | rust_slower |
+| decodecorpus-z000033 + stage=compress, level=level4-row | 0.1075 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=c\_stream | 0.1344 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=best, source=rust\_stream | 0.1515 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=c\_stream | 0.1358 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=better, source=rust\_stream | 0.1520 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=c\_stream | 0.1382 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=default, source=rust\_stream | 0.1763 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=c\_stream | 0.1369 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=fastest, source=rust\_stream | 0.1560 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=c\_stream | 0.1371 | rust_slower |
+| decodecorpus-z000033 + stage=decompress, level=level4-row, source=rust\_stream | 0.1603 | rust_slower |
+| high-entropy-1m + stage=compress, level=best | 0.4647 | rust_slower |
+| high-entropy-1m + stage=compress, level=better | 0.3720 | rust_slower |
+| high-entropy-1m + stage=compress, level=default | 0.1606 | rust_slower |
+| high-entropy-1m + stage=compress, level=fastest | 0.2839 | rust_slower |
+| high-entropy-1m + stage=compress, level=level4-row | 0.4192 | rust_slower |
+| high-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.6298 | rust_slower |
+| high-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.6364 | rust_slower |
+| high-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.6330 | rust_slower |
+| high-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.6295 | rust_slower |
+| high-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.6313 | rust_slower |
+| high-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.6347 | rust_slower |
+| high-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.6327 | rust_slower |
+| high-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.6314 | rust_slower |
+| high-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.6330 | rust_slower |
+| high-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.6296 | rust_slower |
+| large-log-stream + stage=compress, level=best | 0.1695 | rust_slower |
+| large-log-stream + stage=compress, level=better | 0.1462 | rust_slower |
+| large-log-stream + stage=compress, level=default | 0.0608 | rust_slower |
+| large-log-stream + stage=compress, level=fastest | 0.1298 | rust_slower |
+| large-log-stream + stage=compress, level=level4-row | 0.0418 | rust_slower |
+| large-log-stream + stage=decompress, level=best, source=c\_stream | 0.4857 | rust_slower |
+| large-log-stream + stage=decompress, level=best, source=rust\_stream | 0.4959 | rust_slower |
+| large-log-stream + stage=decompress, level=better, source=c\_stream | 0.5230 | rust_slower |
+| large-log-stream + stage=decompress, level=better, source=rust\_stream | 0.5049 | rust_slower |
+| large-log-stream + stage=decompress, level=default, source=c\_stream | 0.5186 | rust_slower |
+| large-log-stream + stage=decompress, level=default, source=rust\_stream | 0.5133 | rust_slower |
+| large-log-stream + stage=decompress, level=fastest, source=c\_stream | 0.5184 | rust_slower |
+| large-log-stream + stage=decompress, level=fastest, source=rust\_stream | 0.5281 | rust_slower |
+| large-log-stream + stage=decompress, level=level4-row, source=c\_stream | 0.5183 | rust_slower |
+| large-log-stream + stage=decompress, level=level4-row, source=rust\_stream | 0.5167 | rust_slower |
+| low-entropy-1m + stage=compress, level=best | 0.3978 | rust_slower |
+| low-entropy-1m + stage=compress, level=better | 0.2565 | rust_slower |
+| low-entropy-1m + stage=compress, level=default | 0.0806 | rust_slower |
+| low-entropy-1m + stage=compress, level=fastest | 0.1827 | rust_slower |
+| low-entropy-1m + stage=compress, level=level4-row | 0.1480 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=c\_stream | 0.4088 | rust_slower |
+| low-entropy-1m + stage=decompress, level=best, source=rust\_stream | 0.3636 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=c\_stream | 0.4098 | rust_slower |
+| low-entropy-1m + stage=decompress, level=better, source=rust\_stream | 0.3629 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=c\_stream | 0.4097 | rust_slower |
+| low-entropy-1m + stage=decompress, level=default, source=rust\_stream | 0.3643 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=c\_stream | 0.4091 | rust_slower |
+| low-entropy-1m + stage=decompress, level=fastest, source=rust\_stream | 0.4171 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=c\_stream | 0.4090 | rust_slower |
+| low-entropy-1m + stage=decompress, level=level4-row, source=rust\_stream | 0.3627 | rust_slower |
+| small-10k-random + stage=compress, level=best | 0.8274 | rust_slower |
+| small-10k-random + stage=compress, level=better | 0.3183 | rust_slower |
+| small-10k-random + stage=compress, level=default | 0.2582 | rust_slower |
+| small-10k-random + stage=compress, level=fastest | 0.7400 | rust_slower |
+| small-10k-random + stage=compress, level=level4-row | 0.7485 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=c\_stream | 0.3270 | rust_slower |
+| small-10k-random + stage=decompress, level=best, source=rust\_stream | 0.3280 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=c\_stream | 0.3263 | rust_slower |
+| small-10k-random + stage=decompress, level=better, source=rust\_stream | 0.3281 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=c\_stream | 0.3298 | rust_slower |
+| small-10k-random + stage=decompress, level=default, source=rust\_stream | 0.3273 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=c\_stream | 0.3269 | rust_slower |
+| small-10k-random + stage=decompress, level=fastest, source=rust\_stream | 0.3295 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=c\_stream | 0.3283 | rust_slower |
+| small-10k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.3289 | rust_slower |
+| small-1k-random + stage=compress, level=best | 0.1879 | rust_slower |
+| small-1k-random + stage=compress, level=better | 0.1420 | rust_slower |
+| small-1k-random + stage=compress, level=default | 0.0778 | rust_slower |
+| small-1k-random + stage=compress, level=fastest | 0.3572 | rust_slower |
+| small-1k-random + stage=compress, level=level4-row | 0.3200 | rust_slower |
+| small-1k-random + stage=decompress, level=best, source=c\_stream | 0.0856 | rust_slower |
 | small-1k-random + stage=decompress, level=best, source=rust\_stream | 0.0861 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.0859 | rust_slower |
-| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.0860 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.0859 | rust_slower |
-| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.0856 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.0860 | rust_slower |
-| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.0861 | rust_slower |
-| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 0.0859 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=c\_stream | 0.0862 | rust_slower |
+| small-1k-random + stage=decompress, level=better, source=rust\_stream | 0.0864 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=c\_stream | 0.0848 | rust_slower |
+| small-1k-random + stage=decompress, level=default, source=rust\_stream | 0.0863 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=c\_stream | 0.0858 | rust_slower |
+| small-1k-random + stage=decompress, level=fastest, source=rust\_stream | 0.0863 | rust_slower |
+| small-1k-random + stage=decompress, level=level4-row, source=c\_stream | 0.0864 | rust_slower |
 | small-1k-random + stage=decompress, level=level4-row, source=rust\_stream | 0.0861 | rust_slower |
-| small-4k-log-lines + stage=compress, level=best | 0.2252 | rust_slower |
-| small-4k-log-lines + stage=compress, level=better | 0.1843 | rust_slower |
-| small-4k-log-lines + stage=compress, level=default | 0.1175 | rust_slower |
-| small-4k-log-lines + stage=compress, level=fastest | 0.3749 | rust_slower |
-| small-4k-log-lines + stage=compress, level=level4-row | 0.3551 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.3669 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.1914 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.3674 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.1870 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.3634 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.1836 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.3575 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.1932 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.3651 | rust_slower |
-| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.1845 | rust_slower |
+| small-4k-log-lines + stage=compress, level=best | 0.2250 | rust_slower |
+| small-4k-log-lines + stage=compress, level=better | 0.1820 | rust_slower |
+| small-4k-log-lines + stage=compress, level=default | 0.1142 | rust_slower |
+| small-4k-log-lines + stage=compress, level=fastest | 0.3621 | rust_slower |
+| small-4k-log-lines + stage=compress, level=level4-row | 0.3387 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=c\_stream | 0.3651 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=best, source=rust\_stream | 0.1929 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=c\_stream | 0.3651 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=better, source=rust\_stream | 0.1865 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=c\_stream | 0.3590 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=default, source=rust\_stream | 0.1848 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=c\_stream | 0.3546 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=fastest, source=rust\_stream | 0.1959 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=c\_stream | 0.3582 | rust_slower |
+| small-4k-log-lines + stage=decompress, level=level4-row, source=rust\_stream | 0.1864 | rust_slower |
