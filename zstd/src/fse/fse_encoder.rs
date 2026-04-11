@@ -317,7 +317,7 @@ pub fn build_table_from_data(
 ///
 /// This path reuses the shared histogram counter to avoid repeated ad-hoc
 /// symbol scans in entropy-table construction call sites.
-pub fn build_table_from_bytes(data: &[u8], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+pub(crate) fn build_table_from_bytes(data: &[u8], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     assert!(
         !data.is_empty(),
         "cannot build an FSE table from empty data"
