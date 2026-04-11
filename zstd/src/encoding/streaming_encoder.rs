@@ -1144,6 +1144,34 @@ mod tests {
     }
 
     #[test]
+    fn single_segment_requires_pledged_to_fit_matcher_window() {
+        let payload = b"streaming-window-gate-".repeat(60); // 1320 bytes
+        let mut encoder = StreamingEncoder::new_with_matcher(
+            TinyMatcher::new(1024),
+            Vec::new(),
+            CompressionLevel::Fastest,
+        );
+        encoder
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        encoder.write_all(payload.as_slice()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        assert_eq!(header.frame_content_size(), payload.len() as u64);
+        assert!(
+            !header.descriptor.single_segment_flag(),
+            "single-segment must stay off when pledged content size exceeds matcher window"
+        );
+        assert!(
+            header.window_size().unwrap() >= 1024,
+            "window descriptor should be present when single-segment is disabled"
+        );
+    }
+
+    #[test]
     fn no_pledged_size_omits_fcs_from_header() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
         encoder.write_all(b"no pledged size").unwrap();

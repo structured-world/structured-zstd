@@ -1911,7 +1911,8 @@ impl DfastMatchGenerator {
         current_len: usize,
         pos: usize,
     ) {
-        let mut seed_pos = pos.min(current_len);
+        let boundary_tail_start = current_len.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        let mut seed_pos = pos.min(current_len).min(boundary_tail_start);
         while seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= current_len {
             self.insert_position(current_abs_start + seed_pos);
             seed_pos += 1;
@@ -5124,6 +5125,31 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     assert!(
         matcher.short_hash[short_hash].contains(&target_abs_pos),
         "tail seeding must include the last 4-byte-hashable start"
+    );
+}
+
+#[test]
+fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
+    let mut matcher = DfastMatchGenerator::new(1 << 20);
+    let block = deterministic_high_entropy_bytes(0x7BB2_DA91_441E_C0EF, 64);
+    matcher.add_data(block, |_| {});
+    matcher.ensure_hash_tables();
+
+    let current_len = matcher.window.back().unwrap().len();
+    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
+    matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
+
+    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_rel = target_abs_pos - matcher.history_abs_start;
+    let live = matcher.live_history();
+    assert!(
+        target_rel + 4 <= live.len(),
+        "fixture must leave the last short-hash start valid"
+    );
+    let short_hash = matcher.hash4(&live[target_rel..]);
+    assert!(
+        matcher.short_hash[short_hash].contains(&target_abs_pos),
+        "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
     );
 }
 
