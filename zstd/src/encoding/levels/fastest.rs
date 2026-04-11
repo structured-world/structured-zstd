@@ -165,13 +165,14 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        compress_block_encoded(
+        let emitted = compress_block_encoded(
             &mut state,
             CompressionLevel::Fastest,
             true,
             vec![0xAB; 1024],
             &mut output,
         );
+        assert_eq!(emitted, BlockType::RLE);
 
         assert_eq!(
             state.matcher.skip_hints,
@@ -203,13 +204,14 @@ mod tests {
             "fixture must look incompressible to hit raw fast-path success branch"
         );
 
-        compress_block_encoded(
+        let emitted = compress_block_encoded(
             &mut state,
             CompressionLevel::Fastest,
             true,
             block.clone(),
             &mut output,
         );
+        assert_eq!(emitted, BlockType::Raw);
 
         assert_eq!(state.matcher.skip_hints, vec![Some(true)]);
         assert_eq!(state.matcher.get_last_space(), block.as_slice());

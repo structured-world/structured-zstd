@@ -249,7 +249,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Accumulate all compressed blocks; the frame header is written after
         // all input has been read so that Frame_Content_Size is known.
         let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
-        let mut all_blocks_raw = true;
         let mut total_uncompressed: u64 = 0;
         // Compress block by block
         loop {
@@ -300,16 +299,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Better
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => {
-                    let emitted_block_type = compress_block_encoded(
+                    compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         uncompressed_data,
                         &mut all_blocks,
                     );
-                    if emitted_block_type != crate::blocks::block::BlockType::Raw {
-                        all_blocks_raw = false;
-                    }
                 }
             }
             if last_block {
@@ -318,13 +314,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
 
         // Now that total_uncompressed is known, write the frame header with FCS.
-        // Keep hinted tiny raw-fast-path frames in single-segment mode for
-        // Rust/FFI parity across levels. We intentionally gate this on raw
-        // emission to avoid forcing single-segment for tiny compressed blocks
-        // until compressed-path window handling is fully donor-aligned.
+        // Keep hinted tiny one-shot frames in single-segment mode to match the
+        // donor framing policy used by the FFI path across levels.
+        // Guard out sub-256 byte payloads for now: the 1-byte FCS single-segment
+        // form is still not fully C-FFI compatible on the compressed path.
         let single_segment = !use_dictionary_state
             && small_source_hint == Some(true)
-            && all_blocks_raw
+            && total_uncompressed >= 256
             && total_uncompressed <= (1 << 14);
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
@@ -843,6 +839,48 @@ mod tests {
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Better);
         assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Best);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_small_compressible_frames_use_single_segment_across_levels() {
+        let mut data = Vec::with_capacity(4 * 1024);
+        const LINE: &[u8] =
+            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
+        while data.len() < 4 * 1024 {
+            let remaining = 4 * 1024 - data.len();
+            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
+        }
+
+        for level in [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ] {
+            let compressed = {
+                let mut compressor = FrameCompressor::new(level);
+                compressor.set_source_size_hint(data.len() as u64);
+                compressor.set_source(data.as_slice());
+                let mut out = Vec::new();
+                compressor.set_drain(&mut out);
+                compressor.compress();
+                out
+            };
+            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+            assert!(
+                frame_header.descriptor.single_segment_flag(),
+                "hinted small compressible frame should use single-segment (level={level:?})"
+            );
+            let mut decoded = Vec::new();
+            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
+                .unwrap_or_else(|e| panic!("ffi decode failed (level={level:?}): {e}"));
+            assert_eq!(decoded, data);
+        }
     }
 
     struct NoDictionaryMatcher {

@@ -458,7 +458,7 @@ impl MatchGeneratorDriver {
         match self.active_backend {
             MatcherBackend::Simple => self.match_generator.skip_matching_with_hint(Some(false)),
             MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
-            MatcherBackend::Row => self.row_matcher_mut().skip_matching(),
+            MatcherBackend::Row => self.row_matcher_mut().skip_matching_with_hint(Some(false)),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(Some(false)),
         }
     }
@@ -804,6 +804,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::HashChain => self.hc_matcher_mut().start_matching(&mut handle_sequence),
         }
     }
+
     fn skip_matching(&mut self) {
         self.skip_matching_with_hint(None);
     }
@@ -1619,8 +1620,9 @@ fn pick_lazy_match_shared(
 
 impl DfastMatchGenerator {
     // Keep a short dense tail at block boundaries for two related reasons:
-    // 1) insert_position() needs 4 bytes of lookahead, so appending a new block can
-    //    make starts from the previous block newly hashable and require backfill;
+    // 1) insert_position() needs short (4-byte) and long (8-byte) lookahead,
+    //    so appending a new block can make starts from the previous block newly
+    //    hashable and require backfill;
     // 2) we also need enough trailing bytes from the previous block to preserve
     //    cross-block matching for the minimum match length.
     const BOUNDARY_DENSE_TAIL_LEN: usize = DFAST_MIN_MATCH_LEN + 3;
@@ -1811,6 +1813,7 @@ impl DfastMatchGenerator {
             }
         }
 
+        self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
         self.emit_trailing_literals(literals_start, handle_sequence);
     }
 
@@ -1897,7 +1900,21 @@ impl DfastMatchGenerator {
             }
         }
 
+        self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
         self.emit_trailing_literals(literals_start, handle_sequence);
+    }
+
+    fn seed_remaining_hashable_starts(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        pos: usize,
+    ) {
+        let mut seed_pos = pos.min(current_len);
+        while seed_pos + DFAST_MIN_MATCH_LEN <= current_len {
+            self.insert_position(current_abs_start + seed_pos);
+            seed_pos += 1;
+        }
     }
 
     fn emit_candidate(
@@ -2276,10 +2293,6 @@ impl RowMatchGenerator {
             self.history_abs_start += removed.len();
             reuse_space(removed);
         }
-    }
-
-    fn skip_matching(&mut self) {
-        self.skip_matching_with_hint(None);
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
