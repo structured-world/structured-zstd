@@ -8,7 +8,9 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
+use core::arch::aarch64::{
+    __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
+};
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
     __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
@@ -59,6 +61,7 @@ const ROW_TARGET_LEN: usize = 48;
 const ROW_TAG_BITS: usize = 8;
 const ROW_EMPTY_SLOT: usize = usize::MAX;
 const ROW_HASH_KEY_LEN: usize = 4;
+const HASH_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
 
 const HC_HASH_LOG: usize = 20;
 const HC_CHAIN_LOG: usize = 19;
@@ -72,6 +75,44 @@ const HC_EMPTY: u32 = 0;
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 32;
+
+#[inline(always)]
+fn hash_mix_u64(value: u64) -> u64 {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        if crc_hash_available() {
+            // SAFETY: guarded by runtime/static `crc` feature detection.
+            return unsafe { hash_mix_u64_crc(value) };
+        }
+    }
+
+    value.wrapping_mul(HASH_MIX_PRIME)
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline(always)]
+fn crc_hash_available() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static HAS_CRC: OnceLock<bool> = OnceLock::new();
+        return *HAS_CRC.get_or_init(|| is_aarch64_feature_detected!("crc"));
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        cfg!(target_feature = "crc")
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "crc")]
+unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
+    // Feed the full 64-bit lane through ARM CRC32 and then mix back with a
+    // rotated copy of the source to keep dispersion in the upper bits used by
+    // hash table indexing.
+    let crc = __crc32d(0, value) as u64;
+    ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(HASH_MIX_PRIME)
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum PrefixKernel {
@@ -2191,8 +2232,7 @@ impl DfastMatchGenerator {
     }
 
     fn hash_index(&self, value: u64) -> usize {
-        const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-        ((value.wrapping_mul(PRIME)) >> (64 - self.hash_bits)) as usize
+        (hash_mix_u64(value) >> (64 - self.hash_bits)) as usize
     }
 }
 
@@ -2421,8 +2461,7 @@ impl RowMatchGenerator {
         }
         let value =
             u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-        const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-        let hash = value.wrapping_mul(PRIME);
+        let hash = hash_mix_u64(value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
@@ -4170,7 +4209,7 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
     assert_eq!(chosen.match_len, best.match_len);
 }
 
-/// Verifies row/tag extraction uses the high bits of the multiplicative hash.
+/// Verifies row/tag extraction uses the shared hash mix bit-splitting contract.
 #[test]
 fn row_hash_and_row_extracts_high_bits() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
@@ -4192,8 +4231,7 @@ fn row_hash_and_row_extracts_high_bits() {
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
     let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-    const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-    let hash = value.wrapping_mul(PRIME);
+    let hash = hash_mix_u64(value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =
