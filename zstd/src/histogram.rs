@@ -81,6 +81,20 @@ pub(crate) fn count_bytes(data: &[u8], counts: &mut [usize; 256]) -> (usize, usi
         return count_bytes_scalar(data, counts);
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    if std::arch::is_aarch64_feature_detected!("sve2") {
+        // SAFETY: runtime detection guarantees SVE2 support for this call site.
+        return unsafe { count_bytes_sve2(data, counts) };
+    }
+
+    count_bytes_parallel(data, counts)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve2")]
+unsafe fn count_bytes_sve2(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize) {
+    // Rust stable does not expose HISTCNT intrinsics yet, so we keep the same
+    // striped algorithm while compiling this variant with SVE2 enabled.
     count_bytes_parallel(data, counts)
 }
 
