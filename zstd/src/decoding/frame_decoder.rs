@@ -239,7 +239,9 @@ impl FrameDecoder {
                     .ok_or(err::DictNotProvided { dict_id })?;
                 core::ptr::from_ref(dict)
             };
-            // Safe: dict lives in self-owned storage and outlives this call.
+            // SAFETY: `dict_ptr` comes from `owned_dicts`/`shared_dict(dict_id)` and
+            // neither map is mutated before dereference. `state` is a separate field,
+            // and only `state.decoder_scratch` / `state.using_dict` are mutated.
             let dict = unsafe { &*dict_ptr };
             let state = self.state.as_mut().expect("state initialized");
             state.decoder_scratch.init_from_dict(dict);
@@ -312,7 +314,9 @@ impl FrameDecoder {
                 .ok_or(err::DictNotProvided { dict_id })?;
             core::ptr::from_ref(dict)
         };
-        // Safe: dict lives in self-owned storage and outlives this call.
+        // SAFETY: `dict_ptr` comes from `owned_dicts`/`shared_dict(dict_id)` and
+        // neither map is mutated before dereference. `state` is a separate field,
+        // and only `state.decoder_scratch` / `state.using_dict` are mutated.
         let dict = unsafe { &*dict_ptr };
         let Some(state) = self.state.as_mut() else {
             return Err(err::NotYetInitialized);
