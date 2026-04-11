@@ -300,20 +300,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Better
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => {
-                    let block_start = all_blocks.len();
-                    compress_block_encoded(
+                    let emitted_block_type = compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         uncompressed_data,
                         &mut all_blocks,
                     );
-                    if let Some(&first_header_byte) = all_blocks.get(block_start) {
-                        let block_type = (first_header_byte >> 1) & 0b11;
-                        if block_type != 0 {
-                            all_blocks_raw = false;
-                        }
-                    } else {
+                    if emitted_block_type != crate::blocks::block::BlockType::Raw {
                         all_blocks_raw = false;
                     }
                 }
