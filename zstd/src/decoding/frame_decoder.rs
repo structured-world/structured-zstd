@@ -6,7 +6,7 @@
 
 use super::frame;
 use crate::decoding;
-use crate::decoding::dictionary::Dictionary;
+use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
@@ -71,7 +71,7 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 /// ```
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    dicts: BTreeMap<u32, Dictionary>,
+    dicts: BTreeMap<u32, DictionaryHandle>,
 }
 
 struct FrameDecoderState {
@@ -194,7 +194,7 @@ impl FrameDecoder {
                 .dicts
                 .get(&dict_id)
                 .ok_or(err::DictNotProvided { dict_id })?;
-            state.decoder_scratch.init_from_dict(dict);
+            state.decoder_scratch.init_from_dict(dict.as_ref());
             state.using_dict = Some(dict_id);
         }
         Ok(())
@@ -202,7 +202,12 @@ impl FrameDecoder {
 
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
-        self.dicts.insert(dict.id, dict);
+        self.add_dict_handle(dict.into_handle())
+    }
+
+    /// Add a pre-parsed dictionary handle for reuse across decoders.
+    pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
+        self.dicts.insert(dict.id(), dict);
         Ok(())
     }
 
@@ -216,7 +221,7 @@ impl FrameDecoder {
             .dicts
             .get(&dict_id)
             .ok_or(err::DictNotProvided { dict_id })?;
-        state.decoder_scratch.init_from_dict(dict);
+        state.decoder_scratch.init_from_dict(dict.as_ref());
         state.using_dict = Some(dict_id);
 
         Ok(())

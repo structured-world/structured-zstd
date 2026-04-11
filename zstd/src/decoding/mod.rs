@@ -4,7 +4,7 @@ pub mod errors;
 mod frame_decoder;
 mod streaming_decoder;
 
-pub use dictionary::Dictionary;
+pub use dictionary::{Dictionary, DictionaryHandle};
 pub use frame_decoder::{BlockDecodingStrategy, FrameDecoder};
 pub use streaming_decoder::StreamingDecoder;
 

@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
@@ -34,6 +35,12 @@ pub struct Dictionary {
     /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#repeat-offsets>
     /// for more.
     pub offset_hist: [u32; 3],
+}
+
+/// Shared pre-parsed dictionary handle for repeated decoding.
+#[derive(Clone)]
+pub struct DictionaryHandle {
+    inner: Arc<Dictionary>,
 }
 
 /// This 4 byte (little endian) magic number refers to the start of a dictionary
@@ -156,6 +163,45 @@ impl Dictionary {
 
         Ok(new_dict)
     }
+
+    /// Convert this parsed dictionary into a reusable shared handle.
+    pub fn into_handle(self) -> DictionaryHandle {
+        DictionaryHandle::from_dictionary(self)
+    }
+}
+
+impl DictionaryHandle {
+    /// Wrap an already-parsed dictionary in a shared handle.
+    pub fn from_dictionary(dict: Dictionary) -> Self {
+        Self {
+            inner: Arc::new(dict),
+        }
+    }
+
+    /// Parse a serialized dictionary and return a reusable shared handle.
+    pub fn decode_dict(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
+        Dictionary::decode_dict(raw).map(Self::from_dictionary)
+    }
+
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    pub fn as_dict(&self) -> &Dictionary {
+        &self.inner
+    }
+}
+
+impl AsRef<Dictionary> for DictionaryHandle {
+    fn as_ref(&self) -> &Dictionary {
+        self.as_dict()
+    }
+}
+
+impl From<Dictionary> for DictionaryHandle {
+    fn from(dict: Dictionary) -> Self {
+        DictionaryHandle::from_dictionary(dict)
+    }
 }
 
 #[cfg(test)]
@@ -254,5 +300,15 @@ mod tests {
             result,
             Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 })
         ));
+    }
+
+    #[test]
+    fn dictionary_handle_clones_share_inner() {
+        let raw = include_bytes!("../../dict_tests/dictionary");
+        let handle = DictionaryHandle::decode_dict(raw).expect("dictionary should parse");
+        let clone = handle.clone();
+
+        assert_eq!(handle.id(), clone.id());
+        assert!(Arc::ptr_eq(&handle.inner, &clone.inner));
     }
 }
