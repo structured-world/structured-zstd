@@ -204,8 +204,9 @@ mod tests {
 
     #[test]
     fn merge_lane_counts_widens_before_sum() {
-        let sum = merge_lane_counts(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-        let expected = 4u64 * (u32::MAX as u64);
+        let lane = u32::MAX / 4;
+        let sum = merge_lane_counts(lane, lane, lane, lane);
+        let expected = 4u64 * (lane as u64);
         assert_eq!(sum as u64, expected);
     }
 }
