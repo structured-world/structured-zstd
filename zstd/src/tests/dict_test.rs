@@ -344,15 +344,17 @@ fn test_decode_all_with_dict_helpers() {
     let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
 
     let mut output = vec![0u8; original.len()];
-    FrameDecoder::new()
+    let written = FrameDecoder::new()
         .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
         .expect("decode_all_with_dict_handle should succeed");
+    assert_eq!(written, original.len());
     assert_eq!(output, original);
 
     let mut output = vec![0u8; original.len()];
-    FrameDecoder::new()
+    let written = FrameDecoder::new()
         .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_raw)
         .expect("decode_all_with_dict_bytes should succeed");
+    assert_eq!(written, original.len());
     assert_eq!(output, original);
 
     let mut decoder = StreamingDecoder::new_with_dictionary_handle(compressed.as_slice(), &handle)
