@@ -4309,6 +4309,11 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
 /// Verifies row/tag extraction uses the shared hash mix bit-splitting contract.
 #[test]
 fn row_hash_and_row_extracts_high_bits() {
+    #[cfg(feature = "std")]
+    let _lock = HASH_MIX_KERNEL_TEST_LOCK
+        .lock()
+        .expect("hash mix test lock poisoned");
+
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
     matcher.add_data(
