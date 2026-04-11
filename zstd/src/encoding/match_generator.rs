@@ -103,7 +103,7 @@ fn sse42_crc_hash_available() -> bool {
     #[cfg(feature = "std")]
     {
         static HAS_SSE42: OnceLock<bool> = OnceLock::new();
-        return *HAS_SSE42.get_or_init(|| is_x86_feature_detected!("sse4.2"));
+        *HAS_SSE42.get_or_init(|| is_x86_feature_detected!("sse4.2"))
     }
 
     #[cfg(not(feature = "std"))]
@@ -116,7 +116,7 @@ fn sse42_crc_hash_available() -> bool {
 #[target_feature(enable = "sse4.2")]
 unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
     let crc = _mm_crc32_u64(0, value);
-    ((crc as u64) << 32 ^ value.rotate_left(13)).wrapping_mul(HASH_MIX_PRIME)
+    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(HASH_MIX_PRIME)
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -125,7 +125,7 @@ fn crc_hash_available() -> bool {
     #[cfg(feature = "std")]
     {
         static HAS_CRC: OnceLock<bool> = OnceLock::new();
-        return *HAS_CRC.get_or_init(|| is_aarch64_feature_detected!("crc"));
+        *HAS_CRC.get_or_init(|| is_aarch64_feature_detected!("crc"))
     }
 
     #[cfg(not(feature = "std"))]
