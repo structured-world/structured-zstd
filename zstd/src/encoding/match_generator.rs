@@ -102,8 +102,7 @@ fn hash_mix_u64(value: u64) -> u64 {
 fn sse42_crc_hash_available() -> bool {
     #[cfg(feature = "std")]
     {
-        static HAS_SSE42: OnceLock<bool> = OnceLock::new();
-        *HAS_SSE42.get_or_init(|| is_x86_feature_detected!("sse4.2"))
+        is_x86_feature_detected!("sse4.2")
     }
 
     #[cfg(not(feature = "std"))]
@@ -124,8 +123,7 @@ unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
 fn crc_hash_available() -> bool {
     #[cfg(feature = "std")]
     {
-        static HAS_CRC: OnceLock<bool> = OnceLock::new();
-        *HAS_CRC.get_or_init(|| is_aarch64_feature_detected!("crc"))
+        is_aarch64_feature_detected!("crc")
     }
 
     #[cfg(not(feature = "std"))]
@@ -4298,28 +4296,26 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
 
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[test]
-fn hash_mix_sse42_path_is_available_and_deterministic_when_supported() {
+fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported() {
     if !is_x86_feature_detected!("sse4.2") {
         return;
     }
 
     let v = 0x0123_4567_89AB_CDEFu64;
-    let a = hash_mix_u64(v);
-    let b = hash_mix_u64(v);
-    assert_eq!(a, b);
+    let accelerated = unsafe { hash_mix_u64_sse42(v) };
+    assert_eq!(hash_mix_u64(v), accelerated);
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 #[test]
-fn hash_mix_crc_path_is_available_and_deterministic_when_supported() {
+fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() {
     if !is_aarch64_feature_detected!("crc") {
         return;
     }
 
     let v = 0x0123_4567_89AB_CDEFu64;
-    let a = hash_mix_u64(v);
-    let b = hash_mix_u64(v);
-    assert_eq!(a, b);
+    let accelerated = unsafe { hash_mix_u64_crc(v) };
+    assert_eq!(hash_mix_u64(v), accelerated);
 }
 
 #[test]
