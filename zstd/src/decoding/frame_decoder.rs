@@ -69,23 +69,10 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 ///     std::io::stdout().write_all(data).unwrap();
 /// }
 /// ```
-enum StoredDictionary {
-    Owned(Dictionary),
-    Shared(DictionaryHandle),
-}
-
-impl StoredDictionary {
-    fn as_dict(&self) -> &Dictionary {
-        match self {
-            StoredDictionary::Owned(dict) => dict,
-            StoredDictionary::Shared(handle) => handle.as_dict(),
-        }
-    }
-}
-
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    dicts: BTreeMap<u32, StoredDictionary>,
+    owned_dicts: BTreeMap<u32, Dictionary>,
+    shared_dicts: BTreeMap<u32, DictionaryHandle>,
 }
 
 struct FrameDecoderState {
@@ -171,7 +158,8 @@ impl FrameDecoder {
     pub fn new() -> FrameDecoder {
         FrameDecoder {
             state: None,
-            dicts: BTreeMap::new(),
+            owned_dicts: BTreeMap::new(),
+            shared_dicts: BTreeMap::new(),
         }
     }
 
@@ -214,10 +202,15 @@ impl FrameDecoder {
         };
         if let Some(dict_id) = state.frame_header.dictionary_id() {
             let dict = self
-                .dicts
+                .owned_dicts
                 .get(&dict_id)
+                .or_else(|| {
+                    self.shared_dicts
+                        .get(&dict_id)
+                        .map(|handle| handle.as_dict())
+                })
                 .ok_or(err::DictNotProvided { dict_id })?;
-            state.decoder_scratch.init_from_dict(dict.as_dict());
+            state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
         }
         Ok(())
@@ -253,7 +246,7 @@ impl FrameDecoder {
     /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id;
-        self.dicts.insert(dict_id, StoredDictionary::Owned(dict));
+        self.owned_dicts.insert(dict_id, dict);
         Ok(())
     }
 
@@ -266,7 +259,7 @@ impl FrameDecoder {
     /// Add a pre-parsed dictionary handle for reuse across decoders.
     pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id();
-        self.dicts.insert(dict_id, StoredDictionary::Shared(dict));
+        self.shared_dicts.insert(dict_id, dict);
         Ok(())
     }
 
@@ -277,10 +270,15 @@ impl FrameDecoder {
         };
 
         let dict = self
-            .dicts
+            .owned_dicts
             .get(&dict_id)
+            .or_else(|| {
+                self.shared_dicts
+                    .get(&dict_id)
+                    .map(|handle| handle.as_dict())
+            })
             .ok_or(err::DictNotProvided { dict_id })?;
-        state.decoder_scratch.init_from_dict(dict.as_dict());
+        state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
 
         Ok(())
@@ -590,40 +588,10 @@ impl FrameDecoder {
     /// Returns the number of bytes written to `output`.
     pub fn decode_all(
         &mut self,
-        mut input: &[u8],
-        mut output: &mut [u8],
+        input: &[u8],
+        output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
-        let mut total_bytes_written = 0;
-        while !input.is_empty() {
-            match self.init(&mut input) {
-                Ok(_) => {}
-                Err(FrameDecoderError::ReadFrameHeaderError(
-                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
-                )) => {
-                    input = input
-                        .get(length as usize..)
-                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            loop {
-                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
-                let bytes_written = self
-                    .read(output)
-                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
-                output = &mut output[bytes_written..];
-                total_bytes_written += bytes_written;
-                if self.can_collect() != 0 {
-                    return Err(FrameDecoderError::TargetTooSmall);
-                }
-                if self.is_finished() {
-                    break;
-                }
-            }
-        }
-
-        Ok(total_bytes_written)
+        self.decode_all_impl(input, output, |this, src| this.init(src))
     }
 
     /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
@@ -637,13 +605,24 @@ impl FrameDecoder {
     /// decoder will be lost.
     pub fn decode_all_with_dict_handle(
         &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        dict: &DictionaryHandle,
+    ) -> Result<usize, FrameDecoderError> {
+        self.decode_all_impl(input, output, |this, src| {
+            this.init_with_dict_handle(src, dict)
+        })
+    }
+
+    fn decode_all_impl(
+        &mut self,
         mut input: &[u8],
         mut output: &mut [u8],
-        dict: &DictionaryHandle,
+        mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
-            match self.init_with_dict_handle(&mut input, dict) {
+            match init_frame(self, &mut input) {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },

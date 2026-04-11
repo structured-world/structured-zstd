@@ -1,7 +1,7 @@
-#[cfg(target_has_atomic = "ptr")]
-use alloc::sync::Arc;
 #[cfg(not(target_has_atomic = "ptr"))]
 use alloc::rc::Rc;
+#[cfg(target_has_atomic = "ptr")]
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 

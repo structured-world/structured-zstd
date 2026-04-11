@@ -264,9 +264,9 @@ fn test_dict_decoding() {
 #[test]
 fn test_decode_all_with_dict_helpers() {
     extern crate std;
+    use crate::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
     use alloc::vec;
     use alloc::vec::Vec;
-    use crate::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
     use std::fs;
     use std::io::Read;
 
@@ -286,16 +286,14 @@ fn test_decode_all_with_dict_helpers() {
         .expect("decode_all_with_dict_bytes should succeed");
     assert_eq!(output, original);
 
-    let mut decoder =
-        StreamingDecoder::new_with_dictionary_handle(compressed.as_slice(), &handle)
-            .expect("streaming decoder should init");
+    let mut decoder = StreamingDecoder::new_with_dictionary_handle(compressed.as_slice(), &handle)
+        .expect("streaming decoder should init");
     let mut streamed = Vec::new();
     Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
     assert_eq!(streamed, original);
 
-    let mut decoder =
-        StreamingDecoder::new_with_dictionary_bytes(compressed.as_slice(), &dict_raw)
-            .expect("streaming decoder should init");
+    let mut decoder = StreamingDecoder::new_with_dictionary_bytes(compressed.as_slice(), &dict_raw)
+        .expect("streaming decoder should init");
     let mut streamed = Vec::new();
     Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
     assert_eq!(streamed, original);
@@ -329,6 +327,13 @@ fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
         .expect("expected at least one .zst file in dict_tests/files");
 
     let compressed = fs::read(&file_path).expect("compressed data should load");
+    let mut header_src = compressed.as_slice();
+    let (header, _) = crate::decoding::frame::read_frame_header(&mut header_src)
+        .expect("sample frame header should parse");
+    assert!(
+        header.dictionary_id().is_some(),
+        "sample fixture must require a dictionary"
+    );
     let original_path = file_path
         .to_str()
         .expect("dict test path should be utf-8")
