@@ -500,6 +500,7 @@ pub enum FrameDecoderError {
     FailedToSkipFrame,
     TargetTooSmall,
     DictNotProvided { dict_id: u32 },
+    DictIdMismatch { expected: u32, provided: u32 },
     DictAlreadyRegistered { dict_id: u32 },
 }
 
@@ -576,7 +577,13 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::DictNotProvided { dict_id } => {
                 write!(
                     f,
-                    "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict()/add_dict_from_bytes() or reset_with_dict_handle()/decode_all_with_dict_handle()/decode_all_with_dict_bytes()"
+                    "Frame header specified dictionary id 0x{dict_id:X} that wasn't provided via add_dict()/add_dict_from_bytes() (or add_dict_handle() on atomic targets) or reset_with_dict_handle()/decode_all_with_dict_handle()/decode_all_with_dict_bytes()"
+                )
+            }
+            FrameDecoderError::DictIdMismatch { expected, provided } => {
+                write!(
+                    f,
+                    "Frame header dictionary id 0x{expected:X} does not match provided dictionary id 0x{provided:X}"
                 )
             }
             FrameDecoderError::DictAlreadyRegistered { dict_id } => {
@@ -1236,7 +1243,15 @@ mod tests {
         );
         assert_eq!(
             FrameDecoderError::DictNotProvided { dict_id: 0xABCD }.to_string(),
-            "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict()/add_dict_from_bytes() or reset_with_dict_handle()/decode_all_with_dict_handle()/decode_all_with_dict_bytes()"
+            "Frame header specified dictionary id 0xABCD that wasn't provided via add_dict()/add_dict_from_bytes() (or add_dict_handle() on atomic targets) or reset_with_dict_handle()/decode_all_with_dict_handle()/decode_all_with_dict_bytes()"
+        );
+        assert_eq!(
+            FrameDecoderError::DictIdMismatch {
+                expected: 0xABCD,
+                provided: 0x1234
+            }
+            .to_string(),
+            "Frame header dictionary id 0xABCD does not match provided dictionary id 0x1234"
         );
         assert_eq!(
             FrameDecoderError::DictAlreadyRegistered { dict_id: 0xABCD }.to_string(),

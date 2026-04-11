@@ -269,7 +269,10 @@ impl FrameDecoder {
         };
         if let Some(dict_id) = state.frame_header.dictionary_id() {
             if dict_id != dict.id() {
-                return Err(err::DictNotProvided { dict_id });
+                return Err(err::DictIdMismatch {
+                    expected: dict_id,
+                    provided: dict.id(),
+                });
             }
             state.decoder_scratch.init_from_dict(dict.as_ref());
             state.using_dict = Some(dict_id);
@@ -306,6 +309,9 @@ impl FrameDecoder {
 
     pub fn force_dict(&mut self, dict_id: u32) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        if self.state.is_none() {
+            return Err(err::NotYetInitialized);
+        }
         let dict_ptr = {
             let dict = self
                 .owned_dicts
@@ -318,9 +324,7 @@ impl FrameDecoder {
         // neither map is mutated before dereference. `state` is a separate field,
         // and only `state.decoder_scratch` / `state.using_dict` are mutated.
         let dict = unsafe { &*dict_ptr };
-        let Some(state) = self.state.as_mut() else {
-            return Err(err::NotYetInitialized);
-        };
+        let state = self.state.as_mut().expect("state checked above");
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
 

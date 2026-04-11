@@ -457,8 +457,19 @@ fn test_reset_with_dict_handle_rejects_mismatched_id() {
 
     assert!(matches!(
         result,
-        Err(FrameDecoderError::DictNotProvided { dict_id }) if dict_id == expected_dict_id
+        Err(FrameDecoderError::DictIdMismatch { expected, provided })
+            if expected == expected_dict_id && provided == mismatched_id
     ));
+}
+
+#[test]
+fn test_force_dict_requires_initialization_before_dict_lookup() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
+
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.force_dict(0xABCD);
+    assert!(matches!(result, Err(FrameDecoderError::NotYetInitialized)));
 }
 
 #[cfg(test)]
