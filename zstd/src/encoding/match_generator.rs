@@ -39,6 +39,7 @@ const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
 const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
 const DFAST_MIN_MATCH_LEN: usize = 6;
+const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 const ROW_MIN_MATCH_LEN: usize = 6;
 const DFAST_TARGET_LEN: usize = 48;
 // Keep these aligned with the issue's zstd level-3/dfast target unless ratio
@@ -1911,7 +1912,7 @@ impl DfastMatchGenerator {
         pos: usize,
     ) {
         let mut seed_pos = pos.min(current_len);
-        while seed_pos + DFAST_MIN_MATCH_LEN <= current_len {
+        while seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= current_len {
             self.insert_position(current_abs_start + seed_pos);
             seed_pos += 1;
         }
@@ -5097,6 +5098,32 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
     assert!(
         matcher.long_hash[long_hash].contains(&target_abs_pos),
         "dense skip must seed long-hash entry for newly hashable boundary start"
+    );
+}
+
+#[test]
+fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
+    let mut matcher = DfastMatchGenerator::new(1 << 20);
+    let block = deterministic_high_entropy_bytes(0x13F0_9A6D_55CE_7B21, 64);
+    matcher.add_data(block, |_| {});
+    matcher.ensure_hash_tables();
+
+    let current_len = matcher.window.back().unwrap().len();
+    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
+    let seed_start = current_len - DFAST_MIN_MATCH_LEN;
+    matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
+
+    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_rel = target_abs_pos - matcher.history_abs_start;
+    let live = matcher.live_history();
+    assert!(
+        target_rel + 4 <= live.len(),
+        "fixture must leave the last short-hash start valid"
+    );
+    let short_hash = matcher.hash4(&live[target_rel..]);
+    assert!(
+        matcher.short_hash[short_hash].contains(&target_abs_pos),
+        "tail seeding must include the last 4-byte-hashable start"
     );
 }
 

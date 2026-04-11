@@ -657,7 +657,7 @@ mod tests {
             super::CompressionLevel::Level(11),
         ];
         let sizes = [
-            513usize, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191, 16_384, 16_385,
+            511usize, 512, 513, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191, 16_384, 16_385,
         ];
 
         for (seed_idx, seed) in [11u64, 23, 41].into_iter().enumerate() {
@@ -673,6 +673,14 @@ mod tests {
                         compressor.compress();
                         out
                     };
+                    if matches!(size, 511 | 512) {
+                        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                        assert_eq!(
+                            frame_header.descriptor.single_segment_flag(),
+                            size == 512,
+                            "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
+                        );
+                    }
 
                     let mut decoded = Vec::new();
                     zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
@@ -736,6 +744,54 @@ mod tests {
                     )
                 });
                 assert_eq!(decoded, data);
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hinted_levels_pin_511_512_single_segment_boundary() {
+        let levels = [
+            super::CompressionLevel::Fastest,
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Better,
+            super::CompressionLevel::Best,
+            super::CompressionLevel::Level(0),
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(3),
+            super::CompressionLevel::Level(4),
+            super::CompressionLevel::Level(11),
+        ];
+        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
+            for &size in &[511usize, 512] {
+                let data = generate_data(seed + seed_idx as u64, size);
+                for &level in &levels {
+                    let compressed = {
+                        let mut compressor = FrameCompressor::new(level);
+                        compressor.set_source_size_hint(data.len() as u64);
+                        compressor.set_source(data.as_slice());
+                        let mut out = Vec::new();
+                        compressor.set_drain(&mut out);
+                        compressor.compress();
+                        out
+                    };
+                    let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
+                    assert_eq!(
+                        frame_header.descriptor.single_segment_flag(),
+                        size == 512,
+                        "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
+                    );
+                    let mut decoded = Vec::new();
+                    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "ffi decode failed at single-segment boundary: level={level:?} size={size} seed={} err={e}",
+                                seed + seed_idx as u64
+                            )
+                        },
+                    );
+                    assert_eq!(decoded, data);
+                }
             }
         }
     }
