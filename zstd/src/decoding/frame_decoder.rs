@@ -190,6 +190,23 @@ impl FrameDecoder {
     }
 
     /// Initialize the decoder for a new frame using a pre-parsed dictionary handle.
+    ///
+    /// If the frame header has a dictionary ID, this validates it against
+    /// `dict.id()` and returns [`FrameDecoderError::DictIdMismatch`] on mismatch.
+    ///
+    /// If the header omits the optional dictionary ID, this still applies the
+    /// provided dictionary handle.
+    ///
+    /// # Warning
+    ///
+    /// This method always applies `dict` unless the frame header contains a
+    /// non-matching dictionary ID. Callers must only use this API when they
+    /// already know the frame was encoded with the provided dictionary, even if
+    /// the frame header omits the dictionary ID or encodes an explicit
+    /// dictionary ID of `0`.
+    ///
+    /// Passing a dictionary for a frame that was not encoded with it can
+    /// silently corrupt the decoded output.
     pub fn init_with_dict_handle(
         &mut self,
         source: impl Read,
@@ -672,6 +689,13 @@ impl FrameDecoder {
     ///
     /// This calls [`FrameDecoder::init_with_dict_handle`], and all bytes currently in the
     /// decoder will be lost.
+    ///
+    /// # Warning
+    ///
+    /// Each decoded frame is initialized with `dict`, even when a frame header
+    /// omits the optional dictionary ID. Callers must only use this API when
+    /// they already know the input frames were encoded with the provided
+    /// dictionary; otherwise decoded output can be silently corrupted.
     pub fn decode_all_with_dict_handle(
         &mut self,
         input: &[u8],

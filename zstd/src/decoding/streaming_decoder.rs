@@ -67,6 +67,14 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     }
 
     /// Create a streaming decoder using a pre-parsed dictionary handle.
+    ///
+    /// # Warning
+    ///
+    /// This constructor initializes the underlying [`FrameDecoder`] with
+    /// `dict`, even if a frame header omits the optional dictionary ID.
+    /// Callers must only use it when they already know the stream was encoded
+    /// with this dictionary; otherwise decoded output can be silently
+    /// corrupted.
     pub fn new_with_dictionary_handle(
         mut source: READ,
         dict: &DictionaryHandle,
@@ -77,6 +85,13 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     }
 
     /// Create a streaming decoder using a serialized dictionary blob.
+    ///
+    /// # Warning
+    ///
+    /// This API forwards to [`StreamingDecoder::new_with_dictionary_handle`]
+    /// and therefore applies the decoded dictionary to frames whose headers may
+    /// omit the optional dictionary ID. Only use it when the stream is known to
+    /// be encoded with that dictionary.
     pub fn new_with_dictionary_bytes(
         source: READ,
         raw_dictionary: &[u8],
