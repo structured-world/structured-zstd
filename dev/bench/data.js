@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775929705087,
+  "lastUpdate": 1775990629510,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -23852,6 +23852,480 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "495a38d04b6f069c2dd3ef72a09029e790131fb8",
+          "message": "perf(decoding): add shared dictionary handle (#105)\n\n* perf(decoding): add shared dictionary handle\n\n* perf(decoding): add prepared dict decode path\n\n* fix(decoding): address review feedback\n\n- use Rc on non-atomic targets for DictionaryHandle\n- keep add_dict allocation-free and add dict decode tests\n- add benchmark preflight correctness checks\n\n* refactor(decoding): share decode loop\n\n- reuse shared multi-frame decode helper\n- ensure sample dict fixture requires a dictionary\n\n* test(decoding): raise patch coverage\n\n- cover decode_all skip and target-too-small paths\n- exercise DictionaryHandle conversions\n\n* test(decoding): cover dict handle edges\n\n- cover add_dict_from_bytes and mismatched dict handle reset\n- exercise dictionary handle as_ref via into_handle\n- document decode_all skipping skippable frames\n\n* test(decoding): assert decode_all written length\n\n- assert decode_all_* returns original length\n- guard against zero-filled false positives\n\n* fix(decoding): guard dict handle usage\n\n- prevent duplicate dict ids across owned/shared maps\n- gate shared dict storage on atomic targets\n- assert decode_all writes full length and harden bench allocations\n\n* docs(readme): document dictionary decode api and strategy gaps\n\n- add dictionary-backed decode examples for handle and raw-bytes paths\n- clarify implemented compression backend coverage by level\n- list currently unimplemented strategy families (greedy, btopt, btultra)\n\n* fix(decoding): keep no_std ptr path and update dict error text\n\n* fix(decoding): clarify dict safety note and error guidance\n\n* fix(decoding): clarify dict mismatch and force_dict preconditions\n\n* fix(decoding): apply explicit dict when frame omits dict id\n\n* docs(decoding): document duplicate dict registration errors\n\n* refactor(decoding): remove unsafe dictionary borrows\n\n* fix(decoding): gate shared dictionary lookups\n\n* test(decoding): add force_dict regression coverage\n\n* refactor(decoding): remove unsafe force_dict lookup\n\n* fix(decoding): remove unsafe reset dict lookup\n\n* docs(decoding): warn about dict-handle misuse\n\n* docs(decoding): mirror dict-handle safety warnings\n\n* refactor(decoding): unify shared dict accessor naming\n\n* fix(decoding): validate registered dictionary invariants\n\n* fix(decoding): validate dict handles before reset\n\n* style(decoding): unify DictionaryHandle accessor usage\n\n* test(decoding): validate DictionaryHandle AsRef in unit test",
+          "timestamp": "2026-04-12T13:14:10+03:00",
+          "tree_id": "7528a60734c1b6285b1841f2fdaac375b7f047af",
+          "url": "https://github.com/structured-world/structured-zstd/commit/495a38d04b6f069c2dd3ef72a09029e790131fb8"
+        },
+        "date": 1775990628246,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.071,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.04,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.044,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.041,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
+            "value": 17.521,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.908,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 115.148,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 3.725,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 66.802,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 9.916,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/pure_rust",
+            "value": 55.268,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
+            "value": 76.118,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
+            "value": 14.814,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.204,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 9.832,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.253,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 3.645,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.558,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 5.231,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 3.668,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 0.861,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.174,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.468,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.592,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.768,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.732,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.41,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.769,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.843,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.253,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.477,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.635,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.811,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.744,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.375,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.787,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.847,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.228,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.471,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.553,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.789,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.277,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.285,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
             "unit": "ms"
           }
         ]
