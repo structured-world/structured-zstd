@@ -139,19 +139,24 @@ unsafe fn copy_baseline_avx512(mut src: *const u8, mut dst: *mut u8, len: usize)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn select_candidate_copy_kernel(len: usize, baseline_chunk: usize) -> BenchPath {
+fn select_candidate_copy_kernel(len: usize, baseline_path: BenchPath) -> Option<BenchPath> {
+    if baseline_path.name == "baseline_avx512" {
+        // Skip AVX2 candidate when production baseline is AVX-512.
+        return None;
+    }
+
     if std::arch::is_x86_feature_detected!("avx2") && len >= 64 {
-        BenchPath {
+        Some(BenchPath {
             name: "candidate_avx2_unroll2",
-            chunk: baseline_chunk,
+            chunk: baseline_path.chunk,
             kernel: copy_candidate_unroll2_avx2,
-        }
+        })
     } else {
-        BenchPath {
+        Some(BenchPath {
             name: "candidate_scalar_fallback",
-            chunk: baseline_chunk,
+            chunk: baseline_path.chunk,
             kernel: copy_candidate_scalar,
-        }
+        })
     }
 }
 
@@ -230,7 +235,7 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
 
     for len in lengths {
         let baseline_path = select_baseline_copy_kernel(len);
-        let candidate_path = select_candidate_copy_kernel(len, baseline_path.chunk);
+        let candidate_path = select_candidate_copy_kernel(len, baseline_path);
         let mut src = vec![0u8; len + 64];
         rng.fill(&mut src);
         let mut dst_production = vec![0u8; len + 64];
@@ -249,21 +254,27 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
                 len,
                 baseline_path,
             );
-            copy_with_overshoot_policy(
-                (src.as_ptr(), src.len()),
-                (dst_candidate.as_mut_ptr(), dst_candidate.len()),
-                len,
-                candidate_path,
-            );
+            if let Some(path) = candidate_path {
+                copy_with_overshoot_policy(
+                    (src.as_ptr(), src.len()),
+                    (dst_candidate.as_mut_ptr(), dst_candidate.len()),
+                    len,
+                    path,
+                );
+            }
         }
+        let check_len = len.next_multiple_of(baseline_path.chunk);
         assert_eq!(
-            &dst_baseline[..len],
-            &dst_production[..len],
+            &dst_baseline[..check_len],
+            &dst_production[..check_len],
             "baseline path must match production wildcopy for len={len}"
         );
+        if candidate_path.is_none() {
+            continue;
+        }
         assert_eq!(
-            &dst_candidate[..len],
-            &dst_production[..len],
+            &dst_candidate[..check_len],
+            &dst_production[..check_len],
             "candidate path must match production wildcopy for len={len}"
         );
 
@@ -287,23 +298,25 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new(candidate_path.name, len),
-            &len,
-            |b, &copy_len| {
-                b.iter(|| unsafe {
-                    let src_buf = black_box(src.as_slice());
-                    let dst_buf = black_box(dst_candidate.as_mut_slice());
-                    copy_with_overshoot_policy(
-                        (black_box(src_buf.as_ptr()), src_buf.len()),
-                        (black_box(dst_buf.as_mut_ptr()), dst_buf.len()),
-                        black_box(copy_len),
-                        candidate_path,
-                    );
-                    black_box(dst_buf[copy_len - 1]);
-                });
-            },
-        );
+        if let Some(candidate_path) = candidate_path {
+            group.bench_with_input(
+                BenchmarkId::new(candidate_path.name, len),
+                &len,
+                |b, &copy_len| {
+                    b.iter(|| unsafe {
+                        let src_buf = black_box(src.as_slice());
+                        let dst_buf = black_box(dst_candidate.as_mut_slice());
+                        copy_with_overshoot_policy(
+                            (black_box(src_buf.as_ptr()), src_buf.len()),
+                            (black_box(dst_buf.as_mut_ptr()), dst_buf.len()),
+                            black_box(copy_len),
+                            candidate_path,
+                        );
+                        black_box(dst_buf[copy_len - 1]);
+                    });
+                },
+            );
+        }
     }
 
     group.finish();

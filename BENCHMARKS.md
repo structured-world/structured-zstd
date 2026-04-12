@@ -69,7 +69,8 @@ Local sample measurements from `wildcopy_candidates` (ns/iter):
 - `16384B`: baseline `347` -> candidate `268`
 - `65536B`: baseline `1368` -> candidate `1121`
 
-Decision: **GO** for production integration of AVX2 unroll2 candidate.
+Decision: **Provisional GO (microbench only)** for AVX2 unroll2 candidate,
+based on local `wildcopy_candidates` microbench data; this does not close issue #87.
 
 Follow-up implementation issue: [#108](https://github.com/structured-world/structured-zstd/issues/108).
 
