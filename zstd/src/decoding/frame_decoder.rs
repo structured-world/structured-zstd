@@ -316,7 +316,7 @@ impl FrameDecoder {
                 provided: dict.id(),
             });
         }
-        state.decoder_scratch.init_from_dict(dict.as_ref());
+        state.decoder_scratch.init_from_dict(dict.as_dict());
         state.using_dict = Some(dict.id());
         Ok(())
     }
