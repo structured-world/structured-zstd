@@ -21,4 +21,6 @@ mod ringbuffer;
 pub(crate) mod scratch;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
-pub(crate) mod simd_copy;
+mod simd_copy;
+#[cfg(feature = "bench_internals")]
+pub use self::simd_copy::copy_bytes_overshooting_for_bench;
