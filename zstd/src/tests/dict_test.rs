@@ -343,8 +343,8 @@ fn test_decode_all_with_dict_helpers() {
     use std::io::Read;
 
     let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
-    let (compressed, original) = load_sample_dict_frame();
     let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let (compressed, original) = load_sample_dict_frame(handle.id());
 
     let mut output = vec![0u8; original.len()];
     let mut decoder = FrameDecoder::new();
@@ -385,7 +385,10 @@ fn test_add_dict_from_bytes_allows_decode_all() {
     use std::fs;
 
     let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
-    let (compressed, original) = load_sample_dict_frame();
+    let expected_dict_id = Dictionary::decode_dict(&dict_raw)
+        .expect("dictionary should parse")
+        .id;
+    let (compressed, original) = load_sample_dict_frame(expected_dict_id);
 
     let mut output = vec![0u8; original.len()];
     let mut decoder = FrameDecoder::new();
@@ -455,7 +458,7 @@ fn test_reset_with_dict_handle_rejects_mismatched_id() {
         .expect("mismatched dictionary should build");
     let handle = DictionaryHandle::from_dictionary(mismatched);
 
-    let (compressed, _original) = load_sample_dict_frame();
+    let (compressed, _original) = load_sample_dict_frame(expected_dict_id);
     let mut decoder = FrameDecoder::new();
     let result = decoder.reset_with_dict_handle(compressed.as_slice(), &handle);
 
@@ -484,9 +487,9 @@ fn test_force_dict_reports_missing_dict_after_initialization() {
     use crate::decoding::errors::FrameDecoderError;
     use std::fs;
 
-    let (compressed, _original) = load_sample_dict_frame();
     let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
     let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let (compressed, _original) = load_sample_dict_frame(handle.id());
     let mut decoder = FrameDecoder::new();
     decoder
         .reset_with_dict_handle(compressed.as_slice(), &handle)
@@ -512,7 +515,7 @@ fn test_force_dict_accepts_shared_handle_after_initialization() {
     let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
     let dict_id = handle.id();
 
-    let (compressed, _original) = load_sample_dict_frame();
+    let (compressed, _original) = load_sample_dict_frame(dict_id);
     let mut decoder = FrameDecoder::new();
     decoder
         .add_dict_handle(handle)
@@ -526,7 +529,7 @@ fn test_force_dict_accepts_shared_handle_after_initialization() {
 }
 
 #[cfg(test)]
-fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+fn load_sample_dict_frame(expected_dict_id: u32) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
     extern crate std;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
@@ -557,7 +560,7 @@ fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
             let compressed = fs::read(&path).ok()?;
             let mut header_src = compressed.as_slice();
             let (header, _) = crate::decoding::frame::read_frame_header(&mut header_src).ok()?;
-            if header.dictionary_id().is_some() {
+            if header.dictionary_id() == Some(expected_dict_id) {
                 Some((path, compressed))
             } else {
                 None
