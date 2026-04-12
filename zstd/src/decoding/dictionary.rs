@@ -317,9 +317,10 @@ mod tests {
     fn dictionary_handle_from_raw_content_supports_as_ref() {
         let dict = Dictionary::from_raw_content(7, vec![42]).expect("raw dict should build");
         let handle = dict.into_handle();
+        let dict_ref: &Dictionary = handle.as_ref();
 
-        assert_eq!(handle.as_dict().id, 7);
-        assert_eq!(handle.as_dict().dict_content.as_slice(), &[42]);
+        assert_eq!(dict_ref.id, 7);
+        assert_eq!(dict_ref.dict_content.as_slice(), &[42]);
     }
 
     #[test]
