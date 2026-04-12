@@ -6,7 +6,7 @@
 
 use super::frame;
 use crate::decoding;
-use crate::decoding::dictionary::Dictionary;
+use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
@@ -71,7 +71,11 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 /// ```
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    dicts: BTreeMap<u32, Dictionary>,
+    owned_dicts: BTreeMap<u32, Dictionary>,
+    #[cfg(target_has_atomic = "ptr")]
+    shared_dicts: BTreeMap<u32, DictionaryHandle>,
+    #[cfg(not(target_has_atomic = "ptr"))]
+    shared_dicts: (),
 }
 
 struct FrameDecoderState {
@@ -157,8 +161,36 @@ impl FrameDecoder {
     pub fn new() -> FrameDecoder {
         FrameDecoder {
             state: None,
-            dicts: BTreeMap::new(),
+            owned_dicts: BTreeMap::new(),
+            #[cfg(target_has_atomic = "ptr")]
+            shared_dicts: BTreeMap::new(),
+            #[cfg(not(target_has_atomic = "ptr"))]
+            shared_dicts: (),
         }
+    }
+
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_dict_exists(&self, dict_id: u32) -> bool {
+        self.shared_dicts.contains_key(&dict_id)
+    }
+
+    #[cfg(not(target_has_atomic = "ptr"))]
+    fn shared_dict_exists(&self, _dict_id: u32) -> bool {
+        false
+    }
+
+    fn validate_registered_dictionary(dict: &Dictionary) -> Result<(), FrameDecoderError> {
+        use crate::decoding::errors::DictionaryDecodeError as dict_err;
+
+        if dict.id == 0 {
+            return Err(FrameDecoderError::from(dict_err::ZeroDictionaryId));
+        }
+        if let Some(index) = dict.offset_hist.iter().position(|&rep| rep == 0) {
+            return Err(FrameDecoderError::from(
+                dict_err::ZeroRepeatOffsetInDictionary { index: index as u8 },
+            ));
+        }
+        Ok(())
     }
 
     /// init() will allocate all needed buffers if it is the first time this decoder is used
@@ -171,6 +203,32 @@ impl FrameDecoder {
         self.reset(source)
     }
 
+    /// Initialize the decoder for a new frame using a pre-parsed dictionary handle.
+    ///
+    /// If the frame header has a dictionary ID, this validates it against
+    /// `dict.id()` and returns [`FrameDecoderError::DictIdMismatch`] on mismatch.
+    ///
+    /// If the header omits the optional dictionary ID, this still applies the
+    /// provided dictionary handle.
+    ///
+    /// # Warning
+    ///
+    /// This method always applies `dict` unless the frame header contains a
+    /// non-matching dictionary ID. Callers must only use this API when they
+    /// already know the frame was encoded with the provided dictionary, even if
+    /// the frame header omits the dictionary ID or encodes an explicit
+    /// dictionary ID of `0`.
+    ///
+    /// Passing a dictionary for a frame that was not encoded with it can
+    /// silently corrupt the decoded output.
+    pub fn init_with_dict_handle(
+        &mut self,
+        source: impl Read,
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
+        self.reset_with_dict_handle(source, dict)
+    }
+
     /// reset() will allocate all needed buffers if it is the first time this decoder is used
     /// else they just reset these buffers with not further allocations
     ///
@@ -179,6 +237,67 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        let dict_id = match &mut self.state {
+            Some(s) => {
+                s.reset(source)?;
+                s.frame_header.dictionary_id()
+            }
+            None => {
+                self.state = Some(FrameDecoderState::new(source)?);
+                self.state
+                    .as_ref()
+                    .and_then(|state| state.frame_header.dictionary_id())
+            }
+        };
+        if let Some(dict_id) = dict_id {
+            let state = self.state.as_mut().expect("state initialized");
+            let owned_dicts = &self.owned_dicts;
+            #[cfg(target_has_atomic = "ptr")]
+            let shared_dicts = &self.shared_dicts;
+            let dict = owned_dicts
+                .get(&dict_id)
+                .or_else(|| {
+                    #[cfg(target_has_atomic = "ptr")]
+                    {
+                        shared_dicts.get(&dict_id).map(DictionaryHandle::as_dict)
+                    }
+                    #[cfg(not(target_has_atomic = "ptr"))]
+                    {
+                        None
+                    }
+                })
+                .ok_or(err::DictNotProvided { dict_id })?;
+            state.decoder_scratch.init_from_dict(dict);
+            state.using_dict = Some(dict_id);
+        }
+        Ok(())
+    }
+
+    /// Reset this decoder for a new frame using a pre-parsed dictionary handle.
+    ///
+    /// If the frame header has a dictionary ID, this validates it against
+    /// `dict.id()` and returns [`FrameDecoderError::DictIdMismatch`] on mismatch.
+    ///
+    /// If the header omits the optional dictionary ID, this still applies the
+    /// provided dictionary handle.
+    ///
+    /// # Warning
+    ///
+    /// This method always applies `dict` unless the frame header contains a
+    /// non-matching dictionary ID. Callers must only use this API when they
+    /// already know the frame was encoded with the provided dictionary, even if
+    /// the frame header omits the dictionary ID or encodes an explicit
+    /// dictionary ID of `0`.
+    ///
+    /// Passing a dictionary for a frame that was not encoded with it can
+    /// silently corrupt the decoded output.
+    pub fn reset_with_dict_handle(
+        &mut self,
+        source: impl Read,
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        Self::validate_registered_dictionary(dict.as_dict())?;
         let state = match &mut self.state {
             Some(s) => {
                 s.reset(source)?;
@@ -189,32 +308,76 @@ impl FrameDecoder {
                 self.state.as_mut().unwrap()
             }
         };
-        if let Some(dict_id) = state.frame_header.dictionary_id() {
-            let dict = self
-                .dicts
-                .get(&dict_id)
-                .ok_or(err::DictNotProvided { dict_id })?;
-            state.decoder_scratch.init_from_dict(dict);
-            state.using_dict = Some(dict_id);
+        if let Some(dict_id) = state.frame_header.dictionary_id()
+            && dict_id != dict.id()
+        {
+            return Err(err::DictIdMismatch {
+                expected: dict_id,
+                provided: dict.id(),
+            });
         }
+        state.decoder_scratch.init_from_dict(dict.as_dict());
+        state.using_dict = Some(dict.id());
         Ok(())
     }
 
-    /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
+    /// Add a dictionary that can be selected dynamically by frame dictionary ID.
+    ///
+    /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
+    /// registered (either as owned or shared).
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
-        self.dicts.insert(dict.id, dict);
+        Self::validate_registered_dictionary(&dict)?;
+        let dict_id = dict.id;
+        if self.owned_dicts.contains_key(&dict_id) || self.shared_dict_exists(dict_id) {
+            return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
+        }
+        self.owned_dicts.insert(dict_id, dict);
+        Ok(())
+    }
+
+    /// Parse and add a serialized dictionary blob.
+    pub fn add_dict_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), FrameDecoderError> {
+        let dict = Dictionary::decode_dict(raw_dictionary)?;
+        self.add_dict(dict)
+    }
+
+    /// Add a pre-parsed dictionary handle for reuse across decoders.
+    ///
+    /// This API is available on targets with pointer-width atomics
+    /// (`target_has_atomic = "ptr"`).
+    ///
+    /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
+    /// registered (either as owned or shared).
+    #[cfg(target_has_atomic = "ptr")]
+    pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
+        Self::validate_registered_dictionary(dict.as_dict())?;
+        let dict_id = dict.id();
+        if self.owned_dicts.contains_key(&dict_id) || self.shared_dicts.contains_key(&dict_id) {
+            return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
+        }
+        self.shared_dicts.insert(dict_id, dict);
         Ok(())
     }
 
     pub fn force_dict(&mut self, dict_id: u32) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
-        let Some(state) = self.state.as_mut() else {
-            return Err(err::NotYetInitialized);
-        };
+        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        let owned_dicts = &self.owned_dicts;
+        #[cfg(target_has_atomic = "ptr")]
+        let shared_dicts = &self.shared_dicts;
 
-        let dict = self
-            .dicts
+        let dict = owned_dicts
             .get(&dict_id)
+            .or_else(|| {
+                #[cfg(target_has_atomic = "ptr")]
+                {
+                    shared_dicts.get(&dict_id).map(DictionaryHandle::as_dict)
+                }
+                #[cfg(not(target_has_atomic = "ptr"))]
+                {
+                    None
+                }
+            })
             .ok_or(err::DictNotProvided { dict_id })?;
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
@@ -516,7 +679,8 @@ impl FrameDecoder {
 
     /// Decode multiple frames into the output slice.
     ///
-    /// `input` must contain an exact number of frames.
+    /// `input` must contain an exact number of frames. Skippable frames are allowed and will be
+    /// skipped during decode.
     ///
     /// `output` must be large enough to hold the decompressed data. If you don't know
     /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
@@ -526,12 +690,49 @@ impl FrameDecoder {
     /// Returns the number of bytes written to `output`.
     pub fn decode_all(
         &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, FrameDecoderError> {
+        self.decode_all_impl(input, output, |this, src| this.init(src))
+    }
+
+    /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
+    ///
+    /// `input` must contain an exact number of frames. Skippable frames are allowed and will be
+    /// skipped during decode.
+    ///
+    /// `output` must be large enough to hold the decompressed data. If you don't know
+    /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
+    ///
+    /// This calls [`FrameDecoder::init_with_dict_handle`], and all bytes currently in the
+    /// decoder will be lost.
+    ///
+    /// # Warning
+    ///
+    /// Each decoded frame is initialized with `dict`, even when a frame header
+    /// omits the optional dictionary ID. Callers must only use this API when
+    /// they already know the input frames were encoded with the provided
+    /// dictionary; otherwise decoded output can be silently corrupted.
+    pub fn decode_all_with_dict_handle(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        dict: &DictionaryHandle,
+    ) -> Result<usize, FrameDecoderError> {
+        self.decode_all_impl(input, output, |this, src| {
+            this.init_with_dict_handle(src, dict)
+        })
+    }
+
+    fn decode_all_impl(
+        &mut self,
         mut input: &[u8],
         mut output: &mut [u8],
+        mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
-            match self.init(&mut input) {
+            match init_frame(self, &mut input) {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
@@ -560,6 +761,24 @@ impl FrameDecoder {
         }
 
         Ok(total_bytes_written)
+    }
+
+    /// Decode multiple frames into the output slice using a serialized dictionary.
+    ///
+    /// # Warning
+    ///
+    /// Each decoded frame is initialized with the parsed dictionary, even when a
+    /// frame header omits the optional dictionary ID. Callers must only use this
+    /// API when they already know the input frames were encoded with that
+    /// dictionary; otherwise decoded output can be silently corrupted.
+    pub fn decode_all_with_dict_bytes(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        raw_dictionary: &[u8],
+    ) -> Result<usize, FrameDecoderError> {
+        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
+        self.decode_all_with_dict_handle(input, output, &dict)
     }
 
     /// Decode multiple frames into the extra capacity of the output vector.
@@ -609,5 +828,35 @@ impl Read for FrameDecoder {
         } else {
             state.decoder_scratch.buffer.read(target)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{DictionaryHandle, FrameDecoder};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec::Vec;
+
+    #[test]
+    fn reset_with_dict_handle_applies_dict_when_no_dict_id() {
+        let payload = b"reset-without-dict-id";
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
+
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .reset_with_dict_handle(compressed.as_slice(), &handle)
+            .expect("reset should succeed");
+        let state = decoder.state.as_ref().expect("state should be initialized");
+        assert!(state.frame_header.dictionary_id().is_none());
+        assert_eq!(state.using_dict, Some(handle.id()));
     }
 }

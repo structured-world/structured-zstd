@@ -75,9 +75,29 @@ fn test_dict_parsing() {
 }
 
 #[test]
+fn test_dictionary_handle_from_dictionary_roundtrips() {
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use alloc::vec;
+
+    let dict = Dictionary::from_raw_content(1, vec![1, 2, 3]).unwrap();
+    let handle = DictionaryHandle::from_dictionary(dict);
+    assert_eq!(handle.id(), 1);
+    assert_eq!(handle.as_dict().dict_content.as_slice(), &[1, 2, 3]);
+
+    let dict = Dictionary::from_raw_content(2, vec![4]).unwrap();
+    let handle: DictionaryHandle = dict.into();
+    assert_eq!(handle.id(), 2);
+    assert_eq!(handle.as_dict().dict_content.as_slice(), &[4]);
+}
+
+#[test]
 fn test_dict_decoding() {
     extern crate std;
     use crate::decoding::BlockDecodingStrategy;
+    #[cfg(not(target_has_atomic = "ptr"))]
+    use crate::decoding::Dictionary;
+    #[cfg(target_has_atomic = "ptr")]
+    use crate::decoding::DictionaryHandle;
     use crate::decoding::FrameDecoder;
     use alloc::borrow::ToOwned;
     use alloc::string::{String, ToString};
@@ -107,8 +127,16 @@ fn test_dict_decoding() {
     });
 
     let mut frame_dec = FrameDecoder::new();
-    let dict = crate::decoding::dictionary::Dictionary::decode_dict(&dict).unwrap();
-    frame_dec.add_dict(dict).unwrap();
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        let dict = DictionaryHandle::decode_dict(&dict).unwrap();
+        frame_dec.add_dict_handle(dict).unwrap();
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        let dict = Dictionary::decode_dict(&dict).unwrap();
+        frame_dec.add_dict(dict).unwrap();
+    }
 
     for file in files {
         let f = file.unwrap();
@@ -259,4 +287,394 @@ fn test_dict_decoding() {
     }
 
     assert!(failed.is_empty());
+}
+
+#[test]
+fn test_decode_all_skips_skippable_frames() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"decode-all-skip-frame";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut input = Vec::new();
+    let magic = 0x184D2A50u32.to_le_bytes();
+    let skippable_payload = [0xAA, 0xBB, 0xCC, 0xDD];
+    let length = (skippable_payload.len() as u32).to_le_bytes();
+    input.extend_from_slice(&magic);
+    input.extend_from_slice(&length);
+    input.extend_from_slice(&skippable_payload);
+    input.extend_from_slice(&compressed);
+
+    let mut output = vec![0u8; payload.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all(input.as_slice(), &mut output)
+        .expect("decode_all should succeed");
+    assert_eq!(written, payload.len());
+    assert_eq!(output, payload);
+}
+
+#[test]
+fn test_decode_all_reports_target_too_small() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"decode-all-target-too-small";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut output = vec![0u8; payload.len() - 1];
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.decode_all(compressed.as_slice(), &mut output);
+    assert!(matches!(result, Err(FrameDecoderError::TargetTooSmall)));
+}
+
+#[test]
+fn test_decode_all_with_dict_helpers() {
+    extern crate std;
+    use crate::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use std::fs;
+    use std::io::Read;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let (compressed, original) = load_sample_dict_frame(handle.id());
+
+    let mut output = vec![0u8; original.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
+        .expect("decode_all_with_dict_handle should succeed");
+    assert_eq!(written, original.len());
+    assert_eq!(output, original);
+
+    let mut output = vec![0u8; original.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_raw)
+        .expect("decode_all_with_dict_bytes should succeed");
+    assert_eq!(written, original.len());
+    assert_eq!(output, original);
+
+    let mut decoder = StreamingDecoder::new_with_dictionary_handle(compressed.as_slice(), &handle)
+        .expect("streaming decoder should init");
+    let mut streamed = Vec::new();
+    Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
+    assert_eq!(streamed, original);
+
+    let mut decoder = StreamingDecoder::new_with_dictionary_bytes(compressed.as_slice(), &dict_raw)
+        .expect("streaming decoder should init");
+    let mut streamed = Vec::new();
+    Read::read_to_end(&mut decoder, &mut streamed).expect("streaming read should succeed");
+    assert_eq!(streamed, original);
+}
+
+#[test]
+fn test_add_dict_from_bytes_allows_decode_all() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::Dictionary;
+    use crate::decoding::errors::FrameDecoderError;
+    use alloc::vec;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let expected_dict_id = Dictionary::decode_dict(&dict_raw)
+        .expect("dictionary should parse")
+        .id;
+    let (compressed, original) = load_sample_dict_frame(expected_dict_id);
+
+    let mut output = vec![0u8; original.len()];
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict_from_bytes(&dict_raw)
+        .expect("dict bytes should parse");
+    let written = decoder
+        .decode_all(compressed.as_slice(), &mut output)
+        .expect("decode_all should succeed");
+    assert_eq!(written, original.len());
+    assert_eq!(output, original);
+
+    let mut decoder = FrameDecoder::new();
+    let dict = Dictionary::from_raw_content(7, vec![1u8]).expect("dict should build");
+    decoder.add_dict(dict).expect("dict should insert");
+    let dict = Dictionary::from_raw_content(7, vec![2u8]).expect("dict should build");
+    let result = decoder.add_dict(dict);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictAlreadyRegistered { dict_id }) if dict_id == 7
+    ));
+}
+
+#[test]
+fn test_add_dict_rejects_invalid_dictionary_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::Dictionary;
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+
+    let mut zero_id = Dictionary::from_raw_content(7, vec![1u8]).expect("dict should build");
+    zero_id.id = 0;
+    let result = decoder.add_dict(zero_id);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroDictionaryId
+        ))
+    ));
+
+    let mut zero_rep = Dictionary::from_raw_content(8, vec![1u8]).expect("dict should build");
+    zero_rep.offset_hist[1] = 0;
+    let result = decoder.add_dict(zero_rep);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 1 }
+        ))
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_add_dict_handle_rejects_existing_owned_id() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::FrameDecoderError;
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+    let dict = Dictionary::from_raw_content(9, vec![1u8]).expect("dict should build");
+    decoder.add_dict(dict).expect("dict should insert");
+
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(9, vec![2u8]).expect("dict should build"),
+    );
+    let result = decoder.add_dict_handle(handle);
+
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictAlreadyRegistered { dict_id }) if dict_id == 9
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_add_dict_handle_rejects_invalid_dictionary_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+
+    let mut zero_id = Dictionary::from_raw_content(10, vec![1u8]).expect("dict should build");
+    zero_id.id = 0;
+    let result = decoder.add_dict_handle(DictionaryHandle::from_dictionary(zero_id));
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroDictionaryId
+        ))
+    ));
+
+    let mut zero_rep = Dictionary::from_raw_content(11, vec![1u8]).expect("dict should build");
+    zero_rep.offset_hist[2] = 0;
+    let result = decoder.add_dict_handle(DictionaryHandle::from_dictionary(zero_rep));
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 2 }
+        ))
+    ));
+}
+
+#[test]
+fn test_reset_with_dict_handle_rejects_mismatched_id() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::FrameDecoderError;
+    use alloc::vec;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let expected_dict_id = DictionaryHandle::decode_dict(&dict_raw)
+        .expect("dictionary should parse")
+        .id();
+    let mismatched_id = if expected_dict_id == u32::MAX {
+        expected_dict_id - 1
+    } else {
+        expected_dict_id + 1
+    };
+    let mismatched = Dictionary::from_raw_content(mismatched_id, vec![1u8])
+        .expect("mismatched dictionary should build");
+    let handle = DictionaryHandle::from_dictionary(mismatched);
+
+    let (compressed, _original) = load_sample_dict_frame(expected_dict_id);
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.reset_with_dict_handle(compressed.as_slice(), &handle);
+
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictIdMismatch { expected, provided })
+            if expected == expected_dict_id && provided == mismatched_id
+    ));
+}
+
+#[test]
+fn test_reset_with_dict_handle_rejects_invalid_handle_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"dict-handle-invariants";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut invalid = Dictionary::from_raw_content(123, vec![1u8]).expect("dict should build");
+    invalid.offset_hist[0] = 0;
+    let handle = DictionaryHandle::from_dictionary(invalid);
+
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.reset_with_dict_handle(compressed.as_slice(), &handle);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 0 }
+        ))
+    ));
+}
+
+#[test]
+fn test_force_dict_requires_initialization_before_dict_lookup() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
+
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.force_dict(0xABCD);
+    assert!(matches!(result, Err(FrameDecoderError::NotYetInitialized)));
+}
+
+#[test]
+fn test_force_dict_reports_missing_dict_after_initialization() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::DictionaryHandle;
+    use crate::decoding::errors::FrameDecoderError;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let (compressed, _original) = load_sample_dict_frame(handle.id());
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .reset_with_dict_handle(compressed.as_slice(), &handle)
+        .expect("reset_with_dict_handle should initialize decoder state");
+
+    let missing_id = 0xDEADBEEF;
+    let result = decoder.force_dict(missing_id);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictNotProvided { dict_id }) if dict_id == missing_id
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_force_dict_accepts_shared_handle_after_initialization() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::DictionaryHandle;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let dict_id = handle.id();
+
+    let (compressed, _original) = load_sample_dict_frame(dict_id);
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict_handle(handle)
+        .expect("shared handle should register");
+    decoder
+        .reset(compressed.as_slice())
+        .expect("reset should initialize decoder state");
+    decoder
+        .force_dict(dict_id)
+        .expect("force_dict should accept registered shared handle");
+}
+
+#[cfg(test)]
+fn load_sample_dict_frame(expected_dict_id: u32) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    extern crate std;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use std::fs;
+
+    let mut files: Vec<std::io::Result<std::fs::DirEntry>> = fs::read_dir("./dict_tests/files")
+        .expect("dict test files should exist")
+        .collect();
+    files.sort_by_key(|entry| match entry {
+        Err(_) => String::new(),
+        Ok(dir_entry) => dir_entry.path().to_string_lossy().to_string(),
+    });
+
+    let (file_path, compressed) = files
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find_map(|path| {
+            let is_zst = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "zst")
+                .unwrap_or(false);
+            if !is_zst {
+                return None;
+            }
+
+            let compressed = fs::read(&path).ok()?;
+            let mut header_src = compressed.as_slice();
+            let (header, _) = crate::decoding::frame::read_frame_header(&mut header_src).ok()?;
+            if header.dictionary_id() == Some(expected_dict_id) {
+                Some((path, compressed))
+            } else {
+                None
+            }
+        })
+        .expect("expected at least one dictionary-backed .zst file in dict_tests/files");
+    let original_path = file_path
+        .to_str()
+        .expect("dict test path should be utf-8")
+        .trim_end_matches(".zst")
+        .to_string();
+    let original = fs::read(original_path).expect("original data should load");
+
+    (compressed, original)
 }

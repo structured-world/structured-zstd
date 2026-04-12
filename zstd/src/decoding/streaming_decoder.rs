@@ -3,7 +3,7 @@
 use core::borrow::BorrowMut;
 
 use crate::decoding::errors::FrameDecoderError;
-use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
 #[cfg(not(feature = "std"))]
 use crate::io::ErrorKind;
 use crate::io::{Error, Read};
@@ -64,6 +64,40 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
         let mut decoder = FrameDecoder::new();
         decoder.init(&mut source)?;
         Ok(StreamingDecoder { decoder, source })
+    }
+
+    /// Create a streaming decoder using a pre-parsed dictionary handle.
+    ///
+    /// # Warning
+    ///
+    /// This constructor initializes the underlying [`FrameDecoder`] with
+    /// `dict`, even if a frame header omits the optional dictionary ID.
+    /// Callers must only use it when they already know the stream was encoded
+    /// with this dictionary; otherwise decoded output can be silently
+    /// corrupted.
+    pub fn new_with_dictionary_handle(
+        mut source: READ,
+        dict: &DictionaryHandle,
+    ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
+        let mut decoder = FrameDecoder::new();
+        decoder.init_with_dict_handle(&mut source, dict)?;
+        Ok(StreamingDecoder { decoder, source })
+    }
+
+    /// Create a streaming decoder using a serialized dictionary blob.
+    ///
+    /// # Warning
+    ///
+    /// This API forwards to [`StreamingDecoder::new_with_dictionary_handle`]
+    /// and therefore applies the decoded dictionary to frames whose headers may
+    /// omit the optional dictionary ID. Only use it when the stream is known to
+    /// be encoded with that dictionary.
+    pub fn new_with_dictionary_bytes(
+        source: READ,
+        raw_dictionary: &[u8],
+    ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
+        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
+        Self::new_with_dictionary_handle(source, &dict)
     }
 }
 
