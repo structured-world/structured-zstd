@@ -76,4 +76,19 @@ mod tests;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::bit_io::BitReaderReversed;
+
+    /// Bench-only facade for the decoder wildcopy implementation.
+    ///
+    /// # Safety
+    /// Caller must satisfy the same safety contract as
+    /// `decoding::copy_bytes_overshooting_for_bench`.
+    #[inline(always)]
+    pub unsafe fn copy_bytes_overshooting_for_bench(
+        src: (*const u8, usize),
+        dst: (*mut u8, usize),
+        copy_at_least: usize,
+    ) {
+        // Keep decoder internals crate-private and expose only this bench shim.
+        unsafe { crate::decoding::copy_bytes_overshooting_for_bench(src, dst, copy_at_least) };
+    }
 }

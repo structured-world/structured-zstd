@@ -69,6 +69,26 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     }
 }
 
+/// Bench-only entrypoint for evaluating alternative copy kernels against the
+/// production overshooting wildcopy implementation.
+///
+/// # Safety
+/// Caller must satisfy the same requirements as [`copy_bytes_overshooting`]:
+/// source and destination pointers must be valid for reads/writes of at least
+/// `copy_at_least` bytes, support any rounded-up overshoot implied by the
+/// active copy strategy when capacities permit it, and must not overlap.
+#[cfg(feature = "bench_internals")]
+#[inline(always)]
+pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
+    src: (*const u8, usize),
+    dst: (*mut u8, usize),
+    copy_at_least: usize,
+) {
+    // Keep an explicit unsafe block here because the crate enforces
+    // `unsafe_op_in_unsafe_fn` under `-D warnings`.
+    unsafe { copy_bytes_overshooting(src, dst, copy_at_least) };
+}
+
 #[inline(always)]
 fn scalar_strategy() -> CopyStrategy {
     CopyStrategy {

@@ -51,6 +51,29 @@ Dictionary benchmarks currently include:
 - [x] Small data (`1-10 KiB`) scenarios for CoordiNode-like payloads
 - [x] Results documented in `benchmark-report.md`
 
+## Issue #87 Research Mapping (Wildcopy Candidates)
+
+Research PR: [#107](https://github.com/structured-world/structured-zstd/pull/107)
+
+- [x] At least one candidate benchmarked against baseline on supported hardware.
+- [x] No correctness regression in research branch validation runs.
+- [x] Candidate shows reproducible gain in local sample runs.
+- [x] Final recommendation documented with go/no-go outcome.
+
+Local sample measurements from `wildcopy_candidates` (ns/iter):
+
+- `64B`: baseline `3` -> candidate `2`
+- `256B`: baseline `7` -> candidate `4`
+- `1024B`: baseline `28` -> candidate `14`
+- `4096B`: baseline `94` -> candidate `58`
+- `16384B`: baseline `347` -> candidate `268`
+- `65536B`: baseline `1368` -> candidate `1121`
+
+Decision: **Provisional GO (microbench only)** for AVX2 unroll2 candidate,
+based on local `wildcopy_candidates` microbench data; this does not close issue #87.
+
+Follow-up implementation issue: [#108](https://github.com/structured-world/structured-zstd/issues/108).
+
 ## Commands
 
 Run the full Criterion matrix:

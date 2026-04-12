@@ -71,3 +71,8 @@ required-features = ["dict_builder"]
 [[bench]]
 name = "decode_dict_handle"
 harness = false
+
+[[bench]]
+name = "wildcopy_candidates"
+harness = false
+required-features = ["bench_internals"]
