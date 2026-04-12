@@ -3,17 +3,21 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::hint::black_box;
 use structured_zstd::testing::copy_bytes_overshooting_for_bench;
 
-#[inline(always)]
-unsafe fn copy_candidate_unroll2_avx2(src: *const u8, dst: *mut u8, len: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && len >= 64 {
-            unsafe { copy_unroll2_avx2_impl(src, dst, len) };
-            return;
-        }
-    }
+type CopyKernel = unsafe fn(*const u8, *mut u8, usize);
 
+#[inline(always)]
+unsafe fn copy_candidate_scalar(src: *const u8, dst: *mut u8, len: usize) {
     unsafe { dst.copy_from_nonoverlapping(src, len) };
+}
+
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn copy_candidate_unroll2_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    if len >= 64 {
+        unsafe { copy_unroll2_avx2_impl(src, dst, len) };
+    } else {
+        unsafe { copy_candidate_scalar(src, dst, len) };
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -44,9 +48,24 @@ unsafe fn copy_unroll2_avx2_impl(mut src: *const u8, mut dst: *mut u8, len: usiz
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn select_candidate_copy_kernel() -> (&'static str, CopyKernel) {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        ("candidate_avx2_unroll2", copy_candidate_unroll2_avx2)
+    } else {
+        ("candidate_scalar_fallback", copy_candidate_scalar)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn select_candidate_copy_kernel() -> (&'static str, CopyKernel) {
+    ("candidate_scalar_fallback", copy_candidate_scalar)
+}
+
 fn bench_wildcopy_candidates(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(0x57A7_1DC0_0EED_1234);
     let mut group = c.benchmark_group("decode_wildcopy_candidates");
+    let (candidate_name, candidate_copy_kernel) = select_candidate_copy_kernel();
     let lengths = [64usize, 256, 1024, 4096, 16 * 1024, 64 * 1024];
 
     for len in lengths {
@@ -61,7 +80,7 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
                 (dst_baseline.as_mut_ptr(), dst_baseline.len()),
                 len,
             );
-            copy_candidate_unroll2_avx2(src.as_ptr(), dst_candidate.as_mut_ptr(), len);
+            candidate_copy_kernel(src.as_ptr(), dst_candidate.as_mut_ptr(), len);
         }
         assert_eq!(
             &dst_baseline[..len],
@@ -78,22 +97,30 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("baseline", len), &len, |b, &copy_len| {
             b.iter(|| unsafe {
+                let src_buf = black_box(src.as_slice());
+                let dst_buf = black_box(dst_baseline.as_mut_slice());
                 copy_bytes_overshooting_for_bench(
-                    (src.as_ptr(), src.len()),
-                    (dst_baseline.as_mut_ptr(), dst_baseline.len()),
-                    copy_len,
+                    (black_box(src_buf.as_ptr()), src_buf.len()),
+                    (black_box(dst_buf.as_mut_ptr()), dst_buf.len()),
+                    black_box(copy_len),
                 );
-                black_box(dst_baseline[copy_len - 1]);
+                black_box(dst_buf[copy_len - 1]);
             });
         });
 
         group.bench_with_input(
-            BenchmarkId::new("candidate_avx2_unroll2", len),
+            BenchmarkId::new(candidate_name, len),
             &len,
             |b, &copy_len| {
                 b.iter(|| unsafe {
-                    copy_candidate_unroll2_avx2(src.as_ptr(), dst_candidate.as_mut_ptr(), copy_len);
-                    black_box(dst_candidate[copy_len - 1]);
+                    let src_buf = black_box(src.as_slice());
+                    let dst_buf = black_box(dst_candidate.as_mut_slice());
+                    candidate_copy_kernel(
+                        black_box(src_buf.as_ptr()),
+                        black_box(dst_buf.as_mut_ptr()),
+                        black_box(copy_len),
+                    );
+                    black_box(dst_buf[copy_len - 1]);
                 });
             },
         );
