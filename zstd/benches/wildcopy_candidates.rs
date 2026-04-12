@@ -1,11 +1,17 @@
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::hint::black_box;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use structured_zstd::testing::copy_bytes_overshooting_for_bench;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 type CopyKernel = unsafe fn(*const u8, *mut u8, usize);
 
 #[derive(Clone, Copy)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 struct BenchPath {
     name: &'static str,
     chunk: usize,
@@ -13,6 +19,7 @@ struct BenchPath {
 }
 
 #[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_candidate_scalar(src: *const u8, dst: *mut u8, len: usize) {
     unsafe { dst.copy_from_nonoverlapping(src, len) };
 }
@@ -113,8 +120,8 @@ unsafe fn copy_baseline_avx512(mut src: *const u8, mut dst: *mut u8, len: usize)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn select_candidate_copy_kernel() -> BenchPath {
-    if std::arch::is_x86_feature_detected!("avx2") {
+fn select_candidate_copy_kernel(len: usize) -> BenchPath {
+    if std::arch::is_x86_feature_detected!("avx2") && len >= 64 {
         BenchPath {
             name: "candidate_avx2_unroll2",
             chunk: 64,
@@ -126,15 +133,6 @@ fn select_candidate_copy_kernel() -> BenchPath {
             chunk: core::mem::size_of::<usize>(),
             kernel: copy_candidate_scalar,
         }
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn select_candidate_copy_kernel() -> BenchPath {
-    BenchPath {
-        name: "candidate_scalar_fallback",
-        chunk: core::mem::size_of::<usize>(),
-        kernel: copy_candidate_scalar,
     }
 }
 
@@ -167,16 +165,8 @@ fn select_baseline_copy_kernel(len: usize) -> BenchPath {
     }
 }
 
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn select_baseline_copy_kernel(_len: usize) -> BenchPath {
-    BenchPath {
-        name: "baseline_scalar",
-        chunk: core::mem::size_of::<usize>(),
-        kernel: copy_candidate_scalar,
-    }
-}
-
 #[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_with_overshoot_policy(
     src: (*const u8, usize),
     dst: (*mut u8, usize),
@@ -196,10 +186,10 @@ unsafe fn copy_with_overshoot_policy(
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn bench_wildcopy_candidates(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(0x57A7_1DC0_0EED_1234);
     let mut group = c.benchmark_group("decode_wildcopy_candidates");
-    let candidate_path = select_candidate_copy_kernel();
     let lengths = [
         17usize,
         33,
@@ -214,6 +204,7 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
     ];
 
     for len in lengths {
+        let candidate_path = select_candidate_copy_kernel(len);
         let baseline_path = select_baseline_copy_kernel(len);
         let mut src = vec![0u8; len + 64];
         rng.fill(&mut src);
@@ -293,5 +284,10 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 criterion_group!(benches, bench_wildcopy_candidates);
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 criterion_main!(benches);
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn main() {}
