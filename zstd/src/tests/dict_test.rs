@@ -476,6 +476,55 @@ fn test_force_dict_requires_initialization_before_dict_lookup() {
     assert!(matches!(result, Err(FrameDecoderError::NotYetInitialized)));
 }
 
+#[test]
+fn test_force_dict_reports_missing_dict_after_initialization() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::DictionaryHandle;
+    use crate::decoding::errors::FrameDecoderError;
+    use std::fs;
+
+    let (compressed, _original) = load_sample_dict_frame();
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .reset_with_dict_handle(compressed.as_slice(), &handle)
+        .expect("reset_with_dict_handle should initialize decoder state");
+
+    let missing_id = 0xDEADBEEF;
+    let result = decoder.force_dict(missing_id);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictNotProvided { dict_id }) if dict_id == missing_id
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_force_dict_accepts_shared_handle_after_initialization() {
+    extern crate std;
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::DictionaryHandle;
+    use std::fs;
+
+    let dict_raw = fs::read("./dict_tests/dictionary").expect("dictionary should load");
+    let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
+    let dict_id = handle.id();
+
+    let (compressed, _original) = load_sample_dict_frame();
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict_handle(handle)
+        .expect("shared handle should register");
+    decoder
+        .reset(compressed.as_slice())
+        .expect("reset should initialize decoder state");
+    decoder
+        .force_dict(dict_id)
+        .expect("force_dict should accept registered shared handle");
+}
+
 #[cfg(test)]
 fn load_sample_dict_frame() -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
     extern crate std;
