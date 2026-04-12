@@ -354,7 +354,7 @@ impl FrameDecoder {
             .or_else(|| {
                 #[cfg(target_has_atomic = "ptr")]
                 {
-                    shared_dicts.get(&dict_id).map(DictionaryHandle::as_ref)
+                    shared_dicts.get(&dict_id).map(DictionaryHandle::as_dict)
                 }
                 #[cfg(not(target_has_atomic = "ptr"))]
                 {
