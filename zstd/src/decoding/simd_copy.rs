@@ -79,7 +79,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
 /// active copy strategy when capacities permit it, and must not overlap.
 #[cfg(feature = "bench_internals")]
 #[inline(always)]
-pub unsafe fn copy_bytes_overshooting_for_bench(
+pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
     src: (*const u8, usize),
     dst: (*mut u8, usize),
     copy_at_least: usize,
