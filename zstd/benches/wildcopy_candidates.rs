@@ -21,16 +21,25 @@ struct BenchPath {
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_candidate_scalar(src: *const u8, dst: *mut u8, len: usize) {
-    dst.copy_from_nonoverlapping(src, len);
+    // SAFETY: Benchmark callers provide valid non-overlapping buffers for `len`.
+    unsafe {
+        dst.copy_from_nonoverlapping(src, len);
+    }
 }
 
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_candidate_unroll2_avx2(src: *const u8, dst: *mut u8, len: usize) {
     if len >= 64 {
-        copy_unroll2_avx2_impl(src, dst, len);
+        // SAFETY: AVX2 support and copy bounds are checked by caller/path selection.
+        unsafe {
+            copy_unroll2_avx2_impl(src, dst, len);
+        }
     } else {
-        copy_candidate_scalar(src, dst, len);
+        // SAFETY: Same preconditions as this function.
+        unsafe {
+            copy_candidate_scalar(src, dst, len);
+        }
     }
 }
 
@@ -45,18 +54,24 @@ unsafe fn copy_unroll2_avx2_impl(mut src: *const u8, mut dst: *mut u8, len: usiz
     let end_unrolled = len & !63;
     let mut copied = 0usize;
     while copied < end_unrolled {
-        let v0: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
-        let v1: __m256i = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
-        _mm256_storeu_si256(dst.cast::<__m256i>(), v0);
-        _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), v1);
-        src = src.add(64);
-        dst = dst.add(64);
+        // SAFETY: Unrolled loop copies within caller-provided valid bounds.
+        unsafe {
+            let v0: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
+            let v1: __m256i = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
+            _mm256_storeu_si256(dst.cast::<__m256i>(), v0);
+            _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), v1);
+            src = src.add(64);
+            dst = dst.add(64);
+        }
         copied += 64;
     }
 
     let tail = len - copied;
     if tail > 0 {
-        dst.copy_from_nonoverlapping(src, tail);
+        // SAFETY: Remaining tail stays within the validated source/destination ranges.
+        unsafe {
+            dst.copy_from_nonoverlapping(src, tail);
+        }
     }
 }
 
@@ -68,12 +83,16 @@ unsafe fn copy_baseline_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 
-    let end = src.add(len);
+    // SAFETY: `src..src+len` stays in caller-provided readable range.
+    let end = unsafe { src.add(len) };
     while src < end {
-        let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
-        _mm256_storeu_si256(dst.cast::<__m256i>(), v);
-        src = src.add(32);
-        dst = dst.add(32);
+        // SAFETY: Loop advances by vector width while staying inside valid ranges.
+        unsafe {
+            let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
+            _mm256_storeu_si256(dst.cast::<__m256i>(), v);
+            src = src.add(32);
+            dst = dst.add(32);
+        }
     }
 }
 
@@ -85,12 +104,16 @@ unsafe fn copy_baseline_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 
-    let end = src.add(len);
+    // SAFETY: `src..src+len` stays in caller-provided readable range.
+    let end = unsafe { src.add(len) };
     while src < end {
-        let v: __m128i = _mm_loadu_si128(src.cast::<__m128i>());
-        _mm_storeu_si128(dst.cast::<__m128i>(), v);
-        src = src.add(16);
-        dst = dst.add(16);
+        // SAFETY: Loop advances by vector width while staying inside valid ranges.
+        unsafe {
+            let v: __m128i = _mm_loadu_si128(src.cast::<__m128i>());
+            _mm_storeu_si128(dst.cast::<__m128i>(), v);
+            src = src.add(16);
+            dst = dst.add(16);
+        }
     }
 }
 
@@ -102,12 +125,16 @@ unsafe fn copy_baseline_avx512(mut src: *const u8, mut dst: *mut u8, len: usize)
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
 
-    let end = src.add(len);
+    // SAFETY: `src..src+len` stays in caller-provided readable range.
+    let end = unsafe { src.add(len) };
     while src < end {
-        let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
-        _mm512_storeu_si512(dst.cast::<__m512i>(), v);
-        src = src.add(64);
-        dst = dst.add(64);
+        // SAFETY: Loop advances by vector width while staying inside valid ranges.
+        unsafe {
+            let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
+            _mm512_storeu_si512(dst.cast::<__m512i>(), v);
+            src = src.add(64);
+            dst = dst.add(64);
+        }
     }
 }
 
@@ -172,9 +199,15 @@ unsafe fn copy_with_overshoot_policy(
     let copy_multiple = copy_at_least.next_multiple_of(path.chunk);
     let min_capacity = core::cmp::min(src.1, dst.1);
     if min_capacity >= copy_multiple {
-        (path.kernel)(src.0, dst.0, copy_multiple);
+        // SAFETY: `copy_multiple` is bounded by both capacities and kernel contract.
+        unsafe {
+            (path.kernel)(src.0, dst.0, copy_multiple);
+        }
     } else {
-        dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
+        // SAFETY: Fallback path copies exactly `copy_at_least` bytes within capacities.
+        unsafe {
+            dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
+        }
     }
 }
 
