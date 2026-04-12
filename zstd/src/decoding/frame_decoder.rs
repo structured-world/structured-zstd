@@ -280,7 +280,10 @@ impl FrameDecoder {
         Ok(())
     }
 
-    /// Add a dict to the FrameDecoder that can be used when needed. The FrameDecoder uses the appropriate one dynamically
+    /// Add a dictionary that can be selected dynamically by frame dictionary ID.
+    ///
+    /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
+    /// registered (either as owned or shared).
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id;
         if self.owned_dicts.contains_key(&dict_id) || self.shared_dict_exists(dict_id) {
@@ -297,6 +300,12 @@ impl FrameDecoder {
     }
 
     /// Add a pre-parsed dictionary handle for reuse across decoders.
+    ///
+    /// This API is available on targets with pointer-width atomics
+    /// (`target_has_atomic = "ptr"`).
+    ///
+    /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
+    /// registered (either as owned or shared).
     #[cfg(target_has_atomic = "ptr")]
     pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
         let dict_id = dict.id();
