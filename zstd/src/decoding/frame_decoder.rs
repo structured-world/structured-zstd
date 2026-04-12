@@ -251,6 +251,11 @@ impl FrameDecoder {
     }
 
     /// Reset this decoder for a new frame using a pre-parsed dictionary handle.
+    ///
+    /// If the frame header has a dictionary ID, this validates it against
+    /// `dict.id()` and returns [`FrameDecoderError::DictIdMismatch`] on mismatch.
+    /// If the header omits the optional dictionary ID, this still applies the
+    /// provided dictionary handle.
     pub fn reset_with_dict_handle(
         &mut self,
         source: impl Read,
@@ -318,22 +323,24 @@ impl FrameDecoder {
 
     pub fn force_dict(&mut self, dict_id: u32) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
-        if self.state.is_none() {
-            return Err(err::NotYetInitialized);
-        }
-        let dict_ptr = {
-            let dict = self
-                .owned_dicts
-                .get(&dict_id)
-                .or_else(|| self.shared_dict(dict_id))
-                .ok_or(err::DictNotProvided { dict_id })?;
-            core::ptr::from_ref(dict)
-        };
-        // SAFETY: `dict_ptr` comes from `owned_dicts`/`shared_dict(dict_id)` and
-        // neither map is mutated before dereference. `state` is a separate field,
-        // and only `state.decoder_scratch` / `state.using_dict` are mutated.
-        let dict = unsafe { &*dict_ptr };
-        let state = self.state.as_mut().expect("state checked above");
+        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        let owned_dicts = &self.owned_dicts;
+        #[cfg(target_has_atomic = "ptr")]
+        let shared_dicts = &self.shared_dicts;
+
+        let dict = owned_dicts
+            .get(&dict_id)
+            .or_else(|| {
+                #[cfg(target_has_atomic = "ptr")]
+                {
+                    shared_dicts.get(&dict_id).map(DictionaryHandle::as_ref)
+                }
+                #[cfg(not(target_has_atomic = "ptr"))]
+                {
+                    None
+                }
+            })
+            .ok_or(err::DictNotProvided { dict_id })?;
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);
 
