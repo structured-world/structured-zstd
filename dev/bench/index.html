@@ -76,6 +76,11 @@
       }
       .chart-wrap {
         margin-top: 14px;
+        min-height: 460px;
+      }
+      #chart {
+        width: 100% !important;
+        height: 440px !important;
       }
       #status {
         margin-top: 8px;
@@ -168,9 +173,15 @@
           <label>Source
             <select id="f-source"></select>
           </label>
+          <label>From
+            <select id="f-from"></select>
+          </label>
+          <label>To
+            <select id="f-to"></select>
+          </label>
         </div>
         <div class="chart-wrap">
-          <canvas id="chart" height="120"></canvas>
+          <canvas id="chart"></canvas>
         </div>
         <div id="status"></div>
       </section>
@@ -217,6 +228,8 @@
       const state = {
         records: [],
         chart: null,
+        timeIndex: new Map(),
+        windowInitialized: false,
       };
 
       const el = (id) => document.getElementById(id);
@@ -228,6 +241,8 @@
         scenario: el("f-scenario"),
         level: el("f-level"),
         source: el("f-source"),
+        from: el("f-from"),
+        to: el("f-to"),
       };
 
       function parseTimestamp(value) {
@@ -296,7 +311,19 @@
         select.replaceChildren(fragment);
       }
 
-      function matchesFilter(record, filter) {
+      function renderPointOptions(select, values) {
+        const fragment = document.createDocumentFragment();
+        for (const value of values) {
+          const option = document.createElement("option");
+          const text = String(value);
+          option.value = text;
+          option.textContent = text;
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
+      }
+
+      function matchesCoreFilters(record, filter) {
         if (filter.target !== ALWAYS && record.target !== filter.target) return false;
         if (filter.metric !== ALWAYS && record.metric !== filter.metric) return false;
         if (filter.stage !== ALWAYS && record.stage !== filter.stage) return false;
@@ -304,6 +331,48 @@
         if (filter.level !== ALWAYS && record.level !== filter.level) return false;
         if (filter.source !== ALWAYS && (record.source || "none") !== filter.source) return false;
         return true;
+      }
+
+      function updateTimeWindowOptions(records) {
+        const labels = uniq(records.map((r) => r.generated_at || "local-run"));
+        state.timeIndex = new Map(labels.map((label, idx) => [label, idx]));
+
+        if (!labels.length) {
+          selectors.from.replaceChildren();
+          selectors.to.replaceChildren();
+          return;
+        }
+
+        const previousFrom = selectors.from.value;
+        const previousTo = selectors.to.value;
+        renderPointOptions(selectors.from, labels);
+        renderPointOptions(selectors.to, labels);
+
+        const defaultTo = labels[labels.length - 1];
+        const defaultFrom = labels[Math.max(0, labels.length - 3)];
+
+        if (!state.windowInitialized) {
+          selectors.from.value = defaultFrom;
+          selectors.to.value = defaultTo;
+          state.windowInitialized = true;
+          return;
+        }
+
+        selectors.from.value = labels.includes(previousFrom) ? previousFrom : defaultFrom;
+        selectors.to.value = labels.includes(previousTo) ? previousTo : defaultTo;
+      }
+
+      function applyTimeWindow(records, filter) {
+        if (!filter.fromPoint || !filter.toPoint) return records;
+        const fromIdx = state.timeIndex.get(filter.fromPoint);
+        const toIdx = state.timeIndex.get(filter.toPoint);
+        if (fromIdx === undefined || toIdx === undefined) return records;
+        const low = Math.min(fromIdx, toIdx);
+        const high = Math.max(fromIdx, toIdx);
+        return records.filter((record) => {
+          const idx = state.timeIndex.get(record.generated_at || "local-run");
+          return idx !== undefined && idx >= low && idx <= high;
+        });
       }
 
       function buildChart(records) {
@@ -467,6 +536,7 @@
             plugins: {
               legend: { position: "bottom" },
             },
+            maintainAspectRatio: false,
           },
         });
       }
@@ -479,12 +549,17 @@
           scenario: selectors.scenario.value,
           level: selectors.level.value,
           source: selectors.source.value,
+          fromPoint: selectors.from.value,
+          toPoint: selectors.to.value,
         };
       }
 
       function rerender() {
         const filter = currentFilter();
-        const filtered = state.records.filter((row) => matchesFilter(row, filter));
+        const coreFiltered = state.records.filter((row) => matchesCoreFilters(row, filter));
+        updateTimeWindowOptions(coreFiltered);
+        const resolvedFilter = currentFilter();
+        const filtered = applyTimeWindow(coreFiltered, resolvedFilter);
         renderChart(filtered);
         updateStatus(filtered);
       }
