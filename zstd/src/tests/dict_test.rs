@@ -82,12 +82,12 @@ fn test_dictionary_handle_from_dictionary_roundtrips() {
     let dict = Dictionary::from_raw_content(1, vec![1, 2, 3]).unwrap();
     let handle = DictionaryHandle::from_dictionary(dict);
     assert_eq!(handle.id(), 1);
-    assert_eq!(handle.as_dict().dict_content, vec![1, 2, 3]);
+    assert_eq!(handle.as_dict().dict_content.as_slice(), &[1, 2, 3]);
 
     let dict = Dictionary::from_raw_content(2, vec![4]).unwrap();
     let handle: DictionaryHandle = dict.into();
     assert_eq!(handle.id(), 2);
-    assert_eq!(handle.as_dict().dict_content, vec![4]);
+    assert_eq!(handle.as_dict().dict_content.as_slice(), &[4]);
 }
 
 #[cfg(target_has_atomic = "ptr")]
@@ -412,6 +412,36 @@ fn test_add_dict_from_bytes_allows_decode_all() {
     ));
 }
 
+#[test]
+fn test_add_dict_rejects_invalid_dictionary_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::Dictionary;
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+
+    let mut zero_id = Dictionary::from_raw_content(7, vec![1u8]).expect("dict should build");
+    zero_id.id = 0;
+    let result = decoder.add_dict(zero_id);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroDictionaryId
+        ))
+    ));
+
+    let mut zero_rep = Dictionary::from_raw_content(8, vec![1u8]).expect("dict should build");
+    zero_rep.offset_hist[1] = 0;
+    let result = decoder.add_dict(zero_rep);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 1 }
+        ))
+    ));
+}
+
 #[cfg(target_has_atomic = "ptr")]
 #[test]
 fn test_add_dict_handle_rejects_existing_owned_id() {
@@ -433,6 +463,37 @@ fn test_add_dict_handle_rejects_existing_owned_id() {
     assert!(matches!(
         result,
         Err(FrameDecoderError::DictAlreadyRegistered { dict_id }) if dict_id == 9
+    ));
+}
+
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn test_add_dict_handle_rejects_invalid_dictionary_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use alloc::vec;
+
+    let mut decoder = FrameDecoder::new();
+
+    let mut zero_id = Dictionary::from_raw_content(10, vec![1u8]).expect("dict should build");
+    zero_id.id = 0;
+    let result = decoder.add_dict_handle(DictionaryHandle::from_dictionary(zero_id));
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroDictionaryId
+        ))
+    ));
+
+    let mut zero_rep = Dictionary::from_raw_content(11, vec![1u8]).expect("dict should build");
+    zero_rep.offset_hist[2] = 0;
+    let result = decoder.add_dict_handle(DictionaryHandle::from_dictionary(zero_rep));
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 2 }
+        ))
     ));
 }
 

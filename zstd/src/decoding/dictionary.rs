@@ -319,7 +319,7 @@ mod tests {
         let handle = dict.into_handle();
 
         assert_eq!(handle.as_ref().id, 7);
-        assert_eq!(handle.as_ref().dict_content, vec![42]);
+        assert_eq!(handle.as_ref().dict_content.as_slice(), &[42]);
     }
 
     #[test]

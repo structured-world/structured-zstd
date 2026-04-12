@@ -179,6 +179,20 @@ impl FrameDecoder {
         false
     }
 
+    fn validate_registered_dictionary(dict: &Dictionary) -> Result<(), FrameDecoderError> {
+        use crate::decoding::errors::DictionaryDecodeError as dict_err;
+
+        if dict.id == 0 {
+            return Err(FrameDecoderError::from(dict_err::ZeroDictionaryId));
+        }
+        if let Some(index) = dict.offset_hist.iter().position(|&rep| rep == 0) {
+            return Err(FrameDecoderError::from(
+                dict_err::ZeroRepeatOffsetInDictionary { index: index as u8 },
+            ));
+        }
+        Ok(())
+    }
+
     /// init() will allocate all needed buffers if it is the first time this decoder is used
     /// else they just reset these buffers with not further allocations
     ///
@@ -311,6 +325,7 @@ impl FrameDecoder {
     /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
     /// registered (either as owned or shared).
     pub fn add_dict(&mut self, dict: Dictionary) -> Result<(), FrameDecoderError> {
+        Self::validate_registered_dictionary(&dict)?;
         let dict_id = dict.id;
         if self.owned_dicts.contains_key(&dict_id) || self.shared_dict_exists(dict_id) {
             return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
@@ -334,6 +349,7 @@ impl FrameDecoder {
     /// registered (either as owned or shared).
     #[cfg(target_has_atomic = "ptr")]
     pub fn add_dict_handle(&mut self, dict: DictionaryHandle) -> Result<(), FrameDecoderError> {
+        Self::validate_registered_dictionary(dict.as_dict())?;
         let dict_id = dict.id();
         if self.owned_dicts.contains_key(&dict_id) || self.shared_dicts.contains_key(&dict_id) {
             return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
@@ -747,6 +763,13 @@ impl FrameDecoder {
     }
 
     /// Decode multiple frames into the output slice using a serialized dictionary.
+    ///
+    /// # Warning
+    ///
+    /// Each decoded frame is initialized with the parsed dictionary, even when a
+    /// frame header omits the optional dictionary ID. Callers must only use this
+    /// API when they already know the input frames were encoded with that
+    /// dictionary; otherwise decoded output can be silently corrupted.
     pub fn decode_all_with_dict_bytes(
         &mut self,
         input: &[u8],
