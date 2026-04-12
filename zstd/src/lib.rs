@@ -76,5 +76,5 @@ mod tests;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::bit_io::BitReaderReversed;
-    pub use crate::decoding::copy_bytes_overshooting_for_bench;
+    pub use crate::decoding::simd_copy::copy_bytes_overshooting_for_bench;
 }

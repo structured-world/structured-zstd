@@ -75,6 +75,44 @@ unsafe fn copy_baseline_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn copy_baseline_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+
+    let end = unsafe { src.add(len) };
+    while src < end {
+        unsafe {
+            let v: __m128i = _mm_loadu_si128(src.cast::<__m128i>());
+            _mm_storeu_si128(dst.cast::<__m128i>(), v);
+            src = src.add(16);
+            dst = dst.add(16);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn copy_baseline_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
+
+    let end = unsafe { src.add(len) };
+    while src < end {
+        unsafe {
+            let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
+            _mm512_storeu_si512(dst.cast::<__m512i>(), v);
+            src = src.add(64);
+            dst = dst.add(64);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn select_candidate_copy_kernel() -> (&'static str, CopyKernel) {
     if std::arch::is_x86_feature_detected!("avx2") {
         ("candidate_avx2_unroll2", copy_candidate_unroll2_avx2)
@@ -89,12 +127,24 @@ fn select_candidate_copy_kernel() -> (&'static str, CopyKernel) {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn select_baseline_copy_kernel() -> BenchPath {
-    if std::arch::is_x86_feature_detected!("avx2") {
+fn select_baseline_copy_kernel(len: usize) -> BenchPath {
+    if std::arch::is_x86_feature_detected!("avx512f") && len >= 64 {
+        BenchPath {
+            name: "baseline_avx512",
+            chunk: 64,
+            kernel: copy_baseline_avx512,
+        }
+    } else if std::arch::is_x86_feature_detected!("avx2") && len >= 32 {
         BenchPath {
             name: "baseline_avx2",
             chunk: 32,
             kernel: copy_baseline_avx2,
+        }
+    } else if std::arch::is_x86_feature_detected!("sse2") && len >= 16 {
+        BenchPath {
+            name: "baseline_sse2",
+            chunk: 16,
+            kernel: copy_baseline_sse2,
         }
     } else {
         BenchPath {
@@ -106,7 +156,7 @@ fn select_baseline_copy_kernel() -> BenchPath {
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn select_baseline_copy_kernel() -> BenchPath {
+fn select_baseline_copy_kernel(_len: usize) -> BenchPath {
     BenchPath {
         name: "baseline_scalar",
         chunk: core::mem::size_of::<usize>(),
@@ -137,7 +187,6 @@ unsafe fn copy_with_overshoot_policy(
 fn bench_wildcopy_candidates(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(0x57A7_1DC0_0EED_1234);
     let mut group = c.benchmark_group("decode_wildcopy_candidates");
-    let baseline_path = select_baseline_copy_kernel();
     let (candidate_name, candidate_copy_kernel) = select_candidate_copy_kernel();
     let candidate_path = BenchPath {
         name: candidate_name,
@@ -148,9 +197,21 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
         },
         kernel: candidate_copy_kernel,
     };
-    let lengths = [64usize, 65, 256, 1024, 4096, 16 * 1024, 64 * 1024];
+    let lengths = [
+        17usize,
+        33,
+        63,
+        64,
+        65,
+        256,
+        1024,
+        4096,
+        16 * 1024,
+        64 * 1024,
+    ];
 
     for len in lengths {
+        let baseline_path = select_baseline_copy_kernel(len);
         let mut src = vec![0u8; len + 64];
         rng.fill(&mut src);
         let mut dst_production = vec![0u8; len + 64];
