@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.18](https://github.com/structured-world/structured-zstd/compare/v0.0.17...v0.0.18) - 2026-04-12
+
+### Performance
+
+- *(decoding)* add shared dictionary handle ([#105](https://github.com/structured-world/structured-zstd/pull/105))
+
 ## [0.0.17](https://github.com/structured-world/structured-zstd/compare/v0.0.16...v0.0.17) - 2026-04-11
 
 ### Performance
