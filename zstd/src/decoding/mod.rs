@@ -8,6 +8,8 @@ mod streaming_decoder;
 
 pub use dictionary::{Dictionary, DictionaryHandle};
 pub use frame_decoder::{BlockDecodingStrategy, FrameDecoder};
+#[cfg(feature = "bench_internals")]
+pub use simd_copy::copy_bytes_overshooting_for_bench;
 pub use streaming_decoder::StreamingDecoder;
 
 pub(crate) mod block_decoder;

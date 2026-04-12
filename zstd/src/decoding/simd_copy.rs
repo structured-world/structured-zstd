@@ -69,6 +69,18 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     }
 }
 
+/// Bench-only entrypoint for evaluating alternative copy kernels against the
+/// production overshooting wildcopy implementation.
+#[cfg(feature = "bench_internals")]
+#[inline(always)]
+pub unsafe fn copy_bytes_overshooting_for_bench(
+    src: (*const u8, usize),
+    dst: (*mut u8, usize),
+    copy_at_least: usize,
+) {
+    unsafe { copy_bytes_overshooting(src, dst, copy_at_least) };
+}
+
 #[inline(always)]
 fn scalar_strategy() -> CopyStrategy {
     CopyStrategy {
