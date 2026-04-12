@@ -84,6 +84,8 @@ pub unsafe fn copy_bytes_overshooting_for_bench(
     dst: (*mut u8, usize),
     copy_at_least: usize,
 ) {
+    // Keep an explicit unsafe block here because the crate enforces
+    // `unsafe_op_in_unsafe_fn` under `-D warnings`.
     unsafe { copy_bytes_overshooting(src, dst, copy_at_least) };
 }
 

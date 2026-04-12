@@ -21,16 +21,16 @@ struct BenchPath {
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_candidate_scalar(src: *const u8, dst: *mut u8, len: usize) {
-    unsafe { dst.copy_from_nonoverlapping(src, len) };
+    dst.copy_from_nonoverlapping(src, len);
 }
 
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn copy_candidate_unroll2_avx2(src: *const u8, dst: *mut u8, len: usize) {
     if len >= 64 {
-        unsafe { copy_unroll2_avx2_impl(src, dst, len) };
+        copy_unroll2_avx2_impl(src, dst, len);
     } else {
-        unsafe { copy_candidate_scalar(src, dst, len) };
+        copy_candidate_scalar(src, dst, len);
     }
 }
 
@@ -45,20 +45,18 @@ unsafe fn copy_unroll2_avx2_impl(mut src: *const u8, mut dst: *mut u8, len: usiz
     let end_unrolled = len & !63;
     let mut copied = 0usize;
     while copied < end_unrolled {
-        unsafe {
-            let v0: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
-            let v1: __m256i = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
-            _mm256_storeu_si256(dst.cast::<__m256i>(), v0);
-            _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), v1);
-            src = src.add(64);
-            dst = dst.add(64);
-        }
+        let v0: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
+        let v1: __m256i = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
+        _mm256_storeu_si256(dst.cast::<__m256i>(), v0);
+        _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), v1);
+        src = src.add(64);
+        dst = dst.add(64);
         copied += 64;
     }
 
     let tail = len - copied;
     if tail > 0 {
-        unsafe { dst.copy_from_nonoverlapping(src, tail) };
+        dst.copy_from_nonoverlapping(src, tail);
     }
 }
 
@@ -70,14 +68,12 @@ unsafe fn copy_baseline_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 
-    let end = unsafe { src.add(len) };
+    let end = src.add(len);
     while src < end {
-        unsafe {
-            let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
-            _mm256_storeu_si256(dst.cast::<__m256i>(), v);
-            src = src.add(32);
-            dst = dst.add(32);
-        }
+        let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
+        _mm256_storeu_si256(dst.cast::<__m256i>(), v);
+        src = src.add(32);
+        dst = dst.add(32);
     }
 }
 
@@ -89,14 +85,12 @@ unsafe fn copy_baseline_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 
-    let end = unsafe { src.add(len) };
+    let end = src.add(len);
     while src < end {
-        unsafe {
-            let v: __m128i = _mm_loadu_si128(src.cast::<__m128i>());
-            _mm_storeu_si128(dst.cast::<__m128i>(), v);
-            src = src.add(16);
-            dst = dst.add(16);
-        }
+        let v: __m128i = _mm_loadu_si128(src.cast::<__m128i>());
+        _mm_storeu_si128(dst.cast::<__m128i>(), v);
+        src = src.add(16);
+        dst = dst.add(16);
     }
 }
 
@@ -108,29 +102,27 @@ unsafe fn copy_baseline_avx512(mut src: *const u8, mut dst: *mut u8, len: usize)
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
 
-    let end = unsafe { src.add(len) };
+    let end = src.add(len);
     while src < end {
-        unsafe {
-            let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
-            _mm512_storeu_si512(dst.cast::<__m512i>(), v);
-            src = src.add(64);
-            dst = dst.add(64);
-        }
+        let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
+        _mm512_storeu_si512(dst.cast::<__m512i>(), v);
+        src = src.add(64);
+        dst = dst.add(64);
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn select_candidate_copy_kernel(len: usize) -> BenchPath {
+fn select_candidate_copy_kernel(len: usize, baseline_chunk: usize) -> BenchPath {
     if std::arch::is_x86_feature_detected!("avx2") && len >= 64 {
         BenchPath {
             name: "candidate_avx2_unroll2",
-            chunk: 64,
+            chunk: baseline_chunk,
             kernel: copy_candidate_unroll2_avx2,
         }
     } else {
         BenchPath {
             name: "candidate_scalar_fallback",
-            chunk: core::mem::size_of::<usize>(),
+            chunk: baseline_chunk,
             kernel: copy_candidate_scalar,
         }
     }
@@ -180,9 +172,9 @@ unsafe fn copy_with_overshoot_policy(
     let copy_multiple = copy_at_least.next_multiple_of(path.chunk);
     let min_capacity = core::cmp::min(src.1, dst.1);
     if min_capacity >= copy_multiple {
-        unsafe { (path.kernel)(src.0, dst.0, copy_multiple) };
+        (path.kernel)(src.0, dst.0, copy_multiple);
     } else {
-        unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
+        dst.0.copy_from_nonoverlapping(src.0, copy_at_least);
     }
 }
 
@@ -204,8 +196,8 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
     ];
 
     for len in lengths {
-        let candidate_path = select_candidate_copy_kernel(len);
         let baseline_path = select_baseline_copy_kernel(len);
+        let candidate_path = select_candidate_copy_kernel(len, baseline_path.chunk);
         let mut src = vec![0u8; len + 64];
         rng.fill(&mut src);
         let mut dst_production = vec![0u8; len + 64];
