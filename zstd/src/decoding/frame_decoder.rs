@@ -297,6 +297,7 @@ impl FrameDecoder {
         dict: &DictionaryHandle,
     ) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        Self::validate_registered_dictionary(dict.as_dict())?;
         let state = match &mut self.state {
             Some(s) => {
                 s.reset(source)?;

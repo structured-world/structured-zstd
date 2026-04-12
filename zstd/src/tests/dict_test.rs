@@ -90,11 +90,14 @@ fn test_dictionary_handle_from_dictionary_roundtrips() {
     assert_eq!(handle.as_dict().dict_content.as_slice(), &[4]);
 }
 
-#[cfg(target_has_atomic = "ptr")]
 #[test]
 fn test_dict_decoding() {
     extern crate std;
     use crate::decoding::BlockDecodingStrategy;
+    #[cfg(not(target_has_atomic = "ptr"))]
+    use crate::decoding::Dictionary;
+    #[cfg(target_has_atomic = "ptr")]
+    use crate::decoding::DictionaryHandle;
     use crate::decoding::FrameDecoder;
     use alloc::borrow::ToOwned;
     use alloc::string::{String, ToString};
@@ -124,8 +127,16 @@ fn test_dict_decoding() {
     });
 
     let mut frame_dec = FrameDecoder::new();
-    let dict = crate::decoding::DictionaryHandle::decode_dict(&dict).unwrap();
-    frame_dec.add_dict_handle(dict).unwrap();
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        let dict = DictionaryHandle::decode_dict(&dict).unwrap();
+        frame_dec.add_dict_handle(dict).unwrap();
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        let dict = Dictionary::decode_dict(&dict).unwrap();
+        frame_dec.add_dict(dict).unwrap();
+    }
 
     for file in files {
         let f = file.unwrap();
@@ -527,6 +538,36 @@ fn test_reset_with_dict_handle_rejects_mismatched_id() {
         result,
         Err(FrameDecoderError::DictIdMismatch { expected, provided })
             if expected == expected_dict_id && provided == mismatched_id
+    ));
+}
+
+#[test]
+fn test_reset_with_dict_handle_rejects_invalid_handle_invariants() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::decoding::errors::{DictionaryDecodeError, FrameDecoderError};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let payload = b"dict-handle-invariants";
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut invalid = Dictionary::from_raw_content(123, vec![1u8]).expect("dict should build");
+    invalid.offset_hist[0] = 0;
+    let handle = DictionaryHandle::from_dictionary(invalid);
+
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.reset_with_dict_handle(compressed.as_slice(), &handle);
+    assert!(matches!(
+        result,
+        Err(FrameDecoderError::DictionaryDecodeError(
+            DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 0 }
+        ))
     ));
 }
 
