@@ -303,7 +303,8 @@ fn test_decode_all_skips_skippable_frames() {
     input.extend_from_slice(&compressed);
 
     let mut output = vec![0u8; payload.len()];
-    let written = FrameDecoder::new()
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
         .decode_all(input.as_slice(), &mut output)
         .expect("decode_all should succeed");
     assert_eq!(written, payload.len());
@@ -327,7 +328,8 @@ fn test_decode_all_reports_target_too_small() {
     compressor.compress();
 
     let mut output = vec![0u8; payload.len() - 1];
-    let result = FrameDecoder::new().decode_all(compressed.as_slice(), &mut output);
+    let mut decoder = FrameDecoder::new();
+    let result = decoder.decode_all(compressed.as_slice(), &mut output);
     assert!(matches!(result, Err(FrameDecoderError::TargetTooSmall)));
 }
 
@@ -345,14 +347,16 @@ fn test_decode_all_with_dict_helpers() {
     let handle = DictionaryHandle::decode_dict(&dict_raw).expect("dictionary should parse");
 
     let mut output = vec![0u8; original.len()];
-    let written = FrameDecoder::new()
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
         .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
         .expect("decode_all_with_dict_handle should succeed");
     assert_eq!(written, original.len());
     assert_eq!(output, original);
 
     let mut output = vec![0u8; original.len()];
-    let written = FrameDecoder::new()
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
         .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_raw)
         .expect("decode_all_with_dict_bytes should succeed");
     assert_eq!(written, original.len());

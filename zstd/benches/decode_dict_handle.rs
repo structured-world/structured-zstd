@@ -35,7 +35,8 @@ fn bench_decode_dict_handle(c: &mut Criterion) {
     let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
 
     let mut output = vec![0u8; output_len];
-    FrameDecoder::new()
+    let mut decoder = FrameDecoder::new();
+    decoder
         .decode_all_with_dict_handle(compressed.as_slice(), &mut output, &handle)
         .expect("decode should succeed");
     assert_eq!(
@@ -44,7 +45,8 @@ fn bench_decode_dict_handle(c: &mut Criterion) {
     );
 
     output.fill(0);
-    FrameDecoder::new()
+    let mut decoder = FrameDecoder::new();
+    decoder
         .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, dict_raw)
         .expect("decode should succeed");
     assert_eq!(

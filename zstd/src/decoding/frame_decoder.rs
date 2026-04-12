@@ -179,6 +179,18 @@ impl FrameDecoder {
         false
     }
 
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_dict(&self, dict_id: u32) -> Option<&Dictionary> {
+        self.shared_dicts
+            .get(&dict_id)
+            .map(DictionaryHandle::as_ref)
+    }
+
+    #[cfg(not(target_has_atomic = "ptr"))]
+    fn shared_dict(&self, _dict_id: u32) -> Option<&Dictionary> {
+        None
+    }
+
     /// init() will allocate all needed buffers if it is the first time this decoder is used
     /// else they just reset these buffers with not further allocations
     ///
@@ -219,15 +231,18 @@ impl FrameDecoder {
             }
         };
         if let Some(dict_id) = dict_id {
-            let dict = self
-                .owned_dicts
-                .get(&dict_id)
-                .or_else(|| {
-                    self.shared_dicts
-                        .get(&dict_id)
-                        .map(DictionaryHandle::as_ref)
-                })
-                .ok_or(err::DictNotProvided { dict_id })?;
+            let dict_ptr = {
+                let dict = self
+                    .owned_dicts
+                    .get(&dict_id)
+                    .or_else(|| self.shared_dict(dict_id))
+                    .ok_or(err::DictNotProvided { dict_id })?;
+                core::ptr::from_ref(dict)
+            };
+            // SAFETY: `dict_ptr` comes from `owned_dicts`/`shared_dict(dict_id)` and
+            // neither map is mutated before dereference. `state` is a separate field,
+            // and only `state.decoder_scratch` / `state.using_dict` are mutated.
+            let dict = unsafe { &*dict_ptr };
             let state = self.state.as_mut().expect("state initialized");
             state.decoder_scratch.init_from_dict(dict);
             state.using_dict = Some(dict_id);
@@ -306,15 +321,18 @@ impl FrameDecoder {
         if self.state.is_none() {
             return Err(err::NotYetInitialized);
         }
-        let dict = self
-            .owned_dicts
-            .get(&dict_id)
-            .or_else(|| {
-                self.shared_dicts
-                    .get(&dict_id)
-                    .map(DictionaryHandle::as_ref)
-            })
-            .ok_or(err::DictNotProvided { dict_id })?;
+        let dict_ptr = {
+            let dict = self
+                .owned_dicts
+                .get(&dict_id)
+                .or_else(|| self.shared_dict(dict_id))
+                .ok_or(err::DictNotProvided { dict_id })?;
+            core::ptr::from_ref(dict)
+        };
+        // SAFETY: `dict_ptr` comes from `owned_dicts`/`shared_dict(dict_id)` and
+        // neither map is mutated before dereference. `state` is a separate field,
+        // and only `state.decoder_scratch` / `state.using_dict` are mutated.
+        let dict = unsafe { &*dict_ptr };
         let state = self.state.as_mut().expect("state checked above");
         state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict_id);

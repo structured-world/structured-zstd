@@ -144,7 +144,8 @@ let _written = decoder
     .unwrap();
 
 // Compatibility path: pass raw dictionary bytes directly.
-let _written = FrameDecoder::new()
+let mut decoder = FrameDecoder::new();
+let _written = decoder
     .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, &dict_bytes)
     .unwrap();
 
