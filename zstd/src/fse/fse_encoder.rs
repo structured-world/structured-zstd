@@ -1,4 +1,4 @@
-use crate::{bit_io::BitWriter, histogram};
+use crate::bit_io::BitWriter;
 use alloc::vec::Vec;
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
@@ -53,56 +53,50 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     pub fn encode_interleaved(&mut self, data: &[u8]) {
         self.write_table();
 
-        let mut state_1 = self.table.start_state(data[data.len() - 1]);
-        let mut state_2 = self.table.start_state(data[data.len() - 2]);
+        assert!(data.len() > 2);
+        let mut ip = data.len();
+        let mut state_1;
+        let mut state_2;
 
-        // The first two symbols are represented by the start states
-        // Then encode the state transitions for two symbols at a time
-        let mut idx = data.len() - 4;
-        loop {
-            {
-                let state = state_1;
-                let x = data[idx + 1];
-                let next = self.table.next_state(x, state.index);
-                let diff = state.index - next.baseline;
-                self.writer.write_bits(diff as u64, next.num_bits as usize);
-                state_1 = next;
-            }
-            {
-                let state = state_2;
-                let x = data[idx];
-                let next = self.table.next_state(x, state.index);
-                let diff = state.index - next.baseline;
-                self.writer.write_bits(diff as u64, next.num_bits as usize);
-                state_2 = next;
-            }
-
-            if idx < 2 {
-                break;
-            }
-            idx -= 2;
-        }
-
-        // Determine if we have an even or odd number of symbols to encode
-        // If odd we need to encode the last states transition and encode the final states in the flipped order
-        if idx == 1 {
-            let state = state_1;
-            let x = data[0];
-            let next = self.table.next_state(x, state.index);
-            let diff = state.index - next.baseline;
-            self.writer.write_bits(diff as u64, next.num_bits as usize);
-            state_1 = next;
-
-            self.writer
-                .write_bits(state_2.index as u64, self.acc_log() as usize);
-            self.writer
-                .write_bits(state_1.index as u64, self.acc_log() as usize);
+        if data.len() & 1 != 0 {
+            ip -= 1;
+            state_1 = self.table.start_state(data[ip]).index;
+            ip -= 1;
+            state_2 = self.table.start_state(data[ip]).index;
+            ip -= 1;
+            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
         } else {
-            self.writer
-                .write_bits(state_1.index as u64, self.acc_log() as usize);
-            self.writer
-                .write_bits(state_2.index as u64, self.acc_log() as usize);
+            ip -= 1;
+            state_2 = self.table.start_state(data[ip]).index;
+            ip -= 1;
+            state_1 = self.table.start_state(data[ip]).index;
         }
+
+        let remaining_after_init = data.len() - 2;
+        if remaining_after_init & 2 != 0 {
+            ip -= 1;
+            state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+            ip -= 1;
+            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+        }
+
+        while ip > 0 {
+            ip -= 1;
+            state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+            ip -= 1;
+            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+            if ip > 0 {
+                ip -= 1;
+                state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+                ip -= 1;
+                state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+            }
+        }
+
+        self.writer
+            .write_bits(state_2 as u64, self.acc_log() as usize);
+        self.writer
+            .write_bits(state_1 as u64, self.acc_log() as usize);
 
         let bits_to_fill = self.writer.misaligned();
         if bits_to_fill == 0 {
@@ -110,6 +104,13 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         } else {
             self.writer.write_bits(1u32, bits_to_fill);
         }
+    }
+
+    fn encode_symbol_with_state(&mut self, state_index: usize, symbol: u8) -> usize {
+        let next = self.table.next_state(symbol, state_index);
+        let diff = state_index - next.baseline;
+        self.writer.write_bits(diff as u64, next.num_bits as usize);
+        next.index
     }
 
     fn write_table(&mut self) {
@@ -137,7 +138,14 @@ impl FSETable {
 
     pub(crate) fn start_state(&self, symbol: u8) -> &State {
         let states = &self.states[symbol as usize];
-        &states.states[0]
+        let start_index = states
+            .start_index
+            .expect("symbol must be present in the FSE table");
+        states
+            .states
+            .iter()
+            .find(|state| state.index == start_index)
+            .expect("FSE start state must be present")
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -147,6 +155,14 @@ impl FSETable {
     /// Get the probability assigned to a symbol (0 means absent, -1 means less-than-1).
     pub(crate) fn symbol_probability(&self, symbol: u8) -> i32 {
         self.states[symbol as usize].probability
+    }
+
+    pub(crate) fn max_num_bits_for_symbol(&self, symbol: u8) -> Option<u8> {
+        let states = &self.states[symbol as usize];
+        if states.probability == 0 {
+            return None;
+        }
+        states.states.iter().map(|state| state.num_bits).max()
     }
 
     /// Compute the exact serialized size (in bits) of the FSE table header,
@@ -264,6 +280,7 @@ pub(super) struct SymbolStates {
     /// Sorted by baseline to allow easy lookup using an index
     pub(super) states: Vec<State>,
     pub(super) probability: i32,
+    start_index: Option<usize>,
 }
 
 impl SymbolStates {
@@ -313,20 +330,6 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
-/// Builds an FSE table directly from a byte slice.
-///
-/// This path reuses the shared histogram counter to avoid repeated ad-hoc
-/// symbol scans in entropy-table construction call sites.
-pub(crate) fn build_table_from_bytes(data: &[u8], max_log: u8, avoid_0_numbit: bool) -> FSETable {
-    assert!(
-        !data.is_empty(),
-        "cannot build an FSE table from empty data"
-    );
-    let mut counts = [0; 256];
-    let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
-    build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
-}
-
 pub(crate) fn build_table_from_symbol_counts(
     counts: &[usize],
     max_log: u8,
@@ -336,78 +339,209 @@ pub(crate) fn build_table_from_symbol_counts(
 }
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
-    let mut probs = [0; 256];
-    let probs = &mut probs[..counts.len()];
-    let mut min_count = 0;
-    for (idx, count) in counts.iter().copied().enumerate() {
-        probs[idx] = count as i32;
-        if count > 0 && (count < min_count || min_count == 0) {
-            min_count = count;
+    let total = counts.iter().sum::<usize>();
+    assert!(total > 1, "RLE distributions must not build FSE tables");
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    let table_log = donor_optimal_table_log(max_log, total, max_symbol);
+    let mut probs = [0i32; 256];
+    donor_normalize_counts(
+        &mut probs[..counts.len()],
+        table_log,
+        counts,
+        total,
+        max_symbol,
+        avoid_0_numbit,
+    );
+    build_table_from_probabilities(&probs[..counts.len()], table_log)
+}
+
+fn donor_min_table_log(total: usize, max_symbol: usize) -> u8 {
+    let min_bits_src = total.ilog2() + 1;
+    let min_bits_symbols = if max_symbol == 0 {
+        2
+    } else {
+        max_symbol.ilog2() + 2
+    };
+    min_bits_src.min(min_bits_symbols) as u8
+}
+
+fn donor_optimal_table_log(max_table_log: u8, total: usize, max_symbol: usize) -> u8 {
+    let max_bits_src = (total - 1).ilog2().saturating_sub(2) as u8;
+    let min_bits = donor_min_table_log(total, max_symbol);
+    let mut table_log = max_table_log;
+    if max_bits_src < table_log {
+        table_log = max_bits_src;
+    }
+    if min_bits > table_log {
+        table_log = min_bits;
+    }
+    table_log.clamp(5, 12)
+}
+
+fn donor_normalize_counts(
+    normalized: &mut [i32],
+    table_log: u8,
+    counts: &[usize],
+    total: usize,
+    max_symbol: usize,
+    use_low_prob_count: bool,
+) {
+    const RTB_TABLE: [u64; 8] = [
+        0, 473_195, 504_333, 520_860, 550_000, 700_000, 750_000, 830_000,
+    ];
+    let low_prob_count = if use_low_prob_count { -1 } else { 1 };
+    let scale = 62 - table_log as usize;
+    let step = (1u64 << 62) / total as u64;
+    let v_step = 1u64 << (scale - 20);
+    let low_threshold = total >> table_log;
+    let mut still_to_distribute = 1i32 << table_log;
+    let mut largest = 0usize;
+    let mut largest_probability = 0i32;
+
+    for symbol in 0..=max_symbol {
+        let count = counts[symbol];
+        if count == 0 {
+            normalized[symbol] = 0;
+        } else if count <= low_threshold {
+            normalized[symbol] = low_prob_count;
+            still_to_distribute -= 1;
+        } else {
+            let product = count as u64 * step;
+            let mut probability = (product >> scale) as i32;
+            if probability < 8 {
+                let rest_to_beat = v_step * RTB_TABLE[probability as usize];
+                probability +=
+                    u64::from(product - ((probability as u64) << scale) > rest_to_beat) as i32;
+            }
+            if probability > largest_probability {
+                largest_probability = probability;
+                largest = symbol;
+            }
+            normalized[symbol] = probability;
+            still_to_distribute -= probability;
         }
     }
 
-    // shift all probabilities down so that the lowest are 1
-    min_count -= 1;
-    let mut max_prob = 0i32;
-    for prob in probs.iter_mut() {
-        if *prob > 0 {
-            *prob -= min_count as i32;
-        }
-        max_prob = max_prob.max(*prob);
+    if -still_to_distribute >= normalized[largest] >> 1 {
+        donor_normalize_m2(
+            normalized,
+            table_log,
+            counts,
+            total,
+            max_symbol,
+            low_prob_count,
+        );
+    } else {
+        normalized[largest] += still_to_distribute;
     }
 
-    if max_prob > 0 && max_prob as usize > probs.len() {
-        let divisor = max_prob / (probs.len() as i32);
-        for prob in probs.iter_mut() {
-            if *prob > 0 {
-                *prob = (*prob / divisor).max(1)
+    debug_assert_eq!(
+        normalized
+            .iter()
+            .take(max_symbol + 1)
+            .map(|&probability| probability.unsigned_abs() as usize)
+            .sum::<usize>(),
+        1usize << table_log
+    );
+}
+
+fn donor_normalize_m2(
+    normalized: &mut [i32],
+    table_log: u8,
+    counts: &[usize],
+    mut total: usize,
+    max_symbol: usize,
+    low_prob_count: i32,
+) {
+    const NOT_YET_ASSIGNED: i32 = -2;
+    let low_threshold = total >> table_log;
+    let mut low_one = (total * 3) >> (table_log as usize + 1);
+    let mut distributed = 0usize;
+
+    for symbol in 0..=max_symbol {
+        let count = counts[symbol];
+        if count == 0 {
+            normalized[symbol] = 0;
+        } else if count <= low_threshold {
+            normalized[symbol] = low_prob_count;
+            distributed += 1;
+            total -= count;
+        } else if count <= low_one {
+            normalized[symbol] = 1;
+            distributed += 1;
+            total -= count;
+        } else {
+            normalized[symbol] = NOT_YET_ASSIGNED;
+        }
+    }
+
+    let mut to_distribute = (1usize << table_log) - distributed;
+    if to_distribute == 0 {
+        return;
+    }
+
+    if total / to_distribute > low_one {
+        low_one = (total * 3) / (to_distribute * 2);
+        for symbol in 0..=max_symbol {
+            if normalized[symbol] == NOT_YET_ASSIGNED && counts[symbol] <= low_one {
+                normalized[symbol] = 1;
+                distributed += 1;
+                total -= counts[symbol];
             }
         }
+        to_distribute = (1usize << table_log) - distributed;
     }
 
-    // normalize probabilities to a 2^x
-    let sum = probs.iter().sum::<i32>();
-    assert!(sum > 0);
-    let sum = sum as usize;
-    let acc_log = (sum.ilog2() as u8 + 1).max(5);
-    let acc_log = u8::min(acc_log, max_log);
+    if distributed == max_symbol + 1 {
+        let max_symbol = counts
+            .iter()
+            .copied()
+            .take(max_symbol + 1)
+            .enumerate()
+            .max_by_key(|&(_, count)| count)
+            .map(|(symbol, _)| symbol)
+            .unwrap_or_default();
+        normalized[max_symbol] += to_distribute as i32;
+        return;
+    }
 
-    if sum < 1 << acc_log {
-        // just raise the maximum probability as much as possible
-        // TODO is this optimal?
-        let diff = (1 << acc_log) - sum;
-        let max = probs.iter_mut().max().unwrap();
-        *max += diff as i32;
-    } else {
-        // decrease the smallest ones to 1 first
-        let mut diff = sum - (1 << acc_log);
-        while diff > 0 {
-            let min = probs.iter_mut().filter(|prob| **prob > 1).min().unwrap();
-            let decrease = usize::min(*min as usize - 1, diff);
-            diff -= decrease;
-            *min -= decrease as i32;
+    if total == 0 {
+        let mut symbol = 0usize;
+        while to_distribute > 0 {
+            if normalized[symbol] > 0 {
+                normalized[symbol] += 1;
+                to_distribute -= 1;
+            }
+            symbol = (symbol + 1) % (max_symbol + 1);
+        }
+        return;
+    }
+
+    let v_step_log = 62 - table_log as usize;
+    let mid = (1u64 << (v_step_log - 1)) - 1;
+    let r_step = (((1u64 << v_step_log) * to_distribute as u64) + mid) / total as u64;
+    let mut tmp_total = mid;
+    for symbol in 0..=max_symbol {
+        if normalized[symbol] == NOT_YET_ASSIGNED {
+            let end = tmp_total + counts[symbol] as u64 * r_step;
+            let start_bucket = tmp_total >> v_step_log;
+            let end_bucket = end >> v_step_log;
+            let weight = end_bucket - start_bucket;
+            assert!(weight >= 1, "donor FSE normalization produced zero weight");
+            normalized[symbol] = weight as i32;
+            tmp_total = end;
         }
     }
-    let max = probs.iter_mut().max().unwrap();
-    if avoid_0_numbit && *max > 1 << (acc_log - 1) {
-        let redistribute = *max - (1 << (acc_log - 1));
-        *max -= redistribute;
-        let max = *max;
-
-        // find first occurence of the second_max to avoid lifting the last zero
-        let second_max = *probs.iter_mut().filter(|x| **x != max).max().unwrap();
-        let second_max = probs.iter_mut().find(|x| **x == second_max).unwrap();
-        *second_max += redistribute;
-        assert!(*second_max <= max);
-    }
-
-    build_table_from_probabilities(probs, acc_log)
 }
 
 pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
     let mut states = core::array::from_fn::<SymbolStates, 256, _>(|_| SymbolStates {
         states: Vec::new(),
         probability: 0,
+        start_index: None,
     });
 
     // distribute -1 symbols
@@ -454,44 +588,67 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         assert_eq!(states.len(), prob as usize);
     }
 
-    // After all states know their index we can determine the numbits and baselines
-    for (symbol, prob) in probs.iter().copied().enumerate() {
-        if prob <= 0 {
+    // Materialize the C `stateTable`: symbols are grouped by symbol and, within
+    // each symbol, ordered by table position.
+    let mut state_table = Vec::with_capacity(1 << acc_log);
+    for state in &mut states {
+        state.states.sort_by_key(|entry| entry.index);
+        state_table.extend(state.states.iter().map(|entry| entry.index));
+    }
+
+    // Build encoder transitions directly from C `FSE_encodeSymbol()` formulas.
+    let mut symbol_transform_total = 0usize;
+    for (symbol, probability) in probs.iter().copied().enumerate() {
+        if probability == 0 {
             continue;
         }
-        let prob = prob as u32;
-        let state = &mut states[symbol];
-
-        // We process the states in their order in the table
-        state.states.sort_by_key(|l| l.index);
-
-        let prob_log = if prob.is_power_of_two() {
-            prob.ilog2()
-        } else {
-            prob.ilog2() + 1
-        };
-        let rounded_up = 1u32 << prob_log;
-
-        // The lower states target double the amount of indexes -> numbits + 1
-        let double_states = rounded_up - prob;
-        let single_states = prob - double_states;
-        let num_bits = acc_log - prob_log as u8;
-        let mut baseline = (single_states as usize * (1 << (num_bits))) % (1 << acc_log);
-        for (idx, state) in state.states.iter_mut().enumerate() {
-            if (idx as u32) < double_states {
-                let num_bits = num_bits + 1;
-                state.baseline = baseline;
-                state.num_bits = num_bits;
-                state.last_index = baseline + ((1 << num_bits) - 1);
-
-                baseline += 1 << num_bits;
-                baseline %= 1 << acc_log;
-            } else {
-                state.baseline = baseline;
-                state.num_bits = num_bits;
-                state.last_index = baseline + ((1 << num_bits) - 1);
-                baseline += 1 << num_bits;
+        let probability_abs = probability.unsigned_abs() as usize;
+        let (delta_nb_bits, delta_find_state) = match probability {
+            -1 | 1 => (
+                ((acc_log as usize) << 16).saturating_sub(1usize << acc_log),
+                symbol_transform_total as isize - 1,
+            ),
+            probability if probability > 1 => {
+                let probability = probability as usize;
+                let max_bits_out = acc_log as usize - (probability - 1).ilog2() as usize;
+                let min_state_plus = probability << max_bits_out;
+                (
+                    (max_bits_out << 16).saturating_sub(min_state_plus),
+                    symbol_transform_total as isize - probability as isize,
+                )
             }
+            _ => unreachable!(),
+        };
+        let state = &mut states[symbol];
+        let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
+        let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
+        let state_table_index = (init_value >> init_nb_bits_out) as isize + delta_find_state;
+        state.start_index = Some(state_table[state_table_index as usize]);
+        symbol_transform_total += probability_abs;
+
+        state.states.clear();
+        for current_index in 0..(1usize << acc_log) {
+            let current_value = (1usize << acc_log) + current_index;
+            let num_bits = (current_value + delta_nb_bits) >> 16;
+            let next_state_idx = (current_value >> num_bits) as isize + delta_find_state;
+            let next_index = state_table[next_state_idx as usize];
+            let mask = (1usize << num_bits) - 1;
+            let baseline = current_index & !mask;
+            let last_index = baseline + mask;
+            if state.states.iter().any(|entry| {
+                entry.baseline == baseline
+                    && entry.last_index == last_index
+                    && entry.index == next_index
+                    && entry.num_bits == num_bits as u8
+            }) {
+                continue;
+            }
+            state.states.push(State {
+                num_bits: num_bits as u8,
+                baseline,
+                last_index,
+                index: next_index,
+            });
         }
 
         // For encoding we use the states ordered by the indexes they target

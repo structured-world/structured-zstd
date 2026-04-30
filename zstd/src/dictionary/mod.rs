@@ -34,7 +34,7 @@ use crate::blocks::sequence_section::{
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
 use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
 use crate::dictionary::reservoir::create_sample;
-use crate::fse::fse_encoder::{self, build_table_from_bytes};
+use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 use core::cmp::Reverse;
@@ -50,6 +50,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    vec,
     vec::Vec,
 };
 
@@ -344,7 +345,11 @@ fn serialize_fse_table_from_corpus(
         sample_data
     };
     let symbols = bounded_fse_symbols(source, max_symbol);
-    let table = build_table_from_bytes(&symbols, max_log, false);
+    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
+    for symbol in symbols {
+        counts[usize::from(symbol)] += 1;
+    }
+    let table = build_table_from_symbol_counts(&counts, max_log, false);
     serialize_fse_table(&table)
 }
 

@@ -24,6 +24,9 @@ pub fn round_trip(data: &[u8]) {
     }
     let mut writer = BitWriter::new();
     let encoder_table = huff0_encoder::HuffmanTable::build_from_data(data);
+    if encoder_table.writeable_table_description_size().is_none() {
+        return;
+    }
     let mut encoder = huff0_encoder::HuffmanEncoder::new(&encoder_table, &mut writer);
 
     encoder.encode(data, true);

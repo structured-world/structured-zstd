@@ -468,17 +468,6 @@ fn test_ll_default() {
         )
         .unwrap();
 
-    #[cfg(feature = "std")]
-    for idx in 0..table.decode.len() {
-        std::println!(
-            "{:3}: {:3} {:3} {:3}",
-            idx,
-            table.decode[idx].symbol,
-            table.decode[idx].num_bits,
-            table.decode[idx].new_state
-        );
-    }
-
     assert!(table.decode.len() == 64);
 
     //just test a few values. TODO test all values
