@@ -73,6 +73,9 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         if matches!(compression_level, CompressionLevel::Level(16..=22))
             && state.matcher.window_size() >= (1 << 17)
         {
+            // This helper may emit multiple physical blocks (compressed or raw)
+            // into `output`; this function's return value remains a coarse
+            // "compressed-path selected" signal for caller accounting.
             compress_block_with_post_split(state, last_block, output);
             return BlockType::Compressed;
         }

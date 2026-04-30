@@ -275,6 +275,9 @@ fn repetitive_data_compresses_better_than_random() {
 /// persistence across block boundaries.
 #[test]
 fn roundtrip_multi_block_repeat_offsets() {
+    // Per-frame mode may emit a few extra bytes for table/header decisions versus
+    // independent per-block resets. Keep this bound explicit and named.
+    const CROSS_BLOCK_OVERHEAD_SLACK_BYTES: usize = 16;
     // 512KB of data with fixed-offset repeats broken by a changing sentinel —
     // spans multiple 128KB blocks, so offset history and FSE tables must
     // persist correctly across block boundaries.
@@ -302,7 +305,7 @@ fn roundtrip_multi_block_repeat_offsets() {
         .sum::<usize>()
         .saturating_add(frame_overhead);
     assert!(
-        whole_frame.len() <= independent_chunks + 16,
+        whole_frame.len() <= independent_chunks + CROSS_BLOCK_OVERHEAD_SLACK_BYTES,
         "Cross-block reuse should stay near per-block resets. whole={} bytes, split={} bytes",
         whole_frame.len(),
         independent_chunks

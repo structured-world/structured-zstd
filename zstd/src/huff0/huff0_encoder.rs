@@ -149,8 +149,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
 
         let raw_description_is_representable = weights.len() <= 128;
+        let raw_description_bytes = weights.len().div_ceil(2);
         if encoded.len() > 1
-            && (encoded.len() < weights.len() / 2 || !raw_description_is_representable)
+            && (encoded.len() < raw_description_bytes || !raw_description_is_representable)
         {
             if encoded.len() >= 128 {
                 return None;
@@ -277,7 +278,8 @@ impl HuffmanTable {
             }
             bits += num_bits as usize;
         }
-        Some(bits.div_ceil(8))
+        let bytes = bits.div_ceil(8);
+        Some(bytes + usize::from(bits.is_multiple_of(8)))
     }
 
     /// Returns estimated table-description size or a large sentinel when not writable.
@@ -312,12 +314,13 @@ impl HuffmanTable {
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
     fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
-        self.codes
+        let bits = self
+            .codes
             .iter()
             .zip(counts.iter())
             .map(|(&(_, bits), &count)| bits as usize * count)
-            .sum::<usize>()
-            .div_ceil(8)
+            .sum::<usize>();
+        bits.div_ceil(8) + usize::from(bits.is_multiple_of(8))
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {

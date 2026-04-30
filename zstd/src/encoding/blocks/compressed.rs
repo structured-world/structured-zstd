@@ -94,15 +94,18 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 ) {
     let parts = collect_block_parts(state);
     if parts.sequences.len() <= 4 {
-        let source = state.matcher.get_last_space().to_vec();
-        emit_single_sequence_block(
+        let source_len = state.matcher.get_last_space().len();
+        let emitted_raw = emit_single_sequence_block(
             state,
             last_block,
-            &source,
+            source_len,
             &parts.literals,
             &parts.sequences,
             output,
         );
+        if emitted_raw {
+            output.extend_from_slice(state.matcher.get_last_space());
+        }
         return;
     }
 
@@ -117,7 +120,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     );
     partitions.push(parts.sequences.len());
 
-    let source = state.matcher.get_last_space().to_vec();
     let mut seq_start = 0usize;
     let mut lit_start = 0usize;
     let mut src_start = 0usize;
@@ -137,18 +139,23 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             lit_start + chunk_lit_len
         };
         let src_size = if last_partition {
-            source.len() - src_start
+            state.matcher.get_last_space().len() - src_start
         } else {
             chunk_lit_len + chunk_match_len
         };
-        emit_single_sequence_block(
+        let emitted_raw = emit_single_sequence_block(
             state,
             last_block && last_partition,
-            &source[src_start..src_start + src_size],
+            src_size,
             &parts.literals[lit_start..lit_end],
             &parts.sequences[seq_start..seq_end],
             output,
         );
+        if emitted_raw {
+            output.extend_from_slice(
+                &state.matcher.get_last_space()[src_start..src_start + src_size],
+            );
+        }
         seq_start = seq_end;
         lit_start = lit_end;
         src_start += src_size;
@@ -262,11 +269,11 @@ fn encode_block_parts<M: Matcher>(
 fn emit_single_sequence_block<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
-    source: &[u8],
+    source_len: usize,
     literals: &[u8],
     sequences: &[RawSequence],
     output: &mut Vec<u8>,
-) {
+) -> bool {
     let saved_offset_hist = state.offset_hist;
     let saved_huff_table = state.last_huff_table.clone();
     let saved_ll_previous = state.fse_tables.ll_previous.clone();
@@ -274,8 +281,8 @@ fn emit_single_sequence_block<M: Matcher>(
     let saved_of_previous = state.fse_tables.of_previous.clone();
     let mut compressed = Vec::new();
     encode_block_parts(state, literals, sequences, &mut compressed);
-    let min_gain = (source.len() >> 8) + 2;
-    if compressed.len() >= source.len().saturating_sub(min_gain) {
+    let min_gain = (source_len >> 8) + 2;
+    if compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
         state.last_huff_table = saved_huff_table;
         state.fse_tables.ll_previous = saved_ll_previous;
@@ -284,10 +291,10 @@ fn emit_single_sequence_block<M: Matcher>(
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
-            block_size: source.len() as u32,
+            block_size: source_len as u32,
         };
         header.serialize(output);
-        output.extend_from_slice(source);
+        true
     } else {
         let header = BlockHeader {
             last_block,
@@ -296,6 +303,7 @@ fn emit_single_sequence_block<M: Matcher>(
         };
         header.serialize(output);
         output.extend(compressed);
+        false
     }
 }
 
@@ -1079,7 +1087,17 @@ mod tests {
         }];
         let mut output = Vec::new();
 
-        emit_single_sequence_block(&mut state, true, &source, &[], &sequences, &mut output);
+        let emitted_raw = emit_single_sequence_block(
+            &mut state,
+            true,
+            source.len(),
+            &[],
+            &sequences,
+            &mut output,
+        );
+        if emitted_raw {
+            output.extend_from_slice(&source);
+        }
 
         assert_eq!(
             state.offset_hist,
