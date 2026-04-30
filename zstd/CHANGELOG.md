@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.19](https://github.com/structured-world/structured-zstd/compare/v0.0.18...v0.0.19) - 2026-04-12
+
+### Performance
+
+- *(bench)* add wildcopy candidate research bench and dashboard range filter ([#107](https://github.com/structured-world/structured-zstd/pull/107))
+
 ## [0.0.18](https://github.com/structured-world/structured-zstd/compare/v0.0.17...v0.0.18) - 2026-04-12
 
 ### Performance
