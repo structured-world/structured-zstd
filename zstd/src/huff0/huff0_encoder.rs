@@ -125,6 +125,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
     }
 
+    /// Encodes Huffman weights using FSE when that representation is valid and beneficial.
+    ///
+    /// Returns `None` when FSE metadata is not suitable, so callers fall back to raw weight encoding.
     fn encode_weight_description(weights: &[u8]) -> Option<Vec<u8>> {
         if weights.len() <= 2 {
             return None;
@@ -164,6 +167,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
     }
 
+    /// Validates that a serialized weight description decodes back to the same weights.
     fn weight_description_roundtrips(weights: &[u8], description: &[u8]) -> bool {
         let mut decoded = crate::huff0::huff0_decoder::HuffmanTable::new();
         if decoded.build_decoder(description).is_err() {
@@ -182,6 +186,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         decoded_weights.len() == weights.len() + 1 && &decoded_weights[..weights.len()] == weights
     }
 
+    /// Writes the raw nibble-packed Huffman weight representation.
     fn write_raw_weight_description<VV: AsMut<Vec<u8>>>(
         writer: &mut BitWriter<VV>,
         weights: &[u8],
@@ -262,6 +267,7 @@ impl HuffmanTable {
             .unwrap_or_else(|| Self::build_from_weights(&build_donor_limited_weights(counts, 11)))
     }
 
+    /// Estimates encoded payload size in bytes for `data` using this table.
     pub(crate) fn estimate_compressed_size(&self, data: &[u8]) -> Option<usize> {
         let mut bits = 0usize;
         for &symbol in data {
@@ -274,10 +280,12 @@ impl HuffmanTable {
         Some(bits.div_ceil(8))
     }
 
+    /// Returns estimated table-description size or a large sentinel when not writable.
     pub(crate) fn table_description_size(&self) -> usize {
         self.try_table_description_size().unwrap_or(usize::MAX / 2)
     }
 
+    /// Returns exact writable table-description size when representable.
     pub(crate) fn try_table_description_size(&self) -> Option<usize> {
         let weights = {
             let mut out = Vec::new();
@@ -297,10 +305,12 @@ impl HuffmanTable {
         }
     }
 
+    /// Alias for `try_table_description_size` used by call sites that require explicit writeability.
     pub(crate) fn writeable_table_description_size(&self) -> Option<usize> {
         self.try_table_description_size()
     }
 
+    /// Estimates encoded payload size in bytes directly from per-symbol counts.
     fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
         self.codes
             .iter()
