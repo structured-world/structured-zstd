@@ -50,6 +50,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    // Keep macro import explicit: this module uses `vec![..]` in non-test paths.
     vec,
     vec::Vec,
 };

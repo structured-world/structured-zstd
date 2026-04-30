@@ -77,6 +77,9 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             return BlockType::Compressed;
         }
 
+        // Keep rollback snapshots for the oversize fallback path below:
+        // `compress_block` can mutate entropy/history state before we know
+        // whether the compressed payload fits `MAX_BLOCK_SIZE`.
         let saved_offset_hist = state.offset_hist;
         let saved_huff_table = state.last_huff_table.clone();
         let saved_ll_previous = state.fse_tables.ll_previous.clone();

@@ -149,13 +149,15 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         if encoded.len() > 1
             && (encoded.len() < weights.len() / 2 || !raw_description_is_representable)
         {
+            if encoded.len() >= 128 {
+                return None;
+            }
             let mut description = Vec::with_capacity(encoded.len() + 1);
             description.push(encoded.len() as u8);
             description.extend_from_slice(&encoded);
             if !Self::weight_description_roundtrips(weights, &description) {
                 return None;
             }
-            debug_assert!(encoded.len() < 128);
             Some(encoded)
         } else {
             None
@@ -269,7 +271,7 @@ impl HuffmanTable {
             }
             bits += num_bits as usize;
         }
-        Some(bits >> 3)
+        Some(bits.div_ceil(8))
     }
 
     pub(crate) fn table_description_size(&self) -> usize {
@@ -305,7 +307,7 @@ impl HuffmanTable {
             .zip(counts.iter())
             .map(|(&(_, bits), &count)| bits as usize * count)
             .sum::<usize>()
-            >> 3
+            .div_ceil(8)
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
