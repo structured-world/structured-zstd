@@ -38,6 +38,33 @@ struct EncodedBlockParts {
     sequences: Vec<RawSequence>,
 }
 
+struct SequencePrefixSums {
+    lit: Vec<usize>,
+    ml: Vec<usize>,
+}
+
+impl SequencePrefixSums {
+    fn build(sequences: &[RawSequence]) -> Self {
+        let mut lit = Vec::with_capacity(sequences.len() + 1);
+        let mut ml = Vec::with_capacity(sequences.len() + 1);
+        lit.push(0);
+        ml.push(0);
+        for seq in sequences {
+            lit.push(*lit.last().unwrap_or(&0) + seq.ll as usize);
+            ml.push(*ml.last().unwrap_or(&0) + seq.ml as usize);
+        }
+        Self { lit, ml }
+    }
+
+    fn lit_range(&self, start: usize, end: usize) -> usize {
+        self.lit[end] - self.lit[start]
+    }
+
+    fn ml_range(&self, start: usize, end: usize) -> usize {
+        self.ml[end] - self.ml[start]
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RawSequence {
     ll: u32,
@@ -110,14 +137,15 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     }
 
     let mut partitions = Vec::new();
-    derive_block_splits(
-        &parts,
-        &state.fse_tables,
-        state.last_huff_table.as_ref(),
-        0,
-        parts.sequences.len(),
-        &mut partitions,
-    );
+    let prefix_sums = SequencePrefixSums::build(&parts.sequences);
+    let estimator = SplitEstimator {
+        parts: &parts,
+        prefix_sums: &prefix_sums,
+        fse_tables: &state.fse_tables,
+        huff_table: state.last_huff_table.as_ref(),
+        offset_hist: state.offset_hist,
+    };
+    estimator.derive_block_splits(0, parts.sequences.len(), &mut partitions);
     partitions.push(parts.sequences.len());
 
     let mut seq_start = 0usize;
@@ -125,14 +153,8 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     let mut src_start = 0usize;
     for (partition_idx, &seq_end) in partitions.iter().enumerate() {
         let last_partition = partition_idx + 1 == partitions.len();
-        let chunk_lit_len = parts.sequences[seq_start..seq_end]
-            .iter()
-            .map(|seq| seq.ll as usize)
-            .sum::<usize>();
-        let chunk_match_len = parts.sequences[seq_start..seq_end]
-            .iter()
-            .map(|seq| seq.ml as usize)
-            .sum::<usize>();
+        let chunk_lit_len = prefix_sums.lit_range(seq_start, seq_end);
+        let chunk_match_len = prefix_sums.ml_range(seq_start, seq_end);
         let lit_end = if last_partition {
             parts.literals.len()
         } else {
@@ -332,69 +354,66 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
     }
 }
 
-fn estimate_subblock_size(
-    parts: &EncodedBlockParts,
-    fse_tables: &FseTables,
-    huff_table: Option<&huff0_encoder::HuffmanTable>,
-    start_idx: usize,
-    end_idx: usize,
-) -> usize {
-    let lit_start = parts.sequences[..start_idx]
-        .iter()
-        .map(|seq| seq.ll as usize)
-        .sum::<usize>();
-    let lit_len = parts.sequences[start_idx..end_idx]
-        .iter()
-        .map(|seq| seq.ll as usize)
-        .sum::<usize>();
-    let lit_end = if end_idx == parts.sequences.len() {
-        parts.literals.len()
-    } else {
-        lit_start + lit_len
-    };
-    let mut state = CompressState {
-        matcher: EntropyOnlyMatcher,
-        last_huff_table: huff_table.cloned(),
-        fse_tables: clone_fse_tables(fse_tables),
-        offset_hist: [1, 4, 8],
-    };
-    let mut out = Vec::new();
-    encode_block_parts(
-        &mut state,
-        &parts.literals[lit_start..lit_end],
-        &parts.sequences[start_idx..end_idx],
-        &mut out,
-    );
-    out.len()
+struct SplitEstimator<'a> {
+    parts: &'a EncodedBlockParts,
+    prefix_sums: &'a SequencePrefixSums,
+    fse_tables: &'a FseTables,
+    huff_table: Option<&'a huff0_encoder::HuffmanTable>,
+    offset_hist: [u32; 3],
 }
 
-fn derive_block_splits(
-    parts: &EncodedBlockParts,
-    fse_tables: &FseTables,
-    huff_table: Option<&huff0_encoder::HuffmanTable>,
-    start_idx: usize,
-    end_idx: usize,
-    partitions: &mut Vec<usize>,
-) {
-    if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
-        || partitions.len() >= MAX_NB_BLOCK_SPLITS
-    {
-        return;
-    }
-    let mid_idx = (start_idx + end_idx) / 2;
-    let full = estimate_subblock_size(parts, fse_tables, huff_table, start_idx, end_idx);
-    let first = estimate_subblock_size(parts, fse_tables, huff_table, start_idx, mid_idx);
-    let second = estimate_subblock_size(parts, fse_tables, huff_table, mid_idx, end_idx);
-    let estimator_tolerance = full / 512;
-    if first + second < full + estimator_tolerance {
-        derive_block_splits(
-            parts, fse_tables, huff_table, start_idx, mid_idx, partitions,
+impl SplitEstimator<'_> {
+    fn estimate_subblock_size(&self, start_idx: usize, end_idx: usize) -> usize {
+        let lit_start = self.prefix_sums.lit[start_idx];
+        let lit_len = self.prefix_sums.lit_range(start_idx, end_idx);
+        let match_len = self.prefix_sums.ml_range(start_idx, end_idx);
+        let lit_end = if end_idx == self.parts.sequences.len() {
+            self.parts.literals.len()
+        } else {
+            lit_start + lit_len
+        };
+        let mut state = CompressState {
+            matcher: EntropyOnlyMatcher,
+            last_huff_table: self.huff_table.cloned(),
+            fse_tables: clone_fse_tables(self.fse_tables),
+            offset_hist: self.offset_hist,
+        };
+        let mut out = Vec::new();
+        encode_block_parts(
+            &mut state,
+            &self.parts.literals[lit_start..lit_end],
+            &self.parts.sequences[start_idx..end_idx],
+            &mut out,
         );
-        if partitions.len() >= MAX_NB_BLOCK_SPLITS {
+        let source_len = (lit_end - lit_start) + match_len;
+        let min_gain = (source_len >> 8) + 2;
+        let emitted_payload = if out.len() >= source_len.saturating_sub(min_gain) {
+            source_len
+        } else {
+            out.len()
+        };
+        emitted_payload + 3
+    }
+
+    fn derive_block_splits(&self, start_idx: usize, end_idx: usize, partitions: &mut Vec<usize>) {
+        if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
+            || partitions.len() >= MAX_NB_BLOCK_SPLITS
+        {
             return;
         }
-        partitions.push(mid_idx);
-        derive_block_splits(parts, fse_tables, huff_table, mid_idx, end_idx, partitions);
+        let mid_idx = (start_idx + end_idx) / 2;
+        let full = self.estimate_subblock_size(start_idx, end_idx);
+        let first = self.estimate_subblock_size(start_idx, mid_idx);
+        let second = self.estimate_subblock_size(mid_idx, end_idx);
+        let estimator_tolerance = full / 512;
+        if first + second < full + estimator_tolerance {
+            self.derive_block_splits(start_idx, mid_idx, partitions);
+            if partitions.len() >= MAX_NB_BLOCK_SPLITS {
+                return;
+            }
+            partitions.push(mid_idx);
+            self.derive_block_splits(mid_idx, end_idx, partitions);
+        }
     }
 }
 

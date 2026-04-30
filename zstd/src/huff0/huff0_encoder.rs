@@ -434,7 +434,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
     nodes.resize(
         2 * leaf_count - 1,
         HuffNode {
-            count: 1usize << 30,
+            count: usize::MAX,
             symbol: usize::MAX,
             parent: None,
             nb_bits: 0,
@@ -446,7 +446,9 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
     let node_root = leaf_count + (leaf_count - 1) - 1;
     let mut node_nb = leaf_count;
 
-    nodes[node_nb].count = nodes[low_s as usize].count + nodes[(low_s - 1) as usize].count;
+    nodes[node_nb].count = nodes[low_s as usize]
+        .count
+        .saturating_add(nodes[(low_s - 1) as usize].count);
     nodes[node_nb].symbol = nodes[(low_s - 1) as usize]
         .symbol
         .min(nodes[low_s as usize].symbol);
@@ -460,7 +462,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
             let leaf_count = if low_s >= 0 {
                 nodes[low_s as usize].count
             } else {
-                1usize << 31
+                usize::MAX
             };
             let node_count = nodes[low_n].count;
             if leaf_count < node_count {
@@ -477,7 +479,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
             let leaf_count = if low_s >= 0 {
                 nodes[low_s as usize].count
             } else {
-                1usize << 31
+                usize::MAX
             };
             let node_count = nodes[low_n].count;
             if leaf_count < node_count {
@@ -490,7 +492,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
                 idx
             }
         };
-        nodes[node_nb].count = nodes[first].count + nodes[second].count;
+        nodes[node_nb].count = nodes[first].count.saturating_add(nodes[second].count);
         nodes[node_nb].symbol = nodes[first].symbol.min(nodes[second].symbol);
         nodes[first].parent = Some(node_nb);
         nodes[second].parent = Some(node_nb);
