@@ -70,11 +70,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
         state.matcher.commit_space(uncompressed_data);
-        let saved_offset_hist = state.offset_hist;
-        let saved_huff_table = state.last_huff_table.clone();
-        let saved_ll_previous = state.fse_tables.ll_previous.clone();
-        let saved_ml_previous = state.fse_tables.ml_previous.clone();
-        let saved_of_previous = state.fse_tables.of_previous.clone();
         if matches!(compression_level, CompressionLevel::Level(16..=22))
             && state.matcher.window_size() >= (1 << 17)
         {
@@ -82,6 +77,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             return BlockType::Compressed;
         }
 
+        let saved_offset_hist = state.offset_hist;
+        let saved_huff_table = state.last_huff_table.clone();
+        let saved_ll_previous = state.fse_tables.ll_previous.clone();
+        let saved_ml_previous = state.fse_tables.ml_previous.clone();
+        let saved_of_previous = state.fse_tables.of_previous.clone();
         compress_block(state, &mut compressed);
         // If the compressed data is larger than the maximum
         // allowable block size, instead store uncompressed

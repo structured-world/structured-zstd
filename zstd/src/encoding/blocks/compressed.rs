@@ -35,7 +35,14 @@ const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 
 struct EncodedBlockParts {
     literals: Vec<u8>,
-    sequences: Vec<crate::blocks::sequence_section::Sequence>,
+    sequences: Vec<RawSequence>,
+}
+
+#[derive(Clone, Copy)]
+struct RawSequence {
+    ll: u32,
+    ml: u32,
+    offset: u32,
 }
 
 struct EntropyOnlyMatcher;
@@ -151,7 +158,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>) -> EncodedBlockParts {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    let offset_hist = &mut state.offset_hist;
     state.matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
         Sequence::Triple {
@@ -161,12 +167,10 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>) -> EncodedBlock
         } => {
             let ll = literals.len() as u32;
             literals_vec.extend_from_slice(literals);
-            let actual_offset = offset as u32;
-            let of = encode_offset_with_history(actual_offset, ll, offset_hist);
-            sequences.push(crate::blocks::sequence_section::Sequence {
+            sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
-                of,
+                offset: offset as u32,
             });
         }
     });
@@ -179,9 +183,11 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>) -> EncodedBlock
 fn encode_block_parts<M: Matcher>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    raw_sequences: &[RawSequence],
     output: &mut Vec<u8>,
 ) {
+    let sequences = encode_raw_sequences(raw_sequences, &mut state.offset_hist);
+
     // literals section
 
     let mut writer = BitWriter::from(output);
@@ -237,7 +243,7 @@ fn encode_block_parts<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            sequences,
+            &sequences,
             &mut writer,
             &ll_mode,
             &ml_mode,
@@ -258,9 +264,10 @@ fn emit_single_sequence_block<M: Matcher>(
     last_block: bool,
     source: &[u8],
     literals: &[u8],
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    sequences: &[RawSequence],
     output: &mut Vec<u8>,
 ) {
+    let saved_offset_hist = state.offset_hist;
     let saved_huff_table = state.last_huff_table.clone();
     let saved_ll_previous = state.fse_tables.ll_previous.clone();
     let saved_ml_previous = state.fse_tables.ml_previous.clone();
@@ -269,6 +276,7 @@ fn emit_single_sequence_block<M: Matcher>(
     encode_block_parts(state, literals, sequences, &mut compressed);
     let min_gain = (source.len() >> 8) + 2;
     if compressed.len() >= source.len().saturating_sub(min_gain) {
+        state.offset_hist = saved_offset_hist;
         state.last_huff_table = saved_huff_table;
         state.fse_tables.ll_previous = saved_ll_previous;
         state.fse_tables.ml_previous = saved_ml_previous;
@@ -289,6 +297,20 @@ fn emit_single_sequence_block<M: Matcher>(
         header.serialize(output);
         output.extend(compressed);
     }
+}
+
+fn encode_raw_sequences(
+    raw_sequences: &[RawSequence],
+    offset_hist: &mut [u32; 3],
+) -> Vec<crate::blocks::sequence_section::Sequence> {
+    raw_sequences
+        .iter()
+        .map(|seq| crate::blocks::sequence_section::Sequence {
+            ll: seq.ll,
+            ml: seq.ml,
+            of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
+        })
+        .collect()
 }
 
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
@@ -991,11 +1013,12 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::{
-        FseTableMode, choose_table, encode_match_len, encode_offset_with_history, previous_table,
-        remember_last_used_tables,
+        FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_match_len,
+        encode_offset_with_history, previous_table, remember_last_used_tables,
     };
-    use crate::encoding::frame_compressor::{FseTables, PreviousFseTable};
+    use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
     use crate::fse::fse_encoder::build_table_from_symbol_counts;
+    use alloc::vec::Vec;
 
     fn tables_match(
         lhs: &crate::fse::fse_encoder::FSETable,
@@ -1038,6 +1061,36 @@ mod tests {
         assert_eq!(encode_match_len(65539), (52, 0, 16));
         assert_eq!(encode_match_len(65540), (52, 1, 16));
         assert_eq!(encode_match_len(131074), (52, 65535, 16));
+    }
+
+    #[test]
+    fn raw_partition_fallback_restores_repeat_offset_history() {
+        let mut state = CompressState {
+            matcher: super::EntropyOnlyMatcher,
+            last_huff_table: None,
+            fse_tables: FseTables::new(),
+            offset_hist: [10, 20, 30],
+        };
+        let source = [0xA5; 8];
+        let sequences = [RawSequence {
+            ll: 0,
+            ml: 5,
+            offset: 20,
+        }];
+        let mut output = Vec::new();
+
+        emit_single_sequence_block(&mut state, true, &source, &[], &sequences, &mut output);
+
+        assert_eq!(
+            state.offset_hist,
+            [10, 20, 30],
+            "raw post-split fallback must not advance decoder repeat-offset history"
+        );
+        assert_eq!(
+            (output[0] >> 1) & 0b11,
+            0,
+            "fixture should force the partition to fall back to a Raw block"
+        );
     }
 
     #[test]

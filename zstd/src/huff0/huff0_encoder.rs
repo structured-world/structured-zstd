@@ -145,7 +145,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             writer.flush();
         }
 
-        if encoded.len() > 1 && encoded.len() < weights.len() / 2 {
+        let raw_description_is_representable = weights.len() <= 128;
+        if encoded.len() > 1
+            && (encoded.len() < weights.len() / 2 || !raw_description_is_representable)
+        {
             let mut description = Vec::with_capacity(encoded.len() + 1);
             description.push(encoded.len() as u8);
             description.extend_from_slice(&encoded);
@@ -916,6 +919,37 @@ fn encoded_weight_description_roundtrips() {
         encoder.weights()
     };
     assert_eq!(table_weights, decoded_weights);
+}
+
+#[test]
+fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
+    let mut data = Vec::new();
+    for symbol in 0u8..=255 {
+        data.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
+    }
+    let table = HuffmanTable::build_from_data(&data);
+    let mut weights = {
+        let mut out = Vec::new();
+        let mut writer = BitWriter::from(&mut out);
+        let encoder = HuffmanEncoder::new(&table, &mut writer);
+        encoder.weights()
+    };
+    weights.pop();
+    assert!(
+        weights.len() > 128,
+        "fixture must require an FSE table description"
+    );
+
+    let encoded = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
+        .expect("FSE weight description must be available when raw weights cannot be represented");
+    let mut description = Vec::with_capacity(encoded.len() + 1);
+    description.push(encoded.len() as u8);
+    description.extend_from_slice(&encoded);
+
+    assert!(HuffmanEncoder::<Vec<u8>>::weight_description_roundtrips(
+        &weights,
+        &description
+    ));
 }
 
 #[test]

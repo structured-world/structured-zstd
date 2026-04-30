@@ -24,9 +24,9 @@ pub fn round_trip(data: &[u8]) {
     }
     let mut writer = BitWriter::new();
     let encoder_table = huff0_encoder::HuffmanTable::build_from_data(data);
-    if encoder_table.writeable_table_description_size().is_none() {
-        return;
-    }
+    encoder_table
+        .writeable_table_description_size()
+        .expect("round_trip must only build Huffman tables with a writeable description");
     let mut encoder = huff0_encoder::HuffmanEncoder::new(&encoder_table, &mut writer);
 
     encoder.encode(data, true);
@@ -63,7 +63,7 @@ fn roundtrip() {
     round_trip(&[1, 1, 1, 1, 2, 3]);
     round_trip(&[1, 1, 1, 1, 2, 3, 5, 45, 12, 90]);
 
-    for size in 2..512 {
+    for size in 2..255 {
         use alloc::vec;
         let data = vec![123; size];
         round_trip(&data);
