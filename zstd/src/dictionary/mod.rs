@@ -571,6 +571,12 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
+    if sample.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source stream is empty",
+        ));
+    }
     let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)?;
     let (raw_dict, tuned) =
         train_fastcover_raw_from_slice(sample.as_slice(), content_budget, fastcover)?;
