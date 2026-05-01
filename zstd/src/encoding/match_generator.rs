@@ -3757,7 +3757,11 @@ impl HcMatchGenerator {
         if current_len == 0 {
             return;
         }
-        let current = self.window.back().unwrap().to_vec();
+        let current_ptr = self.window.back().unwrap().as_ptr();
+        // `start_matching_optimal()` mutates tables/state but never mutates or
+        // reorders `self.window`, so this block slice remains valid for the
+        // duration of the routine and avoids cloning the full block.
+        let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
@@ -3768,7 +3772,7 @@ impl HcMatchGenerator {
         self.prepare_ldm_candidates(current_abs_start, current_len);
 
         if self.should_run_btultra2_seed_pass(current_len) {
-            self.run_btultra2_seed_pass(current.as_slice(), current_abs_start, current_len);
+            self.run_btultra2_seed_pass(current, current_abs_start, current_len);
         }
 
         let profile = if self.parse_mode == HcParseMode::BtUltra2 {
@@ -3777,8 +3781,8 @@ impl HcMatchGenerator {
         } else {
             HcOptimalCostProfile::for_mode(self.parse_mode, false)
         };
-        self.opt_state.rescale_freqs(current.as_slice(), profile);
-        let mut best_plan = Vec::new();
+        self.opt_state.rescale_freqs(current, profile);
+        let mut best_plan = Vec::with_capacity(current_len / 8);
         let mut plan_reps = self.offset_hist;
         let (mut cursor, mut plan_litlen) =
             self.donor_opt_start_cursor_and_litlen(current_abs_start);
@@ -3919,6 +3923,7 @@ impl HcMatchGenerator {
         nodes[0].litlen = initial_litlen as u32;
         nodes[0].reps = initial_reps;
         let sufficient_len = profile.sufficient_match_len;
+        let ll0_price = profile.lit_length_price(&stats, 0);
 
         let mut candidates = Vec::with_capacity(MAX_HC_SEARCH_DEPTH);
         let mut pos = 1usize;
@@ -3969,9 +3974,11 @@ impl HcMatchGenerator {
                         initial_litlen,
                         initial_reps,
                     );
-                    let seq_cost = profile
-                        .lit_length_price(&stats, 0)
-                        .saturating_add(profile.match_price(&stats, off_base, longest_len));
+                    let seq_cost = ll0_price.saturating_add(profile.match_price(
+                        &stats,
+                        off_base,
+                        longest_len,
+                    ));
                     let forced_price = nodes[0].price.saturating_add(seq_cost);
                     let forced_state = HcOptimalNode {
                         price: forced_price,
@@ -4000,14 +4007,13 @@ impl HcMatchGenerator {
                         prev_max_len = prev_max_len.max(max_match_len);
                         continue;
                     }
+                    let (off_base, _) = Self::encode_offset_with_reps(
+                        candidate.offset as u32,
+                        initial_litlen,
+                        initial_reps,
+                    );
                     for match_len in (start_len..=max_match_len).rev() {
-                        let (off_base, _) = Self::encode_offset_with_reps(
-                            candidate.offset as u32,
-                            initial_litlen,
-                            initial_reps,
-                        );
-                        let seq_cost = profile
-                            .lit_length_price(&stats, 0)
+                        let seq_cost = ll0_price
                             .saturating_add(profile.match_price(&stats, off_base, match_len));
                         let next_cost = nodes[0].price.saturating_add(seq_cost);
                         if match_len > last_pos || next_cost < nodes[match_len].price {
@@ -4174,20 +4180,16 @@ impl HcMatchGenerator {
                     prev_max_len = prev_max_len.max(max_match_len);
                     continue;
                 }
+                let lit_len = base_node.litlen as usize;
+                let (off_base, _) =
+                    Self::encode_offset_with_reps(candidate.offset as u32, lit_len, base_node.reps);
                 // donor-style descending ML scan from best length to minimum.
                 // For faster btopt-like mode (optLevel==0 equivalent) we stop
                 // early once shorter lengths stop improving the current best.
                 for match_len in (start_len..=max_match_len).rev() {
                     let next = pos + match_len;
-                    let lit_len = base_node.litlen as usize;
-                    let (off_base, _) = Self::encode_offset_with_reps(
-                        candidate.offset as u32,
-                        lit_len,
-                        base_node.reps,
-                    );
-                    let seq_cost = profile
-                        .lit_length_price(&stats, 0)
-                        .saturating_add(profile.match_price(&stats, off_base, match_len));
+                    let seq_cost =
+                        ll0_price.saturating_add(profile.match_price(&stats, off_base, match_len));
                     let next_cost = base_cost.saturating_add(seq_cost);
                     let improved = next > last_pos || next_cost < nodes[next].price;
                     if improved {
@@ -4220,9 +4222,11 @@ impl HcMatchGenerator {
                         lit_len,
                         base_node.reps,
                     );
-                    let seq_cost = profile
-                        .lit_length_price(&stats, 0)
-                        .saturating_add(profile.match_price(&stats, off_base, longest_len));
+                    let seq_cost = ll0_price.saturating_add(profile.match_price(
+                        &stats,
+                        off_base,
+                        longest_len,
+                    ));
                     let forced_price = base_cost.saturating_add(seq_cost);
                     let end_pos = (pos + longest_len).min(current_len);
                     let forced_state = HcOptimalNode {
@@ -4350,7 +4354,8 @@ impl HcMatchGenerator {
             stretch_pos -= step;
         }
 
-        let mut matches = Vec::new();
+        let mut matches =
+            Vec::with_capacity(store_end.saturating_sub(store_start).saturating_add(1));
         let mut tail_literals = initial_litlen;
         for stretch in store.iter().take(store_end + 1).skip(store_start) {
             let llen = stretch.litlen as usize;
@@ -4793,17 +4798,14 @@ impl HcMatchGenerator {
         4
     }
 
-    fn count_match_from(
-        &self,
-        abs_pos: usize,
-        candidate_abs: usize,
-        current_abs_end: usize,
+    #[inline(always)]
+    fn count_match_from_indices(
+        concat: &[u8],
+        current_idx: usize,
+        candidate_idx: usize,
+        tail_limit: usize,
         seed_len: usize,
     ) -> usize {
-        let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
-        let candidate_idx = candidate_abs - self.history_abs_start;
-        let tail_limit = current_abs_end.saturating_sub(abs_pos);
         let seed = seed_len.min(tail_limit);
         if seed == tail_limit {
             return seed;
@@ -4826,6 +4828,7 @@ impl HcMatchGenerator {
         if idx + 8 > concat.len() {
             return 1;
         }
+        let tail_limit = current_abs_end.saturating_sub(abs_pos);
         let hash = Self::hash_position_with_mls(&concat[idx..], self.hash_log, self.bt_hash_mls());
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return 1;
@@ -4861,8 +4864,9 @@ impl HcMatchGenerator {
             let next_smaller = self.chain_table[next_pair_idx];
             let next_larger = self.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - self.history_abs_start;
             let match_len =
-                self.count_match_from(abs_pos, candidate_abs, current_abs_end, seed_len);
+                Self::count_match_from_indices(concat, idx, candidate_idx, tail_limit, seed_len);
 
             if match_len > best_len {
                 best_len = match_len;
@@ -4872,11 +4876,11 @@ impl HcMatchGenerator {
                 }
             }
 
-            if abs_pos.saturating_add(match_len) >= current_abs_end {
+            if match_len >= tail_limit {
                 break;
             }
 
-            let candidate_next = candidate_abs + match_len - self.history_abs_start;
+            let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
                 self.chain_table[smaller_slot] = match_stored;
@@ -4918,9 +4922,14 @@ impl HcMatchGenerator {
         if self.skip_insert_until_abs < self.history_abs_start {
             self.skip_insert_until_abs = self.history_abs_start;
         }
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        let can_skip_rebase_checks =
+            self.position_base == 0 && self.index_shift == 0 && abs_pos <= max_rel_no_rebase;
         let mut update_abs = self.skip_insert_until_abs;
         while update_abs < abs_pos {
-            self.maybe_rebase_positions(update_abs);
+            if !can_skip_rebase_checks {
+                self.maybe_rebase_positions(update_abs);
+            }
             let forward = self.bt_insert_step_no_rebase(update_abs, current_abs_end, abs_pos);
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -4941,6 +4950,7 @@ impl HcMatchGenerator {
         if idx + 8 > concat.len() {
             return;
         }
+        let tail_limit = current_abs_end.saturating_sub(abs_pos);
         let hash = Self::hash_position_with_mls(&concat[idx..], self.hash_log, self.bt_hash_mls());
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
@@ -4980,8 +4990,9 @@ impl HcMatchGenerator {
             let next_smaller = self.chain_table[next_pair_idx];
             let next_larger = self.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - self.history_abs_start;
             let match_len =
-                self.count_match_from(abs_pos, candidate_abs, current_abs_end, seed_len);
+                Self::count_match_from_indices(concat, idx, candidate_idx, tail_limit, seed_len);
 
             if match_len > best_len {
                 let offset = abs_pos - candidate_abs;
@@ -5001,19 +5012,17 @@ impl HcMatchGenerator {
                     if candidate_end > match_end_abs {
                         match_end_abs = candidate_end;
                     }
-                    if abs_pos.saturating_add(match_len) >= current_abs_end
-                        || match_len > HC_OPT_NUM
-                    {
+                    if match_len >= tail_limit || match_len > HC_OPT_NUM {
                         break;
                     }
                 }
             }
 
-            if abs_pos.saturating_add(match_len) >= current_abs_end {
+            if match_len >= tail_limit {
                 break;
             }
 
-            let candidate_next = candidate_abs + match_len - self.history_abs_start;
+            let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
                 self.chain_table[smaller_slot] = match_stored;
@@ -5123,8 +5132,13 @@ impl HcMatchGenerator {
         if self.next_to_update3 >= abs_pos {
             return;
         }
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        let can_skip_rebase_checks =
+            self.position_base == 0 && self.index_shift == 0 && abs_pos <= max_rel_no_rebase;
         while self.next_to_update3 < abs_pos {
-            self.maybe_rebase_positions(self.next_to_update3);
+            if !can_skip_rebase_checks {
+                self.maybe_rebase_positions(self.next_to_update3);
+            }
             self.insert_hash3_only_no_rebase(self.next_to_update3);
             self.next_to_update3 = self.next_to_update3.saturating_add(1);
         }

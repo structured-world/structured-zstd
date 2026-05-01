@@ -53,7 +53,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     pub fn encode_interleaved(&mut self, data: &[u8]) {
         self.write_table();
 
-        assert!(data.len() > 2);
+        assert!(data.len() >= 2);
         let mut ip = data.len();
         let mut state_1;
         let mut state_2;
