@@ -336,6 +336,8 @@ pub(crate) fn build_table_from_symbol_counts(
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let total = counts.iter().sum::<usize>();
+    // Single-symbol histograms are still valid here for some internal paths;
+    // only an actual one-sample input is invalid for FSE table construction.
     assert!(total > 1, "RLE distributions must not build FSE tables");
     let max_symbol = counts
         .iter()
