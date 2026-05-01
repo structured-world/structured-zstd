@@ -340,17 +340,28 @@ fn serialize_fse_table_from_corpus(
     max_symbol: u8,
     max_log: u8,
 ) -> io::Result<Vec<u8>> {
-    let source = if sample_data.is_empty() {
-        raw_content
-    } else {
-        sample_data
-    };
-    let symbols = bounded_fse_symbols(source, max_symbol);
-    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
-    for symbol in symbols {
-        counts[usize::from(symbol)] += 1;
+    fn counts_total_for_source(source: &[u8], max_symbol: u8, counts: &mut [usize]) -> usize {
+        counts.fill(0);
+        for symbol in bounded_fse_symbols(source, max_symbol) {
+            counts[usize::from(symbol)] += 1;
+        }
+        counts.iter().sum::<usize>()
     }
-    let total = counts.iter().sum::<usize>();
+
+    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
+    let using_sample = !sample_data.is_empty();
+    let mut total = counts_total_for_source(
+        if using_sample {
+            sample_data
+        } else {
+            raw_content
+        },
+        max_symbol,
+        &mut counts,
+    );
+    if total <= 1 && using_sample && !raw_content.is_empty() {
+        total = counts_total_for_source(raw_content, max_symbol, &mut counts);
+    }
     if total <= 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

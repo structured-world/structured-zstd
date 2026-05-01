@@ -138,14 +138,10 @@ impl FSETable {
 
     pub(crate) fn start_state(&self, symbol: u8) -> &State {
         let states = &self.states[symbol as usize];
-        let start_index = states
-            .start_index
+        let slot = states
+            .start_state_slot
             .expect("symbol must be present in the FSE table");
-        states
-            .states
-            .iter()
-            .find(|state| state.index == start_index)
-            .expect("FSE start state must be present")
+        &states.states[slot]
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -280,7 +276,7 @@ pub(super) struct SymbolStates {
     /// Sorted by baseline to allow easy lookup using an index
     pub(super) states: Vec<State>,
     pub(super) probability: i32,
-    start_index: Option<usize>,
+    start_state_slot: Option<usize>,
 }
 
 impl SymbolStates {
@@ -541,8 +537,9 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     let mut states = core::array::from_fn::<SymbolStates, 256, _>(|_| SymbolStates {
         states: Vec::new(),
         probability: 0,
-        start_index: None,
+        start_state_slot: None,
     });
+    let mut symbol_positions = core::array::from_fn::<Vec<usize>, 256, _>(|_| Vec::new());
 
     // distribute -1 symbols
     let mut negative_idx = (1 << acc_log) - 1;
@@ -558,6 +555,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             last_index: (1 << acc_log) - 1,
             index: negative_idx,
         });
+        symbol_positions[symbol].push(negative_idx);
         states[symbol].probability = -1;
         negative_idx -= 1;
     }
@@ -572,6 +570,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         }
         states[symbol].probability = prob;
         let states = &mut states[symbol].states;
+        let positions = &mut symbol_positions[symbol];
         for _ in 0..prob {
             states.push(State {
                 num_bits: 0,
@@ -579,6 +578,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
                 last_index: 0,
                 index: idx,
             });
+            positions.push(idx);
 
             idx = next_position(idx, 1 << acc_log);
             while idx > negative_idx {
@@ -591,9 +591,9 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // Materialize the C `stateTable`: symbols are grouped by symbol and, within
     // each symbol, ordered by table position.
     let mut state_table = Vec::with_capacity(1 << acc_log);
-    for state in &mut states {
-        state.states.sort_by_key(|entry| entry.index);
-        state_table.extend(state.states.iter().map(|entry| entry.index));
+    for positions in &mut symbol_positions {
+        positions.sort_unstable();
+        state_table.extend(positions.iter().copied());
     }
 
     // Build encoder transitions directly from C `FSE_encodeSymbol()` formulas.
@@ -623,10 +623,9 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
         let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
         let state_table_index = (init_value >> init_nb_bits_out) as isize + delta_find_state;
-        state.start_index = Some(state_table[state_table_index as usize]);
+        let start_index = state_table[state_table_index as usize];
         symbol_transform_total += probability_abs;
-
-        state.states.clear();
+        state.states = Vec::with_capacity(probability_abs.max(1));
         for current_index in 0..(1usize << acc_log) {
             let current_value = (1usize << acc_log) + current_index;
             let num_bits = (current_value + delta_nb_bits) >> 16;
@@ -653,6 +652,10 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
 
         // For encoding we use the states ordered by the indexes they target
         state.states.sort_by_key(|l| l.baseline);
+        state.start_state_slot = state
+            .states
+            .iter()
+            .position(|entry| entry.index == start_index);
     }
 
     FSETable {
