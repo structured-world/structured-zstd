@@ -4923,8 +4923,11 @@ impl HcMatchGenerator {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        let can_skip_rebase_checks =
-            self.position_base == 0 && self.index_shift == 0 && abs_pos <= max_rel_no_rebase;
+        let can_skip_rebase_checks = self.position_base == 0
+            && self.index_shift == 0
+            && abs_pos <= max_rel_no_rebase
+            && (self.allow_zero_relative_position
+                || self.skip_insert_until_abs > self.history_abs_start);
         let mut update_abs = self.skip_insert_until_abs;
         while update_abs < abs_pos {
             if !can_skip_rebase_checks {
@@ -5133,8 +5136,10 @@ impl HcMatchGenerator {
             return;
         }
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        let can_skip_rebase_checks =
-            self.position_base == 0 && self.index_shift == 0 && abs_pos <= max_rel_no_rebase;
+        let can_skip_rebase_checks = self.position_base == 0
+            && self.index_shift == 0
+            && abs_pos <= max_rel_no_rebase
+            && (self.allow_zero_relative_position || self.next_to_update3 > self.history_abs_start);
         while self.next_to_update3 < abs_pos {
             if !can_skip_rebase_checks {
                 self.maybe_rebase_positions(self.next_to_update3);
