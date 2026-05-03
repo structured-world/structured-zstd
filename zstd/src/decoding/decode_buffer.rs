@@ -69,6 +69,15 @@ impl DecodeBuffer {
         self.buffer.reserve(amount);
     }
 
+    /// Fill `fill_length` bytes of the output with the literal `fill_with`,
+    /// advancing the ringbuffer cursor in place. Used by the RLE block path
+    /// (and, after upstream commit `29a56160`, the Raw block path) so the
+    /// decoder doesn't need a stack scratch buffer to materialise repeated
+    /// bytes before pushing them.
+    pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
+        self.buffer.extend_and_fill(fill_with, fill_length);
+    }
+
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
