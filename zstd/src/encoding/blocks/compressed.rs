@@ -153,6 +153,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             offset_hist: state.offset_hist,
         },
         scratch_output: Vec::new(),
+        scratch_sequences: Vec::new(),
     };
     estimator.derive_block_splits(0, parts.sequences.len(), &mut partitions);
     partitions.push(parts.sequences.len());
@@ -225,7 +226,24 @@ fn encode_block_parts<M: Matcher>(
     raw_sequences: &[RawSequence],
     output: &mut Vec<u8>,
 ) {
-    let sequences = encode_raw_sequences(raw_sequences, &mut state.offset_hist);
+    let mut sequences = Vec::new();
+    encode_block_parts_with_sequence_scratch(
+        state,
+        literals_vec,
+        raw_sequences,
+        output,
+        &mut sequences,
+    );
+}
+
+fn encode_block_parts_with_sequence_scratch<M: Matcher>(
+    state: &mut CompressState<M>,
+    literals_vec: &[u8],
+    raw_sequences: &[RawSequence],
+    output: &mut Vec<u8>,
+    sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
+) {
+    encode_raw_sequences_into(raw_sequences, &mut state.offset_hist, sequences);
 
     // literals section
 
@@ -282,7 +300,7 @@ fn encode_block_parts<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            &sequences,
+            sequences,
             &mut writer,
             &ll_mode,
             &ml_mode,
@@ -339,18 +357,24 @@ fn emit_single_sequence_block<M: Matcher>(
     }
 }
 
-fn encode_raw_sequences(
+fn encode_raw_sequences_into(
     raw_sequences: &[RawSequence],
     offset_hist: &mut [u32; 3],
-) -> Vec<crate::blocks::sequence_section::Sequence> {
-    raw_sequences
-        .iter()
-        .map(|seq| crate::blocks::sequence_section::Sequence {
-            ll: seq.ll,
-            ml: seq.ml,
-            of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
-        })
-        .collect()
+    out: &mut Vec<crate::blocks::sequence_section::Sequence>,
+) {
+    out.clear();
+    if out.capacity() < raw_sequences.len() {
+        out.reserve_exact(raw_sequences.len() - out.capacity());
+    }
+    out.extend(
+        raw_sequences
+            .iter()
+            .map(|seq| crate::blocks::sequence_section::Sequence {
+                ll: seq.ll,
+                ml: seq.ml,
+                of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
+            }),
+    );
 }
 
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
@@ -374,6 +398,7 @@ struct SplitEstimator<'a> {
     of_previous: Option<PreviousFseTable>,
     scratch_state: CompressState<EntropyOnlyMatcher>,
     scratch_output: Vec<u8>,
+    scratch_sequences: Vec<crate::blocks::sequence_section::Sequence>,
 }
 
 impl SplitEstimator<'_> {
@@ -392,11 +417,12 @@ impl SplitEstimator<'_> {
         self.scratch_state.fse_tables.of_previous = self.of_previous.clone();
         self.scratch_state.offset_hist = self.offset_hist;
         self.scratch_output.clear();
-        encode_block_parts(
+        encode_block_parts_with_sequence_scratch(
             &mut self.scratch_state,
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
             &mut self.scratch_output,
+            &mut self.scratch_sequences,
         );
         let source_len = (lit_end - lit_start) + match_len;
         let min_gain = (source_len >> 8) + 2;
