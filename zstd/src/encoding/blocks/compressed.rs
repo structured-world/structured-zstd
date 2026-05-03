@@ -122,6 +122,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     let parts = collect_block_parts(state);
     if parts.sequences.len() <= 4 {
         let source_len = state.matcher.get_last_space().len();
+        let mut compressed_scratch = Vec::new();
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block,
@@ -129,6 +130,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             &parts.literals,
             &parts.sequences,
             output,
+            &mut compressed_scratch,
         );
         if emitted_raw {
             output.extend_from_slice(state.matcher.get_last_space());
@@ -158,6 +160,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     estimator.derive_block_splits(0, parts.sequences.len(), &mut partitions);
     partitions.push(parts.sequences.len());
 
+    let mut compressed_scratch = Vec::new();
     let mut seq_start = 0usize;
     let mut lit_start = 0usize;
     let mut src_start = 0usize;
@@ -182,6 +185,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             &parts.literals[lit_start..lit_end],
             &parts.sequences[seq_start..seq_end],
             output,
+            &mut compressed_scratch,
         );
         if emitted_raw {
             output.extend_from_slice(
@@ -323,14 +327,15 @@ fn emit_single_sequence_block<M: Matcher>(
     literals: &[u8],
     sequences: &[RawSequence],
     output: &mut Vec<u8>,
+    compressed: &mut Vec<u8>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
     let saved_huff_table = state.last_huff_table.clone();
     let saved_ll_previous = state.fse_tables.ll_previous.clone();
     let saved_ml_previous = state.fse_tables.ml_previous.clone();
     let saved_of_previous = state.fse_tables.of_previous.clone();
-    let mut compressed = Vec::new();
-    encode_block_parts(state, literals, sequences, &mut compressed);
+    compressed.clear();
+    encode_block_parts(state, literals, sequences, compressed);
     let min_gain = (source_len >> 8) + 2;
     if compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
@@ -352,7 +357,7 @@ fn emit_single_sequence_block<M: Matcher>(
             block_size: compressed.len() as u32,
         };
         header.serialize(output);
-        output.extend(compressed);
+        output.extend_from_slice(compressed);
         false
     }
 }
@@ -1149,6 +1154,7 @@ mod tests {
             offset: 20,
         }];
         let mut output = Vec::new();
+        let mut compressed_scratch = Vec::new();
 
         let emitted_raw = emit_single_sequence_block(
             &mut state,
@@ -1157,6 +1163,7 @@ mod tests {
             &[],
             &sequences,
             &mut output,
+            &mut compressed_scratch,
         );
         if emitted_raw {
             output.extend_from_slice(&source);
