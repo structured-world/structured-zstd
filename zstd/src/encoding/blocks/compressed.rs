@@ -138,12 +138,21 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 
     let mut partitions = Vec::new();
     let prefix_sums = SequencePrefixSums::build(&parts.sequences);
-    let estimator = SplitEstimator {
+    let mut estimator = SplitEstimator {
         parts: &parts,
         prefix_sums: &prefix_sums,
-        fse_tables: &state.fse_tables,
         huff_table: state.last_huff_table.as_ref(),
         offset_hist: state.offset_hist,
+        ll_previous: state.fse_tables.ll_previous.clone(),
+        ml_previous: state.fse_tables.ml_previous.clone(),
+        of_previous: state.fse_tables.of_previous.clone(),
+        scratch_state: CompressState {
+            matcher: EntropyOnlyMatcher,
+            last_huff_table: state.last_huff_table.clone(),
+            fse_tables: clone_fse_tables(&state.fse_tables),
+            offset_hist: state.offset_hist,
+        },
+        scratch_output: Vec::new(),
     };
     estimator.derive_block_splits(0, parts.sequences.len(), &mut partitions);
     partitions.push(parts.sequences.len());
@@ -358,13 +367,17 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
 struct SplitEstimator<'a> {
     parts: &'a EncodedBlockParts,
     prefix_sums: &'a SequencePrefixSums,
-    fse_tables: &'a FseTables,
     huff_table: Option<&'a huff0_encoder::HuffmanTable>,
     offset_hist: [u32; 3],
+    ll_previous: Option<PreviousFseTable>,
+    ml_previous: Option<PreviousFseTable>,
+    of_previous: Option<PreviousFseTable>,
+    scratch_state: CompressState<EntropyOnlyMatcher>,
+    scratch_output: Vec<u8>,
 }
 
 impl SplitEstimator<'_> {
-    fn estimate_subblock_size(&self, start_idx: usize, end_idx: usize) -> usize {
+    fn estimate_subblock_size(&mut self, start_idx: usize, end_idx: usize) -> usize {
         let lit_start = self.prefix_sums.lit[start_idx];
         let lit_len = self.prefix_sums.lit_range(start_idx, end_idx);
         let match_len = self.prefix_sums.ml_range(start_idx, end_idx);
@@ -373,30 +386,34 @@ impl SplitEstimator<'_> {
         } else {
             lit_start + lit_len
         };
-        let mut state = CompressState {
-            matcher: EntropyOnlyMatcher,
-            last_huff_table: self.huff_table.cloned(),
-            fse_tables: clone_fse_tables(self.fse_tables),
-            offset_hist: self.offset_hist,
-        };
-        let mut out = Vec::new();
+        self.scratch_state.last_huff_table = self.huff_table.cloned();
+        self.scratch_state.fse_tables.ll_previous = self.ll_previous.clone();
+        self.scratch_state.fse_tables.ml_previous = self.ml_previous.clone();
+        self.scratch_state.fse_tables.of_previous = self.of_previous.clone();
+        self.scratch_state.offset_hist = self.offset_hist;
+        self.scratch_output.clear();
         encode_block_parts(
-            &mut state,
+            &mut self.scratch_state,
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
-            &mut out,
+            &mut self.scratch_output,
         );
         let source_len = (lit_end - lit_start) + match_len;
         let min_gain = (source_len >> 8) + 2;
-        let emitted_payload = if out.len() >= source_len.saturating_sub(min_gain) {
+        let emitted_payload = if self.scratch_output.len() >= source_len.saturating_sub(min_gain) {
             source_len
         } else {
-            out.len()
+            self.scratch_output.len()
         };
         emitted_payload + 3
     }
 
-    fn derive_block_splits(&self, start_idx: usize, end_idx: usize, partitions: &mut Vec<usize>) {
+    fn derive_block_splits(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+        partitions: &mut Vec<usize>,
+    ) {
         if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
             || partitions.len() >= MAX_NB_BLOCK_SPLITS
         {
