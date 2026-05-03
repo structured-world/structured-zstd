@@ -185,8 +185,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 }
 
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>) -> EncodedBlockParts {
-    let mut literals_vec = Vec::new();
-    let mut sequences = Vec::new();
+    let src_len = state.matcher.get_last_space().len();
+    let mut literals_vec = Vec::with_capacity(src_len);
+    let mut sequences = Vec::with_capacity(src_len / 8);
     state.matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
         Sequence::Triple {
