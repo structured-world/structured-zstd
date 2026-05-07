@@ -4120,7 +4120,7 @@ impl HcMatchGenerator {
                 None
             };
             candidates.clear();
-            self.collect_optimal_candidates(
+            self.collect_optimal_candidates_initialized(
                 current_abs_start,
                 current_abs_end,
                 profile,
@@ -4411,7 +4411,7 @@ impl HcMatchGenerator {
                 None
             };
             candidates.clear();
-            self.collect_optimal_candidates(
+            self.collect_optimal_candidates_initialized(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -4843,6 +4843,7 @@ impl HcMatchGenerator {
         price
     }
 
+    #[cfg(test)]
     fn collect_optimal_candidates(
         &mut self,
         abs_pos: usize,
@@ -4852,6 +4853,20 @@ impl HcMatchGenerator {
         out: &mut Vec<MatchCandidate>,
     ) {
         self.ensure_tables();
+        self.collect_optimal_candidates_initialized(abs_pos, current_abs_end, profile, query, out);
+    }
+
+    fn collect_optimal_candidates_initialized(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        debug_assert!(!self.hash_table.is_empty());
+        debug_assert!(!self.hash3_table.is_empty());
+        debug_assert!(!self.chain_table.is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let reps = query.reps;
         let lit_len = query.lit_len;
