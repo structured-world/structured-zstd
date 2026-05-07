@@ -4227,6 +4227,9 @@ impl HcMatchGenerator {
                     }
                     prev_max_len = prev_max_len.max(max_match_len);
                 }
+                if last_pos + 1 < nodes.len() {
+                    nodes[last_pos + 1].price = u32::MAX;
+                }
             }
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
@@ -4526,6 +4529,9 @@ impl HcMatchGenerator {
                 }
             }
 
+            if last_pos + 1 < nodes.len() {
+                nodes[last_pos + 1].price = u32::MAX;
+            }
             pos += 1;
         }
 
