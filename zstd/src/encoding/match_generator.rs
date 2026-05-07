@@ -2859,9 +2859,9 @@ impl Default for HcOptimalNode {
 
 #[derive(Copy, Clone)]
 struct HcOptimalSequence {
-    offset: usize,
-    match_len: usize,
-    lit_len: usize,
+    offset: u32,
+    match_len: u32,
+    lit_len: u32,
 }
 
 #[derive(Copy, Clone)]
@@ -4012,16 +4012,18 @@ impl HcMatchGenerator {
             return;
         }
         for item in plan {
-            let start = literals_start.saturating_add(item.lit_len);
-            if start < *literals_start || start + item.match_len > current_len {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < *literals_start || start + match_len > current_len {
                 continue;
             }
             let literals = &current[*literals_start..start];
             let (off_base, next_reps) =
-                Self::encode_offset_with_reps(item.offset as u32, literals.len(), *reps);
-            opt_state.update_stats(literals.len(), literals, off_base, item.match_len);
+                Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
+            opt_state.update_stats(literals.len(), literals, off_base, match_len);
             *reps = next_reps;
-            *literals_start = start + item.match_len;
+            *literals_start = start + match_len;
         }
         opt_state.set_base_prices(accurate);
     }
@@ -4713,9 +4715,9 @@ impl HcMatchGenerator {
                 continue;
             }
             out.push(HcOptimalSequence {
-                offset: stretch.off as usize,
-                match_len: mlen,
-                lit_len: llen,
+                offset: stretch.off,
+                match_len: mlen as u32,
+                lit_len: llen as u32,
             });
             tail_literals = 0;
         }
@@ -5170,22 +5172,20 @@ impl HcMatchGenerator {
 
         let mut literals_start = 0usize;
         for item in plan {
-            let start = literals_start.saturating_add(item.lit_len);
-            if start < literals_start || start + item.match_len > current_len {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < literals_start || start + match_len > current_len {
                 continue;
             }
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
                 literals,
-                offset: item.offset,
-                match_len: item.match_len,
+                offset: item.offset as usize,
+                match_len,
             });
-            encode_offset_with_history(
-                item.offset as u32,
-                literals.len() as u32,
-                &mut self.offset_hist,
-            );
-            literals_start = start + item.match_len;
+            encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
+            literals_start = start + match_len;
         }
 
         if literals_start < current_len {
