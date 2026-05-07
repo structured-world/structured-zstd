@@ -454,8 +454,7 @@ impl SplitEstimator<'_> {
         let full = self.estimate_subblock_size(start_idx, end_idx);
         let first = self.estimate_subblock_size(start_idx, mid_idx);
         let second = self.estimate_subblock_size(mid_idx, end_idx);
-        let estimator_tolerance = full / 512;
-        if first + second < full + estimator_tolerance {
+        if first + second < full {
             self.derive_block_splits(start_idx, mid_idx, partitions);
             if partitions.len() >= MAX_NB_BLOCK_SPLITS {
                 return;
