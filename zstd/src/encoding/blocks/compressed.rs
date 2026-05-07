@@ -33,27 +33,54 @@ const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
 /// Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit size format.
 const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 
+#[derive(Default)]
 struct EncodedBlockParts {
     literals: Vec<u8>,
     sequences: Vec<RawSequence>,
 }
 
+#[derive(Default)]
+pub(crate) struct CompressedBlockScratch {
+    parts: EncodedBlockParts,
+    partitions: Vec<usize>,
+    prefix_sums: SequencePrefixSums,
+    compressed: Vec<u8>,
+    estimator_output: Vec<u8>,
+    estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
+}
+
+impl CompressedBlockScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Default)]
 struct SequencePrefixSums {
     lit: Vec<usize>,
     ml: Vec<usize>,
 }
 
 impl SequencePrefixSums {
-    fn build(sequences: &[RawSequence]) -> Self {
-        let mut lit = Vec::with_capacity(sequences.len() + 1);
-        let mut ml = Vec::with_capacity(sequences.len() + 1);
-        lit.push(0);
-        ml.push(0);
-        for seq in sequences {
-            lit.push(*lit.last().unwrap_or(&0) + seq.ll as usize);
-            ml.push(*ml.last().unwrap_or(&0) + seq.ml as usize);
+    fn rebuild(&mut self, sequences: &[RawSequence]) {
+        self.lit.clear();
+        self.ml.clear();
+        if self.lit.capacity() < sequences.len() + 1 {
+            self.lit
+                .reserve_exact(sequences.len() + 1 - self.lit.capacity());
         }
-        Self { lit, ml }
+        if self.ml.capacity() < sequences.len() + 1 {
+            self.ml
+                .reserve_exact(sequences.len() + 1 - self.ml.capacity());
+        }
+        self.lit.push(0);
+        self.ml.push(0);
+        for seq in sequences {
+            self.lit
+                .push(*self.lit.last().unwrap_or(&0) + seq.ll as usize);
+            self.ml
+                .push(*self.ml.last().unwrap_or(&0) + seq.ml as usize);
+        }
     }
 
     fn lit_range(&self, start: usize, end: usize) -> usize {
@@ -110,8 +137,15 @@ impl Matcher for EntropyOnlyMatcher {
 
 /// A block of [`crate::common::BlockType::Compressed`]
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
-    let parts = collect_block_parts(state);
-    encode_block_parts(state, &parts.literals, &parts.sequences, output);
+    let mut scratch = core::mem::take(&mut state.block_scratch);
+    collect_block_parts(state, &mut scratch.parts);
+    encode_block_parts(
+        state,
+        &scratch.parts.literals,
+        &scratch.parts.sequences,
+        output,
+    );
+    state.block_scratch = scratch;
 }
 
 pub(crate) fn compress_block_with_post_split<M: Matcher>(
@@ -119,30 +153,34 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     last_block: bool,
     output: &mut Vec<u8>,
 ) {
-    let parts = collect_block_parts(state);
-    if parts.sequences.len() <= 4 {
+    let mut scratch = core::mem::take(&mut state.block_scratch);
+    collect_block_parts(state, &mut scratch.parts);
+    if scratch.parts.sequences.len() <= 4 {
         let source_len = state.matcher.get_last_space().len();
-        let mut compressed_scratch = Vec::new();
+        scratch.compressed.clear();
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block,
             source_len,
-            &parts.literals,
-            &parts.sequences,
+            &scratch.parts.literals,
+            &scratch.parts.sequences,
             output,
-            &mut compressed_scratch,
+            &mut scratch.compressed,
         );
         if emitted_raw {
             output.extend_from_slice(state.matcher.get_last_space());
         }
+        state.block_scratch = scratch;
         return;
     }
 
-    let mut partitions = Vec::new();
-    let prefix_sums = SequencePrefixSums::build(&parts.sequences);
+    scratch.partitions.clear();
+    scratch.prefix_sums.rebuild(&scratch.parts.sequences);
+    let estimator_output = core::mem::take(&mut scratch.estimator_output);
+    let estimator_sequences = core::mem::take(&mut scratch.estimator_sequences);
     let mut estimator = SplitEstimator {
-        parts: &parts,
-        prefix_sums: &prefix_sums,
+        parts: &scratch.parts,
+        prefix_sums: &scratch.prefix_sums,
         huff_table: state.last_huff_table.as_ref(),
         offset_hist: state.offset_hist,
         ll_previous: state.fse_tables.ll_previous.clone(),
@@ -152,24 +190,27 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
             fse_tables: clone_fse_tables(&state.fse_tables),
+            block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: state.offset_hist,
         },
-        scratch_output: Vec::new(),
-        scratch_sequences: Vec::new(),
+        scratch_output: estimator_output,
+        scratch_sequences: estimator_sequences,
     };
-    estimator.derive_block_splits(0, parts.sequences.len(), &mut partitions);
-    partitions.push(parts.sequences.len());
+    estimator.derive_block_splits(0, scratch.parts.sequences.len(), &mut scratch.partitions);
+    scratch.partitions.push(scratch.parts.sequences.len());
+    scratch.estimator_output = estimator.scratch_output;
+    scratch.estimator_sequences = estimator.scratch_sequences;
 
-    let mut compressed_scratch = Vec::new();
+    scratch.compressed.clear();
     let mut seq_start = 0usize;
     let mut lit_start = 0usize;
     let mut src_start = 0usize;
-    for (partition_idx, &seq_end) in partitions.iter().enumerate() {
-        let last_partition = partition_idx + 1 == partitions.len();
-        let chunk_lit_len = prefix_sums.lit_range(seq_start, seq_end);
-        let chunk_match_len = prefix_sums.ml_range(seq_start, seq_end);
+    for (partition_idx, &seq_end) in scratch.partitions.iter().enumerate() {
+        let last_partition = partition_idx + 1 == scratch.partitions.len();
+        let chunk_lit_len = scratch.prefix_sums.lit_range(seq_start, seq_end);
+        let chunk_match_len = scratch.prefix_sums.ml_range(seq_start, seq_end);
         let lit_end = if last_partition {
-            parts.literals.len()
+            scratch.parts.literals.len()
         } else {
             lit_start + chunk_lit_len
         };
@@ -182,10 +223,10 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             state,
             last_block && last_partition,
             src_size,
-            &parts.literals[lit_start..lit_end],
-            &parts.sequences[seq_start..seq_end],
+            &scratch.parts.literals[lit_start..lit_end],
+            &scratch.parts.sequences[seq_start..seq_end],
             output,
-            &mut compressed_scratch,
+            &mut scratch.compressed,
         );
         if emitted_raw {
             output.extend_from_slice(
@@ -196,32 +237,40 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         lit_start = lit_end;
         src_start += src_size;
     }
+    state.block_scratch = scratch;
 }
 
-fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>) -> EncodedBlockParts {
+fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
     let src_len = state.matcher.get_last_space().len();
-    let mut literals_vec = Vec::with_capacity(src_len);
-    let mut sequences = Vec::with_capacity(src_len / 8);
+    parts.literals.clear();
+    parts.sequences.clear();
+    if parts.literals.capacity() < src_len {
+        parts
+            .literals
+            .reserve_exact(src_len - parts.literals.capacity());
+    }
+    let sequence_capacity = src_len / 8;
+    if parts.sequences.capacity() < sequence_capacity {
+        parts
+            .sequences
+            .reserve_exact(sequence_capacity - parts.sequences.capacity());
+    }
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Literals { literals } => parts.literals.extend_from_slice(literals),
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            literals_vec.extend_from_slice(literals);
-            sequences.push(RawSequence {
+            parts.literals.extend_from_slice(literals);
+            parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
                 offset: offset as u32,
             });
         }
     });
-    EncodedBlockParts {
-        literals: literals_vec,
-        sequences,
-    }
 }
 
 fn encode_block_parts<M: Matcher>(
@@ -1144,6 +1193,7 @@ mod tests {
             matcher: super::EntropyOnlyMatcher,
             last_huff_table: None,
             fse_tables: FseTables::new(),
+            block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: [10, 20, 30],
         };
         let source = [0xA5; 8];

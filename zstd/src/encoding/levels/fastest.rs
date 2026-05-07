@@ -184,6 +184,7 @@ mod tests {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
             fse_tables: FseTables::new(),
+            block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
         };
         let mut output = Vec::new();
@@ -210,6 +211,7 @@ mod tests {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
             fse_tables: FseTables::new(),
+            block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
         };
         let mut output = Vec::new();
