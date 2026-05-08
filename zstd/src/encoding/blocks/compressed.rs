@@ -499,17 +499,32 @@ impl SplitEstimator<'_> {
         {
             return;
         }
-        let mid_idx = (start_idx + end_idx) / 2;
         let full = self.estimate_subblock_size(start_idx, end_idx);
+        self.derive_block_splits_with_full(start_idx, end_idx, full, partitions);
+    }
+
+    fn derive_block_splits_with_full(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+        full: usize,
+        partitions: &mut Vec<usize>,
+    ) {
+        if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
+            || partitions.len() >= MAX_NB_BLOCK_SPLITS
+        {
+            return;
+        }
+        let mid_idx = (start_idx + end_idx) / 2;
         let first = self.estimate_subblock_size(start_idx, mid_idx);
         let second = self.estimate_subblock_size(mid_idx, end_idx);
         if first + second < full {
-            self.derive_block_splits(start_idx, mid_idx, partitions);
+            self.derive_block_splits_with_full(start_idx, mid_idx, first, partitions);
             if partitions.len() >= MAX_NB_BLOCK_SPLITS {
                 return;
             }
             partitions.push(mid_idx);
-            self.derive_block_splits(mid_idx, end_idx, partitions);
+            self.derive_block_splits_with_full(mid_idx, end_idx, second, partitions);
         }
     }
 }
