@@ -4044,6 +4044,11 @@ impl HcMatchGenerator {
         let initial_litlen = initial_state.litlen;
         let mut profile = initial_state.profile;
         profile.sufficient_match_len = self.sufficient_match_len_for_pass(profile);
+        let abort_on_worse_match = self.parse_mode == HcParseMode::BtOpt;
+        let opt_level = matches!(
+            self.parse_mode,
+            HcParseMode::BtUltra | HcParseMode::BtUltra2
+        );
         let mut nodes = core::mem::take(&mut self.opt_nodes_scratch);
         if nodes.len() < frontier_limit.saturating_add(2) {
             nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
@@ -4221,7 +4226,7 @@ impl HcMatchGenerator {
                             if match_len > last_pos {
                                 last_pos = match_len;
                             }
-                        } else if self.parse_mode == HcParseMode::BtOpt {
+                        } else if abort_on_worse_match {
                             break;
                         }
                     }
@@ -4270,10 +4275,6 @@ impl HcMatchGenerator {
                     nodes[pos] = prev_node;
                     nodes[pos].litlen = lit_len as u32;
                     nodes[pos].price = lit_cost;
-                    let opt_level = matches!(
-                        self.parse_mode,
-                        HcParseMode::BtUltra | HcParseMode::BtUltra2
-                    );
                     if opt_level
                         && prev_match.mlen > 0
                         && prev_match.litlen == 0
@@ -4397,7 +4398,7 @@ impl HcMatchGenerator {
 
             // donor-style early skip for opt-level path: if next literal-only
             // state is already nearly as good, skip expensive match probing.
-            if self.parse_mode == HcParseMode::BtOpt
+            if abort_on_worse_match
                 && nodes[pos + 1].price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
             {
                 pos += 1;
@@ -4481,7 +4482,7 @@ impl HcMatchGenerator {
                         if next > last_pos {
                             last_pos = next;
                         }
-                    } else if self.parse_mode == HcParseMode::BtOpt {
+                    } else if abort_on_worse_match {
                         break;
                     }
                 }
@@ -4864,6 +4865,7 @@ impl HcMatchGenerator {
         self.collect_optimal_candidates_initialized(abs_pos, current_abs_end, profile, query, out);
     }
 
+    #[inline(always)]
     fn collect_optimal_candidates_initialized(
         &mut self,
         abs_pos: usize,
@@ -5301,6 +5303,7 @@ impl HcMatchGenerator {
         seed + extra
     }
 
+    #[inline(always)]
     fn bt_insert_step_no_rebase(
         &mut self,
         abs_pos: usize,
@@ -5404,6 +5407,7 @@ impl HcMatchGenerator {
         speed_positions.max(match_end_abs.saturating_sub(abs_pos.saturating_add(8)))
     }
 
+    #[inline(always)]
     fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
         if self.skip_insert_until_abs < self.history_abs_start {
             self.skip_insert_until_abs = self.history_abs_start;
@@ -5425,6 +5429,7 @@ impl HcMatchGenerator {
         self.skip_insert_until_abs = abs_pos;
     }
 
+    #[inline(always)]
     fn bt_insert_and_collect_matches(
         &mut self,
         abs_pos: usize,
@@ -5586,6 +5591,7 @@ impl HcMatchGenerator {
         unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
     }
 
+    #[inline(always)]
     fn hash3_candidate(
         &self,
         abs_pos: usize,
@@ -5878,6 +5884,7 @@ impl HcMatchGenerator {
         best
     }
 
+    #[inline(always)]
     fn for_each_repcode_candidate_with_reps(
         &self,
         abs_pos: usize,
