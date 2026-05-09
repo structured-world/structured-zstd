@@ -4150,6 +4150,14 @@ impl HcMatchGenerator {
             &mut ll_price_generations,
             ll_price_stamp,
         );
+        let ll1_price = Self::cached_lit_length_price(
+            profile,
+            stats,
+            1,
+            &mut ll_prices,
+            &mut ll_price_generations,
+            ll_price_stamp,
+        );
         let mut pos = 1usize;
         let mut last_pos = 0usize;
         let mut forced_end: Option<usize> = None;
@@ -4332,33 +4340,18 @@ impl HcMatchGenerator {
                         && prev_match.litlen == 0
                         && pos < current_len
                     {
-                        let ll0 = Self::cached_lit_length_price(
-                            profile,
-                            stats,
-                            0,
-                            &mut ll_prices,
-                            &mut ll_price_generations,
-                            ll_price_stamp,
-                        );
-                        let ll1 = Self::cached_lit_length_price(
-                            profile,
-                            stats,
-                            1,
-                            &mut ll_prices,
-                            &mut ll_price_generations,
-                            ll_price_stamp,
-                        );
-                        if ll1 < ll0 {
+                        if ll1_price < ll0_price {
+                            let next_lit_price = Self::cached_literal_price(
+                                profile,
+                                stats,
+                                current[pos],
+                                &mut self.opt_lit_price_scratch,
+                                &mut self.opt_lit_price_generation,
+                                lit_price_stamp,
+                            );
                             let with1literal = (prev_match.price as i64)
-                                .saturating_add(Self::cached_literal_price(
-                                    profile,
-                                    stats,
-                                    current[pos],
-                                    &mut self.opt_lit_price_scratch,
-                                    &mut self.opt_lit_price_generation,
-                                    lit_price_stamp,
-                                ) as i64)
-                                .saturating_add(ll1 as i64 - ll0 as i64)
+                                .saturating_add(next_lit_price as i64)
+                                .saturating_add(ll1_price as i64 - ll0_price as i64)
                                 .clamp(0, u32::MAX as i64)
                                 as u32;
                             let next_ll = Self::cached_lit_length_price(
@@ -4378,14 +4371,7 @@ impl HcMatchGenerator {
                                 ll_price_stamp,
                             );
                             let with_more_literals = (lit_cost as i64)
-                                .saturating_add(Self::cached_literal_price(
-                                    profile,
-                                    stats,
-                                    current[pos],
-                                    &mut self.opt_lit_price_scratch,
-                                    &mut self.opt_lit_price_generation,
-                                    lit_price_stamp,
-                                ) as i64)
+                                .saturating_add(next_lit_price as i64)
                                 .saturating_add(next_ll as i64 - cur_ll as i64)
                                 .clamp(0, u32::MAX as i64)
                                 as u32;
