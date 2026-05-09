@@ -4335,6 +4335,10 @@ impl HcMatchGenerator {
                     nodes[pos] = prev_node;
                     nodes[pos].litlen = lit_len as u32;
                     nodes[pos].price = lit_cost;
+                    // Keep the cheaper-LL branch nested: collapsing it into
+                    // the outer condition measured slower on the level22
+                    // small-block hot path.
+                    #[allow(clippy::collapsible_if)]
                     if opt_level
                         && prev_match.mlen > 0
                         && prev_match.litlen == 0
