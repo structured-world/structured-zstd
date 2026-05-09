@@ -4831,7 +4831,8 @@ impl HcMatchGenerator {
     #[inline(always)]
     fn reset_opt_node(node: &mut HcOptimalNode) {
         node.price = u32::MAX;
-        node.mlen = 0;
+        // Donor only marks the slot as unreachable and not end-of-match here;
+        // stale mlen is ignored while price is MAX and litlen is non-zero.
         node.litlen = u32::MAX;
     }
 
