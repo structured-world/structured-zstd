@@ -3386,15 +3386,19 @@ impl HcOptimalCostProfile {
     }
 
     #[inline(always)]
-    fn offset_price(&self, stats: &HcOptState, off_base: u32) -> u32 {
+    fn offset_price_for<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+        &self,
+        stats: &HcOptState,
+        off_base: u32,
+    ) -> u32 {
         let off_code = 31u32.saturating_sub(off_base.max(1).leading_zeros());
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return (16 + off_code).saturating_mul(HC_BITCOST_MULTIPLIER);
         }
         let mut price = off_code.saturating_mul(HC_BITCOST_MULTIPLIER)
             + (stats.off_code_sum_base_price
-                - HcOptState::weight(stats.off_code_freq[off_code as usize], self.accurate));
-        if self.favor_small_offsets && off_code >= 20 {
+                - HcOptState::weight(stats.off_code_freq[off_code as usize], ACCURATE_PRICE));
+        if FAVOR_SMALL_OFFSETS && off_code >= 20 {
             price = price.saturating_add(
                 (off_code - 19)
                     .saturating_mul(2)
@@ -4037,6 +4041,52 @@ impl HcMatchGenerator {
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
     ) -> (u32, [u32; 3], usize, usize) {
+        let profile = initial_state.profile;
+        match (profile.accurate, profile.favor_small_offsets) {
+            (true, false) => self.build_optimal_plan_impl::<true, false>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (true, true) => self.build_optimal_plan_impl::<true, true>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (false, false) => self.build_optimal_plan_impl::<false, false>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (false, true) => self.build_optimal_plan_impl::<false, true>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+        }
+    }
+
+    fn build_optimal_plan_impl<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
         let current_abs_end = current_abs_start + current_len;
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let frontier_limit = current_len.min(HC_OPT_NUM.saturating_sub(1));
@@ -4154,7 +4204,8 @@ impl HcMatchGenerator {
                         initial_litlen,
                         initial_reps,
                     );
-                    let off_price = profile.offset_price(stats, off_base);
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
                     let ml_price = Self::cached_match_length_price(
                         profile,
                         stats,
@@ -4201,7 +4252,8 @@ impl HcMatchGenerator {
                         initial_litlen,
                         initial_reps,
                     );
-                    let off_price = profile.offset_price(stats, off_base);
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = Self::cached_match_length_price(
                             profile,
@@ -4453,7 +4505,8 @@ impl HcMatchGenerator {
                     lit_len,
                     base_node.reps,
                 );
-                let off_price = profile.offset_price(stats, off_base);
+                let off_price = profile
+                    .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
                 // donor-style descending ML scan from best length to minimum.
                 // For faster btopt-like mode (optLevel==0 equivalent) we stop
                 // early once shorter lengths stop improving the current best.
@@ -4501,7 +4554,8 @@ impl HcMatchGenerator {
                         lit_len,
                         base_node.reps,
                     );
-                    let off_price = profile.offset_price(stats, off_base);
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
                     let ml_price = Self::cached_match_length_price(
                         profile,
                         stats,
