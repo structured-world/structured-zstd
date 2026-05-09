@@ -4177,7 +4177,7 @@ impl HcMatchGenerator {
                 None
             };
             candidates.clear();
-            self.collect_optimal_candidates_initialized(
+            self.collect_optimal_candidates_initialized::<true>(
                 current_abs_start,
                 current_abs_end,
                 profile,
@@ -4469,7 +4469,7 @@ impl HcMatchGenerator {
                 None
             };
             candidates.clear();
-            self.collect_optimal_candidates_initialized(
+            self.collect_optimal_candidates_initialized::<true>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -4916,11 +4916,27 @@ impl HcMatchGenerator {
         out: &mut Vec<MatchCandidate>,
     ) {
         self.ensure_tables();
-        self.collect_optimal_candidates_initialized(abs_pos, current_abs_end, profile, query, out);
+        if self.uses_bt_matchfinder() {
+            self.collect_optimal_candidates_initialized::<true>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            );
+        } else {
+            self.collect_optimal_candidates_initialized::<false>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            );
+        }
     }
 
     #[inline(always)]
-    fn collect_optimal_candidates_initialized(
+    fn collect_optimal_candidates_initialized<const USE_BT_MATCHFINDER: bool>(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -4944,7 +4960,7 @@ impl HcMatchGenerator {
             }
             return;
         }
-        if self.uses_bt_matchfinder() {
+        if USE_BT_MATCHFINDER {
             self.bt_update_tree_until(abs_pos, current_abs_end);
         }
         let current_idx = abs_pos - self.history_abs_start;
@@ -5000,7 +5016,7 @@ impl HcMatchGenerator {
                 }
             }
         }
-        if !skip_further_match_search && self.uses_bt_matchfinder() {
+        if !skip_further_match_search && USE_BT_MATCHFINDER {
             self.bt_insert_and_collect_matches(
                 abs_pos,
                 current_abs_end,
