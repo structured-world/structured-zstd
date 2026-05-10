@@ -4470,6 +4470,43 @@ impl HcMatchGenerator {
                 },
                 &mut candidates,
             );
+            if let Some(candidate) = candidates.last() {
+                let longest_len = candidate.match_len.min(current_len - pos);
+                if longest_len > sufficient_len
+                    || pos + longest_len >= HC_OPT_NUM
+                    || pos + longest_len >= current_len
+                {
+                    let lit_len = base_node.litlen as usize;
+                    let off_base = Self::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        lit_len,
+                        base_node.reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
+                    let ml_price = Self::cached_match_length_price(
+                        profile,
+                        stats,
+                        longest_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = ll0_price
+                        .saturating_add(profile.match_price_from_parts(off_price, ml_price, stats));
+                    let forced_price = base_cost.saturating_add(seq_cost);
+                    let end_pos = (pos + longest_len).min(current_len);
+                    forced_end = Some(end_pos);
+                    forced_end_state = Some(HcOptimalNode {
+                        price: forced_price,
+                        off: candidate.offset as u32,
+                        mlen: longest_len as u32,
+                        litlen: 0,
+                        reps: base_node.reps,
+                    });
+                    break;
+                }
+            }
             let mut prev_max_len = min_match_len.saturating_sub(1);
             for candidate in candidates.iter() {
                 let max_match_len = candidate
@@ -4530,48 +4567,6 @@ impl HcMatchGenerator {
                     }
                 }
                 prev_max_len = prev_max_len.max(max_match_len);
-            }
-
-            if let Some(candidate) = candidates.last() {
-                let longest_len = candidate.match_len.min(current_len - pos);
-                if longest_len > sufficient_len
-                    || pos + longest_len >= HC_OPT_NUM
-                    || pos + longest_len >= current_len
-                {
-                    let lit_len = base_node.litlen as usize;
-                    let off_base = Self::encode_offset_base_with_reps(
-                        candidate.offset as u32,
-                        lit_len,
-                        base_node.reps,
-                    );
-                    let off_price = profile
-                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
-                    let ml_price = Self::cached_match_length_price(
-                        profile,
-                        stats,
-                        longest_len,
-                        &mut ml_prices,
-                        &mut ml_price_generations,
-                        ml_price_stamp,
-                    );
-                    let seq_cost = ll0_price
-                        .saturating_add(profile.match_price_from_parts(off_price, ml_price, stats));
-                    let forced_price = base_cost.saturating_add(seq_cost);
-                    let end_pos = (pos + longest_len).min(current_len);
-                    let forced_state = HcOptimalNode {
-                        price: forced_price,
-                        off: candidate.offset as u32,
-                        mlen: longest_len as u32,
-                        litlen: 0,
-                        reps: base_node.reps,
-                    };
-                    if end_pos < nodes.len() && forced_price < nodes[end_pos].price {
-                        nodes[end_pos] = forced_state;
-                    }
-                    forced_end = Some(end_pos);
-                    forced_end_state = Some(forced_state);
-                    break;
-                }
             }
 
             if last_pos + 1 < nodes.len() {
