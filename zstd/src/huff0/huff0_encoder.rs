@@ -105,13 +105,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     pub(super) fn weights(&self) -> Vec<u8> {
-        let max = self.table.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        self.table
-            .codes
-            .iter()
-            .copied()
-            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>()
+        self.table.weights()
     }
 
     fn write_table(&mut self) {
@@ -289,12 +283,7 @@ impl HuffmanTable {
 
     /// Returns exact writable table-description size when representable.
     pub(crate) fn try_table_description_size(&self) -> Option<usize> {
-        let weights = {
-            let mut out = Vec::new();
-            let mut writer = BitWriter::from(&mut out);
-            let encoder = HuffmanEncoder::new(self, &mut writer);
-            encoder.weights()
-        };
+        let weights = self.weights();
         let weights = &weights[..weights.len() - 1];
         if let Some(fse_description) = HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
         {
@@ -310,6 +299,15 @@ impl HuffmanTable {
     /// Alias for `try_table_description_size` used by call sites that require explicit writeability.
     pub(crate) fn writeable_table_description_size(&self) -> Option<usize> {
         self.try_table_description_size()
+    }
+
+    fn weights(&self) -> Vec<u8> {
+        let max = self.codes.iter().map(|(_, nb)| nb).max().unwrap();
+        self.codes
+            .iter()
+            .copied()
+            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
+            .collect::<Vec<u8>>()
     }
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
