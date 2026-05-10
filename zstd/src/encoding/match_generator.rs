@@ -5751,6 +5751,13 @@ impl HcMatchGenerator {
     }
 
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
+        if self.parse_mode == HcParseMode::BtUltra2
+            && !self.allow_zero_relative_position
+            && self.position_base == 0
+            && abs_pos == 0
+        {
+            return;
+        }
         let needs_rebase = self
             .relative_position(abs_pos)
             .is_none_or(|relative| relative >= u32::MAX - 1);
