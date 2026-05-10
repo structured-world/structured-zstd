@@ -5798,11 +5798,11 @@ impl HcMatchGenerator {
 
     fn insert_position_no_rebase(&mut self, abs_pos: usize) {
         let idx = abs_pos - self.history_abs_start;
-        let concat = self.live_history();
+        let concat = &self.history[self.history_start..];
         if idx + 4 > concat.len() {
             return;
         }
-        let hash = self.hash_position(&concat[idx..]);
+        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
