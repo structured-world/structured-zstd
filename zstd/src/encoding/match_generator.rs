@@ -3594,14 +3594,17 @@ impl HcMatchGenerator {
     }
 
     fn configure(&mut self, config: HcConfig, window_log: u8) {
-        let resize = self.hash_log != config.hash_log || self.chain_log != config.chain_log;
-        self.hash_log = config.hash_log;
-        self.chain_log = config.chain_log;
-        self.hash3_log = if config.parse_mode == HcParseMode::BtUltra2 {
+        let next_hash3_log = if config.parse_mode == HcParseMode::BtUltra2 {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0
         };
+        let resize = self.hash_log != config.hash_log
+            || self.chain_log != config.chain_log
+            || self.hash3_log != next_hash3_log;
+        self.hash_log = config.hash_log;
+        self.chain_log = config.chain_log;
+        self.hash3_log = next_hash3_log;
         self.search_depth = if matches!(
             config.parse_mode,
             HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
@@ -4931,7 +4934,7 @@ impl HcMatchGenerator {
         out: &mut Vec<MatchCandidate>,
     ) {
         debug_assert!(!self.hash_table.is_empty());
-        debug_assert!(!self.hash3_table.is_empty());
+        debug_assert!(self.hash3_log == 0 || !self.hash3_table.is_empty());
         debug_assert!(!self.chain_table.is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let reps = query.reps;
@@ -5262,7 +5265,12 @@ impl HcMatchGenerator {
     fn ensure_tables(&mut self) {
         if self.hash_table.is_empty() {
             self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
-            self.hash3_table = alloc::vec![HC_EMPTY; 1 << HC3_HASH_LOG];
+            let hash3_size = if self.hash3_log == 0 {
+                0
+            } else {
+                1 << self.hash3_log
+            };
+            self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
             self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
         }
     }
