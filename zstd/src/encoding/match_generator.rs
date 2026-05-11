@@ -2825,6 +2825,8 @@ struct HcMatchGenerator {
     opt_seed_plan_scratch: Vec<HcOptimalSequence>,
     opt_ll_price_scratch: Vec<u32>,
     opt_ll_price_generation: Vec<u32>,
+    opt_ll_delta_price_scratch: Vec<i32>,
+    opt_ll_delta_price_generation: Vec<u32>,
     opt_ll_price_stamp: u32,
     opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
     opt_lit_price_generation: [u32; HC_MAX_LIT + 1],
@@ -2917,8 +2919,17 @@ struct HcOptimalPlanBuffers {
     store: Vec<HcOptimalNode>,
     ll_prices: Vec<u32>,
     ll_price_generations: Vec<u32>,
+    ll_delta_prices: Vec<i32>,
+    ll_delta_generations: Vec<u32>,
     ml_prices: Vec<u32>,
     ml_price_generations: Vec<u32>,
+}
+
+struct HcLitLengthPriceCache<'a> {
+    prices: &'a mut [u32],
+    generations: &'a mut [u32],
+    deltas: &'a mut [i32],
+    delta_generations: &'a mut [u32],
 }
 
 #[derive(Copy, Clone)]
@@ -3583,6 +3594,8 @@ impl HcMatchGenerator {
             opt_seed_plan_scratch: Vec::new(),
             opt_ll_price_scratch: Vec::new(),
             opt_ll_price_generation: Vec::new(),
+            opt_ll_delta_price_scratch: Vec::new(),
+            opt_ll_delta_price_generation: Vec::new(),
             opt_ll_price_stamp: 0,
             opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
             opt_lit_price_generation: [0; HC_MAX_LIT + 1],
@@ -3655,6 +3668,8 @@ impl HcMatchGenerator {
         self.opt_seed_plan_scratch.clear();
         self.opt_ll_price_scratch.clear();
         self.opt_ll_price_generation.clear();
+        self.opt_ll_delta_price_scratch.clear();
+        self.opt_ll_delta_price_generation.clear();
         self.opt_ll_price_stamp = 0;
         self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
@@ -4115,9 +4130,15 @@ impl HcMatchGenerator {
         store.clear();
         let mut ll_prices = core::mem::take(&mut self.opt_ll_price_scratch);
         let mut ll_price_generations = core::mem::take(&mut self.opt_ll_price_generation);
+        let mut ll_delta_prices = core::mem::take(&mut self.opt_ll_delta_price_scratch);
+        let mut ll_delta_generations = core::mem::take(&mut self.opt_ll_delta_price_generation);
         if ll_prices.len() <= frontier_limit {
             ll_prices.resize(frontier_limit + 1, 0);
             ll_price_generations.resize(frontier_limit + 1, 0);
+        }
+        if ll_delta_prices.len() <= frontier_limit + 1 {
+            ll_delta_prices.resize(frontier_limit + 2, 0);
+            ll_delta_generations.resize(frontier_limit + 2, 0);
         }
         self.opt_ll_price_stamp = self.opt_ll_price_stamp.wrapping_add(1).max(1);
         let ll_price_stamp = self.opt_ll_price_stamp;
@@ -4313,22 +4334,18 @@ impl HcMatchGenerator {
                     &mut self.opt_lit_price_generation,
                     lit_price_stamp,
                 );
-                let ll_delta = Self::cached_lit_length_price(
+                let ll_delta = Self::cached_lit_length_delta_price(
                     profile,
                     stats,
                     lit_len,
-                    &mut ll_prices,
-                    &mut ll_price_generations,
+                    HcLitLengthPriceCache {
+                        prices: &mut ll_prices,
+                        generations: &mut ll_price_generations,
+                        deltas: &mut ll_delta_prices,
+                        delta_generations: &mut ll_delta_generations,
+                    },
                     ll_price_stamp,
-                ) as i64
-                    - Self::cached_lit_length_price(
-                        profile,
-                        stats,
-                        prev_node.litlen as usize,
-                        &mut ll_prices,
-                        &mut ll_price_generations,
-                        ll_price_stamp,
-                    ) as i64;
+                ) as i64;
                 let lit_cost = (prev_node.price as i64)
                     .saturating_add(lit_price as i64)
                     .saturating_add(ll_delta)
@@ -4361,25 +4378,21 @@ impl HcMatchGenerator {
                                 .saturating_add(ll1_price as i64 - ll0_price as i64)
                                 .clamp(0, u32::MAX as i64)
                                 as u32;
-                            let next_ll = Self::cached_lit_length_price(
+                            let ll_delta_next = Self::cached_lit_length_delta_price(
                                 profile,
                                 stats,
                                 lit_len.saturating_add(1),
-                                &mut ll_prices,
-                                &mut ll_price_generations,
+                                HcLitLengthPriceCache {
+                                    prices: &mut ll_prices,
+                                    generations: &mut ll_price_generations,
+                                    deltas: &mut ll_delta_prices,
+                                    delta_generations: &mut ll_delta_generations,
+                                },
                                 ll_price_stamp,
-                            );
-                            let cur_ll = Self::cached_lit_length_price(
-                                profile,
-                                stats,
-                                lit_len,
-                                &mut ll_prices,
-                                &mut ll_price_generations,
-                                ll_price_stamp,
-                            );
+                            ) as i64;
                             let with_more_literals = (lit_cost as i64)
                                 .saturating_add(next_lit_price as i64)
-                                .saturating_add(next_ll as i64 - cur_ll as i64)
+                                .saturating_add(ll_delta_next)
                                 .clamp(0, u32::MAX as i64)
                                 as u32;
                             let next = pos + 1;
@@ -4588,6 +4601,8 @@ impl HcMatchGenerator {
                         store,
                         ll_prices,
                         ll_price_generations,
+                        ll_delta_prices,
+                        ll_delta_generations,
                         ml_prices,
                         ml_price_generations,
                     },
@@ -4603,22 +4618,18 @@ impl HcMatchGenerator {
                 lit_price_stamp,
             );
             let next_litlen = initial_litlen.saturating_add(1);
-            let ll_delta = Self::cached_lit_length_price(
+            let ll_delta = Self::cached_lit_length_delta_price(
                 profile,
                 stats,
                 next_litlen,
-                &mut ll_prices,
-                &mut ll_price_generations,
+                HcLitLengthPriceCache {
+                    prices: &mut ll_prices,
+                    generations: &mut ll_price_generations,
+                    deltas: &mut ll_delta_prices,
+                    delta_generations: &mut ll_delta_generations,
+                },
                 ll_price_stamp,
-            ) as i64
-                - Self::cached_lit_length_price(
-                    profile,
-                    stats,
-                    initial_litlen,
-                    &mut ll_prices,
-                    &mut ll_price_generations,
-                    ll_price_stamp,
-                ) as i64;
+            ) as i64;
             let price = (nodes[0].price as i64)
                 .saturating_add(lit_price as i64)
                 .saturating_add(ll_delta)
@@ -4630,6 +4641,8 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
+                    ll_delta_prices,
+                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4653,6 +4666,8 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
+                    ll_delta_prices,
+                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4668,6 +4683,8 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
+                    ll_delta_prices,
+                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4699,6 +4716,8 @@ impl HcMatchGenerator {
                         store,
                         ll_prices,
                         ll_price_generations,
+                        ll_delta_prices,
+                        ll_delta_generations,
                         ml_prices,
                         ml_price_generations,
                     },
@@ -4787,6 +4806,8 @@ impl HcMatchGenerator {
                 store,
                 ll_prices,
                 ll_price_generations,
+                ll_delta_prices,
+                ll_delta_generations,
                 ml_prices,
                 ml_price_generations,
             },
@@ -4805,6 +4826,8 @@ impl HcMatchGenerator {
             store,
             ll_prices,
             ll_price_generations,
+            ll_delta_prices,
+            ll_delta_generations,
             ml_prices,
             ml_price_generations,
         } = buffers;
@@ -4814,6 +4837,8 @@ impl HcMatchGenerator {
         self.opt_store_scratch = store;
         self.opt_ll_price_scratch = ll_prices;
         self.opt_ll_price_generation = ll_price_generations;
+        self.opt_ll_delta_price_scratch = ll_delta_prices;
+        self.opt_ll_delta_price_generation = ll_delta_generations;
         self.opt_ml_price_scratch = ml_prices;
         self.opt_ml_price_generation = ml_price_generations;
         result
@@ -4872,6 +4897,43 @@ impl HcMatchGenerator {
         prices[lit_len] = price;
         generations[lit_len] = stamp;
         price
+    }
+
+    #[inline(always)]
+    fn cached_lit_length_delta_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        lit_len: usize,
+        cache: HcLitLengthPriceCache<'_>,
+        stamp: u32,
+    ) -> i32 {
+        if lit_len == 0 || lit_len >= cache.deltas.len() {
+            return profile.lit_length_price(stats, lit_len) as i32
+                - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
+        }
+        if cache.delta_generations[lit_len] == stamp {
+            return cache.deltas[lit_len];
+        }
+        let price = Self::cached_lit_length_price(
+            profile,
+            stats,
+            lit_len,
+            cache.prices,
+            cache.generations,
+            stamp,
+        );
+        let previous = Self::cached_lit_length_price(
+            profile,
+            stats,
+            lit_len - 1,
+            cache.prices,
+            cache.generations,
+            stamp,
+        );
+        let delta = price as i32 - previous as i32;
+        cache.deltas[lit_len] = delta;
+        cache.delta_generations[lit_len] = stamp;
+        delta
     }
 
     #[inline(always)]
