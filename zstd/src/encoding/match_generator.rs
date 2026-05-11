@@ -2825,8 +2825,6 @@ struct HcMatchGenerator {
     opt_seed_plan_scratch: Vec<HcOptimalSequence>,
     opt_ll_price_scratch: Vec<u32>,
     opt_ll_price_generation: Vec<u32>,
-    opt_ll_delta_price_scratch: Vec<i32>,
-    opt_ll_delta_price_generation: Vec<u32>,
     opt_ll_price_stamp: u32,
     opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
     opt_lit_price_generation: [u32; HC_MAX_LIT + 1],
@@ -2919,17 +2917,8 @@ struct HcOptimalPlanBuffers {
     store: Vec<HcOptimalNode>,
     ll_prices: Vec<u32>,
     ll_price_generations: Vec<u32>,
-    ll_delta_prices: Vec<i32>,
-    ll_delta_generations: Vec<u32>,
     ml_prices: Vec<u32>,
     ml_price_generations: Vec<u32>,
-}
-
-struct HcLitLengthPriceCache<'a> {
-    prices: &'a mut [u32],
-    generations: &'a mut [u32],
-    deltas: &'a mut [i32],
-    delta_generations: &'a mut [u32],
 }
 
 #[derive(Copy, Clone)]
@@ -3131,6 +3120,7 @@ impl HcOptState {
         sum
     }
 
+    #[inline(always)]
     fn lit_code_and_bits(lit_len: usize) -> (usize, u32) {
         let ll = lit_len.min(131_071) as u32;
         let (code, _, extra_bits) = match ll {
@@ -3159,6 +3149,7 @@ impl HcOptState {
         (code as usize, extra_bits as u32)
     }
 
+    #[inline(always)]
     fn ml_code_and_bits(match_len: usize) -> (usize, u32) {
         let ml = match_len.clamp(3, 131_074) as u32;
         let (code, _, extra_bits) = match ml {
@@ -3434,12 +3425,13 @@ impl HcOptimalCostProfile {
 
     #[inline(always)]
     fn match_price_from_parts(&self, off_price: u32, ml_price: u32, stats: &HcOptState) -> u32 {
-        let price = off_price.saturating_add(ml_price);
-        if matches!(stats.price_type, HcOptPriceType::Predefined) {
-            price
-        } else {
-            price.saturating_add(HC_BITCOST_MULTIPLIER / 5)
+        let mut price = off_price + ml_price;
+        debug_assert!(price >= off_price);
+        if !matches!(stats.price_type, HcOptPriceType::Predefined) {
+            price += HC_BITCOST_MULTIPLIER / 5;
+            debug_assert!(price >= off_price);
         }
+        price
     }
 }
 
@@ -3594,8 +3586,6 @@ impl HcMatchGenerator {
             opt_seed_plan_scratch: Vec::new(),
             opt_ll_price_scratch: Vec::new(),
             opt_ll_price_generation: Vec::new(),
-            opt_ll_delta_price_scratch: Vec::new(),
-            opt_ll_delta_price_generation: Vec::new(),
             opt_ll_price_stamp: 0,
             opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
             opt_lit_price_generation: [0; HC_MAX_LIT + 1],
@@ -3668,8 +3658,6 @@ impl HcMatchGenerator {
         self.opt_seed_plan_scratch.clear();
         self.opt_ll_price_scratch.clear();
         self.opt_ll_price_generation.clear();
-        self.opt_ll_delta_price_scratch.clear();
-        self.opt_ll_delta_price_generation.clear();
         self.opt_ll_price_stamp = 0;
         self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
@@ -4130,15 +4118,9 @@ impl HcMatchGenerator {
         store.clear();
         let mut ll_prices = core::mem::take(&mut self.opt_ll_price_scratch);
         let mut ll_price_generations = core::mem::take(&mut self.opt_ll_price_generation);
-        let mut ll_delta_prices = core::mem::take(&mut self.opt_ll_delta_price_scratch);
-        let mut ll_delta_generations = core::mem::take(&mut self.opt_ll_delta_price_generation);
         if ll_prices.len() <= frontier_limit {
             ll_prices.resize(frontier_limit + 1, 0);
             ll_price_generations.resize(frontier_limit + 1, 0);
-        }
-        if ll_delta_prices.len() <= frontier_limit + 1 {
-            ll_delta_prices.resize(frontier_limit + 2, 0);
-            ll_delta_generations.resize(frontier_limit + 2, 0);
         }
         self.opt_ll_price_stamp = self.opt_ll_price_stamp.wrapping_add(1).max(1);
         let ll_price_stamp = self.opt_ll_price_stamp;
@@ -4246,9 +4228,11 @@ impl HcMatchGenerator {
                         &mut ml_price_generations,
                         ml_price_stamp,
                     );
-                    let seq_cost = ll0_price
-                        .saturating_add(profile.match_price_from_parts(off_price, ml_price, stats));
-                    let forced_price = nodes[0].price.saturating_add(seq_cost);
+                    let seq_cost = Self::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, stats),
+                    );
+                    let forced_price = Self::add_prices(nodes[0].price, seq_cost);
                     let forced_state = HcOptimalNode {
                         price: forced_price,
                         off: candidate.offset as u32,
@@ -4295,10 +4279,11 @@ impl HcMatchGenerator {
                             &mut ml_price_generations,
                             ml_price_stamp,
                         );
-                        let seq_cost = ll0_price.saturating_add(
+                        let seq_cost = Self::add_prices(
+                            ll0_price,
                             profile.match_price_from_parts(off_price, ml_price, stats),
                         );
-                        let next_cost = nodes[0].price.saturating_add(seq_cost);
+                        let next_cost = Self::add_prices(nodes[0].price, seq_cost);
                         if match_len > last_pos || next_cost < nodes[match_len].price {
                             nodes[match_len] = HcOptimalNode {
                                 price: next_cost,
@@ -4338,18 +4323,11 @@ impl HcMatchGenerator {
                     profile,
                     stats,
                     lit_len,
-                    HcLitLengthPriceCache {
-                        prices: &mut ll_prices,
-                        generations: &mut ll_price_generations,
-                        deltas: &mut ll_delta_prices,
-                        delta_generations: &mut ll_delta_generations,
-                    },
+                    &mut ll_prices,
+                    &mut ll_price_generations,
                     ll_price_stamp,
-                ) as i64;
-                let lit_cost = (prev_node.price as i64)
-                    .saturating_add(lit_price as i64)
-                    .saturating_add(ll_delta)
-                    .clamp(0, u32::MAX as i64) as u32;
+                );
+                let lit_cost = Self::add_price_delta(prev_node.price, lit_price, ll_delta);
                 if lit_cost <= nodes[pos].price {
                     let prev_match = nodes[pos];
                     nodes[pos] = prev_node;
@@ -4373,28 +4351,21 @@ impl HcMatchGenerator {
                                 &mut self.opt_lit_price_generation,
                                 lit_price_stamp,
                             );
-                            let with1literal = (prev_match.price as i64)
-                                .saturating_add(next_lit_price as i64)
-                                .saturating_add(ll1_price as i64 - ll0_price as i64)
-                                .clamp(0, u32::MAX as i64)
-                                as u32;
+                            let with1literal = Self::add_price_delta(
+                                prev_match.price,
+                                next_lit_price,
+                                ll1_price as i32 - ll0_price as i32,
+                            );
                             let ll_delta_next = Self::cached_lit_length_delta_price(
                                 profile,
                                 stats,
                                 lit_len.saturating_add(1),
-                                HcLitLengthPriceCache {
-                                    prices: &mut ll_prices,
-                                    generations: &mut ll_price_generations,
-                                    deltas: &mut ll_delta_prices,
-                                    delta_generations: &mut ll_delta_generations,
-                                },
+                                &mut ll_prices,
+                                &mut ll_price_generations,
                                 ll_price_stamp,
-                            ) as i64;
-                            let with_more_literals = (lit_cost as i64)
-                                .saturating_add(next_lit_price as i64)
-                                .saturating_add(ll_delta_next)
-                                .clamp(0, u32::MAX as i64)
-                                as u32;
+                            );
+                            let with_more_literals =
+                                Self::add_price_delta(lit_cost, next_lit_price, ll_delta_next);
                             let next = pos + 1;
                             if with1literal < with_more_literals && with1literal < nodes[next].price
                             {
@@ -4508,9 +4479,11 @@ impl HcMatchGenerator {
                         &mut ml_price_generations,
                         ml_price_stamp,
                     );
-                    let seq_cost = ll0_price
-                        .saturating_add(profile.match_price_from_parts(off_price, ml_price, stats));
-                    let forced_price = base_cost.saturating_add(seq_cost);
+                    let seq_cost = Self::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, stats),
+                    );
+                    let forced_price = Self::add_prices(base_cost, seq_cost);
                     let end_pos = (pos + longest_len).min(current_len);
                     forced_end = Some(end_pos);
                     forced_end_state = Some(HcOptimalNode {
@@ -4563,9 +4536,11 @@ impl HcMatchGenerator {
                         &mut ml_price_generations,
                         ml_price_stamp,
                     );
-                    let seq_cost = ll0_price
-                        .saturating_add(profile.match_price_from_parts(off_price, ml_price, stats));
-                    let next_cost = base_cost.saturating_add(seq_cost);
+                    let seq_cost = Self::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, stats),
+                    );
+                    let next_cost = Self::add_prices(base_cost, seq_cost);
                     let improved = next > last_pos || next_cost < nodes[next].price;
                     if improved {
                         nodes[next] = HcOptimalNode {
@@ -4601,8 +4576,6 @@ impl HcMatchGenerator {
                         store,
                         ll_prices,
                         ll_price_generations,
-                        ll_delta_prices,
-                        ll_delta_generations,
                         ml_prices,
                         ml_price_generations,
                     },
@@ -4622,18 +4595,11 @@ impl HcMatchGenerator {
                 profile,
                 stats,
                 next_litlen,
-                HcLitLengthPriceCache {
-                    prices: &mut ll_prices,
-                    generations: &mut ll_price_generations,
-                    deltas: &mut ll_delta_prices,
-                    delta_generations: &mut ll_delta_generations,
-                },
+                &mut ll_prices,
+                &mut ll_price_generations,
                 ll_price_stamp,
-            ) as i64;
-            let price = (nodes[0].price as i64)
-                .saturating_add(lit_price as i64)
-                .saturating_add(ll_delta)
-                .clamp(0, u32::MAX as i64) as u32;
+            );
+            let price = Self::add_price_delta(nodes[0].price, lit_price, ll_delta);
             return self.finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
@@ -4641,8 +4607,6 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
-                    ll_delta_prices,
-                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4666,8 +4630,6 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
-                    ll_delta_prices,
-                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4683,8 +4645,6 @@ impl HcMatchGenerator {
                     store,
                     ll_prices,
                     ll_price_generations,
-                    ll_delta_prices,
-                    ll_delta_generations,
                     ml_prices,
                     ml_price_generations,
                 },
@@ -4716,8 +4676,6 @@ impl HcMatchGenerator {
                         store,
                         ll_prices,
                         ll_price_generations,
-                        ll_delta_prices,
-                        ll_delta_generations,
                         ml_prices,
                         ml_price_generations,
                     },
@@ -4775,11 +4733,14 @@ impl HcMatchGenerator {
         }
 
         let mut tail_literals = initial_litlen;
-        for stretch in store.iter().take(store_end + 1).skip(store_start) {
+        let mut store_pos = store_start;
+        while store_pos <= store_end {
+            let stretch = store[store_pos];
             let llen = stretch.litlen as usize;
             let mlen = stretch.mlen as usize;
             if mlen == 0 {
                 tail_literals = llen;
+                store_pos += 1;
                 continue;
             }
             out.push(HcOptimalSequence {
@@ -4788,6 +4749,7 @@ impl HcMatchGenerator {
                 lit_len: llen as u32,
             });
             tail_literals = 0;
+            store_pos += 1;
         }
         let result = (
             last_stretch.price,
@@ -4806,8 +4768,6 @@ impl HcMatchGenerator {
                 store,
                 ll_prices,
                 ll_price_generations,
-                ll_delta_prices,
-                ll_delta_generations,
                 ml_prices,
                 ml_price_generations,
             },
@@ -4826,8 +4786,6 @@ impl HcMatchGenerator {
             store,
             ll_prices,
             ll_price_generations,
-            ll_delta_prices,
-            ll_delta_generations,
             ml_prices,
             ml_price_generations,
         } = buffers;
@@ -4837,8 +4795,6 @@ impl HcMatchGenerator {
         self.opt_store_scratch = store;
         self.opt_ll_price_scratch = ll_prices;
         self.opt_ll_price_generation = ll_price_generations;
-        self.opt_ll_delta_price_scratch = ll_delta_prices;
-        self.opt_ll_delta_price_generation = ll_delta_generations;
         self.opt_ml_price_scratch = ml_prices;
         self.opt_ml_price_generation = ml_price_generations;
         result
@@ -4857,6 +4813,23 @@ impl HcMatchGenerator {
         // Donor only marks the slot as unreachable and not end-of-match here;
         // stale mlen is ignored while price is MAX and litlen is non-zero.
         node.litlen = u32::MAX;
+    }
+
+    #[inline(always)]
+    fn add_price_delta(price: u32, add: u32, delta: i32) -> u32 {
+        #[cfg(debug_assertions)]
+        {
+            let sum = price as i64 + add as i64 + delta as i64;
+            debug_assert!((0..=u32::MAX as i64).contains(&sum));
+        }
+        price.wrapping_add(add).wrapping_add_signed(delta)
+    }
+
+    #[inline(always)]
+    fn add_prices(lhs: u32, rhs: u32) -> u32 {
+        let sum = lhs + rhs;
+        debug_assert!(sum >= lhs);
+        sum
     }
 
     #[inline(always)]
@@ -4904,36 +4877,19 @@ impl HcMatchGenerator {
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
-        cache: HcLitLengthPriceCache<'_>,
+        prices: &mut [u32],
+        generations: &mut [u32],
         stamp: u32,
     ) -> i32 {
-        if lit_len == 0 || lit_len >= cache.deltas.len() {
+        if lit_len == 0 {
             return profile.lit_length_price(stats, lit_len) as i32
                 - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
         }
-        if cache.delta_generations[lit_len] == stamp {
-            return cache.deltas[lit_len];
-        }
-        let price = Self::cached_lit_length_price(
-            profile,
-            stats,
-            lit_len,
-            cache.prices,
-            cache.generations,
-            stamp,
-        );
-        let previous = Self::cached_lit_length_price(
-            profile,
-            stats,
-            lit_len - 1,
-            cache.prices,
-            cache.generations,
-            stamp,
-        );
-        let delta = price as i32 - previous as i32;
-        cache.deltas[lit_len] = delta;
-        cache.delta_generations[lit_len] = stamp;
-        delta
+        let price =
+            Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);
+        let previous =
+            Self::cached_lit_length_price(profile, stats, lit_len - 1, prices, generations, stamp);
+        price as i32 - previous as i32
     }
 
     #[inline(always)]
@@ -5538,15 +5494,9 @@ impl HcMatchGenerator {
         if self.skip_insert_until_abs < self.history_abs_start {
             self.skip_insert_until_abs = self.history_abs_start;
         }
-        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        let can_skip_rebase_checks = self.position_base == 0
-            && self.index_shift == 0
-            && abs_pos <= max_rel_no_rebase
-            && (self.allow_zero_relative_position
-                || self.skip_insert_until_abs > self.history_abs_start);
         let mut update_abs = self.skip_insert_until_abs;
         while update_abs < abs_pos {
-            if !can_skip_rebase_checks {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = self.bt_insert_step_no_rebase(update_abs, current_abs_end, abs_pos);
@@ -5782,13 +5732,8 @@ impl HcMatchGenerator {
         if self.next_to_update3 >= abs_pos {
             return;
         }
-        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        let can_skip_rebase_checks = self.position_base == 0
-            && self.index_shift == 0
-            && abs_pos <= max_rel_no_rebase
-            && (self.allow_zero_relative_position || self.next_to_update3 > self.history_abs_start);
         while self.next_to_update3 < abs_pos {
-            if !can_skip_rebase_checks {
+            if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos) {
                 self.maybe_rebase_positions(self.next_to_update3);
             }
             self.insert_hash3_only_no_rebase(self.next_to_update3);
@@ -5810,6 +5755,17 @@ impl HcMatchGenerator {
         // empty sentinel. So the raw relative position itself must stay
         // strictly below u32::MAX.
         (rel_u32 < u32::MAX).then_some(rel_u32)
+    }
+
+    #[inline(always)]
+    fn can_skip_rebase_check_at(&self, abs_pos: usize, max_abs_pos: usize) -> bool {
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        self.position_base == 0
+            && self.index_shift == 0
+            && max_abs_pos <= max_rel_no_rebase
+            && (self.allow_zero_relative_position
+                || abs_pos > self.history_abs_start
+                || (self.parse_mode == HcParseMode::BtUltra2 && abs_pos == self.history_abs_start))
     }
 
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
