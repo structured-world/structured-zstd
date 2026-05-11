@@ -45,8 +45,8 @@ pub(crate) struct CompressedBlockScratch {
     partitions: Vec<usize>,
     prefix_sums: SequencePrefixSums,
     compressed: Vec<u8>,
-    estimator_output: Vec<u8>,
     estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
+    estimator_workspace: EstimatorWorkspace,
 }
 
 impl CompressedBlockScratch {
@@ -158,14 +158,18 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     if scratch.parts.sequences.len() <= 4 {
         let source_len = state.matcher.get_last_space().len();
         scratch.compressed.clear();
+        let mut emit_buffers = SingleSequenceEmitBuffers {
+            output,
+            compressed: &mut scratch.compressed,
+            sequence_scratch: &mut scratch.estimator_sequences,
+        };
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block,
             source_len,
             &scratch.parts.literals,
             &scratch.parts.sequences,
-            output,
-            &mut scratch.compressed,
+            &mut emit_buffers,
         );
         if emitted_raw {
             output.extend_from_slice(state.matcher.get_last_space());
@@ -176,8 +180,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 
     scratch.partitions.clear();
     scratch.prefix_sums.rebuild(&scratch.parts.sequences);
-    let estimator_output = core::mem::take(&mut scratch.estimator_output);
-    let estimator_sequences = core::mem::take(&mut scratch.estimator_sequences);
+    let mut workspace = core::mem::take(&mut scratch.estimator_workspace);
     let mut estimator = SplitEstimator {
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
@@ -193,13 +196,12 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: state.offset_hist,
         },
-        scratch_output: estimator_output,
-        scratch_sequences: estimator_sequences,
+        workspace,
     };
     estimator.derive_block_splits(0, scratch.parts.sequences.len(), &mut scratch.partitions);
     scratch.partitions.push(scratch.parts.sequences.len());
-    scratch.estimator_output = estimator.scratch_output;
-    scratch.estimator_sequences = estimator.scratch_sequences;
+    workspace = estimator.workspace;
+    scratch.estimator_workspace = workspace;
 
     scratch.compressed.clear();
     let mut seq_start = 0usize;
@@ -219,14 +221,18 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         } else {
             chunk_lit_len + chunk_match_len
         };
+        let mut emit_buffers = SingleSequenceEmitBuffers {
+            output,
+            compressed: &mut scratch.compressed,
+            sequence_scratch: &mut scratch.estimator_sequences,
+        };
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block && last_partition,
             src_size,
             &scratch.parts.literals[lit_start..lit_end],
             &scratch.parts.sequences[seq_start..seq_end],
-            output,
-            &mut scratch.compressed,
+            &mut emit_buffers,
         );
         if emitted_raw {
             output.extend_from_slice(
@@ -369,24 +375,362 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     writer.flush();
 }
 
+/// Workspace shared across estimator probes so per-probe cost computation never
+/// allocates. Counts are zeroed at the top of every probe.
+struct EstimatorWorkspace {
+    lit_counts: Box<[usize; 256]>,
+    ll_counts: Box<[usize; 256]>,
+    ml_counts: Box<[usize; 256]>,
+    of_counts: Box<[usize; 256]>,
+    sequences: Vec<crate::blocks::sequence_section::Sequence>,
+}
+
+impl Default for EstimatorWorkspace {
+    fn default() -> Self {
+        Self {
+            lit_counts: Box::new([0; 256]),
+            ll_counts: Box::new([0; 256]),
+            ml_counts: Box::new([0; 256]),
+            of_counts: Box::new([0; 256]),
+            sequences: Vec::new(),
+        }
+    }
+}
+
+/// Dry-run analog of [`encode_block_parts_with_sequence_scratch`]: mirrors the
+/// real encoder's `compress_literals` and `choose_table` decisions byte-for-byte
+/// (same `last_huff_table` lookup, same FSE mode selection, same
+/// `remember_last_used_tables` mutation), and computes the would-be output size
+/// in bytes via existing cost primitives instead of running the per-sequence
+/// FSE bit-level write. Splitter probes use this path to get the same byte
+/// count `encode_block_parts` would produce while saving the dominant
+/// `encode_sequences` write cost on every probe.
+fn estimate_block_parts_size<M: Matcher>(
+    state: &mut CompressState<M>,
+    literals_vec: &[u8],
+    raw_sequences: &[RawSequence],
+    workspace: &mut EstimatorWorkspace,
+) -> usize {
+    encode_raw_sequences_into(
+        raw_sequences,
+        &mut state.offset_hist,
+        &mut workspace.sequences,
+    );
+
+    let lit_bytes = estimate_literals_section_bytes(
+        literals_vec,
+        &mut state.last_huff_table,
+        &mut workspace.lit_counts,
+    );
+
+    let seq_bytes = if workspace.sequences.is_empty() {
+        1
+    } else {
+        estimate_sequences_section_bytes(
+            &workspace.sequences,
+            &mut state.fse_tables,
+            &mut workspace.ll_counts,
+            &mut workspace.ml_counts,
+            &mut workspace.of_counts,
+        )
+    };
+
+    lit_bytes + seq_bytes
+}
+
+fn estimate_literals_section_bytes(
+    literals: &[u8],
+    last_huff: &mut Option<huff0_encoder::HuffmanTable>,
+    counts: &mut [usize; 256],
+) -> usize {
+    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches.
+    if literals.len() < 8 {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    }
+    if all_bytes_identical(literals) {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + 1;
+    }
+
+    counts.fill(0);
+    for &b in literals {
+        counts[b as usize] += 1;
+    }
+    let max_sym = counts.iter().rposition(|&c| c > 0).unwrap_or_default();
+    let new_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_sym]);
+
+    let Some(new_desc) = new_table.writeable_table_description_size() else {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    };
+    // For lit_size ≥ 256, donor `compress_literals` calls `encoder.encode4x`
+    // which splits the data in 4 streams with a 6-byte jumptable and per-stream
+    // byte-aligned padding. Bare `estimate_compressed_size_from_counts` would
+    // model a single stream and undercount by ~6–10 bytes per section, biasing
+    // splitter probes. We reuse `estimate_compressed_size` on each quarter so
+    // the cost matches the actual wire format.
+    let new_payload = estimate_huff_payload_bytes(&new_table, literals, counts);
+
+    // Mirror `compress_literals` reuse-vs-new decision. Old-table reuse needs
+    // `estimate_compressed_size` (Option return) because the prior table may
+    // lack codes for symbols present in the current literals; `_from_counts`
+    // would silently zero out those terms.
+    let (use_new, reuse_payload) = match last_huff.as_ref() {
+        Some(table) => match estimate_huff_payload_bytes_checked(table, literals) {
+            Some(old_payload) => {
+                if old_payload <= new_desc + new_payload || new_desc + 12 >= literals.len() {
+                    (false, Some(old_payload))
+                } else {
+                    (true, None)
+                }
+            }
+            None => (true, None),
+        },
+        None => (true, None),
+    };
+
+    let payload: usize = if use_new {
+        new_payload
+    } else {
+        reuse_payload.unwrap_or(literals.len())
+    };
+    let tree_desc = if use_new { new_desc } else { 0 };
+    let compressed_header = compressed_literals_header_bytes(literals.len());
+    let total = compressed_header + tree_desc + payload;
+
+    // Mirror `compress_literals` raw fallback when compressed ≥ literals.
+    if total >= literals.len() {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    }
+
+    if use_new {
+        *last_huff = Some(new_table);
+    }
+    total
+}
+
+fn estimate_sequences_section_bytes(
+    sequences: &[crate::blocks::sequence_section::Sequence],
+    fse_tables: &mut FseTables,
+    ll_counts: &mut [usize; 256],
+    ml_counts: &mut [usize; 256],
+    of_counts: &mut [usize; 256],
+) -> usize {
+    ll_counts.fill(0);
+    ml_counts.fill(0);
+    of_counts.fill(0);
+    let mut extra_bits: usize = 0;
+    for seq in sequences {
+        let (ll, _, ll_bits) = encode_literal_length(seq.ll);
+        let (ml, _, ml_bits) = encode_match_len(seq.ml);
+        let (of, _, _) = encode_offset(seq.of);
+        ll_counts[ll as usize] += 1;
+        ml_counts[ml as usize] += 1;
+        of_counts[of as usize] += 1;
+        // Donor: OF code's value equals its additional-bits width.
+        extra_bits += ll_bits + ml_bits + of as usize;
+    }
+
+    // Same `choose_table` calls as the real encoder — counts the iterator
+    // internally, identical decision path.
+    let ll_mode = choose_table(
+        fse_tables.ll_previous.as_ref(),
+        &fse_tables.ll_default,
+        sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
+        9,
+    );
+    let ml_mode = choose_table(
+        fse_tables.ml_previous.as_ref(),
+        &fse_tables.ml_default,
+        sequences.iter().map(|seq| encode_match_len(seq.ml).0),
+        9,
+    );
+    let of_mode = choose_table(
+        fse_tables.of_previous.as_ref(),
+        &fse_tables.of_default,
+        sequences.iter().map(|seq| encode_offset(seq.of).0),
+        8,
+    );
+
+    let ll_bits_chosen = fse_section_bits_for_mode(&ll_mode, ll_counts, &fse_tables.ll_default);
+    let ml_bits_chosen = fse_section_bits_for_mode(&ml_mode, ml_counts, &fse_tables.ml_default);
+    let of_bits_chosen = fse_section_bits_for_mode(&of_mode, of_counts, &fse_tables.of_default);
+
+    let ll_table_desc_bytes = mode_table_description_bytes(&ll_mode);
+    let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
+    let of_table_desc_bytes = mode_table_description_bytes(&of_mode);
+
+    // nbSeq varint header (donor RFC 8878 §3.1.1.3.2.1): 1–3 bytes.
+    let nb_seq_header = match sequences.len() {
+        0..=127 => 1,
+        128..=0x7FFF => 2,
+        _ => 3,
+    };
+    let mode_byte = 1;
+
+    let bit_content = ll_bits_chosen + ml_bits_chosen + of_bits_chosen + extra_bits;
+    // `encode_sequences` tail: if already byte-aligned, writes one extra byte
+    // (`write_bits(1u32, 8)`); else writes `8 - bit_content % 8` padding bits.
+    let padding_bits = if bit_content.is_multiple_of(8) {
+        8
+    } else {
+        8 - bit_content % 8
+    };
+    let stream_bytes = (bit_content + padding_bits) / 8;
+
+    // Mirror state mutation done by `encode_block_parts_with_sequence_scratch`.
+    let ll_last = into_last_used_table(ll_mode);
+    let ml_last = into_last_used_table(ml_mode);
+    let of_last = into_last_used_table(of_mode);
+    remember_last_used_tables(fse_tables, ll_last, ml_last, of_last);
+
+    nb_seq_header
+        + mode_byte
+        + ll_table_desc_bytes
+        + of_table_desc_bytes
+        + ml_table_desc_bytes
+        + stream_bytes
+}
+
+/// Bit cost of a sequence section under `mode`, matching what
+/// `encode_sequences` would emit: FSE state transitions + final state flush.
+fn fse_section_bits_for_mode(
+    mode: &FseTableMode<'_>,
+    counts: &[usize; 256],
+    default: &FSETable,
+) -> usize {
+    let max_symbol = counts.iter().rposition(|&c| c > 0).unwrap_or_default();
+    match mode {
+        FseTableMode::Predefined(t) => {
+            cross_entropy_cost(counts, max_symbol, t).unwrap_or(0) + t.acc_log() as usize
+        }
+        FseTableMode::Encoded(t) => {
+            // New table built from these very counts — `fse_bit_cost` is
+            // strictly more accurate than the `entropy_cost` proxy here.
+            fse_bit_cost(counts, max_symbol, t).unwrap_or_else(|| {
+                let total: usize = counts[..=max_symbol].iter().sum();
+                entropy_cost(counts, max_symbol, total)
+            }) + t.acc_log() as usize
+        }
+        FseTableMode::RepeatLast(prev) => {
+            let table = prev.as_table(default).unwrap_or(default);
+            fse_bit_cost(counts, max_symbol, table).unwrap_or(0) + table.acc_log() as usize
+        }
+        FseTableMode::Rle(_) => 0,
+    }
+}
+
+/// Byte size of the table description `encode_table` writes for each FSE mode.
+fn mode_table_description_bytes(mode: &FseTableMode<'_>) -> usize {
+    match mode {
+        FseTableMode::Predefined(_) | FseTableMode::RepeatLast(_) => 0,
+        FseTableMode::Encoded(table) => table.table_header_bits() / 8,
+        FseTableMode::Rle(_) => 1,
+    }
+}
+
+/// Mirrors `compress_literals` choice: lit_size < 256 → single huff0 stream
+/// (`encode`), else → 4-stream layout (`encode4x`) with a 6-byte jumptable and
+/// per-stream byte-aligned padding. Returns the exact wire-format byte cost of
+/// the Huffman-encoded payload, excluding the literals section header and the
+/// Huffman tree description.
+fn estimate_huff_payload_bytes(
+    table: &huff0_encoder::HuffmanTable,
+    literals: &[u8],
+    counts: &[usize; 256],
+) -> usize {
+    if literals.len() < 256 {
+        table.estimate_compressed_size_from_counts(counts)
+    } else {
+        let split_size = literals.len().div_ceil(4);
+        let s1 = &literals[..split_size];
+        let s2 = &literals[split_size..split_size * 2];
+        let s3 = &literals[split_size * 2..split_size * 3];
+        let s4 = &literals[split_size * 3..];
+        let mut total = 6; // 3 × u16 jumptable entries
+        for stream in [s1, s2, s3, s4] {
+            total += table
+                .estimate_compressed_size(stream)
+                .unwrap_or(stream.len());
+        }
+        total
+    }
+}
+
+/// `estimate_huff_payload_bytes` variant that returns `None` when the table
+/// can't encode some symbol in `literals` (Huffman codes with `num_bits == 0`).
+/// Required to mirror `compress_literals`'s reuse-failure branch where the
+/// real encoder bails to the new-table path.
+fn estimate_huff_payload_bytes_checked(
+    table: &huff0_encoder::HuffmanTable,
+    literals: &[u8],
+) -> Option<usize> {
+    if literals.len() < 256 {
+        table.estimate_compressed_size(literals)
+    } else {
+        let split_size = literals.len().div_ceil(4);
+        let s1 = &literals[..split_size];
+        let s2 = &literals[split_size..split_size * 2];
+        let s3 = &literals[split_size * 2..split_size * 3];
+        let s4 = &literals[split_size * 3..];
+        let mut total = 6;
+        for stream in [s1, s2, s3, s4] {
+            total += table.estimate_compressed_size(stream)?;
+        }
+        Some(total)
+    }
+}
+
+/// Donor RFC 8878 §3.1.1.3.1.2 raw/RLE literals header size (bytes).
+fn uncompressed_literals_header_bytes(lit_size: usize) -> usize {
+    match lit_size {
+        0..=31 => 1,
+        32..=4095 => 2,
+        _ => 3,
+    }
+}
+
+/// Donor RFC 8878 §3.1.1.3.1.1 compressed literals section header size (bytes,
+/// excluding the Huffman tree description itself).
+fn compressed_literals_header_bytes(lit_size: usize) -> usize {
+    match lit_size {
+        0..1024 => 3,
+        1024..16384 => 4,
+        _ => 5,
+    }
+}
+
+struct SingleSequenceEmitBuffers<'a> {
+    output: &'a mut Vec<u8>,
+    compressed: &'a mut Vec<u8>,
+    sequence_scratch: &'a mut Vec<crate::blocks::sequence_section::Sequence>,
+}
+
 fn emit_single_sequence_block<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
     source_len: usize,
     literals: &[u8],
     sequences: &[RawSequence],
-    output: &mut Vec<u8>,
-    compressed: &mut Vec<u8>,
+    buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
     let saved_huff_table = state.last_huff_table.clone();
     let saved_ll_previous = state.fse_tables.ll_previous.clone();
     let saved_ml_previous = state.fse_tables.ml_previous.clone();
     let saved_of_previous = state.fse_tables.of_previous.clone();
-    compressed.clear();
-    encode_block_parts(state, literals, sequences, compressed);
+    buffers.compressed.clear();
+    encode_block_parts_with_sequence_scratch(
+        state,
+        literals,
+        sequences,
+        buffers.compressed,
+        buffers.sequence_scratch,
+    );
     let min_gain = (source_len >> 8) + 2;
-    if compressed.len() >= source_len.saturating_sub(min_gain) {
+    if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
         state.last_huff_table = saved_huff_table;
         state.fse_tables.ll_previous = saved_ll_previous;
@@ -397,16 +741,16 @@ fn emit_single_sequence_block<M: Matcher>(
             block_type: BlockType::Raw,
             block_size: source_len as u32,
         };
-        header.serialize(output);
+        header.serialize(buffers.output);
         true
     } else {
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Compressed,
-            block_size: compressed.len() as u32,
+            block_size: buffers.compressed.len() as u32,
         };
-        header.serialize(output);
-        output.extend_from_slice(compressed);
+        header.serialize(buffers.output);
+        buffers.output.extend_from_slice(buffers.compressed);
         false
     }
 }
@@ -451,8 +795,7 @@ struct SplitEstimator<'a> {
     ml_previous: Option<PreviousFseTable>,
     of_previous: Option<PreviousFseTable>,
     scratch_state: CompressState<EntropyOnlyMatcher>,
-    scratch_output: Vec<u8>,
-    scratch_sequences: Vec<crate::blocks::sequence_section::Sequence>,
+    workspace: EstimatorWorkspace,
 }
 
 impl SplitEstimator<'_> {
@@ -470,20 +813,18 @@ impl SplitEstimator<'_> {
         self.scratch_state.fse_tables.ml_previous = self.ml_previous.clone();
         self.scratch_state.fse_tables.of_previous = self.of_previous.clone();
         self.scratch_state.offset_hist = self.offset_hist;
-        self.scratch_output.clear();
-        encode_block_parts_with_sequence_scratch(
+        let emitted_payload = estimate_block_parts_size(
             &mut self.scratch_state,
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
-            &mut self.scratch_output,
-            &mut self.scratch_sequences,
+            &mut self.workspace,
         );
         let source_len = (lit_end - lit_start) + match_len;
         let min_gain = (source_len >> 8) + 2;
-        let emitted_payload = if self.scratch_output.len() >= source_len.saturating_sub(min_gain) {
+        let emitted_payload = if emitted_payload >= source_len.saturating_sub(min_gain) {
             source_len
         } else {
-            self.scratch_output.len()
+            emitted_payload
         };
         emitted_payload + 3
     }
@@ -1219,15 +1560,20 @@ mod tests {
         }];
         let mut output = Vec::new();
         let mut compressed_scratch = Vec::new();
+        let mut sequence_scratch = Vec::new();
 
+        let mut emit_buffers = super::SingleSequenceEmitBuffers {
+            output: &mut output,
+            compressed: &mut compressed_scratch,
+            sequence_scratch: &mut sequence_scratch,
+        };
         let emitted_raw = emit_single_sequence_block(
             &mut state,
             true,
             source.len(),
             &[],
             &sequences,
-            &mut output,
-            &mut compressed_scratch,
+            &mut emit_buffers,
         );
         if emitted_raw {
             output.extend_from_slice(&source);

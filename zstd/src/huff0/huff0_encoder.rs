@@ -311,7 +311,7 @@ impl HuffmanTable {
     }
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
-    fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
+    pub(crate) fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
         let bits = self
             .codes
             .iter()
