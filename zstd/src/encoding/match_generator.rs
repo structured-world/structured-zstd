@@ -3347,6 +3347,720 @@ macro_rules! bt_insert_step_no_rebase_body {
     }};
 }
 
+/// `build_optimal_plan_impl` body parameterized over the per-CPU
+/// `collect_optimal_candidates_initialized_<kernel>` method name. Caller
+/// passes its `&mut self`, the seven DP entry-point arguments, and the
+/// kernel-specific collect method. Each per-kernel wrapper invokes this
+/// macro inside its own `#[target_feature]` umbrella so the per-position
+/// `$collect` call inlines and the entire DP loop runs as one straight-line
+/// hot path without an ABI barrier between the DP and the match-gathering
+/// pipeline.
+///
+/// Body is ~730 lines but mechanically identical across kernels — the macro
+/// keeps a single source of truth. The two const generics
+/// (`ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`) come from the wrapper's
+/// generic parameter list and are referenced as bare identifiers; macro
+/// hygiene resolves them at the expansion site.
+macro_rules! build_optimal_plan_impl_body {
+    (
+        $self:expr,
+        $current:ident,
+        $current_abs_start:ident,
+        $current_len:ident,
+        $initial_state:ident,
+        $stats:ident,
+        $out:ident,
+        $collect:ident $(,)?
+    ) => {{
+        let current_abs_end = $current_abs_start + $current_len;
+        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let frontier_limit = $current_len.min(HC_OPT_NUM.saturating_sub(1));
+        let initial_reps = $initial_state.reps;
+        let initial_litlen = $initial_state.litlen;
+        let mut profile = $initial_state.profile;
+        profile.sufficient_match_len = $self.sufficient_match_len_for_pass(profile);
+        let abort_on_worse_match = $self.parse_mode == HcParseMode::BtOpt;
+        let opt_level = matches!(
+            $self.parse_mode,
+            HcParseMode::BtUltra | HcParseMode::BtUltra2
+        );
+        let mut nodes = core::mem::take(&mut $self.opt_nodes_scratch);
+        if nodes.len() < frontier_limit.saturating_add(2) {
+            nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
+        }
+        let mut candidates = core::mem::take(&mut $self.opt_candidates_scratch);
+        candidates.clear();
+        if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
+            candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
+        }
+        let mut store = core::mem::take(&mut $self.opt_store_scratch);
+        store.clear();
+        let mut ll_prices = core::mem::take(&mut $self.opt_ll_price_scratch);
+        let mut ll_price_generations = core::mem::take(&mut $self.opt_ll_price_generation);
+        if ll_prices.len() <= frontier_limit {
+            ll_prices.resize(frontier_limit + 1, 0);
+            ll_price_generations.resize(frontier_limit + 1, 0);
+        }
+        $self.opt_ll_price_stamp = $self.opt_ll_price_stamp.wrapping_add(1).max(1);
+        let ll_price_stamp = $self.opt_ll_price_stamp;
+        $self.opt_lit_price_stamp = $self.opt_lit_price_stamp.wrapping_add(1).max(1);
+        let lit_price_stamp = $self.opt_lit_price_stamp;
+        let mut ml_prices = core::mem::take(&mut $self.opt_ml_price_scratch);
+        let mut ml_price_generations = core::mem::take(&mut $self.opt_ml_price_generation);
+        if ml_prices.len() <= frontier_limit {
+            ml_prices.resize(frontier_limit + 1, 0);
+            ml_price_generations.resize(frontier_limit + 1, 0);
+        }
+        $self.opt_ml_price_stamp = $self.opt_ml_price_stamp.wrapping_add(1).max(1);
+        let ml_price_stamp = $self.opt_ml_price_stamp;
+        nodes[0] = HcOptimalNode {
+            price: HcMatchGenerator::cached_lit_length_price(
+                profile,
+                $stats,
+                initial_litlen,
+                &mut ll_prices,
+                &mut ll_price_generations,
+                ll_price_stamp,
+            ),
+            litlen: initial_litlen as u32,
+            reps: initial_reps,
+            ..HcOptimalNode::default()
+        };
+        let sufficient_len = profile.sufficient_match_len;
+        let ll0_price = HcMatchGenerator::cached_lit_length_price(
+            profile,
+            $stats,
+            0,
+            &mut ll_prices,
+            &mut ll_price_generations,
+            ll_price_stamp,
+        );
+        let ll1_price = HcMatchGenerator::cached_lit_length_price(
+            profile,
+            $stats,
+            1,
+            &mut ll_prices,
+            &mut ll_price_generations,
+            ll_price_stamp,
+        );
+        let mut pos = 1usize;
+        let mut last_pos = 0usize;
+        let mut forced_end: Option<usize> = None;
+        let mut forced_end_state: Option<HcOptimalNode> = None;
+        let mut seed_forced_shortest_path = false;
+        let mut opt_ldm = HcOptLdmState {
+            seq_store: HcRawSeqStore {
+                pos: 0,
+                pos_in_sequence: 0,
+                size: $self.ldm_sequences.len(),
+            },
+            ..HcOptLdmState::default()
+        };
+        let has_ldm = !$self.ldm_sequences.is_empty();
+        if has_ldm {
+            $self.ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
+        }
+
+        // Donor-like seed at rPos=0: initialize frontier with matches starting
+        // at current position before entering the generic forward DP loop.
+        if $current_len >= min_match_len {
+            let seed_ldm = if has_ldm {
+                $self.ldm_process_match_candidate(&mut opt_ldm, 0, $current_len, min_match_len)
+            } else {
+                None
+            };
+            candidates.clear();
+            // SAFETY: wrapper is in the same target_feature umbrella as the
+            // `$collect` kernel variant; the runtime kernel detector already
+            // gated entry into the wrapper.
+            unsafe {
+                $self.$collect::<true>(
+                    $current_abs_start,
+                    current_abs_end,
+                    profile,
+                    HcCandidateQuery {
+                        reps: initial_reps,
+                        lit_len: initial_litlen,
+                        ldm_candidate: seed_ldm,
+                    },
+                    &mut candidates,
+                )
+            };
+            if !candidates.is_empty() {
+                last_pos = min_match_len.saturating_sub(1).min(frontier_limit);
+                for p in 1..min_match_len.min(nodes.len()) {
+                    HcMatchGenerator::reset_opt_node(&mut nodes[p]);
+                    nodes[p].litlen = initial_litlen.saturating_add(p) as u32;
+                }
+            }
+
+            if let Some(candidate) = candidates.last() {
+                let longest_len = candidate.match_len.min($current_len);
+                if longest_len > sufficient_len {
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        initial_litlen,
+                        initial_reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        longest_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let forced_price = HcMatchGenerator::add_prices(nodes[0].price, seq_cost);
+                    let forced_state = HcOptimalNode {
+                        price: forced_price,
+                        off: candidate.offset as u32,
+                        mlen: longest_len as u32,
+                        litlen: 0,
+                        reps: initial_reps,
+                    };
+                    if longest_len < nodes.len() && forced_price < nodes[longest_len].price {
+                        nodes[longest_len] = forced_state;
+                    }
+                    forced_end = Some(longest_len);
+                    forced_end_state = Some(forced_state);
+                    seed_forced_shortest_path = true;
+                }
+            }
+            if !seed_forced_shortest_path {
+                let mut prev_max_len = min_match_len.saturating_sub(1);
+                for candidate in candidates.iter() {
+                    let max_match_len = candidate.match_len.min(frontier_limit);
+                    if max_match_len < min_match_len {
+                        continue;
+                    }
+                    let start_len = prev_max_len.saturating_add(1).max(min_match_len);
+                    if start_len > max_match_len {
+                        prev_max_len = prev_max_len.max(max_match_len);
+                        continue;
+                    }
+                    if max_match_len > last_pos {
+                        HcMatchGenerator::reset_opt_nodes(&mut nodes, last_pos + 1, max_match_len);
+                    }
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        initial_litlen,
+                        initial_reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    debug_assert!(max_match_len < nodes.len());
+                    let nodes0_price = nodes[0].price;
+                    for match_len in (start_len..=max_match_len).rev() {
+                        let ml_price = HcMatchGenerator::cached_match_length_price(
+                            profile,
+                            $stats,
+                            match_len,
+                            &mut ml_prices,
+                            &mut ml_price_generations,
+                            ml_price_stamp,
+                        );
+                        let seq_cost = HcMatchGenerator::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, ml_price, $stats),
+                        );
+                        let next_cost = HcMatchGenerator::add_prices(nodes0_price, seq_cost);
+                        let node_price = unsafe { nodes.get_unchecked(match_len).price };
+                        if match_len > last_pos || next_cost < node_price {
+                            let slot = unsafe { nodes.get_unchecked_mut(match_len) };
+                            *slot = HcOptimalNode {
+                                price: next_cost,
+                                off: candidate.offset as u32,
+                                mlen: match_len as u32,
+                                litlen: 0,
+                                reps: initial_reps,
+                            };
+                            if match_len > last_pos {
+                                last_pos = match_len;
+                            }
+                        } else if abort_on_worse_match {
+                            break;
+                        }
+                    }
+                    prev_max_len = prev_max_len.max(max_match_len);
+                }
+                if last_pos + 1 < nodes.len() {
+                    nodes[last_pos + 1].price = u32::MAX;
+                }
+            }
+        }
+        while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
+            debug_assert!(pos + 1 < nodes.len());
+            let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
+            if prev_node.price != u32::MAX {
+                let lit_len = prev_node.litlen as usize + 1;
+                let lit_price = HcMatchGenerator::cached_literal_price(
+                    profile,
+                    $stats,
+                    $current[pos - 1],
+                    &mut $self.opt_lit_price_scratch,
+                    &mut $self.opt_lit_price_generation,
+                    lit_price_stamp,
+                );
+                let ll_delta = HcMatchGenerator::cached_lit_length_delta_price(
+                    profile,
+                    $stats,
+                    lit_len,
+                    &mut ll_prices,
+                    &mut ll_price_generations,
+                    ll_price_stamp,
+                );
+                let lit_cost =
+                    HcMatchGenerator::add_price_delta(prev_node.price, lit_price, ll_delta);
+                let node_pos_price = unsafe { nodes.get_unchecked(pos).price };
+                if lit_cost <= node_pos_price {
+                    let prev_match = unsafe { *nodes.get_unchecked(pos) };
+                    let slot = unsafe { nodes.get_unchecked_mut(pos) };
+                    *slot = prev_node;
+                    slot.litlen = lit_len as u32;
+                    slot.price = lit_cost;
+                    #[allow(clippy::collapsible_if)]
+                    if opt_level
+                        && prev_match.mlen > 0
+                        && prev_match.litlen == 0
+                        && pos < $current_len
+                    {
+                        if ll1_price < ll0_price {
+                            let next_lit_price = HcMatchGenerator::cached_literal_price(
+                                profile,
+                                $stats,
+                                $current[pos],
+                                &mut $self.opt_lit_price_scratch,
+                                &mut $self.opt_lit_price_generation,
+                                lit_price_stamp,
+                            );
+                            let with1literal = HcMatchGenerator::add_price_delta(
+                                prev_match.price,
+                                next_lit_price,
+                                ll1_price as i32 - ll0_price as i32,
+                            );
+                            let ll_delta_next = HcMatchGenerator::cached_lit_length_delta_price(
+                                profile,
+                                $stats,
+                                lit_len.saturating_add(1),
+                                &mut ll_prices,
+                                &mut ll_price_generations,
+                                ll_price_stamp,
+                            );
+                            let with_more_literals = HcMatchGenerator::add_price_delta(
+                                lit_cost,
+                                next_lit_price,
+                                ll_delta_next,
+                            );
+                            let next = pos + 1;
+                            let next_price = unsafe { nodes.get_unchecked(next).price };
+                            if with1literal < with_more_literals && with1literal < next_price {
+                                let prev_pos = pos.saturating_sub(prev_match.mlen as usize);
+                                if prev_pos <= pos {
+                                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
+                                    let (_, reps_after_match) =
+                                        HcMatchGenerator::encode_offset_with_reps(
+                                            prev_match.off,
+                                            prev_state.litlen as usize,
+                                            prev_state.reps,
+                                        );
+                                    let slot = unsafe { nodes.get_unchecked_mut(next) };
+                                    *slot = prev_match;
+                                    slot.reps = reps_after_match;
+                                    slot.litlen = 1;
+                                    slot.price = with1literal;
+                                    if next > last_pos {
+                                        last_pos = next;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut base_node = unsafe { *nodes.get_unchecked(pos) };
+            if base_node.price == u32::MAX {
+                pos += 1;
+                continue;
+            }
+            if base_node.mlen > 0 && base_node.litlen == 0 {
+                let prev_pos = pos.saturating_sub(base_node.mlen as usize);
+                if prev_pos <= pos {
+                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
+                    let (_, reps_after_match) = HcMatchGenerator::encode_offset_with_reps(
+                        base_node.off,
+                        prev_state.litlen as usize,
+                        prev_state.reps,
+                    );
+                    base_node.reps = reps_after_match;
+                    unsafe { nodes.get_unchecked_mut(pos).reps = reps_after_match };
+                }
+            }
+            let base_cost = base_node.price;
+
+            if pos + 8 > $current_len {
+                pos += 1;
+                continue;
+            }
+
+            if pos == last_pos {
+                break;
+            }
+
+            let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            if abort_on_worse_match
+                && next_price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
+            {
+                pos += 1;
+                continue;
+            }
+
+            let abs_pos = $current_abs_start + pos;
+            let ldm_candidate = if has_ldm {
+                $self.ldm_process_match_candidate(
+                    &mut opt_ldm,
+                    pos,
+                    $current_len - pos,
+                    min_match_len,
+                )
+            } else {
+                None
+            };
+            candidates.clear();
+            // SAFETY: same umbrella as `$collect`.
+            unsafe {
+                $self.$collect::<true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    HcCandidateQuery {
+                        reps: base_node.reps,
+                        lit_len: base_node.litlen as usize,
+                        ldm_candidate,
+                    },
+                    &mut candidates,
+                )
+            };
+            if let Some(candidate) = candidates.last() {
+                let longest_len = candidate.match_len.min($current_len - pos);
+                if longest_len > sufficient_len
+                    || pos + longest_len >= HC_OPT_NUM
+                    || pos + longest_len >= $current_len
+                {
+                    let lit_len = base_node.litlen as usize;
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        lit_len,
+                        base_node.reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        longest_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let forced_price = HcMatchGenerator::add_prices(base_cost, seq_cost);
+                    let end_pos = (pos + longest_len).min($current_len);
+                    forced_end = Some(end_pos);
+                    forced_end_state = Some(HcOptimalNode {
+                        price: forced_price,
+                        off: candidate.offset as u32,
+                        mlen: longest_len as u32,
+                        litlen: 0,
+                        reps: base_node.reps,
+                    });
+                    break;
+                }
+            }
+            let mut prev_max_len = min_match_len.saturating_sub(1);
+            for candidate in candidates.iter() {
+                let max_match_len = candidate
+                    .match_len
+                    .min($current_len - pos)
+                    .min(frontier_limit.saturating_sub(pos));
+                let min_len = min_match_len;
+                if max_match_len < min_len {
+                    continue;
+                }
+                let start_len = prev_max_len.saturating_add(1).max(min_len);
+                if start_len > max_match_len {
+                    prev_max_len = prev_max_len.max(max_match_len);
+                    continue;
+                }
+                let max_next = pos + max_match_len;
+                if max_next > last_pos {
+                    HcMatchGenerator::reset_opt_nodes(&mut nodes, last_pos + 1, max_next);
+                }
+                let lit_len = base_node.litlen as usize;
+                let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                    candidate.offset as u32,
+                    lit_len,
+                    base_node.reps,
+                );
+                let off_price = profile
+                    .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                debug_assert!(pos + max_match_len < nodes.len());
+                for match_len in (start_len..=max_match_len).rev() {
+                    let next = pos + match_len;
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        match_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let next_cost = HcMatchGenerator::add_prices(base_cost, seq_cost);
+                    let node_next_price = unsafe { nodes.get_unchecked(next).price };
+                    let improved = next > last_pos || next_cost < node_next_price;
+                    if improved {
+                        let slot = unsafe { nodes.get_unchecked_mut(next) };
+                        *slot = HcOptimalNode {
+                            price: next_cost,
+                            off: candidate.offset as u32,
+                            mlen: match_len as u32,
+                            litlen: 0,
+                            reps: base_node.reps,
+                        };
+                        if next > last_pos {
+                            last_pos = next;
+                        }
+                    } else if abort_on_worse_match {
+                        break;
+                    }
+                }
+                prev_max_len = prev_max_len.max(max_match_len);
+            }
+
+            if last_pos + 1 < nodes.len() {
+                unsafe {
+                    nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
+                }
+            }
+            pos += 1;
+        }
+
+        if last_pos == 0 {
+            if $current_len == 0 {
+                let price = nodes[0].price;
+                return $self.finish_optimal_plan(
+                    HcOptimalPlanBuffers {
+                        nodes,
+                        candidates,
+                        store,
+                        ll_prices,
+                        ll_price_generations,
+                        ml_prices,
+                        ml_price_generations,
+                    },
+                    (price, initial_reps, initial_litlen, 0),
+                );
+            }
+            let lit_price = HcMatchGenerator::cached_literal_price(
+                profile,
+                $stats,
+                $current[0],
+                &mut $self.opt_lit_price_scratch,
+                &mut $self.opt_lit_price_generation,
+                lit_price_stamp,
+            );
+            let next_litlen = initial_litlen.saturating_add(1);
+            let ll_delta = HcMatchGenerator::cached_lit_length_delta_price(
+                profile,
+                $stats,
+                next_litlen,
+                &mut ll_prices,
+                &mut ll_price_generations,
+                ll_price_stamp,
+            );
+            let price = HcMatchGenerator::add_price_delta(nodes[0].price, lit_price, ll_delta);
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (price, initial_reps, next_litlen, 1),
+            );
+        }
+
+        let target_pos = forced_end.unwrap_or(last_pos.min(frontier_limit));
+        let last_stretch = if let Some(forced_state) = forced_end_state {
+            forced_state
+        } else {
+            nodes[target_pos]
+        };
+        if last_stretch.price == u32::MAX {
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (u32::MAX, initial_reps, initial_litlen, $current_len),
+            );
+        }
+
+        if last_stretch.mlen == 0 {
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (
+                    last_stretch.price,
+                    last_stretch.reps,
+                    last_stretch.litlen as usize,
+                    target_pos.min($current_len),
+                ),
+            );
+        }
+
+        let mut cur = target_pos.saturating_sub(last_stretch.mlen as usize);
+        let end_reps = if last_stretch.litlen == 0 {
+            let prev_state = nodes[cur];
+            let (_, reps_after_match) = HcMatchGenerator::encode_offset_with_reps(
+                last_stretch.off,
+                prev_state.litlen as usize,
+                prev_state.reps,
+            );
+            reps_after_match
+        } else {
+            let tail_literals = last_stretch.litlen as usize;
+            if cur < tail_literals {
+                return $self.finish_optimal_plan(
+                    HcOptimalPlanBuffers {
+                        nodes,
+                        candidates,
+                        store,
+                        ll_prices,
+                        ll_price_generations,
+                        ml_prices,
+                        ml_price_generations,
+                    },
+                    (
+                        last_stretch.price,
+                        last_stretch.reps,
+                        tail_literals,
+                        target_pos.min($current_len),
+                    ),
+                );
+            }
+            cur -= tail_literals;
+            last_stretch.reps
+        };
+        let store_end = cur + 2;
+        if store.len() <= store_end {
+            store.resize(store_end + 1, HcOptimalNode::default());
+        }
+        let mut store_start;
+        let mut stretch_pos = cur;
+
+        if last_stretch.litlen > 0 {
+            store[store_end] = HcOptimalNode {
+                litlen: last_stretch.litlen,
+                mlen: 0,
+                ..HcOptimalNode::default()
+            };
+            store_start = store_end.saturating_sub(1);
+            store[store_start] = last_stretch;
+        }
+        store[store_end] = last_stretch;
+        store_start = store_end;
+
+        loop {
+            let next_stretch = nodes[stretch_pos];
+            store[store_start].litlen = next_stretch.litlen;
+            if next_stretch.mlen == 0 {
+                break;
+            }
+            if store_start == 0 {
+                break;
+            }
+            store_start -= 1;
+            store[store_start] = next_stretch;
+            let step = (next_stretch.litlen as usize).saturating_add(next_stretch.mlen as usize);
+            if step == 0 || stretch_pos < step {
+                break;
+            }
+            stretch_pos -= step;
+        }
+
+        let mut tail_literals = initial_litlen;
+        let mut store_pos = store_start;
+        while store_pos <= store_end {
+            let stretch = store[store_pos];
+            let llen = stretch.litlen as usize;
+            let mlen = stretch.mlen as usize;
+            if mlen == 0 {
+                tail_literals = llen;
+                store_pos += 1;
+                continue;
+            }
+            $out.push(HcOptimalSequence {
+                offset: stretch.off,
+                match_len: mlen as u32,
+                lit_len: llen as u32,
+            });
+            tail_literals = 0;
+            store_pos += 1;
+        }
+        let result = (
+            last_stretch.price,
+            end_reps,
+            if last_stretch.litlen > 0 {
+                last_stretch.litlen as usize
+            } else {
+                tail_literals
+            },
+            target_pos.min($current_len),
+        );
+        $self.finish_optimal_plan(
+            HcOptimalPlanBuffers {
+                nodes,
+                candidates,
+                store,
+                ll_prices,
+                ll_price_generations,
+                ml_prices,
+                ml_price_generations,
+            },
+            result,
+        )
+    }};
+}
+
 /// `collect_optimal_candidates_initialized` body parameterized over the per-CPU
 /// kernel: the `$cpl` path is the kernel's `common_prefix_len_ptr` (used in
 /// the HC chain walk fallback), and the four method-name substitutions
@@ -4430,7 +5144,198 @@ impl HcMatchGenerator {
         }
     }
 
+    /// Cross-platform DP entry. Picks the kernel-specific variant so the
+    /// entire optimal-parser DP body (per-position match gathering, price
+    /// updates, traceback) runs inside a single `target_feature` umbrella
+    /// alongside the per-position `collect_optimal_candidates_initialized_
+    /// <kernel>`. This eliminates the final ABI barrier on the hot per-
+    /// position match-collection call — the level22 critical path is now
+    /// one straight-line inline chain from DP body down through BT walk
+    /// and match-length probes.
+    #[inline(always)]
     fn build_optimal_plan_impl<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.build_optimal_plan_impl_neon::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.build_optimal_plan_impl_avx2_bmi2::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.build_optimal_plan_impl_sse42::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self
+                    .build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella DP body. Inlines
+    /// `collect_optimal_candidates_initialized_neon` (and its entire
+    /// per-position pipeline) directly into the DP loop.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn build_optimal_plan_impl_neon<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_neon,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn build_optimal_plan_impl_sse42<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_sse42,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn build_optimal_plan_impl_avx2_bmi2<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_avx2_bmi2,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn build_optimal_plan_impl_scalar<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_scalar,
+        )
+    }
+
+    /// Pre-umbrella copy of the DP body. Kept temporarily for diff review of
+    /// Week 3d; no live caller. Will be removed once the umbrella variants
+    /// are validated.
+    #[allow(dead_code, non_snake_case)]
+    fn build_optimal_plan_impl_OLD<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
         &mut self,
         current: &[u8],
         current_abs_start: usize,
