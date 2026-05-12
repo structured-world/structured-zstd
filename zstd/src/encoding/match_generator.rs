@@ -3347,6 +3347,75 @@ macro_rules! bt_insert_step_no_rebase_body {
     }};
 }
 
+/// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
+/// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
+/// the wrapper's `target_feature` umbrella instead of crossing the ABI
+/// boundary through the dispatcher. Three rep probes per encoded position →
+/// thousands per segment, so the per-call barrier was non-trivial.
+///
+/// The callback `f` runs in the wrapper's umbrella context too, so closures
+/// that capture mutable state still work (FnMut).
+macro_rules! for_each_repcode_candidate_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $lit_len:ident,
+        $reps:ident,
+        $current_abs_end:ident,
+        $min_match_len:ident,
+        $f:ident,
+        $cpl:path $(,)?
+    ) => {{
+        let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
+            [
+                Some($reps[1] as usize),
+                Some($reps[2] as usize),
+                ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
+            ]
+        } else {
+            [
+                Some($reps[0] as usize),
+                Some($reps[1] as usize),
+                Some($reps[2] as usize),
+            ]
+        };
+        let concat = $self.live_history();
+        let current_idx = $abs_pos - $self.history_abs_start;
+        if current_idx + 4 > concat.len() {
+            return;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let base = concat.as_ptr();
+        let concat_len = concat.len();
+        for rep in rep_offsets.into_iter().flatten() {
+            if rep == 0 || rep > $abs_pos {
+                continue;
+            }
+            let candidate_pos = $abs_pos - rep;
+            if candidate_pos < $self.history_abs_start {
+                continue;
+            }
+            let candidate_idx = candidate_pos - $self.history_abs_start;
+            // SAFETY: `candidate_idx ≤ current_idx < concat_len` (since
+            // candidate_pos ≤ abs_pos and we early-returned on
+            // `current_idx + 4 > concat_len`). `max` clamps to the shorter
+            // remaining run so neither pointer overruns `concat`.
+            let max = (concat_len - candidate_idx)
+                .min(concat_len - current_idx)
+                .min(tail_limit);
+            let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), max) };
+            if match_len < $min_match_len {
+                continue;
+            }
+            $f(MatchCandidate {
+                start: $abs_pos,
+                offset: rep,
+                match_len,
+            });
+        }
+    }};
+}
+
 /// `bt_insert_and_collect_matches` body parameterized over the per-CPU
 /// `count_match_from_indices` symbol. Same shape as
 /// [`bt_insert_step_no_rebase_body`] — picks up the matching kernel through
@@ -6250,6 +6319,8 @@ impl HcMatchGenerator {
         best
     }
 
+    /// Cross-platform entry. Dispatches to the kernel-specific variant so the
+    /// per-rep prefix probe inlines without an ABI barrier per call.
     #[inline(always)]
     fn for_each_repcode_candidate_with_reps(
         &self,
@@ -6258,48 +6329,166 @@ impl HcMatchGenerator {
         reps: [u32; 3],
         current_abs_end: usize,
         min_match_len: usize,
+        f: impl FnMut(MatchCandidate),
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (same shape as the BT walk dispatchers).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.for_each_repcode_candidate_with_reps_neon(
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_avx2_bmi2(
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_sse42(
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Scalar => self.for_each_repcode_candidate_with_reps_scalar(
+                    abs_pos,
+                    lit_len,
+                    reps,
+                    current_abs_end,
+                    min_match_len,
+                    f,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.for_each_repcode_candidate_with_reps_scalar(
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant: per-rep `common_prefix_len_ptr` call inlines via
+    /// the shared body macro.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn for_each_repcode_candidate_with_reps_neon(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
         mut f: impl FnMut(MatchCandidate),
     ) {
-        let rep_offsets: [Option<usize>; 3] = if lit_len == 0 {
-            [
-                Some(reps[1] as usize),
-                Some(reps[2] as usize),
-                (reps[0] > 1).then_some((reps[0] - 1) as usize),
-            ]
-        } else {
-            [
-                Some(reps[0] as usize),
-                Some(reps[1] as usize),
-                Some(reps[2] as usize),
-            ]
-        };
-        let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
-        if current_idx + 4 > concat.len() {
-            return;
-        }
-        let tail_limit = current_abs_end.saturating_sub(abs_pos);
-        for rep in rep_offsets.into_iter().flatten() {
-            if rep == 0 || rep > abs_pos {
-                continue;
-            }
-            let candidate_pos = abs_pos - rep;
-            if candidate_pos < self.history_abs_start {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..])
-                    .min(tail_limit);
-            if match_len < min_match_len {
-                continue;
-            }
-            f(MatchCandidate {
-                start: abs_pos,
-                offset: rep,
-                match_len,
-            });
-        }
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    /// SSE4.2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn for_each_repcode_candidate_with_reps_sse42(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn for_each_repcode_candidate_with_reps_avx2_bmi2(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn for_each_repcode_candidate_with_reps_scalar(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
     }
 
     fn extend_backwards(
