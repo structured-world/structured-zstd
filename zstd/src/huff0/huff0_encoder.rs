@@ -246,9 +246,17 @@ impl HuffmanTable {
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
+            // Skip candidates whose tree description can't be serialized: the
+            // sentinel from `table_description_size()` would otherwise contaminate
+            // `new_size`, and on the first iteration (when `best_size` is still
+            // its initial `usize::MAX - 1`) the candidate would be accepted —
+            // returning a table that compress_literals can't write.
+            let Some(desc_size) = table.try_table_description_size() else {
+                continue;
+            };
             let new_size = table
                 .estimate_compressed_size_from_counts(counts)
-                .saturating_add(table.table_description_size());
+                .saturating_add(desc_size);
             if new_size > best_size + 1 {
                 break;
             }
@@ -274,11 +282,6 @@ impl HuffmanTable {
         }
         let bytes = bits.div_ceil(8);
         Some(bytes + usize::from(bits.is_multiple_of(8)))
-    }
-
-    /// Returns estimated table-description size or a large sentinel when not writable.
-    pub(crate) fn table_description_size(&self) -> usize {
-        self.try_table_description_size().unwrap_or(usize::MAX / 2)
     }
 
     /// Returns exact writable table-description size when representable.
