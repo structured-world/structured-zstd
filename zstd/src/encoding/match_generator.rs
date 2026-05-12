@@ -5789,6 +5789,14 @@ impl HcMatchGenerator {
                 || (self.parse_mode == HcParseMode::BtUltra2 && abs_pos == self.history_abs_start))
     }
 
+    /// Hot wrapper: every `insert_position*` call passes through here. The
+    /// fast path is "no rebase needed" — `BtUltra2` first-position skip and a
+    /// single `relative_position()` range probe. The actual table rebuild
+    /// fires once per ~`u32::MAX` positions on rolling streams and never for
+    /// typical single-shot inputs, so it lives in a separate `#[cold]`
+    /// function. Inlining the hot wrapper lets the compiler fold the early
+    /// return into the caller and keep the cold path off the i-cache.
+    #[inline]
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
         if self.parse_mode == HcParseMode::BtUltra2
             && !self.allow_zero_relative_position
@@ -5803,7 +5811,12 @@ impl HcMatchGenerator {
         if !needs_rebase {
             return;
         }
+        self.rebase_positions_cold(abs_pos);
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn rebase_positions_cold(&mut self, abs_pos: usize) {
         // Keep all live history addressable after rebase.
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
@@ -5830,13 +5843,15 @@ impl HcMatchGenerator {
         self.next_to_update3 = self.next_to_update3.max(abs_pos);
     }
 
+    #[inline]
     fn insert_position(&mut self, abs_pos: usize) {
         self.maybe_rebase_positions(abs_pos);
         self.insert_position_no_rebase(abs_pos);
     }
 
+    #[inline]
     fn insert_position_no_rebase(&mut self, abs_pos: usize) {
-        let idx = abs_pos - self.history_abs_start;
+        let idx = abs_pos.wrapping_sub(self.history_abs_start);
         let concat = &self.history[self.history_start..];
         if idx + 4 > concat.len() {
             return;
@@ -5846,10 +5861,21 @@ impl HcMatchGenerator {
             return;
         };
         let stored = relative_pos + 1;
-        let chain_idx = relative_pos as usize & ((1 << self.chain_log) - 1);
-        let prev = self.hash_table[hash];
-        self.chain_table[chain_idx] = prev;
-        self.hash_table[hash] = stored;
+        let chain_mask = (1usize << self.chain_log) - 1;
+        let chain_idx = relative_pos as usize & chain_mask;
+        // SAFETY: `hash` is produced by `hash_value_with_mls` which masks the
+        // result down to `hash_log` bits, and `hash_table.len() == 1 <<
+        // hash_log` (`ensure_tables`). `chain_idx` is `& chain_mask` so
+        // `< chain_table.len() == 1 << chain_log`. Both indices are provably
+        // in bounds, so the elided bounds checks save ~4 instructions per
+        // call on this per-byte-of-input hot path.
+        debug_assert!(hash < self.hash_table.len());
+        debug_assert!(chain_idx < self.chain_table.len());
+        unsafe {
+            let prev = *self.hash_table.get_unchecked(hash);
+            *self.chain_table.get_unchecked_mut(chain_idx) = prev;
+            *self.hash_table.get_unchecked_mut(hash) = stored;
+        }
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
