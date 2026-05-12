@@ -8,6 +8,19 @@ pub(crate) mod incompressible;
 pub(crate) mod match_generator;
 pub(crate) mod util;
 
+// `#111` encoder architecture rewrite — Phase 1 scaffold.
+// These submodules currently hold doc-only placeholders; subsequent Phase 1
+// commits relocate code out of `match_generator` and `blocks` into them
+// without touching behaviour. The rewrite plan is tracked in
+// <https://github.com/structured-world/structured-zstd/issues/111> and the
+// per-phase boundary is `perf/post-pr-110-baseline`.
+pub(crate) mod bt;
+pub(crate) mod cost_model;
+pub(crate) mod hc;
+pub(crate) mod match_table;
+pub(crate) mod opt;
+pub(crate) mod strategy;
+
 mod frame_compressor;
 mod levels;
 mod streaming_encoder;
