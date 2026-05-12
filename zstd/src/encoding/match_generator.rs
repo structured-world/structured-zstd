@@ -3338,6 +3338,133 @@ macro_rules! bt_insert_step_no_rebase_body {
     }};
 }
 
+/// `bt_insert_and_collect_matches` body parameterized over the per-CPU
+/// `count_match_from_indices` symbol. Same shape as
+/// [`bt_insert_step_no_rebase_body`] — picks up the matching kernel through
+/// `$cmf` so the per-iteration vector probe inlines under the wrapper's
+/// `target_feature` umbrella. Returns nothing (matches the original method).
+macro_rules! bt_insert_and_collect_matches_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $profile:ident,
+        $min_match_len:ident,
+        $best_len_for_skip:ident,
+        $out:ident,
+        $cmf:path $(,)?
+    ) => {{
+        let idx = $abs_pos - $self.history_abs_start;
+        let concat = &$self.history[$self.history_start..];
+        if idx + 8 > concat.len() {
+            return;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let hash =
+            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+            return;
+        };
+        let stored = relative_pos + 1;
+        let bt_mask = $self.bt_mask();
+        let bt_low = $abs_pos.saturating_sub(bt_mask);
+        let window_low = $self.window_low_abs_for_target($abs_pos);
+        let mut match_end_abs = $abs_pos.saturating_add(9);
+        let mut compares_left = $profile.max_chain_depth.min($self.search_depth);
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let mut smaller_slot = pair_idx;
+        let mut larger_slot = pair_idx + 1;
+        let mut match_stored = $self.hash_table[hash];
+        $self.hash_table[hash] = stored;
+        // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
+        // probing may raise it; BT then only reports strictly longer matches.
+        let mut best_len = (*$best_len_for_skip).max($min_match_len.saturating_sub(1));
+
+        while compares_left > 0 {
+            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
+                match_stored,
+                $self.position_base,
+                $self.index_shift,
+            ) else {
+                break;
+            };
+            if candidate_abs < window_low || candidate_abs >= $abs_pos {
+                break;
+            }
+            compares_left -= 1;
+
+            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_smaller = $self.chain_table[next_pair_idx];
+            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - $self.history_abs_start;
+            // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
+            // concat.len()`.
+            let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
+
+            if match_len > best_len {
+                let offset = $abs_pos - candidate_abs;
+                let accepted = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    $best_len_for_skip,
+                    MatchCandidate {
+                        start: $abs_pos,
+                        offset,
+                        match_len,
+                    },
+                    $min_match_len,
+                );
+                if accepted {
+                    best_len = match_len;
+                    let candidate_end = candidate_abs.saturating_add(match_len);
+                    if candidate_end > match_end_abs {
+                        match_end_abs = candidate_end;
+                    }
+                    if match_len >= tail_limit || match_len > HC_OPT_NUM {
+                        break;
+                    }
+                }
+            }
+
+            if match_len >= tail_limit {
+                break;
+            }
+
+            let candidate_next = candidate_idx + match_len;
+            let current_next = idx + match_len;
+            if concat[candidate_next] < concat[current_next] {
+                $self.chain_table[smaller_slot] = match_stored;
+                common_length_smaller = match_len;
+                if candidate_abs <= bt_low {
+                    smaller_slot = usize::MAX;
+                    break;
+                }
+                smaller_slot = next_pair_idx + 1;
+                match_stored = next_larger;
+            } else {
+                $self.chain_table[larger_slot] = match_stored;
+                common_length_larger = match_len;
+                if candidate_abs <= bt_low {
+                    larger_slot = usize::MAX;
+                    break;
+                }
+                larger_slot = next_pair_idx;
+                match_stored = next_smaller;
+            }
+        }
+
+        if smaller_slot != usize::MAX {
+            $self.chain_table[smaller_slot] = HC_EMPTY;
+        }
+        if larger_slot != usize::MAX {
+            $self.chain_table[larger_slot] = HC_EMPTY;
+        }
+        $self.skip_insert_until_abs = match_end_abs.saturating_sub(8);
+    }};
+}
+
 impl HcMatchGenerator {
     fn donor_opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
         let start_cursor = usize::from(current_abs_start == self.history_abs_start);
@@ -5330,28 +5457,6 @@ impl HcMatchGenerator {
         4
     }
 
-    /// Shim used by callers that have not yet been lifted under a
-    /// `#[target_feature]` umbrella (currently `bt_insert_and_collect_matches`
-    /// and the HC chain-walk path). Routes through the fastpath dispatcher;
-    /// callers that migrate to a per-kernel umbrella call the kernel's
-    /// `count_match_from_indices` directly so the inner vector loop inlines.
-    #[inline(always)]
-    fn count_match_from_indices(
-        concat: &[u8],
-        current_idx: usize,
-        candidate_idx: usize,
-        tail_limit: usize,
-        seed_len: usize,
-    ) -> usize {
-        crate::encoding::fastpath::dispatch_count_match_from_indices(
-            concat,
-            current_idx,
-            candidate_idx,
-            tail_limit,
-            seed_len,
-        )
-    }
-
     /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
     /// body executes inside one `target_feature` umbrella and inlines the
     /// vectorized `count_match_from_indices` directly.
@@ -5431,6 +5536,10 @@ impl HcMatchGenerator {
         self.skip_insert_until_abs = abs_pos;
     }
 
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
+    /// body executes inside one `target_feature` umbrella and inlines the
+    /// vectorized `count_match_from_indices` directly. See
+    /// `bt_insert_step_no_rebase` for the same dispatcher pattern.
     #[inline(always)]
     fn bt_insert_and_collect_matches(
         &mut self,
@@ -5441,115 +5550,79 @@ impl HcMatchGenerator {
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
     ) {
-        let idx = abs_pos - self.history_abs_start;
-        let concat = &self.history[self.history_start..];
-        if idx + 8 > concat.len() {
-            return;
+        // SAFETY (aarch64 branch): NEON is part of the AArch64 baseline ISA;
+        // `target_feature(enable = "neon")` on the callee is required for
+        // inlining only, not for CPU feature presence.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_and_collect_matches_neon(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
         }
-        let tail_limit = current_abs_end.saturating_sub(abs_pos);
-        let hash = Self::hash_position_at(concat, idx, self.hash_log, self.bt_hash_mls());
-        let Some(relative_pos) = self.relative_position(abs_pos) else {
-            return;
-        };
-        let stored = relative_pos + 1;
-        let bt_mask = self.bt_mask();
-        let bt_low = abs_pos.saturating_sub(bt_mask);
-        let window_low = self.window_low_abs_for_target(abs_pos);
-        let mut match_end_abs = abs_pos.saturating_add(9);
-        let mut compares_left = profile.max_chain_depth.min(self.search_depth);
-        let mut common_length_smaller = 0usize;
-        let mut common_length_larger = 0usize;
-        let pair_idx = self.bt_pair_index_for_abs(abs_pos);
-        let mut smaller_slot = pair_idx;
-        let mut larger_slot = pair_idx + 1;
-        let mut match_stored = self.hash_table[hash];
-        self.hash_table[hash] = stored;
-        // Donor semantics:
-        // - `bestLength` starts at `lengthToBeat - 1`,
-        // - rep/hash3 probing may raise it before BT traversal,
-        // - BT then only reports strictly longer matches.
-        // So after rep/hash3 we must not relax the threshold back down, or we
-        // mutate `matchEndIdx` / `nextToUpdate` with non-donor equal-length BT
-        // alternatives and drift the future tree evolution.
-        let mut best_len = (*best_len_for_skip).max(min_match_len.saturating_sub(1));
-
-        while compares_left > 0 {
-            let Some(candidate_abs) =
-                Self::stored_abs_position_fast(match_stored, self.position_base, self.index_shift)
-            else {
-                break;
-            };
-            if candidate_abs < window_low || candidate_abs >= abs_pos {
-                break;
-            }
-            compares_left -= 1;
-
-            let next_pair_idx = self.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = self.chain_table[next_pair_idx];
-            let next_larger = self.chain_table[next_pair_idx + 1];
-            let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - self.history_abs_start;
-            let match_len =
-                Self::count_match_from_indices(concat, idx, candidate_idx, tail_limit, seed_len);
-
-            if match_len > best_len {
-                let offset = abs_pos - candidate_abs;
-                let accepted = Self::push_candidate_ladder(
-                    out,
-                    best_len_for_skip,
-                    MatchCandidate {
-                        start: abs_pos,
-                        offset,
-                        match_len,
-                    },
-                    min_match_len,
-                );
-                if accepted {
-                    best_len = match_len;
-                    let candidate_end = candidate_abs.saturating_add(match_len);
-                    if candidate_end > match_end_abs {
-                        match_end_abs = candidate_end;
-                    }
-                    if match_len >= tail_limit || match_len > HC_OPT_NUM {
-                        break;
-                    }
-                }
-            }
-
-            if match_len >= tail_limit {
-                break;
-            }
-
-            let candidate_next = candidate_idx + match_len;
-            let current_next = idx + match_len;
-            if concat[candidate_next] < concat[current_next] {
-                self.chain_table[smaller_slot] = match_stored;
-                common_length_smaller = match_len;
-                if candidate_abs <= bt_low {
-                    smaller_slot = usize::MAX;
-                    break;
-                }
-                smaller_slot = next_pair_idx + 1;
-                match_stored = next_larger;
-            } else {
-                self.chain_table[larger_slot] = match_stored;
-                common_length_larger = match_len;
-                if candidate_abs <= bt_low {
-                    larger_slot = usize::MAX;
-                    break;
-                }
-                larger_slot = next_pair_idx;
-                match_stored = next_smaller;
-            }
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        {
+            self.bt_insert_and_collect_matches_scalar(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
         }
+    }
 
-        if smaller_slot != usize::MAX {
-            self.chain_table[smaller_slot] = HC_EMPTY;
-        }
-        if larger_slot != usize::MAX {
-            self.chain_table[larger_slot] = HC_EMPTY;
-        }
-        self.skip_insert_until_abs = match_end_abs.saturating_sub(8);
+    /// NEON-umbrella variant of `bt_insert_and_collect_matches`. Inlines
+    /// `fastpath::neon::count_match_from_indices` via the shared body macro.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_insert_and_collect_matches_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::neon::count_match_from_indices,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_insert_and_collect_matches_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::scalar::count_match_from_indices,
+        )
     }
 
     fn hash_position_with_mls(data: &[u8], hash_log: usize, mls: usize) -> usize {
