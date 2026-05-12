@@ -147,6 +147,79 @@ fn detect_kernel_uncached() -> FastpathKernel {
     FastpathKernel::Scalar
 }
 
+/// Public entry point for match-length probes — used during migration as the
+/// shim that callers in `match_generator` adopt without yet being themselves
+/// inside the `#[target_feature]` umbrella. Once the BT walk methods are
+/// lifted into the umbrella (Week 3a) they will call the per-kernel symbol
+/// directly so the entire inner loop inlines.
+#[inline]
+pub(crate) fn dispatch_count_match_from_indices(
+    concat: &[u8],
+    current_idx: usize,
+    candidate_idx: usize,
+    tail_limit: usize,
+    seed_len: usize,
+) -> usize {
+    match select_kernel() {
+        FastpathKernel::Scalar => unsafe {
+            scalar::count_match_from_indices(
+                concat,
+                current_idx,
+                candidate_idx,
+                tail_limit,
+                seed_len,
+            )
+        },
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        FastpathKernel::Neon => unsafe {
+            neon::count_match_from_indices(concat, current_idx, candidate_idx, tail_limit, seed_len)
+        },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Sse42 => unsafe {
+            sse42::count_match_from_indices(
+                concat,
+                current_idx,
+                candidate_idx,
+                tail_limit,
+                seed_len,
+            )
+        },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Avx2Bmi2 => unsafe {
+            avx2_bmi2::count_match_from_indices(
+                concat,
+                current_idx,
+                candidate_idx,
+                tail_limit,
+                seed_len,
+            )
+        },
+    }
+}
+
+/// Public entry point for raw-pointer prefix-length scans (BT byte compare,
+/// repcode extend, etc.). Same migration shim semantics as
+/// [`dispatch_count_match_from_indices`].
+///
+/// # Safety
+/// `lhs` / `rhs` must each point to at least `max` initialized bytes.
+#[inline]
+pub(crate) unsafe fn dispatch_common_prefix_len_ptr(
+    lhs: *const u8,
+    rhs: *const u8,
+    max: usize,
+) -> usize {
+    match select_kernel() {
+        FastpathKernel::Scalar => unsafe { scalar::common_prefix_len_ptr(lhs, rhs, max) },
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Sse42 => unsafe { sse42::common_prefix_len_ptr(lhs, rhs, max) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::common_prefix_len_ptr(lhs, rhs, max) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FastpathKernel, detect_kernel_uncached, select_kernel};
