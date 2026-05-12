@@ -50,7 +50,10 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    // Keep macro import explicit: this module uses `vec![..]` in non-test paths.
+    // `vec` import covers the `vec![..]` macro used below: this crate is
+    // no_std-with-std-feature, so the std prelude isn't pulled in implicitly
+    // for top-level items in this module. Removing this import fails the
+    // build with `cannot find macro 'vec' in this scope` — verified.
     vec,
     vec::Vec,
 };
