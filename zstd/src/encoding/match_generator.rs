@@ -5584,8 +5584,49 @@ impl HcMatchGenerator {
         )
     }
 
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
+    /// update loop runs inside the same `target_feature` umbrella as the per-
+    /// position `bt_insert_step_no_rebase` it calls — eliminating one ABI
+    /// barrier per fill iteration.
     #[inline(always)]
     fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (see `bt_insert_step_no_rebase` dispatcher).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_update_tree_until_neon(abs_pos, current_abs_end)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+        }
+    }
+
+    /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
+    /// inlines into the body because both share the `target_feature = "neon"`
+    /// umbrella.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_update_tree_until_neon(&mut self, abs_pos: usize, current_abs_end: usize) {
         if self.skip_insert_until_abs < self.history_abs_start {
             self.skip_insert_until_abs = self.history_abs_start;
         }
@@ -5594,7 +5635,67 @@ impl HcMatchGenerator {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
-            let forward = self.bt_insert_step_no_rebase(update_abs, current_abs_end, abs_pos);
+            // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
+            let forward =
+                unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// SSE4.2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_update_tree_until_sse42(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_update_tree_until_avx2_bmi2(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward =
+                self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
             update_abs = update_abs.saturating_add(forward.max(1));
         }
         self.skip_insert_until_abs = abs_pos;
