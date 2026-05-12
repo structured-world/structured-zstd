@@ -25,6 +25,11 @@ use super::cost_model::{
 #[cfg(test)]
 use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOptPriceType};
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
+use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
+use super::opt::types::{
+    HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
+    MatchCandidate,
+};
 #[cfg(all(
     test,
     feature = "std",
@@ -1444,13 +1449,6 @@ struct DfastMatchGenerator {
     lazy_depth: u8,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct MatchCandidate {
-    start: usize,
-    offset: usize,
-    match_len: usize,
-}
-
 fn best_len_offset_candidate(
     lhs: Option<MatchCandidate>,
     rhs: Option<MatchCandidate>,
@@ -2647,92 +2645,10 @@ struct HcMatchGenerator {
     opt_ml_price_stamp: u32,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct HcOptimalNode {
-    price: u32,
-    off: u32,
-    mlen: u32,
-    litlen: u32,
-    reps: [u32; 3],
-}
-
-impl Default for HcOptimalNode {
-    fn default() -> Self {
-        Self {
-            price: u32::MAX,
-            off: 0,
-            mlen: 0,
-            // Donor parity: uninitialized DP slots use litlen != 0
-            // (C code uses !0) so they are never treated as end-of-match.
-            litlen: u32::MAX,
-            reps: [1, 4, 8],
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-struct HcOptimalSequence {
-    offset: u32,
-    match_len: u32,
-    lit_len: u32,
-}
-
-#[derive(Copy, Clone)]
-struct HcRawSeq {
-    lit_length: usize,
-    offset: usize,
-    match_length: usize,
-}
-
-#[derive(Copy, Clone, Default)]
-struct HcRawSeqStore {
-    pos: usize,
-    pos_in_sequence: usize,
-    size: usize,
-}
-
-#[derive(Copy, Clone)]
-struct HcOptLdmState {
-    seq_store: HcRawSeqStore,
-    start_pos_in_block: usize,
-    end_pos_in_block: usize,
-    offset: usize,
-}
-
-impl Default for HcOptLdmState {
-    fn default() -> Self {
-        Self {
-            seq_store: HcRawSeqStore::default(),
-            start_pos_in_block: usize::MAX,
-            end_pos_in_block: usize::MAX,
-            offset: 0,
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-struct HcCandidateQuery {
-    reps: [u32; 3],
-    lit_len: usize,
-    ldm_candidate: Option<MatchCandidate>,
-}
-
-#[derive(Copy, Clone)]
-struct HcOptimalPlanState {
-    reps: [u32; 3],
-    litlen: usize,
-    profile: HcOptimalCostProfile,
-}
-
-struct HcOptimalPlanBuffers {
-    nodes: Vec<HcOptimalNode>,
-    candidates: Vec<MatchCandidate>,
-    store: Vec<HcOptimalNode>,
-    ll_prices: Vec<u32>,
-    ll_price_generations: Vec<u32>,
-    ml_prices: Vec<u32>,
-    ml_price_generations: Vec<u32>,
-}
+// Plain-data types relocated to [`crate::encoding::opt::types`] and
+// [`crate::encoding::opt::ldm`] by #111 Phase 1. The use statements at
+// the top of this file bring them back into scope so the existing
+// methods on `HcMatchGenerator` compile unchanged.
 
 /// `bt_insert_step_no_rebase` body parameterized over the per-CPU
 /// `count_match_from_indices` symbol. Each kernel-specific wrapper invokes
