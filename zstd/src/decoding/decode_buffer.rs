@@ -73,17 +73,26 @@ impl DecodeBuffer {
     /// advancing the ringbuffer cursor in place. Used by the RLE block path
     /// (and, after upstream commit `29a56160`, the Raw block path) so the
     /// decoder doesn't need a stack scratch buffer to materialise repeated
-    /// bytes before pushing them.
+    /// bytes before pushing them. Mirrors `push`'s `total_output_counter`
+    /// bookkeeping so dictionary-repeat validation in `repeat_from_dict`
+    /// stays accurate after RLE/Raw blocks.
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         self.buffer.extend_and_fill(fill_with, fill_length);
+        self.total_output_counter += fill_length as u64;
     }
 
+    /// Read `fill_length` bytes from `read` directly into the ringbuffer's
+    /// free slots. Mirrors `push`'s `total_output_counter` bookkeeping —
+    /// only after the read succeeds, so an EOF/IO error leaves the counter
+    /// (and `tail`) unchanged.
     pub fn extend_from_reader<R: Read>(
         &mut self,
         read: R,
         fill_length: usize,
     ) -> Result<(), crate::io::Error> {
-        self.buffer.extend_from_reader(read, fill_length)
+        self.buffer.extend_from_reader(read, fill_length)?;
+        self.total_output_counter += fill_length as u64;
+        Ok(())
     }
 
     pub fn push(&mut self, data: &[u8]) {

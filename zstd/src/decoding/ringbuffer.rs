@@ -1165,4 +1165,104 @@ mod tests {
             &src_overshoot[1..1 + fallback_len]
         );
     }
+
+    /// Helper: drive the ringbuffer into a wrapped layout where the two
+    /// free-slice halves straddle the physical end of the backing buffer.
+    /// Returns a buffer whose `len() == fill_len` of `pre_byte` data and
+    /// whose free region wraps.
+    fn build_wrapped_buffer(cap: usize, fill_len: usize, pre_byte: u8) -> RingBuffer {
+        let mut rb = RingBuffer::new();
+        rb.reserve(cap);
+        let actual_cap = rb.cap;
+        // Push to near-end of the physical buffer.
+        let pre_len = actual_cap - 2;
+        let prefix = alloc::vec![pre_byte; pre_len];
+        rb.extend(&prefix);
+        // Drop those bytes so head advances past them; tail now sits near
+        // the end of `cap`, head is in the middle. Subsequent inserts will
+        // wrap across the physical end.
+        rb.drop_first_n(pre_len - fill_len);
+        assert_eq!(rb.len(), fill_len);
+        assert!(rb.tail > rb.head, "tail should still trail tape end");
+        rb
+    }
+
+    #[test]
+    fn extend_and_fill_contiguous_layout() {
+        let mut rb = RingBuffer::new();
+        rb.extend_and_fill(0xAB, 7);
+        assert_eq!(rb.len(), 7);
+        let (s1, s2) = rb.as_slices();
+        let mut combined = alloc::vec::Vec::with_capacity(7);
+        combined.extend_from_slice(s1);
+        combined.extend_from_slice(s2);
+        assert_eq!(combined, alloc::vec![0xAB; 7]);
+    }
+
+    #[test]
+    fn extend_and_fill_wrapped_layout() {
+        // Pre-fill so the free region straddles the wrap boundary, then
+        // verify both halves are written with the fill byte.
+        let mut rb = build_wrapped_buffer(16, 2, 0x11);
+        let extra = rb.cap - 2; // fills exactly to capacity, forcing a wrap
+        rb.extend_and_fill(0x22, extra);
+        assert_eq!(rb.len(), 2 + extra);
+        let (s1, s2) = rb.as_slices();
+        let mut combined = alloc::vec::Vec::with_capacity(rb.len());
+        combined.extend_from_slice(s1);
+        combined.extend_from_slice(s2);
+        let mut expected = alloc::vec![0x11; 2];
+        expected.extend(alloc::vec![0x22; extra]);
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn extend_from_reader_contiguous_layout() {
+        let mut rb = RingBuffer::new();
+        let src: [u8; 6] = [1, 2, 3, 4, 5, 6];
+        rb.extend_from_reader(&src[..], 6).unwrap();
+        assert_eq!(rb.len(), 6);
+        let (s1, s2) = rb.as_slices();
+        let mut combined = alloc::vec::Vec::with_capacity(6);
+        combined.extend_from_slice(s1);
+        combined.extend_from_slice(s2);
+        assert_eq!(combined, src);
+    }
+
+    #[test]
+    fn extend_from_reader_wrapped_layout() {
+        let mut rb = build_wrapped_buffer(16, 3, 0xAA);
+        let extra = rb.cap - 3;
+        let src: alloc::vec::Vec<u8> = (0..extra as u8).collect();
+        rb.extend_from_reader(src.as_slice(), extra).unwrap();
+        assert_eq!(rb.len(), 3 + extra);
+        let (s1, s2) = rb.as_slices();
+        let mut combined = alloc::vec::Vec::with_capacity(rb.len());
+        combined.extend_from_slice(s1);
+        combined.extend_from_slice(s2);
+        let mut expected = alloc::vec![0xAA; 3];
+        expected.extend_from_slice(&src);
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn extend_from_reader_eof_leaves_state_unchanged() {
+        let mut rb = RingBuffer::new();
+        rb.extend(b"prefix");
+        let snapshot_len = rb.len();
+        let snapshot_slices: (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) = {
+            let (a, b) = rb.as_slices();
+            (a.to_vec(), b.to_vec())
+        };
+
+        // Reader yields only 2 bytes but we ask for 10 → `read_exact` fails
+        // on the second chunk, and `tail` must not advance.
+        let short: [u8; 2] = [0xCC, 0xDD];
+        let err = rb.extend_from_reader(&short[..], 10);
+        assert!(err.is_err(), "short reader must propagate IO error");
+        assert_eq!(rb.len(), snapshot_len, "len() must be unchanged on error");
+        let (a, b) = rb.as_slices();
+        assert_eq!(a, snapshot_slices.0.as_slice());
+        assert_eq!(b, snapshot_slices.1.as_slice());
+    }
 }
