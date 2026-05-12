@@ -2326,26 +2326,31 @@ impl DfastMatchGenerator {
         }
     }
 
+    #[inline]
     fn insert_position(&mut self, pos: usize) {
-        let idx = pos - self.history_abs_start;
-        let short = {
-            let concat = self.live_history();
-            (idx + 4 <= concat.len()).then(|| self.hash4(&concat[idx..]))
-        };
-        if let Some(short) = short {
-            let bucket = &mut self.short_hash[short];
+        let idx = pos.wrapping_sub(self.history_abs_start);
+        let concat_len = self.history.len() - self.history_start;
+        // SAFETY: `hash_index` masks the mixed hash to `hash_bits` bits and
+        // both tables are sized to `1 << hash_bits` in `ensure_hash_tables`,
+        // so every index produced here is provably below the table length.
+        // Eliding the bounds check on this per-byte hot path saves ~4
+        // instructions and one branch per call.
+        if idx + 4 <= concat_len {
+            let concat = &self.history[self.history_start..];
+            let short = self.hash4(&concat[idx..]);
+            debug_assert!(short < self.short_hash.len());
+            let bucket = unsafe { self.short_hash.get_unchecked_mut(short) };
             if bucket[0] != pos {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
                 bucket[0] = pos;
             }
         }
 
-        let long = {
-            let concat = self.live_history();
-            (idx + 8 <= concat.len()).then(|| self.hash8(&concat[idx..]))
-        };
-        if let Some(long) = long {
-            let bucket = &mut self.long_hash[long];
+        if idx + 8 <= concat_len {
+            let concat = &self.history[self.history_start..];
+            let long = self.hash8(&concat[idx..]);
+            debug_assert!(long < self.long_hash.len());
+            let bucket = unsafe { self.long_hash.get_unchecked_mut(long) };
             if bucket[0] != pos {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
                 bucket[0] = pos;
@@ -2776,6 +2781,7 @@ impl RowMatchGenerator {
         }
     }
 
+    #[inline]
     fn insert_position(&mut self, abs_pos: usize) {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
@@ -2783,11 +2789,22 @@ impl RowMatchGenerator {
         let row_entries = 1usize << self.row_log;
         let row_mask = row_entries - 1;
         let row_base = row << self.row_log;
-        let head = self.row_heads[row] as usize;
-        let next = head.wrapping_sub(1) & row_mask;
-        self.row_heads[row] = next as u8;
-        self.row_tags[row_base + next] = tag;
-        self.row_positions[row_base + next] = abs_pos;
+        // SAFETY: `hash_and_row` masks `row` to `row_hash_log` bits and
+        // `row_heads.len() == 1 << row_hash_log` by `ensure_tables`.
+        // `row_base = row << row_log = row * row_entries` and
+        // `next < row_entries`, so `row_base + next < row_count *
+        // row_entries == row_positions.len() == row_tags.len()`. Both
+        // index pairs are provably in bounds; per-byte hot path on
+        // fast/dfast/row levels saves ~6 instructions and 3 branches.
+        debug_assert!(row < self.row_heads.len());
+        debug_assert!(row_base + row_entries <= self.row_positions.len());
+        unsafe {
+            let head = *self.row_heads.get_unchecked(row) as usize;
+            let next = head.wrapping_sub(1) & row_mask;
+            *self.row_heads.get_unchecked_mut(row) = next as u8;
+            *self.row_tags.get_unchecked_mut(row_base + next) = tag;
+            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos;
+        }
     }
 }
 
