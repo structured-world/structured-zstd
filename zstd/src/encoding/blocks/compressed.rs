@@ -65,13 +65,18 @@ impl SequencePrefixSums {
     fn rebuild(&mut self, sequences: &[RawSequence]) {
         self.lit.clear();
         self.ml.clear();
-        if self.lit.capacity() < sequences.len() + 1 {
-            self.lit
-                .reserve_exact(sequences.len() + 1 - self.lit.capacity());
+        // `Vec::reserve_exact(additional)` adds `additional` elements ABOVE
+        // current length, not capacity. Subtracting `capacity` here would
+        // request `N - cap` more, leaving the Vec with `cap = max(cap, N-cap)`
+        // — still below the `N` we need whenever `cap < N/2`, forcing a
+        // reallocation on the very next `push`. After `clear()` length is 0,
+        // so subtracting `len()` (here always 0) is the correct delta.
+        let target = sequences.len() + 1;
+        if self.lit.capacity() < target {
+            self.lit.reserve_exact(target - self.lit.len());
         }
-        if self.ml.capacity() < sequences.len() + 1 {
-            self.ml
-                .reserve_exact(sequences.len() + 1 - self.ml.capacity());
+        if self.ml.capacity() < target {
+            self.ml.reserve_exact(target - self.ml.len());
         }
         self.lit.push(0);
         self.ml.push(0);
@@ -252,16 +257,19 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     let src_len = state.matcher.get_last_space().len();
     parts.literals.clear();
     parts.sequences.clear();
+    // `reserve_exact(N)` adds capacity above LENGTH, not above existing
+    // capacity. Both `literals` and `sequences` were just `clear()`-ed (len
+    // = 0), so subtracting `len()` ensures `cap >= N` after the call — the
+    // older `cap - cap` form left the Vec under-provisioned whenever the
+    // existing capacity was less than half of the target.
     if parts.literals.capacity() < src_len {
-        parts
-            .literals
-            .reserve_exact(src_len - parts.literals.capacity());
+        parts.literals.reserve_exact(src_len - parts.literals.len());
     }
     let sequence_capacity = src_len / 8;
     if parts.sequences.capacity() < sequence_capacity {
         parts
             .sequences
-            .reserve_exact(sequence_capacity - parts.sequences.capacity());
+            .reserve_exact(sequence_capacity - parts.sequences.len());
     }
     state.matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => parts.literals.extend_from_slice(literals),
@@ -617,8 +625,19 @@ fn fse_section_bits_for_mode(
             }) + t.acc_log() as usize
         }
         FseTableMode::RepeatLast(prev) => {
-            let table = prev.as_table(default).unwrap_or(default);
-            fse_bit_cost(counts, max_symbol, table).unwrap_or(0) + table.acc_log() as usize
+            // `PreviousFseTable::Rle(_).as_table()` returns `None`. The real
+            // encoder in that case writes no FSE state transitions and no
+            // final-state flush — `encode_sequences` short-circuits on a
+            // `None` table mapping — so the section costs 0 bits, matching
+            // the bare `Rle(_)` arm below. Falling back to `default` here
+            // would over-count by the default table's acc_log plus its
+            // per-code cross-entropy and bias splitter probes.
+            match prev.as_table(default) {
+                Some(table) => {
+                    fse_bit_cost(counts, max_symbol, table).unwrap_or(0) + table.acc_log() as usize
+                }
+                None => 0,
+            }
         }
         FseTableMode::Rle(_) => 0,
     }
@@ -763,8 +782,10 @@ fn encode_raw_sequences_into(
     out: &mut Vec<crate::blocks::sequence_section::Sequence>,
 ) {
     out.clear();
+    // `reserve_exact` argument is the increment over LENGTH, not capacity —
+    // see `SequencePrefixSums::rebuild` for the full rationale.
     if out.capacity() < raw_sequences.len() {
-        out.reserve_exact(raw_sequences.len() - out.capacity());
+        out.reserve_exact(raw_sequences.len() - out.len());
     }
     out.extend(
         raw_sequences
