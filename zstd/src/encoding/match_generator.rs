@@ -5467,15 +5467,33 @@ impl HcMatchGenerator {
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
-        // SAFETY (aarch64 branch): NEON is part of the AArch64 baseline ISA;
-        // the `#[target_feature(enable = "neon")]` on the callee is required
-        // for inlining only, not for CPU feature presence. Caller may invoke
-        // from any context.
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee — aarch64 NEON is baseline; x86 AVX2/BMI2 and SSE4.2 are
+        // selected only when the runtime detector reports them present.
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
             self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
         }
-        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
         {
             self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
         }
@@ -5498,6 +5516,43 @@ impl HcMatchGenerator {
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::neon::count_match_from_indices
+        )
+    }
+
+    /// SSE4.2-umbrella variant. Calls `fastpath::sse42::count_match_from_indices`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_insert_step_no_rebase_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::sse42::count_match_from_indices
+        )
+    }
+
+    /// AVX2+BMI2-umbrella variant. Calls
+    /// `fastpath::avx2_bmi2::count_match_from_indices`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
         )
     }
 
@@ -5550,9 +5605,8 @@ impl HcMatchGenerator {
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
     ) {
-        // SAFETY (aarch64 branch): NEON is part of the AArch64 baseline ISA;
-        // `target_feature(enable = "neon")` on the callee is required for
-        // inlining only, not for CPU feature presence.
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (see `bt_insert_step_no_rebase` dispatcher).
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
             self.bt_insert_and_collect_matches_neon(
@@ -5564,7 +5618,45 @@ impl HcMatchGenerator {
                 out,
             )
         }
-        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_and_collect_matches_avx2_bmi2(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_and_collect_matches_sse42(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self.bt_insert_and_collect_matches_scalar(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    min_match_len,
+                    best_len_for_skip,
+                    out,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
         {
             self.bt_insert_and_collect_matches_scalar(
                 abs_pos,
@@ -5599,6 +5691,54 @@ impl HcMatchGenerator {
             best_len_for_skip,
             out,
             crate::encoding::fastpath::neon::count_match_from_indices,
+        )
+    }
+
+    /// SSE4.2 umbrella variant of `bt_insert_and_collect_matches`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_insert_and_collect_matches_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::sse42::count_match_from_indices,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant of `bt_insert_and_collect_matches`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_insert_and_collect_matches_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
     }
 
