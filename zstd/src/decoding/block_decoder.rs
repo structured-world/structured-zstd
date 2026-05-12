@@ -59,59 +59,34 @@ impl BlockDecoder {
         let block_type = header.block_type;
         match block_type {
             BlockType::RLE => {
-                const BATCH_SIZE: usize = 512;
-                let mut buf = [0u8; BATCH_SIZE];
-                let full_reads = header.decompressed_size / BATCH_SIZE as u32;
-                let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
-
-                workspace.buffer.reserve(header.decompressed_size as usize);
-
-                source.read_exact(&mut buf[0..1]).map_err(|err| {
+                let mut buf = [0u8; 1];
+                source.read_exact(&mut buf[..]).map_err(|err| {
                     DecodeBlockContentError::ReadError {
                         step: block_type,
                         source: err,
                     }
                 })?;
+                workspace
+                    .buffer
+                    .extend_and_fill(buf[0], header.decompressed_size as usize);
+
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
-
-                for i in 1..BATCH_SIZE {
-                    buf[i] = buf[0];
-                }
-
-                for _ in 0..full_reads {
-                    workspace.buffer.push(&buf[..]);
-                }
-                let smaller = &mut buf[..single_read_size as usize];
-                workspace.buffer.push(smaller);
 
                 Ok(1)
             }
             BlockType::Raw => {
-                const BATCH_SIZE: usize = 128 * 1024;
-                let mut buf = [0u8; BATCH_SIZE];
-                let full_reads = header.decompressed_size / BATCH_SIZE as u32;
-                let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
-
-                workspace.buffer.reserve(header.decompressed_size as usize);
-
-                for _ in 0..full_reads {
-                    source.read_exact(&mut buf[..]).map_err(|err| {
-                        DecodeBlockContentError::ReadError {
-                            step: block_type,
-                            source: err,
-                        }
-                    })?;
-                    workspace.buffer.push(&buf[..]);
-                }
-
-                let smaller = &mut buf[..single_read_size as usize];
-                source
-                    .read_exact(smaller)
+                // Pass `source` by value, not `&mut source`: `extend_from_reader<R: Read>`
+                // takes `R` by value, and `crate::io::Read` (the `no_std` shim) does not
+                // provide a blanket `impl<R: Read + ?Sized> Read for &mut R` like
+                // `std::io::Read` does, so `&mut source` would fail to compile without
+                // the `std` feature. `source` is not used after this match arm.
+                workspace
+                    .buffer
+                    .extend_from_reader(source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
                         step: block_type,
                         source: err,
                     })?;
-                workspace.buffer.push(smaller);
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))
