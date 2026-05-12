@@ -197,6 +197,23 @@ pub(crate) fn dispatch_count_match_from_indices(
     }
 }
 
+/// Hash-mix dispatch for Dfast/Row hash compute. Routes to the per-CPU
+/// `hash_mix_u64` variant (CRC32-accelerated on SSE4.2 x86 / aarch64 + crc,
+/// pure scalar multiply otherwise). Cached kernel keeps the per-call
+/// overhead to a single atomic load + match jump.
+#[inline]
+pub(crate) fn dispatch_hash_mix_u64(value: u64) -> u64 {
+    match select_kernel() {
+        FastpathKernel::Scalar => scalar::hash_mix_u64(value),
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        FastpathKernel::Neon => unsafe { neon::hash_mix_u64(value) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Sse42 => unsafe { sse42::hash_mix_u64(value) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::hash_mix_u64(value) },
+    }
+}
+
 /// Public entry point for raw-pointer prefix-length scans (BT byte compare,
 /// repcode extend, etc.). Same migration shim semantics as
 /// [`dispatch_count_match_from_indices`].

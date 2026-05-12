@@ -10,11 +10,25 @@
 #![cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #![allow(dead_code)]
 
-use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
+use core::arch::aarch64::{
+    __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
+};
 
 use super::scalar;
 
 pub(crate) const KERNEL_TAG: &str = "neon";
+
+/// AArch64 `crc32d`-accelerated `hash_mix_u64`. Routes a full 64-bit lane
+/// through the CRC unit and folds the result back with a rotated copy of the
+/// source so the upper bits stay well-distributed for hash-table indexing.
+/// Marked `target_feature(enable = "crc")` (NEON umbrella implies it on
+/// AArch64 baseline, but the attribute is required by Rust's ABI rules).
+#[target_feature(enable = "crc")]
+#[inline]
+pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
+    let crc = __crc32d(0, value) as u64;
+    ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(scalar::HASH_MIX_PRIME)
+}
 
 /// 16-byte NEON vector prefix-length probe. Returns the number of leading
 /// equal bytes that fit in whole 16-byte chunks; the caller (or the wrapper

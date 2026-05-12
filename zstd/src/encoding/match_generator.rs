@@ -7,14 +7,9 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-// Prefix-length SIMD/CRC intrinsics moved to `crate::encoding::fastpath::*`
-// where they sit under per-CPU `#[target_feature]` umbrellas. Only the few
-// intrinsics still consumed by `hash_mix_u64_with_kernel` (Dfast/Row hash mix)
-// remain imported here until that helper is migrated in a later week.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-use core::arch::aarch64::__crc32d;
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_mm_crc32_u64;
+// SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
+// sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
+// intrinsic imports remain in this file.
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
@@ -24,7 +19,12 @@ use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
-#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    test,
+    feature = "std",
+    target_arch = "aarch64",
+    target_endian = "little"
+))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
@@ -53,7 +53,8 @@ const ROW_TARGET_LEN: usize = 48;
 const ROW_TAG_BITS: usize = 8;
 const ROW_EMPTY_SLOT: usize = usize::MAX;
 const ROW_HASH_KEY_LEN: usize = 4;
-const HASH_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+// HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
+// per-CPU `hash_mix_u64` variants share it via that module.
 const HC_PRIME3BYTES: u32 = 506_832_829;
 const HC_PRIME4BYTES: u32 = 2_654_435_761;
 
@@ -72,79 +73,6 @@ const HC_EMPTY: u32 = 0;
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 512;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u8)]
-enum HashMixKernel {
-    Scalar = 0,
-    #[cfg(target_arch = "x86_64")]
-    X86Sse42 = 1,
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    Aarch64Crc = 2,
-}
-
-#[inline(always)]
-fn hash_mix_u64_with_kernel(value: u64, kernel: HashMixKernel) -> u64 {
-    match kernel {
-        HashMixKernel::Scalar => value.wrapping_mul(HASH_MIX_PRIME),
-        #[cfg(target_arch = "x86_64")]
-        HashMixKernel::X86Sse42 => {
-            // SAFETY: runtime/static detection selected this kernel.
-            unsafe { hash_mix_u64_sse42(value) }
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        HashMixKernel::Aarch64Crc => {
-            // SAFETY: runtime/static detection selected this kernel.
-            unsafe { hash_mix_u64_crc(value) }
-        }
-    }
-}
-
-#[inline(always)]
-fn detect_hash_mix_kernel() -> HashMixKernel {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if is_x86_feature_detected!("sse4.2") {
-        return HashMixKernel::X86Sse42;
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-    if is_aarch64_feature_detected!("crc") {
-        return HashMixKernel::Aarch64Crc;
-    }
-
-    #[cfg(all(not(feature = "std"), target_arch = "x86_64"))]
-    if cfg!(target_feature = "sse4.2") {
-        return HashMixKernel::X86Sse42;
-    }
-
-    #[cfg(all(
-        not(feature = "std"),
-        target_arch = "aarch64",
-        target_endian = "little"
-    ))]
-    if cfg!(target_feature = "crc") {
-        return HashMixKernel::Aarch64Crc;
-    }
-
-    HashMixKernel::Scalar
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.2")]
-unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
-    let crc = _mm_crc32_u64(0, value);
-    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(HASH_MIX_PRIME)
-}
-
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[target_feature(enable = "crc")]
-unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
-    // Feed the full 64-bit lane through ARM CRC32 and then mix back with a
-    // rotated copy of the source to keep dispersion in the upper bits used by
-    // hash table indexing.
-    let crc = __crc32d(0, value) as u64;
-    ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(HASH_MIX_PRIME)
-}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum HcParseMode {
@@ -1497,7 +1425,6 @@ struct DfastMatchGenerator {
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     hash_bits: usize,
-    hash_mix_kernel: HashMixKernel,
     use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
@@ -1700,7 +1627,6 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             hash_bits: DFAST_HASH_BITS,
-            hash_mix_kernel: detect_hash_mix_kernel(),
             use_fast_loop: false,
             lazy_depth: 1,
         }
@@ -2270,7 +2196,7 @@ impl DfastMatchGenerator {
     }
 
     fn hash_index(&self, value: u64) -> usize {
-        (hash_mix_u64_with_kernel(value, self.hash_mix_kernel) >> (64 - self.hash_bits)) as usize
+        (crate::encoding::fastpath::dispatch_hash_mix_u64(value) >> (64 - self.hash_bits)) as usize
     }
 }
 
@@ -2287,7 +2213,6 @@ struct RowMatchGenerator {
     search_depth: usize,
     target_len: usize,
     lazy_depth: u8,
-    hash_mix_kernel: HashMixKernel,
     row_heads: Vec<u8>,
     row_positions: Vec<usize>,
     row_tags: Vec<u8>,
@@ -2308,7 +2233,6 @@ impl RowMatchGenerator {
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
             lazy_depth: 1,
-            hash_mix_kernel: detect_hash_mix_kernel(),
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
@@ -2501,7 +2425,7 @@ impl RowMatchGenerator {
         }
         let value =
             u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-        let hash = hash_mix_u64_with_kernel(value, self.hash_mix_kernel);
+        let hash = crate::encoding::fastpath::dispatch_hash_mix_u64(value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
@@ -8146,7 +8070,7 @@ fn row_hash_and_row_extracts_high_bits() {
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
     let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-    let hash = hash_mix_u64_with_kernel(value, matcher.hash_mix_kernel);
+    let hash = crate::encoding::fastpath::dispatch_hash_mix_u64(value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =
@@ -8184,47 +8108,36 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[test]
 fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported() {
+    use crate::encoding::fastpath::{self, FastpathKernel};
     if !is_x86_feature_detected!("sse4.2") {
         return;
     }
-
-    let kernel = detect_hash_mix_kernel();
-    assert_eq!(kernel, HashMixKernel::X86Sse42);
     let v = 0x0123_4567_89AB_CDEFu64;
-    let accelerated = unsafe { hash_mix_u64_sse42(v) };
-    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-#[test]
-fn hash_mix_scalar_path_can_be_forced_for_coverage_and_matches_formula() {
-    let v = 0x0123_4567_89AB_CDEFu64;
-    let expected = v.wrapping_mul(HASH_MIX_PRIME);
-    let mixed = hash_mix_u64_with_kernel(v, HashMixKernel::Scalar);
-    assert_eq!(mixed, expected);
+    // SAFETY: feature check above guarantees SSE4.2 is available.
+    let accelerated = unsafe { fastpath::sse42::hash_mix_u64(v) };
+    // Dispatcher must resolve to SSE4.2 (or better) and produce the same mix.
+    let dispatched = fastpath::dispatch_hash_mix_u64(v);
+    let kernel = fastpath::select_kernel();
+    if kernel == FastpathKernel::Sse42 {
+        assert_eq!(dispatched, accelerated);
+    } else {
+        // AVX2 kernel uses the same CRC32 instruction under the hood.
+        assert_eq!(dispatched, accelerated, "AVX2/SSE4.2 share CRC32 mix");
+    }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 #[test]
 fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() {
+    use crate::encoding::fastpath;
     if !is_aarch64_feature_detected!("crc") {
         return;
     }
-
-    let kernel = detect_hash_mix_kernel();
-    assert_eq!(kernel, HashMixKernel::Aarch64Crc);
     let v = 0x0123_4567_89AB_CDEFu64;
-    let accelerated = unsafe { hash_mix_u64_crc(v) };
-    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-#[test]
-fn hash_mix_scalar_path_can_be_forced_on_aarch64_and_matches_formula() {
-    let v = 0x0123_4567_89AB_CDEFu64;
-    let expected = v.wrapping_mul(HASH_MIX_PRIME);
-    let mixed = hash_mix_u64_with_kernel(v, HashMixKernel::Scalar);
-    assert_eq!(mixed, expected);
+    // SAFETY: feature check above guarantees CRC32 is available.
+    let accelerated = unsafe { fastpath::neon::hash_mix_u64(v) };
+    let dispatched = fastpath::dispatch_hash_mix_u64(v);
+    assert_eq!(dispatched, accelerated);
 }
 
 #[test]

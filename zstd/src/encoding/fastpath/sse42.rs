@@ -11,11 +11,34 @@
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+use core::arch::x86_64::{
+    __m128i, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_loadu_si128, _mm_movemask_epi8,
+};
 
 use super::scalar;
 
 pub(crate) const KERNEL_TAG: &str = "sse42";
+
+/// SSE4.2 `_mm_crc32_u64`-accelerated `hash_mix_u64`. Mirror of the donor
+/// CRC-folded hash mix used by Dfast/Row hash compute. `_mm_crc32_u64` is
+/// only available in 64-bit mode.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
+    let crc = unsafe { _mm_crc32_u64(0, value) };
+    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(scalar::HASH_MIX_PRIME)
+}
+
+/// 32-bit fallback path: `_mm_crc32_u64` is not available on x86 (only x86_64),
+/// so fall back to the scalar mix. Same signature as the 64-bit variant so the
+/// dispatcher can route uniformly.
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
+    scalar::hash_mix_u64(value)
+}
 
 /// 16-byte SSE2 vector prefix-length probe. SSE2 is implied by SSE4.2.
 ///

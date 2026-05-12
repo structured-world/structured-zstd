@@ -18,6 +18,30 @@ use super::scalar;
 
 pub(crate) const KERNEL_TAG: &str = "avx2_bmi2";
 
+/// AVX2+BMI2 variant of `hash_mix_u64`. AVX2 itself doesn't change the hash
+/// mix algorithm vs SSE4.2 (the CRC32 unit is the same), but having it on the
+/// AVX2+BMI2 kernel lets callers in this module call into it without crossing
+/// the SSE4.2-vs-AVX2 feature boundary.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2")]
+#[inline]
+pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
+    // SAFETY: AVX2 implies SSE4.2 → CRC32 instruction available.
+    let crc = unsafe {
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::_mm_crc32_u64;
+        _mm_crc32_u64(0, value)
+    };
+    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(scalar::HASH_MIX_PRIME)
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2,bmi2")]
+#[inline]
+pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
+    scalar::hash_mix_u64(value)
+}
+
 /// 32-byte AVX2 vector prefix-length probe.
 ///
 /// # Safety
