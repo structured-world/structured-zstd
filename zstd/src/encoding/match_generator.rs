@@ -3229,6 +3229,115 @@ impl HcOptimalCostProfile {
     }
 }
 
+/// `bt_insert_step_no_rebase` body parameterized over the per-CPU
+/// `count_match_from_indices` symbol. Each kernel-specific wrapper invokes
+/// the macro with its own `fastpath::<kernel>::count_match_from_indices`
+/// path so the call resolves inside the wrapper's `#[target_feature]`
+/// umbrella and inlines instead of paying the function-call ABI per BT walk
+/// iteration. Used only by `HcMatchGenerator` BT walk wrappers below.
+macro_rules! bt_insert_step_no_rebase_body {
+    ($self:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
+        let idx = $abs_pos - $self.history_abs_start;
+        let concat = &$self.history[$self.history_start..];
+        if idx + 8 > concat.len() {
+            return 1;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let hash =
+            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+            return 1;
+        };
+        let stored = relative_pos + 1;
+        let bt_mask = $self.bt_mask();
+        let bt_low = $abs_pos.saturating_sub(bt_mask);
+        let window_low = $self.window_low_abs_for_target($target_abs);
+        let mut match_end_abs = $abs_pos.saturating_add(9);
+        let mut best_len = 8usize;
+        let mut compares_left = $self.search_depth;
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let mut smaller_slot = pair_idx;
+        let mut larger_slot = pair_idx + 1;
+        let mut match_stored = $self.hash_table[hash];
+        $self.hash_table[hash] = stored;
+
+        while compares_left > 0 {
+            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
+                match_stored,
+                $self.position_base,
+                $self.index_shift,
+            ) else {
+                break;
+            };
+            if candidate_abs < window_low || candidate_abs >= $abs_pos {
+                break;
+            }
+            compares_left -= 1;
+
+            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_smaller = $self.chain_table[next_pair_idx];
+            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - $self.history_abs_start;
+            // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
+            // concat.len()` since the candidate is within
+            // `[history_abs_start, abs_pos)` and `tail_limit ≤
+            // current_abs_end - abs_pos`.
+            let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
+
+            if match_len > best_len {
+                best_len = match_len;
+                let candidate_end = candidate_abs.saturating_add(match_len);
+                if candidate_end > match_end_abs {
+                    match_end_abs = candidate_end;
+                }
+            }
+
+            if match_len >= tail_limit {
+                break;
+            }
+
+            let candidate_next = candidate_idx + match_len;
+            let current_next = idx + match_len;
+            if concat[candidate_next] < concat[current_next] {
+                $self.chain_table[smaller_slot] = match_stored;
+                common_length_smaller = match_len;
+                if candidate_abs <= bt_low {
+                    smaller_slot = usize::MAX;
+                    break;
+                }
+                smaller_slot = next_pair_idx + 1;
+                match_stored = next_larger;
+            } else {
+                $self.chain_table[larger_slot] = match_stored;
+                common_length_larger = match_len;
+                if candidate_abs <= bt_low {
+                    larger_slot = usize::MAX;
+                    break;
+                }
+                larger_slot = next_pair_idx;
+                match_stored = next_smaller;
+            }
+        }
+
+        if smaller_slot != usize::MAX {
+            $self.chain_table[smaller_slot] = HC_EMPTY;
+        }
+        if larger_slot != usize::MAX {
+            $self.chain_table[larger_slot] = HC_EMPTY;
+        }
+
+        let speed_positions = if best_len > 384 {
+            (best_len - 384).min(192)
+        } else {
+            0
+        };
+        speed_positions.max(match_end_abs.saturating_sub($abs_pos.saturating_add(8)))
+    }};
+}
+
 impl HcMatchGenerator {
     fn donor_opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
         let start_cursor = usize::from(current_abs_start == self.history_abs_start);
@@ -5221,13 +5330,11 @@ impl HcMatchGenerator {
         4
     }
 
-    /// BT-walk match-length probe entry. Delegates to the fastpath dispatcher
-    /// so the per-CPU kernel (NEON / SSE4.2 / AVX2+BMI2 / scalar) is selected
-    /// once and reused. The dispatcher routes into `fastpath::<kernel>::
-    /// count_match_from_indices` which carries the same `target_feature`
-    /// attribute as the kernel module — Week 3a will lift the BT walk methods
-    /// themselves into that umbrella so this call collapses into an inline
-    /// vector loop with no ABI barrier.
+    /// Shim used by callers that have not yet been lifted under a
+    /// `#[target_feature]` umbrella (currently `bt_insert_and_collect_matches`
+    /// and the HC chain-walk path). Routes through the fastpath dispatcher;
+    /// callers that migrate to a per-kernel umbrella call the kernel's
+    /// `count_match_from_indices` directly so the inner vector loop inlines.
     #[inline(always)]
     fn count_match_from_indices(
         concat: &[u8],
@@ -5245,6 +5352,9 @@ impl HcMatchGenerator {
         )
     }
 
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
+    /// body executes inside one `target_feature` umbrella and inlines the
+    /// vectorized `count_match_from_indices` directly.
     #[inline(always)]
     fn bt_insert_step_no_rebase(
         &mut self,
@@ -5252,101 +5362,57 @@ impl HcMatchGenerator {
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
-        let idx = abs_pos - self.history_abs_start;
-        let concat = &self.history[self.history_start..];
-        if idx + 8 > concat.len() {
-            return 1;
+        // SAFETY (aarch64 branch): NEON is part of the AArch64 baseline ISA;
+        // the `#[target_feature(enable = "neon")]` on the callee is required
+        // for inlining only, not for CPU feature presence. Caller may invoke
+        // from any context.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
         }
-        let tail_limit = current_abs_end.saturating_sub(abs_pos);
-        let hash = Self::hash_position_at(concat, idx, self.hash_log, self.bt_hash_mls());
-        let Some(relative_pos) = self.relative_position(abs_pos) else {
-            return 1;
-        };
-        let stored = relative_pos + 1;
-        let bt_mask = self.bt_mask();
-        let bt_low = abs_pos.saturating_sub(bt_mask);
-        // Donor `ZSTD_insertBt1()` computes `windowLow` from the update target,
-        // not from the position being inserted, because updateTree only needs
-        // positions that stay in-window at the end of the batched fill.
-        let window_low = self.window_low_abs_for_target(target_abs);
-        let mut match_end_abs = abs_pos.saturating_add(9);
-        let mut best_len = 8usize;
-        let mut compares_left = self.search_depth;
-        let mut common_length_smaller = 0usize;
-        let mut common_length_larger = 0usize;
-        let pair_idx = self.bt_pair_index_for_abs(abs_pos);
-        let mut smaller_slot = pair_idx;
-        let mut larger_slot = pair_idx + 1;
-        let mut match_stored = self.hash_table[hash];
-        self.hash_table[hash] = stored;
-
-        while compares_left > 0 {
-            let Some(candidate_abs) =
-                Self::stored_abs_position_fast(match_stored, self.position_base, self.index_shift)
-            else {
-                break;
-            };
-            if candidate_abs < window_low || candidate_abs >= abs_pos {
-                break;
-            }
-            compares_left -= 1;
-
-            let next_pair_idx = self.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = self.chain_table[next_pair_idx];
-            let next_larger = self.chain_table[next_pair_idx + 1];
-            let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - self.history_abs_start;
-            let match_len =
-                Self::count_match_from_indices(concat, idx, candidate_idx, tail_limit, seed_len);
-
-            if match_len > best_len {
-                best_len = match_len;
-                let candidate_end = candidate_abs.saturating_add(match_len);
-                if candidate_end > match_end_abs {
-                    match_end_abs = candidate_end;
-                }
-            }
-
-            if match_len >= tail_limit {
-                break;
-            }
-
-            let candidate_next = candidate_idx + match_len;
-            let current_next = idx + match_len;
-            if concat[candidate_next] < concat[current_next] {
-                self.chain_table[smaller_slot] = match_stored;
-                common_length_smaller = match_len;
-                if candidate_abs <= bt_low {
-                    smaller_slot = usize::MAX;
-                    break;
-                }
-                smaller_slot = next_pair_idx + 1;
-                match_stored = next_larger;
-            } else {
-                self.chain_table[larger_slot] = match_stored;
-                common_length_larger = match_len;
-                if candidate_abs <= bt_low {
-                    larger_slot = usize::MAX;
-                    break;
-                }
-                larger_slot = next_pair_idx;
-                match_stored = next_smaller;
-            }
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        {
+            self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
         }
+    }
 
-        if smaller_slot != usize::MAX {
-            self.chain_table[smaller_slot] = HC_EMPTY;
-        }
-        if larger_slot != usize::MAX {
-            self.chain_table[larger_slot] = HC_EMPTY;
-        }
+    /// NEON-umbrella variant: body inlines `fastpath::neon::count_match_from_indices`.
+    /// AArch64 only. Future x86 variants (`_sse42`, `_avx2_bmi2`) follow the
+    /// same pattern with their respective umbrellas.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_insert_step_no_rebase_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::neon::count_match_from_indices
+        )
+    }
 
-        let speed_positions = if best_len > 384 {
-            (best_len - 384).min(192)
-        } else {
-            0
-        };
-        speed_positions.max(match_end_abs.saturating_sub(abs_pos.saturating_add(8)))
+    /// Scalar fallback used on non-AArch64 targets (and when no SIMD kernel
+    /// is selected). Routes through `fastpath::scalar::count_match_from_indices`
+    /// directly so the call site remains the same shape as the SIMD variants.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_insert_step_no_rebase_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::scalar::count_match_from_indices
+        )
     }
 
     #[inline(always)]
