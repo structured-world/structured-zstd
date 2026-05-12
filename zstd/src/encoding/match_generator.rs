@@ -7,20 +7,14 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+// Prefix-length SIMD/CRC intrinsics moved to `crate::encoding::fastpath::*`
+// where they sit under per-CPU `#[target_feature]` umbrellas. Only the few
+// intrinsics still consumed by `hash_mix_u64_with_kernel` (Dfast/Row hash mix)
+// remain imported here until that helper is migrated in a later week.
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-use core::arch::aarch64::{
-    __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
-};
-#[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
-    _mm256_loadu_si256, _mm256_movemask_epi8,
-};
+use core::arch::aarch64::__crc32d;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_loadu_si128, _mm_movemask_epi8,
-    _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-};
+use core::arch::x86_64::_mm_crc32_u64;
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
@@ -34,8 +28,6 @@ use super::incompressible::{block_looks_incompressible, block_looks_incompressib
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
-#[cfg(feature = "std")]
-use std::sync::OnceLock;
 
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
@@ -152,17 +144,6 @@ unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
     // hash table indexing.
     let crc = __crc32d(0, value) as u64;
     ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(HASH_MIX_PRIME)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum PrefixKernel {
-    Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Sse2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Avx2,
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    Aarch64Neon,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1121,77 +1102,6 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[inline(always)]
-    const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
-        if has_avx2 {
-            return PrefixKernel::X86Avx2;
-        }
-        if has_sse2 {
-            return PrefixKernel::X86Sse2;
-        }
-        PrefixKernel::Scalar
-    }
-
-    #[cfg(feature = "std")]
-    #[inline(always)]
-    fn detect_prefix_kernel() -> PrefixKernel {
-        static KERNEL: OnceLock<PrefixKernel> = OnceLock::new();
-        *KERNEL.get_or_init(|| {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                let kernel = Self::select_x86_prefix_kernel(
-                    is_x86_feature_detected!("avx2"),
-                    is_x86_feature_detected!("sse2"),
-                );
-                if kernel != PrefixKernel::Scalar {
-                    return kernel;
-                }
-            }
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            {
-                if is_aarch64_feature_detected!("neon") {
-                    return PrefixKernel::Aarch64Neon;
-                }
-            }
-            PrefixKernel::Scalar
-        })
-    }
-
-    #[cfg(not(feature = "std"))]
-    #[inline(always)]
-    fn detect_prefix_kernel() -> PrefixKernel {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            let kernel = Self::select_x86_prefix_kernel(
-                cfg!(target_feature = "avx2"),
-                cfg!(target_feature = "sse2"),
-            );
-            if kernel != PrefixKernel::Scalar {
-                return kernel;
-            }
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        {
-            if cfg!(target_feature = "neon") {
-                return PrefixKernel::Aarch64Neon;
-            }
-        }
-        PrefixKernel::Scalar
-    }
-
-    #[inline(always)]
-    #[cfg(target_endian = "little")]
-    fn mismatch_byte_index(diff: usize) -> usize {
-        diff.trailing_zeros() as usize / 8
-    }
-
-    #[inline(always)]
-    #[cfg(target_endian = "big")]
-    fn mismatch_byte_index(diff: usize) -> usize {
-        diff.leading_zeros() as usize / 8
-    }
-
     /// max_size defines how many bytes will be used at most in the window used for matching
     fn new(max_size: usize) -> Self {
         Self {
@@ -1327,120 +1237,19 @@ impl MatchGenerator {
         }
     }
 
-    /// Find the common prefix length between two byte slices
+    /// Find the common prefix length between two byte slices. Delegates to
+    /// the fastpath dispatcher so kernel selection (NEON / SSE4.2 /
+    /// AVX2+BMI2 / scalar) lives in one place. See
+    /// [`crate::encoding::fastpath`] for the per-CPU implementations.
     #[inline(always)]
     fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
         let max = a.len().min(b.len());
-        let mut off = 0usize;
-        let lhs = a.as_ptr();
-        let rhs = b.as_ptr();
-
-        match Self::detect_prefix_kernel() {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            PrefixKernel::X86Avx2 => {
-                off = unsafe { Self::prefix_len_simd_avx2(lhs, rhs, max) };
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            PrefixKernel::X86Sse2 => {
-                off = unsafe { Self::prefix_len_simd_sse2(lhs, rhs, max) };
-            }
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            PrefixKernel::Aarch64Neon => {
-                off = unsafe { Self::prefix_len_simd_neon(lhs, rhs, max) };
-            }
-            PrefixKernel::Scalar => {}
+        // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
+        // bytes; `max` is the minimum so both pointers are valid for `max`
+        // bytes.
+        unsafe {
+            crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
         }
-
-        Self::common_prefix_len_scalar(a, b, off, max)
-    }
-
-    #[inline(always)]
-    fn common_prefix_len_scalar(a: &[u8], b: &[u8], off: usize, max: usize) -> usize {
-        Self::common_prefix_len_scalar_ptr(a.as_ptr(), b.as_ptr(), off, max)
-    }
-
-    #[inline(always)]
-    fn common_prefix_len_scalar_ptr(
-        lhs: *const u8,
-        rhs: *const u8,
-        mut off: usize,
-        max: usize,
-    ) -> usize {
-        let chunk = core::mem::size_of::<usize>();
-        while off + chunk <= max {
-            let lhs_word = unsafe { core::ptr::read_unaligned(lhs.add(off) as *const usize) };
-            let rhs_word = unsafe { core::ptr::read_unaligned(rhs.add(off) as *const usize) };
-            let diff = lhs_word ^ rhs_word;
-            if diff != 0 {
-                return off + Self::mismatch_byte_index(diff);
-            }
-            off += chunk;
-        }
-        while off < max {
-            if unsafe { *lhs.add(off) != *rhs.add(off) } {
-                break;
-            }
-            off += 1;
-        }
-        off
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse2")]
-    unsafe fn prefix_len_simd_sse2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 16 <= max {
-            let a: __m128i = unsafe { _mm_loadu_si128(lhs.add(off).cast::<__m128i>()) };
-            let b: __m128i = unsafe { _mm_loadu_si128(rhs.add(off).cast::<__m128i>()) };
-            let eq = _mm_cmpeq_epi8(a, b);
-            let mask = _mm_movemask_epi8(eq) as u32;
-            if mask != 0xFFFF {
-                return off + (!mask).trailing_zeros() as usize;
-            }
-            off += 16;
-        }
-        off
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    unsafe fn prefix_len_simd_avx2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 32 <= max {
-            let a: __m256i = unsafe { _mm256_loadu_si256(lhs.add(off).cast::<__m256i>()) };
-            let b: __m256i = unsafe { _mm256_loadu_si256(rhs.add(off).cast::<__m256i>()) };
-            let eq = _mm256_cmpeq_epi8(a, b);
-            let mask = _mm256_movemask_epi8(eq) as u32;
-            if mask != u32::MAX {
-                return off + (!mask).trailing_zeros() as usize;
-            }
-            off += 32;
-        }
-        off
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn prefix_len_simd_neon(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 16 <= max {
-            let a: uint8x16_t = unsafe { vld1q_u8(lhs.add(off)) };
-            let b: uint8x16_t = unsafe { vld1q_u8(rhs.add(off)) };
-            let eq = vceqq_u8(a, b);
-            let lanes = vreinterpretq_u64_u8(eq);
-            let low = vgetq_lane_u64(lanes, 0);
-            if low != u64::MAX {
-                let diff = low ^ u64::MAX;
-                return off + Self::mismatch_byte_index(diff as usize);
-            }
-            let high = vgetq_lane_u64(lanes, 1);
-            if high != u64::MAX {
-                let diff = high ^ u64::MAX;
-                return off + 8 + Self::mismatch_byte_index(diff as usize);
-            }
-            off += 16;
-        }
-        off
     }
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
@@ -5179,12 +4988,16 @@ impl HcMatchGenerator {
                     let candidate_idx = candidate_abs - self.history_abs_start;
                     let tail_limit = current_abs_end.saturating_sub(abs_pos);
                     let base = concat.as_ptr();
-                    let match_len = MatchGenerator::common_prefix_len_scalar_ptr(
-                        unsafe { base.add(candidate_idx) },
-                        unsafe { base.add(current_idx) },
-                        0,
-                        tail_limit,
-                    );
+                    // SAFETY: `candidate_idx` and `current_idx` are
+                    // history-relative positions; `tail_limit` bounds the
+                    // scan within `concat`.
+                    let match_len = unsafe {
+                        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                            base.add(candidate_idx),
+                            base.add(current_idx),
+                            tail_limit,
+                        )
+                    };
                     if match_len < min_match_len {
                         continue;
                     }
@@ -5484,6 +5297,13 @@ impl HcMatchGenerator {
         4
     }
 
+    /// BT-walk match-length probe entry. Delegates to the fastpath dispatcher
+    /// so the per-CPU kernel (NEON / SSE4.2 / AVX2+BMI2 / scalar) is selected
+    /// once and reused. The dispatcher routes into `fastpath::<kernel>::
+    /// count_match_from_indices` which carries the same `target_feature`
+    /// attribute as the kernel module — Week 3a will lift the BT walk methods
+    /// themselves into that umbrella so this call collapses into an inline
+    /// vector loop with no ABI barrier.
     #[inline(always)]
     fn count_match_from_indices(
         concat: &[u8],
@@ -5492,19 +5312,13 @@ impl HcMatchGenerator {
         tail_limit: usize,
         seed_len: usize,
     ) -> usize {
-        let seed = seed_len.min(tail_limit);
-        if seed == tail_limit {
-            return seed;
-        }
-        let remaining = tail_limit - seed;
-        let base = concat.as_ptr();
-        let extra = MatchGenerator::common_prefix_len_scalar_ptr(
-            unsafe { base.add(candidate_idx + seed) },
-            unsafe { base.add(current_idx + seed) },
-            0,
-            remaining,
-        );
-        seed + extra
+        crate::encoding::fastpath::dispatch_count_match_from_indices(
+            concat,
+            current_idx,
+            candidate_idx,
+            tail_limit,
+            seed_len,
+        )
     }
 
     #[inline(always)]
@@ -5818,12 +5632,14 @@ impl HcMatchGenerator {
         let candidate_idx = candidate_abs - self.history_abs_start;
         let tail_limit = current_abs_end.saturating_sub(abs_pos);
         let base = concat.as_ptr();
-        let match_len = MatchGenerator::common_prefix_len_scalar_ptr(
-            unsafe { base.add(candidate_idx) },
-            unsafe { base.add(idx) },
-            0,
-            tail_limit,
-        );
+        // SAFETY: candidate/idx within history range; tail_limit bounds the scan.
+        let match_len = unsafe {
+            crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                base.add(candidate_idx),
+                base.add(idx),
+                tail_limit,
+            )
+        };
         (match_len >= min_match_len).then_some(MatchCandidate {
             start: abs_pos,
             offset,
