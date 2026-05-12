@@ -467,22 +467,23 @@ fn estimate_literals_section_bytes(
     // the cost matches the actual wire format.
     let new_payload = estimate_huff_payload_bytes(&new_table, literals, counts);
 
-    // Mirror `compress_literals` reuse-vs-new decision. Old-table reuse needs
-    // `estimate_compressed_size` (Option return) because the prior table may
-    // lack codes for symbols present in the current literals; `_from_counts`
-    // would silently zero out those terms.
-    let (use_new, reuse_payload) = match last_huff.as_ref() {
-        Some(table) => match estimate_huff_payload_bytes_checked(table, literals) {
-            Some(old_payload) => {
-                if old_payload <= new_desc + new_payload || new_desc + 12 >= literals.len() {
-                    (false, Some(old_payload))
-                } else {
-                    (true, None)
-                }
-            }
-            None => (true, None),
-        },
-        None => (true, None),
+    // Mirror `compress_literals` reuse-vs-new decision **byte-for-byte**.
+    // The real encoder compares single-stream `estimate_compressed_size` for
+    // both new and old tables (see `compress_literals` below); the actual
+    // wire output is the 4-stream `encode4x` layout once the table is chosen.
+    // Using the 4-stream `estimate_huff_payload_bytes_checked` here would
+    // disagree with the encoder and bias the splitter to pick a different
+    // table than the encoder ultimately emits.
+    let use_new =
+        decide_huff_reuse_like_encoder(&new_table, last_huff.as_ref(), new_desc, literals);
+    let reuse_payload = if !use_new {
+        // Safe to recompute with 4-stream model now that the table is chosen:
+        // the chosen-table path always returns the actual wire cost.
+        last_huff
+            .as_ref()
+            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
+    } else {
+        None
     };
 
     let payload: usize = if use_new {
@@ -635,6 +636,36 @@ fn mode_table_description_bytes(mode: &FseTableMode<'_>) -> usize {
         FseTableMode::Encoded(table) => table.table_header_bits() / 8,
         FseTableMode::Rle(_) => 1,
     }
+}
+
+/// Shared reuse-vs-new Huffman table decision used by both the real encoder
+/// (`compress_literals`) and the splitter cost estimator
+/// (`estimate_literals_section_bytes`). Returns `true` when a fresh table
+/// should be emitted, `false` when the prior table can be reused.
+///
+/// Decision logic is byte-for-byte the donor's: the old-table cost is the
+/// single-stream `estimate_compressed_size` (returns `None` when the prior
+/// table lacks codes for a symbol present in the current literals — in which
+/// case we must emit a new table). The new-table cost is its description
+/// size plus the single-stream payload estimate. A small-input guard
+/// (`new_desc + 12 >= literals.len()`) keeps the reuse path for tiny blocks
+/// where the description alone would exceed the literals.
+fn decide_huff_reuse_like_encoder(
+    new_table: &huff0_encoder::HuffmanTable,
+    last_table: Option<&huff0_encoder::HuffmanTable>,
+    new_desc: usize,
+    literals: &[u8],
+) -> bool {
+    let Some(prev) = last_table else {
+        return true;
+    };
+    let Some(old_estimate) = prev.estimate_compressed_size(literals) else {
+        return true;
+    };
+    let new_estimate = new_table
+        .estimate_compressed_size(literals)
+        .unwrap_or(literals.len());
+    !(old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len())
 }
 
 /// Mirrors `compress_literals` choice: lit_size < 256 → single huff0 stream
@@ -1482,23 +1513,20 @@ fn compress_literals(
         raw_literals(literals, writer);
         return HuffmanTableUpdate::Cleared;
     };
-    let new_payload_estimate = new_encoder_table
-        .estimate_compressed_size(literals)
-        .unwrap_or(literals.len());
-    let (encoder_table, new_table) = if let Some(table) = last_table {
-        if let Some(old_payload_estimate) = table.estimate_compressed_size(literals) {
-            if old_payload_estimate <= new_table_description_size + new_payload_estimate
-                || new_table_description_size + 12 >= literals.len()
-            {
-                (table, false)
-            } else {
-                (&new_encoder_table, true)
-            }
-        } else {
-            (&new_encoder_table, true)
-        }
+    // Shared with the splitter cost estimator
+    // (`estimate_literals_section_bytes`) so both code paths agree on which
+    // table they would pick for a given `(new_table, last_table, literals)`
+    // input.
+    let new_table = decide_huff_reuse_like_encoder(
+        &new_encoder_table,
+        last_table,
+        new_table_description_size,
+        literals,
+    );
+    let encoder_table = if new_table {
+        &new_encoder_table
     } else {
-        (&new_encoder_table, true)
+        last_table.expect("reuse path implies prior table exists")
     };
 
     if new_table {
