@@ -305,7 +305,21 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
-    fn aarch64_picks_neon() {
-        assert_eq!(detect_kernel_uncached(), FastpathKernel::Neon);
+    fn aarch64_picks_neon_when_crc_available() {
+        // The dispatcher gates the NEON kernel on both `neon` (baseline)
+        // and the optional `crc` extension. Mirror that runtime/compile-time
+        // gate so the test stays accurate on AArch64 CPUs (or CI runners)
+        // where `crc` is not reported.
+        #[cfg(feature = "std")]
+        let crc_available = std::arch::is_aarch64_feature_detected!("crc");
+        #[cfg(not(feature = "std"))]
+        let crc_available = cfg!(target_feature = "crc");
+
+        let expected = if crc_available {
+            FastpathKernel::Neon
+        } else {
+            FastpathKernel::Scalar
+        };
+        assert_eq!(detect_kernel_uncached(), expected);
     }
 }

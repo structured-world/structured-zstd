@@ -337,9 +337,15 @@ pub(crate) fn build_table_from_symbol_counts(
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let total = counts.iter().sum::<usize>();
-    // Single-symbol histograms are still valid here for some internal paths;
-    // only an actual one-sample input is invalid for FSE table construction.
-    assert!(total > 1, "RLE distributions must not build FSE tables");
+    // FSE table construction needs at least two samples in the histogram.
+    // A single-distinct-symbol histogram (e.g. `[N, 0, ...]`) with `total
+    // >= 2` is still acceptable here — some internal fallback paths feed
+    // a phantom zero-count second slot when they want an FSE table for
+    // an effectively-RLE distribution.
+    assert!(
+        total > 1,
+        "FSE table requires at least 2 samples in the histogram (got {total})"
+    );
     let max_symbol = counts
         .iter()
         .rposition(|&count| count > 0)
