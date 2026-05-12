@@ -1,4 +1,5 @@
 use crate::bit_io::BitWriter;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
@@ -628,6 +629,15 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         let start_index = state_table[state_table_index as usize];
         symbol_transform_total += probability_abs;
         state.states = Vec::with_capacity(probability_abs.max(1));
+        // Dedup via `BTreeSet<(baseline, last_index, index, num_bits)>` instead
+        // of the previous `state.states.iter().any(...)` linear scan. With
+        // `acc_log` up to 12 (table_size = 4096) the inner scan was O(N²) per
+        // symbol and dominated encoder FSE table construction (~6% exclusive
+        // on level22 profile). BTreeSet keeps insertion order on the
+        // accepted-entries Vec untouched — important because the downstream
+        // `start_state_slot = states.iter().position(|e| e.index == start_index)`
+        // lookup depends on which duplicate-keyed entry shows up first.
+        let mut seen: BTreeSet<(usize, usize, usize, u8)> = BTreeSet::new();
         for current_index in 0..(1usize << acc_log) {
             let current_value = (1usize << acc_log) + current_index;
             let num_bits = (current_value + delta_nb_bits) >> 16;
@@ -636,12 +646,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             let mask = (1usize << num_bits) - 1;
             let baseline = current_index & !mask;
             let last_index = baseline + mask;
-            if state.states.iter().any(|entry| {
-                entry.baseline == baseline
-                    && entry.last_index == last_index
-                    && entry.index == next_index
-                    && entry.num_bits == num_bits as u8
-            }) {
+            if !seen.insert((baseline, last_index, next_index, num_bits as u8)) {
                 continue;
             }
             state.states.push(State {
