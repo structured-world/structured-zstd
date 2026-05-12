@@ -27,7 +27,10 @@ pub(crate) const KERNEL_TAG: &str = "neon";
 #[inline]
 pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
     let crc = __crc32d(0, value) as u64;
-    ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(scalar::HASH_MIX_PRIME)
+    // Match the x86 SSE4.2/AVX2 kernels so the per-arch hash mixers stay
+    // consistent (different rotate counts on the same input would hide bugs
+    // in cross-kernel hash assertions).
+    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(scalar::HASH_MIX_PRIME)
 }
 
 /// 16-byte NEON vector prefix-length probe. Returns the number of leading

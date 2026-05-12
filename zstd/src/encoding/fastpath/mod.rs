@@ -57,8 +57,8 @@
 //! Week 5-6: bench vs `perf/pre-intrinsics-refactor-baseline` tag, profile,
 //!   finalize.
 //!
-//! See `~/.claude/projects/.../memory/refactor_intrinsics_encoder_plan.md` for
-//! full plan and working rules.
+//! Refactor history and working rules for the multi-week PR #110 effort are
+//! captured in the corresponding pull-request description.
 
 // Scaffold-stage: the dispatcher and variant tags are wired up before any
 // caller adopts them, so the dead-code lint would fire on every commit until
