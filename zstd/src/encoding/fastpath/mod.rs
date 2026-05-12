@@ -112,9 +112,28 @@ pub(crate) fn select_kernel() -> FastpathKernel {
 
 #[inline]
 fn detect_kernel_uncached() -> FastpathKernel {
+    // Each kernel's `hash_mix_u64` uses a hardware CRC instruction
+    // (`_mm_crc32_u64` on x86, `__crc32d` on AArch64) for the donor-style
+    // mix. The CRC ISA extension is NOT implied by the SIMD umbrella that
+    // names the kernel:
+    //   * `_mm_crc32_u64` is SSE4.2, NOT AVX2 — older Intel CPUs can ship
+    //     AVX2+BMI2 without SSE4.2 in software (though all real shipping
+    //     parts have both, compile-time `target_feature` enforcement
+    //     doesn't propagate the implication).
+    //   * `__crc32d` is the optional `crc` extension on AArch64, separate
+    //     from the NEON baseline.
+    //
+    // Both kernels must therefore gate on the CRC support explicitly at
+    // runtime (std path) and at compile time (no_std path). Without the
+    // CRC ISA available the hash mix would trap with an illegal
+    // instruction, so we fall back to a SIMD-less kernel that uses the
+    // scalar multiply-only mix.
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("sse4.2")
+        {
             return FastpathKernel::Avx2Bmi2;
         }
         if std::is_x86_feature_detected!("sse4.2") {
@@ -123,17 +142,22 @@ fn detect_kernel_uncached() -> FastpathKernel {
     }
     #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
     {
-        // NEON is part of the AArch64 baseline; the runtime check below is
-        // present for completeness on platforms with conditional feature
-        // reporting.
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        // NEON is part of the AArch64 baseline, but the `crc` extension is
+        // optional. Both must be present before selecting the NEON kernel
+        // because its `hash_mix_u64` calls `__crc32d` directly.
+        if std::arch::is_aarch64_feature_detected!("neon")
+            && std::arch::is_aarch64_feature_detected!("crc")
+        {
             return FastpathKernel::Neon;
         }
     }
 
     #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        if cfg!(target_feature = "avx2") && cfg!(target_feature = "bmi2") {
+        if cfg!(target_feature = "avx2")
+            && cfg!(target_feature = "bmi2")
+            && cfg!(target_feature = "sse4.2")
+        {
             return FastpathKernel::Avx2Bmi2;
         }
         if cfg!(target_feature = "sse4.2") {
@@ -146,7 +170,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
         target_endian = "little"
     ))]
     {
-        if cfg!(target_feature = "neon") {
+        if cfg!(target_feature = "neon") && cfg!(target_feature = "crc") {
             return FastpathKernel::Neon;
         }
     }

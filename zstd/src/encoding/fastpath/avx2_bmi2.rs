@@ -18,15 +18,16 @@ use super::scalar;
 
 pub(crate) const KERNEL_TAG: &str = "avx2_bmi2";
 
-/// AVX2+BMI2 variant of `hash_mix_u64`. AVX2 itself doesn't change the hash
-/// mix algorithm vs SSE4.2 (the CRC32 unit is the same), but having it on the
-/// AVX2+BMI2 kernel lets callers in this module call into it without crossing
-/// the SSE4.2-vs-AVX2 feature boundary.
+/// AVX2+BMI2 variant of `hash_mix_u64`. AVX2 itself doesn't include the
+/// CRC32 instruction (`_mm_crc32_u64` lives under SSE4.2); every shipping
+/// AVX2 CPU also has SSE4.2 in hardware, but Rust's `target_feature`
+/// machinery does not propagate that implication, so the attribute must
+/// list `sse4.2` explicitly and the dispatcher must gate AVX2 kernel
+/// selection on `sse4.2` being reported as well.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi2")]
+#[target_feature(enable = "avx2,bmi2,sse4.2")]
 #[inline]
 pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
-    // SAFETY: AVX2 implies SSE4.2 → CRC32 instruction available.
     let crc = unsafe {
         #[cfg(target_arch = "x86_64")]
         use core::arch::x86_64::_mm_crc32_u64;

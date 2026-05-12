@@ -21,8 +21,13 @@ pub(crate) const KERNEL_TAG: &str = "neon";
 /// AArch64 `crc32d`-accelerated `hash_mix_u64`. Routes a full 64-bit lane
 /// through the CRC unit and folds the result back with a rotated copy of the
 /// source so the upper bits stay well-distributed for hash-table indexing.
-/// Marked `target_feature(enable = "crc")` (NEON umbrella implies it on
-/// AArch64 baseline, but the attribute is required by Rust's ABI rules).
+///
+/// The `crc` AArch64 extension is **optional** and NOT implied by the NEON
+/// baseline. Callers must therefore confirm both `neon` and `crc` are
+/// reported by the runtime feature detector (or compile-time `cfg!` in
+/// `no_std`) before reaching this function — the dispatcher in
+/// `fastpath::detect_kernel_uncached` enforces that gate. Calling this on a
+/// CPU without the CRC extension would trap with an illegal instruction.
 #[target_feature(enable = "crc")]
 #[inline]
 pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
