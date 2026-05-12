@@ -1719,6 +1719,7 @@ fn best_len_offset_candidate(
     }
 }
 
+#[inline]
 fn extend_backwards_shared(
     concat: &[u8],
     history_abs_start: usize,
@@ -1728,10 +1729,22 @@ fn extend_backwards_shared(
     lit_len: usize,
 ) -> MatchCandidate {
     let min_abs_pos = abs_pos - lit_len;
-    while abs_pos > min_abs_pos
-        && candidate_pos > history_abs_start
-        && concat[candidate_pos - history_abs_start - 1] == concat[abs_pos - history_abs_start - 1]
-    {
+    let concat_ptr = concat.as_ptr();
+    let concat_len = concat.len();
+    // SAFETY: loop guard `candidate_pos > history_abs_start` and
+    // `abs_pos > min_abs_pos` keep both `candidate_pos - history_abs_start - 1`
+    // and `abs_pos - history_abs_start - 1` strictly positive (no underflow).
+    // Their upper bound is `concat.len() - 1` because both `candidate_pos` and
+    // `abs_pos` point at currently-live history. Asserted in debug builds.
+    while abs_pos > min_abs_pos && candidate_pos > history_abs_start {
+        let cand_off = candidate_pos - history_abs_start - 1;
+        let cur_off = abs_pos - history_abs_start - 1;
+        debug_assert!(cand_off < concat_len && cur_off < concat_len);
+        let cand_byte = unsafe { *concat_ptr.add(cand_off) };
+        let cur_byte = unsafe { *concat_ptr.add(cur_off) };
+        if cand_byte != cur_byte {
+            break;
+        }
         candidate_pos -= 1;
         abs_pos -= 1;
         match_len += 1;
@@ -4645,8 +4658,14 @@ impl HcMatchGenerator {
                 prev_max_len = prev_max_len.max(max_match_len);
             }
 
+            // Per-iter sentinel write: extend the unset-frontier marker one
+            // slot past `last_pos`. Bound check folded into a single unchecked
+            // store once we know the slot exists (the surrounding `if`).
+            // SAFETY: `last_pos + 1 < nodes.len()` confirmed by the guard.
             if last_pos + 1 < nodes.len() {
-                nodes[last_pos + 1].price = u32::MAX;
+                unsafe {
+                    nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
+                }
             }
             pos += 1;
         }
