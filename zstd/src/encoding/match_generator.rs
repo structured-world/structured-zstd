@@ -26,7 +26,11 @@ use super::incompressible::{block_looks_incompressible, block_looks_incompressib
     target_endian = "little"
 ))]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 use std::arch::is_x86_feature_detected;
 
 const MIN_MATCH_LEN: usize = 5;
@@ -5319,6 +5323,10 @@ impl HcMatchGenerator {
     }
 
     #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    // Body macros wrap callees in `unsafe { }` for the NEON/AVX/SSE
+    // variants where callees are `unsafe fn`. The scalar wrappers route
+    // through safe fns, so those blocks are redundant on this path.
+    #[allow(unused_unsafe)]
     fn build_optimal_plan_impl_scalar<
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
@@ -5689,6 +5697,9 @@ impl HcMatchGenerator {
     }
 
     #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
+    // callees are safe so the blocks are redundant here only.
+    #[allow(unused_unsafe)]
     fn collect_optimal_candidates_initialized_scalar<const USE_BT_MATCHFINDER: bool>(
         &mut self,
         abs_pos: usize,

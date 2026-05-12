@@ -2,6 +2,13 @@
 //! whole hot loop stays inside one `#[target_feature]` umbrella and SIMD/BMI2
 //! intrinsics inline natively (no ABI barrier).
 //!
+//! All kernel functions are `unsafe fn`; the explicit inner `unsafe { }` blocks
+//! around intrinsic calls are kept for safety documentation (this matches the
+//! Rust 2024 recommended style enforced by `unsafe_op_in_unsafe_fn`). The
+//! `unused_unsafe` lint sees them as redundant inside an `unsafe fn` body, so
+//! we silence it at the module level rather than removing the documentation.
+#![allow(unused_unsafe)]
+//!
 //! # Background
 //!
 //! In Rust, `#[target_feature(enable = "...")]` creates an ABI boundary: a
