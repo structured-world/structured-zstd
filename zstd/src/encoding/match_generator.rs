@@ -3347,6 +3347,54 @@ macro_rules! bt_insert_step_no_rebase_body {
     }};
 }
 
+/// `hash3_candidate` body parameterized over the per-CPU
+/// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
+/// position when invoked, so the per-call ABI savings compound across the
+/// segment.
+macro_rules! hash3_candidate_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $min_match_len:ident,
+        $cpl:path $(,)?
+    ) => {{
+        if $self.hash3_log == 0 {
+            return None;
+        }
+        let idx = $abs_pos.checked_sub($self.history_abs_start)?;
+        let concat = $self.live_history();
+        if idx + 4 > concat.len() {
+            return None;
+        }
+        let hash3 = HcMatchGenerator::hash_position_at(concat, idx, $self.hash3_log, 3);
+        let entry = $self.hash3_table.get(hash3).copied().unwrap_or(HC_EMPTY);
+        let candidate_abs = HcMatchGenerator::stored_abs_position_fast(
+            entry,
+            $self.position_base,
+            $self.index_shift,
+        )?;
+        if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+            return None;
+        }
+        let offset = $abs_pos - candidate_abs;
+        if offset >= HC3_MAX_OFFSET {
+            return None;
+        }
+        let candidate_idx = candidate_abs - $self.history_abs_start;
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let base = concat.as_ptr();
+        // SAFETY: candidate/idx are within history range; tail_limit bounds
+        // the scan within `concat`.
+        let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(idx), tail_limit) };
+        (match_len >= $min_match_len).then_some(MatchCandidate {
+            start: $abs_pos,
+            offset,
+            match_len,
+        })
+    }};
+}
+
 /// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
 /// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
 /// the wrapper's `target_feature` umbrella instead of crossing the ABI
@@ -5985,6 +6033,7 @@ impl HcMatchGenerator {
         unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
     }
 
+    /// Cross-platform entry. Dispatches to the kernel-specific variant.
     #[inline(always)]
     fn hash3_candidate(
         &self,
@@ -5992,41 +6041,100 @@ impl HcMatchGenerator {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        if self.hash3_log == 0 {
-            return None;
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.hash3_candidate_neon(abs_pos, current_abs_end, min_match_len)
         }
-        let idx = abs_pos.checked_sub(self.history_abs_start)?;
-        let concat = self.live_history();
-        if idx + 4 > concat.len() {
-            return None;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Scalar => {
+                    self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
+                }
+            }
         }
-        let hash3 = Self::hash_position_at(concat, idx, self.hash3_log, 3);
-        let entry = self.hash3_table.get(hash3).copied().unwrap_or(HC_EMPTY);
-        let candidate_abs =
-            Self::stored_abs_position_fast(entry, self.position_base, self.index_shift)?;
-        if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
-            return None;
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
         }
-        let offset = abs_pos - candidate_abs;
-        if offset >= HC3_MAX_OFFSET {
-            return None;
-        }
-        let candidate_idx = candidate_abs - self.history_abs_start;
-        let tail_limit = current_abs_end.saturating_sub(abs_pos);
-        let base = concat.as_ptr();
-        // SAFETY: candidate/idx within history range; tail_limit bounds the scan.
-        let match_len = unsafe {
-            crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                base.add(candidate_idx),
-                base.add(idx),
-                tail_limit,
-            )
-        };
-        (match_len >= min_match_len).then_some(MatchCandidate {
-            start: abs_pos,
-            offset,
-            match_len,
-        })
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn hash3_candidate_neon(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn hash3_candidate_sse42(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn hash3_candidate_avx2_bmi2(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn hash3_candidate_scalar(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
     }
 
     fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
