@@ -4945,14 +4945,20 @@ impl HcMatchGenerator {
         generations: &mut [u32; HC_MAX_LIT + 1],
         stamp: u32,
     ) -> u32 {
+        // SAFETY: `byte as usize` is `0..256` and the fixed-size arrays are
+        // `[u32; HC_MAX_LIT + 1 = 257]`, so the index is statically in bounds.
+        // Each cached_*_price call sits inside the optimal parser per-byte
+        // hot loop where these bounds checks are pure overhead.
         let idx = byte as usize;
-        if generations[idx] == stamp {
-            return prices[idx];
+        unsafe {
+            if *generations.get_unchecked(idx) == stamp {
+                return *prices.get_unchecked(idx);
+            }
+            let price = profile.literal_price(stats, byte);
+            *prices.get_unchecked_mut(idx) = price;
+            *generations.get_unchecked_mut(idx) = stamp;
+            price
         }
-        let price = profile.literal_price(stats, byte);
-        prices[idx] = price;
-        generations[idx] = stamp;
-        price
     }
 
     #[inline(always)]
@@ -4967,13 +4973,20 @@ impl HcMatchGenerator {
         if lit_len >= prices.len() {
             return profile.lit_length_price(stats, lit_len);
         }
-        if generations[lit_len] == stamp {
-            return prices[lit_len];
+        // SAFETY: the early-return above proves `lit_len < prices.len()`. The
+        // matching `generations` slice is sized identically by the caller in
+        // `build_optimal_plan_impl` (`opt_ll_price_scratch` /
+        // `opt_ll_price_generation` are `resize`d together), so the same
+        // index is in bounds for both.
+        unsafe {
+            if *generations.get_unchecked(lit_len) == stamp {
+                return *prices.get_unchecked(lit_len);
+            }
+            let price = profile.lit_length_price(stats, lit_len);
+            *prices.get_unchecked_mut(lit_len) = price;
+            *generations.get_unchecked_mut(lit_len) = stamp;
+            price
         }
-        let price = profile.lit_length_price(stats, lit_len);
-        prices[lit_len] = price;
-        generations[lit_len] = stamp;
-        price
     }
 
     #[inline(always)]
@@ -5008,13 +5021,18 @@ impl HcMatchGenerator {
         if match_len >= prices.len() {
             return profile.match_length_price(stats, match_len);
         }
-        if generations[match_len] == stamp {
-            return prices[match_len];
+        // SAFETY: see `cached_lit_length_price` — the caller co-sizes
+        // `opt_ml_price_scratch` and `opt_ml_price_generation`, and the
+        // early return proves `match_len < prices.len()`.
+        unsafe {
+            if *generations.get_unchecked(match_len) == stamp {
+                return *prices.get_unchecked(match_len);
+            }
+            let price = profile.match_length_price(stats, match_len);
+            *prices.get_unchecked_mut(match_len) = price;
+            *generations.get_unchecked_mut(match_len) = stamp;
+            price
         }
-        let price = profile.match_length_price(stats, match_len);
-        prices[match_len] = price;
-        generations[match_len] = stamp;
-        price
     }
 
     #[cfg(test)]
