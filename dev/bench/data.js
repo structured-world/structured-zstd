@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776343605393,
+  "lastUpdate": 1778627534220,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -26222,6 +26222,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6d97c1c5f67391b339265799c4d6010f798066b5",
+          "message": "perf(level22): complete donor parity path (#110)\n\n* perf(level22): checkpoint donor parity analysis\n\n- align HC main hash with donor hash4 formula\n- keep donor regression coverage for level 22 parity gap\n- preserve current donor-path findings before full BT rewrite\n\n* perf(level22): complete donor parity path\n\n* chore(dict): satisfy newer clippy sort lint\n\n* fix(encoding): address level22 review feedback\n\n* fix(review): address copilot follow-up threads\n\n* docs(huff0): add sizing and table docstrings\n\n* fix(review): close remaining PR110 threads\n\n* fix(dictionary): reject empty fastcover finalize source early\n\n* fix(review): align split estimator and huffman sentinel handling\n\n* perf(fse): remove hot-path scans and table-build churn\n\n* perf(level22): optimize btultra2 hot path\n\n* fix(level22): preserve hash3/bt rebase guard\n\n* docs(fse): clarify single-symbol histogram guard\n\n* perf(encoding): reuse level22 optimal buffers\n\n* perf(encoding): reuse split estimator scratch\n\n* perf(encoding): reuse encoded sequence scratch\n\n* perf(encoding): reuse partition output scratch\n\n* perf(encoding): match donor split threshold\n\n* perf(encoding): reuse compressed block workspace\n\n* perf(encoding): skip redundant optimal table checks\n\n* perf(encoding): compact optimal sequence plan\n\n* perf(encoding): reset optimal frontier sentinel\n\n* perf(encoding): reuse split estimates\n\n* perf(encoding): inline level22 match search\n\n* perf(encoding): specialize optimal offset pricing\n\n* perf(encoding): specialize optimal candidate collection\n\n* perf(encoding): reuse literal repair prices\n\n* fix(encoding): document literal repair branch\n\n* perf(encoding): trim optimal node reset\n\n* perf(encoding): align optimal forced exit\n\n* perf(encoding): size hash3 table to window\n\n* perf(encoding): skip btultra2 zero rebase\n\n* perf(encoding): avoid insert hash subslices\n\n* perf(huff0): reuse table weight extraction\n\n* perf(encoding): cache literal length deltas\n\n* perf(encoding): drop optimal literal length delta cache\n\nReverts the per-pos `opt_ll_delta_price_*` cache introduced for the\noptimal parser: the cache stamping + per-call generation comparisons\nadded more work than the saved repeat lookups on level22 hot paths,\nand the saturating-add fallbacks blocked compiler folding on the\ninner cost-update path. Replaces it with `add_prices` /\n`add_price_delta` helpers that keep the same overflow semantics via\ndebug_assert without the runtime saturation cost.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): replace splitter probe with dry-run cost estimator\n\nSplitter recursive bisect was running the full encode pipeline per\nprobe — including `encode_sequences` per-bit writes for every\ncandidate window — to obtain a byte-accurate cost. Replaces the probe\nbody with `estimate_block_parts_size`, a dry-run analog of\n`encode_block_parts_with_sequence_scratch` that mirrors decisions\nbyte-for-byte (same `compress_literals` reuse-vs-new logic via\n`HuffmanTable::build_from_counts` + `estimate_compressed_size_*`, same\n`choose_table` calls, same `remember_last_used_tables` mutations) and\ncomputes the would-be wire size using existing cost primitives\n(`cross_entropy_cost`, `fse_bit_cost`, `entropy_cost`, FSE\n`acc_log` final-state flush, `table_header_bits`).\n\nLiteral-section sizing models the donor `encode4x` layout exactly:\n6-byte jumptable plus per-stream byte-aligned padding when\n`lit_size >= 256`, single-stream `estimate_compressed_size_from_counts`\notherwise. Reuse-vs-new uses the `Option`-returning\n`estimate_compressed_size` variant on the prior table so missing\nsymbols correctly fall through to the new-table path, matching\n`compress_literals`.\n\nWorkspace moved into `EstimatorWorkspace` (counts arrays + sequence\nscratch) on the block scratch so probes never allocate, and\n`estimator_output: Vec<u8>` is gone since dry-run never writes a\nbitstream. Promotes `HuffmanTable::estimate_compressed_size_from_counts`\nfrom private to `pub(crate)` for the new caller.\n\nMeasured (criterion --quick):\n- compress level22 small-4k-log-lines: 161.51 us -> 154.23 us\n  (-4.5%; gap to FFI 2.78x -> 2.70x)\n- compress level22 decodecorpus-z000033: 352.33 ms -> 307.61 ms\n  (-12.7%; gap to FFI 2.19x -> 2.06x)\n\nRatio preserved: rust_level22 stays <= ffi_level22 on the\ndecodecorpus proxy, full cross-validation suite green.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): bypass bounds checks in optimal parser ML scan\n\nReplaces `nodes[next]` / `nodes[match_len]` indexing in the two hottest\ninner ML-scan loops of `build_optimal_plan_impl` with\n`get_unchecked` / `get_unchecked_mut`. The indices are provably in\nbounds: both inner loops clamp `max_match_len` via\n`frontier_limit.saturating_sub(pos)` and `nodes` is sized to\n`frontier_limit + 2` at the top of the function, so every probed\nposition lies inside the allocated slice. `debug_assert!` guards the\ninvariant so any future refactor that breaks it trips immediately in\ndebug builds.\n\n`build_optimal_plan_impl` accounts for ~35% exclusive on level22\nprofile and the per-iteration `nodes[next]` access pair is the loop's\nhottest store/load. Removing the bounds check tightens the\nemitted ML scan to ~3 instructions less per iteration.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* fix(huff0): skip non-writable candidates in table_log search\n\n`build_from_counts` evaluated each table_log candidate by adding\n`table_description_size()` (which folds the non-writable case into\n`usize::MAX / 2` sentinel) to its payload estimate. With the initial\n`best_size = usize::MAX - 1`, the first iteration's `new_size`\n(roughly `MAX/2 + payload`) is smaller than that initial best, so a\nnon-writable candidate would be accepted as `best_table` and then\nreturned from the function — `compress_literals` would later fail\nto serialize its Huffman tree description.\n\nSwitches the loop to `try_table_description_size().is_some()` and\n`continue`s on non-writable candidates so they can never win. The\nfinal `unwrap_or_else` fallback is unchanged (the `table_log = 11`\npath produces a writable tree for every input the loop encounters\non real corpora).\n\nAlso removes the now-unused public `table_description_size` shim;\nall in-tree callers were already on `try_table_description_size`.\n\nAddresses CodeRabbit thread on PR #110.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* fix(encoding): propagate left partition post-state into right estimate\n\n`SplitEstimator::estimate_subblock_size` previously re-seeded the\nscratch state from the block-entry Huffman/FSE/repeat-offset values\non every probe, so the right half of a bisect pair (`second`) was\nscored as if it started a fresh block. The real emit path doesn't\nbehave that way — once the left half is emitted compressed, the\nright half inherits the post-emit entropy tables and updated repeat\noffsets. That asymmetry biased `derive_block_splits_with_full`'s\n`first + second < full` comparison toward optimistically cheap\nsplits in parity-sensitive cases.\n\nIntroduces `ProbeEntryState` (the owned tuple of `last_huff_table`,\nthree `*_previous` FSE tables, and `offset_hist`) and threads it\nthrough bisect:\n\n- `estimate_subblock_size` returns the post-probe state.\n- `derive_block_splits_with_full` uses the parent's entry for the\n  left probe and recursion, and the left's post-state for the right\n  probe and its recursion.\n- Raw fallback returns the entry state unchanged, matching the real\n  encoder's state-restore in `emit_single_sequence_block`.\n\nThe clones added in recursion (~one snapshot per depth level, max\n~log2(N) deep) are dwarfed by the existing per-probe FSE table\nbuild cost the dry-run estimator already pays.\n\nAddresses CodeRabbit duplicate finding on PR #110 (compressed.rs\nlines 468-472, 519-520).\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* fix(encoding): reserve splitter buffers against length not capacity\n\n`Vec::reserve_exact(N)` extends capacity above the current LENGTH, not\nabove the existing capacity. The previous form\n`reserve_exact(target - capacity)` (called after `clear()` so length is\n0) requested only `target - cap` more slots, leaving the Vec with\n`cap = max(cap, target - cap)` — still under `target` whenever\n`cap < target/2`. The next `push` then reallocated and copied the\nhalf-filled buffer, defeating the pre-allocation entirely.\n\nSwitch all three reservation sites in the splitter scratch path to\n`target - len()`: `SequencePrefixSums::rebuild`,\n`collect_block_parts`, and `encode_raw_sequences_into`.\n\nAlso tighten `fse_section_bits_for_mode`'s `FseTableMode::RepeatLast`\narm: when `prev.as_table(default)` returns `None` (now possible since\n`PreviousFseTable::Rle(_)` exists), the real `encode_sequences` writes\nno FSE state transitions and no final-state flush, so the section\ncosts 0 bits. The old fallback to `default` over-counted by\n`default.acc_log()` plus its cross-entropy and biased splitter probes.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): pre-reserve pending_input after pre-split\n\nAfter `pending_input = uncompressed_data.split_off(block_len)` the new\nVec inherited a capacity close to its length (often a few KB). The\nnext loop iteration moves it back into `uncompressed_data` and\n`resize`s to `MAX_BLOCK_SIZE` — which reallocates and zero-fills a\nfresh buffer on every pre-split. Reserve up to `block_capacity`\nimmediately after `split_off` so the resize stays in-place.\n\n* docs(dictionary): clarify why std::vec import is required\n\nThe `vec` module import looks unused at a glance (this module only\ncalls the `vec![..]` macro, never `vec::Foo::bar()`). But in our\nno_std-with-std-feature crate the std prelude isn't pulled in\nimplicitly, so the macro resolver actually needs `use std::vec` to\nfind `vec!` — removing it fails the build with `cannot find macro\n'vec' in this scope`. Add a comment documenting this so the import\nisn't stripped in a future cleanup pass.\n\n* docs(copilot): pin `use std::vec` as required, not unused\n\nThe `use std::vec` import is required wherever `vec![..]` is called\nin this crate: the std prelude isn't implicitly in scope under the\nno_std-with-std-feature build, so the macro resolver needs the\nmodule path. Removing the import fails the build with `cannot find\nmacro 'vec' in this scope`. Document the rule in\n.github/copilot-instructions.md so the static analyzer stops\nemitting an \"unused import\" finding on every cycle.\n\n* docs(copilot): drop fork-of-ruzstd framing from instructions\n\nRemoves the \"managed fork — avoid divergent architectural changes\"\nconstraint and the upstream link from the project overview. This\nproject is a standalone maintained fork; what was in the original\nupstream is not a guideline for review here.\n\n* perf(encoding): reuse sequences scratch on non-split encode path\n\n`compress_block` (the non-post-split encode path) called the\n`encode_block_parts` wrapper, which allocated a fresh\n`Vec<Sequence>` and grew it from zero on every block.\n`CompressedBlockScratch` already owns a reusable\n`estimator_sequences` buffer for the splitter, so route the\nnon-split call through `encode_block_parts_with_sequence_scratch`\nwith that buffer and drop the wrapper entirely. Eliminates one\nheap growth per non-split block.\n\n* fix(encoding): thread true left-subtree post-state into right recursion\n\n`derive_block_splits_with_full` was passing the precomputed\n`first_post` (the post-state for emitting `start_idx..mid_idx` as\nONE partition) into the right-side recursive call. But if the left\nrecursive call inserts additional nested splits, the actual state\nat `mid_idx` is the post-state of that chosen subtree, not\n`first_post` — so the right recursion was scoring its probes\nagainst stale Huffman/FSE/repeat-offset state and drifting from\nemit-time donor parity.\n\nChange `derive_block_splits_with_full` to return the post-emit\n`ProbeEntryState` at `end_idx` produced by whichever partitioning\nthe recursion settles on (single emit, or N nested splits). The\ncaller threads that returned state into the sibling probe, so each\nsubtree is scored against the real donor-parity state the emit\npath will land in. Leaf branches (range too small to split, or\npartition cap hit) just return the single-partition probe's\npost-state. The top-level `derive_block_splits` discards the\nreturned state — partitions are pushed into the shared `Vec`\nside-channel as before.\n\n* perf(encoding): bounds-check elision + cold-split in per-byte insert path\n\nPhase A.1 of multi-phase encoder rewrite toward C-style hot path.\n\n`insert_position_no_rebase` is called once per input byte during match\ngeneration (one of the top-three exclusive hotspots in level22\nprofile at 5.6%). Two bounds-checked accesses per call —\n`hash_table[hash]` and `chain_table[chain_idx]` — are provably safe:\n`hash` is masked down to `hash_log` bits by `hash_value_with_mls` and\n`hash_table.len() == 1 << hash_log` by construction in\n`ensure_tables`; `chain_idx & ((1 << chain_log) - 1)` similarly bounds\nto `chain_table.len()`. Replaces both with `get_unchecked` /\n`get_unchecked_mut`, with `debug_assert!` invariant guards so any\nfuture change that breaks the bound trips immediately.\n\n`maybe_rebase_positions` (4.6% exclusive) is structurally a hot\nno-op guarded path that rebuilds the entire table set on rare\n`u32::MAX` rollover. Extracts the rebuild body into a separate\n`#[cold] #[inline(never)] rebase_positions_cold` so the hot\nwrapper (now `#[inline]`) is just two compares + a tail call when\nrebase fires. Keeps the cold path off the i-cache and lets the\ncompiler tighten branch prediction on the hot side.\n\n`abs_pos - self.history_abs_start` → `wrapping_sub`: when\n`abs_pos < history_abs_start` the wrapping result becomes a huge\n`usize` that's immediately rejected by the `idx + 4 > concat.len()`\nguard, so we drop a panic-on-underflow check that never fired in\npractice.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): bounds-check elision in Dfast / Row per-byte insert path\n\nPhase A.2 of the encoder hot-path rewrite. Applies the same unsafe\npattern landed in Phase A.1 (HC insert) to the Dfast and Row\nmatchers' per-byte `insert_position` paths.\n\n`DfastMatchGenerator::insert_position` (~4.0% exclusive on profile)\nindexes `short_hash[short]` and `long_hash[long]`. Both indices are\nproduced by `hash_index` which masks to `hash_bits` bits, and both\ntables are sized `1 << hash_bits` in `ensure_hash_tables`. Bounds\nelided via `get_unchecked_mut`; `debug_assert!` guards the invariant.\n\n`RowMatchGenerator::insert_position` (~2.7% exclusive) indexes\n`row_heads[row]`, `row_tags[row_base + next]`, and\n`row_positions[row_base + next]`. `hash_and_row` masks `row` to\n`row_hash_log` bits, `row_base = row << row_log` and `next < 1 <<\nrow_log`, so `row_base + next < row_count * row_entries =\nrow_positions.len() = row_tags.len()` and `row < row_heads.len()`.\nAll three accesses elided.\n\nAlso folds the absolute-position subtraction to `wrapping_sub` in\nthe Dfast path (matches the HC path's earlier change): when\n`pos < history_abs_start` the wrapped result is a huge usize\nimmediately rejected by the `idx + 4/8 > concat.len()` guards, so\nwe drop a panic-on-underflow that never fires.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(fse): BTreeSet dedup instead of O(N²) linear scan in encoder table build\n\n`build_table_from_probabilities` built each symbol's state-transition\nlist by iterating `1 << acc_log` candidate state indices and, for\nevery iteration, scanning the already-accepted entries with\n`state.states.iter().any(...)` to detect duplicates by\n`(baseline, last_index, index, num_bits)`. With `acc_log` up to 12\n(table_size = 4096) this is quadratic per symbol and dominated\nencoder FSE table construction (~6% exclusive on level22 profile,\n~8.7% inclusive across both `build_table_from_symbol_counts` and\ndirect callers).\n\nReplaces the inner linear scan with a `BTreeSet<(baseline,\nlast_index, index, num_bits)>`. The set's insert returns `false`\nwhen the tuple is already present, so we skip exactly the same\niterations as before — preserving the insertion order of the\naccepted-entries `Vec`. That ordering matters: the downstream\n`start_state_slot = states.iter().position(|e| e.index ==\nstart_index)` lookup picks the first matching entry, so reordering\nwould change which transition the encoder initializes from.\n\nComplexity per symbol: O(N log N) instead of O(N²). On the 4096-entry\nworst case that's ~50K compares vs ~16M.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): inline candidate enumeration in Dfast hash_candidate / repcode_shared\n\n`DfastMatchGenerator::best_match` was 32% exclusive on default-level\nprofile, mostly inside the inlined `hash_candidate`. Two issues:\n\n1. `short_candidates` / `long_candidates` adapter methods rebuilt\n   `live_history` and recomputed `idx` inside a\n   `.then(...).into_iter().flatten().filter(...)` combinator chain\n   that the optimizer didn't fully erase. The outer `hash_candidate`\n   already had `concat` and `current_idx` in registers. Drops both\n   adapter methods (now unused) and inlines the bucket walk twice\n   directly, with `get_unchecked` on the provably-in-bounds\n   `long_hash[long]` / `short_hash[short]` accesses (same bounds\n   reasoning as the per-byte insert path: hash output is masked to\n   `hash_bits` and tables are sized `1 << hash_bits`).\n\n2. `repcode_candidate_shared` (10% exclusive — shared call site\n   across all matchers) walked `[Option<usize>; 3]` via\n   `into_iter().flatten()`, which the compiler couldn't reliably\n   unroll through the conditional `then_some` on the rep[2] slot.\n   Replaced with explicit `(rep0, rep1, rep2_opt)` destructure and a\n   local `probe!` macro that emits the same per-rep body three\n   times. Per-rep body is unchanged.\n\nMeasured default-level decodecorpus encode: 99.8 ms -> 91.1 ms\n(criterion --quick, c_ffi 2.95 ms, gap 33x -> 30.9x).\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): elide bounds checks in optimal parser DP literal path\n\nPhase A continuation: cycle 3 already covered the two inner ML scan\nloops in `build_optimal_plan_impl`. This commit extends the same\nprovably-safe unchecked-indexing pattern to the literal-path\nsegment of the outer `while pos <= last_pos` loop (~35% exclusive\non level22 profile), which holds several `nodes[pos]`,\n`nodes[pos - 1]`, `nodes[next]`, `nodes[prev_pos]` accesses per\niteration.\n\nInvariant guarded by the loop header `pos <= last_pos &&\npos <= frontier_limit`: combined with `nodes` being sized to\n`frontier_limit + 2` at function entry, every access in the body\nsatisfies `idx < nodes.len()`:\n- `pos - 1 < pos < nodes.len()`\n- `pos + 1 <= frontier_limit + 1 < nodes.len()`\n- `prev_pos = pos.saturating_sub(_) <= pos < nodes.len()`\n\nThe hot reads (`nodes[pos - 1]`, `nodes[pos]`, `nodes[pos + 1]`,\n`nodes[next]`, `nodes[prev_pos]`) and writes (`nodes[pos] = ...`,\n`nodes[next] = ...`) are routed through `get_unchecked` /\n`get_unchecked_mut`. `debug_assert!` at the top of the iteration\ncatches any future invariant break in debug builds.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): unsafe pointer walk in extend_backwards + DP sentinel\n\nTwo final spots in Phase A:\n\n1. `extend_backwards_shared` is called inside every Dfast/HC/Row\n   match-search inner loop (after each candidate finds a forward\n   match of >= min_match_len). The body walks backwards one byte at\n   a time comparing `concat[candidate_pos - history_abs_start - 1]`\n   with `concat[abs_pos - history_abs_start - 1]`. Both bounds:\n   - Lower: loop guards `candidate_pos > history_abs_start` and\n     `abs_pos > min_abs_pos` keep both offsets >= 0 (no underflow).\n   - Upper: `candidate_pos` and `abs_pos` reference live history\n     positions, so `offset = pos - history_abs_start - 1 <\n     concat.len()`.\n\n   Switch to raw `concat.as_ptr().add(off)` reads with\n   `debug_assert!` invariant guards. Per-iteration cost drops from\n   2 bounds-checked array accesses to 2 direct pointer reads on\n   what is one of the inner-most loops of the encoder.\n\n2. The optimal-parser DP outer loop ends every iteration with\n   `if last_pos + 1 < nodes.len() { nodes[last_pos + 1].price =\n   u32::MAX; }`. The `if` already proves the index is in bounds —\n   collapse the redundant bounds check on the store with\n   `get_unchecked_mut` inside the same guard.\n\nBoth follow the established Phase A invariant pattern with\ndebug-build assertions guarding the bound proof.\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* perf(encoding): elide bounds checks in cached price helpers\n\n`cached_literal_price` / `cached_lit_length_price` /\n`cached_match_length_price` sit inside the optimal parser per-byte\nloop (called multiple times per iteration in\n`build_optimal_plan_impl`). Each does an indexed read of the\ngenerations array, possibly a price-array read, and on miss two\nwrites. Each access was bounds-checked.\n\n- `cached_literal_price`: `byte: u8` so `byte as usize < 256` and\n  the price/generations arrays are fixed `[u32; HC_MAX_LIT + 1 =\n  257]`. The bound is statically guaranteed by the input type.\n\n- `cached_lit_length_price` / `cached_match_length_price`: the\n  early-return `if lit_len >= prices.len() { ... }` proves\n  `lit_len < prices.len()` for the remaining code. The matching\n  `generations` slice is co-sized with `prices` in\n  `build_optimal_plan_impl` (`opt_ll_price_scratch` is `resize`d\n  with `opt_ll_price_generation`; same for ml_*), so the same\n  index is in bounds for both.\n\nAll three helpers are `#[inline(always)]` and called multiple\ntimes per outer DP iteration. Replacing four indexed ops per call\nwith their `get_unchecked` / `get_unchecked_mut` variants saves\nthe bounds prelude on every cache hit (the common case after the\nfirst iteration of the block warms the table).\n\nValidated: cargo nextest run -p structured-zstd --features\ndict_builder -> 424/424 pass; cargo clippy --all-targets --features\ndict_builder -- -D warnings clean.\n\n* refactor(encoding): fastpath module scaffold\n\nSet up src/encoding/fastpath/ as the home for per-CPU-feature variants of\nthe encoder hot path. Goal of the broader refactor: move BT walk, optimal\nparser DP, FSE/Huff0 encoders into target_feature-marked submodules so\nSIMD/BMI2 intrinsics inline natively (no function-call ABI barrier) on the\ninner loops.\n\nVariants compiled per target arch:\n- scalar (portable baseline)\n- neon (aarch64, NEON is baseline ISA but Rust still gates intrinsics)\n- sse42 (x86, runtime-fallback)\n- avx2_bmi2 (x86, Haswell+)\n\nDispatcher (`select_kernel`) caches the chosen variant via OnceLock so the\nsingle indirect call lands once per encoder invocation. No callers wired up\nyet — Week 2a starts the migration with match-length helpers.\n\nBaseline tag for cumulative perf comparison: perf/pre-intrinsics-refactor-baseline\n\n* refactor(encoding): fastpath match-length kernels per CPU feature\n\nAdd per-variant implementations of the BT-walk match-length probe under\nsrc/encoding/fastpath/{scalar,neon,sse42,avx2_bmi2}.rs. Each module groups\nits kernel functions under the same `#[target_feature]` umbrella so\nintrinsics inline freely inside the module. Public dispatch entry points\n`dispatch_count_match_from_indices` and `dispatch_common_prefix_len_ptr`\nland on `fastpath::mod` and switch on the cached `select_kernel()` once\nper call.\n\nKernels added (mirrors of `MatchGenerator::common_prefix_len_*` and\n`HcMatchGenerator::count_match_from_indices`):\n\n- scalar: portable word-XOR loop + byte tail (no target_feature)\n- neon (aarch64): 16-byte vector loop + scalar tail, marked\n  `target_feature(enable = \"neon\")` so vld1q_u8/vceqq_u8 inline\n- sse42 (x86_64): 16-byte SSE2 loop, `target_feature(enable = \"sse4.2\")`\n- avx2_bmi2 (x86_64): 32-byte AVX2 loop, `target_feature(enable =\n  \"avx2,bmi2\")` so BMI2 ops in later commits inline alongside\n\nNo callers wired up yet — Week 3a lifts BT walk methods\n(`bt_insert_step_no_rebase`, `bt_insert_and_collect_matches`) into the\numbrella so they call the per-kernel symbol directly. The dispatcher\nshims exist now so the call-site refactor lands as a single mechanical\nswap.\n\nUnit tests cover scalar correctness and neon == scalar parity on\nmixed-length inputs.\n\n* refactor(encoding): route match-length through fastpath dispatcher\n\nSwitch the remaining match-length call sites in `match_generator.rs` to\nthe `fastpath::dispatch_*` entry points and delete the now-dead local\nSIMD helpers:\n\n  - `MatchGenerator::common_prefix_len(&[u8], &[u8])` now goes through\n    `fastpath::dispatch_common_prefix_len_ptr` (slice → ptr+len with the\n    SAFETY-justified pointer conversion).\n  - `HcMatchGenerator::count_match_from_indices` now delegates to\n    `fastpath::dispatch_count_match_from_indices`.\n  - `chain_walk` inside `collect_optimal_candidates_initialized` and the\n    `hash3_candidate` probe both call `fastpath::dispatch_common_prefix_len_ptr`\n    directly; the BT walk caller will be lifted into the umbrella in\n    Week 3a so this dispatcher boundary collapses away.\n\nRemoved from `match_generator.rs`:\n  - `enum PrefixKernel` + `select_x86_prefix_kernel`\n  - `MatchGenerator::detect_prefix_kernel` (std + no_std variants)\n  - `MatchGenerator::mismatch_byte_index`\n  - `MatchGenerator::common_prefix_len_scalar` / `_scalar_ptr`\n  - `prefix_len_simd_sse2` / `_avx2` / `_neon`\n  - Their now-unused intrinsic imports\n\nThe functionality lives in `fastpath::{scalar,neon,sse42,avx2_bmi2}`.\n\nThis commit is intentionally perf-neutral or slightly negative — the\ndispatcher's per-call `match select_kernel()` is the same shape as the\nprevious `OnceLock<PrefixKernel>` check. The structural win lands when\nBT walk methods themselves adopt `#[target_feature]` in Week 3a and call\nthe per-kernel symbol directly so the entire inner loop inlines.\n\n* refactor(encoding): hash kernels under fastpath umbrella\n\nAdd per-CPU `hash_mix_u64` variants in `fastpath/{scalar,neon,sse42,\navx2_bmi2}.rs`. Each variant matches the donor CRC-folded hash mix used\nby Dfast/Row hash compute. Shared constant `HASH_MIX_PRIME` lives in\n`fastpath::scalar`.\n\nDispatch entry `fastpath::dispatch_hash_mix_u64` switches on the cached\n`select_kernel()` and routes to:\n- `scalar::hash_mix_u64`: portable Knuth multiply\n- `neon::hash_mix_u64`: aarch64 `__crc32d` under `target_feature = \"crc\"`\n- `sse42::hash_mix_u64`: x86_64 `_mm_crc32_u64` under `target_feature\n  = \"sse4.2\"`\n- `avx2_bmi2::hash_mix_u64`: same CRC32 instruction, hoisted under the\n  AVX2+BMI2 umbrella so future AVX2 callers inline alongside it\n\nRemoved from `match_generator.rs`:\n- `enum HashMixKernel` + `detect_hash_mix_kernel` (std + no_std)\n- `hash_mix_u64_with_kernel`\n- `hash_mix_u64_sse42` / `hash_mix_u64_crc` and their intrinsic imports\n- `hash_mix_kernel: HashMixKernel` field from `DfastMatchGenerator` and\n  `RowMatchGenerator` (each had its own copy, redundant with the\n  module-level cache)\n- `HASH_MIX_PRIME` constant (lives in `fastpath::scalar`)\n\n`Dfast::hash_index` and `Row::hash_and_row` now call\n`fastpath::dispatch_hash_mix_u64` directly. Tests updated to compare\nthe dispatcher result against the relevant `fastpath::<kernel>` symbol.\n\nSame migration-shim shape as Week 2a — no perf win expected from this\ncommit alone; the structural win lands when BT walk / DP / FSE callers\ngo under their own `target_feature` umbrella in Week 3+.\n\n* refactor(encoding): bt_insert_step_no_rebase under target_feature umbrella\n\nHoist `HcMatchGenerator::bt_insert_step_no_rebase` body into a shared\n`bt_insert_step_no_rebase_body!` macro and instantiate it once per CPU\nkernel:\n\n- `bt_insert_step_no_rebase_neon` is `#[target_feature(enable = \"neon\")]`\n  and calls `fastpath::neon::count_match_from_indices` directly. Because\n  the wrapper itself is in the NEON umbrella, the per-iteration\n  match-length probe no longer pays the function-call ABI barrier — the\n  vectorized inner loop should now inline into the BT walk hot loop on\n  aarch64. This is the structural win the refactor plan was aiming at\n  for level22 / btultra2; bench impact lands at end-of-refactor.\n- `bt_insert_step_no_rebase_scalar` mirrors the body using\n  `fastpath::scalar::count_match_from_indices` for non-aarch64 targets\n  (cfg-gated so aarch64 builds don't carry the dead copy).\n- Cross-platform entry `bt_insert_step_no_rebase` is a thin cfg\n  dispatcher to the right variant.\n\n`HcMatchGenerator::count_match_from_indices` is kept as a fastpath\ndispatcher shim for the remaining callers\n(`bt_insert_and_collect_matches`, HC chain walk) which still cross the\nABI boundary per iteration. Those are migrated in subsequent Week 3a\ncommits.\n\nx86_64 SSE4.2 and AVX2+BMI2 variants of `bt_insert_step_no_rebase` will\nland alongside the matching umbrella wrappers when the migration reaches\nthat target; the macro is shaped so adding them is a single 5-line\nwrapper per variant.\n\n* refactor(encoding): bt_insert_and_collect_matches under NEON umbrella\n\nSame lift as `bt_insert_step_no_rebase`: the body is now in\n`bt_insert_and_collect_matches_body!` macro; the aarch64 wrapper\n`bt_insert_and_collect_matches_neon` is `#[target_feature(enable =\n\"neon\")]` and feeds the macro `fastpath::neon::count_match_from_indices`\nso the per-iteration match-length probe inlines into the BT walk loop.\nScalar fallback `bt_insert_and_collect_matches_scalar` covers\nnon-AArch64 targets.\n\n`HcMatchGenerator::count_match_from_indices` shim is removed — all\nremaining callers now go through one of:\n- `fastpath::dispatch_*` (HC chain walk, hash3 probe)\n- per-kernel direct symbol inside the BT walk umbrellas\n\nx86 (`_sse42`, `_avx2_bmi2`) variants of `bt_insert_and_collect_matches`\nwill land alongside the matching `bt_insert_step_no_rebase` x86\nwrappers when the migration reaches that target.\n\nCorrectness gates (roundtrip_integrity 30 tests, cross_validation 18\ntests) all pass.\n\n* refactor(encoding): SSE4.2 + AVX2+BMI2 umbrella variants of BT walk\n\nAdd the matching x86_64 wrappers for both BT walk functions via the\nexisting body macros:\n\n- `bt_insert_step_no_rebase_sse42` / `_avx2_bmi2`\n- `bt_insert_and_collect_matches_sse42` / `_avx2_bmi2`\n\nEach is one ~10-line wrapper that instantiates the shared\n`bt_*_body!` macro with the matching `fastpath::<kernel>::count_match_from_indices`\npath. Under their respective `#[target_feature]` umbrella the inner\nmatch-length probe inlines just as the aarch64 NEON variant.\n\nCross-platform dispatcher (`bt_insert_step_no_rebase` /\n`bt_insert_and_collect_matches`) gains an x86 branch that consults the\nruntime kernel via `fastpath::select_kernel()` and routes to the right\nvariant. Single indirect dispatch per call (same shape as the existing\nhash kernel dispatch), then everything inlines inside the chosen\numbrella.\n\nVariants are cfg-gated to their architectures so aarch64 builds don't\ncarry the x86 copies and vice versa. Cross-platform correctness will be\nvalidated when CI lands on x86 in Week 5-6.\n\n* refactor(encoding): cache fastpath kernel in Dfast/Row matchers\n\nHot path fix: `dispatch_hash_mix_u64` resolves the kernel via `OnceLock`\non every call. Dfast `hash_index` runs once per input byte at default\nlevel, so the atomic load + null check was paying ~3-5 cycles per byte\n× millions of bytes → measurable regression vs the pre-refactor pattern\nthat stored `HashMixKernel` directly in the matcher struct.\n\nRe-introduce that pattern using the fastpath types:\n\n- Add `hash_kernel: FastpathKernel` field to `DfastMatchGenerator` and\n  `RowMatchGenerator`. Init via `fastpath::select_kernel()` in `new()`.\n- Add `fastpath::hash_mix_u64_with_kernel(kernel, value)` that takes the\n  resolved kernel by value and dispatches via match. `#[inline(always)]`\n  so it folds into the caller.\n- `fastpath::dispatch_hash_mix_u64` (kept for cold paths) now just calls\n  `hash_mix_u64_with_kernel(select_kernel(), value)`.\n\nDfast/Row callers and the row-hash unit test now use the cached-kernel\nform. Bench: level22 returns to parity with baseline (≤1% within noise);\ndefault still shows residual regression but ~half of pre-fix delta.\nRemaining gap likely comes from cross-module call shape; chased later\nin the refactor if it persists after BT walk / FSE umbrella lifts land.\n\n* refactor(encoding): bt_update_tree_until under target_feature umbrella\n\n`bt_update_tree_until` walks the BT-tree fill loop calling\n`bt_insert_step_no_rebase` once per skipped position. Each iteration was\ncrossing the ABI boundary into the kernel-specific\n`bt_insert_step_no_rebase_<kernel>` (Week 3a). Lift `bt_update_tree_until`\nitself under the same umbrella so the per-iteration step inlines.\n\nAdds per-kernel wrappers (`_neon`, `_sse42`, `_avx2_bmi2`, `_scalar`)\nthat each call the matching `bt_insert_step_no_rebase_<kernel>` directly\ninside their `#[target_feature]` umbrella. Cross-platform entry is a\nthin cfg + runtime-kernel dispatcher (single ABI barrier per\n`bt_update_tree_until` call instead of one per fill iteration).\n\n`maybe_rebase_positions` / `can_skip_rebase_check_at` are plain integer\nmath methods on `&mut self` — they remain callable from inside any of\nthe umbrellas without further changes.\n\nBody is duplicated four times (one per kernel) rather than going\nthrough `macro_rules!` because the body is small (10 lines) — the\nduplication overhead is lower than the macro indirection here.\n\n* refactor(encoding): for_each_repcode_candidate_with_reps under umbrella\n\nSame per-CPU split as the BT walk methods:\n`for_each_repcode_candidate_body!` macro shares the loop body, then four\nthin wrappers (`_neon`, `_sse42`, `_avx2_bmi2`, `_scalar`) instantiate it\nwith the matching `fastpath::<kernel>::common_prefix_len_ptr` path. Each\nwrapper is `#[target_feature(...)]` so the per-rep prefix probe inlines\nunder the umbrella — was paying an ABI barrier per rep × 3 reps × N\npositions before.\n\nBody switches from `Self::common_prefix_len(&[u8], &[u8])` (dispatcher\nshim) to direct `$cpl(base.add(candidate_idx), base.add(current_idx),\nmax)` calls with explicit `max` clamping (shorter remaining run × tail\nlimit) so the kernel function operates on raw pointers without rebuilding\nslices.\n\nCross-platform entry is a thin runtime/cfg dispatcher (single ABI per\nouter call). Closure parameter `f: impl FnMut(MatchCandidate)` is\nforwarded through unchanged — monomorphization at each call site keeps\nthe closure body inlined inside the variant's umbrella.\n\n* refactor(encoding): hash3_candidate under target_feature umbrella\n\nSame pattern as the BT walk / for_each_repcode methods: `hash3_candidate_body!`\nmacro carries the body, four kernel-specific wrappers\n(`_neon`/`_sse42`/`_avx2_bmi2`/`_scalar`) instantiate it with the matching\n`fastpath::<kernel>::common_prefix_len_ptr` path. The inner SAFETY-gated\nprefix probe inlines under each wrapper's `target_feature` umbrella; the\ncross-platform `hash3_candidate` becomes a thin cfg/runtime dispatcher.\n\nCalled once per encoded position (when the rep ladder doesn't cover the\nposition) → one ABI barrier saved per call, compounding across the\nsegment.\n\n* refactor(encoding): collect_optimal_candidates_initialized under umbrella\n\nThe level22 per-position pipeline now executes inside one\n`target_feature` umbrella per kernel:\n- BT-tree fill (`bt_update_tree_until_<kernel>`)\n- Repcode probing (`for_each_repcode_candidate_with_reps_<kernel>`)\n- Hash3 probing (`hash3_candidate_<kernel>`)\n- BT match collection (`bt_insert_and_collect_matches_<kernel>`)\n- HC chain walk fallback (`fastpath::<kernel>::common_prefix_len_ptr`)\n\n`collect_optimal_candidates_initialized_body!` macro shares the 150-line\npipeline body. Four kernel-specific wrappers\n(`_neon`/`_sse42`/`_avx2_bmi2`/`_scalar`) instantiate the macro with\nmatching helper method names + the kernel's `common_prefix_len_ptr` path.\nEach wrapper is `#[target_feature(...)]` and `const-generic` over\n`USE_BT_MATCHFINDER` (BT vs HC parse modes share the path).\n\nCross-platform entry `collect_optimal_candidates_initialized` is a thin\ncfg + runtime-kernel dispatcher (1 ABI per outer call). The on-encode\nhot path bypasses the dispatchers of inner helpers\n(`bt_insert_and_collect_matches`, `hash3_candidate`,\n`for_each_repcode_candidate_with_reps`) since the umbrella variants are\ncalled directly through the macro. Those dispatchers are kept\n`#[allow(dead_code)]` for tests / external callers.\n\nCompounds on top of Week 3a — the entire BT walk + per-position match\ngathering for level22 is now a single ABI barrier per call instead of\n~6 per call.\n\n* refactor(encoding): build_optimal_plan_impl under target_feature umbrella\n\nLast per-position ABI barrier in the level22 hot path closed. The DP\nloop now executes inside the same `target_feature` umbrella as the\nper-position `collect_optimal_candidates_initialized_<kernel>` it\ninvokes — Rust inlines the entire match-gathering pipeline (BT tree\nfill + rep probes + hash3 probe + BT collect / HC chain walk + per-\niter match-length probe) directly into the DP loop body.\n\n`build_optimal_plan_impl_body!` macro carries the ~730-line DP body,\nparameterised over `$self` and the seven function-level identifiers\n(`$current`, `$current_abs_start`, `$current_len`, `$initial_state`,\n`$stats`, `$out`, `$collect`). All `$ident` substitutions present so\nmacro_rules hygiene resolves caller-scope bindings; `Self::` references\nin the original body are rewritten to `HcMatchGenerator::` to stay path-\naddressable from the macro expansion.\n\nFour kernel-specific wrappers\n(`build_optimal_plan_impl_{neon,sse42,avx2_bmi2,scalar}`) each\ninstantiate the macro with the matching\n`collect_optimal_candidates_initialized_<kernel>` method, marked with\nthe corresponding `#[target_feature]`. Cross-platform entry\n`build_optimal_plan_impl` is a thin cfg + runtime-kernel dispatcher\n(one ABI barrier per outer call from the segment loop in\n`compress_optimal`).\n\nA pre-umbrella copy of the DP body is kept temporarily as\n`build_optimal_plan_impl_OLD` (allow_dead_code) for diff review of this\ncommit. It has no live callers and will be removed in a follow-up.\n\nLevel22 critical path is now:\n\n  compress_optimal\n    → build_optimal_plan_impl (1 ABI per segment)\n    → build_optimal_plan_impl_<kernel> [target_feature umbrella]\n        → collect_optimal_candidates_initialized_<kernel>     [inline]\n            → bt_update_tree_until_<kernel>                   [inline]\n                → bt_insert_step_no_rebase_<kernel>           [inline]\n                    → fastpath::<kernel>::count_match...      [inline]\n                        → fastpath::<kernel>::prefix_len_simd [inline]\n            → for_each_repcode_candidate_with_reps_<kernel>   [inline]\n                → fastpath::<kernel>::common_prefix_len_ptr   [inline]\n            → hash3_candidate_<kernel>                        [inline]\n                → fastpath::<kernel>::common_prefix_len_ptr   [inline]\n            → bt_insert_and_collect_matches_<kernel>          [inline]\n                → fastpath::<kernel>::count_match...          [inline]\n\nOne ABI boundary per segment instead of N×6 per segment.\n\n* refactor(encoding): remove pre-umbrella build_optimal_plan_impl_OLD copy\n\n`build_optimal_plan_impl_OLD` was kept after Week 3d as a diff anchor for\nreview. The umbrella variants pass the full correctness suite and the\nsingle source of truth lives in `build_optimal_plan_impl_body!` macro, so\nthe duplicate is removed (-735 lines).\n\n`collect_optimal_candidates_initialized` cross-platform dispatcher is now\nexercised only by the `#[cfg(test)]` `collect_optimal_candidates` shim;\nmarked `#[allow(dead_code)]` for release builds so dead-code lint stays\nclean.\n\n* perf(encoding): drop saturating ops on cost-model hot path\n\nDonor uses raw scalar arithmetic everywhere (zstd_opt.c:45-65, 354-387);\nour hot-path defensive `saturating_*` ops compile into CMOV chains that\nadd ~1 cycle each. In the BtUltra2 DP body these run per match per\nposition, accumulating measurable overhead.\n\nReplace with raw `+`/`-`/`*` (gated by `debug_assert!` where donor has\nits own asserts) in:\n- `HcOptState::bit_weight` / `frac_weight` (donor `ZSTD_bitWeight` /\n  `ZSTD_fracWeight`)\n- `HcOptState::downscale_stats` / `scale_stats` (donor\n  `ZSTD_downscaleStats` / `ZSTD_scaleStats`)\n- `HcOptState::update_stats` (donor `ZSTD_updateStats`)\n- `HcOptimalCostProfile::literal_price` / `lit_length_price` /\n  `offset_price_unrep` / `match_length_price` (donor\n  `ZSTD_rawLiteralsCost` / `ZSTD_litLengthPrice` / `ZSTD_getMatchPrice`)\n- DP body predecessor lookups inside `build_optimal_plan_impl_body!`\n\nAll invariants are guaranteed by callers and matched against donor\npreconditions (e.g. `cur >= opt[cur].mlen`, `match_len >= MINMATCH`,\n`lit_sum_base_price >= BITCOST_MULTIPLIER`).\n\nRatio gate (`level22_stays_within_ffi_level22_on_corpus_proxy`),\nroundtrip and cross-validation tests pass.\n\n* fix(encoding): silence unused_unsafe on scalar fastpath fallbacks\n\nCI runs clippy on `x86_64-unknown-linux-gnu` with Rust 1.95 stable.\nThe macro-generated `unsafe { ... }` wrappers in the body macros\n(`build_optimal_plan_impl_body`, `collect_optimal_candidates_initialized_body`)\nare required when invoked from NEON/SSE4.2/AVX2+BMI2 wrappers (callees are\n`unsafe fn`) but redundant when routed through the scalar variant\n(callees are safe fns). `unused_unsafe` is deny-by-default under\n`-D warnings` and fires on the scalar-instantiation path, breaking the\nlint job.\n\n- `fastpath` module: explicit inner `unsafe { }` annotations around\n  intrinsic calls are kept for safety documentation (Rust 2024 idiom).\n  Allow `unused_unsafe` at module level since the outer `unsafe fn`\n  already provides the unsafe context.\n- `build_optimal_plan_impl_scalar` / `collect_optimal_candidates_initialized_scalar`:\n  attach `#[allow(unused_unsafe)]` so the macro-emitted unsafe wrappers\n  compile cleanly on scalar-only builds without weakening the lint\n  globally.\n- Gate `is_x86_feature_detected` import on `cfg(test)` so the lib build\n  on x86 doesn't produce an `unused_imports` error (the macro is only\n  consumed by tests).\n\n* fix(encoding): align NEON hash_mix rotate with x86 kernels\n\n- Use rotate_left(13) in NEON hash_mix_u64 to match the SSE4.2/AVX2\n  variants. All three kernels now agree on the bit-rotation count so\n  cross-kernel hash equivalence holds when invoked on the same input.\n- Replace the user-local refactor-plan link in fastpath/mod.rs docs\n  with a pointer to the PR description.\n- Split the LE-only mismatch_byte_index test into two cfg-gated\n  variants (LE keeps the 0xff00 expectation; BE adds the mirrored\n  0xff case for the leading_zeros()/8 branch).\n\n* refactor(encoding): share Huffman reuse decision between encoder and estimator\n\nThe splitter cost estimator (`estimate_literals_section_bytes`) and the real\nencoder (`compress_literals`) used different cost models to decide whether\nto reuse the prior Huffman table or emit a fresh one — the estimator scored\nboth candidates with the 4-stream `estimate_huff_payload_bytes_checked`\nwhile the encoder used single-stream `estimate_compressed_size`. The two\ncould therefore disagree on the chosen table for the same input, biasing\nthe post-split partition search to pick partitions the encoder would not\nactually produce.\n\nExtract `decide_huff_reuse_like_encoder` and route both call sites through\nit. The decision now uses single-stream estimates byte-for-byte with the\ndonor; the splitter's final cost reporting keeps the 4-stream wire model\nfor the *chosen* table since that is what the encoder actually emits via\n`encode4x` on `lit_size ≥ 256`.\n\n* fix(encoding): compare compressed vs raw literals as on-wire sections\n\nBoth the splitter cost estimator (`estimate_literals_section_bytes`) and\nthe real encoder (`compress_literals`) decide to fall back to raw\nliterals when \"compressed >= literals.len()\". The LHS already includes\nthe compressed literals header (1–3 bytes) plus the Huffman tree\ndescription (when emitting a new table), but the RHS used bare\n`literals.len()` without the raw section's own 1–3 byte header. For\nsmall payloads where the raw header is smaller than the compressed\nheader, the comparison forces a raw fallback even when the compressed\nsection is actually smaller on the wire.\n\nDonor parity (`zstd_compress_literals.c:188`): donor compares `cLitSize`\n(payload-only, header excluded) against `srcSize - minGain`, i.e. both\nsides without their own headers. Our equivalent is to compare the full\non-wire sections — `total` (compressed header + tree + payload) against\n`uncompressed_literals_header_bytes(literals.len()) + literals.len()`.\n\nEstimator and encoder now use the same `raw_section_bytes` formulation\nand the splitter no longer biases toward raw on small literal payloads.\n\n* fix(encoding): gate fastpath kernel selection on CRC32 ISA support\n\nEach accelerated `hash_mix_u64` variant calls a hardware CRC32 instruction\nthat is NOT included in the SIMD umbrella naming the kernel:\n\n  * `_mm_crc32_u64` lives under SSE4.2, not AVX2/BMI2. Every shipping AVX2\n    CPU also has SSE4.2 but Rust's `target_feature` machinery does not\n    propagate that implication.\n  * `__crc32d` is the optional `crc` AArch64 extension, separate from the\n    NEON baseline.\n\nThe runtime dispatcher previously selected `FastpathKernel::Avx2Bmi2` on\nAVX2+BMI2 alone and `FastpathKernel::Neon` on NEON alone, so a CPU\nwithout the corresponding CRC32 ISA would have trapped with an illegal\ninstruction on the first hash mix.\n\nAdd the missing checks in `detect_kernel_uncached`:\n\n  * std path (runtime, both targets): require `sse4.2` for the AVX2+BMI2\n    kernel; require `crc` alongside `neon` for the AArch64 NEON kernel.\n  * no_std path (compile-time `cfg!`): same predicates via\n    `target_feature` flags.\n\nMake the requirement self-documenting on the kernels themselves:\n\n  * AVX2+BMI2 `hash_mix_u64` now declares `enable = \"avx2,bmi2,sse4.2\"`.\n  * NEON `hash_mix_u64` keeps `enable = \"crc\"` and the doc comment now\n    explicitly states `crc` is NOT implied by NEON; callers must verify\n    both before invoking it.\n\nWhen the required CRC32 ISA is absent the dispatcher falls back to the\nscalar kernel, which uses a CRC-free multiply-only hash mix.\n\n* fix(encoding): align aarch64 kernel test and FSE histogram assert with real preconditions\n\naarch64_picks_neon was hard-asserting `FastpathKernel::Neon`, but the\ndispatcher now gates NEON selection on both the `neon` baseline and the\noptional `crc` extension. On AArch64 hosts (or CI runners) where `crc`\nis not reported the dispatcher correctly falls back to `Scalar`; the\nold assertion would treat that valid fallback as a failure. Mirror the\ndispatcher's gate in the test (std runtime detection + cfg in no_std)\nand expect `Scalar` when CRC is absent.\n\n`build_table_from_counts` panicked with \"RLE distributions must not\nbuild FSE tables\" but the actual condition was `total <= 1`. A\nsingle-distinct-symbol histogram is allowed here (some internal paths\nfeed `[N, 0]` to get an FSE table for an effectively-RLE distribution).\nReword the message to describe the real invariant — \"FSE table requires\nat least 2 samples in the histogram\" — and include the failing total\nto help debugging.",
+          "timestamp": "2026-05-13T01:33:59+03:00",
+          "tree_id": "02f4c5fd1a2ea13f3f176d36c6cade689cc95741",
+          "url": "https://github.com/structured-world/structured-zstd/commit/6d97c1c5f67391b339265799c4d6010f798066b5"
+        },
+        "date": 1778627532405,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.159,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.227,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.211,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.187,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.214,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.017,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.284,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
+            "value": 26.718,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.843,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 131.801,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.197,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 170.867,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 12.606,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/pure_rust",
+            "value": 85.666,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.539,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
+            "value": 183.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
+            "value": 19.193,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/pure_rust",
+            "value": 516.606,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/c_ffi",
+            "value": 263.299,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.839,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.232,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 15.838,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.293,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.511,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.641,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 7.824,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.309,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 5.902,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 0.999,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.806,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.403,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.008,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.041,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.686,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.038,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.968,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.113,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.958,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.197,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.723,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.073,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.568,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.981,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.971,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.88,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.183,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.635,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.047,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 8.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.904,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.943,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
             "unit": "ms"
           }
         ]
