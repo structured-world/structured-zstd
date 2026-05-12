@@ -495,10 +495,17 @@ fn estimate_literals_section_bytes(
     let compressed_header = compressed_literals_header_bytes(literals.len());
     let total = compressed_header + tree_desc + payload;
 
-    // Mirror `compress_literals` raw fallback when compressed ≥ literals.
-    if total >= literals.len() {
+    // Mirror `compress_literals` raw fallback: compare on-wire sections
+    // *byte-for-byte* — `total` already includes the compressed literals
+    // header (and the Huffman tree description when emitting a new table),
+    // so the raw side must also include its own 1–3 byte header. Comparing
+    // against bare `literals.len()` would bias the splitter toward raw on
+    // small payloads where the raw header (1 byte for size < 32) is smaller
+    // than the compressed header (3 bytes for size < 1 KB).
+    let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    if total >= raw_section_bytes {
         *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw_section_bytes;
     }
 
     if use_new {
@@ -1567,8 +1574,14 @@ fn compress_literals(
     writer.change_bits(size_index, encoded_len as u64, size_bits);
     let total_len = (writer.index() - reset_idx) / 8;
 
-    // If encoded len is bigger than the raw literals we are better off just writing the raw literals here
-    if total_len >= literals.len() {
+    // Compare on-wire sections byte-for-byte: `total_len` already includes
+    // the compressed literals header + tree description + payload, so the
+    // raw side must also include its own 1–3 byte header
+    // (`uncompressed_literals_header_bytes`). Comparing against bare
+    // `literals.len()` would bias toward raw on small payloads where the
+    // raw header is smaller than the compressed header.
+    let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    if total_len >= raw_section_bytes {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
         HuffmanTableUpdate::Cleared
