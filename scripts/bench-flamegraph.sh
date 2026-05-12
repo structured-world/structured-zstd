@@ -18,6 +18,7 @@ fi
 if cargo flamegraph \
   --bench compare_ffi \
   -p structured-zstd \
+  --features dict_builder \
   ${EXTRA_FLAMEGRAPH_ARGS[@]+"${EXTRA_FLAMEGRAPH_ARGS[@]}"} \
   --output "$OUTPUT_DIR/${BENCH_FILTER//\//_}.svg" \
   -- \

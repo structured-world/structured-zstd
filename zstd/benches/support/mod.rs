@@ -73,7 +73,7 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
 }
 
 /// Benchmark levels mapped to comparable Rust and FFI compression settings.
-pub(crate) fn supported_levels() -> [LevelConfig; 5] {
+pub(crate) fn supported_levels() -> [LevelConfig; 6] {
     [
         LevelConfig {
             name: "fastest",
@@ -100,6 +100,11 @@ pub(crate) fn supported_levels() -> [LevelConfig; 5] {
             rust_level: CompressionLevel::Best,
             ffi_level: 11,
         },
+        LevelConfig {
+            name: "level22",
+            rust_level: CompressionLevel::Level(22),
+            ffi_level: 22,
+        },
     ]
 }
 
@@ -120,11 +125,6 @@ impl Scenario {
 
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
     }
 
     pub(crate) fn throughput_bytes(&self) -> u64 {

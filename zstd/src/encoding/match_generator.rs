@@ -7,20 +7,9 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-use core::arch::aarch64::{
-    __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
-};
-#[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
-    _mm256_loadu_si256, _mm256_movemask_epi8,
-};
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    __m128i, __m256i, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_loadu_si128, _mm_movemask_epi8,
-    _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-};
+// SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
+// sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
+// intrinsic imports remain in this file.
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
@@ -30,12 +19,19 @@ use super::Matcher;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
-#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    test,
+    feature = "std",
+    target_arch = "aarch64",
+    target_endian = "little"
+))]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 use std::arch::is_x86_feature_detected;
-#[cfg(feature = "std")]
-use std::sync::OnceLock;
 
 const MIN_MATCH_LEN: usize = 5;
 const FAST_HASH_FILL_STEP: usize = 3;
@@ -61,12 +57,18 @@ const ROW_TARGET_LEN: usize = 48;
 const ROW_TAG_BITS: usize = 8;
 const ROW_EMPTY_SLOT: usize = usize::MAX;
 const ROW_HASH_KEY_LEN: usize = 4;
-const HASH_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+// HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
+// per-CPU `hash_mix_u64` variants share it via that module.
+const HC_PRIME3BYTES: u32 = 506_832_829;
+const HC_PRIME4BYTES: u32 = 2_654_435_761;
 
 const HC_HASH_LOG: usize = 20;
 const HC_CHAIN_LOG: usize = 19;
+const HC3_HASH_LOG: usize = 17;
+const HC3_MAX_OFFSET: usize = 1 << 18;
 const HC_SEARCH_DEPTH: usize = 16;
-const HC_MIN_MATCH_LEN: usize = 5;
+const HC_MIN_MATCH_LEN: usize = 4;
+const HC_OPT_MIN_MATCH_LEN: usize = HC_FORMAT_MINMATCH;
 const HC_TARGET_LEN: usize = 48;
 // Positions are stored as (relative_pos + 1) so that 0 is a safe empty
 // sentinel that can never collide with any valid position.
@@ -74,90 +76,14 @@ const HC_EMPTY: u32 = 0;
 
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
-const MAX_HC_SEARCH_DEPTH: usize = 32;
+const MAX_HC_SEARCH_DEPTH: usize = 512;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u8)]
-enum HashMixKernel {
-    Scalar = 0,
-    #[cfg(target_arch = "x86_64")]
-    X86Sse42 = 1,
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    Aarch64Crc = 2,
-}
-
-#[inline(always)]
-fn hash_mix_u64_with_kernel(value: u64, kernel: HashMixKernel) -> u64 {
-    match kernel {
-        HashMixKernel::Scalar => value.wrapping_mul(HASH_MIX_PRIME),
-        #[cfg(target_arch = "x86_64")]
-        HashMixKernel::X86Sse42 => {
-            // SAFETY: runtime/static detection selected this kernel.
-            unsafe { hash_mix_u64_sse42(value) }
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        HashMixKernel::Aarch64Crc => {
-            // SAFETY: runtime/static detection selected this kernel.
-            unsafe { hash_mix_u64_crc(value) }
-        }
-    }
-}
-
-#[inline(always)]
-fn detect_hash_mix_kernel() -> HashMixKernel {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if is_x86_feature_detected!("sse4.2") {
-        return HashMixKernel::X86Sse42;
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-    if is_aarch64_feature_detected!("crc") {
-        return HashMixKernel::Aarch64Crc;
-    }
-
-    #[cfg(all(not(feature = "std"), target_arch = "x86_64"))]
-    if cfg!(target_feature = "sse4.2") {
-        return HashMixKernel::X86Sse42;
-    }
-
-    #[cfg(all(
-        not(feature = "std"),
-        target_arch = "aarch64",
-        target_endian = "little"
-    ))]
-    if cfg!(target_feature = "crc") {
-        return HashMixKernel::Aarch64Crc;
-    }
-
-    HashMixKernel::Scalar
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse4.2")]
-unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
-    let crc = _mm_crc32_u64(0, value);
-    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(HASH_MIX_PRIME)
-}
-
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[target_feature(enable = "crc")]
-unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
-    // Feed the full 64-bit lane through ARM CRC32 and then mix back with a
-    // rotated copy of the source to keep dispersion in the upper bits used by
-    // hash table indexing.
-    let crc = __crc32d(0, value) as u64;
-    ((crc << 32) ^ value.rotate_left(17)).wrapping_mul(HASH_MIX_PRIME)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum PrefixKernel {
-    Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Sse2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Avx2,
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    Aarch64Neon,
+enum HcParseMode {
+    Lazy2,
+    BtOpt,
+    BtUltra,
+    BtUltra2,
 }
 
 /// Bundled tuning knobs for the hash-chain matcher. Using a typed config
@@ -168,6 +94,7 @@ struct HcConfig {
     chain_log: usize,
     search_depth: usize,
     target_len: usize,
+    parse_mode: HcParseMode,
 }
 
 #[derive(Copy, Clone)]
@@ -183,6 +110,7 @@ const HC_CONFIG: HcConfig = HcConfig {
     chain_log: HC_CHAIN_LOG,
     search_depth: HC_SEARCH_DEPTH,
     target_len: HC_TARGET_LEN,
+    parse_mode: HcParseMode::Lazy2,
 };
 
 /// Best-level: deeper search, larger tables, higher target length.
@@ -191,6 +119,63 @@ const BEST_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 20,
     search_depth: 32,
     target_len: 128,
+    parse_mode: HcParseMode::Lazy2,
+};
+
+const BTOPT_HC_CONFIG: HcConfig = HcConfig {
+    hash_log: 23,
+    chain_log: 22,
+    search_depth: 32,
+    target_len: 256,
+    parse_mode: HcParseMode::BtOpt,
+};
+
+const BTULTRA_HC_CONFIG: HcConfig = HcConfig {
+    hash_log: 23,
+    chain_log: 23,
+    search_depth: 32,
+    target_len: 256,
+    parse_mode: HcParseMode::BtUltra,
+};
+
+const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
+    hash_log: 24,
+    chain_log: 24,
+    search_depth: 512,
+    target_len: 256,
+    parse_mode: HcParseMode::BtUltra2,
+};
+
+const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
+    hash_log: 25,
+    chain_log: 27,
+    search_depth: 512,
+    target_len: 999,
+    parse_mode: HcParseMode::BtUltra2,
+};
+
+const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
+    hash_log: 19,
+    chain_log: 19,
+    search_depth: 1 << 13,
+    target_len: 999,
+    parse_mode: HcParseMode::BtUltra2,
+};
+
+const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
+    hash_log: 17,
+    chain_log: 18,
+    search_depth: 1 << 11,
+    target_len: 999,
+    parse_mode: HcParseMode::BtUltra2,
+};
+
+const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
+    hash_log: 15,
+    chain_log: 15,
+    search_depth: 1 << 10,
+    target_len: 999,
+    parse_mode: HcParseMode::BtUltra2,
 };
 
 const ROW_CONFIG: RowConfig = RowConfig {
@@ -224,9 +209,8 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Parameter table for numeric compression levels 1–22.
 ///
 /// Each entry maps a zstd compression level to the best-available matcher
-/// backend and tuning knobs.  Levels that require strategies this crate does
-/// not implement (greedy, btopt, btultra) are approximated with the closest
-/// available backend.
+/// backend and tuning knobs. High levels map to dedicated parse modes:
+/// btopt (16-17), btultra (18-19), btultra2 (20-22).
 ///
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
@@ -237,24 +221,24 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 2 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 4 */ LevelParams { backend: MatcherBackend::Row,       window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32  }, row: ROW_CONFIG },
-    /* 6 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48  }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48  }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64  }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64  }, row: ROW_CONFIG },
-    /*10 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96  }, row: ROW_CONFIG },
+    /* 5 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
     /*11 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
-    /*12 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*17 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*18 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*19 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*20 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*21 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
-    /*22 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 32, target_len: 256 }, row: ROW_CONFIG },
+    /*12 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
+    /*16 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*17 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*18 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*19 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*20 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*21 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*22 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -306,9 +290,48 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     params
 }
 
+fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelParams {
+    let mut hc = match source_size {
+        Some(size) if size <= 16 * 1024 => BTULTRA2_HC_CONFIG_L22_16K,
+        Some(size) if size <= 128 * 1024 => BTULTRA2_HC_CONFIG_L22_128K,
+        Some(size) if size <= 256 * 1024 => BTULTRA2_HC_CONFIG_L22_256K,
+        _ => BTULTRA2_HC_CONFIG_L22,
+    };
+    let mut window_log = match source_size {
+        Some(size) if size <= 16 * 1024 => 14,
+        Some(size) if size <= 128 * 1024 => 17,
+        Some(size) if size <= 256 * 1024 => 18,
+        _ => 27,
+    };
+    if let Some(size) = source_size
+        && size > 256 * 1024
+    {
+        let src_log = if size == 0 {
+            MIN_WINDOW_LOG
+        } else {
+            (64 - (size - 1).leading_zeros()) as u8
+        };
+        window_log = window_log.min(src_log.max(MIN_WINDOW_LOG));
+        let adjusted_table_log = window_log as usize + 1;
+        hc.hash_log = hc.hash_log.min(adjusted_table_log);
+        hc.chain_log = hc.chain_log.min(adjusted_table_log);
+    }
+    LevelParams {
+        backend: MatcherBackend::HashChain,
+        window_log,
+        hash_fill_step: 1,
+        lazy_depth: 2,
+        hc,
+        row: ROW_CONFIG,
+    }
+}
+
 /// Resolve a [`CompressionLevel`] to internal tuning parameters,
 /// optionally adjusted for a known source size.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
+    if matches!(level, CompressionLevel::Level(22)) {
+        return level22_btultra2_params_for_source_size(source_size);
+    }
     let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
             backend: MatcherBackend::Simple,
@@ -668,7 +691,7 @@ impl Matcher for MatchGeneratorDriver {
                     .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
                 hc.max_window_size = max_window_size;
                 hc.lazy_depth = params.lazy_depth;
-                hc.configure(params.hc);
+                hc.configure(params.hc, params.window_log);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -683,7 +706,11 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
             MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
             MatcherBackend::Row => self.row_matcher_mut().offset_hist = offset_hist,
-            MatcherBackend::HashChain => self.hc_matcher_mut().offset_hist = offset_hist,
+            MatcherBackend::HashChain => {
+                let matcher = self.hc_matcher_mut();
+                matcher.offset_hist = offset_hist;
+                matcher.mark_dictionary_primed();
+            }
         }
 
         if dict_content.is_empty() {
@@ -773,6 +800,23 @@ impl Matcher for MatchGeneratorDriver {
             self.dictionary_retained_budget = self
                 .dictionary_retained_budget
                 .saturating_add(committed_dict_budget);
+        }
+        if self.active_backend == MatcherBackend::HashChain {
+            self.hc_matcher_mut()
+                .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
+        }
+    }
+
+    fn seed_dictionary_entropy(
+        &mut self,
+        huff: Option<&crate::huff0::huff0_encoder::HuffmanTable>,
+        ll: Option<&crate::fse::fse_encoder::FSETable>,
+        ml: Option<&crate::fse::fse_encoder::FSETable>,
+        of: Option<&crate::fse::fse_encoder::FSETable>,
+    ) {
+        if self.active_backend == MatcherBackend::HashChain {
+            self.hc_matcher_mut()
+                .seed_dictionary_entropy(huff, ll, ml, of);
         }
     }
 
@@ -990,77 +1034,6 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[inline(always)]
-    const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
-        if has_avx2 {
-            return PrefixKernel::X86Avx2;
-        }
-        if has_sse2 {
-            return PrefixKernel::X86Sse2;
-        }
-        PrefixKernel::Scalar
-    }
-
-    #[cfg(feature = "std")]
-    #[inline(always)]
-    fn detect_prefix_kernel() -> PrefixKernel {
-        static KERNEL: OnceLock<PrefixKernel> = OnceLock::new();
-        *KERNEL.get_or_init(|| {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                let kernel = Self::select_x86_prefix_kernel(
-                    is_x86_feature_detected!("avx2"),
-                    is_x86_feature_detected!("sse2"),
-                );
-                if kernel != PrefixKernel::Scalar {
-                    return kernel;
-                }
-            }
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            {
-                if is_aarch64_feature_detected!("neon") {
-                    return PrefixKernel::Aarch64Neon;
-                }
-            }
-            PrefixKernel::Scalar
-        })
-    }
-
-    #[cfg(not(feature = "std"))]
-    #[inline(always)]
-    fn detect_prefix_kernel() -> PrefixKernel {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            let kernel = Self::select_x86_prefix_kernel(
-                cfg!(target_feature = "avx2"),
-                cfg!(target_feature = "sse2"),
-            );
-            if kernel != PrefixKernel::Scalar {
-                return kernel;
-            }
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        {
-            if cfg!(target_feature = "neon") {
-                return PrefixKernel::Aarch64Neon;
-            }
-        }
-        PrefixKernel::Scalar
-    }
-
-    #[inline(always)]
-    #[cfg(target_endian = "little")]
-    fn mismatch_byte_index(diff: usize) -> usize {
-        diff.trailing_zeros() as usize / 8
-    }
-
-    #[inline(always)]
-    #[cfg(target_endian = "big")]
-    fn mismatch_byte_index(diff: usize) -> usize {
-        diff.leading_zeros() as usize / 8
-    }
-
     /// max_size defines how many bytes will be used at most in the window used for matching
     fn new(max_size: usize) -> Self {
         Self {
@@ -1196,108 +1169,19 @@ impl MatchGenerator {
         }
     }
 
-    /// Find the common prefix length between two byte slices
+    /// Find the common prefix length between two byte slices. Delegates to
+    /// the fastpath dispatcher so kernel selection (NEON / SSE4.2 /
+    /// AVX2+BMI2 / scalar) lives in one place. See
+    /// [`crate::encoding::fastpath`] for the per-CPU implementations.
     #[inline(always)]
     fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
         let max = a.len().min(b.len());
-        let mut off = 0usize;
-        let lhs = a.as_ptr();
-        let rhs = b.as_ptr();
-
-        match Self::detect_prefix_kernel() {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            PrefixKernel::X86Avx2 => {
-                off = unsafe { Self::prefix_len_simd_avx2(lhs, rhs, max) };
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            PrefixKernel::X86Sse2 => {
-                off = unsafe { Self::prefix_len_simd_sse2(lhs, rhs, max) };
-            }
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            PrefixKernel::Aarch64Neon => {
-                off = unsafe { Self::prefix_len_simd_neon(lhs, rhs, max) };
-            }
-            PrefixKernel::Scalar => {}
+        // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
+        // bytes; `max` is the minimum so both pointers are valid for `max`
+        // bytes.
+        unsafe {
+            crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
         }
-
-        Self::common_prefix_len_scalar(a, b, off, max)
-    }
-
-    #[inline(always)]
-    fn common_prefix_len_scalar(a: &[u8], b: &[u8], mut off: usize, max: usize) -> usize {
-        let chunk = core::mem::size_of::<usize>();
-        let lhs = a.as_ptr();
-        let rhs = b.as_ptr();
-        while off + chunk <= max {
-            let lhs_word = unsafe { core::ptr::read_unaligned(lhs.add(off) as *const usize) };
-            let rhs_word = unsafe { core::ptr::read_unaligned(rhs.add(off) as *const usize) };
-            let diff = lhs_word ^ rhs_word;
-            if diff != 0 {
-                return off + Self::mismatch_byte_index(diff);
-            }
-            off += chunk;
-        }
-        off + core::iter::zip(&a[off..max], &b[off..max])
-            .take_while(|(x, y)| x == y)
-            .count()
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse2")]
-    unsafe fn prefix_len_simd_sse2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 16 <= max {
-            let a: __m128i = unsafe { _mm_loadu_si128(lhs.add(off).cast::<__m128i>()) };
-            let b: __m128i = unsafe { _mm_loadu_si128(rhs.add(off).cast::<__m128i>()) };
-            let eq = _mm_cmpeq_epi8(a, b);
-            let mask = _mm_movemask_epi8(eq) as u32;
-            if mask != 0xFFFF {
-                return off + (!mask).trailing_zeros() as usize;
-            }
-            off += 16;
-        }
-        off
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    unsafe fn prefix_len_simd_avx2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 32 <= max {
-            let a: __m256i = unsafe { _mm256_loadu_si256(lhs.add(off).cast::<__m256i>()) };
-            let b: __m256i = unsafe { _mm256_loadu_si256(rhs.add(off).cast::<__m256i>()) };
-            let eq = _mm256_cmpeq_epi8(a, b);
-            let mask = _mm256_movemask_epi8(eq) as u32;
-            if mask != u32::MAX {
-                return off + (!mask).trailing_zeros() as usize;
-            }
-            off += 32;
-        }
-        off
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn prefix_len_simd_neon(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
-        let mut off = 0usize;
-        while off + 16 <= max {
-            let a: uint8x16_t = unsafe { vld1q_u8(lhs.add(off)) };
-            let b: uint8x16_t = unsafe { vld1q_u8(rhs.add(off)) };
-            let eq = vceqq_u8(a, b);
-            let lanes = vreinterpretq_u64_u8(eq);
-            let low = vgetq_lane_u64(lanes, 0);
-            if low != u64::MAX {
-                let diff = low ^ u64::MAX;
-                return off + Self::mismatch_byte_index(diff as usize);
-            }
-            let high = vgetq_lane_u64(lanes, 1);
-            if high != u64::MAX {
-                let diff = high ^ u64::MAX;
-                return off + 8 + Self::mismatch_byte_index(diff as usize);
-            }
-            off += 16;
-        }
-        off
     }
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
@@ -1545,13 +1429,16 @@ struct DfastMatchGenerator {
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     hash_bits: usize,
-    hash_mix_kernel: HashMixKernel,
+    /// Cached fastpath kernel for `hash_mix_u64`. Resolved once at `new()`
+    /// and reused on every `hash_index` call so we skip the per-call
+    /// `OnceLock` atomic load that `dispatch_hash_mix_u64` would pay.
+    hash_kernel: crate::encoding::fastpath::FastpathKernel,
     use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct MatchCandidate {
     start: usize,
     offset: usize,
@@ -1576,6 +1463,7 @@ fn best_len_offset_candidate(
     }
 }
 
+#[inline]
 fn extend_backwards_shared(
     concat: &[u8],
     history_abs_start: usize,
@@ -1585,10 +1473,22 @@ fn extend_backwards_shared(
     lit_len: usize,
 ) -> MatchCandidate {
     let min_abs_pos = abs_pos - lit_len;
-    while abs_pos > min_abs_pos
-        && candidate_pos > history_abs_start
-        && concat[candidate_pos - history_abs_start - 1] == concat[abs_pos - history_abs_start - 1]
-    {
+    let concat_ptr = concat.as_ptr();
+    let concat_len = concat.len();
+    // SAFETY: loop guard `candidate_pos > history_abs_start` and
+    // `abs_pos > min_abs_pos` keep both `candidate_pos - history_abs_start - 1`
+    // and `abs_pos - history_abs_start - 1` strictly positive (no underflow).
+    // Their upper bound is `concat.len() - 1` because both `candidate_pos` and
+    // `abs_pos` point at currently-live history. Asserted in debug builds.
+    while abs_pos > min_abs_pos && candidate_pos > history_abs_start {
+        let cand_off = candidate_pos - history_abs_start - 1;
+        let cur_off = abs_pos - history_abs_start - 1;
+        debug_assert!(cand_off < concat_len && cur_off < concat_len);
+        let cand_byte = unsafe { *concat_ptr.add(cand_off) };
+        let cur_byte = unsafe { *concat_ptr.add(cur_off) };
+        if cand_byte != cur_byte {
+            break;
+        }
         candidate_pos -= 1;
         abs_pos -= 1;
         match_len += 1;
@@ -1600,6 +1500,7 @@ fn extend_backwards_shared(
     }
 }
 
+#[inline]
 fn repcode_candidate_shared(
     concat: &[u8],
     history_abs_start: usize,
@@ -1608,48 +1509,65 @@ fn repcode_candidate_shared(
     lit_len: usize,
     min_match_len: usize,
 ) -> Option<MatchCandidate> {
-    let reps = if lit_len == 0 {
-        [
-            Some(offset_hist[1] as usize),
-            Some(offset_hist[2] as usize),
-            (offset_hist[0] > 1).then_some((offset_hist[0] - 1) as usize),
-        ]
-    } else {
-        [
-            Some(offset_hist[0] as usize),
-            Some(offset_hist[1] as usize),
-            Some(offset_hist[2] as usize),
-        ]
-    };
-
     let current_idx = abs_pos - history_abs_start;
     if current_idx + min_match_len > concat.len() {
         return None;
     }
 
-    let mut best = None;
-    for rep in reps.into_iter().flatten() {
-        if rep == 0 || rep > abs_pos {
-            continue;
-        }
-        let candidate_pos = abs_pos - rep;
-        if candidate_pos < history_abs_start {
-            continue;
-        }
-        let candidate_idx = candidate_pos - history_abs_start;
-        let match_len =
-            MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-        if match_len >= min_match_len {
-            let candidate = extend_backwards_shared(
-                concat,
-                history_abs_start,
-                candidate_pos,
-                abs_pos,
-                match_len,
-                lit_len,
-            );
-            best = best_len_offset_candidate(best, Some(candidate));
-        }
+    // Called once per input byte (10% exclusive on default-level profile).
+    // The previous form built an `[Option<usize>; 3]` and walked it via
+    // `into_iter().flatten()`, which the compiler couldn't always unroll
+    // through the conditional `then_some` on the last slot. Unroll the
+    // 3-rep probe by hand: each branch is a couple of compares + one
+    // `common_prefix_len` (already SIMD).
+    let mut best: Option<MatchCandidate> = None;
+
+    let (rep0, rep1, rep2_opt) = if lit_len == 0 {
+        let r2 = if offset_hist[0] > 1 {
+            Some(offset_hist[0] as usize - 1)
+        } else {
+            None
+        };
+        (offset_hist[1] as usize, offset_hist[2] as usize, r2)
+    } else {
+        (
+            offset_hist[0] as usize,
+            offset_hist[1] as usize,
+            Some(offset_hist[2] as usize),
+        )
+    };
+
+    macro_rules! probe {
+        ($rep:expr) => {{
+            let rep = $rep;
+            if rep != 0 && rep <= abs_pos {
+                let candidate_pos = abs_pos - rep;
+                if candidate_pos >= history_abs_start {
+                    let candidate_idx = candidate_pos - history_abs_start;
+                    let match_len = MatchGenerator::common_prefix_len(
+                        &concat[candidate_idx..],
+                        &concat[current_idx..],
+                    );
+                    if match_len >= min_match_len {
+                        let candidate = extend_backwards_shared(
+                            concat,
+                            history_abs_start,
+                            candidate_pos,
+                            abs_pos,
+                            match_len,
+                            lit_len,
+                        );
+                        best = best_len_offset_candidate(best, Some(candidate));
+                    }
+                }
+            }
+        }};
+    }
+
+    probe!(rep0);
+    probe!(rep1);
+    if let Some(rep2) = rep2_opt {
+        probe!(rep2);
     }
     best
 }
@@ -1717,7 +1635,7 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             hash_bits: DFAST_HASH_BITS,
-            hash_mix_kernel: detect_hash_mix_kernel(),
+            hash_kernel: crate::encoding::fastpath::select_kernel(),
             use_fast_loop: false,
             lazy_depth: 1,
         }
@@ -1849,7 +1767,7 @@ impl DfastMatchGenerator {
     ) {
         let use_adaptive_skip =
             self.block_looks_incompressible(current_abs_start, current_abs_start + current_len);
-        let mut pos = 0usize;
+        let mut pos = 1usize;
         let mut literals_start = 0usize;
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
@@ -1904,7 +1822,7 @@ impl DfastMatchGenerator {
     ) {
         let block_is_strict_incompressible = self
             .block_looks_incompressible_strict(current_abs_start, current_abs_start + current_len);
-        let mut pos = 0usize;
+        let mut pos = 1usize;
         let mut literals_start = 0usize;
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
@@ -2107,37 +2025,70 @@ impl DfastMatchGenerator {
     }
 
     fn hash_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        // Hoist all the per-loop invariants out of the combinator chains.
+        // `short_candidates`/`long_candidates` each re-fetch `live_history`
+        // and recompute `idx` from scratch inside their Option/flatten/filter
+        // adapters; on a per-byte hot path (32% exclusive on default-level
+        // profile) that's measurable Option/Iterator scaffolding the
+        // compiler can't always erase.
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
+        let history_abs_start = self.history_abs_start;
         let mut best = None;
-        for candidate_pos in self.long_candidates(abs_pos) {
-            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
-                    return best;
+
+        // Long-hash probes first (8-byte hash → longer matches more likely).
+        if current_idx + 8 <= concat.len() {
+            let long_hash = self.hash8(&concat[current_idx..]);
+            // SAFETY: `hash_index` masks to `hash_bits` and `long_hash.len()
+            // == 1 << hash_bits` (`ensure_hash_tables`).
+            debug_assert!(long_hash < self.long_hash.len());
+            let bucket = unsafe { self.long_hash.get_unchecked(long_hash) };
+            for &candidate_pos in bucket {
+                if candidate_pos == DFAST_EMPTY_SLOT
+                    || candidate_pos < history_abs_start
+                    || candidate_pos >= abs_pos
+                {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - history_abs_start;
+                let match_len = MatchGenerator::common_prefix_len(
+                    &concat[candidate_idx..],
+                    &concat[current_idx..],
+                );
+                if match_len >= DFAST_MIN_MATCH_LEN {
+                    let candidate =
+                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                    best = best_len_offset_candidate(best, Some(candidate));
+                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                        return best;
+                    }
                 }
             }
         }
 
-        for candidate_pos in self.short_candidates(abs_pos) {
-            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
-                    return best;
+        if current_idx + 4 <= concat.len() {
+            let short_hash = self.hash4(&concat[current_idx..]);
+            debug_assert!(short_hash < self.short_hash.len());
+            let bucket = unsafe { self.short_hash.get_unchecked(short_hash) };
+            for &candidate_pos in bucket {
+                if candidate_pos == DFAST_EMPTY_SLOT
+                    || candidate_pos < history_abs_start
+                    || candidate_pos >= abs_pos
+                {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - history_abs_start;
+                let match_len = MatchGenerator::common_prefix_len(
+                    &concat[candidate_idx..],
+                    &concat[current_idx..],
+                );
+                if match_len >= DFAST_MIN_MATCH_LEN {
+                    let candidate =
+                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                    best = best_len_offset_candidate(best, Some(candidate));
+                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                        return best;
+                    }
                 }
             }
         }
@@ -2183,51 +2134,36 @@ impl DfastMatchGenerator {
         }
     }
 
+    #[inline]
     fn insert_position(&mut self, pos: usize) {
-        let idx = pos - self.history_abs_start;
-        let short = {
-            let concat = self.live_history();
-            (idx + 4 <= concat.len()).then(|| self.hash4(&concat[idx..]))
-        };
-        if let Some(short) = short {
-            let bucket = &mut self.short_hash[short];
+        let idx = pos.wrapping_sub(self.history_abs_start);
+        let concat_len = self.history.len() - self.history_start;
+        // SAFETY: `hash_index` masks the mixed hash to `hash_bits` bits and
+        // both tables are sized to `1 << hash_bits` in `ensure_hash_tables`,
+        // so every index produced here is provably below the table length.
+        // Eliding the bounds check on this per-byte hot path saves ~4
+        // instructions and one branch per call.
+        if idx + 4 <= concat_len {
+            let concat = &self.history[self.history_start..];
+            let short = self.hash4(&concat[idx..]);
+            debug_assert!(short < self.short_hash.len());
+            let bucket = unsafe { self.short_hash.get_unchecked_mut(short) };
             if bucket[0] != pos {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
                 bucket[0] = pos;
             }
         }
 
-        let long = {
-            let concat = self.live_history();
-            (idx + 8 <= concat.len()).then(|| self.hash8(&concat[idx..]))
-        };
-        if let Some(long) = long {
-            let bucket = &mut self.long_hash[long];
+        if idx + 8 <= concat_len {
+            let concat = &self.history[self.history_start..];
+            let long = self.hash8(&concat[idx..]);
+            debug_assert!(long < self.long_hash.len());
+            let bucket = unsafe { self.long_hash.get_unchecked_mut(long) };
             if bucket[0] != pos {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
                 bucket[0] = pos;
             }
         }
-    }
-
-    fn short_candidates(&self, pos: usize) -> impl Iterator<Item = usize> + '_ {
-        let concat = self.live_history();
-        let idx = pos - self.history_abs_start;
-        (idx + 4 <= concat.len())
-            .then(|| self.short_hash[self.hash4(&concat[idx..])])
-            .into_iter()
-            .flatten()
-            .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
-    }
-
-    fn long_candidates(&self, pos: usize) -> impl Iterator<Item = usize> + '_ {
-        let concat = self.live_history();
-        let idx = pos - self.history_abs_start;
-        (idx + 8 <= concat.len())
-            .then(|| self.long_hash[self.hash8(&concat[idx..])])
-            .into_iter()
-            .flatten()
-            .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
     }
 
     fn hash4(&self, data: &[u8]) -> usize {
@@ -2269,7 +2205,8 @@ impl DfastMatchGenerator {
     }
 
     fn hash_index(&self, value: u64) -> usize {
-        (hash_mix_u64_with_kernel(value, self.hash_mix_kernel) >> (64 - self.hash_bits)) as usize
+        let mixed = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
+        (mixed >> (64 - self.hash_bits)) as usize
     }
 }
 
@@ -2286,7 +2223,8 @@ struct RowMatchGenerator {
     search_depth: usize,
     target_len: usize,
     lazy_depth: u8,
-    hash_mix_kernel: HashMixKernel,
+    /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
+    hash_kernel: crate::encoding::fastpath::FastpathKernel,
     row_heads: Vec<u8>,
     row_positions: Vec<usize>,
     row_tags: Vec<u8>,
@@ -2307,7 +2245,7 @@ impl RowMatchGenerator {
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
             lazy_depth: 1,
-            hash_mix_kernel: detect_hash_mix_kernel(),
+            hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
@@ -2500,7 +2438,7 @@ impl RowMatchGenerator {
         }
         let value =
             u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-        let hash = hash_mix_u64_with_kernel(value, self.hash_mix_kernel);
+        let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
@@ -2633,6 +2571,7 @@ impl RowMatchGenerator {
         }
     }
 
+    #[inline]
     fn insert_position(&mut self, abs_pos: usize) {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
@@ -2640,11 +2579,22 @@ impl RowMatchGenerator {
         let row_entries = 1usize << self.row_log;
         let row_mask = row_entries - 1;
         let row_base = row << self.row_log;
-        let head = self.row_heads[row] as usize;
-        let next = head.wrapping_sub(1) & row_mask;
-        self.row_heads[row] = next as u8;
-        self.row_tags[row_base + next] = tag;
-        self.row_positions[row_base + next] = abs_pos;
+        // SAFETY: `hash_and_row` masks `row` to `row_hash_log` bits and
+        // `row_heads.len() == 1 << row_hash_log` by `ensure_tables`.
+        // `row_base = row << row_log = row * row_entries` and
+        // `next < row_entries`, so `row_base + next < row_count *
+        // row_entries == row_positions.len() == row_tags.len()`. Both
+        // index pairs are provably in bounds; per-byte hot path on
+        // fast/dfast/row levels saves ~6 instructions and 3 branches.
+        debug_assert!(row < self.row_heads.len());
+        debug_assert!(row_base + row_entries <= self.row_positions.len());
+        unsafe {
+            let head = *self.row_heads.get_unchecked(row) as usize;
+            let next = head.wrapping_sub(1) & row_mask;
+            *self.row_heads.get_unchecked_mut(row) = next as u8;
+            *self.row_tags.get_unchecked_mut(row_base + next) = tag;
+            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos;
+        }
     }
 }
 
@@ -2656,17 +2606,2027 @@ struct HcMatchGenerator {
     history_start: usize,
     history_abs_start: usize,
     position_base: usize,
+    index_shift: usize,
     offset_hist: [u32; 3],
     hash_table: Vec<u32>,
+    hash3_table: Vec<u32>,
     chain_table: Vec<u32>,
     lazy_depth: u8,
     hash_log: usize,
     chain_log: usize,
     search_depth: usize,
     target_len: usize,
+    parse_mode: HcParseMode,
+    ldm_sequences: Vec<HcRawSeq>,
+    next_to_update3: usize,
+    hash3_log: usize,
+    skip_insert_until_abs: usize,
+    dictionary_limit_abs: Option<usize>,
+    dictionary_primed_for_frame: bool,
+    allow_zero_relative_position: bool,
+    opt_state: HcOptState,
+    opt_nodes_scratch: Vec<HcOptimalNode>,
+    opt_candidates_scratch: Vec<MatchCandidate>,
+    opt_store_scratch: Vec<HcOptimalNode>,
+    opt_segment_plan_scratch: Vec<HcOptimalSequence>,
+    opt_seed_plan_scratch: Vec<HcOptimalSequence>,
+    opt_ll_price_scratch: Vec<u32>,
+    opt_ll_price_generation: Vec<u32>,
+    opt_ll_price_stamp: u32,
+    opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
+    opt_lit_price_generation: [u32; HC_MAX_LIT + 1],
+    opt_lit_price_stamp: u32,
+    opt_ml_price_scratch: Vec<u32>,
+    opt_ml_price_generation: Vec<u32>,
+    opt_ml_price_stamp: u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct HcOptimalNode {
+    price: u32,
+    off: u32,
+    mlen: u32,
+    litlen: u32,
+    reps: [u32; 3],
+}
+
+impl Default for HcOptimalNode {
+    fn default() -> Self {
+        Self {
+            price: u32::MAX,
+            off: 0,
+            mlen: 0,
+            // Donor parity: uninitialized DP slots use litlen != 0
+            // (C code uses !0) so they are never treated as end-of-match.
+            litlen: u32::MAX,
+            reps: [1, 4, 8],
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct HcOptimalSequence {
+    offset: u32,
+    match_len: u32,
+    lit_len: u32,
+}
+
+#[derive(Copy, Clone)]
+struct HcRawSeq {
+    lit_length: usize,
+    offset: usize,
+    match_length: usize,
+}
+
+#[derive(Copy, Clone, Default)]
+struct HcRawSeqStore {
+    pos: usize,
+    pos_in_sequence: usize,
+    size: usize,
+}
+
+#[derive(Copy, Clone)]
+struct HcOptLdmState {
+    seq_store: HcRawSeqStore,
+    start_pos_in_block: usize,
+    end_pos_in_block: usize,
+    offset: usize,
+}
+
+impl Default for HcOptLdmState {
+    fn default() -> Self {
+        Self {
+            seq_store: HcRawSeqStore::default(),
+            start_pos_in_block: usize::MAX,
+            end_pos_in_block: usize::MAX,
+            offset: 0,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct HcCandidateQuery {
+    reps: [u32; 3],
+    lit_len: usize,
+    ldm_candidate: Option<MatchCandidate>,
+}
+
+#[derive(Copy, Clone)]
+struct HcOptimalPlanState {
+    reps: [u32; 3],
+    litlen: usize,
+    profile: HcOptimalCostProfile,
+}
+
+struct HcOptimalPlanBuffers {
+    nodes: Vec<HcOptimalNode>,
+    candidates: Vec<MatchCandidate>,
+    store: Vec<HcOptimalNode>,
+    ll_prices: Vec<u32>,
+    ll_price_generations: Vec<u32>,
+    ml_prices: Vec<u32>,
+    ml_price_generations: Vec<u32>,
+}
+
+#[derive(Copy, Clone)]
+enum HcOptPriceType {
+    Dynamic,
+    Predefined,
+}
+
+#[derive(Clone)]
+struct HcDictEntropySeed {
+    has_lit: bool,
+    has_ll: bool,
+    has_ml: bool,
+    has_of: bool,
+    lit_bits: [u8; HC_MAX_LIT + 1],
+    ll_bits: [u8; HC_MAX_LL + 1],
+    ml_bits: [u8; HC_MAX_ML + 1],
+    of_bits: [u8; HC_MAX_OFF + 1],
+}
+
+const HC_MAX_LIT: usize = 255;
+const HC_MAX_LL: usize = 35;
+const HC_MAX_ML: usize = 52;
+const HC_MAX_OFF: usize = 31;
+const HC_LITFREQ_ADD: u32 = 2;
+const HC_PREDEF_THRESHOLD: usize = 8;
+const HC_BITCOST_MULTIPLIER: u32 = 1 << 8;
+const HC_BLOCKSIZE_MAX: usize = crate::common::MAX_BLOCK_SIZE as usize;
+const HC_OPT_NUM: usize = 1 << 12;
+const HC_FORMAT_MINMATCH: usize = 3;
+#[derive(Clone)]
+struct HcOptState {
+    lit_freq: [u32; HC_MAX_LIT + 1],
+    lit_length_freq: [u32; HC_MAX_LL + 1],
+    match_length_freq: [u32; HC_MAX_ML + 1],
+    off_code_freq: [u32; HC_MAX_OFF + 1],
+    lit_sum: u32,
+    lit_length_sum: u32,
+    match_length_sum: u32,
+    off_code_sum: u32,
+    lit_sum_base_price: u32,
+    lit_length_sum_base_price: u32,
+    match_length_sum_base_price: u32,
+    off_code_sum_base_price: u32,
+    price_type: HcOptPriceType,
+    literals_compressed: bool,
+    dictionary_seed: Option<HcDictEntropySeed>,
+}
+
+impl HcOptState {
+    fn new() -> Self {
+        Self {
+            lit_freq: [0; HC_MAX_LIT + 1],
+            lit_length_freq: [0; HC_MAX_LL + 1],
+            match_length_freq: [0; HC_MAX_ML + 1],
+            off_code_freq: [0; HC_MAX_OFF + 1],
+            lit_sum: 0,
+            lit_length_sum: 0,
+            match_length_sum: 0,
+            off_code_sum: 0,
+            lit_sum_base_price: 0,
+            lit_length_sum_base_price: 0,
+            match_length_sum_base_price: 0,
+            off_code_sum_base_price: 0,
+            price_type: HcOptPriceType::Dynamic,
+            literals_compressed: true,
+            dictionary_seed: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn bit_weight(stat: u32) -> u32 {
+        // Donor parity: stat+1 ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
+        // hb ≤ 31, MULTIPLIER = 256 ⇒ product ≤ 7936, no overflow.
+        let hb = 31 - (stat + 1).leading_zeros();
+        hb * HC_BITCOST_MULTIPLIER
+    }
+
+    fn frac_weight(raw_stat: u32) -> u32 {
+        // Donor parity (ZSTD_fracWeight). All operands bounded: stat fits u32,
+        // hb ∈ 0..=31, BWeight ≤ 7936, FWeight ≤ 65535 ⇒ sum no overflow.
+        let stat = raw_stat + 1;
+        let hb = 31 - stat.leading_zeros();
+        let b_weight = hb * HC_BITCOST_MULTIPLIER;
+        let f_weight = (stat << 8) >> hb;
+        b_weight + f_weight
+    }
+
+    fn weight(stat: u32, accurate: bool) -> u32 {
+        if accurate {
+            Self::frac_weight(stat)
+        } else {
+            Self::bit_weight(stat)
+        }
+    }
+
+    fn downscale_stats(table: &mut [u32], shift: u32, base1: bool) -> u32 {
+        // Donor parity: table sums bounded by block size (≤ 256K) ⇒ no overflow.
+        let mut sum = 0u32;
+        for stat in table {
+            let base = if base1 { 1 } else { u32::from(*stat > 0) };
+            let new_stat = base + (*stat >> shift);
+            *stat = new_stat;
+            sum += new_stat;
+        }
+        sum
+    }
+
+    fn scale_stats(table: &mut [u32], log_target: u32) -> u32 {
+        let prev_sum = table.iter().copied().sum::<u32>();
+        let factor = prev_sum >> log_target;
+        if factor <= 1 {
+            return prev_sum;
+        }
+        // factor ≥ 2 ⇒ leading_zeros ≤ 30 ⇒ 31-lz ≥ 1.
+        let shift = 31 - factor.leading_zeros();
+        Self::downscale_stats(table, shift, true)
+    }
+
+    fn set_base_prices(&mut self, accurate: bool) {
+        self.lit_sum_base_price = if self.literals_compressed() {
+            Self::weight(self.lit_sum, accurate)
+        } else {
+            0
+        };
+        self.lit_length_sum_base_price = Self::weight(self.lit_length_sum, accurate);
+        self.match_length_sum_base_price = Self::weight(self.match_length_sum, accurate);
+        self.off_code_sum_base_price = Self::weight(self.off_code_sum, accurate);
+    }
+
+    fn literals_compressed(&self) -> bool {
+        self.literals_compressed
+    }
+
+    #[cfg(test)]
+    fn set_literals_compressed_for_tests(&mut self, enabled: bool) {
+        self.literals_compressed = enabled;
+    }
+
+    fn seed_dictionary_entropy(
+        &mut self,
+        huff: Option<&crate::huff0::huff0_encoder::HuffmanTable>,
+        ll: Option<&crate::fse::fse_encoder::FSETable>,
+        ml: Option<&crate::fse::fse_encoder::FSETable>,
+        of: Option<&crate::fse::fse_encoder::FSETable>,
+    ) {
+        if huff.is_none() && ll.is_none() && ml.is_none() && of.is_none() {
+            self.dictionary_seed = None;
+            return;
+        }
+        let mut lit_bits = [0u8; HC_MAX_LIT + 1];
+        if let Some(huff) = huff {
+            for (sym, slot) in lit_bits.iter_mut().enumerate() {
+                *slot = huff.num_bits_for_symbol(sym as u8).unwrap_or(0);
+            }
+        }
+        let mut ll_bits = [0u8; HC_MAX_LL + 1];
+        if let Some(ll) = ll {
+            for (sym, slot) in ll_bits.iter_mut().enumerate() {
+                *slot = ll.max_num_bits_for_symbol(sym as u8).unwrap_or(0);
+            }
+        }
+        let mut ml_bits = [0u8; HC_MAX_ML + 1];
+        if let Some(ml) = ml {
+            for (sym, slot) in ml_bits.iter_mut().enumerate() {
+                *slot = ml.max_num_bits_for_symbol(sym as u8).unwrap_or(0);
+            }
+        }
+        let mut of_bits = [0u8; HC_MAX_OFF + 1];
+        if let Some(of) = of {
+            for (sym, slot) in of_bits.iter_mut().enumerate() {
+                *slot = of.max_num_bits_for_symbol(sym as u8).unwrap_or(0);
+            }
+        }
+        self.dictionary_seed = Some(HcDictEntropySeed {
+            has_lit: huff.is_some(),
+            has_ll: ll.is_some(),
+            has_ml: ml.is_some(),
+            has_of: of.is_some(),
+            lit_bits,
+            ll_bits,
+            ml_bits,
+            of_bits,
+        });
+    }
+
+    fn apply_seeded_table<const N: usize>(
+        table: &mut [u32; N],
+        bits: &[u8; N],
+        scale_log: u8,
+    ) -> u32 {
+        let mut sum = 0u32;
+        for (slot, &bit_cost) in table.iter_mut().zip(bits.iter()) {
+            let value = if bit_cost == 0 || bit_cost >= scale_log {
+                1
+            } else {
+                1u32 << (scale_log - bit_cost)
+            };
+            *slot = value;
+            sum += value;
+        }
+        sum
+    }
+
+    #[inline(always)]
+    fn lit_code_and_bits(lit_len: usize) -> (usize, u32) {
+        let ll = lit_len.min(131_071) as u32;
+        let (code, _, extra_bits) = match ll {
+            0..=15 => (ll as u8, 0, 0),
+            16..=17 => (16, ll - 16, 1),
+            18..=19 => (17, ll - 18, 1),
+            20..=21 => (18, ll - 20, 1),
+            22..=23 => (19, ll - 22, 1),
+            24..=27 => (20, ll - 24, 2),
+            28..=31 => (21, ll - 28, 2),
+            32..=39 => (22, ll - 32, 3),
+            40..=47 => (23, ll - 40, 3),
+            48..=63 => (24, ll - 48, 4),
+            64..=127 => (25, ll - 64, 6),
+            128..=255 => (26, ll - 128, 7),
+            256..=511 => (27, ll - 256, 8),
+            512..=1023 => (28, ll - 512, 9),
+            1024..=2047 => (29, ll - 1024, 10),
+            2048..=4095 => (30, ll - 2048, 11),
+            4096..=8191 => (31, ll - 4096, 12),
+            8192..=16383 => (32, ll - 8192, 13),
+            16384..=32767 => (33, ll - 16384, 14),
+            32768..=65535 => (34, ll - 32768, 15),
+            _ => (35, ll - 65536, 16),
+        };
+        (code as usize, extra_bits as u32)
+    }
+
+    #[inline(always)]
+    fn ml_code_and_bits(match_len: usize) -> (usize, u32) {
+        let ml = match_len.clamp(3, 131_074) as u32;
+        let (code, _, extra_bits) = match ml {
+            3..=34 => (ml as u8 - 3, 0, 0),
+            35..=36 => (32, ml - 35, 1),
+            37..=38 => (33, ml - 37, 1),
+            39..=40 => (34, ml - 39, 1),
+            41..=42 => (35, ml - 41, 1),
+            43..=46 => (36, ml - 43, 2),
+            47..=50 => (37, ml - 47, 2),
+            51..=58 => (38, ml - 51, 3),
+            59..=66 => (39, ml - 59, 3),
+            67..=82 => (40, ml - 67, 4),
+            83..=98 => (41, ml - 83, 4),
+            99..=130 => (42, ml - 99, 5),
+            131..=258 => (43, ml - 131, 7),
+            259..=514 => (44, ml - 259, 8),
+            515..=1026 => (45, ml - 515, 9),
+            1027..=2050 => (46, ml - 1027, 10),
+            2051..=4098 => (47, ml - 2051, 11),
+            4099..=8194 => (48, ml - 4099, 12),
+            8195..=16386 => (49, ml - 8195, 13),
+            16387..=32770 => (50, ml - 16387, 14),
+            32771..=65538 => (51, ml - 32771, 15),
+            _ => (52, ml - 65539, 16),
+        };
+        (code as usize, extra_bits as u32)
+    }
+
+    fn rescale_freqs(&mut self, src: &[u8], profile: HcOptimalCostProfile) {
+        self.price_type = HcOptPriceType::Dynamic;
+        if self.lit_length_sum == 0 {
+            if src.len() <= HC_PREDEF_THRESHOLD {
+                self.price_type = HcOptPriceType::Predefined;
+            }
+            if let Some(seed) = self.dictionary_seed.take() {
+                if seed.has_lit || seed.has_ll || seed.has_ml || seed.has_of {
+                    self.price_type = HcOptPriceType::Dynamic;
+                }
+                if seed.has_lit && self.literals_compressed() {
+                    self.lit_sum = Self::apply_seeded_table(&mut self.lit_freq, &seed.lit_bits, 11);
+                } else {
+                    if self.literals_compressed() {
+                        self.lit_freq.fill(0);
+                        for &byte in src {
+                            self.lit_freq[byte as usize] =
+                                self.lit_freq[byte as usize].saturating_add(1);
+                        }
+                        self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
+                        if self.lit_sum == 0 {
+                            self.lit_freq[0] = 1;
+                            self.lit_sum = 1;
+                        }
+                    } else {
+                        self.lit_freq.fill(0);
+                        self.lit_sum = 0;
+                    }
+                }
+
+                if seed.has_ll {
+                    self.lit_length_sum =
+                        Self::apply_seeded_table(&mut self.lit_length_freq, &seed.ll_bits, 10);
+                } else {
+                    let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
+                        4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    ];
+                    self.lit_length_freq = base_ll_freqs;
+                    self.lit_length_sum = base_ll_freqs.iter().copied().sum();
+                }
+
+                if seed.has_ml {
+                    self.match_length_sum =
+                        Self::apply_seeded_table(&mut self.match_length_freq, &seed.ml_bits, 10);
+                } else {
+                    self.match_length_freq.fill(1);
+                    self.match_length_sum = (HC_MAX_ML + 1) as u32;
+                }
+
+                if seed.has_of {
+                    self.off_code_sum =
+                        Self::apply_seeded_table(&mut self.off_code_freq, &seed.of_bits, 10);
+                } else {
+                    let base_off_freqs: [u32; HC_MAX_OFF + 1] = [
+                        6, 2, 1, 1, 2, 3, 4, 4, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                        1, 1, 1, 1, 1, 1, 1,
+                    ];
+                    self.off_code_freq = base_off_freqs;
+                    self.off_code_sum = base_off_freqs.iter().copied().sum();
+                }
+            } else {
+                if self.literals_compressed() {
+                    self.lit_freq.fill(0);
+                    for &byte in src {
+                        self.lit_freq[byte as usize] =
+                            self.lit_freq[byte as usize].saturating_add(1);
+                    }
+                    self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
+                    if self.lit_sum == 0 {
+                        self.lit_freq[0] = 1;
+                        self.lit_sum = 1;
+                    }
+                } else {
+                    self.lit_freq.fill(0);
+                    self.lit_sum = 0;
+                }
+
+                let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
+                    4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                ];
+                self.lit_length_freq = base_ll_freqs;
+                self.lit_length_sum = base_ll_freqs.iter().copied().sum();
+
+                self.match_length_freq.fill(1);
+                self.match_length_sum = (HC_MAX_ML + 1) as u32;
+
+                let base_off_freqs: [u32; HC_MAX_OFF + 1] = [
+                    6, 2, 1, 1, 2, 3, 4, 4, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1,
+                ];
+                self.off_code_freq = base_off_freqs;
+                self.off_code_sum = base_off_freqs.iter().copied().sum();
+            }
+        } else {
+            if self.literals_compressed() {
+                self.lit_sum = Self::scale_stats(&mut self.lit_freq, 12);
+            }
+            self.lit_length_sum = Self::scale_stats(&mut self.lit_length_freq, 11);
+            self.match_length_sum = Self::scale_stats(&mut self.match_length_freq, 11);
+            self.off_code_sum = Self::scale_stats(&mut self.off_code_freq, 11);
+        }
+        self.set_base_prices(profile.accurate);
+    }
+
+    fn update_stats(&mut self, lit_len: usize, literals: &[u8], off_base: u32, match_len: usize) {
+        // Donor parity (ZSTD_updateStats). All freq sums bounded by
+        // block_size * LITFREQ_ADD ≤ 256K * 2 = 512K ≪ u32::MAX.
+        if self.literals_compressed() {
+            for &byte in literals.iter().take(lit_len) {
+                self.lit_freq[byte as usize] += HC_LITFREQ_ADD;
+            }
+            self.lit_sum += (lit_len as u32) * HC_LITFREQ_ADD;
+        }
+
+        let (ll_code, _) = Self::lit_code_and_bits(lit_len);
+        self.lit_length_freq[ll_code] += 1;
+        self.lit_length_sum += 1;
+
+        // off_base ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
+        let off_code = ((31 - off_base.max(1).leading_zeros()) as usize).min(HC_MAX_OFF);
+        self.off_code_freq[off_code] += 1;
+        self.off_code_sum += 1;
+
+        let (ml_code, _) = Self::ml_code_and_bits(match_len);
+        self.match_length_freq[ml_code] += 1;
+        self.match_length_sum += 1;
+    }
+}
+
+#[derive(Copy, Clone)]
+struct HcOptimalCostProfile {
+    max_chain_depth: usize,
+    sufficient_match_len: usize,
+    accurate: bool,
+    favor_small_offsets: bool,
+}
+
+impl HcOptimalCostProfile {
+    fn for_mode(mode: HcParseMode, pass2: bool) -> Self {
+        match mode {
+            HcParseMode::Lazy2 => Self {
+                max_chain_depth: 8,
+                sufficient_match_len: 32,
+                accurate: false,
+                favor_small_offsets: true,
+            },
+            HcParseMode::BtOpt => Self {
+                max_chain_depth: 32,
+                sufficient_match_len: usize::MAX,
+                accurate: false,
+                favor_small_offsets: true,
+            },
+            HcParseMode::BtUltra => Self {
+                max_chain_depth: 32,
+                sufficient_match_len: usize::MAX,
+                accurate: true,
+                favor_small_offsets: false,
+            },
+            HcParseMode::BtUltra2 => {
+                let _ = pass2;
+                Self {
+                    max_chain_depth: 512,
+                    sufficient_match_len: usize::MAX,
+                    accurate: true,
+                    // Donor opt2 path doesn't apply the small-offset
+                    // decompression-speed handicap.
+                    favor_small_offsets: false,
+                }
+            }
+        }
+    }
+
+    fn literal_price(&self, stats: &HcOptState, byte: u8) -> u32 {
+        if !stats.literals_compressed() {
+            return 8 * HC_BITCOST_MULTIPLIER;
+        }
+        if matches!(stats.price_type, HcOptPriceType::Predefined) {
+            return 6 * HC_BITCOST_MULTIPLIER;
+        }
+        // Donor parity: ZSTD_rawLiteralsCost asserts lit_sum_base_price ≥
+        // BITCOST_MULTIPLIER, then clamps lit_weight to that range, so the
+        // final subtract never underflows.
+        debug_assert!(stats.lit_sum_base_price >= HC_BITCOST_MULTIPLIER);
+        let lit_max = stats.lit_sum_base_price - HC_BITCOST_MULTIPLIER;
+        let mut lit_weight = HcOptState::weight(stats.lit_freq[byte as usize], self.accurate);
+        if lit_weight > lit_max {
+            lit_weight = lit_max;
+        }
+        stats.lit_sum_base_price - lit_weight
+    }
+
+    fn lit_length_price(&self, stats: &HcOptState, lit_len: usize) -> u32 {
+        if lit_len == HC_BLOCKSIZE_MAX {
+            // Donor parity: ZSTD_litLengthPrice() handles the non-representable
+            // BLOCKSIZE_MAX literal-length by charging one extra bit over the
+            // largest encodable litLength symbol.
+            return HC_BITCOST_MULTIPLIER
+                + self.lit_length_price(stats, HC_BLOCKSIZE_MAX.saturating_sub(1));
+        }
+        if matches!(stats.price_type, HcOptPriceType::Predefined) {
+            return HcOptState::weight(lit_len as u32, self.accurate);
+        }
+        // ll_bits ≤ 16 ⇒ ll_bits * 256 ≤ 4096, sum no overflow.
+        let (ll_code, ll_bits) = HcOptState::lit_code_and_bits(lit_len);
+        ll_bits * HC_BITCOST_MULTIPLIER + stats.lit_length_sum_base_price
+            - HcOptState::weight(stats.lit_length_freq[ll_code], self.accurate)
+    }
+
+    #[inline(always)]
+    fn offset_price_for<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+        &self,
+        stats: &HcOptState,
+        off_base: u32,
+    ) -> u32 {
+        // Donor parity (ZSTD_getMatchPrice). off_base ≥ 1 ⇒ leading_zeros ≤ 31.
+        // off_code ≤ 31, (16 + off_code) * 256 ≤ 12032, sums no overflow.
+        let off_code = 31 - off_base.max(1).leading_zeros();
+        if matches!(stats.price_type, HcOptPriceType::Predefined) {
+            return (16 + off_code) * HC_BITCOST_MULTIPLIER;
+        }
+        let mut price = off_code * HC_BITCOST_MULTIPLIER
+            + (stats.off_code_sum_base_price
+                - HcOptState::weight(stats.off_code_freq[off_code as usize], ACCURATE_PRICE));
+        if FAVOR_SMALL_OFFSETS && off_code >= 20 {
+            price += (off_code - 19) * 2 * HC_BITCOST_MULTIPLIER;
+        }
+        price
+    }
+
+    #[inline(always)]
+    fn match_length_price(&self, stats: &HcOptState, match_len: usize) -> u32 {
+        // Donor parity: mlBase = match_len - MINMATCH; callers guarantee
+        // match_len ≥ HC_FORMAT_MINMATCH. ml_bits ≤ 16, * 256 ≤ 4096.
+        debug_assert!(match_len >= HC_FORMAT_MINMATCH);
+        let ml_base = match_len - HC_FORMAT_MINMATCH;
+        if matches!(stats.price_type, HcOptPriceType::Predefined) {
+            return HcOptState::weight(ml_base as u32, self.accurate);
+        }
+        let (ml_code, ml_bits) = HcOptState::ml_code_and_bits(match_len);
+        ml_bits * HC_BITCOST_MULTIPLIER
+            + (stats.match_length_sum_base_price
+                - HcOptState::weight(stats.match_length_freq[ml_code], self.accurate))
+    }
+
+    #[inline(always)]
+    fn match_price_from_parts(&self, off_price: u32, ml_price: u32, stats: &HcOptState) -> u32 {
+        let mut price = off_price + ml_price;
+        debug_assert!(price >= off_price);
+        if !matches!(stats.price_type, HcOptPriceType::Predefined) {
+            price += HC_BITCOST_MULTIPLIER / 5;
+            debug_assert!(price >= off_price);
+        }
+        price
+    }
+}
+
+/// `bt_insert_step_no_rebase` body parameterized over the per-CPU
+/// `count_match_from_indices` symbol. Each kernel-specific wrapper invokes
+/// the macro with its own `fastpath::<kernel>::count_match_from_indices`
+/// path so the call resolves inside the wrapper's `#[target_feature]`
+/// umbrella and inlines instead of paying the function-call ABI per BT walk
+/// iteration. Used only by `HcMatchGenerator` BT walk wrappers below.
+macro_rules! bt_insert_step_no_rebase_body {
+    ($self:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
+        let idx = $abs_pos - $self.history_abs_start;
+        let concat = &$self.history[$self.history_start..];
+        if idx + 8 > concat.len() {
+            return 1;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let hash =
+            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+            return 1;
+        };
+        let stored = relative_pos + 1;
+        let bt_mask = $self.bt_mask();
+        let bt_low = $abs_pos.saturating_sub(bt_mask);
+        let window_low = $self.window_low_abs_for_target($target_abs);
+        let mut match_end_abs = $abs_pos.saturating_add(9);
+        let mut best_len = 8usize;
+        let mut compares_left = $self.search_depth;
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let mut smaller_slot = pair_idx;
+        let mut larger_slot = pair_idx + 1;
+        let mut match_stored = $self.hash_table[hash];
+        $self.hash_table[hash] = stored;
+
+        while compares_left > 0 {
+            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
+                match_stored,
+                $self.position_base,
+                $self.index_shift,
+            ) else {
+                break;
+            };
+            if candidate_abs < window_low || candidate_abs >= $abs_pos {
+                break;
+            }
+            compares_left -= 1;
+
+            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_smaller = $self.chain_table[next_pair_idx];
+            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - $self.history_abs_start;
+            // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
+            // concat.len()` since the candidate is within
+            // `[history_abs_start, abs_pos)` and `tail_limit ≤
+            // current_abs_end - abs_pos`.
+            let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
+
+            if match_len > best_len {
+                best_len = match_len;
+                let candidate_end = candidate_abs.saturating_add(match_len);
+                if candidate_end > match_end_abs {
+                    match_end_abs = candidate_end;
+                }
+            }
+
+            if match_len >= tail_limit {
+                break;
+            }
+
+            let candidate_next = candidate_idx + match_len;
+            let current_next = idx + match_len;
+            if concat[candidate_next] < concat[current_next] {
+                $self.chain_table[smaller_slot] = match_stored;
+                common_length_smaller = match_len;
+                if candidate_abs <= bt_low {
+                    smaller_slot = usize::MAX;
+                    break;
+                }
+                smaller_slot = next_pair_idx + 1;
+                match_stored = next_larger;
+            } else {
+                $self.chain_table[larger_slot] = match_stored;
+                common_length_larger = match_len;
+                if candidate_abs <= bt_low {
+                    larger_slot = usize::MAX;
+                    break;
+                }
+                larger_slot = next_pair_idx;
+                match_stored = next_smaller;
+            }
+        }
+
+        if smaller_slot != usize::MAX {
+            $self.chain_table[smaller_slot] = HC_EMPTY;
+        }
+        if larger_slot != usize::MAX {
+            $self.chain_table[larger_slot] = HC_EMPTY;
+        }
+
+        let speed_positions = if best_len > 384 {
+            (best_len - 384).min(192)
+        } else {
+            0
+        };
+        speed_positions.max(match_end_abs.saturating_sub($abs_pos.saturating_add(8)))
+    }};
+}
+
+/// `build_optimal_plan_impl` body parameterized over the per-CPU
+/// `collect_optimal_candidates_initialized_<kernel>` method name. Caller
+/// passes its `&mut self`, the seven DP entry-point arguments, and the
+/// kernel-specific collect method. Each per-kernel wrapper invokes this
+/// macro inside its own `#[target_feature]` umbrella so the per-position
+/// `$collect` call inlines and the entire DP loop runs as one straight-line
+/// hot path without an ABI barrier between the DP and the match-gathering
+/// pipeline.
+///
+/// Body is ~730 lines but mechanically identical across kernels — the macro
+/// keeps a single source of truth. The two const generics
+/// (`ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`) come from the wrapper's
+/// generic parameter list and are referenced as bare identifiers; macro
+/// hygiene resolves them at the expansion site.
+macro_rules! build_optimal_plan_impl_body {
+    (
+        $self:expr,
+        $current:ident,
+        $current_abs_start:ident,
+        $current_len:ident,
+        $initial_state:ident,
+        $stats:ident,
+        $out:ident,
+        $collect:ident $(,)?
+    ) => {{
+        let current_abs_end = $current_abs_start + $current_len;
+        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let frontier_limit = $current_len.min(HC_OPT_NUM.saturating_sub(1));
+        let initial_reps = $initial_state.reps;
+        let initial_litlen = $initial_state.litlen;
+        let mut profile = $initial_state.profile;
+        profile.sufficient_match_len = $self.sufficient_match_len_for_pass(profile);
+        let abort_on_worse_match = $self.parse_mode == HcParseMode::BtOpt;
+        let opt_level = matches!(
+            $self.parse_mode,
+            HcParseMode::BtUltra | HcParseMode::BtUltra2
+        );
+        let mut nodes = core::mem::take(&mut $self.opt_nodes_scratch);
+        if nodes.len() < frontier_limit.saturating_add(2) {
+            nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
+        }
+        let mut candidates = core::mem::take(&mut $self.opt_candidates_scratch);
+        candidates.clear();
+        if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
+            candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
+        }
+        let mut store = core::mem::take(&mut $self.opt_store_scratch);
+        store.clear();
+        let mut ll_prices = core::mem::take(&mut $self.opt_ll_price_scratch);
+        let mut ll_price_generations = core::mem::take(&mut $self.opt_ll_price_generation);
+        if ll_prices.len() <= frontier_limit {
+            ll_prices.resize(frontier_limit + 1, 0);
+            ll_price_generations.resize(frontier_limit + 1, 0);
+        }
+        $self.opt_ll_price_stamp = $self.opt_ll_price_stamp.wrapping_add(1).max(1);
+        let ll_price_stamp = $self.opt_ll_price_stamp;
+        $self.opt_lit_price_stamp = $self.opt_lit_price_stamp.wrapping_add(1).max(1);
+        let lit_price_stamp = $self.opt_lit_price_stamp;
+        let mut ml_prices = core::mem::take(&mut $self.opt_ml_price_scratch);
+        let mut ml_price_generations = core::mem::take(&mut $self.opt_ml_price_generation);
+        if ml_prices.len() <= frontier_limit {
+            ml_prices.resize(frontier_limit + 1, 0);
+            ml_price_generations.resize(frontier_limit + 1, 0);
+        }
+        $self.opt_ml_price_stamp = $self.opt_ml_price_stamp.wrapping_add(1).max(1);
+        let ml_price_stamp = $self.opt_ml_price_stamp;
+        nodes[0] = HcOptimalNode {
+            price: HcMatchGenerator::cached_lit_length_price(
+                profile,
+                $stats,
+                initial_litlen,
+                &mut ll_prices,
+                &mut ll_price_generations,
+                ll_price_stamp,
+            ),
+            litlen: initial_litlen as u32,
+            reps: initial_reps,
+            ..HcOptimalNode::default()
+        };
+        let sufficient_len = profile.sufficient_match_len;
+        let ll0_price = HcMatchGenerator::cached_lit_length_price(
+            profile,
+            $stats,
+            0,
+            &mut ll_prices,
+            &mut ll_price_generations,
+            ll_price_stamp,
+        );
+        let ll1_price = HcMatchGenerator::cached_lit_length_price(
+            profile,
+            $stats,
+            1,
+            &mut ll_prices,
+            &mut ll_price_generations,
+            ll_price_stamp,
+        );
+        let mut pos = 1usize;
+        let mut last_pos = 0usize;
+        let mut forced_end: Option<usize> = None;
+        let mut forced_end_state: Option<HcOptimalNode> = None;
+        let mut seed_forced_shortest_path = false;
+        let mut opt_ldm = HcOptLdmState {
+            seq_store: HcRawSeqStore {
+                pos: 0,
+                pos_in_sequence: 0,
+                size: $self.ldm_sequences.len(),
+            },
+            ..HcOptLdmState::default()
+        };
+        let has_ldm = !$self.ldm_sequences.is_empty();
+        if has_ldm {
+            $self.ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
+        }
+
+        // Donor-like seed at rPos=0: initialize frontier with matches starting
+        // at current position before entering the generic forward DP loop.
+        if $current_len >= min_match_len {
+            let seed_ldm = if has_ldm {
+                $self.ldm_process_match_candidate(&mut opt_ldm, 0, $current_len, min_match_len)
+            } else {
+                None
+            };
+            candidates.clear();
+            // SAFETY: wrapper is in the same target_feature umbrella as the
+            // `$collect` kernel variant; the runtime kernel detector already
+            // gated entry into the wrapper.
+            unsafe {
+                $self.$collect::<true>(
+                    $current_abs_start,
+                    current_abs_end,
+                    profile,
+                    HcCandidateQuery {
+                        reps: initial_reps,
+                        lit_len: initial_litlen,
+                        ldm_candidate: seed_ldm,
+                    },
+                    &mut candidates,
+                )
+            };
+            if !candidates.is_empty() {
+                last_pos = min_match_len.saturating_sub(1).min(frontier_limit);
+                for p in 1..min_match_len.min(nodes.len()) {
+                    HcMatchGenerator::reset_opt_node(&mut nodes[p]);
+                    nodes[p].litlen = initial_litlen.saturating_add(p) as u32;
+                }
+            }
+
+            if let Some(candidate) = candidates.last() {
+                let longest_len = candidate.match_len.min($current_len);
+                if longest_len > sufficient_len {
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        initial_litlen,
+                        initial_reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        longest_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let forced_price = HcMatchGenerator::add_prices(nodes[0].price, seq_cost);
+                    let forced_state = HcOptimalNode {
+                        price: forced_price,
+                        off: candidate.offset as u32,
+                        mlen: longest_len as u32,
+                        litlen: 0,
+                        reps: initial_reps,
+                    };
+                    if longest_len < nodes.len() && forced_price < nodes[longest_len].price {
+                        nodes[longest_len] = forced_state;
+                    }
+                    forced_end = Some(longest_len);
+                    forced_end_state = Some(forced_state);
+                    seed_forced_shortest_path = true;
+                }
+            }
+            if !seed_forced_shortest_path {
+                let mut prev_max_len = min_match_len.saturating_sub(1);
+                for candidate in candidates.iter() {
+                    let max_match_len = candidate.match_len.min(frontier_limit);
+                    if max_match_len < min_match_len {
+                        continue;
+                    }
+                    let start_len = prev_max_len.saturating_add(1).max(min_match_len);
+                    if start_len > max_match_len {
+                        prev_max_len = prev_max_len.max(max_match_len);
+                        continue;
+                    }
+                    if max_match_len > last_pos {
+                        HcMatchGenerator::reset_opt_nodes(&mut nodes, last_pos + 1, max_match_len);
+                    }
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        initial_litlen,
+                        initial_reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    debug_assert!(max_match_len < nodes.len());
+                    let nodes0_price = nodes[0].price;
+                    for match_len in (start_len..=max_match_len).rev() {
+                        let ml_price = HcMatchGenerator::cached_match_length_price(
+                            profile,
+                            $stats,
+                            match_len,
+                            &mut ml_prices,
+                            &mut ml_price_generations,
+                            ml_price_stamp,
+                        );
+                        let seq_cost = HcMatchGenerator::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, ml_price, $stats),
+                        );
+                        let next_cost = HcMatchGenerator::add_prices(nodes0_price, seq_cost);
+                        let node_price = unsafe { nodes.get_unchecked(match_len).price };
+                        if match_len > last_pos || next_cost < node_price {
+                            let slot = unsafe { nodes.get_unchecked_mut(match_len) };
+                            *slot = HcOptimalNode {
+                                price: next_cost,
+                                off: candidate.offset as u32,
+                                mlen: match_len as u32,
+                                litlen: 0,
+                                reps: initial_reps,
+                            };
+                            if match_len > last_pos {
+                                last_pos = match_len;
+                            }
+                        } else if abort_on_worse_match {
+                            break;
+                        }
+                    }
+                    prev_max_len = prev_max_len.max(max_match_len);
+                }
+                if last_pos + 1 < nodes.len() {
+                    nodes[last_pos + 1].price = u32::MAX;
+                }
+            }
+        }
+        while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
+            debug_assert!(pos + 1 < nodes.len());
+            let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
+            if prev_node.price != u32::MAX {
+                let lit_len = prev_node.litlen as usize + 1;
+                let lit_price = HcMatchGenerator::cached_literal_price(
+                    profile,
+                    $stats,
+                    $current[pos - 1],
+                    &mut $self.opt_lit_price_scratch,
+                    &mut $self.opt_lit_price_generation,
+                    lit_price_stamp,
+                );
+                let ll_delta = HcMatchGenerator::cached_lit_length_delta_price(
+                    profile,
+                    $stats,
+                    lit_len,
+                    &mut ll_prices,
+                    &mut ll_price_generations,
+                    ll_price_stamp,
+                );
+                let lit_cost =
+                    HcMatchGenerator::add_price_delta(prev_node.price, lit_price, ll_delta);
+                let node_pos_price = unsafe { nodes.get_unchecked(pos).price };
+                if lit_cost <= node_pos_price {
+                    let prev_match = unsafe { *nodes.get_unchecked(pos) };
+                    let slot = unsafe { nodes.get_unchecked_mut(pos) };
+                    *slot = prev_node;
+                    slot.litlen = lit_len as u32;
+                    slot.price = lit_cost;
+                    #[allow(clippy::collapsible_if)]
+                    if opt_level
+                        && prev_match.mlen > 0
+                        && prev_match.litlen == 0
+                        && pos < $current_len
+                    {
+                        if ll1_price < ll0_price {
+                            let next_lit_price = HcMatchGenerator::cached_literal_price(
+                                profile,
+                                $stats,
+                                $current[pos],
+                                &mut $self.opt_lit_price_scratch,
+                                &mut $self.opt_lit_price_generation,
+                                lit_price_stamp,
+                            );
+                            let with1literal = HcMatchGenerator::add_price_delta(
+                                prev_match.price,
+                                next_lit_price,
+                                ll1_price as i32 - ll0_price as i32,
+                            );
+                            let ll_delta_next = HcMatchGenerator::cached_lit_length_delta_price(
+                                profile,
+                                $stats,
+                                lit_len.saturating_add(1),
+                                &mut ll_prices,
+                                &mut ll_price_generations,
+                                ll_price_stamp,
+                            );
+                            let with_more_literals = HcMatchGenerator::add_price_delta(
+                                lit_cost,
+                                next_lit_price,
+                                ll_delta_next,
+                            );
+                            let next = pos + 1;
+                            let next_price = unsafe { nodes.get_unchecked(next).price };
+                            if with1literal < with_more_literals && with1literal < next_price {
+                                // Donor parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
+                                debug_assert!(pos >= prev_match.mlen as usize);
+                                let prev_pos = pos - prev_match.mlen as usize;
+                                {
+                                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
+                                    let (_, reps_after_match) =
+                                        HcMatchGenerator::encode_offset_with_reps(
+                                            prev_match.off,
+                                            prev_state.litlen as usize,
+                                            prev_state.reps,
+                                        );
+                                    let slot = unsafe { nodes.get_unchecked_mut(next) };
+                                    *slot = prev_match;
+                                    slot.reps = reps_after_match;
+                                    slot.litlen = 1;
+                                    slot.price = with1literal;
+                                    if next > last_pos {
+                                        last_pos = next;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut base_node = unsafe { *nodes.get_unchecked(pos) };
+            if base_node.price == u32::MAX {
+                pos += 1;
+                continue;
+            }
+            if base_node.mlen > 0 && base_node.litlen == 0 {
+                // Donor parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
+                debug_assert!(pos >= base_node.mlen as usize);
+                let prev_pos = pos - base_node.mlen as usize;
+                {
+                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
+                    let (_, reps_after_match) = HcMatchGenerator::encode_offset_with_reps(
+                        base_node.off,
+                        prev_state.litlen as usize,
+                        prev_state.reps,
+                    );
+                    base_node.reps = reps_after_match;
+                    unsafe { nodes.get_unchecked_mut(pos).reps = reps_after_match };
+                }
+            }
+            let base_cost = base_node.price;
+
+            if pos + 8 > $current_len {
+                pos += 1;
+                continue;
+            }
+
+            if pos == last_pos {
+                break;
+            }
+
+            let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            if abort_on_worse_match
+                && next_price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
+            {
+                pos += 1;
+                continue;
+            }
+
+            let abs_pos = $current_abs_start + pos;
+            let ldm_candidate = if has_ldm {
+                $self.ldm_process_match_candidate(
+                    &mut opt_ldm,
+                    pos,
+                    $current_len - pos,
+                    min_match_len,
+                )
+            } else {
+                None
+            };
+            candidates.clear();
+            // SAFETY: same umbrella as `$collect`.
+            unsafe {
+                $self.$collect::<true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    HcCandidateQuery {
+                        reps: base_node.reps,
+                        lit_len: base_node.litlen as usize,
+                        ldm_candidate,
+                    },
+                    &mut candidates,
+                )
+            };
+            if let Some(candidate) = candidates.last() {
+                let longest_len = candidate.match_len.min($current_len - pos);
+                if longest_len > sufficient_len
+                    || pos + longest_len >= HC_OPT_NUM
+                    || pos + longest_len >= $current_len
+                {
+                    let lit_len = base_node.litlen as usize;
+                    let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                        candidate.offset as u32,
+                        lit_len,
+                        base_node.reps,
+                    );
+                    let off_price = profile
+                        .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        longest_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let forced_price = HcMatchGenerator::add_prices(base_cost, seq_cost);
+                    let end_pos = (pos + longest_len).min($current_len);
+                    forced_end = Some(end_pos);
+                    forced_end_state = Some(HcOptimalNode {
+                        price: forced_price,
+                        off: candidate.offset as u32,
+                        mlen: longest_len as u32,
+                        litlen: 0,
+                        reps: base_node.reps,
+                    });
+                    break;
+                }
+            }
+            let mut prev_max_len = min_match_len.saturating_sub(1);
+            for candidate in candidates.iter() {
+                let max_match_len = candidate
+                    .match_len
+                    .min($current_len - pos)
+                    .min(frontier_limit.saturating_sub(pos));
+                let min_len = min_match_len;
+                if max_match_len < min_len {
+                    continue;
+                }
+                let start_len = prev_max_len.saturating_add(1).max(min_len);
+                if start_len > max_match_len {
+                    prev_max_len = prev_max_len.max(max_match_len);
+                    continue;
+                }
+                let max_next = pos + max_match_len;
+                if max_next > last_pos {
+                    HcMatchGenerator::reset_opt_nodes(&mut nodes, last_pos + 1, max_next);
+                }
+                let lit_len = base_node.litlen as usize;
+                let off_base = HcMatchGenerator::encode_offset_base_with_reps(
+                    candidate.offset as u32,
+                    lit_len,
+                    base_node.reps,
+                );
+                let off_price = profile
+                    .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                debug_assert!(pos + max_match_len < nodes.len());
+                for match_len in (start_len..=max_match_len).rev() {
+                    let next = pos + match_len;
+                    let ml_price = HcMatchGenerator::cached_match_length_price(
+                        profile,
+                        $stats,
+                        match_len,
+                        &mut ml_prices,
+                        &mut ml_price_generations,
+                        ml_price_stamp,
+                    );
+                    let seq_cost = HcMatchGenerator::add_prices(
+                        ll0_price,
+                        profile.match_price_from_parts(off_price, ml_price, $stats),
+                    );
+                    let next_cost = HcMatchGenerator::add_prices(base_cost, seq_cost);
+                    let node_next_price = unsafe { nodes.get_unchecked(next).price };
+                    let improved = next > last_pos || next_cost < node_next_price;
+                    if improved {
+                        let slot = unsafe { nodes.get_unchecked_mut(next) };
+                        *slot = HcOptimalNode {
+                            price: next_cost,
+                            off: candidate.offset as u32,
+                            mlen: match_len as u32,
+                            litlen: 0,
+                            reps: base_node.reps,
+                        };
+                        if next > last_pos {
+                            last_pos = next;
+                        }
+                    } else if abort_on_worse_match {
+                        break;
+                    }
+                }
+                prev_max_len = prev_max_len.max(max_match_len);
+            }
+
+            if last_pos + 1 < nodes.len() {
+                unsafe {
+                    nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
+                }
+            }
+            pos += 1;
+        }
+
+        if last_pos == 0 {
+            if $current_len == 0 {
+                let price = nodes[0].price;
+                return $self.finish_optimal_plan(
+                    HcOptimalPlanBuffers {
+                        nodes,
+                        candidates,
+                        store,
+                        ll_prices,
+                        ll_price_generations,
+                        ml_prices,
+                        ml_price_generations,
+                    },
+                    (price, initial_reps, initial_litlen, 0),
+                );
+            }
+            let lit_price = HcMatchGenerator::cached_literal_price(
+                profile,
+                $stats,
+                $current[0],
+                &mut $self.opt_lit_price_scratch,
+                &mut $self.opt_lit_price_generation,
+                lit_price_stamp,
+            );
+            let next_litlen = initial_litlen.saturating_add(1);
+            let ll_delta = HcMatchGenerator::cached_lit_length_delta_price(
+                profile,
+                $stats,
+                next_litlen,
+                &mut ll_prices,
+                &mut ll_price_generations,
+                ll_price_stamp,
+            );
+            let price = HcMatchGenerator::add_price_delta(nodes[0].price, lit_price, ll_delta);
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (price, initial_reps, next_litlen, 1),
+            );
+        }
+
+        let target_pos = forced_end.unwrap_or(last_pos.min(frontier_limit));
+        let last_stretch = if let Some(forced_state) = forced_end_state {
+            forced_state
+        } else {
+            nodes[target_pos]
+        };
+        if last_stretch.price == u32::MAX {
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (u32::MAX, initial_reps, initial_litlen, $current_len),
+            );
+        }
+
+        if last_stretch.mlen == 0 {
+            return $self.finish_optimal_plan(
+                HcOptimalPlanBuffers {
+                    nodes,
+                    candidates,
+                    store,
+                    ll_prices,
+                    ll_price_generations,
+                    ml_prices,
+                    ml_price_generations,
+                },
+                (
+                    last_stretch.price,
+                    last_stretch.reps,
+                    last_stretch.litlen as usize,
+                    target_pos.min($current_len),
+                ),
+            );
+        }
+
+        let mut cur = target_pos.saturating_sub(last_stretch.mlen as usize);
+        let end_reps = if last_stretch.litlen == 0 {
+            let prev_state = nodes[cur];
+            let (_, reps_after_match) = HcMatchGenerator::encode_offset_with_reps(
+                last_stretch.off,
+                prev_state.litlen as usize,
+                prev_state.reps,
+            );
+            reps_after_match
+        } else {
+            let tail_literals = last_stretch.litlen as usize;
+            if cur < tail_literals {
+                return $self.finish_optimal_plan(
+                    HcOptimalPlanBuffers {
+                        nodes,
+                        candidates,
+                        store,
+                        ll_prices,
+                        ll_price_generations,
+                        ml_prices,
+                        ml_price_generations,
+                    },
+                    (
+                        last_stretch.price,
+                        last_stretch.reps,
+                        tail_literals,
+                        target_pos.min($current_len),
+                    ),
+                );
+            }
+            cur -= tail_literals;
+            last_stretch.reps
+        };
+        let store_end = cur + 2;
+        if store.len() <= store_end {
+            store.resize(store_end + 1, HcOptimalNode::default());
+        }
+        let mut store_start;
+        let mut stretch_pos = cur;
+
+        if last_stretch.litlen > 0 {
+            store[store_end] = HcOptimalNode {
+                litlen: last_stretch.litlen,
+                mlen: 0,
+                ..HcOptimalNode::default()
+            };
+            store_start = store_end.saturating_sub(1);
+            store[store_start] = last_stretch;
+        }
+        store[store_end] = last_stretch;
+        store_start = store_end;
+
+        loop {
+            let next_stretch = nodes[stretch_pos];
+            store[store_start].litlen = next_stretch.litlen;
+            if next_stretch.mlen == 0 {
+                break;
+            }
+            if store_start == 0 {
+                break;
+            }
+            store_start -= 1;
+            store[store_start] = next_stretch;
+            let step = (next_stretch.litlen as usize).saturating_add(next_stretch.mlen as usize);
+            if step == 0 || stretch_pos < step {
+                break;
+            }
+            stretch_pos -= step;
+        }
+
+        let mut tail_literals = initial_litlen;
+        let mut store_pos = store_start;
+        while store_pos <= store_end {
+            let stretch = store[store_pos];
+            let llen = stretch.litlen as usize;
+            let mlen = stretch.mlen as usize;
+            if mlen == 0 {
+                tail_literals = llen;
+                store_pos += 1;
+                continue;
+            }
+            $out.push(HcOptimalSequence {
+                offset: stretch.off,
+                match_len: mlen as u32,
+                lit_len: llen as u32,
+            });
+            tail_literals = 0;
+            store_pos += 1;
+        }
+        let result = (
+            last_stretch.price,
+            end_reps,
+            if last_stretch.litlen > 0 {
+                last_stretch.litlen as usize
+            } else {
+                tail_literals
+            },
+            target_pos.min($current_len),
+        );
+        $self.finish_optimal_plan(
+            HcOptimalPlanBuffers {
+                nodes,
+                candidates,
+                store,
+                ll_prices,
+                ll_price_generations,
+                ml_prices,
+                ml_price_generations,
+            },
+            result,
+        )
+    }};
+}
+
+/// `collect_optimal_candidates_initialized` body parameterized over the per-CPU
+/// kernel: the `$cpl` path is the kernel's `common_prefix_len_ptr` (used in
+/// the HC chain walk fallback), and the four method-name substitutions
+/// (`$bt_update`, `$bt_insert`, `$for_each_rep`, `$hash3`) route to the
+/// kernel-specific wrappers of the inner helpers. With every helper under
+/// the same `target_feature` umbrella, the entire per-position pipeline
+/// (BT-tree fill + rep probing + hash3 probing + BT match collection /
+/// HC chain walk) inlines without ABI barriers on the level22 hot path.
+macro_rules! collect_optimal_candidates_initialized_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $profile:ident,
+        $query:ident,
+        $out:ident,
+        $bt_matchfinder:ident,
+        $bt_update:ident,
+        $bt_insert:ident,
+        $for_each_rep:ident,
+        $hash3:ident,
+        $cpl:path $(,)?
+    ) => {{
+        debug_assert!(!$self.hash_table.is_empty());
+        debug_assert!($self.hash3_log == 0 || !$self.hash3_table.is_empty());
+        debug_assert!(!$self.chain_table.is_empty());
+        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let reps = $query.reps;
+        let lit_len = $query.lit_len;
+        let ldm_candidate = $query.ldm_candidate;
+        $out.clear();
+        if $abs_pos < $self.skip_insert_until_abs {
+            if let Some(ldm) = ldm_candidate {
+                let mut best_len_for_skip = 0usize;
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    ldm,
+                    min_match_len,
+                );
+            }
+            return;
+        }
+        if $bt_matchfinder {
+            // SAFETY: caller is in the same target_feature umbrella as
+            // `$bt_update`; the runtime kernel detector already gated entry.
+            unsafe { $self.$bt_update($abs_pos, $current_abs_end) };
+        }
+        let current_idx = $abs_pos - $self.history_abs_start;
+        if current_idx + 4 > $self.live_history().len() {
+            if let Some(ldm) = ldm_candidate {
+                let mut best_len_for_skip = 0usize;
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    ldm,
+                    min_match_len,
+                );
+            }
+            return;
+        }
+        let mut best_len_for_skip = 0usize;
+        let mut skip_further_match_search = false;
+        let mut rep_len_candidate_found = false;
+        // SAFETY: same umbrella; closure capture is monomorphized per call.
+        unsafe {
+            $self.$for_each_rep(
+                $abs_pos,
+                lit_len,
+                reps,
+                $current_abs_end,
+                min_match_len,
+                |rep| {
+                    if rep.match_len >= min_match_len {
+                        rep_len_candidate_found = true;
+                    }
+                    let _ = HcMatchGenerator::push_candidate_ladder(
+                        $out,
+                        &mut best_len_for_skip,
+                        rep,
+                        min_match_len,
+                    );
+                    if rep.match_len > $profile.sufficient_match_len {
+                        skip_further_match_search = true;
+                    }
+                    if $abs_pos.saturating_add(rep.match_len) >= $current_abs_end {
+                        skip_further_match_search = true;
+                    }
+                },
+            )
+        };
+        if !skip_further_match_search && best_len_for_skip < min_match_len {
+            $self.update_hash3_until($abs_pos);
+            // SAFETY: same umbrella for hash3_candidate.
+            if let Some(h3) = unsafe { $self.$hash3($abs_pos, $current_abs_end, min_match_len) } {
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    h3,
+                    min_match_len,
+                );
+                if !rep_len_candidate_found
+                    && (h3.match_len > $profile.sufficient_match_len
+                        || $abs_pos.saturating_add(h3.match_len) >= $current_abs_end)
+                {
+                    $self.skip_insert_until_abs = $abs_pos.saturating_add(1);
+                    skip_further_match_search = true;
+                }
+            }
+        }
+        if !skip_further_match_search && $bt_matchfinder {
+            // SAFETY: same umbrella for bt_insert_and_collect_matches.
+            unsafe {
+                $self.$bt_insert(
+                    $abs_pos,
+                    $current_abs_end,
+                    $profile,
+                    min_match_len,
+                    &mut best_len_for_skip,
+                    $out,
+                )
+            };
+        } else if !skip_further_match_search {
+            $self.insert_position($abs_pos);
+            let max_chain_depth = $profile.max_chain_depth.min($self.search_depth);
+            let concat = &$self.history[$self.history_start..];
+            let mut match_end_abs = $abs_pos.saturating_add(9);
+            if max_chain_depth > 0 {
+                for (visited, candidate_abs) in
+                    $self.chain_candidates($abs_pos).into_iter().enumerate()
+                {
+                    if visited >= max_chain_depth {
+                        break;
+                    }
+                    if candidate_abs == usize::MAX {
+                        break;
+                    }
+                    if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+                        continue;
+                    }
+                    let candidate_idx = candidate_abs - $self.history_abs_start;
+                    let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+                    let base = concat.as_ptr();
+                    // SAFETY: history-relative indices; `tail_limit` bounds
+                    // the scan within `concat`. `$cpl` is the kernel-specific
+                    // common_prefix_len_ptr — call inlines because the
+                    // surrounding wrapper carries the same target_feature.
+                    let match_len =
+                        unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), tail_limit) };
+                    if match_len < min_match_len {
+                        continue;
+                    }
+                    let offset = $abs_pos - candidate_abs;
+                    if HcMatchGenerator::push_candidate_ladder(
+                        $out,
+                        &mut best_len_for_skip,
+                        MatchCandidate {
+                            start: $abs_pos,
+                            offset,
+                            match_len,
+                        },
+                        min_match_len,
+                    ) {
+                        let candidate_end = candidate_abs.saturating_add(match_len);
+                        if candidate_end > match_end_abs {
+                            match_end_abs = candidate_end;
+                        }
+                    }
+                    if match_len > HC_OPT_NUM
+                        || $abs_pos.saturating_add(match_len) >= $current_abs_end
+                    {
+                        break;
+                    }
+                }
+            }
+            $self.skip_insert_until_abs = $self
+                .skip_insert_until_abs
+                .max(match_end_abs.saturating_sub(8));
+        }
+        if let Some(ldm) = ldm_candidate {
+            let _ = HcMatchGenerator::push_candidate_ladder(
+                $out,
+                &mut best_len_for_skip,
+                ldm,
+                min_match_len,
+            );
+        }
+    }};
+}
+
+/// `hash3_candidate` body parameterized over the per-CPU
+/// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
+/// position when invoked, so the per-call ABI savings compound across the
+/// segment.
+macro_rules! hash3_candidate_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $min_match_len:ident,
+        $cpl:path $(,)?
+    ) => {{
+        if $self.hash3_log == 0 {
+            return None;
+        }
+        let idx = $abs_pos.checked_sub($self.history_abs_start)?;
+        let concat = $self.live_history();
+        if idx + 4 > concat.len() {
+            return None;
+        }
+        let hash3 = HcMatchGenerator::hash_position_at(concat, idx, $self.hash3_log, 3);
+        let entry = $self.hash3_table.get(hash3).copied().unwrap_or(HC_EMPTY);
+        let candidate_abs = HcMatchGenerator::stored_abs_position_fast(
+            entry,
+            $self.position_base,
+            $self.index_shift,
+        )?;
+        if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+            return None;
+        }
+        let offset = $abs_pos - candidate_abs;
+        if offset >= HC3_MAX_OFFSET {
+            return None;
+        }
+        let candidate_idx = candidate_abs - $self.history_abs_start;
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let base = concat.as_ptr();
+        // SAFETY: candidate/idx are within history range; tail_limit bounds
+        // the scan within `concat`.
+        let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(idx), tail_limit) };
+        (match_len >= $min_match_len).then_some(MatchCandidate {
+            start: $abs_pos,
+            offset,
+            match_len,
+        })
+    }};
+}
+
+/// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
+/// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
+/// the wrapper's `target_feature` umbrella instead of crossing the ABI
+/// boundary through the dispatcher. Three rep probes per encoded position →
+/// thousands per segment, so the per-call barrier was non-trivial.
+///
+/// The callback `f` runs in the wrapper's umbrella context too, so closures
+/// that capture mutable state still work (FnMut).
+macro_rules! for_each_repcode_candidate_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $lit_len:ident,
+        $reps:ident,
+        $current_abs_end:ident,
+        $min_match_len:ident,
+        $f:ident,
+        $cpl:path $(,)?
+    ) => {{
+        let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
+            [
+                Some($reps[1] as usize),
+                Some($reps[2] as usize),
+                ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
+            ]
+        } else {
+            [
+                Some($reps[0] as usize),
+                Some($reps[1] as usize),
+                Some($reps[2] as usize),
+            ]
+        };
+        let concat = $self.live_history();
+        let current_idx = $abs_pos - $self.history_abs_start;
+        if current_idx + 4 > concat.len() {
+            return;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let base = concat.as_ptr();
+        let concat_len = concat.len();
+        for rep in rep_offsets.into_iter().flatten() {
+            if rep == 0 || rep > $abs_pos {
+                continue;
+            }
+            let candidate_pos = $abs_pos - rep;
+            if candidate_pos < $self.history_abs_start {
+                continue;
+            }
+            let candidate_idx = candidate_pos - $self.history_abs_start;
+            // SAFETY: `candidate_idx ≤ current_idx < concat_len` (since
+            // candidate_pos ≤ abs_pos and we early-returned on
+            // `current_idx + 4 > concat_len`). `max` clamps to the shorter
+            // remaining run so neither pointer overruns `concat`.
+            let max = (concat_len - candidate_idx)
+                .min(concat_len - current_idx)
+                .min(tail_limit);
+            let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), max) };
+            if match_len < $min_match_len {
+                continue;
+            }
+            $f(MatchCandidate {
+                start: $abs_pos,
+                offset: rep,
+                match_len,
+            });
+        }
+    }};
+}
+
+/// `bt_insert_and_collect_matches` body parameterized over the per-CPU
+/// `count_match_from_indices` symbol. Same shape as
+/// [`bt_insert_step_no_rebase_body`] — picks up the matching kernel through
+/// `$cmf` so the per-iteration vector probe inlines under the wrapper's
+/// `target_feature` umbrella. Returns nothing (matches the original method).
+macro_rules! bt_insert_and_collect_matches_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $profile:ident,
+        $min_match_len:ident,
+        $best_len_for_skip:ident,
+        $out:ident,
+        $cmf:path $(,)?
+    ) => {{
+        let idx = $abs_pos - $self.history_abs_start;
+        let concat = &$self.history[$self.history_start..];
+        if idx + 8 > concat.len() {
+            return;
+        }
+        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        let hash =
+            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+            return;
+        };
+        let stored = relative_pos + 1;
+        let bt_mask = $self.bt_mask();
+        let bt_low = $abs_pos.saturating_sub(bt_mask);
+        let window_low = $self.window_low_abs_for_target($abs_pos);
+        let mut match_end_abs = $abs_pos.saturating_add(9);
+        let mut compares_left = $profile.max_chain_depth.min($self.search_depth);
+        let mut common_length_smaller = 0usize;
+        let mut common_length_larger = 0usize;
+        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let mut smaller_slot = pair_idx;
+        let mut larger_slot = pair_idx + 1;
+        let mut match_stored = $self.hash_table[hash];
+        $self.hash_table[hash] = stored;
+        // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
+        // probing may raise it; BT then only reports strictly longer matches.
+        let mut best_len = (*$best_len_for_skip).max($min_match_len.saturating_sub(1));
+
+        while compares_left > 0 {
+            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
+                match_stored,
+                $self.position_base,
+                $self.index_shift,
+            ) else {
+                break;
+            };
+            if candidate_abs < window_low || candidate_abs >= $abs_pos {
+                break;
+            }
+            compares_left -= 1;
+
+            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_smaller = $self.chain_table[next_pair_idx];
+            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let seed_len = common_length_smaller.min(common_length_larger);
+            let candidate_idx = candidate_abs - $self.history_abs_start;
+            // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
+            // concat.len()`.
+            let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
+
+            if match_len > best_len {
+                let offset = $abs_pos - candidate_abs;
+                let accepted = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    $best_len_for_skip,
+                    MatchCandidate {
+                        start: $abs_pos,
+                        offset,
+                        match_len,
+                    },
+                    $min_match_len,
+                );
+                if accepted {
+                    best_len = match_len;
+                    let candidate_end = candidate_abs.saturating_add(match_len);
+                    if candidate_end > match_end_abs {
+                        match_end_abs = candidate_end;
+                    }
+                    if match_len >= tail_limit || match_len > HC_OPT_NUM {
+                        break;
+                    }
+                }
+            }
+
+            if match_len >= tail_limit {
+                break;
+            }
+
+            let candidate_next = candidate_idx + match_len;
+            let current_next = idx + match_len;
+            if concat[candidate_next] < concat[current_next] {
+                $self.chain_table[smaller_slot] = match_stored;
+                common_length_smaller = match_len;
+                if candidate_abs <= bt_low {
+                    smaller_slot = usize::MAX;
+                    break;
+                }
+                smaller_slot = next_pair_idx + 1;
+                match_stored = next_larger;
+            } else {
+                $self.chain_table[larger_slot] = match_stored;
+                common_length_larger = match_len;
+                if candidate_abs <= bt_low {
+                    larger_slot = usize::MAX;
+                    break;
+                }
+                larger_slot = next_pair_idx;
+                match_stored = next_smaller;
+            }
+        }
+
+        if smaller_slot != usize::MAX {
+            $self.chain_table[smaller_slot] = HC_EMPTY;
+        }
+        if larger_slot != usize::MAX {
+            $self.chain_table[larger_slot] = HC_EMPTY;
+        }
+        $self.skip_insert_until_abs = match_end_abs.saturating_sub(8);
+    }};
 }
 
 impl HcMatchGenerator {
+    fn donor_opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
+        let start_cursor = usize::from(current_abs_start == self.history_abs_start);
+        (start_cursor, start_cursor)
+    }
+
+    fn sufficient_match_len_for_pass(&self, profile: HcOptimalCostProfile) -> usize {
+        profile
+            .sufficient_match_len
+            .min(self.target_len)
+            .clamp(HC_OPT_MIN_MATCH_LEN, HC_OPT_NUM - 1)
+    }
+
+    fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
+        self.parse_mode == HcParseMode::BtUltra2
+            && self.opt_state.lit_length_sum == 0
+            && self.opt_state.dictionary_seed.is_none()
+            && !self.dictionary_primed_for_frame
+            && self.ldm_sequences.is_empty()
+            && self.window_size == current_len
+            && self.history_abs_start == 0
+            && self.window.len() == 1
+            && current_len > HC_PREDEF_THRESHOLD
+    }
+
+    fn mark_dictionary_primed(&mut self) {
+        self.dictionary_primed_for_frame = true;
+    }
+
+    fn set_dictionary_limit_from_primed_bytes(&mut self, primed_len: usize) {
+        self.dictionary_limit_abs = if primed_len == 0 {
+            None
+        } else {
+            Some(self.history_abs_start.saturating_add(primed_len))
+        };
+    }
+
+    fn encode_offset_with_reps(
+        actual_offset: u32,
+        lit_len: usize,
+        reps: [u32; 3],
+    ) -> (u32, [u32; 3]) {
+        let mut next_reps = reps;
+        let encoded = if lit_len > 0 {
+            if actual_offset == reps[0] {
+                1
+            } else if actual_offset == reps[1] {
+                2
+            } else if actual_offset == reps[2] {
+                3
+            } else {
+                actual_offset.saturating_add(3)
+            }
+        } else if actual_offset == reps[1] {
+            1
+        } else if actual_offset == reps[2] {
+            2
+        } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
+            3
+        } else {
+            actual_offset.saturating_add(3)
+        };
+
+        if lit_len > 0 {
+            match encoded {
+                1 => {}
+                2 => {
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+                _ => {
+                    next_reps[2] = next_reps[1];
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+            }
+        } else {
+            match encoded {
+                1 => {
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+                _ => {
+                    next_reps[2] = next_reps[1];
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+            }
+        }
+
+        (encoded, next_reps)
+    }
+
+    #[inline(always)]
+    fn encode_offset_base_with_reps(actual_offset: u32, lit_len: usize, reps: [u32; 3]) -> u32 {
+        if lit_len > 0 {
+            if actual_offset == reps[0] {
+                1
+            } else if actual_offset == reps[1] {
+                2
+            } else if actual_offset == reps[2] {
+                3
+            } else {
+                actual_offset.saturating_add(3)
+            }
+        } else if actual_offset == reps[1] {
+            1
+        } else if actual_offset == reps[2] {
+            2
+        } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
+            3
+        } else {
+            actual_offset.saturating_add(3)
+        }
+    }
+
     fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
@@ -2676,28 +4636,80 @@ impl HcMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             position_base: 0,
+            index_shift: 0,
             offset_hist: [1, 4, 8],
             hash_table: Vec::new(),
+            hash3_table: Vec::new(),
             chain_table: Vec::new(),
             lazy_depth: 2,
             hash_log: HC_HASH_LOG,
             chain_log: HC_CHAIN_LOG,
             search_depth: HC_SEARCH_DEPTH,
             target_len: HC_TARGET_LEN,
+            parse_mode: HcParseMode::Lazy2,
+            ldm_sequences: Vec::new(),
+            next_to_update3: 0,
+            hash3_log: HC3_HASH_LOG,
+            skip_insert_until_abs: 0,
+            dictionary_limit_abs: None,
+            dictionary_primed_for_frame: false,
+            allow_zero_relative_position: false,
+            opt_state: HcOptState::new(),
+            opt_nodes_scratch: Vec::new(),
+            opt_candidates_scratch: Vec::new(),
+            opt_store_scratch: Vec::new(),
+            opt_segment_plan_scratch: Vec::new(),
+            opt_seed_plan_scratch: Vec::new(),
+            opt_ll_price_scratch: Vec::new(),
+            opt_ll_price_generation: Vec::new(),
+            opt_ll_price_stamp: 0,
+            opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
+            opt_lit_price_generation: [0; HC_MAX_LIT + 1],
+            opt_lit_price_stamp: 0,
+            opt_ml_price_scratch: Vec::new(),
+            opt_ml_price_generation: Vec::new(),
+            opt_ml_price_stamp: 0,
         }
     }
 
-    fn configure(&mut self, config: HcConfig) {
-        let resize = self.hash_log != config.hash_log || self.chain_log != config.chain_log;
+    fn configure(&mut self, config: HcConfig, window_log: u8) {
+        let next_hash3_log = if config.parse_mode == HcParseMode::BtUltra2 {
+            HC3_HASH_LOG.min(window_log as usize)
+        } else {
+            0
+        };
+        let resize = self.hash_log != config.hash_log
+            || self.chain_log != config.chain_log
+            || self.hash3_log != next_hash3_log;
         self.hash_log = config.hash_log;
         self.chain_log = config.chain_log;
-        self.search_depth = config.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        self.hash3_log = next_hash3_log;
+        self.search_depth = if matches!(
+            config.parse_mode,
+            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
+        ) {
+            config.search_depth
+        } else {
+            config.search_depth.min(MAX_HC_SEARCH_DEPTH)
+        };
         self.target_len = config.target_len;
+        self.parse_mode = config.parse_mode;
         if resize && !self.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
             self.hash_table.clear();
+            self.hash3_table.clear();
             self.chain_table.clear();
         }
+    }
+
+    fn seed_dictionary_entropy(
+        &mut self,
+        huff: Option<&crate::huff0::huff0_encoder::HuffmanTable>,
+        ll: Option<&crate::fse::fse_encoder::FSETable>,
+        ml: Option<&crate::fse::fse_encoder::FSETable>,
+        of: Option<&crate::fse::fse_encoder::FSETable>,
+    ) {
+        self.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
     }
 
     fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -2706,9 +4718,32 @@ impl HcMatchGenerator {
         self.history_start = 0;
         self.history_abs_start = 0;
         self.position_base = 0;
+        self.index_shift = 0;
         self.offset_hist = [1, 4, 8];
+        self.ldm_sequences.clear();
+        self.next_to_update3 = 0;
+        self.skip_insert_until_abs = 0;
+        self.dictionary_limit_abs = None;
+        self.dictionary_primed_for_frame = false;
+        self.allow_zero_relative_position = false;
+        self.opt_state.reset();
+        self.opt_nodes_scratch.clear();
+        self.opt_candidates_scratch.clear();
+        self.opt_store_scratch.clear();
+        self.opt_segment_plan_scratch.clear();
+        self.opt_seed_plan_scratch.clear();
+        self.opt_ll_price_scratch.clear();
+        self.opt_ll_price_generation.clear();
+        self.opt_ll_price_stamp = 0;
+        self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
+        self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
+        self.opt_lit_price_stamp = 0;
+        self.opt_ml_price_scratch.clear();
+        self.opt_ml_price_generation.clear();
+        self.opt_ml_price_stamp = 0;
         if !self.hash_table.is_empty() {
             self.hash_table.fill(HC_EMPTY);
+            self.hash3_table.fill(HC_EMPTY);
             self.chain_table.fill(HC_EMPTY);
         }
         for mut data in self.window.drain(..) {
@@ -2735,6 +4770,7 @@ impl HcMatchGenerator {
         }
         self.compact_history();
         self.history.extend_from_slice(&data);
+        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
         self.window_size += data.len();
         self.window.push_back(data);
     }
@@ -2751,12 +4787,26 @@ impl HcMatchGenerator {
 
     /// Backfill positions from the tail of the previous slice that couldn't be
     /// hashed at the time (insert_position needs 4 bytes of lookahead).
-    fn backfill_boundary_positions(&mut self, current_abs_start: usize) {
+    fn backfill_boundary_positions(&mut self, current_abs_start: usize, current_abs_end: usize) {
         let backfill_start = current_abs_start
             .saturating_sub(3)
             .max(self.history_abs_start);
         if backfill_start < current_abs_start {
-            self.insert_positions(backfill_start, current_abs_start);
+            if self.uses_bt_matchfinder() {
+                self.bt_update_tree_until(current_abs_start, current_abs_end);
+            } else {
+                self.insert_positions(backfill_start, current_abs_start);
+            }
+        }
+    }
+
+    fn apply_limited_update_after_long_match(&mut self, current_abs_start: usize) {
+        if !self.uses_bt_matchfinder() {
+            return;
+        }
+        let gap = current_abs_start.saturating_sub(self.skip_insert_until_abs);
+        if gap > 384 {
+            self.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
         }
     }
 
@@ -2765,7 +4815,15 @@ impl HcMatchGenerator {
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
-        self.backfill_boundary_positions(current_abs_start);
+        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        if self.uses_bt_matchfinder() {
+            if incompressible_hint == Some(true) {
+                self.bt_insert_sparse_incompressible_block(current_abs_start, current_abs_end);
+                return;
+            }
+            self.bt_update_tree_until(current_abs_end, current_abs_end);
+            return;
+        }
         if incompressible_hint == Some(true) {
             self.insert_positions_with_step(
                 current_abs_start,
@@ -2787,7 +4845,51 @@ impl HcMatchGenerator {
         }
     }
 
+    fn bt_insert_sparse_incompressible_block(
+        &mut self,
+        current_abs_start: usize,
+        current_abs_end: usize,
+    ) {
+        let mut pos = current_abs_start;
+        while pos < current_abs_end {
+            self.maybe_rebase_positions(pos);
+            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            self.insert_hash3_only_no_rebase(pos);
+            let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
+            if next <= pos {
+                break;
+            }
+            pos = next;
+        }
+
+        let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
+        let tail_start = current_abs_end
+            .saturating_sub(dense_tail)
+            .max(self.history_abs_start)
+            .max(current_abs_start);
+        for pos in tail_start..current_abs_end {
+            if (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
+                continue;
+            }
+            self.maybe_rebase_positions(pos);
+            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            self.insert_hash3_only_no_rebase(pos);
+        }
+
+        self.skip_insert_until_abs = self.skip_insert_until_abs.max(current_abs_end);
+        self.next_to_update3 = self.next_to_update3.max(current_abs_end);
+    }
+
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        match self.parse_mode {
+            HcParseMode::Lazy2 => self.start_matching_lazy(&mut handle_sequence),
+            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2 => {
+                self.start_matching_optimal(&mut handle_sequence)
+            }
+        }
+    }
+
+    fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_tables();
 
         let current_len = self.window.back().unwrap().len();
@@ -2796,7 +4898,8 @@ impl HcMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        self.backfill_boundary_positions(current_abs_start);
+        let current_abs_end = current_abs_start + current_len;
+        self.backfill_boundary_positions(current_abs_start, current_abs_end);
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
@@ -2843,9 +4946,973 @@ impl HcMatchGenerator {
         }
     }
 
+    fn start_matching_optimal(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        self.ensure_tables();
+        let current_len = self.window.back().unwrap().len();
+        if current_len == 0 {
+            return;
+        }
+        let current_ptr = self.window.back().unwrap().as_ptr();
+        // `start_matching_optimal()` mutates tables/state but never mutates or
+        // reorders `self.window`, so this block slice remains valid for the
+        // duration of the routine and avoids cloning the full block.
+        let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
+
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        self.apply_limited_update_after_long_match(current_abs_start);
+        let hash3_start_cursor = self.skip_insert_until_abs.max(self.history_abs_start);
+        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        self.next_to_update3 = hash3_start_cursor;
+        self.prepare_ldm_candidates(current_abs_start, current_len);
+
+        if self.should_run_btultra2_seed_pass(current_len) {
+            self.run_btultra2_seed_pass(current, current_abs_start, current_len);
+        }
+
+        let profile = if self.parse_mode == HcParseMode::BtUltra2 {
+            // Donor btultra2 runs one accurate opt pass after initStats_ultra.
+            HcOptimalCostProfile::for_mode(self.parse_mode, true)
+        } else {
+            HcOptimalCostProfile::for_mode(self.parse_mode, false)
+        };
+        let mut opt_state = core::mem::replace(&mut self.opt_state, HcOptState::new());
+        opt_state.rescale_freqs(current, profile);
+        let mut best_plan = core::mem::take(&mut self.opt_segment_plan_scratch);
+        best_plan.clear();
+        let mut plan_reps = self.offset_hist;
+        let (mut cursor, mut plan_litlen) =
+            self.donor_opt_start_cursor_and_litlen(current_abs_start);
+        let mut plan_literals_cursor = 0usize;
+        let match_loop_limit = current_len.saturating_sub(8);
+        while cursor < match_loop_limit {
+            let remaining_len = current_len - cursor;
+            let segment_abs_start = current_abs_start + cursor;
+            let segment_start = best_plan.len();
+            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan(
+                &current[cursor..],
+                segment_abs_start,
+                remaining_len,
+                HcOptimalPlanState {
+                    reps: plan_reps,
+                    litlen: plan_litlen,
+                    profile,
+                },
+                &opt_state,
+                &mut best_plan,
+            );
+            Self::update_plan_stats_segment(
+                current,
+                current_len,
+                &best_plan[segment_start..],
+                &mut plan_literals_cursor,
+                &mut plan_reps,
+                &mut opt_state,
+                profile.accurate,
+            );
+            plan_reps = end_reps;
+            plan_litlen = end_litlen;
+            cursor += consumed_len;
+        }
+
+        self.emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
+        best_plan.clear();
+        self.opt_segment_plan_scratch = best_plan;
+        self.opt_state = opt_state;
+    }
+
+    fn run_btultra2_seed_pass(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+    ) {
+        let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+        let mut opt_state = core::mem::replace(&mut self.opt_state, HcOptState::new());
+        opt_state.rescale_freqs(current, seed_profile);
+        let mut seed_reps = self.offset_hist;
+        let (mut cursor, mut seed_litlen) =
+            self.donor_opt_start_cursor_and_litlen(current_abs_start);
+        let mut seed_literals_cursor = 0usize;
+        let mut seed_plan = core::mem::take(&mut self.opt_seed_plan_scratch);
+        seed_plan.clear();
+        let match_loop_limit = current_len.saturating_sub(8);
+        while cursor < match_loop_limit {
+            let remaining_len = current_len - cursor;
+            let segment_abs_start = current_abs_start + cursor;
+            let segment_start = seed_plan.len();
+            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan(
+                &current[cursor..],
+                segment_abs_start,
+                remaining_len,
+                HcOptimalPlanState {
+                    reps: seed_reps,
+                    litlen: seed_litlen,
+                    profile: seed_profile,
+                },
+                &opt_state,
+                &mut seed_plan,
+            );
+            Self::update_plan_stats_segment(
+                current,
+                current_len,
+                &seed_plan[segment_start..],
+                &mut seed_literals_cursor,
+                &mut seed_reps,
+                &mut opt_state,
+                seed_profile.accurate,
+            );
+            seed_plan.truncate(segment_start);
+            seed_reps = end_reps;
+            seed_litlen = end_litlen;
+            cursor += consumed_len;
+        }
+        seed_plan.clear();
+        self.opt_seed_plan_scratch = seed_plan;
+        self.opt_state = opt_state;
+
+        // Donor initStats_ultra keeps the collected entropy statistics but
+        // invalidates the first-pass matchfinder history before the real pass.
+        self.position_base = self.history_abs_start;
+        self.index_shift = current_len;
+        self.next_to_update3 = current_abs_start;
+        self.skip_insert_until_abs = current_abs_start;
+        // Donor `ZSTD_initStats_ultra()` invalidates the first scan by moving
+        // `window.base` back by `srcSize`, making the real pass start at
+        // `curr == srcSize` instead of 0. Position 0 is therefore a valid
+        // table entry in the second pass even though raw C tables reserve
+        // value 0 as empty during an unshifted first pass.
+        self.allow_zero_relative_position = true;
+    }
+
+    fn update_plan_stats_segment(
+        current: &[u8],
+        current_len: usize,
+        plan: &[HcOptimalSequence],
+        literals_start: &mut usize,
+        reps: &mut [u32; 3],
+        opt_state: &mut HcOptState,
+        accurate: bool,
+    ) {
+        if plan.is_empty() {
+            return;
+        }
+        for item in plan {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < *literals_start || start + match_len > current_len {
+                continue;
+            }
+            let literals = &current[*literals_start..start];
+            let (off_base, next_reps) =
+                Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
+            opt_state.update_stats(literals.len(), literals, off_base, match_len);
+            *reps = next_reps;
+            *literals_start = start + match_len;
+        }
+        opt_state.set_base_prices(accurate);
+    }
+
+    fn build_optimal_plan(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        let profile = initial_state.profile;
+        match (profile.accurate, profile.favor_small_offsets) {
+            (true, false) => self.build_optimal_plan_impl::<true, false>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (true, true) => self.build_optimal_plan_impl::<true, true>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (false, false) => self.build_optimal_plan_impl::<false, false>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+            (false, true) => self.build_optimal_plan_impl::<false, true>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            ),
+        }
+    }
+
+    /// Cross-platform DP entry. Picks the kernel-specific variant so the
+    /// entire optimal-parser DP body (per-position match gathering, price
+    /// updates, traceback) runs inside a single `target_feature` umbrella
+    /// alongside the per-position `collect_optimal_candidates_initialized_
+    /// <kernel>`. This eliminates the final ABI barrier on the hot per-
+    /// position match-collection call — the level22 critical path is now
+    /// one straight-line inline chain from DP body down through BT walk
+    /// and match-length probes.
+    #[inline(always)]
+    fn build_optimal_plan_impl<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.build_optimal_plan_impl_neon::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.build_optimal_plan_impl_avx2_bmi2::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.build_optimal_plan_impl_sse42::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self
+                    .build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                        current,
+                        current_abs_start,
+                        current_len,
+                        initial_state,
+                        stats,
+                        out,
+                    ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella DP body. Inlines
+    /// `collect_optimal_candidates_initialized_neon` (and its entire
+    /// per-position pipeline) directly into the DP loop.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn build_optimal_plan_impl_neon<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_neon,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn build_optimal_plan_impl_sse42<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_sse42,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn build_optimal_plan_impl_avx2_bmi2<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_avx2_bmi2,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    // Body macros wrap callees in `unsafe { }` for the NEON/AVX/SSE
+    // variants where callees are `unsafe fn`. The scalar wrappers route
+    // through safe fns, so those blocks are redundant on this path.
+    #[allow(unused_unsafe)]
+    fn build_optimal_plan_impl_scalar<
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_scalar,
+        )
+    }
+
+    fn finish_optimal_plan(
+        &mut self,
+        buffers: HcOptimalPlanBuffers,
+        result: (u32, [u32; 3], usize, usize),
+    ) -> (u32, [u32; 3], usize, usize) {
+        let HcOptimalPlanBuffers {
+            nodes,
+            mut candidates,
+            store,
+            ll_prices,
+            ll_price_generations,
+            ml_prices,
+            ml_price_generations,
+        } = buffers;
+        candidates.clear();
+        self.opt_nodes_scratch = nodes;
+        self.opt_candidates_scratch = candidates;
+        self.opt_store_scratch = store;
+        self.opt_ll_price_scratch = ll_prices;
+        self.opt_ll_price_generation = ll_price_generations;
+        self.opt_ml_price_scratch = ml_prices;
+        self.opt_ml_price_generation = ml_price_generations;
+        result
+    }
+
+    #[inline(always)]
+    fn reset_opt_nodes(nodes: &mut [HcOptimalNode], start: usize, end: usize) {
+        for node in &mut nodes[start..=end] {
+            Self::reset_opt_node(node);
+        }
+    }
+
+    #[inline(always)]
+    fn reset_opt_node(node: &mut HcOptimalNode) {
+        node.price = u32::MAX;
+        // Donor only marks the slot as unreachable and not end-of-match here;
+        // stale mlen is ignored while price is MAX and litlen is non-zero.
+        node.litlen = u32::MAX;
+    }
+
+    #[inline(always)]
+    fn add_price_delta(price: u32, add: u32, delta: i32) -> u32 {
+        #[cfg(debug_assertions)]
+        {
+            let sum = price as i64 + add as i64 + delta as i64;
+            debug_assert!((0..=u32::MAX as i64).contains(&sum));
+        }
+        price.wrapping_add(add).wrapping_add_signed(delta)
+    }
+
+    #[inline(always)]
+    fn add_prices(lhs: u32, rhs: u32) -> u32 {
+        let sum = lhs + rhs;
+        debug_assert!(sum >= lhs);
+        sum
+    }
+
+    #[inline(always)]
+    fn cached_literal_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        byte: u8,
+        prices: &mut [u32; HC_MAX_LIT + 1],
+        generations: &mut [u32; HC_MAX_LIT + 1],
+        stamp: u32,
+    ) -> u32 {
+        // SAFETY: `byte as usize` is `0..256` and the fixed-size arrays are
+        // `[u32; HC_MAX_LIT + 1 = 257]`, so the index is statically in bounds.
+        // Each cached_*_price call sits inside the optimal parser per-byte
+        // hot loop where these bounds checks are pure overhead.
+        let idx = byte as usize;
+        unsafe {
+            if *generations.get_unchecked(idx) == stamp {
+                return *prices.get_unchecked(idx);
+            }
+            let price = profile.literal_price(stats, byte);
+            *prices.get_unchecked_mut(idx) = price;
+            *generations.get_unchecked_mut(idx) = stamp;
+            price
+        }
+    }
+
+    #[inline(always)]
+    fn cached_lit_length_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        lit_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> u32 {
+        if lit_len >= prices.len() {
+            return profile.lit_length_price(stats, lit_len);
+        }
+        // SAFETY: the early-return above proves `lit_len < prices.len()`. The
+        // matching `generations` slice is sized identically by the caller in
+        // `build_optimal_plan_impl` (`opt_ll_price_scratch` /
+        // `opt_ll_price_generation` are `resize`d together), so the same
+        // index is in bounds for both.
+        unsafe {
+            if *generations.get_unchecked(lit_len) == stamp {
+                return *prices.get_unchecked(lit_len);
+            }
+            let price = profile.lit_length_price(stats, lit_len);
+            *prices.get_unchecked_mut(lit_len) = price;
+            *generations.get_unchecked_mut(lit_len) = stamp;
+            price
+        }
+    }
+
+    #[inline(always)]
+    fn cached_lit_length_delta_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        lit_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> i32 {
+        if lit_len == 0 {
+            return profile.lit_length_price(stats, lit_len) as i32
+                - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
+        }
+        let price =
+            Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);
+        let previous =
+            Self::cached_lit_length_price(profile, stats, lit_len - 1, prices, generations, stamp);
+        price as i32 - previous as i32
+    }
+
+    #[inline(always)]
+    fn cached_match_length_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        match_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> u32 {
+        if match_len >= prices.len() {
+            return profile.match_length_price(stats, match_len);
+        }
+        // SAFETY: see `cached_lit_length_price` — the caller co-sizes
+        // `opt_ml_price_scratch` and `opt_ml_price_generation`, and the
+        // early return proves `match_len < prices.len()`.
+        unsafe {
+            if *generations.get_unchecked(match_len) == stamp {
+                return *prices.get_unchecked(match_len);
+            }
+            let price = profile.match_length_price(stats, match_len);
+            *prices.get_unchecked_mut(match_len) = price;
+            *generations.get_unchecked_mut(match_len) = stamp;
+            price
+        }
+    }
+
+    #[cfg(test)]
+    fn collect_optimal_candidates(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        self.ensure_tables();
+        if self.uses_bt_matchfinder() {
+            self.collect_optimal_candidates_initialized::<true>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            );
+        } else {
+            self.collect_optimal_candidates_initialized::<false>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            );
+        }
+    }
+
+    /// Cross-platform entry. Picks the kernel-specific variant so the per-
+    /// position pipeline (BT-tree fill, rep probing, hash3 probing, BT
+    /// collect / HC chain walk) runs inside a single `target_feature`
+    /// umbrella — all inner SIMD probes inline without ABI barriers.
+    ///
+    /// The on-encode hot path bypasses this dispatcher: `build_optimal_plan_impl_<kernel>`
+    /// calls the matching `_<kernel>` variant directly. This entry is kept
+    /// for the cfg(test)-only `collect_optimal_candidates` shim and any
+    /// future caller that isn't already inside a kernel umbrella.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn collect_optimal_candidates_initialized<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.collect_optimal_candidates_initialized_neon::<USE_BT_MATCHFINDER>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.collect_optimal_candidates_initialized_sse42::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self
+                    .collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
+                        out,
+                    ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant. Every inner helper (`bt_update_tree_until_neon`,
+    /// `for_each_repcode_candidate_with_reps_neon`, `hash3_candidate_neon`,
+    /// `bt_insert_and_collect_matches_neon`, `fastpath::neon::
+    /// common_prefix_len_ptr`) shares the NEON umbrella so the per-position
+    /// pipeline executes as a single straight-line inline sequence.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn collect_optimal_candidates_initialized_neon<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_neon,
+            bt_insert_and_collect_matches_neon,
+            for_each_repcode_candidate_with_reps_neon,
+            hash3_candidate_neon,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn collect_optimal_candidates_initialized_sse42<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_sse42,
+            bt_insert_and_collect_matches_sse42,
+            for_each_repcode_candidate_with_reps_sse42,
+            hash3_candidate_sse42,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_avx2_bmi2,
+            bt_insert_and_collect_matches_avx2_bmi2,
+            for_each_repcode_candidate_with_reps_avx2_bmi2,
+            hash3_candidate_avx2_bmi2,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
+    // callees are safe so the blocks are redundant here only.
+    #[allow(unused_unsafe)]
+    fn collect_optimal_candidates_initialized_scalar<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_scalar,
+            bt_insert_and_collect_matches_scalar,
+            for_each_repcode_candidate_with_reps_scalar,
+            hash3_candidate_scalar,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
+    }
+
+    fn push_candidate_ladder(
+        out: &mut Vec<MatchCandidate>,
+        best_len_for_skip: &mut usize,
+        candidate: MatchCandidate,
+        min_match_len: usize,
+    ) -> bool {
+        if candidate.match_len < min_match_len {
+            return false;
+        }
+        if candidate.match_len > *best_len_for_skip {
+            out.push(candidate);
+            *best_len_for_skip = candidate.match_len;
+            return true;
+        }
+        false
+    }
+
+    fn ldm_skip_raw_seq_store_bytes(&self, seq_store: &mut HcRawSeqStore, nb_bytes: usize) {
+        let mut curr_pos = seq_store.pos_in_sequence.saturating_add(nb_bytes);
+        while curr_pos > 0 && seq_store.pos < seq_store.size {
+            let curr_seq = self.ldm_sequences[seq_store.pos];
+            let seq_len = curr_seq.lit_length.saturating_add(curr_seq.match_length);
+            if curr_pos >= seq_len {
+                curr_pos -= seq_len;
+                seq_store.pos += 1;
+            } else {
+                seq_store.pos_in_sequence = curr_pos;
+                break;
+            }
+        }
+        if curr_pos == 0 || seq_store.pos == seq_store.size {
+            seq_store.pos_in_sequence = 0;
+        }
+    }
+
+    fn ldm_get_next_match_and_update_seq_store(
+        &self,
+        opt_ldm: &mut HcOptLdmState,
+        curr_pos_in_block: usize,
+        block_bytes_remaining: usize,
+    ) {
+        if opt_ldm.seq_store.size == 0 || opt_ldm.seq_store.pos >= opt_ldm.seq_store.size {
+            opt_ldm.start_pos_in_block = usize::MAX;
+            opt_ldm.end_pos_in_block = usize::MAX;
+            return;
+        }
+        let curr_seq = self.ldm_sequences[opt_ldm.seq_store.pos];
+        let curr_block_end_pos = curr_pos_in_block.saturating_add(block_bytes_remaining);
+        let literals_bytes_remaining = curr_seq
+            .lit_length
+            .saturating_sub(opt_ldm.seq_store.pos_in_sequence);
+        let match_bytes_remaining = if literals_bytes_remaining == 0 {
+            curr_seq.match_length.saturating_sub(
+                opt_ldm
+                    .seq_store
+                    .pos_in_sequence
+                    .saturating_sub(curr_seq.lit_length),
+            )
+        } else {
+            curr_seq.match_length
+        };
+        if literals_bytes_remaining >= block_bytes_remaining {
+            opt_ldm.start_pos_in_block = usize::MAX;
+            opt_ldm.end_pos_in_block = usize::MAX;
+            self.ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, block_bytes_remaining);
+            return;
+        }
+        opt_ldm.start_pos_in_block = curr_pos_in_block.saturating_add(literals_bytes_remaining);
+        opt_ldm.end_pos_in_block = opt_ldm
+            .start_pos_in_block
+            .saturating_add(match_bytes_remaining);
+        opt_ldm.offset = curr_seq.offset;
+        if opt_ldm.end_pos_in_block > curr_block_end_pos {
+            opt_ldm.end_pos_in_block = curr_block_end_pos;
+            self.ldm_skip_raw_seq_store_bytes(
+                &mut opt_ldm.seq_store,
+                curr_block_end_pos.saturating_sub(curr_pos_in_block),
+            );
+        } else {
+            self.ldm_skip_raw_seq_store_bytes(
+                &mut opt_ldm.seq_store,
+                literals_bytes_remaining.saturating_add(match_bytes_remaining),
+            );
+        }
+    }
+
+    fn ldm_maybe_add_match(
+        &self,
+        opt_ldm: &HcOptLdmState,
+        curr_pos_in_block: usize,
+        min_match: usize,
+    ) -> Option<MatchCandidate> {
+        let pos_diff = curr_pos_in_block.saturating_sub(opt_ldm.start_pos_in_block);
+        let candidate_match_length = opt_ldm
+            .end_pos_in_block
+            .saturating_sub(opt_ldm.start_pos_in_block)
+            .saturating_sub(pos_diff);
+        if curr_pos_in_block < opt_ldm.start_pos_in_block
+            || curr_pos_in_block >= opt_ldm.end_pos_in_block
+            || candidate_match_length < min_match
+        {
+            return None;
+        }
+        Some(MatchCandidate {
+            start: curr_pos_in_block,
+            offset: opt_ldm.offset,
+            match_len: candidate_match_length,
+        })
+    }
+
+    fn ldm_process_match_candidate(
+        &self,
+        opt_ldm: &mut HcOptLdmState,
+        curr_pos_in_block: usize,
+        remaining_bytes: usize,
+        min_match: usize,
+    ) -> Option<MatchCandidate> {
+        if opt_ldm.seq_store.size == 0 || opt_ldm.seq_store.pos >= opt_ldm.seq_store.size {
+            return None;
+        }
+        if curr_pos_in_block >= opt_ldm.end_pos_in_block {
+            if curr_pos_in_block > opt_ldm.end_pos_in_block {
+                let pos_overshoot = curr_pos_in_block.saturating_sub(opt_ldm.end_pos_in_block);
+                self.ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, pos_overshoot);
+            }
+            self.ldm_get_next_match_and_update_seq_store(
+                opt_ldm,
+                curr_pos_in_block,
+                remaining_bytes,
+            );
+        }
+        self.ldm_maybe_add_match(opt_ldm, curr_pos_in_block, min_match)
+    }
+
+    fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
+        self.ldm_sequences.clear();
+        let _ = (current_abs_start, current_len);
+        // Donor parity: btopt/btultra/btultra2 only merge LDM candidates when
+        // a real ldmSeqStore exists (`enableLdm == ZSTD_ps_enable`).
+        // This Rust encoder does not expose a donor-equivalent LDM producer or
+        // runtime switch yet, so the ordinary level-22 path must remain LDM-free.
+    }
+
+    fn emit_optimal_plan(
+        &mut self,
+        current_len: usize,
+        plan: &[HcOptimalSequence],
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let current = self.window.back().unwrap().as_slice();
+        if plan.is_empty() {
+            handle_sequence(Sequence::Literals { literals: current });
+            return;
+        }
+
+        let mut literals_start = 0usize;
+        for item in plan {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < literals_start || start + match_len > current_len {
+                continue;
+            }
+            let literals = &current[literals_start..start];
+            handle_sequence(Sequence::Triple {
+                literals,
+                offset: item.offset as usize,
+                match_len,
+            });
+            encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
+            literals_start = start + match_len;
+        }
+
+        if literals_start < current_len {
+            handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
+    }
+
     fn ensure_tables(&mut self) {
         if self.hash_table.is_empty() {
             self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
+            let hash3_size = if self.hash3_log == 0 {
+                0
+            } else {
+                1 << self.hash3_log
+            };
+            self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
             self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
         }
     }
@@ -2870,67 +5937,774 @@ impl HcMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    fn uses_bt_matchfinder(&self) -> bool {
+        matches!(
+            self.parse_mode,
+            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
+        )
+    }
+
+    fn bt_log(&self) -> usize {
+        self.chain_log.saturating_sub(1)
+    }
+
+    fn bt_mask(&self) -> usize {
+        (1usize << self.bt_log()) - 1
+    }
+
+    fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
+        2 * (abs_pos.saturating_add(self.index_shift) & self.bt_mask())
+    }
+
+    #[inline(always)]
+    fn stored_abs_position_fast(
+        stored: u32,
+        position_base: usize,
+        index_shift: usize,
+    ) -> Option<usize> {
+        if stored == HC_EMPTY {
+            return None;
+        }
+        let shifted = position_base + (stored as usize - 1);
+        if shifted < index_shift {
+            return None;
+        }
+        Some(shifted - index_shift)
+    }
+
+    fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
+        let history_low = self.history_abs_start;
+        let window_low = target_abs.saturating_sub(self.max_window_size);
+        history_low.max(window_low)
+    }
+
+    fn bt_hash_mls(&self) -> usize {
+        // Donor parity: even when `minMatch == 3` (btultra2), the main BT/HC
+        // hash still goes through `ZSTD_hashPtr(..., mls)` which falls back to
+        // the default `case 4` in `zstd_compress_internal.h`. The 3-byte path
+        // is a separate HC3 side table only.
+        4
+    }
+
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
+    /// body executes inside one `target_feature` umbrella and inlines the
+    /// vectorized `count_match_from_indices` directly.
+    #[inline(always)]
+    fn bt_insert_step_no_rebase(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee — aarch64 NEON is baseline; x86 AVX2/BMI2 and SSE4.2 are
+        // selected only when the runtime detector reports them present.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+        }
+    }
+
+    /// NEON-umbrella variant: body inlines `fastpath::neon::count_match_from_indices`.
+    /// AArch64 only. Future x86 variants (`_sse42`, `_avx2_bmi2`) follow the
+    /// same pattern with their respective umbrellas.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_insert_step_no_rebase_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::neon::count_match_from_indices
+        )
+    }
+
+    /// SSE4.2-umbrella variant. Calls `fastpath::sse42::count_match_from_indices`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_insert_step_no_rebase_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::sse42::count_match_from_indices
+        )
+    }
+
+    /// AVX2+BMI2-umbrella variant. Calls
+    /// `fastpath::avx2_bmi2::count_match_from_indices`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets (and when no SIMD kernel
+    /// is selected). Routes through `fastpath::scalar::count_match_from_indices`
+    /// directly so the call site remains the same shape as the SIMD variants.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_insert_step_no_rebase_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        bt_insert_step_no_rebase_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::scalar::count_match_from_indices
+        )
+    }
+
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
+    /// update loop runs inside the same `target_feature` umbrella as the per-
+    /// position `bt_insert_step_no_rebase` it calls — eliminating one ABI
+    /// barrier per fill iteration.
+    #[inline(always)]
+    fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (see `bt_insert_step_no_rebase` dispatcher).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_update_tree_until_neon(abs_pos, current_abs_end)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+        }
+    }
+
+    /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
+    /// inlines into the body because both share the `target_feature = "neon"`
+    /// umbrella.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_update_tree_until_neon(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
+            let forward =
+                unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// SSE4.2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_update_tree_until_sse42(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_update_tree_until_avx2_bmi2(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward =
+                self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
+    /// body executes inside one `target_feature` umbrella and inlines the
+    /// vectorized `count_match_from_indices` directly. See
+    /// `bt_insert_step_no_rebase` for the same dispatcher pattern.
+    ///
+    /// The on-encode hot path bypasses this dispatcher: when invoked from
+    /// `collect_optimal_candidates_initialized_<kernel>` the per-kernel
+    /// variant is called directly so the BT match collection inlines under
+    /// the surrounding umbrella. This entry is kept for external / future
+    /// callers that aren't yet under an umbrella.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn bt_insert_and_collect_matches(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (see `bt_insert_step_no_rebase` dispatcher).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_and_collect_matches_neon(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_and_collect_matches_avx2_bmi2(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_and_collect_matches_sse42(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self.bt_insert_and_collect_matches_scalar(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    min_match_len,
+                    best_len_for_skip,
+                    out,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_and_collect_matches_scalar(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant of `bt_insert_and_collect_matches`. Inlines
+    /// `fastpath::neon::count_match_from_indices` via the shared body macro.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn bt_insert_and_collect_matches_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::neon::count_match_from_indices,
+        )
+    }
+
+    /// SSE4.2 umbrella variant of `bt_insert_and_collect_matches`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn bt_insert_and_collect_matches_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::sse42::count_match_from_indices,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant of `bt_insert_and_collect_matches`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn bt_insert_and_collect_matches_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn bt_insert_and_collect_matches_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        bt_insert_and_collect_matches_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::scalar::count_match_from_indices,
+        )
+    }
+
+    fn hash_position_with_mls(data: &[u8], hash_log: usize, mls: usize) -> usize {
+        let value = Self::read_le_u32(data);
+        Self::hash_value_with_mls(value, hash_log, mls)
+    }
+
+    #[inline(always)]
+    fn hash_position_at(data: &[u8], idx: usize, hash_log: usize, mls: usize) -> usize {
+        debug_assert!(idx + 4 <= data.len());
+        let value = unsafe { Self::read_le_u32_ptr(data.as_ptr().add(idx)) };
+        Self::hash_value_with_mls(value, hash_log, mls)
+    }
+
+    #[inline(always)]
+    fn hash_value_with_mls(value: u32, hash_log: usize, mls: usize) -> usize {
+        match mls {
+            3 => (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize,
+            _ => ((value.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hash_log)) as usize,
+        }
+    }
+
     fn hash_position(&self, data: &[u8]) -> usize {
-        let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
-        ((value.wrapping_mul(HASH_MIX_PRIME)) >> (64 - self.hash_log)) as usize
+        Self::hash_position_with_mls(data, self.hash_log, 4)
+    }
+
+    #[cfg(test)]
+    fn hash3_position(data: &[u8], hash_log: usize) -> usize {
+        let value = Self::read_le_u32(data);
+        (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize
+    }
+
+    #[inline(always)]
+    fn read_le_u32(data: &[u8]) -> u32 {
+        debug_assert!(data.len() >= 4);
+        unsafe { Self::read_le_u32_ptr(data.as_ptr()) }
+    }
+
+    #[inline(always)]
+    unsafe fn read_le_u32_ptr(ptr: *const u8) -> u32 {
+        unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
+    }
+
+    /// Cross-platform entry. Dispatches to the kernel-specific variant.
+    /// Retained so external callers / future code still have a stable shim;
+    /// the on-encode hot path bypasses this dispatcher via the kernel-specific
+    /// `_neon`/`_sse42`/`_avx2_bmi2`/`_scalar` variants invoked from inside
+    /// `collect_optimal_candidates_initialized_<kernel>`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn hash3_candidate(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.hash3_candidate_neon(abs_pos, current_abs_end, min_match_len)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Scalar => {
+                    self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn hash3_candidate_neon(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn hash3_candidate_sse42(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn hash3_candidate_avx2_bmi2(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn hash3_candidate_scalar(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
+    }
+
+    fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
+        if self.hash3_log == 0 {
+            return;
+        }
+        let idx = abs_pos - self.history_abs_start;
+        let concat = &self.history[self.history_start..];
+        if idx + 4 > concat.len() {
+            return;
+        }
+        let Some(relative_pos) = self.relative_position(abs_pos) else {
+            return;
+        };
+        let hash3 = Self::hash_position_at(concat, idx, self.hash3_log, 3);
+        self.hash3_table[hash3] = relative_pos + 1;
+    }
+
+    fn update_hash3_until(&mut self, abs_pos: usize) {
+        if self.next_to_update3 < self.history_abs_start {
+            self.next_to_update3 = self.history_abs_start;
+        }
+        if self.next_to_update3 >= abs_pos {
+            return;
+        }
+        while self.next_to_update3 < abs_pos {
+            if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos) {
+                self.maybe_rebase_positions(self.next_to_update3);
+            }
+            self.insert_hash3_only_no_rebase(self.next_to_update3);
+            self.next_to_update3 = self.next_to_update3.saturating_add(1);
+        }
     }
 
     fn relative_position(&self, abs_pos: usize) -> Option<u32> {
-        let rel = abs_pos.checked_sub(self.position_base)?;
+        let shifted_abs = abs_pos.checked_add(self.index_shift)?;
+        let rel = shifted_abs.checked_sub(self.position_base)?;
         let rel_u32 = u32::try_from(rel).ok()?;
+        // Donor parity: raw BT/HC tables use 0 as the empty sentinel, so the
+        // very first absolute position in the first block (curr == 0) is not a
+        // representable candidate index.
+        if !self.allow_zero_relative_position && self.position_base == 0 && rel_u32 == 0 {
+            return None;
+        }
         // Positions are stored as (relative_pos + 1), with 0 reserved as the
         // empty sentinel. So the raw relative position itself must stay
         // strictly below u32::MAX.
         (rel_u32 < u32::MAX).then_some(rel_u32)
     }
 
+    #[inline(always)]
+    fn can_skip_rebase_check_at(&self, abs_pos: usize, max_abs_pos: usize) -> bool {
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        self.position_base == 0
+            && self.index_shift == 0
+            && max_abs_pos <= max_rel_no_rebase
+            && (self.allow_zero_relative_position
+                || abs_pos > self.history_abs_start
+                || (self.parse_mode == HcParseMode::BtUltra2 && abs_pos == self.history_abs_start))
+    }
+
+    /// Hot wrapper: every `insert_position*` call passes through here. The
+    /// fast path is "no rebase needed" — `BtUltra2` first-position skip and a
+    /// single `relative_position()` range probe. The actual table rebuild
+    /// fires once per ~`u32::MAX` positions on rolling streams and never for
+    /// typical single-shot inputs, so it lives in a separate `#[cold]`
+    /// function. Inlining the hot wrapper lets the compiler fold the early
+    /// return into the caller and keep the cold path off the i-cache.
+    #[inline]
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
+        if self.parse_mode == HcParseMode::BtUltra2
+            && !self.allow_zero_relative_position
+            && self.position_base == 0
+            && abs_pos == 0
+        {
+            return;
+        }
         let needs_rebase = self
             .relative_position(abs_pos)
             .is_none_or(|relative| relative >= u32::MAX - 1);
         if !needs_rebase {
             return;
         }
+        self.rebase_positions_cold(abs_pos);
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn rebase_positions_cold(&mut self, abs_pos: usize) {
         // Keep all live history addressable after rebase.
         self.position_base = self.history_abs_start;
+        self.index_shift = 0;
+        self.allow_zero_relative_position = true;
         self.hash_table.fill(HC_EMPTY);
+        self.hash3_table.fill(HC_EMPTY);
         self.chain_table.fill(HC_EMPTY);
 
         let history_start = self.history_abs_start;
         // Rebuild only the already-inserted prefix. The caller inserts abs_pos
         // immediately after this, and later positions are added in-order.
-        for pos in history_start..abs_pos {
-            self.insert_position_no_rebase(pos);
+        if self.uses_bt_matchfinder() {
+            let rebuild_end = self.history_abs_end();
+            let mut pos = history_start;
+            while pos < abs_pos {
+                let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
+                pos = pos.saturating_add(forward.max(1));
+            }
+        } else {
+            for pos in history_start..abs_pos {
+                self.insert_position_no_rebase(pos);
+            }
         }
+        self.next_to_update3 = self.next_to_update3.max(abs_pos);
     }
 
+    #[inline]
     fn insert_position(&mut self, abs_pos: usize) {
         self.maybe_rebase_positions(abs_pos);
         self.insert_position_no_rebase(abs_pos);
     }
 
+    #[inline]
     fn insert_position_no_rebase(&mut self, abs_pos: usize) {
-        let idx = abs_pos - self.history_abs_start;
-        let concat = self.live_history();
+        let idx = abs_pos.wrapping_sub(self.history_abs_start);
+        let concat = &self.history[self.history_start..];
         if idx + 4 > concat.len() {
             return;
         }
-        let hash = self.hash_position(&concat[idx..]);
+        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
         let stored = relative_pos + 1;
-        let chain_idx = relative_pos as usize & ((1 << self.chain_log) - 1);
-        let prev = self.hash_table[hash];
-        self.chain_table[chain_idx] = prev;
-        self.hash_table[hash] = stored;
+        let chain_mask = (1usize << self.chain_log) - 1;
+        let chain_idx = relative_pos as usize & chain_mask;
+        // SAFETY: `hash` is produced by `hash_value_with_mls` which masks the
+        // result down to `hash_log` bits, and `hash_table.len() == 1 <<
+        // hash_log` (`ensure_tables`). `chain_idx` is `& chain_mask` so
+        // `< chain_table.len() == 1 << chain_log`. Both indices are provably
+        // in bounds, so the elided bounds checks save ~4 instructions per
+        // call on this per-byte-of-input hot path.
+        debug_assert!(hash < self.hash_table.len());
+        debug_assert!(chain_idx < self.chain_table.len());
+        unsafe {
+            let prev = *self.hash_table.get_unchecked(hash);
+            *self.chain_table.get_unchecked_mut(chain_idx) = prev;
+            *self.hash_table.get_unchecked_mut(hash) = stored;
+        }
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
         for pos in start..end {
             self.insert_position(pos);
         }
+        self.next_to_update3 = self.next_to_update3.max(end);
     }
 
     fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
@@ -2967,10 +6741,8 @@ impl HcMatchGenerator {
         // Stored values are (relative_pos + 1); decode with wrapping_sub(1)
         // and recover absolute position via position_base + relative.
         // Break on self-loops (masked chain_idx collision at periodicity).
-        // Cap total steps at 4x search depth to bound time spent skipping
-        // stale entries while still finding valid candidates deeper in chain.
         let mut steps = 0;
-        let max_chain_steps = self.search_depth * 4;
+        let max_chain_steps = self.search_depth;
         while filled < self.search_depth && steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
@@ -3068,6 +6840,182 @@ impl HcMatchGenerator {
             }
         }
         best
+    }
+
+    /// Cross-platform entry. Dispatches to the kernel-specific variant so the
+    /// per-rep prefix probe inlines without an ABI barrier per call. The
+    /// on-encode hot path bypasses this dispatcher via the kernel-specific
+    /// variants invoked from inside `collect_optimal_candidates_initialized_
+    /// <kernel>`; this entry is kept for test / external callers only.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn for_each_repcode_candidate_with_reps(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        f: impl FnMut(MatchCandidate),
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (same shape as the BT walk dispatchers).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.for_each_repcode_candidate_with_reps_neon(
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_avx2_bmi2(
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_sse42(
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Scalar => self.for_each_repcode_candidate_with_reps_scalar(
+                    abs_pos,
+                    lit_len,
+                    reps,
+                    current_abs_end,
+                    min_match_len,
+                    f,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.for_each_repcode_candidate_with_reps_scalar(
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant: per-rep `common_prefix_len_ptr` call inlines via
+    /// the shared body macro.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn for_each_repcode_candidate_with_reps_neon(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    /// SSE4.2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn for_each_repcode_candidate_with_reps_sse42(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn for_each_repcode_candidate_with_reps_avx2_bmi2(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn for_each_repcode_candidate_with_reps_scalar(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        for_each_repcode_candidate_body!(
+            self,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
     }
 
     fn extend_backwards(
@@ -3367,6 +7315,933 @@ fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
     assert_eq!(driver.active_backend, MatcherBackend::Row);
+}
+
+#[test]
+fn level_16_17_use_btopt_parse_mode() {
+    let p16 = resolve_level_params(CompressionLevel::Level(16), None);
+    let p17 = resolve_level_params(CompressionLevel::Level(17), None);
+    assert_eq!(p16.backend, MatcherBackend::HashChain);
+    assert_eq!(p17.backend, MatcherBackend::HashChain);
+    assert_eq!(p16.hc.parse_mode, HcParseMode::BtOpt);
+    assert_eq!(p17.hc.parse_mode, HcParseMode::BtOpt);
+}
+
+#[test]
+fn level_18_19_use_btultra_parse_mode() {
+    let p18 = resolve_level_params(CompressionLevel::Level(18), None);
+    let p19 = resolve_level_params(CompressionLevel::Level(19), None);
+    assert_eq!(p18.backend, MatcherBackend::HashChain);
+    assert_eq!(p19.backend, MatcherBackend::HashChain);
+    assert_eq!(p18.hc.parse_mode, HcParseMode::BtUltra);
+    assert_eq!(p19.hc.parse_mode, HcParseMode::BtUltra);
+}
+
+#[test]
+fn level_20_22_use_btultra2_parse_mode() {
+    for level in 20..=22 {
+        let params = resolve_level_params(CompressionLevel::Level(level), None);
+        assert_eq!(params.backend, MatcherBackend::HashChain);
+        assert_eq!(params.hc.parse_mode, HcParseMode::BtUltra2);
+    }
+}
+
+#[test]
+fn level22_uses_donor_target_length_and_large_input_tables() {
+    let params = resolve_level_params(CompressionLevel::Level(22), None);
+    assert_eq!(params.window_log, 27);
+    assert_eq!(params.hc.hash_log, 25);
+    assert_eq!(params.hc.chain_log, 27);
+    assert_eq!(params.hc.search_depth, 1 << 9);
+    assert_eq!(params.hc.target_len, 999);
+}
+
+#[test]
+fn level22_source_size_hint_uses_donor_btultra2_tiers() {
+    let p16k = resolve_level_params(CompressionLevel::Level(22), Some(16 * 1024));
+    assert_eq!(p16k.window_log, 14);
+    assert_eq!(p16k.hc.hash_log, 15);
+    assert_eq!(p16k.hc.chain_log, 15);
+    assert_eq!(p16k.hc.search_depth, 1 << 10);
+    assert_eq!(p16k.hc.target_len, 999);
+
+    let p128k = resolve_level_params(CompressionLevel::Level(22), Some(128 * 1024));
+    assert_eq!(p128k.window_log, 17);
+    assert_eq!(p128k.hc.hash_log, 17);
+    assert_eq!(p128k.hc.chain_log, 18);
+    assert_eq!(p128k.hc.search_depth, 1 << 11);
+    assert_eq!(p128k.hc.target_len, 999);
+
+    let p256k = resolve_level_params(CompressionLevel::Level(22), Some(256 * 1024));
+    assert_eq!(p256k.window_log, 18);
+    assert_eq!(p256k.hc.hash_log, 19);
+    assert_eq!(p256k.hc.chain_log, 19);
+    assert_eq!(p256k.hc.search_depth, 1 << 13);
+    assert_eq!(p256k.hc.target_len, 999);
+}
+
+#[test]
+fn level22_small_source_size_hint_matches_donor_cparams() {
+    use zstd::zstd_safe::zstd_sys;
+
+    let source_size = 15_027u64;
+    let donor = unsafe { zstd_sys::ZSTD_getCParams(22, source_size, 0) };
+    let params = resolve_level_params(CompressionLevel::Level(22), Some(source_size));
+
+    assert_eq!(params.window_log as u32, donor.windowLog);
+    assert_eq!(params.hc.chain_log as u32, donor.chainLog);
+    assert_eq!(params.hc.hash_log as u32, donor.hashLog);
+    assert_eq!(params.hc.search_depth as u32, 1u32 << donor.searchLog);
+    assert_eq!(HC_OPT_MIN_MATCH_LEN as u32, donor.minMatch);
+    assert_eq!(params.hc.target_len as u32, donor.targetLength);
+}
+
+#[test]
+fn level22_small_source_uses_window_bounded_hash3_log() {
+    let mut hc = HcMatchGenerator::new(1 << 14);
+    hc.configure(BTULTRA2_HC_CONFIG_L22_16K, 14);
+    assert_eq!(hc.hash3_log, 14);
+
+    hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
+    assert_eq!(hc.hash3_log, HC3_HASH_LOG);
+}
+
+#[test]
+fn btultra2_seed_pass_initializes_opt_state() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    let data: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+    hc.add_data(data, |_| {});
+    hc.start_matching(|_| {});
+    assert!(
+        hc.opt_state.lit_length_sum > 0,
+        "btultra2 first block should seed non-zero sequence statistics"
+    );
+    assert!(
+        hc.opt_state.off_code_sum > 0,
+        "btultra2 first block should seed offset-code statistics"
+    );
+}
+
+#[test]
+fn btultra2_profile_disables_small_offset_handicap() {
+    let p1 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let p2 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    assert!(
+        !p1.favor_small_offsets,
+        "btultra2 primary profile should match donor opt2 offset pricing"
+    );
+    assert!(
+        !p2.favor_small_offsets,
+        "btultra2 secondary profile should match donor opt2 offset pricing"
+    );
+}
+
+#[test]
+fn btultra2_profile_is_single_pass_opt2() {
+    let p1 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let p2 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    assert_eq!(p1.max_chain_depth, p2.max_chain_depth);
+    assert_eq!(p1.sufficient_match_len, p2.sufficient_match_len);
+    assert_eq!(p1.accurate, p2.accurate);
+    assert_eq!(p1.favor_small_offsets, p2.favor_small_offsets);
+    assert!(
+        p1.accurate,
+        "btultra2 should use donor opt2 accurate pricing in the main pass"
+    );
+}
+
+#[test]
+fn btultra_profile_keeps_donor_search_depth_budget() {
+    let p = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra, false);
+    assert_eq!(
+        p.max_chain_depth, 32,
+        "btultra should not cap chain depth below donor opt2 search budget"
+    );
+}
+
+#[test]
+fn btopt_profile_keeps_donor_search_depth_budget() {
+    let p = HcOptimalCostProfile::for_mode(HcParseMode::BtOpt, false);
+    assert_eq!(
+        p.max_chain_depth, 32,
+        "btopt should not cap chain depth below donor btopt search budget"
+    );
+}
+
+#[test]
+fn sufficient_match_len_is_clamped_by_target_len() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.target_len = 13;
+    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    assert_eq!(hc.sufficient_match_len_for_pass(profile), 13);
+}
+
+#[test]
+fn opt_modes_use_target_len_as_sufficient_len() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.target_len = 57;
+    for (mode, pass2) in [
+        (HcParseMode::BtOpt, false),
+        (HcParseMode::BtUltra, false),
+        (HcParseMode::BtUltra2, false),
+        (HcParseMode::BtUltra2, true),
+    ] {
+        let profile = HcOptimalCostProfile::for_mode(mode, pass2);
+        assert_eq!(hc.sufficient_match_len_for_pass(profile), 57);
+    }
+}
+
+#[test]
+fn sufficient_match_len_is_capped_by_opt_num() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.target_len = usize::MAX / 2;
+    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    assert_eq!(hc.sufficient_match_len_for_pass(profile), HC_OPT_NUM - 1);
+}
+
+#[test]
+fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+
+    let huff = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+        b"aaabbbbccccddddeeeeefffffgggg",
+    );
+    let ll = crate::fse::fse_encoder::default_ll_table();
+    let ml = crate::fse::fse_encoder::default_ml_table();
+    let of = crate::fse::fse_encoder::default_of_table();
+    hc.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
+
+    hc.opt_state.rescale_freqs(
+        b"abcd",
+        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+    );
+
+    let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
+        4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1,
+    ];
+
+    assert_ne!(
+        hc.opt_state.lit_length_freq, base_ll_freqs,
+        "dictionary entropy should override fallback LL bootstrap frequencies"
+    );
+    assert!(
+        hc.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        "dictionary entropy should seed non-uniform ML frequencies"
+    );
+    assert_ne!(
+        hc.opt_state.off_code_freq[0], 6,
+        "dictionary entropy should override fallback OF bootstrap frequencies"
+    );
+}
+
+#[test]
+fn dictionary_fse_seed_applies_without_huffman_seed() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+
+    let ll = crate::fse::fse_encoder::default_ll_table();
+    let ml = crate::fse::fse_encoder::default_ml_table();
+    let of = crate::fse::fse_encoder::default_of_table();
+    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    hc.opt_state.rescale_freqs(
+        b"abcd",
+        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+    );
+
+    let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
+        4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1,
+    ];
+    assert_ne!(
+        hc.opt_state.lit_length_freq, base_ll_freqs,
+        "FSE seed should still override LL bootstrap frequencies without huffman seed"
+    );
+    assert!(
+        hc.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        "FSE seed should still seed non-uniform ML frequencies"
+    );
+    assert_ne!(
+        hc.opt_state.off_code_freq[0], 6,
+        "FSE seed should still override OF bootstrap frequencies without huffman seed"
+    );
+}
+
+#[test]
+fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+
+    let ll = crate::fse::fse_encoder::default_ll_table();
+    let ml = crate::fse::fse_encoder::default_ml_table();
+    let of = crate::fse::fse_encoder::default_of_table();
+    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    hc.opt_state.rescale_freqs(
+        b"abc",
+        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+    );
+    assert!(
+        matches!(hc.opt_state.price_type, HcOptPriceType::Dynamic),
+        "dictionary-seeded first block should stay in dynamic mode even for tiny src"
+    );
+}
+
+#[test]
+fn lit_length_price_blocksize_max_costs_one_extra_bit() {
+    let profile_predef = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let mut stats_predef = HcOptState::new();
+    stats_predef.price_type = HcOptPriceType::Predefined;
+    let predef_max = profile_predef.lit_length_price(&stats_predef, HC_BLOCKSIZE_MAX);
+    let predef_prev =
+        profile_predef.lit_length_price(&stats_predef, HC_BLOCKSIZE_MAX.saturating_sub(1));
+    assert_eq!(
+        predef_max,
+        predef_prev + HC_BITCOST_MULTIPLIER,
+        "predefined litLength pricing at BLOCKSIZE_MAX must add exactly one bit"
+    );
+
+    let profile_dyn = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let mut stats_dyn = HcOptState::new();
+    stats_dyn.price_type = HcOptPriceType::Dynamic;
+    stats_dyn.lit_length_freq.fill(1);
+    stats_dyn.lit_length_sum = (HC_MAX_LL + 1) as u32;
+    stats_dyn.match_length_freq.fill(1);
+    stats_dyn.match_length_sum = (HC_MAX_ML + 1) as u32;
+    stats_dyn.off_code_freq.fill(1);
+    stats_dyn.off_code_sum = (HC_MAX_OFF + 1) as u32;
+    stats_dyn.lit_freq.fill(1);
+    stats_dyn.lit_sum = (HC_MAX_LIT + 1) as u32;
+    stats_dyn.set_base_prices(true);
+    let dyn_max = profile_dyn.lit_length_price(&stats_dyn, HC_BLOCKSIZE_MAX);
+    let dyn_prev = profile_dyn.lit_length_price(&stats_dyn, HC_BLOCKSIZE_MAX.saturating_sub(1));
+    assert_eq!(
+        dyn_max,
+        dyn_prev + HC_BITCOST_MULTIPLIER,
+        "dynamic litLength pricing at BLOCKSIZE_MAX must add exactly one bit"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    let ll = crate::fse::fse_encoder::default_ll_table();
+    let ml = crate::fse::fse_encoder::default_ml_table();
+    let of = crate::fse::fse_encoder::default_of_table();
+    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+        "dictionary-seeded first block should skip btultra2 warmup pass"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.history_abs_start = 17;
+    hc.window.push_back(b"abcdefghijklmnop".to_vec());
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 9),
+        "btultra2 warmup must be first-block only (no prefix history)"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_for_tiny_block() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD),
+        "btultra2 warmup should not run at or below predefined threshold"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_after_stats_initialized() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.opt_state.lit_length_sum = 1;
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        "btultra2 warmup should run only for first block before stats are initialized"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    // Simulate non-first block state: current block has no prefix in deque,
+    // but total produced window already includes prior output.
+    hc.window_size = HC_PREDEF_THRESHOLD + 64;
+    hc.window
+        .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 32]);
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        "btultra2 warmup must not run after frame start"
+    );
+}
+
+#[test]
+fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.window_size = HC_PREDEF_THRESHOLD + 64;
+    hc.window
+        .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 64]);
+    hc.ldm_sequences.push(HcRawSeq {
+        lit_length: 8,
+        offset: 16,
+        match_length: 32,
+    });
+    assert!(
+        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        "btultra2 warmup must not run when LDM already produced sequences"
+    );
+}
+
+#[test]
+fn literal_price_uses_eight_bits_when_literals_uncompressed() {
+    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let mut stats = HcOptState::new();
+    stats.set_literals_compressed_for_tests(false);
+    stats.price_type = HcOptPriceType::Predefined;
+    assert_eq!(
+        profile.literal_price(&stats, b'a'),
+        8 * HC_BITCOST_MULTIPLIER,
+        "uncompressed literals should cost 8 bits regardless of price mode"
+    );
+}
+
+#[test]
+fn update_stats_skips_literal_frequencies_when_uncompressed() {
+    let mut stats = HcOptState::new();
+    stats.set_literals_compressed_for_tests(false);
+    stats.update_stats(3, b"abc", 4, 8);
+    assert_eq!(
+        stats.lit_sum, 0,
+        "literal sum must remain unchanged when literal compression is disabled"
+    );
+    assert_eq!(
+        stats.lit_freq.iter().copied().sum::<u32>(),
+        0,
+        "literal frequencies must not be updated when literal compression is disabled"
+    );
+    assert_eq!(
+        stats.lit_length_sum, 1,
+        "literal-length stats still update for sequence modeling"
+    );
+    assert_eq!(
+        stats.match_length_sum, 1,
+        "match-length stats still update for sequence modeling"
+    );
+    assert_eq!(
+        stats.off_code_sum, 1,
+        "offset-code stats still update for sequence modeling"
+    );
+}
+
+#[test]
+fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
+    let mut stats = HcOptState::new();
+    stats.set_literals_compressed_for_tests(false);
+    let huff = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+        b"aaaaabbbbcccddeeff00112233445566778899",
+    );
+    let ll = crate::fse::fse_encoder::default_ll_table();
+    let ml = crate::fse::fse_encoder::default_ml_table();
+    let of = crate::fse::fse_encoder::default_of_table();
+    stats.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
+    stats.rescale_freqs(
+        b"abcd",
+        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+    );
+    assert_eq!(
+        stats.lit_sum, 0,
+        "literal sum must stay zero when literals are uncompressed"
+    );
+    assert_eq!(
+        stats.lit_freq.iter().copied().sum::<u32>(),
+        0,
+        "literal frequencies must ignore dictionary huffman seed when uncompressed"
+    );
+}
+
+#[test]
+fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
+    let mut hc = HcMatchGenerator::new(64);
+    hc.history = b"xxxxxxABCDEFABCDEF".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+
+    let abs_pos = 12usize; // points at second "ABCDEF"
+    let current_abs_end = hc.history.len();
+    let reps = [6u32, 3u32, 9u32];
+
+    let mut lit_pos_candidates = Vec::new();
+    hc.for_each_repcode_candidate_with_reps(
+        abs_pos,
+        1,
+        reps,
+        current_abs_end,
+        HC_OPT_MIN_MATCH_LEN,
+        |c| {
+            lit_pos_candidates.push(c.offset);
+        },
+    );
+    assert!(
+        lit_pos_candidates.contains(&6),
+        "when lit_len>0, rep0 should be considered and match"
+    );
+
+    let mut ll0_candidates = Vec::new();
+    hc.for_each_repcode_candidate_with_reps(
+        abs_pos,
+        0,
+        reps,
+        current_abs_end,
+        HC_OPT_MIN_MATCH_LEN,
+        |c| {
+            ll0_candidates.push(c.offset);
+        },
+    );
+    assert!(
+        !ll0_candidates.contains(&6),
+        "when lit_len==0, rep0 is not directly eligible (ll0 semantics)"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
+    let mut hc = HcMatchGenerator::new(64);
+    hc.search_depth = 0;
+    hc.history = b"xyzxyzxyzxyz".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+
+    let abs_pos = 6usize;
+    let current_abs_end = hc.history.len();
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: false,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        current_abs_end,
+        profile,
+        HcCandidateQuery {
+            reps: [3, 6, 9],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+    assert!(
+        !out.is_empty(),
+        "rep candidates should remain available even when chain depth is zero"
+    );
+    assert!(
+        out.iter().any(|c| c.offset == 3),
+        "rep0 candidate should be retained"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
+    let mut hc = HcMatchGenerator::new(64);
+    hc.history = b"aaaaaaaaaa".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 32;
+    let abs_pos = 6usize;
+    hc.ensure_tables();
+    hc.insert_positions(0, abs_pos);
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 32,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert!(
+        out.iter()
+            .all(|candidate| matches!(candidate.offset, 1 | 4)),
+        "terminal rep match should return before chain probing adds non-rep offsets"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
+    let mut hc = HcMatchGenerator::new(128);
+    hc.history = b"abcabcabcabcabcabcabcabc".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 32;
+    let abs_pos = 9usize;
+    hc.ensure_tables();
+    hc.insert_positions(0, abs_pos);
+    hc.skip_insert_until_abs = 0;
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 32,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert!(
+        hc.skip_insert_until_abs > abs_pos,
+        "long chain match should advance skip window to avoid redundant immediate insertions"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
+    let mut hc = HcMatchGenerator::new(128);
+    hc.history = b"abcabcabcabcabcabcabcabc".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 32;
+    let abs_pos = 9usize;
+    hc.ensure_tables();
+    hc.insert_positions(0, abs_pos);
+    hc.skip_insert_until_abs = 0;
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 32,
+        sufficient_match_len: 10,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    let best_match_end = out
+        .iter()
+        .map(|candidate| candidate.start.saturating_add(candidate.match_len))
+        .max()
+        .expect("expected at least one candidate");
+    assert!(
+        hc.skip_insert_until_abs > abs_pos,
+        "chain fast-skip must advance past current position"
+    );
+    assert!(
+        hc.skip_insert_until_abs <= best_match_end.saturating_sub(8),
+        "chain fast-skip must not exceed donor-style matchEndIdx - 8 bound"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
+    let mut hc = HcMatchGenerator::new(256);
+    hc.history = b"abcdefghijklmnop".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 0;
+    hc.ensure_tables();
+
+    let abs_pos = 8usize;
+    hc.skip_insert_until_abs = 0;
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert_eq!(
+        hc.skip_insert_until_abs,
+        abs_pos.saturating_add(1),
+        "plain BT path should advance skip window by 1 via donor matchEndIdx baseline"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
+    let mut hc = HcMatchGenerator::new(256);
+    hc.history = b"abcde1234abcdeZZZZ".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 0;
+    let abs_pos = 9usize; // second "abcde"
+    hc.ensure_tables();
+    hc.insert_positions(0, abs_pos);
+    // Donor hash3 has an independent nextToUpdate3 cursor; main-table
+    // insertion does not imply the HC3 side table has been filled.
+    hc.next_to_update3 = 0;
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 2, 3],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert!(
+        out.iter()
+            .any(|candidate| candidate.offset == 9 && candidate.match_len >= HC_MIN_MATCH_LEN),
+        "hash3 candidate should supply at least one valid match when chain search is disabled"
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
+    let mut hc = HcMatchGenerator::new(256);
+    hc.history = b"abcdeZabcdeYY".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 0;
+    hc.ensure_tables();
+    // Simulate donor-like nextToUpdate3 path: no explicit hash/chain insertions
+    // were done for prefix positions, so hash3 must fill them on demand.
+    hc.next_to_update3 = 0;
+
+    let abs_pos = 6usize; // second "abcde"
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 2, 3],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert!(
+        out.iter()
+            .any(|candidate| candidate.offset == 6 && candidate.match_len >= HC_MIN_MATCH_LEN),
+        "hash3 incremental update should surface prefix match even without explicit insert_positions"
+    );
+}
+
+#[test]
+fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
+    let mut hc = HcMatchGenerator::new(256);
+    hc.history = b"abcdeZabcde".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 0;
+    hc.ensure_tables();
+    hc.next_to_update3 = 0;
+
+    let abs_pos = 6usize; // second "abcde", match reaches current end
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 2, 3],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+
+    assert!(
+        hc.next_to_update3 >= abs_pos,
+        "tail-reaching hash3 lookup should fill the update cursor to current position"
+    );
+    assert!(
+        hc.skip_insert_until_abs > abs_pos,
+        "tail-reaching hash3 early return should request skipping current-position hash insertion"
+    );
+}
+
+#[test]
+fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
+    let mut hc = HcMatchGenerator::new(512);
+    hc.history = (0..256).map(|i| (i % 251) as u8).collect();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+
+    let abs_pos = 128usize;
+    let current_abs_end = 256usize;
+    let ldm = MatchCandidate {
+        start: abs_pos,
+        offset: 96,
+        match_len: 40,
+    };
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        current_abs_end,
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: Some(ldm),
+        },
+        &mut out,
+    );
+    assert!(
+        out.iter().any(
+            |candidate| candidate.offset == ldm.offset && candidate.match_len == ldm.match_len
+        ),
+        "LDM candidate should be present in optimal candidate set"
+    );
+}
+
+#[test]
+fn btultra_and_btultra2_both_keep_dictionary_candidates() {
+    let mut hc = HcMatchGenerator::new(256);
+    hc.history = alloc::vec![0u8; 160];
+    for i in 0..64 {
+        hc.history[i] = b'a' + (i % 7) as u8;
+    }
+    for i in 64..160 {
+        hc.history[i] = b'k' + (i % 5) as u8;
+    }
+    let abs_pos = 96usize;
+    for i in 0..24 {
+        hc.history[abs_pos + i] = hc.history[16 + i];
+    }
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.search_depth = 32;
+    hc.ensure_tables();
+    hc.insert_positions(0, abs_pos);
+
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 32,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: true,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+
+    hc.parse_mode = HcParseMode::BtUltra2;
+    hc.dictionary_limit_abs = Some(64);
+    hc.collect_optimal_candidates(
+        abs_pos,
+        160,
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+    assert!(
+        out.iter().any(|candidate| candidate.offset >= 32),
+        "btultra2 should retain dictionary candidates on donor-parity path"
+    );
+
+    hc.parse_mode = HcParseMode::BtUltra;
+    hc.skip_insert_until_abs = 0;
+    hc.collect_optimal_candidates(
+        abs_pos,
+        160,
+        profile,
+        HcCandidateQuery {
+            reps: [1, 4, 8],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+    assert!(
+        out.iter().any(|candidate| candidate.offset >= 32),
+        "btultra should retain dictionary candidates"
+    );
 }
 
 #[test]
@@ -3848,6 +8723,37 @@ fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
 }
 
 #[test]
+fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Better);
+
+    driver.prime_with_dictionary(&[], [11, 7, 3]);
+
+    assert_eq!(driver.hc_matcher().offset_hist, [11, 7, 3]);
+    assert!(
+        !driver
+            .hc_matcher()
+            .should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+        "btultra2 warmup must stay disabled after dictionary priming, even when dict content is empty"
+    );
+}
+
+#[test]
+fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Better);
+
+    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+
+    assert!(
+        !driver
+            .hc_matcher()
+            .should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+        "btultra2 warmup must stay disabled after dictionary priming with content"
+    );
+}
+
+#[test]
 fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(2));
@@ -4269,7 +9175,7 @@ fn row_hash_and_row_extracts_high_bits() {
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
     let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-    let hash = hash_mix_u64_with_kernel(value, matcher.hash_mix_kernel);
+    let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =
@@ -4307,47 +9213,68 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[test]
 fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported() {
+    use crate::encoding::fastpath::{self, FastpathKernel};
     if !is_x86_feature_detected!("sse4.2") {
         return;
     }
-
-    let kernel = detect_hash_mix_kernel();
-    assert_eq!(kernel, HashMixKernel::X86Sse42);
     let v = 0x0123_4567_89AB_CDEFu64;
-    let accelerated = unsafe { hash_mix_u64_sse42(v) };
-    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-#[test]
-fn hash_mix_scalar_path_can_be_forced_for_coverage_and_matches_formula() {
-    let v = 0x0123_4567_89AB_CDEFu64;
-    let expected = v.wrapping_mul(HASH_MIX_PRIME);
-    let mixed = hash_mix_u64_with_kernel(v, HashMixKernel::Scalar);
-    assert_eq!(mixed, expected);
+    // SAFETY: feature check above guarantees SSE4.2 is available.
+    let accelerated = unsafe { fastpath::sse42::hash_mix_u64(v) };
+    // Dispatcher must resolve to SSE4.2 (or better) and produce the same mix.
+    let dispatched = fastpath::dispatch_hash_mix_u64(v);
+    let kernel = fastpath::select_kernel();
+    if kernel == FastpathKernel::Sse42 {
+        assert_eq!(dispatched, accelerated);
+    } else {
+        // AVX2 kernel uses the same CRC32 instruction under the hood.
+        assert_eq!(dispatched, accelerated, "AVX2/SSE4.2 share CRC32 mix");
+    }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 #[test]
 fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() {
+    use crate::encoding::fastpath;
     if !is_aarch64_feature_detected!("crc") {
         return;
     }
-
-    let kernel = detect_hash_mix_kernel();
-    assert_eq!(kernel, HashMixKernel::Aarch64Crc);
     let v = 0x0123_4567_89AB_CDEFu64;
-    let accelerated = unsafe { hash_mix_u64_crc(v) };
-    assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
+    // SAFETY: feature check above guarantees CRC32 is available.
+    let accelerated = unsafe { fastpath::neon::hash_mix_u64(v) };
+    let dispatched = fastpath::dispatch_hash_mix_u64(v);
+    assert_eq!(dispatched, accelerated);
 }
 
-#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 #[test]
-fn hash_mix_scalar_path_can_be_forced_on_aarch64_and_matches_formula() {
-    let v = 0x0123_4567_89AB_CDEFu64;
-    let expected = v.wrapping_mul(HASH_MIX_PRIME);
-    let mixed = hash_mix_u64_with_kernel(v, HashMixKernel::Scalar);
-    assert_eq!(mixed, expected);
+fn hc_hash3_position_matches_donor_formula() {
+    let bytes = [b'a', b'b', b'c', b'd'];
+    let read32 = u32::from_le_bytes(bytes);
+    let expected = (((read32 << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - HC3_HASH_LOG)) as usize;
+    assert_eq!(
+        HcMatchGenerator::hash3_position(&bytes, HC3_HASH_LOG),
+        expected
+    );
+}
+
+#[test]
+fn hc_hash_position_matches_donor_hash4_formula() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(HC_CONFIG, 22);
+    let bytes = [b'a', b'b', b'c', b'd'];
+    let read32 = u32::from_le_bytes(bytes);
+    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.hash_log)) as usize;
+    assert_eq!(hc.hash_position(&bytes), expected);
+}
+
+#[test]
+fn btultra2_main_hash_uses_donor_hash4_formula() {
+    let mut hc = HcMatchGenerator::new(1 << 20);
+    hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
+    let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+    let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.hash_log)) as usize;
+    let actual = HcMatchGenerator::hash_position_with_mls(&bytes, hc.hash_log, hc.bt_hash_mls());
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -4411,6 +9338,219 @@ fn deterministic_high_entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
+fn level22_donor_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    let mut savings = 0i64;
+    while cursor < data.len() {
+        let remaining = data.len() - cursor;
+        let candidate_len = remaining.min(HC_BLOCKSIZE_MAX);
+        let block_len = crate::encoding::frame_compressor::donor_optimal_block_size(
+            CompressionLevel::Level(22),
+            &data[cursor..cursor + candidate_len],
+            remaining,
+            HC_BLOCKSIZE_MAX,
+            savings,
+        )
+        .min(candidate_len)
+        .max(1);
+        ranges.push((cursor, block_len));
+        cursor += block_len;
+        // The exact donor gate uses compressed-size savings. For this corpus
+        // parity harness, after the first full block has compressed, savings is
+        // sufficient to authorize the same pre-block splitter path.
+        if cursor >= HC_BLOCKSIZE_MAX {
+            savings = 3;
+        }
+    }
+    ranges
+}
+
+#[cfg(test)]
+fn merge_block_delimiters_like_donor(
+    sequences: Vec<(usize, usize, usize)>,
+) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::with_capacity(sequences.len());
+    let mut pending_lits = 0usize;
+    for (lit_len, offset, match_len) in sequences {
+        if offset == 0 && match_len == 0 {
+            pending_lits = pending_lits.saturating_add(lit_len);
+            continue;
+        }
+        out.push((lit_len.saturating_add(pending_lits), offset, match_len));
+        pending_lits = 0;
+    }
+    if pending_lits > 0 {
+        out.push((pending_lits, 0, 0));
+    }
+    out
+}
+
+#[cfg(test)]
+fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    merge_block_delimiters_like_donor(collect_level22_sequences_with_delimiters(data))
+        .into_iter()
+        .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
+        .collect()
+}
+
+#[cfg(test)]
+fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut driver = MatchGeneratorDriver::new(HC_BLOCKSIZE_MAX, 1);
+    driver.set_source_size_hint(data.len() as u64);
+    driver.reset(CompressionLevel::Level(22));
+
+    let mut sequences = Vec::new();
+    for (chunk_start, chunk_len) in level22_donor_block_ranges(data) {
+        let chunk = &data[chunk_start..chunk_start + chunk_len];
+        let mut space = driver.get_next_space();
+        space[..chunk.len()].copy_from_slice(chunk);
+        space.truncate(chunk.len());
+        driver.commit_space(space);
+        driver.start_matching(|seq| {
+            let entry = match seq {
+                Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => (literals.len(), offset, match_len),
+            };
+            sequences.push(entry);
+        });
+    }
+    sequences
+}
+
+#[cfg(test)]
+fn donor_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    merge_block_delimiters_like_donor(donor_level22_sequences_with_delimiters(data))
+        .into_iter()
+        .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
+        .collect()
+}
+
+#[cfg(test)]
+fn donor_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    use zstd::zstd_safe;
+    use zstd::zstd_safe::zstd_sys;
+
+    fn assert_zstd_ok(code: usize, context: &str) {
+        assert_eq!(
+            unsafe { zstd_sys::ZSTD_isError(code) },
+            0,
+            "{context} failed: {}",
+            zstd_safe::get_error_name(code)
+        );
+    }
+
+    unsafe {
+        let cctx = zstd_sys::ZSTD_createCCtx();
+        assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
+
+        assert_zstd_ok(
+            zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+                22,
+            ),
+            "ZSTD_c_compressionLevel",
+        );
+
+        let seq_capacity = zstd_safe::sequence_bound(data.len());
+        let mut seqs = alloc::vec![
+            zstd_sys::ZSTD_Sequence {
+                offset: 0,
+                litLength: 0,
+                matchLength: 0,
+                rep: 0,
+            };
+            seq_capacity
+        ];
+
+        let seq_count = zstd_sys::ZSTD_generateSequences(
+            cctx,
+            seqs.as_mut_ptr(),
+            seqs.len(),
+            data.as_ptr().cast(),
+            data.len(),
+        );
+        assert_zstd_ok(seq_count, "ZSTD_generateSequences");
+        let rc = zstd_sys::ZSTD_freeCCtx(cctx);
+        assert_eq!(rc, 0, "ZSTD_freeCCtx failed");
+
+        seqs.truncate(seq_count);
+        seqs.into_iter()
+            .map(|seq| {
+                (
+                    seq.litLength as usize,
+                    seq.offset as usize,
+                    seq.matchLength as usize,
+                )
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn level22_sequences_match_donor_on_corpus_proxy() {
+    let data = include_bytes!("../../decodecorpus_files/z000033");
+    assert_level22_sequences_match_donor(data);
+}
+
+#[test]
+fn level22_sequences_match_donor_on_small_corpus_proxy() {
+    let data = include_bytes!("../../decodecorpus_files/z000030");
+    assert_level22_sequences_match_donor(data);
+}
+
+#[cfg(test)]
+fn assert_level22_sequences_match_donor(data: &[u8]) {
+    let rust = collect_level22_sequences(data);
+    let donor = donor_level22_sequences(data);
+
+    if rust != donor {
+        let first_diff = rust
+            .iter()
+            .zip(donor.iter())
+            .position(|(lhs, rhs)| lhs != rhs)
+            .unwrap_or_else(|| rust.len().min(donor.len()));
+        let rust_pos = rust
+            .iter()
+            .take(first_diff)
+            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
+        let donor_pos = donor
+            .iter()
+            .take(first_diff)
+            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
+        let start = first_diff.saturating_sub(4);
+        let rust_window = &rust[start..rust.len().min(first_diff + 4)];
+        let donor_window = &donor[start..donor.len().min(first_diff + 4)];
+        let mut reps = [1u32, 4, 8];
+        for (lit_len, offset, _) in rust.iter().take(first_diff) {
+            let _ = encode_offset_with_history(*offset as u32, *lit_len as u32, &mut reps);
+        }
+        panic!(
+            "level22 sequence path diverged at idx {}: rust={:?} donor={:?} (rust_len={} donor_len={} rust_pos={} donor_pos={} reps_before={:?} rust_window={:?} donor_window={:?} block_ranges={:?})",
+            first_diff,
+            rust.get(first_diff),
+            donor.get(first_diff),
+            rust.len(),
+            donor.len(),
+            rust_pos,
+            donor_pos,
+            reps,
+            rust_window,
+            donor_window,
+            level22_donor_block_ranges(data)
+                .into_iter()
+                .filter(|(start, len)| *start <= rust_pos && rust_pos < start + len)
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
 #[test]
 fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
@@ -4454,6 +9594,53 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
     assert!(
         match_len >= tail.len(),
         "tail-aligned cross-block match must be preserved"
+    );
+}
+
+#[test]
+fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
+    let mut matcher = HcMatchGenerator::new(1 << 20);
+    matcher.configure(BTULTRA2_HC_CONFIG_L22, 20);
+    let tail = b"Bt9kLm2Rp";
+    let mut first = deterministic_high_entropy_bytes(0xA9C3_7F21_D4E8_510B, 4096);
+    let tail_start = first.len() - tail.len();
+    first[tail_start..].copy_from_slice(tail);
+    matcher.add_data(first, |_| {});
+    matcher.skip_matching(Some(true));
+
+    let mut second = tail.to_vec();
+    second.extend_from_slice(b"after-tail-literals");
+    matcher.add_data(second, |_| {});
+
+    let mut first_sequence = None;
+    matcher.start_matching(|seq| {
+        if first_sequence.is_some() {
+            return;
+        }
+        first_sequence = Some(match seq {
+            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => (literals.len(), offset, match_len),
+        });
+    });
+
+    let (literals_len, offset, match_len) =
+        first_sequence.expect("expected at least one sequence after sparse BT skip");
+    assert_eq!(
+        literals_len, 0,
+        "BT sparse skip should preserve an immediate boundary match"
+    );
+    assert_eq!(
+        offset,
+        tail.len(),
+        "first BT match should reference previous tail"
+    );
+    assert!(
+        match_len >= tail.len(),
+        "BT sparse skip must seed the dense tail for cross-block matching"
     );
 }
 
@@ -4512,6 +9699,42 @@ fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
 
     assert_eq!(hc.hash_table, before_hash);
     assert_eq!(hc.chain_table, before_chain);
+}
+
+#[test]
+fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
+    let mut hc = HcMatchGenerator::new(64);
+    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.ensure_tables();
+    hc.next_to_update3 = 0;
+
+    hc.insert_positions(0, 9);
+
+    assert_eq!(
+        hc.next_to_update3, 9,
+        "contiguous insert_positions should advance hash3 update cursor"
+    );
+}
+
+#[test]
+fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges() {
+    let mut hc = HcMatchGenerator::new(64);
+    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.history_start = 0;
+    hc.history_abs_start = 0;
+    hc.position_base = 0;
+    hc.ensure_tables();
+    hc.next_to_update3 = 0;
+
+    hc.insert_positions_with_step(0, 16, 4);
+
+    assert_eq!(
+        hc.next_to_update3, 0,
+        "sparse insert_positions_with_step must not mark skipped positions as hash3-updated"
+    );
 }
 
 #[test]

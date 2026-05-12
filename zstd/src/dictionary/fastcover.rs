@@ -92,7 +92,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         .filter(|seg| seg.len() >= d)
         .map(|seg| (score_segment(seg, d, mask, &table), seg))
         .collect();
-    segments.sort_by(|a, b| b.0.cmp(&a.0));
+    segments.sort_by_key(|segment| core::cmp::Reverse(segment.0));
 
     let mut out = Vec::with_capacity(dict_size);
     for (_, seg) in segments {

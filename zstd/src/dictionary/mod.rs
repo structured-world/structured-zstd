@@ -34,7 +34,7 @@ use crate::blocks::sequence_section::{
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
 use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
 use crate::dictionary::reservoir::create_sample;
-use crate::fse::fse_encoder::{self, build_table_from_bytes};
+use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 use core::cmp::Reverse;
@@ -50,6 +50,11 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    // `vec` import covers the `vec![..]` macro used below: this crate is
+    // no_std-with-std-feature, so the std prelude isn't pulled in implicitly
+    // for top-level items in this module. Removing this import fails the
+    // build with `cannot find macro 'vec' in this scope` — verified.
+    vec,
     vec::Vec,
 };
 
@@ -337,15 +342,37 @@ fn serialize_fse_table_from_corpus(
     raw_content: &[u8],
     max_symbol: u8,
     max_log: u8,
-) -> Vec<u8> {
-    let source = if sample_data.is_empty() {
-        raw_content
-    } else {
-        sample_data
-    };
-    let symbols = bounded_fse_symbols(source, max_symbol);
-    let table = build_table_from_bytes(&symbols, max_log, false);
-    serialize_fse_table(&table)
+) -> io::Result<Vec<u8>> {
+    fn counts_total_for_source(source: &[u8], max_symbol: u8, counts: &mut [usize]) -> usize {
+        counts.fill(0);
+        for symbol in bounded_fse_symbols(source, max_symbol) {
+            counts[usize::from(symbol)] += 1;
+        }
+        counts.iter().sum::<usize>()
+    }
+
+    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
+    let using_sample = !sample_data.is_empty();
+    let mut total = counts_total_for_source(
+        if using_sample {
+            sample_data
+        } else {
+            raw_content
+        },
+        max_symbol,
+        &mut counts,
+    );
+    if total <= 1 && using_sample && !raw_content.is_empty() {
+        total = counts_total_for_source(raw_content, max_symbol, &mut counts);
+    }
+    if total <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "insufficient symbol statistics for FSE table",
+        ));
+    }
+    let table = build_table_from_symbol_counts(&counts, max_log, false);
+    Ok(serialize_fse_table(&table))
 }
 
 fn finalized_content_budget(
@@ -356,21 +383,21 @@ fn finalized_content_budget(
     let min_content_size = 8usize;
     let huf_len = serialize_huffman_table(sample_data, raw_fallback)?.len();
     let of_len =
-        serialize_fse_table_from_corpus(sample_data, raw_fallback, MAX_OFFSET_CODE, OF_MAX_LOG)
+        serialize_fse_table_from_corpus(sample_data, raw_fallback, MAX_OFFSET_CODE, OF_MAX_LOG)?
             .len();
     let ml_len = serialize_fse_table_from_corpus(
         sample_data,
         raw_fallback,
         MAX_MATCH_LENGTH_CODE,
         ML_MAX_LOG,
-    )
+    )?
     .len();
     let ll_len = serialize_fse_table_from_corpus(
         sample_data,
         raw_fallback,
         MAX_LITERAL_LENGTH_CODE,
         LL_MAX_LOG,
-    )
+    )?
     .len();
 
     let header_len = DICT_MAGIC_NUM.len() + 4 + huf_len + of_len + ml_len + ll_len + 12;
@@ -422,7 +449,7 @@ pub fn finalize_raw_dict(
     out.extend_from_slice(&dict_id.to_le_bytes());
     out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
     out.extend_from_slice(
-        serialize_fse_table_from_corpus(sample_data, raw_content, MAX_OFFSET_CODE, OF_MAX_LOG)
+        serialize_fse_table_from_corpus(sample_data, raw_content, MAX_OFFSET_CODE, OF_MAX_LOG)?
             .as_slice(),
     );
     out.extend_from_slice(
@@ -431,7 +458,7 @@ pub fn finalize_raw_dict(
             raw_content,
             MAX_MATCH_LENGTH_CODE,
             ML_MAX_LOG,
-        )
+        )?
         .as_slice(),
     );
     out.extend_from_slice(
@@ -440,7 +467,7 @@ pub fn finalize_raw_dict(
             raw_content,
             MAX_LITERAL_LENGTH_CODE,
             LL_MAX_LOG,
-        )
+        )?
         .as_slice(),
     );
 
@@ -558,6 +585,12 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
+    if sample.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source stream is empty",
+        ));
+    }
     let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)?;
     let (raw_dict, tuned) =
         train_fastcover_raw_from_slice(sample.as_slice(), content_budget, fastcover)?;
@@ -687,6 +720,20 @@ mod tests {
         .expect_err("too-small dictionary budget must fail during finalize");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("dictionary size too small"));
+    }
+
+    #[test]
+    fn create_fastcover_dict_from_source_rejects_empty_source() {
+        let mut out = Vec::new();
+        let err = create_fastcover_dict_from_source(
+            Cursor::new(Vec::<u8>::new()),
+            &mut out,
+            1024,
+            &FastCoverOptions::default(),
+            FinalizeOptions::default(),
+        )
+        .expect_err("empty source must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use super::{
     CompressionLevel, Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
     match_generator::MatchGeneratorDriver,
 };
+use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
 
 use crate::io::{Read, Write};
@@ -61,13 +62,15 @@ pub(crate) enum PreviousFseTable {
     // repeating them only needs a lightweight marker instead of cloning FSETable.
     Default,
     Custom(Box<FSETable>),
+    Rle(u8),
 }
 
 impl PreviousFseTable {
-    pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> &'a FSETable {
+    pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> Option<&'a FSETable> {
         match self {
-            Self::Default => default,
-            Self::Custom(table) => table,
+            Self::Default => Some(default),
+            Self::Custom(table) => Some(table),
+            Self::Rle(_) => None,
         }
     }
 }
@@ -94,10 +97,171 @@ impl FseTables {
     }
 }
 
+const PRESPLIT_BLOCK_MIN: usize = 3500;
+const PRESPLIT_THRESHOLD_PENALTY_RATE: u64 = 16;
+const PRESPLIT_THRESHOLD_BASE: u64 = PRESPLIT_THRESHOLD_PENALTY_RATE - 2;
+const PRESPLIT_THRESHOLD_PENALTY: i32 = 3;
+const PRESPLIT_CHUNK_SIZE: usize = 8 << 10;
+const PRESPLIT_HASH_LOG_MAX: usize = 10;
+const PRESPLIT_HASH_TABLE_SIZE: usize = 1 << PRESPLIT_HASH_LOG_MAX;
+const PRESPLIT_KNUTH: u32 = 0x9E37_79B9;
+
+#[derive(Clone)]
+struct PreSplitFingerprint {
+    events: [u32; PRESPLIT_HASH_TABLE_SIZE],
+    nb_events: usize,
+}
+
+impl Default for PreSplitFingerprint {
+    fn default() -> Self {
+        Self {
+            events: [0; PRESPLIT_HASH_TABLE_SIZE],
+            nb_events: 0,
+        }
+    }
+}
+
+fn presplit_hash2(bytes: &[u8], hash_log: usize) -> usize {
+    debug_assert!(hash_log >= 8);
+    if hash_log == 8 {
+        return bytes[0] as usize;
+    }
+    debug_assert!(hash_log <= PRESPLIT_HASH_LOG_MAX);
+    let value = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
+    (value.wrapping_mul(PRESPLIT_KNUTH) >> (32 - hash_log)) as usize
+}
+
+fn presplit_record_fingerprint(
+    fp: &mut PreSplitFingerprint,
+    src: &[u8],
+    sampling_rate: usize,
+    hash_log: usize,
+) {
+    fp.events.fill(0);
+    fp.nb_events = 0;
+    if src.len() < 2 {
+        return;
+    }
+    let limit = src.len() - 1;
+    let mut n = 0usize;
+    while n < limit {
+        fp.events[presplit_hash2(&src[n..], hash_log)] += 1;
+        n += sampling_rate;
+    }
+    // Donor parity: zstd_preSplit.c records the integer division, not the
+    // rounded-up number of sampled events from the loop above.
+    fp.nb_events += limit / sampling_rate;
+}
+
+fn presplit_distance(lhs: &PreSplitFingerprint, rhs: &PreSplitFingerprint, hash_log: usize) -> u64 {
+    let slots = 1usize << hash_log;
+    let mut distance = 0u64;
+    for idx in 0..slots {
+        let left = lhs.events[idx] as i128 * rhs.nb_events as i128;
+        let right = rhs.events[idx] as i128 * lhs.nb_events as i128;
+        distance = distance.saturating_add(left.abs_diff(right) as u64);
+    }
+    distance
+}
+
+fn presplit_fingerprints_differ(
+    reference: &PreSplitFingerprint,
+    new_fp: &PreSplitFingerprint,
+    penalty: i32,
+    hash_log: usize,
+) -> bool {
+    debug_assert!(reference.nb_events > 0);
+    debug_assert!(new_fp.nb_events > 0);
+    let p50 = reference.nb_events as u64 * new_fp.nb_events as u64;
+    let deviation = presplit_distance(reference, new_fp, hash_log);
+    let threshold = p50.saturating_mul(PRESPLIT_THRESHOLD_BASE + penalty as u64)
+        / PRESPLIT_THRESHOLD_PENALTY_RATE;
+    deviation >= threshold
+}
+
+fn presplit_merge_events(acc: &mut PreSplitFingerprint, new_fp: &PreSplitFingerprint) {
+    for idx in 0..PRESPLIT_HASH_TABLE_SIZE {
+        acc.events[idx] = acc.events[idx].saturating_add(new_fp.events[idx]);
+    }
+    acc.nb_events = acc.nb_events.saturating_add(new_fp.nb_events);
+}
+
+fn donor_split_block_by_chunks(block: &[u8], level: usize) -> usize {
+    debug_assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
+    debug_assert!((1..=4).contains(&level));
+    let (sampling_rate, hash_log) = match level - 1 {
+        0 => (43, 8),
+        1 => (11, 9),
+        2 => (5, 10),
+        _ => (1, 10),
+    };
+
+    let mut past = PreSplitFingerprint::default();
+    let mut new_events = PreSplitFingerprint::default();
+    let mut penalty = PRESPLIT_THRESHOLD_PENALTY;
+    presplit_record_fingerprint(
+        &mut past,
+        &block[..PRESPLIT_CHUNK_SIZE],
+        sampling_rate,
+        hash_log,
+    );
+    let mut pos = PRESPLIT_CHUNK_SIZE;
+    while pos <= block.len() - PRESPLIT_CHUNK_SIZE {
+        presplit_record_fingerprint(
+            &mut new_events,
+            &block[pos..pos + PRESPLIT_CHUNK_SIZE],
+            sampling_rate,
+            hash_log,
+        );
+        if presplit_fingerprints_differ(&past, &new_events, penalty, hash_log) {
+            return pos;
+        }
+        presplit_merge_events(&mut past, &new_events);
+        if penalty > 0 {
+            penalty -= 1;
+        }
+        pos += PRESPLIT_CHUNK_SIZE;
+    }
+    block.len()
+}
+
+fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
+    match level {
+        // C zstd's default splitter level for btopt/btultra/btultra2 is 4.
+        CompressionLevel::Level(16..=22) => Some(4),
+        _ => None,
+    }
+}
+
+pub(crate) fn donor_optimal_block_size(
+    level: CompressionLevel,
+    block: &[u8],
+    remaining_src_size: usize,
+    block_size_max: usize,
+    savings: i64,
+) -> usize {
+    let Some(split_level) = donor_pre_split_level(level) else {
+        return remaining_src_size.min(block_size_max);
+    };
+    if remaining_src_size < MAX_BLOCK_SIZE as usize || block_size_max < MAX_BLOCK_SIZE as usize {
+        return remaining_src_size.min(block_size_max);
+    }
+    if savings < 3 {
+        return MAX_BLOCK_SIZE as usize;
+    }
+    if block.len() < MAX_BLOCK_SIZE as usize {
+        return remaining_src_size.min(block_size_max);
+    }
+    donor_split_block_by_chunks(&block[..MAX_BLOCK_SIZE as usize], split_level)
+        .max(PRESPLIT_BLOCK_MIN)
+        .min(MAX_BLOCK_SIZE as usize)
+}
+
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
     pub(crate) offset_hist: [u32; 3],
@@ -117,6 +281,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
             },
             #[cfg(feature = "hash")]
@@ -138,6 +303,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
             },
             compression_level,
@@ -184,7 +350,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        let small_source_hint = self.source_size_hint.map(|size| size <= (1 << 14));
+        let source_size_hint_known = self.source_size_hint.is_some();
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming()
@@ -235,6 +401,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.fse_tables.ml_previous = None;
             self.state.fse_tables.of_previous = None;
         }
+        let ll_entropy = cached_entropy.and_then(|cache| match cache.ll_previous.as_ref() {
+            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+            _ => None,
+        });
+        let ml_entropy = cached_entropy.and_then(|cache| match cache.ml_previous.as_ref() {
+            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+            _ => None,
+        });
+        let of_entropy = cached_entropy.and_then(|cache| match cache.of_previous.as_ref() {
+            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+            _ => None,
+        });
+        self.state.matcher.seed_dictionary_entropy(
+            self.state.last_huff_table.as_ref(),
+            ll_entropy,
+            ml_entropy,
+            of_entropy,
+        );
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -250,26 +434,74 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // all input has been read so that Frame_Content_Size is known.
         let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
         let mut total_uncompressed: u64 = 0;
+        let mut pending_input: Vec<u8> = Vec::new();
+        let mut reached_eof = false;
+        let mut savings = 0i64;
         // Compress block by block
         loop {
-            // Read a single block's worth of uncompressed data from the input
-            let mut uncompressed_data = self.state.matcher.get_next_space();
-            let mut read_bytes = 0;
-            let last_block;
+            // Read up to one donor block. When the pre-block splitter keeps a
+            // suffix, top it back up before compressing the next block, matching
+            // ZSTD_compress_frameChunk() over a contiguous input buffer.
+            let block_capacity = MAX_BLOCK_SIZE as usize;
+            let had_pending = !pending_input.is_empty();
+            let mut uncompressed_data = if had_pending {
+                core::mem::take(&mut pending_input)
+            } else {
+                self.state.matcher.get_next_space()
+            };
+            let mut filled = if had_pending {
+                uncompressed_data.len()
+            } else {
+                0
+            };
+            if uncompressed_data.len() < block_capacity {
+                uncompressed_data.resize(block_capacity, 0);
+            }
             'read_loop: loop {
-                let new_bytes = source.read(&mut uncompressed_data[read_bytes..]).unwrap();
-                if new_bytes == 0 {
-                    last_block = true;
+                if reached_eof || filled == block_capacity {
                     break 'read_loop;
                 }
-                read_bytes += new_bytes;
-                if read_bytes == uncompressed_data.len() {
-                    last_block = false;
+                let new_bytes = source
+                    .read(&mut uncompressed_data[filled..block_capacity])
+                    .unwrap();
+                if new_bytes == 0 {
+                    reached_eof = true;
                     break 'read_loop;
+                }
+                filled += new_bytes;
+                total_uncompressed += new_bytes as u64;
+            }
+            uncompressed_data.truncate(filled);
+            let mut last_block = reached_eof;
+            let remaining_for_split = if reached_eof {
+                uncompressed_data.len()
+            } else {
+                block_capacity
+            };
+            if !matches!(self.compression_level, CompressionLevel::Uncompressed)
+                && uncompressed_data.len() == block_capacity
+            {
+                let block_len = donor_optimal_block_size(
+                    self.compression_level,
+                    &uncompressed_data,
+                    remaining_for_split,
+                    block_capacity,
+                    savings,
+                );
+                if block_len < uncompressed_data.len() {
+                    pending_input = uncompressed_data.split_off(block_len);
+                    // `split_off` returns a Vec whose capacity is typically
+                    // close to its length. Next iteration's `had_pending`
+                    // branch moves `pending_input` into `uncompressed_data`
+                    // and resizes to `block_capacity`, which would reallocate
+                    // from scratch on every pre-split. Pre-reserve here so
+                    // the resize stays in-place.
+                    if pending_input.capacity() < block_capacity {
+                        pending_input.reserve_exact(block_capacity - pending_input.len());
+                    }
+                    last_block = false;
                 }
             }
-            uncompressed_data.resize(read_bytes, 0);
-            total_uncompressed += read_bytes as u64;
             // As we read, hash that data too
             #[cfg(feature = "hash")]
             self.hasher.write(&uncompressed_data);
@@ -289,16 +521,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     let header = BlockHeader {
                         last_block,
                         block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: read_bytes.try_into().unwrap(),
+                        block_size: uncompressed_data.len().try_into().unwrap(),
                     };
                     header.serialize(&mut all_blocks);
                     all_blocks.extend_from_slice(&uncompressed_data);
+                    savings +=
+                        uncompressed_data.len() as i64 - (3 + uncompressed_data.len()) as i64;
                 }
                 CompressionLevel::Fastest
                 | CompressionLevel::Default
                 | CompressionLevel::Better
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => {
+                    let before_len = all_blocks.len();
+                    let block_len = uncompressed_data.len();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
@@ -306,21 +542,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         uncompressed_data,
                         &mut all_blocks,
                     );
+                    savings += block_len as i64 - (all_blocks.len() - before_len) as i64;
                 }
             }
-            if last_block {
+            if last_block && pending_input.is_empty() {
                 break;
             }
         }
 
         // Now that total_uncompressed is known, write the frame header with FCS.
-        // Keep hinted tiny one-shot frames in single-segment mode to match the
-        // donor framing policy used by the FFI path across levels.
-        // Guard out sub-512 byte payloads for now: tiny compressed-path
-        // single-segment framing is not yet fully C-FFI compatible.
+        // Match the donor framing policy for pledged one-shot inputs: use a
+        // single-segment frame whenever the source fits the active window.
         let single_segment = !use_dictionary_state
-            && small_source_hint == Some(true)
-            && (512..=(1 << 14)).contains(&total_uncompressed);
+            && source_size_hint_known
+            && total_uncompressed >= 512
+            && total_uncompressed <= window_size;
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
             single_segment,

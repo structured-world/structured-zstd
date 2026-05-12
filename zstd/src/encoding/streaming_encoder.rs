@@ -64,6 +64,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
             },
             pending: Vec::new(),

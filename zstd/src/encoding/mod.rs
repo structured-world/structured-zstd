@@ -2,6 +2,7 @@
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
+pub(crate) mod fastpath;
 pub(crate) mod frame_header;
 pub(crate) mod incompressible;
 pub(crate) mod match_generator;
@@ -105,10 +106,9 @@ pub enum CompressionLevel {
     /// [`Level`](Self::Level) values above 11 can target stronger (slower)
     /// tuning than the named hierarchy.
     ///
-    /// Levels above 11 use progressively larger windows and deeper search
-    /// with the lazy2 hash-chain backend.  Levels that require strategies
-    /// this crate has not yet implemented (btopt, btultra) are approximated
-    /// with the closest available matcher.
+    /// Levels above 11 use progressively larger windows and deeper search.
+    /// Levels 16–17 use a `btopt`-style price parser, 18–19 use `btultra`,
+    /// and 20–22 use a `btultra2`-style two-pass selection profile.
     ///
     /// Semver note: this variant was added after the initial enum shape and
     /// is a breaking API change for downstream crates that exhaustively
@@ -193,6 +193,16 @@ pub trait Matcher {
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}
+    /// Seed matcher cost model with dictionary entropy tables before the next frame.
+    /// Default implementation is a no-op for custom matchers.
+    fn seed_dictionary_entropy(
+        &mut self,
+        _huff: Option<&crate::huff0::huff0_encoder::HuffmanTable>,
+        _ll: Option<&crate::fse::fse_encoder::FSETable>,
+        _ml: Option<&crate::fse::fse_encoder::FSETable>,
+        _of: Option<&crate::fse::fse_encoder::FSETable>,
+    ) {
+    }
     /// Returns whether this matcher can consume dictionary priming state and produce
     /// dictionary-dependent sequences. Defaults to `false` for custom matchers.
     fn supports_dictionary_priming(&self) -> bool {

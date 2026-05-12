@@ -322,3 +322,41 @@ fn best_level_beats_better_on_corpus_proxy() {
         better.len()
     );
 }
+
+#[test]
+fn cross_rust_level22_compress_ffi_decompress_regression() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let compressed = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
+    let result = zstd::decode_all(compressed.as_slice()).unwrap();
+    assert_eq!(
+        data.as_slice(),
+        result.as_slice(),
+        "rust level22→ffi roundtrip failed"
+    );
+}
+
+#[test]
+fn level22_beats_best_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let best = compress_to_vec(data.as_slice(), CompressionLevel::Best);
+    let level22 = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
+    assert!(
+        level22.len() <= best.len(),
+        "Level(22) should not be worse than Best on corpus proxy. level22={} best={}",
+        level22.len(),
+        best.len()
+    );
+}
+
+#[test]
+fn level22_stays_within_ffi_level22_on_corpus_proxy() {
+    let data = include_bytes!("../decodecorpus_files/z000033");
+    let ffi_level22 = zstd::encode_all(data.as_slice(), 22).unwrap();
+    let level22 = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
+    assert!(
+        level22.len() <= ffi_level22.len(),
+        "Rust Level(22) should not be worse than donor level 22 on corpus proxy. rust_level22={} ffi_level22={}",
+        level22.len(),
+        ffi_level22.len()
+    );
+}

@@ -4,7 +4,7 @@ use crate::{
     encoding::{
         CompressionLevel, Matcher,
         block_header::BlockHeader,
-        blocks::compress_block,
+        blocks::{compress_block, compress_block_with_post_split},
         frame_compressor::CompressState,
         incompressible::{
             block_looks_incompressible, block_looks_incompressible_strict,
@@ -70,10 +70,33 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
         state.matcher.commit_space(uncompressed_data);
+        if matches!(compression_level, CompressionLevel::Level(16..=22))
+            && state.matcher.window_size() >= (1 << 17)
+        {
+            // This helper may emit multiple physical blocks (compressed or raw)
+            // into `output`; this function's return value remains a coarse
+            // "compressed-path selected" signal for caller accounting.
+            compress_block_with_post_split(state, last_block, output);
+            return BlockType::Compressed;
+        }
+
+        // Keep rollback snapshots for the oversize fallback path below:
+        // `compress_block` can mutate entropy/history state before we know
+        // whether the compressed payload fits `MAX_BLOCK_SIZE`.
+        let saved_offset_hist = state.offset_hist;
+        let saved_huff_table = state.last_huff_table.clone();
+        let saved_ll_previous = state.fse_tables.ll_previous.clone();
+        let saved_ml_previous = state.fse_tables.ml_previous.clone();
+        let saved_of_previous = state.fse_tables.of_previous.clone();
         compress_block(state, &mut compressed);
         // If the compressed data is larger than the maximum
         // allowable block size, instead store uncompressed
         if compressed.len() >= MAX_BLOCK_SIZE as usize {
+            state.offset_hist = saved_offset_hist;
+            state.last_huff_table = saved_huff_table;
+            state.fse_tables.ll_previous = saved_ll_previous;
+            state.fse_tables.ml_previous = saved_ml_previous;
+            state.fse_tables.of_previous = saved_of_previous;
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Raw,
@@ -161,6 +184,7 @@ mod tests {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
             fse_tables: FseTables::new(),
+            block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
         };
         let mut output = Vec::new();
@@ -187,6 +211,7 @@ mod tests {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
             fse_tables: FseTables::new(),
+            block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
         };
         let mut output = Vec::new();

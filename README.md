@@ -61,15 +61,13 @@ Implemented strategy/back-end coverage:
 - Level 1: simple matcher (`Simple`)
 - Levels 2-3: `Dfast`
 - Level 4: row matcher (`Row`)
-- Levels 5-22: hash-chain matcher (`HashChain`) with lazy/lazy2 style tuning
+- Levels 5-15: hash-chain matcher (`HashChain`) with lazy/lazy2 tuning
+- Levels 16-17: `btopt`-style price parser on top of hash-chain candidates
+- Levels 18-19: `btultra`-style price parser profile
+- Levels 20-22: `btultra2`-style dual-profile pass (choose lower-cost parse)
 
-Not yet implemented as dedicated strategy families:
+Still not implemented as dedicated family:
 - `greedy`
-- `btopt`
-- `btultra`
-
-Current behavior for these missing families:
-- numeric levels that require them are mapped to the closest implemented matcher configuration
 
 ### Dictionary Generation
 
