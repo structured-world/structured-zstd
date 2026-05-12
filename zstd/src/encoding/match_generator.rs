@@ -4364,8 +4364,14 @@ impl HcMatchGenerator {
             }
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
+            // SAFETY: loop guard keeps `pos <= frontier_limit` and `nodes`
+            // was sized to `frontier_limit + 2` near the top of this function
+            // (~line 4145). Therefore `pos - 1 < pos <= frontier_limit <
+            // nodes.len()` and `pos + 1 <= frontier_limit + 1 < nodes.len()`.
+            // Any `prev_pos = pos.saturating_sub(_) <= pos` is also in bounds.
+            debug_assert!(pos + 1 < nodes.len());
             // Donor order: fix opt[cur] from opt[cur-1] with one literal.
-            let prev_node = nodes[pos - 1];
+            let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
             if prev_node.price != u32::MAX {
                 let lit_len = prev_node.litlen as usize + 1;
                 let lit_price = Self::cached_literal_price(
@@ -4385,11 +4391,13 @@ impl HcMatchGenerator {
                     ll_price_stamp,
                 );
                 let lit_cost = Self::add_price_delta(prev_node.price, lit_price, ll_delta);
-                if lit_cost <= nodes[pos].price {
-                    let prev_match = nodes[pos];
-                    nodes[pos] = prev_node;
-                    nodes[pos].litlen = lit_len as u32;
-                    nodes[pos].price = lit_cost;
+                let node_pos_price = unsafe { nodes.get_unchecked(pos).price };
+                if lit_cost <= node_pos_price {
+                    let prev_match = unsafe { *nodes.get_unchecked(pos) };
+                    let slot = unsafe { nodes.get_unchecked_mut(pos) };
+                    *slot = prev_node;
+                    slot.litlen = lit_len as u32;
+                    slot.price = lit_cost;
                     // Keep the cheaper-LL branch nested: collapsing it into
                     // the outer condition measured slower on the level22
                     // small-block hot path.
@@ -4424,20 +4432,24 @@ impl HcMatchGenerator {
                             let with_more_literals =
                                 Self::add_price_delta(lit_cost, next_lit_price, ll_delta_next);
                             let next = pos + 1;
-                            if with1literal < with_more_literals && with1literal < nodes[next].price
-                            {
+                            // SAFETY: see while-loop invariant above —
+                            // `next = pos + 1 <= frontier_limit + 1 < nodes.len()`,
+                            // and `prev_pos = pos.saturating_sub(...) <= pos`.
+                            let next_price = unsafe { nodes.get_unchecked(next).price };
+                            if with1literal < with_more_literals && with1literal < next_price {
                                 let prev_pos = pos.saturating_sub(prev_match.mlen as usize);
                                 if prev_pos <= pos {
-                                    let prev_state = nodes[prev_pos];
+                                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
                                     let (_, reps_after_match) = Self::encode_offset_with_reps(
                                         prev_match.off,
                                         prev_state.litlen as usize,
                                         prev_state.reps,
                                     );
-                                    nodes[next] = prev_match;
-                                    nodes[next].reps = reps_after_match;
-                                    nodes[next].litlen = 1;
-                                    nodes[next].price = with1literal;
+                                    let slot = unsafe { nodes.get_unchecked_mut(next) };
+                                    *slot = prev_match;
+                                    slot.reps = reps_after_match;
+                                    slot.litlen = 1;
+                                    slot.price = with1literal;
                                     if next > last_pos {
                                         last_pos = next;
                                     }
@@ -4448,7 +4460,9 @@ impl HcMatchGenerator {
                 }
             }
 
-            let mut base_node = nodes[pos];
+            // SAFETY: while-loop invariant. `pos < nodes.len()` and
+            // `prev_pos <= pos < nodes.len()`.
+            let mut base_node = unsafe { *nodes.get_unchecked(pos) };
             if base_node.price == u32::MAX {
                 pos += 1;
                 continue;
@@ -4456,14 +4470,14 @@ impl HcMatchGenerator {
             if base_node.mlen > 0 && base_node.litlen == 0 {
                 let prev_pos = pos.saturating_sub(base_node.mlen as usize);
                 if prev_pos <= pos {
-                    let prev_state = nodes[prev_pos];
+                    let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
                     let (_, reps_after_match) = Self::encode_offset_with_reps(
                         base_node.off,
                         prev_state.litlen as usize,
                         prev_state.reps,
                     );
                     base_node.reps = reps_after_match;
-                    nodes[pos].reps = reps_after_match;
+                    unsafe { nodes.get_unchecked_mut(pos).reps = reps_after_match };
                 }
             }
             let base_cost = base_node.price;
@@ -4484,8 +4498,10 @@ impl HcMatchGenerator {
 
             // donor-style early skip for opt-level path: if next literal-only
             // state is already nearly as good, skip expensive match probing.
+            // SAFETY: `pos + 1 <= frontier_limit + 1 < nodes.len()`.
+            let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
             if abort_on_worse_match
-                && nodes[pos + 1].price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
+                && next_price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
             {
                 pos += 1;
                 continue;
