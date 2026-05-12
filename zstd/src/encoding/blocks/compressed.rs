@@ -144,11 +144,12 @@ impl Matcher for EntropyOnlyMatcher {
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
-    encode_block_parts(
+    encode_block_parts_with_sequence_scratch(
         state,
         &scratch.parts.literals,
         &scratch.parts.sequences,
         output,
+        &mut scratch.estimator_sequences,
     );
     state.block_scratch = scratch;
 }
@@ -287,22 +288,6 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             });
         }
     });
-}
-
-fn encode_block_parts<M: Matcher>(
-    state: &mut CompressState<M>,
-    literals_vec: &[u8],
-    raw_sequences: &[RawSequence],
-    output: &mut Vec<u8>,
-) {
-    let mut sequences = Vec::new();
-    encode_block_parts_with_sequence_scratch(
-        state,
-        literals_vec,
-        raw_sequences,
-        output,
-        &mut sequences,
-    );
 }
 
 fn encode_block_parts_with_sequence_scratch<M: Matcher>(
