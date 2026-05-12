@@ -4270,6 +4270,11 @@ impl HcMatchGenerator {
                     );
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(stats, off_base);
+                    // `match_len ≤ max_match_len ≤ frontier_limit`, and
+                    // `nodes.len() ≥ frontier_limit + 2`: every `nodes[match_len]`
+                    // access here is provably in bounds.
+                    debug_assert!(max_match_len < nodes.len());
+                    let nodes0_price = nodes[0].price;
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = Self::cached_match_length_price(
                             profile,
@@ -4283,9 +4288,13 @@ impl HcMatchGenerator {
                             ll0_price,
                             profile.match_price_from_parts(off_price, ml_price, stats),
                         );
-                        let next_cost = Self::add_prices(nodes[0].price, seq_cost);
-                        if match_len > last_pos || next_cost < nodes[match_len].price {
-                            nodes[match_len] = HcOptimalNode {
+                        let next_cost = Self::add_prices(nodes0_price, seq_cost);
+                        // SAFETY: bound established above.
+                        let node_price = unsafe { nodes.get_unchecked(match_len).price };
+                        if match_len > last_pos || next_cost < node_price {
+                            // SAFETY: bound established above.
+                            let slot = unsafe { nodes.get_unchecked_mut(match_len) };
+                            *slot = HcOptimalNode {
                                 price: next_cost,
                                 off: candidate.offset as u32,
                                 mlen: match_len as u32,
@@ -4526,6 +4535,14 @@ impl HcMatchGenerator {
                 // donor-style descending ML scan from best length to minimum.
                 // For faster btopt-like mode (optLevel==0 equivalent) we stop
                 // early once shorter lengths stop improving the current best.
+                //
+                // `next = pos + match_len ≤ pos + max_match_len ≤ frontier_limit`
+                // (see `max_match_len` clamp via `frontier_limit.saturating_sub(pos)`
+                // a few lines up), and `nodes.len() ≥ frontier_limit + 2`
+                // (see `nodes.resize` near the top of this function). So every
+                // `nodes[next]` access is provably in bounds and the bounds
+                // check is dead weight on this hot path.
+                debug_assert!(pos + max_match_len < nodes.len());
                 for match_len in (start_len..=max_match_len).rev() {
                     let next = pos + match_len;
                     let ml_price = Self::cached_match_length_price(
@@ -4541,9 +4558,13 @@ impl HcMatchGenerator {
                         profile.match_price_from_parts(off_price, ml_price, stats),
                     );
                     let next_cost = Self::add_prices(base_cost, seq_cost);
-                    let improved = next > last_pos || next_cost < nodes[next].price;
+                    // SAFETY: bound established above.
+                    let node_next_price = unsafe { nodes.get_unchecked(next).price };
+                    let improved = next > last_pos || next_cost < node_next_price;
                     if improved {
-                        nodes[next] = HcOptimalNode {
+                        // SAFETY: bound established above.
+                        let slot = unsafe { nodes.get_unchecked_mut(next) };
+                        *slot = HcOptimalNode {
                             price: next_cost,
                             off: candidate.offset as u32,
                             mlen: match_len as u32,
