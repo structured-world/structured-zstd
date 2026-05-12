@@ -490,6 +490,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 );
                 if block_len < uncompressed_data.len() {
                     pending_input = uncompressed_data.split_off(block_len);
+                    // `split_off` returns a Vec whose capacity is typically
+                    // close to its length. Next iteration's `had_pending`
+                    // branch moves `pending_input` into `uncompressed_data`
+                    // and resizes to `block_capacity`, which would reallocate
+                    // from scratch on every pre-split. Pre-reserve here so
+                    // the resize stays in-place.
+                    if pending_input.capacity() < block_capacity {
+                        pending_input.reserve_exact(block_capacity - pending_input.len());
+                    }
                     last_block = false;
                 }
             }
