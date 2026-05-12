@@ -1743,6 +1743,7 @@ fn extend_backwards_shared(
     }
 }
 
+#[inline]
 fn repcode_candidate_shared(
     concat: &[u8],
     history_abs_start: usize,
@@ -1751,48 +1752,65 @@ fn repcode_candidate_shared(
     lit_len: usize,
     min_match_len: usize,
 ) -> Option<MatchCandidate> {
-    let reps = if lit_len == 0 {
-        [
-            Some(offset_hist[1] as usize),
-            Some(offset_hist[2] as usize),
-            (offset_hist[0] > 1).then_some((offset_hist[0] - 1) as usize),
-        ]
-    } else {
-        [
-            Some(offset_hist[0] as usize),
-            Some(offset_hist[1] as usize),
-            Some(offset_hist[2] as usize),
-        ]
-    };
-
     let current_idx = abs_pos - history_abs_start;
     if current_idx + min_match_len > concat.len() {
         return None;
     }
 
-    let mut best = None;
-    for rep in reps.into_iter().flatten() {
-        if rep == 0 || rep > abs_pos {
-            continue;
-        }
-        let candidate_pos = abs_pos - rep;
-        if candidate_pos < history_abs_start {
-            continue;
-        }
-        let candidate_idx = candidate_pos - history_abs_start;
-        let match_len =
-            MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-        if match_len >= min_match_len {
-            let candidate = extend_backwards_shared(
-                concat,
-                history_abs_start,
-                candidate_pos,
-                abs_pos,
-                match_len,
-                lit_len,
-            );
-            best = best_len_offset_candidate(best, Some(candidate));
-        }
+    // Called once per input byte (10% exclusive on default-level profile).
+    // The previous form built an `[Option<usize>; 3]` and walked it via
+    // `into_iter().flatten()`, which the compiler couldn't always unroll
+    // through the conditional `then_some` on the last slot. Unroll the
+    // 3-rep probe by hand: each branch is a couple of compares + one
+    // `common_prefix_len` (already SIMD).
+    let mut best: Option<MatchCandidate> = None;
+
+    let (rep0, rep1, rep2_opt) = if lit_len == 0 {
+        let r2 = if offset_hist[0] > 1 {
+            Some(offset_hist[0] as usize - 1)
+        } else {
+            None
+        };
+        (offset_hist[1] as usize, offset_hist[2] as usize, r2)
+    } else {
+        (
+            offset_hist[0] as usize,
+            offset_hist[1] as usize,
+            Some(offset_hist[2] as usize),
+        )
+    };
+
+    macro_rules! probe {
+        ($rep:expr) => {{
+            let rep = $rep;
+            if rep != 0 && rep <= abs_pos {
+                let candidate_pos = abs_pos - rep;
+                if candidate_pos >= history_abs_start {
+                    let candidate_idx = candidate_pos - history_abs_start;
+                    let match_len = MatchGenerator::common_prefix_len(
+                        &concat[candidate_idx..],
+                        &concat[current_idx..],
+                    );
+                    if match_len >= min_match_len {
+                        let candidate = extend_backwards_shared(
+                            concat,
+                            history_abs_start,
+                            candidate_pos,
+                            abs_pos,
+                            match_len,
+                            lit_len,
+                        );
+                        best = best_len_offset_candidate(best, Some(candidate));
+                    }
+                }
+            }
+        }};
+    }
+
+    probe!(rep0);
+    probe!(rep1);
+    if let Some(rep2) = rep2_opt {
+        probe!(rep2);
     }
     best
 }
@@ -2250,37 +2268,70 @@ impl DfastMatchGenerator {
     }
 
     fn hash_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        // Hoist all the per-loop invariants out of the combinator chains.
+        // `short_candidates`/`long_candidates` each re-fetch `live_history`
+        // and recompute `idx` from scratch inside their Option/flatten/filter
+        // adapters; on a per-byte hot path (32% exclusive on default-level
+        // profile) that's measurable Option/Iterator scaffolding the
+        // compiler can't always erase.
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
+        let history_abs_start = self.history_abs_start;
         let mut best = None;
-        for candidate_pos in self.long_candidates(abs_pos) {
-            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
-                    return best;
+
+        // Long-hash probes first (8-byte hash → longer matches more likely).
+        if current_idx + 8 <= concat.len() {
+            let long_hash = self.hash8(&concat[current_idx..]);
+            // SAFETY: `hash_index` masks to `hash_bits` and `long_hash.len()
+            // == 1 << hash_bits` (`ensure_hash_tables`).
+            debug_assert!(long_hash < self.long_hash.len());
+            let bucket = unsafe { self.long_hash.get_unchecked(long_hash) };
+            for &candidate_pos in bucket {
+                if candidate_pos == DFAST_EMPTY_SLOT
+                    || candidate_pos < history_abs_start
+                    || candidate_pos >= abs_pos
+                {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - history_abs_start;
+                let match_len = MatchGenerator::common_prefix_len(
+                    &concat[candidate_idx..],
+                    &concat[current_idx..],
+                );
+                if match_len >= DFAST_MIN_MATCH_LEN {
+                    let candidate =
+                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                    best = best_len_offset_candidate(best, Some(candidate));
+                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                        return best;
+                    }
                 }
             }
         }
 
-        for candidate_pos in self.short_candidates(abs_pos) {
-            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= DFAST_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= DFAST_TARGET_LEN) {
-                    return best;
+        if current_idx + 4 <= concat.len() {
+            let short_hash = self.hash4(&concat[current_idx..]);
+            debug_assert!(short_hash < self.short_hash.len());
+            let bucket = unsafe { self.short_hash.get_unchecked(short_hash) };
+            for &candidate_pos in bucket {
+                if candidate_pos == DFAST_EMPTY_SLOT
+                    || candidate_pos < history_abs_start
+                    || candidate_pos >= abs_pos
+                {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - history_abs_start;
+                let match_len = MatchGenerator::common_prefix_len(
+                    &concat[candidate_idx..],
+                    &concat[current_idx..],
+                );
+                if match_len >= DFAST_MIN_MATCH_LEN {
+                    let candidate =
+                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                    best = best_len_offset_candidate(best, Some(candidate));
+                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                        return best;
+                    }
                 }
             }
         }
@@ -2356,26 +2407,6 @@ impl DfastMatchGenerator {
                 bucket[0] = pos;
             }
         }
-    }
-
-    fn short_candidates(&self, pos: usize) -> impl Iterator<Item = usize> + '_ {
-        let concat = self.live_history();
-        let idx = pos - self.history_abs_start;
-        (idx + 4 <= concat.len())
-            .then(|| self.short_hash[self.hash4(&concat[idx..])])
-            .into_iter()
-            .flatten()
-            .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
-    }
-
-    fn long_candidates(&self, pos: usize) -> impl Iterator<Item = usize> + '_ {
-        let concat = self.live_history();
-        let idx = pos - self.history_abs_start;
-        (idx + 8 <= concat.len())
-            .then(|| self.long_hash[self.hash8(&concat[idx..])])
-            .into_iter()
-            .flatten()
-            .filter(|candidate| *candidate != DFAST_EMPTY_SLOT)
     }
 
     fn hash4(&self, data: &[u8]) -> usize {
