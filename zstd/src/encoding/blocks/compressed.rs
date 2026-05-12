@@ -887,6 +887,11 @@ impl SplitEstimator<'_> {
         self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
     }
 
+    /// Returns the post-emit state at `end_idx` produced by whichever
+    /// partitioning the recursion settles on (single emit OR multiple
+    /// nested splits). Callers thread this into the sibling probe so the
+    /// right-hand recursion sees the actual donor-parity state the real
+    /// emit would land in, not just the "left as one big partition" state.
     fn derive_block_splits_with_full(
         &mut self,
         start_idx: usize,
@@ -894,28 +899,37 @@ impl SplitEstimator<'_> {
         full: usize,
         entry: ProbeEntryState,
         partitions: &mut Vec<usize>,
-    ) {
+    ) -> ProbeEntryState {
         if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
             || partitions.len() >= MAX_NB_BLOCK_SPLITS
         {
-            return;
+            // Leaf: this range will be emitted as a single partition, so the
+            // exit state is the post-state of that single-partition probe.
+            return self.estimate_subblock_size(start_idx, end_idx, &entry).1;
         }
         let mid_idx = (start_idx + end_idx) / 2;
         let (first, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
-        // Donor parity: the right partition inherits the left's post-emit
-        // entropy / repeat-offset state, not the parent's block-entry state.
-        // Without this propagation `second` is scored as if it were the
-        // start of a fresh block, which biases the splitter toward overly
-        // optimistic splits and breaks the parity-sensitive cost compare.
+        // Donor parity: score the right half from the left's post-state,
+        // not from the parent's block-entry state. Without this propagation
+        // `second` is evaluated as a fresh-block start, biasing the
+        // `first + second < full` decision toward overly optimistic splits.
         let (second, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
         if first + second < full {
-            self.derive_block_splits_with_full(start_idx, mid_idx, first, entry, partitions);
+            // If the left side gets further split, the true state at
+            // `mid_idx` is the left subtree's exit state, not `first_post`.
+            // Thread the returned state into the right recursion so the
+            // right subtree probes against actual donor-parity state.
+            let left_post =
+                self.derive_block_splits_with_full(start_idx, mid_idx, first, entry, partitions);
             if partitions.len() >= MAX_NB_BLOCK_SPLITS {
-                return;
+                return left_post;
             }
             partitions.push(mid_idx);
-            self.derive_block_splits_with_full(mid_idx, end_idx, second, first_post, partitions);
+            return self
+                .derive_block_splits_with_full(mid_idx, end_idx, second, left_post, partitions);
         }
+        // No split here — this range will be emitted as one partition.
+        self.estimate_subblock_size(start_idx, end_idx, &entry).1
     }
 }
 
