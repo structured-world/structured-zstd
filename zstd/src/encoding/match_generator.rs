@@ -1425,6 +1425,10 @@ struct DfastMatchGenerator {
     short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
     hash_bits: usize,
+    /// Cached fastpath kernel for `hash_mix_u64`. Resolved once at `new()`
+    /// and reused on every `hash_index` call so we skip the per-call
+    /// `OnceLock` atomic load that `dispatch_hash_mix_u64` would pay.
+    hash_kernel: crate::encoding::fastpath::FastpathKernel,
     use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     lazy_depth: u8,
@@ -1627,6 +1631,7 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             hash_bits: DFAST_HASH_BITS,
+            hash_kernel: crate::encoding::fastpath::select_kernel(),
             use_fast_loop: false,
             lazy_depth: 1,
         }
@@ -2196,7 +2201,8 @@ impl DfastMatchGenerator {
     }
 
     fn hash_index(&self, value: u64) -> usize {
-        (crate::encoding::fastpath::dispatch_hash_mix_u64(value) >> (64 - self.hash_bits)) as usize
+        let mixed = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
+        (mixed >> (64 - self.hash_bits)) as usize
     }
 }
 
@@ -2213,6 +2219,8 @@ struct RowMatchGenerator {
     search_depth: usize,
     target_len: usize,
     lazy_depth: u8,
+    /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
+    hash_kernel: crate::encoding::fastpath::FastpathKernel,
     row_heads: Vec<u8>,
     row_positions: Vec<usize>,
     row_tags: Vec<u8>,
@@ -2233,6 +2241,7 @@ impl RowMatchGenerator {
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
             lazy_depth: 1,
+            hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
@@ -2425,7 +2434,7 @@ impl RowMatchGenerator {
         }
         let value =
             u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-        let hash = crate::encoding::fastpath::dispatch_hash_mix_u64(value);
+        let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
@@ -8349,7 +8358,7 @@ fn row_hash_and_row_extracts_high_bits() {
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
     let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
-    let hash = crate::encoding::fastpath::dispatch_hash_mix_u64(value);
+    let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =

@@ -197,13 +197,17 @@ pub(crate) fn dispatch_count_match_from_indices(
     }
 }
 
-/// Hash-mix dispatch for Dfast/Row hash compute. Routes to the per-CPU
-/// `hash_mix_u64` variant (CRC32-accelerated on SSE4.2 x86 / aarch64 + crc,
-/// pure scalar multiply otherwise). Cached kernel keeps the per-call
-/// overhead to a single atomic load + match jump.
-#[inline]
-pub(crate) fn dispatch_hash_mix_u64(value: u64) -> u64 {
-    match select_kernel() {
+/// Hash-mix dispatch that takes the resolved [`FastpathKernel`] by value, so
+/// the caller can cache it once per matcher / encoder lifetime instead of
+/// hitting the `OnceLock` atomic on every call.
+///
+/// Critical for the default-level Dfast hot path: `hash_index` runs once per
+/// input byte. The previous per-call `dispatch_hash_mix_u64` shape was a
+/// measurable regression versus storing the kernel on the matcher (the old
+/// pre-refactor pattern).
+#[inline(always)]
+pub(crate) fn hash_mix_u64_with_kernel(kernel: FastpathKernel, value: u64) -> u64 {
+    match kernel {
         FastpathKernel::Scalar => scalar::hash_mix_u64(value),
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         FastpathKernel::Neon => unsafe { neon::hash_mix_u64(value) },
@@ -212,6 +216,15 @@ pub(crate) fn dispatch_hash_mix_u64(value: u64) -> u64 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::hash_mix_u64(value) },
     }
+}
+
+/// Hash-mix dispatch that resolves the kernel via [`select_kernel`] on every
+/// call. Suitable for cold paths or callers that only mix a handful of values
+/// per encoder lifetime. Hot loops should call [`hash_mix_u64_with_kernel`]
+/// with a cached kernel instead.
+#[inline]
+pub(crate) fn dispatch_hash_mix_u64(value: u64) -> u64 {
+    hash_mix_u64_with_kernel(select_kernel(), value)
 }
 
 /// Public entry point for raw-pointer prefix-length scans (BT byte compare,
