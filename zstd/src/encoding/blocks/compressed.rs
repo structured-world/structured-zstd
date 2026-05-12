@@ -184,11 +184,13 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     let mut estimator = SplitEstimator {
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
-        huff_table: state.last_huff_table.as_ref(),
-        offset_hist: state.offset_hist,
-        ll_previous: state.fse_tables.ll_previous.clone(),
-        ml_previous: state.fse_tables.ml_previous.clone(),
-        of_previous: state.fse_tables.of_previous.clone(),
+        block_entry: ProbeEntryState {
+            last_huff_table: state.last_huff_table.clone(),
+            ll_previous: state.fse_tables.ll_previous.clone(),
+            ml_previous: state.fse_tables.ml_previous.clone(),
+            of_previous: state.fse_tables.of_previous.clone(),
+            offset_hist: state.offset_hist,
+        },
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
@@ -786,20 +788,40 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
     }
 }
 
-struct SplitEstimator<'a> {
-    parts: &'a EncodedBlockParts,
-    prefix_sums: &'a SequencePrefixSums,
-    huff_table: Option<&'a huff0_encoder::HuffmanTable>,
-    offset_hist: [u32; 3],
+/// Snapshot of the Huffman/FSE/repeat-offset state the real encoder would
+/// have at a given partition boundary. Cloning is the only way to thread
+/// state through recursive bisect probes (each branch needs its own copy),
+/// but the snapshot is small relative to the full encode cost the dry-run
+/// estimator replaces.
+#[derive(Clone)]
+struct ProbeEntryState {
+    last_huff_table: Option<huff0_encoder::HuffmanTable>,
     ll_previous: Option<PreviousFseTable>,
     ml_previous: Option<PreviousFseTable>,
     of_previous: Option<PreviousFseTable>,
+    offset_hist: [u32; 3],
+}
+
+struct SplitEstimator<'a> {
+    parts: &'a EncodedBlockParts,
+    prefix_sums: &'a SequencePrefixSums,
+    block_entry: ProbeEntryState,
     scratch_state: CompressState<EntropyOnlyMatcher>,
     workspace: EstimatorWorkspace,
 }
 
 impl SplitEstimator<'_> {
-    fn estimate_subblock_size(&mut self, start_idx: usize, end_idx: usize) -> usize {
+    /// Run a single estimator probe seeded from `entry`. Returns the would-be
+    /// emitted byte count for this partition plus the post-probe state to
+    /// feed into the sibling partition. When the partition would raw-fallback
+    /// (compressed estimate ≥ source minus min_gain), the real encoder
+    /// restores the entry state, so we return `entry` unchanged.
+    fn estimate_subblock_size(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+        entry: &ProbeEntryState,
+    ) -> (usize, ProbeEntryState) {
         let lit_start = self.prefix_sums.lit[start_idx];
         let lit_len = self.prefix_sums.lit_range(start_idx, end_idx);
         let match_len = self.prefix_sums.ml_range(start_idx, end_idx);
@@ -808,11 +830,11 @@ impl SplitEstimator<'_> {
         } else {
             lit_start + lit_len
         };
-        self.scratch_state.last_huff_table = self.huff_table.cloned();
-        self.scratch_state.fse_tables.ll_previous = self.ll_previous.clone();
-        self.scratch_state.fse_tables.ml_previous = self.ml_previous.clone();
-        self.scratch_state.fse_tables.of_previous = self.of_previous.clone();
-        self.scratch_state.offset_hist = self.offset_hist;
+        self.scratch_state.last_huff_table = entry.last_huff_table.clone();
+        self.scratch_state.fse_tables.ll_previous = entry.ll_previous.clone();
+        self.scratch_state.fse_tables.ml_previous = entry.ml_previous.clone();
+        self.scratch_state.fse_tables.of_previous = entry.of_previous.clone();
+        self.scratch_state.offset_hist = entry.offset_hist;
         let emitted_payload = estimate_block_parts_size(
             &mut self.scratch_state,
             &self.parts.literals[lit_start..lit_end],
@@ -821,12 +843,26 @@ impl SplitEstimator<'_> {
         );
         let source_len = (lit_end - lit_start) + match_len;
         let min_gain = (source_len >> 8) + 2;
-        let emitted_payload = if emitted_payload >= source_len.saturating_sub(min_gain) {
+        let raw_fallback = emitted_payload >= source_len.saturating_sub(min_gain);
+        let cost = if raw_fallback {
             source_len
         } else {
             emitted_payload
+        } + 3;
+        // Real emit on raw fallback restores the entry state — see
+        // `emit_single_sequence_block`'s saved-state restore branch.
+        let post = if raw_fallback {
+            entry.clone()
+        } else {
+            ProbeEntryState {
+                last_huff_table: self.scratch_state.last_huff_table.clone(),
+                ll_previous: self.scratch_state.fse_tables.ll_previous.clone(),
+                ml_previous: self.scratch_state.fse_tables.ml_previous.clone(),
+                of_previous: self.scratch_state.fse_tables.of_previous.clone(),
+                offset_hist: self.scratch_state.offset_hist,
+            }
         };
-        emitted_payload + 3
+        (cost, post)
     }
 
     fn derive_block_splits(
@@ -840,8 +876,9 @@ impl SplitEstimator<'_> {
         {
             return;
         }
-        let full = self.estimate_subblock_size(start_idx, end_idx);
-        self.derive_block_splits_with_full(start_idx, end_idx, full, partitions);
+        let entry = self.block_entry.clone();
+        let (full, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
     }
 
     fn derive_block_splits_with_full(
@@ -849,6 +886,7 @@ impl SplitEstimator<'_> {
         start_idx: usize,
         end_idx: usize,
         full: usize,
+        entry: ProbeEntryState,
         partitions: &mut Vec<usize>,
     ) {
         if end_idx - start_idx < MIN_SEQUENCES_BLOCK_SPLITTING
@@ -857,15 +895,20 @@ impl SplitEstimator<'_> {
             return;
         }
         let mid_idx = (start_idx + end_idx) / 2;
-        let first = self.estimate_subblock_size(start_idx, mid_idx);
-        let second = self.estimate_subblock_size(mid_idx, end_idx);
+        let (first, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
+        // Donor parity: the right partition inherits the left's post-emit
+        // entropy / repeat-offset state, not the parent's block-entry state.
+        // Without this propagation `second` is scored as if it were the
+        // start of a fresh block, which biases the splitter toward overly
+        // optimistic splits and breaks the parity-sensitive cost compare.
+        let (second, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
         if first + second < full {
-            self.derive_block_splits_with_full(start_idx, mid_idx, first, partitions);
+            self.derive_block_splits_with_full(start_idx, mid_idx, first, entry, partitions);
             if partitions.len() >= MAX_NB_BLOCK_SPLITS {
                 return;
             }
             partitions.push(mid_idx);
-            self.derive_block_splits_with_full(mid_idx, end_idx, second, partitions);
+            self.derive_block_splits_with_full(mid_idx, end_idx, second, first_post, partitions);
         }
     }
 }
