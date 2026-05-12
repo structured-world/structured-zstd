@@ -75,9 +75,14 @@ impl BlockDecoder {
                 Ok(1)
             }
             BlockType::Raw => {
+                // Pass `source` by value, not `&mut source`: `extend_from_reader<R: Read>`
+                // takes `R` by value, and `crate::io::Read` (the `no_std` shim) does not
+                // provide a blanket `impl<R: Read + ?Sized> Read for &mut R` like
+                // `std::io::Read` does, so `&mut source` would fail to compile without
+                // the `std` feature. `source` is not used after this match arm.
                 workspace
                     .buffer
-                    .extend_from_reader(&mut source, header.decompressed_size as usize)
+                    .extend_from_reader(source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
                         step: block_type,
                         source: err,
