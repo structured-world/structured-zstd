@@ -2797,16 +2797,20 @@ impl HcOptState {
     }
 
     fn bit_weight(stat: u32) -> u32 {
-        let hb = 31u32.saturating_sub((stat + 1).leading_zeros());
-        hb.saturating_mul(HC_BITCOST_MULTIPLIER)
+        // Donor parity: stat+1 ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
+        // hb ≤ 31, MULTIPLIER = 256 ⇒ product ≤ 7936, no overflow.
+        let hb = 31 - (stat + 1).leading_zeros();
+        hb * HC_BITCOST_MULTIPLIER
     }
 
     fn frac_weight(raw_stat: u32) -> u32 {
+        // Donor parity (ZSTD_fracWeight). All operands bounded: stat fits u32,
+        // hb ∈ 0..=31, BWeight ≤ 7936, FWeight ≤ 65535 ⇒ sum no overflow.
         let stat = raw_stat + 1;
-        let hb = 31u32.saturating_sub(stat.leading_zeros());
-        let b_weight = hb.saturating_mul(HC_BITCOST_MULTIPLIER);
+        let hb = 31 - stat.leading_zeros();
+        let b_weight = hb * HC_BITCOST_MULTIPLIER;
         let f_weight = (stat << 8) >> hb;
-        b_weight.saturating_add(f_weight)
+        b_weight + f_weight
     }
 
     fn weight(stat: u32, accurate: bool) -> u32 {
@@ -2818,12 +2822,13 @@ impl HcOptState {
     }
 
     fn downscale_stats(table: &mut [u32], shift: u32, base1: bool) -> u32 {
+        // Donor parity: table sums bounded by block size (≤ 256K) ⇒ no overflow.
         let mut sum = 0u32;
         for stat in table {
             let base = if base1 { 1 } else { u32::from(*stat > 0) };
             let new_stat = base + (*stat >> shift);
             *stat = new_stat;
-            sum = sum.saturating_add(new_stat);
+            sum += new_stat;
         }
         sum
     }
@@ -2834,7 +2839,8 @@ impl HcOptState {
         if factor <= 1 {
             return prev_sum;
         }
-        let shift = 31u32.saturating_sub(factor.leading_zeros());
+        // factor ≥ 2 ⇒ leading_zeros ≤ 30 ⇒ 31-lz ≥ 1.
+        let shift = 31 - factor.leading_zeros();
         Self::downscale_stats(table, shift, true)
     }
 
@@ -2918,7 +2924,7 @@ impl HcOptState {
                 1u32 << (scale_log - bit_cost)
             };
             *slot = value;
-            sum = sum.saturating_add(value);
+            sum += value;
         }
         sum
     }
@@ -3089,28 +3095,27 @@ impl HcOptState {
     }
 
     fn update_stats(&mut self, lit_len: usize, literals: &[u8], off_base: u32, match_len: usize) {
+        // Donor parity (ZSTD_updateStats). All freq sums bounded by
+        // block_size * LITFREQ_ADD ≤ 256K * 2 = 512K ≪ u32::MAX.
         if self.literals_compressed() {
             for &byte in literals.iter().take(lit_len) {
-                self.lit_freq[byte as usize] =
-                    self.lit_freq[byte as usize].saturating_add(HC_LITFREQ_ADD);
+                self.lit_freq[byte as usize] += HC_LITFREQ_ADD;
             }
-            self.lit_sum = self
-                .lit_sum
-                .saturating_add((lit_len as u32).saturating_mul(HC_LITFREQ_ADD));
+            self.lit_sum += (lit_len as u32) * HC_LITFREQ_ADD;
         }
 
         let (ll_code, _) = Self::lit_code_and_bits(lit_len);
-        self.lit_length_freq[ll_code] = self.lit_length_freq[ll_code].saturating_add(1);
-        self.lit_length_sum = self.lit_length_sum.saturating_add(1);
+        self.lit_length_freq[ll_code] += 1;
+        self.lit_length_sum += 1;
 
-        let off_code =
-            (31u32.saturating_sub(off_base.max(1).leading_zeros()) as usize).min(HC_MAX_OFF);
-        self.off_code_freq[off_code] = self.off_code_freq[off_code].saturating_add(1);
-        self.off_code_sum = self.off_code_sum.saturating_add(1);
+        // off_base ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
+        let off_code = ((31 - off_base.max(1).leading_zeros()) as usize).min(HC_MAX_OFF);
+        self.off_code_freq[off_code] += 1;
+        self.off_code_sum += 1;
 
         let (ml_code, _) = Self::ml_code_and_bits(match_len);
-        self.match_length_freq[ml_code] = self.match_length_freq[ml_code].saturating_add(1);
-        self.match_length_sum = self.match_length_sum.saturating_add(1);
+        self.match_length_freq[ml_code] += 1;
+        self.match_length_sum += 1;
     }
 }
 
@@ -3164,14 +3169,16 @@ impl HcOptimalCostProfile {
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return 6 * HC_BITCOST_MULTIPLIER;
         }
-        let lit_max = stats
-            .lit_sum_base_price
-            .saturating_sub(HC_BITCOST_MULTIPLIER);
+        // Donor parity: ZSTD_rawLiteralsCost asserts lit_sum_base_price ≥
+        // BITCOST_MULTIPLIER, then clamps lit_weight to that range, so the
+        // final subtract never underflows.
+        debug_assert!(stats.lit_sum_base_price >= HC_BITCOST_MULTIPLIER);
+        let lit_max = stats.lit_sum_base_price - HC_BITCOST_MULTIPLIER;
         let mut lit_weight = HcOptState::weight(stats.lit_freq[byte as usize], self.accurate);
         if lit_weight > lit_max {
             lit_weight = lit_max;
         }
-        stats.lit_sum_base_price.saturating_sub(lit_weight)
+        stats.lit_sum_base_price - lit_weight
     }
 
     fn lit_length_price(&self, stats: &HcOptState, lit_len: usize) -> u32 {
@@ -3185,8 +3192,9 @@ impl HcOptimalCostProfile {
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return HcOptState::weight(lit_len as u32, self.accurate);
         }
+        // ll_bits ≤ 16 ⇒ ll_bits * 256 ≤ 4096, sum no overflow.
         let (ll_code, ll_bits) = HcOptState::lit_code_and_bits(lit_len);
-        ll_bits.saturating_mul(HC_BITCOST_MULTIPLIER) + stats.lit_length_sum_base_price
+        ll_bits * HC_BITCOST_MULTIPLIER + stats.lit_length_sum_base_price
             - HcOptState::weight(stats.lit_length_freq[ll_code], self.accurate)
     }
 
@@ -3196,32 +3204,32 @@ impl HcOptimalCostProfile {
         stats: &HcOptState,
         off_base: u32,
     ) -> u32 {
-        let off_code = 31u32.saturating_sub(off_base.max(1).leading_zeros());
+        // Donor parity (ZSTD_getMatchPrice). off_base ≥ 1 ⇒ leading_zeros ≤ 31.
+        // off_code ≤ 31, (16 + off_code) * 256 ≤ 12032, sums no overflow.
+        let off_code = 31 - off_base.max(1).leading_zeros();
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
-            return (16 + off_code).saturating_mul(HC_BITCOST_MULTIPLIER);
+            return (16 + off_code) * HC_BITCOST_MULTIPLIER;
         }
-        let mut price = off_code.saturating_mul(HC_BITCOST_MULTIPLIER)
+        let mut price = off_code * HC_BITCOST_MULTIPLIER
             + (stats.off_code_sum_base_price
                 - HcOptState::weight(stats.off_code_freq[off_code as usize], ACCURATE_PRICE));
         if FAVOR_SMALL_OFFSETS && off_code >= 20 {
-            price = price.saturating_add(
-                (off_code - 19)
-                    .saturating_mul(2)
-                    .saturating_mul(HC_BITCOST_MULTIPLIER),
-            );
+            price += (off_code - 19) * 2 * HC_BITCOST_MULTIPLIER;
         }
         price
     }
 
     #[inline(always)]
     fn match_length_price(&self, stats: &HcOptState, match_len: usize) -> u32 {
-        // Donor parity: mlBase is computed from format MINMATCH (3).
-        let ml_base = match_len.saturating_sub(HC_FORMAT_MINMATCH);
+        // Donor parity: mlBase = match_len - MINMATCH; callers guarantee
+        // match_len ≥ HC_FORMAT_MINMATCH. ml_bits ≤ 16, * 256 ≤ 4096.
+        debug_assert!(match_len >= HC_FORMAT_MINMATCH);
+        let ml_base = match_len - HC_FORMAT_MINMATCH;
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return HcOptState::weight(ml_base as u32, self.accurate);
         }
         let (ml_code, ml_bits) = HcOptState::ml_code_and_bits(match_len);
-        ml_bits.saturating_mul(HC_BITCOST_MULTIPLIER)
+        ml_bits * HC_BITCOST_MULTIPLIER
             + (stats.match_length_sum_base_price
                 - HcOptState::weight(stats.match_length_freq[ml_code], self.accurate))
     }
@@ -3660,8 +3668,10 @@ macro_rules! build_optimal_plan_impl_body {
                             let next = pos + 1;
                             let next_price = unsafe { nodes.get_unchecked(next).price };
                             if with1literal < with_more_literals && with1literal < next_price {
-                                let prev_pos = pos.saturating_sub(prev_match.mlen as usize);
-                                if prev_pos <= pos {
+                                // Donor parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
+                                debug_assert!(pos >= prev_match.mlen as usize);
+                                let prev_pos = pos - prev_match.mlen as usize;
+                                {
                                     let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
                                     let (_, reps_after_match) =
                                         HcMatchGenerator::encode_offset_with_reps(
@@ -3690,8 +3700,10 @@ macro_rules! build_optimal_plan_impl_body {
                 continue;
             }
             if base_node.mlen > 0 && base_node.litlen == 0 {
-                let prev_pos = pos.saturating_sub(base_node.mlen as usize);
-                if prev_pos <= pos {
+                // Donor parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
+                debug_assert!(pos >= base_node.mlen as usize);
+                let prev_pos = pos - base_node.mlen as usize;
+                {
                     let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
                     let (_, reps_after_match) = HcMatchGenerator::encode_offset_with_reps(
                         base_node.off,
