@@ -3347,6 +3347,196 @@ macro_rules! bt_insert_step_no_rebase_body {
     }};
 }
 
+/// `collect_optimal_candidates_initialized` body parameterized over the per-CPU
+/// kernel: the `$cpl` path is the kernel's `common_prefix_len_ptr` (used in
+/// the HC chain walk fallback), and the four method-name substitutions
+/// (`$bt_update`, `$bt_insert`, `$for_each_rep`, `$hash3`) route to the
+/// kernel-specific wrappers of the inner helpers. With every helper under
+/// the same `target_feature` umbrella, the entire per-position pipeline
+/// (BT-tree fill + rep probing + hash3 probing + BT match collection /
+/// HC chain walk) inlines without ABI barriers on the level22 hot path.
+macro_rules! collect_optimal_candidates_initialized_body {
+    (
+        $self:expr,
+        $abs_pos:ident,
+        $current_abs_end:ident,
+        $profile:ident,
+        $query:ident,
+        $out:ident,
+        $bt_matchfinder:ident,
+        $bt_update:ident,
+        $bt_insert:ident,
+        $for_each_rep:ident,
+        $hash3:ident,
+        $cpl:path $(,)?
+    ) => {{
+        debug_assert!(!$self.hash_table.is_empty());
+        debug_assert!($self.hash3_log == 0 || !$self.hash3_table.is_empty());
+        debug_assert!(!$self.chain_table.is_empty());
+        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let reps = $query.reps;
+        let lit_len = $query.lit_len;
+        let ldm_candidate = $query.ldm_candidate;
+        $out.clear();
+        if $abs_pos < $self.skip_insert_until_abs {
+            if let Some(ldm) = ldm_candidate {
+                let mut best_len_for_skip = 0usize;
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    ldm,
+                    min_match_len,
+                );
+            }
+            return;
+        }
+        if $bt_matchfinder {
+            // SAFETY: caller is in the same target_feature umbrella as
+            // `$bt_update`; the runtime kernel detector already gated entry.
+            unsafe { $self.$bt_update($abs_pos, $current_abs_end) };
+        }
+        let current_idx = $abs_pos - $self.history_abs_start;
+        if current_idx + 4 > $self.live_history().len() {
+            if let Some(ldm) = ldm_candidate {
+                let mut best_len_for_skip = 0usize;
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    ldm,
+                    min_match_len,
+                );
+            }
+            return;
+        }
+        let mut best_len_for_skip = 0usize;
+        let mut skip_further_match_search = false;
+        let mut rep_len_candidate_found = false;
+        // SAFETY: same umbrella; closure capture is monomorphized per call.
+        unsafe {
+            $self.$for_each_rep(
+                $abs_pos,
+                lit_len,
+                reps,
+                $current_abs_end,
+                min_match_len,
+                |rep| {
+                    if rep.match_len >= min_match_len {
+                        rep_len_candidate_found = true;
+                    }
+                    let _ = HcMatchGenerator::push_candidate_ladder(
+                        $out,
+                        &mut best_len_for_skip,
+                        rep,
+                        min_match_len,
+                    );
+                    if rep.match_len > $profile.sufficient_match_len {
+                        skip_further_match_search = true;
+                    }
+                    if $abs_pos.saturating_add(rep.match_len) >= $current_abs_end {
+                        skip_further_match_search = true;
+                    }
+                },
+            )
+        };
+        if !skip_further_match_search && best_len_for_skip < min_match_len {
+            $self.update_hash3_until($abs_pos);
+            // SAFETY: same umbrella for hash3_candidate.
+            if let Some(h3) = unsafe { $self.$hash3($abs_pos, $current_abs_end, min_match_len) } {
+                let _ = HcMatchGenerator::push_candidate_ladder(
+                    $out,
+                    &mut best_len_for_skip,
+                    h3,
+                    min_match_len,
+                );
+                if !rep_len_candidate_found
+                    && (h3.match_len > $profile.sufficient_match_len
+                        || $abs_pos.saturating_add(h3.match_len) >= $current_abs_end)
+                {
+                    $self.skip_insert_until_abs = $abs_pos.saturating_add(1);
+                    skip_further_match_search = true;
+                }
+            }
+        }
+        if !skip_further_match_search && $bt_matchfinder {
+            // SAFETY: same umbrella for bt_insert_and_collect_matches.
+            unsafe {
+                $self.$bt_insert(
+                    $abs_pos,
+                    $current_abs_end,
+                    $profile,
+                    min_match_len,
+                    &mut best_len_for_skip,
+                    $out,
+                )
+            };
+        } else if !skip_further_match_search {
+            $self.insert_position($abs_pos);
+            let max_chain_depth = $profile.max_chain_depth.min($self.search_depth);
+            let concat = &$self.history[$self.history_start..];
+            let mut match_end_abs = $abs_pos.saturating_add(9);
+            if max_chain_depth > 0 {
+                for (visited, candidate_abs) in
+                    $self.chain_candidates($abs_pos).into_iter().enumerate()
+                {
+                    if visited >= max_chain_depth {
+                        break;
+                    }
+                    if candidate_abs == usize::MAX {
+                        break;
+                    }
+                    if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+                        continue;
+                    }
+                    let candidate_idx = candidate_abs - $self.history_abs_start;
+                    let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+                    let base = concat.as_ptr();
+                    // SAFETY: history-relative indices; `tail_limit` bounds
+                    // the scan within `concat`. `$cpl` is the kernel-specific
+                    // common_prefix_len_ptr — call inlines because the
+                    // surrounding wrapper carries the same target_feature.
+                    let match_len =
+                        unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), tail_limit) };
+                    if match_len < min_match_len {
+                        continue;
+                    }
+                    let offset = $abs_pos - candidate_abs;
+                    if HcMatchGenerator::push_candidate_ladder(
+                        $out,
+                        &mut best_len_for_skip,
+                        MatchCandidate {
+                            start: $abs_pos,
+                            offset,
+                            match_len,
+                        },
+                        min_match_len,
+                    ) {
+                        let candidate_end = candidate_abs.saturating_add(match_len);
+                        if candidate_end > match_end_abs {
+                            match_end_abs = candidate_end;
+                        }
+                    }
+                    if match_len > HC_OPT_NUM
+                        || $abs_pos.saturating_add(match_len) >= $current_abs_end
+                    {
+                        break;
+                    }
+                }
+            }
+            $self.skip_insert_until_abs = $self
+                .skip_insert_until_abs
+                .max(match_end_abs.saturating_sub(8));
+        }
+        if let Some(ldm) = ldm_candidate {
+            let _ = HcMatchGenerator::push_candidate_ladder(
+                $out,
+                &mut best_len_for_skip,
+                ldm,
+                min_match_len,
+            );
+        }
+    }};
+}
+
 /// `hash3_candidate` body parameterized over the per-CPU
 /// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
 /// position when invoked, so the per-call ABI savings compound across the
@@ -5159,6 +5349,10 @@ impl HcMatchGenerator {
         }
     }
 
+    /// Cross-platform entry. Picks the kernel-specific variant so the per-
+    /// position pipeline (BT-tree fill, rep probing, hash3 probing, BT
+    /// collect / HC chain walk) runs inside a single `target_feature`
+    /// umbrella — all inner SIMD probes inline without ABI barriers.
     #[inline(always)]
     fn collect_optimal_candidates_initialized<const USE_BT_MATCHFINDER: bool>(
         &mut self,
@@ -5168,157 +5362,170 @@ impl HcMatchGenerator {
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
-        debug_assert!(!self.hash_table.is_empty());
-        debug_assert!(self.hash3_log == 0 || !self.hash3_table.is_empty());
-        debug_assert!(!self.chain_table.is_empty());
-        let min_match_len = HC_OPT_MIN_MATCH_LEN;
-        let reps = query.reps;
-        let lit_len = query.lit_len;
-        let ldm_candidate = query.ldm_candidate;
-        out.clear();
-        if abs_pos < self.skip_insert_until_abs {
-            if let Some(ldm) = ldm_candidate {
-                let mut best_len_for_skip = 0usize;
-                let _ =
-                    Self::push_candidate_ladder(out, &mut best_len_for_skip, ldm, min_match_len);
-            }
-            return;
-        }
-        if USE_BT_MATCHFINDER {
-            self.bt_update_tree_until(abs_pos, current_abs_end);
-        }
-        let current_idx = abs_pos - self.history_abs_start;
-        // Hash-based candidate lookup reads 4-byte prefixes.
-        if current_idx + 4 > self.live_history().len() {
-            if let Some(ldm) = ldm_candidate {
-                let mut best_len_for_skip = 0usize;
-                let _ =
-                    Self::push_candidate_ladder(out, &mut best_len_for_skip, ldm, min_match_len);
-            }
-            return;
-        }
-        let mut best_len_for_skip = 0usize;
-        let mut skip_further_match_search = false;
-        let mut rep_len_candidate_found = false;
-        self.for_each_repcode_candidate_with_reps(
-            abs_pos,
-            lit_len,
-            reps,
-            current_abs_end,
-            min_match_len,
-            |rep| {
-                if rep.match_len >= min_match_len {
-                    rep_len_candidate_found = true;
-                }
-                let _ =
-                    Self::push_candidate_ladder(out, &mut best_len_for_skip, rep, min_match_len);
-                if rep.match_len > profile.sufficient_match_len {
-                    skip_further_match_search = true;
-                }
-                if abs_pos.saturating_add(rep.match_len) >= current_abs_end {
-                    skip_further_match_search = true;
-                }
-            },
-        );
-        if !skip_further_match_search && best_len_for_skip < min_match_len {
-            self.update_hash3_until(abs_pos);
-            if let Some(hash3_candidate) =
-                self.hash3_candidate(abs_pos, current_abs_end, min_match_len)
-            {
-                let _ = Self::push_candidate_ladder(
-                    out,
-                    &mut best_len_for_skip,
-                    hash3_candidate,
-                    min_match_len,
-                );
-                if !rep_len_candidate_found
-                    && (hash3_candidate.match_len > profile.sufficient_match_len
-                        || abs_pos.saturating_add(hash3_candidate.match_len) >= current_abs_end)
-                {
-                    self.skip_insert_until_abs = abs_pos.saturating_add(1);
-                    skip_further_match_search = true;
-                }
-            }
-        }
-        if !skip_further_match_search && USE_BT_MATCHFINDER {
-            self.bt_insert_and_collect_matches(
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.collect_optimal_candidates_initialized_neon::<USE_BT_MATCHFINDER>(
                 abs_pos,
                 current_abs_end,
                 profile,
-                min_match_len,
-                &mut best_len_for_skip,
+                query,
                 out,
-            );
-        } else if !skip_further_match_search {
-            self.insert_position(abs_pos);
-            let max_chain_depth = profile.max_chain_depth.min(self.search_depth);
-            let concat = &self.history[self.history_start..];
-            // Donor model:
-            //   bestLength starts from already found rep/hash3 candidates,
-            //   matchEndIdx starts at curr + 8 + 1,
-            //   and after BT walk nextToUpdate = matchEndIdx - 8.
-            let mut match_end_abs = abs_pos.saturating_add(9);
-            if max_chain_depth > 0 {
-                for (visited, candidate_abs) in
-                    self.chain_candidates(abs_pos).into_iter().enumerate()
-                {
-                    if visited >= max_chain_depth {
-                        break;
-                    }
-                    if candidate_abs == usize::MAX {
-                        break;
-                    }
-                    if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
-                        continue;
-                    }
-                    let candidate_idx = candidate_abs - self.history_abs_start;
-                    let tail_limit = current_abs_end.saturating_sub(abs_pos);
-                    let base = concat.as_ptr();
-                    // SAFETY: `candidate_idx` and `current_idx` are
-                    // history-relative positions; `tail_limit` bounds the
-                    // scan within `concat`.
-                    let match_len = unsafe {
-                        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                            base.add(candidate_idx),
-                            base.add(current_idx),
-                            tail_limit,
-                        )
-                    };
-                    if match_len < min_match_len {
-                        continue;
-                    }
-                    let offset = abs_pos - candidate_abs;
-                    if Self::push_candidate_ladder(
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
                         out,
-                        &mut best_len_for_skip,
-                        MatchCandidate {
-                            start: abs_pos,
-                            offset,
-                            match_len,
-                        },
-                        min_match_len,
-                    ) {
-                        let candidate_end = candidate_abs.saturating_add(match_len);
-                        if candidate_end > match_end_abs {
-                            match_end_abs = candidate_end;
-                        }
-                    }
-                    if match_len > HC_OPT_NUM
-                        || abs_pos.saturating_add(match_len) >= current_abs_end
-                    {
-                        break;
-                    }
-                }
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.collect_optimal_candidates_initialized_sse42::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self
+                    .collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        query,
+                        out,
+                    ),
             }
-            // Donor parity: always carry forward nextToUpdate = matchEndIdx - 8
-            // after BT insertion/match walk (non-rep/hash3-early-return path).
-            self.skip_insert_until_abs = self
-                .skip_insert_until_abs
-                .max(match_end_abs.saturating_sub(8));
         }
-        if let Some(ldm) = ldm_candidate {
-            let _ = Self::push_candidate_ladder(out, &mut best_len_for_skip, ldm, min_match_len);
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            )
         }
+    }
+
+    /// NEON-umbrella variant. Every inner helper (`bt_update_tree_until_neon`,
+    /// `for_each_repcode_candidate_with_reps_neon`, `hash3_candidate_neon`,
+    /// `bt_insert_and_collect_matches_neon`, `fastpath::neon::
+    /// common_prefix_len_ptr`) shares the NEON umbrella so the per-position
+    /// pipeline executes as a single straight-line inline sequence.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn collect_optimal_candidates_initialized_neon<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_neon,
+            bt_insert_and_collect_matches_neon,
+            for_each_repcode_candidate_with_reps_neon,
+            hash3_candidate_neon,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn collect_optimal_candidates_initialized_sse42<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_sse42,
+            bt_insert_and_collect_matches_sse42,
+            for_each_repcode_candidate_with_reps_sse42,
+            hash3_candidate_sse42,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_avx2_bmi2,
+            bt_insert_and_collect_matches_avx2_bmi2,
+            for_each_repcode_candidate_with_reps_avx2_bmi2,
+            hash3_candidate_avx2_bmi2,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    fn collect_optimal_candidates_initialized_scalar<const USE_BT_MATCHFINDER: bool>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            USE_BT_MATCHFINDER,
+            bt_update_tree_until_scalar,
+            bt_insert_and_collect_matches_scalar,
+            for_each_repcode_candidate_with_reps_scalar,
+            hash3_candidate_scalar,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
     }
 
     fn push_candidate_ladder(
@@ -5822,6 +6029,13 @@ impl HcMatchGenerator {
     /// body executes inside one `target_feature` umbrella and inlines the
     /// vectorized `count_match_from_indices` directly. See
     /// `bt_insert_step_no_rebase` for the same dispatcher pattern.
+    ///
+    /// The on-encode hot path bypasses this dispatcher: when invoked from
+    /// `collect_optimal_candidates_initialized_<kernel>` the per-kernel
+    /// variant is called directly so the BT match collection inlines under
+    /// the surrounding umbrella. This entry is kept for external / future
+    /// callers that aren't yet under an umbrella.
+    #[allow(dead_code)]
     #[inline(always)]
     fn bt_insert_and_collect_matches(
         &mut self,
@@ -6034,6 +6248,11 @@ impl HcMatchGenerator {
     }
 
     /// Cross-platform entry. Dispatches to the kernel-specific variant.
+    /// Retained so external callers / future code still have a stable shim;
+    /// the on-encode hot path bypasses this dispatcher via the kernel-specific
+    /// `_neon`/`_sse42`/`_avx2_bmi2`/`_scalar` variants invoked from inside
+    /// `collect_optimal_candidates_initialized_<kernel>`.
+    #[allow(dead_code)]
     #[inline(always)]
     fn hash3_candidate(
         &self,
@@ -6428,7 +6647,11 @@ impl HcMatchGenerator {
     }
 
     /// Cross-platform entry. Dispatches to the kernel-specific variant so the
-    /// per-rep prefix probe inlines without an ABI barrier per call.
+    /// per-rep prefix probe inlines without an ABI barrier per call. The
+    /// on-encode hot path bypasses this dispatcher via the kernel-specific
+    /// variants invoked from inside `collect_optimal_candidates_initialized_
+    /// <kernel>`; this entry is kept for test / external callers only.
+    #[allow(dead_code)]
     #[inline(always)]
     fn for_each_repcode_candidate_with_reps(
         &self,
