@@ -15,6 +15,7 @@
 
 #![allow(dead_code)]
 
+use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
 use super::match_table::helpers::common_prefix_len;
 use super::match_table::storage::{HC_EMPTY, MatchTable};
 use super::opt::types::MatchCandidate;
@@ -526,5 +527,17 @@ impl HcMatcher {
             offset: abs_pos - candidate_pos,
             match_len,
         }
+    }
+
+    /// Donor parity: per-pass clamp of the "good enough — stop probing"
+    /// threshold that the optimal parser passes to the BT/HC walkers.
+    /// Reflects donor `ZSTD_compressBlock_opt_generic` which caps the
+    /// profile's `sufficient_match_len` by the user-configured
+    /// `targetLength` and the `HC_OPT_NUM` ceiling.
+    pub(crate) fn sufficient_match_len_for_pass(&self, profile: HcOptimalCostProfile) -> usize {
+        profile
+            .sufficient_match_len
+            .min(self.target_len)
+            .clamp(HC_FORMAT_MINMATCH, HC_OPT_NUM - 1)
     }
 }

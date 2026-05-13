@@ -1146,7 +1146,7 @@ macro_rules! build_optimal_plan_impl_body {
         let initial_reps = $initial_state.reps;
         let initial_litlen = $initial_state.litlen;
         let mut profile = $initial_state.profile;
-        profile.sufficient_match_len = $self.sufficient_match_len_for_pass(profile);
+        profile.sufficient_match_len = $self.hc.sufficient_match_len_for_pass(profile);
         let abort_on_worse_match = $self.parse_mode == HcParseMode::BtOpt;
         let opt_level = matches!(
             $self.parse_mode,
@@ -2301,18 +2301,6 @@ macro_rules! bt_insert_and_collect_matches_body {
 }
 
 impl HcMatchGenerator {
-    fn donor_opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
-        let start_cursor = usize::from(current_abs_start == self.table.history_abs_start);
-        (start_cursor, start_cursor)
-    }
-
-    fn sufficient_match_len_for_pass(&self, profile: HcOptimalCostProfile) -> usize {
-        profile
-            .sufficient_match_len
-            .min(self.hc.target_len)
-            .clamp(HC_OPT_MIN_MATCH_LEN, HC_OPT_NUM - 1)
-    }
-
     fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
         self.parse_mode == HcParseMode::BtUltra2
             && self.bt.opt_state.lit_length_sum == 0
@@ -2669,8 +2657,9 @@ impl HcMatchGenerator {
         let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
         best_plan.clear();
         let mut plan_reps = self.table.offset_hist;
-        let (mut cursor, mut plan_litlen) =
-            self.donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut plan_litlen) = self
+            .table
+            .donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut plan_literals_cursor = 0usize;
         let match_loop_limit = current_len.saturating_sub(8);
         while cursor < match_loop_limit {
@@ -2719,8 +2708,9 @@ impl HcMatchGenerator {
         let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
         let mut seed_reps = self.table.offset_hist;
-        let (mut cursor, mut seed_litlen) =
-            self.donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut seed_litlen) = self
+            .table
+            .donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
         let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
         seed_plan.clear();
@@ -4209,7 +4199,7 @@ fn sufficient_match_len_is_clamped_by_target_len() {
     hc.configure(BTULTRA2_HC_CONFIG, 26);
     hc.hc.target_len = 13;
     let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
-    assert_eq!(hc.sufficient_match_len_for_pass(profile), 13);
+    assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), 13);
 }
 
 #[test]
@@ -4223,7 +4213,7 @@ fn opt_modes_use_target_len_as_sufficient_len() {
         (HcParseMode::BtUltra2, true),
     ] {
         let profile = HcOptimalCostProfile::for_mode(mode, pass2);
-        assert_eq!(hc.sufficient_match_len_for_pass(profile), 57);
+        assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), 57);
     }
 }
 
@@ -4232,7 +4222,7 @@ fn sufficient_match_len_is_capped_by_opt_num() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.hc.target_len = usize::MAX / 2;
     let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
-    assert_eq!(hc.sufficient_match_len_for_pass(profile), HC_OPT_NUM - 1);
+    assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), HC_OPT_NUM - 1);
 }
 
 #[test]

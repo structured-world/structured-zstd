@@ -475,4 +475,18 @@ impl MatchTable {
             reuse_space(data);
         }
     }
+
+    /// Donor parity: `ZSTD_compressBlock_btopt_generic` starts its main
+    /// match loop at cursor `1` (not `0`) whenever the current block sits
+    /// at the absolute history origin — the byte at offset `0` is
+    /// reserved for the seed literal so the parser never reports a
+    /// zero-offset match. The same flag governs the initial `litlen`
+    /// because the seed literal counts as one pending literal byte.
+    pub(crate) fn donor_opt_start_cursor_and_litlen(
+        &self,
+        current_abs_start: usize,
+    ) -> (usize, usize) {
+        let start_cursor = usize::from(current_abs_start == self.history_abs_start);
+        (start_cursor, start_cursor)
+    }
 }
