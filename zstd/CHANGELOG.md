@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.20](https://github.com/structured-world/structured-zstd/compare/v0.0.19...v0.0.20) - 2026-05-12
+
+### Performance
+
+- *(decoding)* port upstream extend_and_fill / extend_from_reader for RLE+Raw blocks ([#114](https://github.com/structured-world/structured-zstd/pull/114))
+- *(level22)* complete donor parity path ([#110](https://github.com/structured-world/structured-zstd/pull/110))
+
 ## [0.0.19](https://github.com/structured-world/structured-zstd/compare/v0.0.18...v0.0.19) - 2026-04-12
 
 ### Performance
