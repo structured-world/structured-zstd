@@ -860,7 +860,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::Simple => self.match_generator.window.last().unwrap().data.as_slice(),
             MatcherBackend::Dfast => self.dfast_matcher().get_last_space(),
             MatcherBackend::Row => self.row_matcher().get_last_space(),
-            MatcherBackend::HashChain => self.hc_matcher().get_last_space(),
+            MatcherBackend::HashChain => self.hc_matcher().table.get_last_space(),
         }
     }
 
@@ -1007,30 +1007,32 @@ macro_rules! bt_insert_step_no_rebase_body {
             $self.table.hash_log,
             $self.bt_hash_mls(),
         );
-        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+        let Some(relative_pos) = $self.table.relative_position($abs_pos) else {
             return 1;
         };
         let stored = relative_pos + 1;
-        let bt_mask = $self.bt_mask();
+        let bt_mask = $self.table.bt_mask();
         let bt_low = $abs_pos.saturating_sub(bt_mask);
-        let window_low = $self.window_low_abs_for_target($target_abs);
+        let window_low = $self.table.window_low_abs_for_target($target_abs);
         let mut match_end_abs = $abs_pos.saturating_add(9);
         let mut best_len = 8usize;
         let mut compares_left = $self.hc.search_depth;
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
-        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let pair_idx = $self.table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
         let mut match_stored = $self.table.hash_table[hash];
         $self.table.hash_table[hash] = stored;
 
         while compares_left > 0 {
-            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
-                match_stored,
-                $self.table.position_base,
-                $self.table.index_shift,
-            ) else {
+            let Some(candidate_abs) =
+                super::match_table::storage::MatchTable::stored_abs_position_fast(
+                    match_stored,
+                    $self.table.position_base,
+                    $self.table.index_shift,
+                )
+            else {
                 break;
             };
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
@@ -1038,7 +1040,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             }
             compares_left -= 1;
 
-            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_pair_idx = $self.table.bt_pair_index_for_abs(candidate_abs);
             let next_smaller = $self.table.chain_table[next_pair_idx];
             let next_larger = $self.table.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
@@ -2036,7 +2038,7 @@ macro_rules! hash3_candidate_body {
             .get(hash3)
             .copied()
             .unwrap_or(HC_EMPTY);
-        let candidate_abs = HcMatchGenerator::stored_abs_position_fast(
+        let candidate_abs = super::match_table::storage::MatchTable::stored_abs_position_fast(
             entry,
             $self.table.position_base,
             $self.table.index_shift,
@@ -2159,18 +2161,18 @@ macro_rules! bt_insert_and_collect_matches_body {
             $self.table.hash_log,
             $self.bt_hash_mls(),
         );
-        let Some(relative_pos) = $self.relative_position($abs_pos) else {
+        let Some(relative_pos) = $self.table.relative_position($abs_pos) else {
             return;
         };
         let stored = relative_pos + 1;
-        let bt_mask = $self.bt_mask();
+        let bt_mask = $self.table.bt_mask();
         let bt_low = $abs_pos.saturating_sub(bt_mask);
-        let window_low = $self.window_low_abs_for_target($abs_pos);
+        let window_low = $self.table.window_low_abs_for_target($abs_pos);
         let mut match_end_abs = $abs_pos.saturating_add(9);
         let mut compares_left = $profile.max_chain_depth.min($self.hc.search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
-        let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
+        let pair_idx = $self.table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
         let mut match_stored = $self.table.hash_table[hash];
@@ -2180,11 +2182,13 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut best_len = (*$best_len_for_skip).max($min_match_len.saturating_sub(1));
 
         while compares_left > 0 {
-            let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
-                match_stored,
-                $self.table.position_base,
-                $self.table.index_shift,
-            ) else {
+            let Some(candidate_abs) =
+                super::match_table::storage::MatchTable::stored_abs_position_fast(
+                    match_stored,
+                    $self.table.position_base,
+                    $self.table.index_shift,
+                )
+            else {
                 break;
             };
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
@@ -2192,7 +2196,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             }
             compares_left -= 1;
 
-            let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
+            let next_pair_idx = $self.table.bt_pair_index_for_abs(candidate_abs);
             let next_smaller = $self.table.chain_table[next_pair_idx];
             let next_larger = $self.table.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
@@ -2430,10 +2434,6 @@ impl HcMatchGenerator {
     fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
         self.table.reset(reuse_space);
         self.bt.reset();
-    }
-
-    fn get_last_space(&self) -> &[u8] {
-        self.table.window.back().unwrap().as_slice()
     }
 
     // History duplicates window data for O(1) contiguous access during match
@@ -3631,40 +3631,6 @@ impl HcMatchGenerator {
         )
     }
 
-    fn bt_log(&self) -> usize {
-        self.table.chain_log.saturating_sub(1)
-    }
-
-    fn bt_mask(&self) -> usize {
-        (1usize << self.bt_log()) - 1
-    }
-
-    fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        2 * (abs_pos.saturating_add(self.table.index_shift) & self.bt_mask())
-    }
-
-    #[inline(always)]
-    fn stored_abs_position_fast(
-        stored: u32,
-        position_base: usize,
-        index_shift: usize,
-    ) -> Option<usize> {
-        if stored == HC_EMPTY {
-            return None;
-        }
-        let shifted = position_base + (stored as usize - 1);
-        if shifted < index_shift {
-            return None;
-        }
-        Some(shifted - index_shift)
-    }
-
-    fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
-        let history_low = self.table.history_abs_start;
-        let window_low = target_abs.saturating_sub(self.table.max_window_size);
-        history_low.max(window_low)
-    }
-
     fn bt_hash_mls(&self) -> usize {
         // Donor parity: even when `minMatch == 3` (btultra2), the main BT/HC
         // hash still goes through `ZSTD_hashPtr(..., mls)` which falls back to
@@ -4248,7 +4214,7 @@ impl HcMatchGenerator {
         if idx + 4 > concat.len() {
             return;
         }
-        let Some(relative_pos) = self.relative_position(abs_pos) else {
+        let Some(relative_pos) = self.table.relative_position(abs_pos) else {
             return;
         };
         let hash3 = Self::hash_position_at(concat, idx, self.table.hash3_log, 3);
@@ -4269,23 +4235,6 @@ impl HcMatchGenerator {
             self.insert_hash3_only_no_rebase(self.table.next_to_update3);
             self.table.next_to_update3 = self.table.next_to_update3.saturating_add(1);
         }
-    }
-
-    fn relative_position(&self, abs_pos: usize) -> Option<u32> {
-        let shifted_abs = abs_pos.checked_add(self.table.index_shift)?;
-        let rel = shifted_abs.checked_sub(self.table.position_base)?;
-        let rel_u32 = u32::try_from(rel).ok()?;
-        // Donor parity: raw BT/HC tables use 0 as the empty sentinel, so the
-        // very first absolute position in the first block (curr == 0) is not a
-        // representable candidate index.
-        if !self.table.allow_zero_relative_position && self.table.position_base == 0 && rel_u32 == 0
-        {
-            return None;
-        }
-        // Positions are stored as (relative_pos + 1), with 0 reserved as the
-        // empty sentinel. So the raw relative position itself must stay
-        // strictly below u32::MAX.
-        (rel_u32 < u32::MAX).then_some(rel_u32)
     }
 
     #[inline(always)]
@@ -4317,6 +4266,7 @@ impl HcMatchGenerator {
             return;
         }
         let needs_rebase = self
+            .table
             .relative_position(abs_pos)
             .is_none_or(|relative| relative >= u32::MAX - 1);
         if !needs_rebase {
@@ -4368,7 +4318,7 @@ impl HcMatchGenerator {
             return;
         }
         let hash = Self::hash_position_at(concat, idx, self.table.hash_log, 4);
-        let Some(relative_pos) = self.relative_position(abs_pos) else {
+        let Some(relative_pos) = self.table.relative_position(abs_pos) else {
             return;
         };
         let stored = relative_pos + 1;
@@ -7356,6 +7306,7 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
         .expect("fixture should contain at least one sparse-grid overlap in dense tail");
 
     let rel = matcher
+        .table
         .relative_position(overlap_pos)
         .expect("overlap position should be representable as relative position");
     let chain_idx = rel as usize & ((1 << matcher.table.chain_log) - 1);

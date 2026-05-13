@@ -101,6 +101,86 @@ impl MatchTable {
         }
     }
 
+    /// Get a reference to the last committed window slice. Returns
+    /// the most recent buffer in the rolling window — panics if no
+    /// data has been committed yet.
+    pub(crate) fn get_last_space(&self) -> &[u8] {
+        self.window.back().unwrap().as_slice()
+    }
+
+    /// Convert an absolute position into the (relative_pos + 1) form
+    /// stored in the hash / chain tables. Returns `None` for positions
+    /// outside the current window's representable range. Donor parity:
+    /// matches the `relIdx` arithmetic in `ZSTD_HcFindBestMatch`.
+    pub(crate) fn relative_position(&self, abs_pos: usize) -> Option<u32> {
+        let shifted_abs = abs_pos.checked_add(self.index_shift)?;
+        let rel = shifted_abs.checked_sub(self.position_base)?;
+        let rel_u32 = u32::try_from(rel).ok()?;
+        // Donor parity: raw BT/HC tables use 0 as the empty sentinel, so
+        // the very first absolute position in the first block
+        // (curr == 0) is not a representable candidate index.
+        if !self.allow_zero_relative_position && self.position_base == 0 && rel_u32 == 0 {
+            return None;
+        }
+        // Positions are stored as (relative_pos + 1), with 0 reserved
+        // as the empty sentinel. So the raw relative position itself
+        // must stay strictly below u32::MAX.
+        (rel_u32 < u32::MAX).then_some(rel_u32)
+    }
+
+    /// Lower bound (in absolute positions) of the window that's still
+    /// reachable from `target_abs`. Donor parity: `windowLow` in
+    /// `ZSTD_compressBlock_*`.
+    pub(crate) fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
+        let history_low = self.history_abs_start;
+        let window_low = target_abs.saturating_sub(self.max_window_size);
+        history_low.max(window_low)
+    }
+
+    /// BT pointer-pair log: chain_log minus one because the table
+    /// stores pairs of pointers (smaller / larger) per node.
+    #[inline(always)]
+    pub(crate) fn bt_log(&self) -> usize {
+        self.chain_log.saturating_sub(1)
+    }
+
+    /// BT pointer-pair address mask. Donor parity: `(1 << btLog) - 1`.
+    #[inline(always)]
+    pub(crate) fn bt_mask(&self) -> usize {
+        (1usize << self.bt_log()) - 1
+    }
+
+    /// Convert an absolute position into a BT pair index in
+    /// `chain_table`. Each node occupies two consecutive slots
+    /// (smaller, larger) so the result is doubled. Donor parity:
+    /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
+    #[inline(always)]
+    pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
+        2 * (abs_pos.saturating_add(self.index_shift) & self.bt_mask())
+    }
+
+    /// Decode a stored hash / chain table entry back into its absolute
+    /// position. Returns `None` for the `HC_EMPTY` sentinel or for
+    /// entries that underflowed after `index_shift` was applied. Pure
+    /// associated function — kept off `&self` so macros can pass the
+    /// constituent fields directly when partial-borrow shenanigans
+    /// would block a `&self` call.
+    #[inline(always)]
+    pub(crate) fn stored_abs_position_fast(
+        stored: u32,
+        position_base: usize,
+        index_shift: usize,
+    ) -> Option<usize> {
+        if stored == HC_EMPTY {
+            return None;
+        }
+        let shifted = position_base + (stored as usize - 1);
+        if shifted < index_shift {
+            return None;
+        }
+        Some(shifted - index_shift)
+    }
+
     /// Reset the per-frame portion of the storage. The hash / chain /
     /// hash3 tables themselves are zeroed in place (via
     /// `Vec::fill(HC_EMPTY)`) if they're already sized; otherwise
