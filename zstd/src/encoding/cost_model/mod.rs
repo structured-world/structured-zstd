@@ -6,15 +6,18 @@
 //! `offset_price_for`, `match_length_price`) consumed by the optimal
 //! parser DP body in [`crate::encoding::opt`].
 //!
-//! Donor parity: mirrors `zstd_opt.c` price functions and stat handling.
-//! All arithmetic is raw (`+`/`-`/`*`) guarded by `debug_assert!`; donor
-//! never uses saturating ops on this path.
+//! Donor parity: mirrors `zstd_opt.c` price functions and stat
+//! handling. All arithmetic on the per-DP-iteration hot path
+//! (`bit_weight` / `frac_weight`, `*_price` helpers, `update_stats`,
+//! `set_base_prices`, `downscale_stats`, `scale_stats`) is raw
+//! (`+`/`-`/`*`) guarded by `debug_assert!` against the same
+//! invariants the donor asserts.
 //!
 //! Extracted from `match_generator.rs` as part of #111 Phase 1
 //! (structural split). No behaviour change — types, constants, and
 //! method names are identical to the pre-extraction monolith.
 
-use super::match_generator::HcParseMode;
+use super::strategy::HcParseMode;
 
 pub(crate) const HC_MAX_LIT: usize = 255;
 pub(crate) const HC_MAX_LL: usize = 35;
@@ -295,9 +298,12 @@ impl HcOptState {
                     self.lit_sum = Self::apply_seeded_table(&mut self.lit_freq, &seed.lit_bits, 11);
                 } else if self.literals_compressed() {
                     self.lit_freq.fill(0);
+                    // Donor parity (ZSTD_rescaleFreqs): raw `+= 1`. The
+                    // freq table holds u32, src.len() ≤ MAX_BLOCK_SIZE
+                    // (≤ 256K) ≪ u32::MAX, so the increment cannot
+                    // overflow even if every byte hits the same slot.
                     for &byte in src {
-                        self.lit_freq[byte as usize] =
-                            self.lit_freq[byte as usize].saturating_add(1);
+                        self.lit_freq[byte as usize] += 1;
                     }
                     self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
                     if self.lit_sum == 0 {
@@ -343,9 +349,12 @@ impl HcOptState {
             } else {
                 if self.literals_compressed() {
                     self.lit_freq.fill(0);
+                    // Donor parity (ZSTD_rescaleFreqs): raw `+= 1`. The
+                    // freq table holds u32, src.len() ≤ MAX_BLOCK_SIZE
+                    // (≤ 256K) ≪ u32::MAX, so the increment cannot
+                    // overflow even if every byte hits the same slot.
                     for &byte in src {
-                        self.lit_freq[byte as usize] =
-                            self.lit_freq[byte as usize].saturating_add(1);
+                        self.lit_freq[byte as usize] += 1;
                     }
                     self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
                     if self.lit_sum == 0 {
@@ -483,8 +492,9 @@ impl HcOptimalCostProfile {
             // Donor parity: ZSTD_litLengthPrice() handles the non-representable
             // BLOCKSIZE_MAX literal-length by charging one extra bit over the
             // largest encodable litLength symbol.
-            return HC_BITCOST_MULTIPLIER
-                + self.lit_length_price(stats, HC_BLOCKSIZE_MAX.saturating_sub(1));
+            // HC_BLOCKSIZE_MAX is a compile-time constant > 0, so the
+            // subtraction never underflows — raw `-` matches the donor.
+            return HC_BITCOST_MULTIPLIER + self.lit_length_price(stats, HC_BLOCKSIZE_MAX - 1);
         }
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return HcOptState::weight(lit_len as u32, self.accurate);

@@ -1,10 +1,12 @@
 //! Plain-data types used by the optimal-parser DP and traceback.
 //!
 //! Extracted from `match_generator.rs` as part of #111 Phase 1
-//! (structural split). All types are mechanical moves — names,
-//! signatures, derives, and `Default` impls match the pre-extraction
-//! monolith byte-for-byte. Methods that operate on these types remain
-//! on `HcMatchGenerator` for now; they migrate in later phases.
+//! (structural split). Names, fields, derives, and `Default` impls are
+//! preserved; the only intentional internal-API change is the
+//! `pub(crate)` visibility on each item so the remaining methods on
+//! `HcMatchGenerator` can import them through `super::opt::*`. Methods
+//! that operate on these types stay on `HcMatchGenerator` for now and
+//! migrate in later phases.
 
 use alloc::vec::Vec;
 

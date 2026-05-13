@@ -30,6 +30,7 @@ use super::opt::types::{
     HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
     MatchCandidate,
 };
+use super::strategy::HcParseMode;
 #[cfg(all(
     test,
     feature = "std",
@@ -89,13 +90,10 @@ const HC_EMPTY: u32 = 0;
 // fixed-length candidate array returned by chain_candidates().
 const MAX_HC_SEARCH_DEPTH: usize = 512;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HcParseMode {
-    Lazy2,
-    BtOpt,
-    BtUltra,
-    BtUltra2,
-}
+// `HcParseMode` lives in `crate::encoding::strategy` so the extracted
+// `cost_model::HcOptimalCostProfile::for_mode` can branch on it without
+// importing back from this monolith — see the use statement at the top
+// of the file.
 
 /// Bundled tuning knobs for the hash-chain matcher. Using a typed config
 /// instead of positional `usize` args eliminates parameter-order hazards.
