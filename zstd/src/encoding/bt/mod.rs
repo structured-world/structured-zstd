@@ -19,7 +19,7 @@
 
 use alloc::vec::Vec;
 
-use super::cost_model::{HC_MAX_LIT, HcOptState};
+use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 use super::match_table::storage::MatchTable;
 use super::opt::ldm::HcRawSeq;
 use super::opt::types::{HcOptimalNode, HcOptimalSequence, MatchCandidate};
@@ -442,5 +442,228 @@ impl BtMatcher {
         self.opt_ml_price_generation.clear();
         self.opt_ml_price_stamp = 0;
         self.ldm_sequences.clear();
+    }
+
+    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
+    /// body executes inside one `target_feature` umbrella and inlines the
+    /// vectorized `count_match_from_indices` directly. See
+    /// `bt_insert_step_no_rebase` for the same dispatcher pattern.
+    ///
+    /// The on-encode hot path bypasses this dispatcher: when invoked from
+    /// `collect_optimal_candidates_initialized_<kernel>` the per-kernel
+    /// variant is called directly so the BT match collection inlines under
+    /// the surrounding umbrella. This entry is kept for external / future
+    /// callers that aren't yet under an umbrella.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn bt_insert_and_collect_matches(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of the
+        // callee (see `bt_insert_step_no_rebase` dispatcher).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_and_collect_matches_neon(
+                table,
+                search_depth,
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_and_collect_matches_avx2_bmi2(
+                        table,
+                        search_depth,
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_and_collect_matches_sse42(
+                        table,
+                        search_depth,
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self.bt_insert_and_collect_matches_scalar(
+                    table,
+                    search_depth,
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    min_match_len,
+                    best_len_for_skip,
+                    out,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_and_collect_matches_scalar(
+                table,
+                search_depth,
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant of `bt_insert_and_collect_matches`. Inlines
+    /// `fastpath::neon::count_match_from_indices` via the shared body macro.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_neon(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let _ = self;
+        crate::bt_insert_and_collect_matches_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::neon::count_match_from_indices,
+        )
+    }
+
+    /// SSE4.2 umbrella variant of `bt_insert_and_collect_matches`.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_sse42(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let _ = self;
+        crate::bt_insert_and_collect_matches_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::sse42::count_match_from_indices,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant of `bt_insert_and_collect_matches`.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 and BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_avx2_bmi2(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let _ = self;
+        crate::bt_insert_and_collect_matches_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bt_insert_and_collect_matches_scalar(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let _ = self;
+        crate::bt_insert_and_collect_matches_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::scalar::count_match_from_indices,
+        )
     }
 }
