@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778640426609,
+  "lastUpdate": 1778682521538,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -29042,6 +29042,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.239,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0cf1c40c3a9e915bb8611dbc62615744a538a057",
+          "message": "refactor(encoding): #111 Phase 1d — split HcMatchGenerator into MatchTable / HcMatcher / BtMatcher (#118)\n\n* refactor(encoding): #111 Phase 1d Stage 1 — extract MatchTable storage struct\n\nMove the 20 storage fields shared between HC and BT modes out of the\nHcMatchGenerator monolith into a dedicated MatchTable struct in\nmatch_table/storage.rs:\n\n  - rolling window + history buffer (window, window_size,\n    max_window_size, history, history_start, history_abs_start)\n  - absolute position cursors (position_base, index_shift,\n    next_to_update3, skip_insert_until_abs)\n  - hash / chain / hash3 tables and their log sizes\n  - dictionary priming flags (offset_hist, dictionary_limit_abs,\n    dictionary_primed_for_frame, allow_zero_relative_position)\n\nHcMatchGenerator now embeds `table: MatchTable`; the constructor and\nthe storage portion of `reset()` delegate to MatchTable::new /\nMatchTable::reset. All ~280 field access sites (incl. macro `$self.X`\nand alias `matcher.X` / `hc.X` paths) are routed through the\n`table` field. The HC/BT method bodies stay on HcMatchGenerator for\nnow — Stage 2/3 will pull them onto HcMatcher / BtMatcher with\n&mut MatchTable arguments as the matchers are carved into their\nown modules, at which point pure-storage helpers (insert_position*,\nhash_position, relative_position, etc.) naturally slide onto\nimpl MatchTable.\n\nHC_EMPTY and the HC_*_LOG defaults move into match_table::storage so\nthe table module is self-contained. Per-CPU dispatch and BT helpers\nare unchanged.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n    (incl. level22_sequences_match_donor_on_corpus_proxy ratio gate)\n\n* refactor(encoding): #111 Phase 1d Stage 2 — extract HcMatcher config struct\n\nMirror the Stage 1 storage split for the HC (lazy / lazy2) parser:\nintroduce HcMatcher in encoding/hc/mod.rs to own the per-frame\nruntime knobs that were previously bare fields on HcMatchGenerator:\n\n  - lazy_depth (1 = lazy, 2 = lazy2 lookahead)\n  - search_depth (chain-walk budget per find_best_match call)\n  - target_len (sufficient match length)\n\nHcMatchGenerator now embeds `hc: HcMatcher`; new() seeds it from the\nHC_SEARCH_DEPTH / HC_TARGET_LEN defaults, configure() routes the\nHcConfig values into it. All 39 access sites (self, $self in macros,\nand the `hc` / `matcher` aliases in tests / dictionary priming) are\nrewired through the new field. Method bodies (chain_candidates,\nfind_best_match, hash_chain_candidate, repcode_candidate,\npick_lazy_match, start_matching_lazy, …) still live on\nHcMatchGenerator; Stage 2b will move them onto impl HcMatcher with\n&mut MatchTable threaded through, alongside the BT-side extraction\nin Stage 3.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n    (incl. level22_sequences_match_donor_on_corpus_proxy ratio gate)\n\n* refactor(encoding): #111 Phase 1d Stage 3 — extract BtMatcher state struct\n\nComplete the Phase 1d ownership split: introduce BtMatcher in\nencoding/bt/mod.rs to own the binary-tree / optimal-parser state\nthat was previously bare fields on HcMatchGenerator:\n\n  - opt_state (donor optStatePtr_t cost model)\n  - opt_nodes_scratch / opt_candidates_scratch / opt_store_scratch\n  - opt_segment_plan_scratch / opt_seed_plan_scratch\n  - cached price lookups (ll / lit / ml _scratch / _generation /\n    _stamp triples) — including the per-symbol fixed [u32; 256]\n    literal-cost arrays\n  - ldm_sequences (LDM candidate buffer for the optimal parser)\n\nHcMatchGenerator now embeds `bt: BtMatcher`; new() seeds it via\nBtMatcher::new(), and reset() delegates the BT half to\nBtMatcher::reset() (which clears all scratch / generation buffers\nand zeroes the price stamps in one shot). All ~80 self/$self\naccess sites plus test-region aliases (hc.opt_*, hc.ldm_sequences)\nare rewired through the new field.\n\n`parse_mode` stays on HcMatchGenerator for now — it's the HC vs BT\ndispatch tag and will be replaced by the planned\n`enum HcBackend { Hc(HcMatcher), Bt(BtMatcher) }` discriminator in\na follow-up phase. Method bodies (BT walk, build_optimal_plan*,\ncollect_optimal_candidates*, emit_optimal_plan, …) still live on\nHcMatchGenerator and will move onto impl BtMatcher with\n&mut MatchTable threaded through in Stage 3b.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n    (incl. level22_sequences_match_donor_on_corpus_proxy ratio gate)\n\n* refactor(encoding): release hash3_table + dedup HC_*_LOG / HC_EMPTY constants\n\nTwo related cleanups noticed during Phase 1d review:\n\n1. When the driver switches away from the HashChain backend it\n   releases the oversized hash_table / chain_table allocations, but\n   was leaving hash3_table pinned. Two consequences:\n     - BtUltra2's `1 << HC3_HASH_LOG` hash3 entries kept their\n       allocation past the backend switch.\n     - The empty-guard in `MatchTable::reset` (`if !hash_table.is_empty()`)\n       then skipped zeroing hash3_table on the next frame's reset\n       because hash_table had been swapped for an empty Vec — leaving\n       stale hash3 entries visible to the new backend.\n   Fix: drop hash3_table alongside hash_table / chain_table on the\n   backend switch.\n\n2. HC_HASH_LOG / HC_CHAIN_LOG / HC3_HASH_LOG / HC_EMPTY were defined\n   twice (Phase 1d Stage 1 added the storage-side copies but the\n   match_generator originals were never removed). Two sources of\n   truth for the same constant is a drift hazard; collapse to a\n   single definition in match_table::storage and re-import on the\n   match_generator side.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* docs(encoding): note storage as single source of truth for HC_*_LOG\n\nInline comment near the HC_*_LOG block in match_table/storage.rs\nwarns future contributors not to re-declare these names in\nmatch_generator.rs. The duplicates were removed in the previous\ncommit; canonical defs live here.\n\n* refactor(encoding): drop hash_table emptiness gate from MatchTable::reset\n\nThe reset path previously cleared hash3_table and chain_table only\nwhen hash_table was non-empty. The logic happened to work today\n(hash3_table.fill on an empty Vec is a no-op; HC mode never\nallocates hash3_table; the backend-switch path swaps every table\nfor Vec::new in one step) but the cross-table allocation invariant\nwas undocumented and easy to break with future changes — flagged\nin PR #118 review.\n\nClear each table independently. `Vec::fill` on an empty Vec is a\nno-op so the guard added no real protection.\n\n* docs(encoding): correct comments after unconditional reset path landed\n\nTwo follow-up comment fixes flagged in PR #118 review:\n - storage.rs (HC_HASH_LOG doc): drop the dangling reference to\n   non-existent MatchTable::configure_logs; spell out that the\n   real values land via HcMatchGenerator::configure on the matcher.\n - match_generator.rs (backend-switch hash3 release): the explanation\n   still cited the old if !hash_table.is_empty() guard in\n   MatchTable::reset, which was removed earlier in this PR. Reword\n   the rationale to stand on the memory-release motivation alone.",
+          "timestamp": "2026-05-13T16:50:03+03:00",
+          "tree_id": "1d3ae99ad2ac488a743e13498d56109ffe71fa6e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/0cf1c40c3a9e915bb8611dbc62615744a538a057"
+        },
+        "date": 1778682519974,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.164,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.233,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.216,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.193,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.217,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.017,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.292,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
+            "value": 26.5,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.876,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 160.904,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.184,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 146.542,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 12.736,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/pure_rust",
+            "value": 73.975,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.518,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
+            "value": 166.716,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
+            "value": 18.949,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/pure_rust",
+            "value": 526.993,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/c_ffi",
+            "value": 259.584,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.859,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.241,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 17.259,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.308,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.483,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.674,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 7.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.327,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 5.653,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.075,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.6,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.416,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.292,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.146,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.203,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.828,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.057,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.122,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.133,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.062,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.22,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.864,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.091,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.724,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.116,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.137,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.798,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.065,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 8.209,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.072,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.99,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.987,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.34,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.34,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.34,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.24,
             "unit": "ms"
           }
         ]
