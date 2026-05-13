@@ -26,6 +26,13 @@ use alloc::vec::Vec;
 /// don't have to pull it from the matcher modules.
 pub(crate) const HC_EMPTY: u32 = 0;
 
+// Default table-log constants — the canonical (and only) definitions.
+// `match_generator.rs` re-imports the names so existing macros / configs
+// can keep referring to them unqualified; do NOT shadow these values
+// there with a second `const HC_*_LOG = ...;` declaration. Drift between
+// the two copies caused Phase 1d review feedback that this comment
+// guards against re-introducing.
+
 /// Default `hash_log` for the level-7 hash-chain matcher prior to
 /// [`MatchTable::configure_logs`]. Real values are overridden per
 /// compression level during driver setup.
