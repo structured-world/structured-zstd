@@ -3742,7 +3742,11 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            if !self
+                .table
+                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
+            {
                 self.maybe_rebase_positions(update_abs);
             }
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
@@ -3762,7 +3766,11 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            if !self
+                .table
+                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
+            {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
@@ -3782,7 +3790,11 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            if !self
+                .table
+                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
+            {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
@@ -3801,7 +3813,11 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
+            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            if !self
+                .table
+                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
+            {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward =
@@ -4102,6 +4118,7 @@ impl HcMatchGenerator {
     }
 
     fn update_hash3_until(&mut self, abs_pos: usize) {
+        let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
         if self.table.next_to_update3 < self.table.history_abs_start {
             self.table.next_to_update3 = self.table.history_abs_start;
         }
@@ -4109,50 +4126,35 @@ impl HcMatchGenerator {
             return;
         }
         while self.table.next_to_update3 < abs_pos {
-            if !self.can_skip_rebase_check_at(self.table.next_to_update3, abs_pos) {
+            if !self.table.can_skip_rebase_check_at(
+                self.table.next_to_update3,
+                abs_pos,
+                is_btultra2,
+            ) {
                 self.maybe_rebase_positions(self.table.next_to_update3);
             }
-            self.table.insert_hash3_only_no_rebase(self.table.next_to_update3);
+            self.table
+                .insert_hash3_only_no_rebase(self.table.next_to_update3);
             self.table.next_to_update3 = self.table.next_to_update3.saturating_add(1);
         }
     }
 
-    #[inline(always)]
-    fn can_skip_rebase_check_at(&self, abs_pos: usize, max_abs_pos: usize) -> bool {
-        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        self.table.position_base == 0
-            && self.table.index_shift == 0
-            && max_abs_pos <= max_rel_no_rebase
-            && (self.table.allow_zero_relative_position
-                || abs_pos > self.table.history_abs_start
-                || (self.parse_mode == HcParseMode::BtUltra2
-                    && abs_pos == self.table.history_abs_start))
-    }
-
-    /// Hot wrapper: every `insert_position*` call passes through here. The
-    /// fast path is "no rebase needed" — `BtUltra2` first-position skip and a
-    /// single `relative_position()` range probe. The actual table rebuild
-    /// fires once per ~`u32::MAX` positions on rolling streams and never for
-    /// typical single-shot inputs, so it lives in a separate `#[cold]`
-    /// function. Inlining the hot wrapper lets the compiler fold the early
-    /// return into the caller and keep the cold path off the i-cache.
+    /// Hot wrapper: every `insert_position*` call passes through here.
+    /// The fast path is "no rebase needed" — a single
+    /// [`MatchTable::needs_rebase`] check including the `BtUltra2`
+    /// first-position skip. The actual table rebuild fires once per
+    /// ~`u32::MAX` positions on rolling streams and never for typical
+    /// single-shot inputs, so it lives in a separate `#[cold]`
+    /// function on this struct (it still needs to drive the BT
+    /// matchfinder, which can't move onto `MatchTable`). Inlining the
+    /// hot wrapper lets the compiler fold the early return into the
+    /// caller and keep the cold path off the i-cache.
     #[inline]
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
-        if self.parse_mode == HcParseMode::BtUltra2
-            && !self.table.allow_zero_relative_position
-            && self.table.position_base == 0
-            && abs_pos == 0
-        {
-            return;
+        let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+        if self.table.needs_rebase(abs_pos, is_btultra2) {
+            self.rebase_positions_cold(abs_pos);
         }
-        let needs_rebase = self
-            .table
-            .relative_position(abs_pos)
-            .is_none_or(|relative| relative >= u32::MAX - 1);
-        if !needs_rebase {
-            return;
-        }
-        self.rebase_positions_cold(abs_pos);
     }
 
     #[cold]

@@ -109,6 +109,48 @@ impl MatchTable {
         }
     }
 
+    /// Cheap precondition check: can the rebase guard for `abs_pos`
+    /// (against the eventual `max_abs_pos`) be skipped because every
+    /// involved position is already trivially representable as a
+    /// `(rel + 1)` u32? The `is_btultra2` flag tweaks the boundary
+    /// rule: BtUltra2 allows `abs_pos == history_abs_start` even when
+    /// `allow_zero_relative_position` is `false`, matching the donor
+    /// btultra2 seed-pass behaviour.
+    #[inline(always)]
+    pub(crate) fn can_skip_rebase_check_at(
+        &self,
+        abs_pos: usize,
+        max_abs_pos: usize,
+        is_btultra2: bool,
+    ) -> bool {
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        self.position_base == 0
+            && self.index_shift == 0
+            && max_abs_pos <= max_rel_no_rebase
+            && (self.allow_zero_relative_position
+                || abs_pos > self.history_abs_start
+                || (is_btultra2 && abs_pos == self.history_abs_start))
+    }
+
+    /// Decide whether the table needs a cold rebase before `abs_pos`
+    /// can be inserted. Pure predicate — does **not** perform the
+    /// rebase. The caller (whichever backend owns the BT walk path)
+    /// is responsible for invoking `rebase_positions_cold` when this
+    /// returns `true`. Hot path: ~once per byte, so the function is
+    /// kept tight and `#[inline]`.
+    #[inline]
+    pub(crate) fn needs_rebase(&self, abs_pos: usize, is_btultra2: bool) -> bool {
+        if is_btultra2
+            && !self.allow_zero_relative_position
+            && self.position_base == 0
+            && abs_pos == 0
+        {
+            return false;
+        }
+        self.relative_position(abs_pos)
+            .is_none_or(|relative| relative >= u32::MAX - 1)
+    }
+
     /// Insert a position into the HC3 short-match side table without
     /// running the rebase check. Caller is responsible for ensuring
     /// the position is already representable (or that the rebase
