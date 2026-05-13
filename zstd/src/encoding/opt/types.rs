@@ -4,9 +4,10 @@
 //! (structural split). Names, fields, derives, and `Default` impls are
 //! preserved; the only intentional internal-API change is the
 //! `pub(crate)` visibility on each item so the remaining methods on
-//! `HcMatchGenerator` can import them through `super::opt::*`. Methods
-//! that operate on these types stay on `HcMatchGenerator` for now and
-//! migrate in later phases.
+//! `HcMatchGenerator` can import them through
+//! `super::opt::types::{…}` (no re-exports are added at `opt::`).
+//! Methods that operate on these types stay on `HcMatchGenerator` for
+//! now and migrate in later phases.
 
 use alloc::vec::Vec;
 
