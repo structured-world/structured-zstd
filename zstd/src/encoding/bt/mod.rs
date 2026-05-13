@@ -61,6 +61,36 @@ pub(crate) struct BtMatcher {
 }
 
 impl BtMatcher {
+    /// BT/HC hash MLS (minimum-length-segment) parameter. Donor
+    /// parity: even when `minMatch == 3` (btultra2), the main BT/HC
+    /// hash still goes through `ZSTD_hashPtr(…, mls)` which falls
+    /// back to the default `case 4` in
+    /// `zstd_compress_internal.h`. The 3-byte path is a separate HC3
+    /// side table only.
+    pub(crate) const HASH_MLS: usize = 4;
+
+    /// Append `candidate` to `out` if it's strictly longer than the
+    /// best length seen so far (and at least `min_match_len`). Maintains
+    /// `best_len_for_skip` so subsequent calls only keep strictly
+    /// improving candidates. Pure associated function — no BtMatcher
+    /// state needed, just the candidate ladder bookkeeping.
+    pub(crate) fn push_candidate_ladder(
+        out: &mut Vec<MatchCandidate>,
+        best_len_for_skip: &mut usize,
+        candidate: MatchCandidate,
+        min_match_len: usize,
+    ) -> bool {
+        if candidate.match_len < min_match_len {
+            return false;
+        }
+        if candidate.match_len > *best_len_for_skip {
+            out.push(candidate);
+            *best_len_for_skip = candidate.match_len;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             opt_state: HcOptState::new(),

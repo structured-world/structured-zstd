@@ -1014,7 +1014,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             concat,
             idx,
             $self.table.hash_log,
-            $self.bt_hash_mls(),
+            super::bt::BtMatcher::HASH_MLS,
         );
         let Some(relative_pos) = $self.table.relative_position($abs_pos) else {
             return 1;
@@ -1863,7 +1863,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         if $abs_pos < $self.table.skip_insert_until_abs {
             if let Some(ldm) = ldm_candidate {
                 let mut best_len_for_skip = 0usize;
-                let _ = HcMatchGenerator::push_candidate_ladder(
+                let _ = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
                     &mut best_len_for_skip,
                     ldm,
@@ -1881,7 +1881,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         if current_idx + 4 > $self.table.live_history().len() {
             if let Some(ldm) = ldm_candidate {
                 let mut best_len_for_skip = 0usize;
-                let _ = HcMatchGenerator::push_candidate_ladder(
+                let _ = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
                     &mut best_len_for_skip,
                     ldm,
@@ -1906,7 +1906,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     if rep.match_len >= min_match_len {
                         rep_len_candidate_found = true;
                     }
-                    let _ = HcMatchGenerator::push_candidate_ladder(
+                    let _ = super::bt::BtMatcher::push_candidate_ladder(
                         $out,
                         &mut best_len_for_skip,
                         rep,
@@ -1925,7 +1925,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.update_hash3_until($abs_pos);
             // SAFETY: same umbrella for hash3_candidate.
             if let Some(h3) = unsafe { $self.$hash3($abs_pos, $current_abs_end, min_match_len) } {
-                let _ = HcMatchGenerator::push_candidate_ladder(
+                let _ = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
                     &mut best_len_for_skip,
                     h3,
@@ -1986,7 +1986,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                         continue;
                     }
                     let offset = $abs_pos - candidate_abs;
-                    if HcMatchGenerator::push_candidate_ladder(
+                    if super::bt::BtMatcher::push_candidate_ladder(
                         $out,
                         &mut best_len_for_skip,
                         MatchCandidate {
@@ -2014,7 +2014,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 .max(match_end_abs.saturating_sub(8));
         }
         if let Some(ldm) = ldm_candidate {
-            let _ = HcMatchGenerator::push_candidate_ladder(
+            let _ = super::bt::BtMatcher::push_candidate_ladder(
                 $out,
                 &mut best_len_for_skip,
                 ldm,
@@ -2178,7 +2178,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             concat,
             idx,
             $self.table.hash_log,
-            $self.bt_hash_mls(),
+            super::bt::BtMatcher::HASH_MLS,
         );
         let Some(relative_pos) = $self.table.relative_position($abs_pos) else {
             return;
@@ -2226,7 +2226,7 @@ macro_rules! bt_insert_and_collect_matches_body {
 
             if match_len > best_len {
                 let offset = $abs_pos - candidate_abs;
-                let accepted = HcMatchGenerator::push_candidate_ladder(
+                let accepted = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
                     $best_len_for_skip,
                     MatchCandidate {
@@ -3385,23 +3385,6 @@ impl HcMatchGenerator {
         )
     }
 
-    fn push_candidate_ladder(
-        out: &mut Vec<MatchCandidate>,
-        best_len_for_skip: &mut usize,
-        candidate: MatchCandidate,
-        min_match_len: usize,
-    ) -> bool {
-        if candidate.match_len < min_match_len {
-            return false;
-        }
-        if candidate.match_len > *best_len_for_skip {
-            out.push(candidate);
-            *best_len_for_skip = candidate.match_len;
-            return true;
-        }
-        false
-    }
-
     fn ldm_skip_raw_seq_store_bytes(&self, seq_store: &mut HcRawSeqStore, nb_bytes: usize) {
         let mut curr_pos = seq_store.pos_in_sequence.saturating_add(nb_bytes);
         while curr_pos > 0 && seq_store.pos < seq_store.size {
@@ -3574,14 +3557,6 @@ impl HcMatchGenerator {
             self.parse_mode,
             HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
         )
-    }
-
-    fn bt_hash_mls(&self) -> usize {
-        // Donor parity: even when `minMatch == 3` (btultra2), the main BT/HC
-        // hash still goes through `ZSTD_hashPtr(..., mls)` which falls back to
-        // the default `case 4` in `zstd_compress_internal.h`. The 3-byte path
-        // is a separate HC3 side table only.
-        4
     }
 
     /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
@@ -6390,7 +6365,7 @@ fn btultra2_main_hash_uses_donor_hash4_formula() {
     let actual = super::match_table::storage::MatchTable::hash_position_with_mls(
         &bytes,
         hc.table.hash_log,
-        hc.bt_hash_mls(),
+        super::bt::BtMatcher::HASH_MLS,
     );
     assert_eq!(actual, expected);
 }
