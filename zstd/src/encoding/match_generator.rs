@@ -2644,7 +2644,8 @@ impl HcMatchGenerator {
             .max(self.table.history_abs_start);
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
-        self.prepare_ldm_candidates(current_abs_start, current_len);
+        self.bt
+            .prepare_ldm_candidates(current_abs_start, current_len);
 
         if self.should_run_btultra2_seed_pass(current_len) {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);
@@ -3380,15 +3381,6 @@ impl HcMatchGenerator {
             hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
         )
-    }
-
-    fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
-        self.bt.ldm_sequences.clear();
-        let _ = (current_abs_start, current_len);
-        // Donor parity: btopt/btultra/btultra2 only merge LDM candidates when
-        // a real ldmSeqStore exists (`enableLdm == ZSTD_ps_enable`).
-        // This Rust encoder does not expose a donor-equivalent LDM producer or
-        // runtime switch yet, so the ordinary level-22 path must remain LDM-free.
     }
 
     fn uses_bt_matchfinder(&self) -> bool {

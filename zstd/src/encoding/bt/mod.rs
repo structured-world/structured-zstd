@@ -831,4 +831,15 @@ impl BtMatcher {
         self.opt_ml_price_generation = ml_price_generations;
         result
     }
+
+    /// Donor parity: `ZSTD_ldm_blockCompress` would seed external
+    /// long-distance match candidates here when `enableLdm ==
+    /// ZSTD_ps_enable`. This Rust encoder does not expose the donor's
+    /// LDM producer / runtime switch yet, so every level-22 frame
+    /// starts with an empty `ldm_sequences` buffer — keep the clear
+    /// to defend against carry-over if a producer is added later.
+    pub(crate) fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
+        self.ldm_sequences.clear();
+        let _ = (current_abs_start, current_len);
+    }
 }
