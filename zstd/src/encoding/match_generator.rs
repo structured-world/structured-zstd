@@ -2306,7 +2306,7 @@ macro_rules! bt_insert_and_collect_matches_body {
 
 impl HcMatchGenerator {
     fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
-        self.parse_mode == HcParseMode::BtUltra2
+        self.is_btultra2()
             && self.bt.opt_state.lit_length_sum == 0
             && self.bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
@@ -2572,7 +2572,7 @@ impl HcMatchGenerator {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);
         }
 
-        let profile = if self.parse_mode == HcParseMode::BtUltra2 {
+        let profile = if self.is_btultra2() {
             // Donor btultra2 runs one accurate opt pass after initStats_ultra.
             HcOptimalCostProfile::for_mode(self.parse_mode, true)
         } else {
@@ -3151,6 +3151,16 @@ impl HcMatchGenerator {
         )
     }
 
+    /// Stage D prep: consolidate the donor "btultra2 special case"
+    /// boolean so all rebase / hash3-fill / parse-mode-conditional
+    /// sites read from a single named accessor. Once `parse_mode` is
+    /// folded into the `HcBackend` enum this becomes a one-line
+    /// `matches!(self.backend, …)` without touching call sites.
+    #[inline]
+    fn is_btultra2(&self) -> bool {
+        self.parse_mode == HcParseMode::BtUltra2
+    }
+
     /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
     /// update loop runs inside the same `target_feature` umbrella as the per-
     /// position `bt_insert_step_no_rebase` it calls — eliminating one ABI
@@ -3199,7 +3209,7 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            let is_btultra2 = self.is_btultra2();
             if !self
                 .table
                 .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
@@ -3230,7 +3240,7 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            let is_btultra2 = self.is_btultra2();
             if !self
                 .table
                 .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
@@ -3260,7 +3270,7 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            let is_btultra2 = self.is_btultra2();
             if !self
                 .table
                 .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
@@ -3289,7 +3299,7 @@ impl HcMatchGenerator {
         }
         let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
-            let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+            let is_btultra2 = self.is_btultra2();
             if !self
                 .table
                 .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
@@ -3309,7 +3319,7 @@ impl HcMatchGenerator {
     }
 
     fn update_hash3_until(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+        let is_btultra2 = self.is_btultra2();
         if self.table.next_to_update3 < self.table.history_abs_start {
             self.table.next_to_update3 = self.table.history_abs_start;
         }
@@ -3342,7 +3352,7 @@ impl HcMatchGenerator {
     /// caller and keep the cold path off the i-cache.
     #[inline]
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.parse_mode == HcParseMode::BtUltra2;
+        let is_btultra2 = self.is_btultra2();
         if self.table.needs_rebase(abs_pos, is_btultra2) {
             self.rebase_positions_cold(abs_pos);
         }
