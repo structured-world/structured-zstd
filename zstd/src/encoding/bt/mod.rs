@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 use super::match_table::storage::MatchTable;
-use super::opt::ldm::HcRawSeq;
+use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalSequence, MatchCandidate};
 
 /// Maximum offset reachable by the HC3 short-match probe. Donor
@@ -665,5 +665,140 @@ impl BtMatcher {
             out,
             crate::encoding::fastpath::scalar::count_match_from_indices,
         )
+    }
+
+    /// Donor parity: `ZSTD_optLdm_skipRawSeqStoreBytes`. Fast-forward the
+    /// raw LDM seq store cursor by `nb_bytes`, consuming whole stored
+    /// sequences and leaving a partial-sequence offset in `pos_in_sequence`.
+    pub(crate) fn ldm_skip_raw_seq_store_bytes(
+        &self,
+        seq_store: &mut HcRawSeqStore,
+        nb_bytes: usize,
+    ) {
+        let mut curr_pos = seq_store.pos_in_sequence.saturating_add(nb_bytes);
+        while curr_pos > 0 && seq_store.pos < seq_store.size {
+            let curr_seq = self.ldm_sequences[seq_store.pos];
+            let seq_len = curr_seq.lit_length.saturating_add(curr_seq.match_length);
+            if curr_pos >= seq_len {
+                curr_pos -= seq_len;
+                seq_store.pos += 1;
+            } else {
+                seq_store.pos_in_sequence = curr_pos;
+                break;
+            }
+        }
+        if curr_pos == 0 || seq_store.pos == seq_store.size {
+            seq_store.pos_in_sequence = 0;
+        }
+    }
+
+    /// Donor parity: `ZSTD_optLdm_maybeAddMatch` / its preamble in
+    /// `ZSTD_optLdm_getNextMatch`. Advance the per-block LDM window
+    /// markers to the next raw LDM sequence and skip its literals.
+    pub(crate) fn ldm_get_next_match_and_update_seq_store(
+        &self,
+        opt_ldm: &mut HcOptLdmState,
+        curr_pos_in_block: usize,
+        block_bytes_remaining: usize,
+    ) {
+        if opt_ldm.seq_store.size == 0 || opt_ldm.seq_store.pos >= opt_ldm.seq_store.size {
+            opt_ldm.start_pos_in_block = usize::MAX;
+            opt_ldm.end_pos_in_block = usize::MAX;
+            return;
+        }
+        let curr_seq = self.ldm_sequences[opt_ldm.seq_store.pos];
+        let curr_block_end_pos = curr_pos_in_block.saturating_add(block_bytes_remaining);
+        let literals_bytes_remaining = curr_seq
+            .lit_length
+            .saturating_sub(opt_ldm.seq_store.pos_in_sequence);
+        let match_bytes_remaining = if literals_bytes_remaining == 0 {
+            curr_seq.match_length.saturating_sub(
+                opt_ldm
+                    .seq_store
+                    .pos_in_sequence
+                    .saturating_sub(curr_seq.lit_length),
+            )
+        } else {
+            curr_seq.match_length
+        };
+        if literals_bytes_remaining >= block_bytes_remaining {
+            opt_ldm.start_pos_in_block = usize::MAX;
+            opt_ldm.end_pos_in_block = usize::MAX;
+            self.ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, block_bytes_remaining);
+            return;
+        }
+        opt_ldm.start_pos_in_block = curr_pos_in_block.saturating_add(literals_bytes_remaining);
+        opt_ldm.end_pos_in_block = opt_ldm
+            .start_pos_in_block
+            .saturating_add(match_bytes_remaining);
+        opt_ldm.offset = curr_seq.offset;
+        if opt_ldm.end_pos_in_block > curr_block_end_pos {
+            opt_ldm.end_pos_in_block = curr_block_end_pos;
+            self.ldm_skip_raw_seq_store_bytes(
+                &mut opt_ldm.seq_store,
+                curr_block_end_pos.saturating_sub(curr_pos_in_block),
+            );
+        } else {
+            self.ldm_skip_raw_seq_store_bytes(
+                &mut opt_ldm.seq_store,
+                literals_bytes_remaining.saturating_add(match_bytes_remaining),
+            );
+        }
+    }
+
+    /// Donor parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
+    /// window (open/close cursors set by
+    /// [`ldm_get_next_match_and_update_seq_store`]) into a usable
+    /// `MatchCandidate` when the current position falls inside it.
+    pub(crate) fn ldm_maybe_add_match(
+        &self,
+        opt_ldm: &HcOptLdmState,
+        curr_pos_in_block: usize,
+        min_match: usize,
+    ) -> Option<MatchCandidate> {
+        let _ = self;
+        let pos_diff = curr_pos_in_block.saturating_sub(opt_ldm.start_pos_in_block);
+        let candidate_match_length = opt_ldm
+            .end_pos_in_block
+            .saturating_sub(opt_ldm.start_pos_in_block)
+            .saturating_sub(pos_diff);
+        if curr_pos_in_block < opt_ldm.start_pos_in_block
+            || curr_pos_in_block >= opt_ldm.end_pos_in_block
+            || candidate_match_length < min_match
+        {
+            return None;
+        }
+        Some(MatchCandidate {
+            start: curr_pos_in_block,
+            offset: opt_ldm.offset,
+            match_len: candidate_match_length,
+        })
+    }
+
+    /// Donor parity: `ZSTD_optLdm_processMatchCandidate`. Wraps
+    /// [`ldm_maybe_add_match`] with a re-seed step when the parser has
+    /// stepped past the current LDM window.
+    pub(crate) fn ldm_process_match_candidate(
+        &self,
+        opt_ldm: &mut HcOptLdmState,
+        curr_pos_in_block: usize,
+        remaining_bytes: usize,
+        min_match: usize,
+    ) -> Option<MatchCandidate> {
+        if opt_ldm.seq_store.size == 0 || opt_ldm.seq_store.pos >= opt_ldm.seq_store.size {
+            return None;
+        }
+        if curr_pos_in_block >= opt_ldm.end_pos_in_block {
+            if curr_pos_in_block > opt_ldm.end_pos_in_block {
+                let pos_overshoot = curr_pos_in_block.saturating_sub(opt_ldm.end_pos_in_block);
+                self.ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, pos_overshoot);
+            }
+            self.ldm_get_next_match_and_update_seq_store(
+                opt_ldm,
+                curr_pos_in_block,
+                remaining_bytes,
+            );
+        }
+        self.ldm_maybe_add_match(opt_ldm, curr_pos_in_block, min_match)
     }
 }
