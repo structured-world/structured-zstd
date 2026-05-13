@@ -8,6 +8,22 @@ pub(crate) mod incompressible;
 pub(crate) mod match_generator;
 pub(crate) mod util;
 
+// `#111` encoder architecture rewrite — Phase 1 (structural split).
+// `cost_model`, `opt`, and `strategy` now host the relocated cost-model
+// types, the optimal-parser plain-data types, and the `HcParseMode`
+// dispatch tag respectively. `bt`, `hc`, and `match_table` are still
+// doc-only placeholders that name the donor helpers and monolith
+// methods slated to move into them in subsequent #111 phase PRs. The
+// rewrite plan is tracked in
+// <https://github.com/structured-world/structured-zstd/issues/111> and
+// the per-phase boundary is `perf/post-pr-110-baseline`.
+pub(crate) mod bt;
+pub(crate) mod cost_model;
+pub(crate) mod hc;
+pub(crate) mod match_table;
+pub(crate) mod opt;
+pub(crate) mod strategy;
+
 mod frame_compressor;
 mod levels;
 mod streaming_encoder;
