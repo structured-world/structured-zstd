@@ -71,8 +71,12 @@ pub(crate) const ROW_EMPTY_SLOT: usize = usize::MAX;
 pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
 // HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
 // per-CPU `hash_mix_u64` variants share it via that module.
-const HC_PRIME3BYTES: u32 = 506_832_829;
-const HC_PRIME4BYTES: u32 = 2_654_435_761;
+// HC_PRIME3BYTES / HC_PRIME4BYTES moved to match_table::storage
+// alongside the hash helpers in Phase 1e Stage A. Only the test
+// module references the constants directly (production code goes
+// through `MatchTable::hash_value_with_mls`).
+#[cfg(test)]
+use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 
 // HC_HASH_LOG / HC_CHAIN_LOG / HC3_HASH_LOG / HC_EMPTY live on the
 // shared storage module so MatchTable methods can reference them
@@ -821,7 +825,8 @@ impl Matcher for MatchGeneratorDriver {
         }
         if self.active_backend == MatcherBackend::HashChain {
             self.hc_matcher_mut()
-                .table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
+                .table
+                .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
         }
     }
 
@@ -920,7 +925,8 @@ impl Matcher for MatchGeneratorDriver {
                 self.hc_match_generator
                     .as_mut()
                     .expect("hash chain backend must be initialized by reset() before use")
-                    .table.add_data(space, |mut data| {
+                    .table
+                    .add_data(space, |mut data| {
                         evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
@@ -1001,7 +1007,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             return 1;
         }
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let hash = HcMatchGenerator::hash_position_at(
+        let hash = super::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
             $self.table.hash_log,
@@ -2031,7 +2037,12 @@ macro_rules! hash3_candidate_body {
         if idx + 4 > concat.len() {
             return None;
         }
-        let hash3 = HcMatchGenerator::hash_position_at(concat, idx, $self.table.hash3_log, 3);
+        let hash3 = super::match_table::storage::MatchTable::hash_position_at(
+            concat,
+            idx,
+            $self.table.hash3_log,
+            3,
+        );
         let entry = $self
             .table
             .hash3_table
@@ -2155,7 +2166,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             return;
         }
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let hash = HcMatchGenerator::hash_position_at(
+        let hash = super::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
             $self.table.hash_log,
@@ -2450,7 +2461,7 @@ impl HcMatchGenerator {
     }
 
     fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
-        self.ensure_tables();
+        self.table.ensure_tables();
         let current_len = self.table.window.back().unwrap().len();
         let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
@@ -2529,7 +2540,7 @@ impl HcMatchGenerator {
     }
 
     fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        self.ensure_tables();
+        self.table.ensure_tables();
 
         let current_len = self.table.window.back().unwrap().len();
         if current_len == 0 {
@@ -2586,7 +2597,7 @@ impl HcMatchGenerator {
     }
 
     fn start_matching_optimal(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        self.ensure_tables();
+        self.table.ensure_tables();
         let current_len = self.table.window.back().unwrap().len();
         if current_len == 0 {
             return;
@@ -3158,7 +3169,7 @@ impl HcMatchGenerator {
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
-        self.ensure_tables();
+        self.table.ensure_tables();
         if self.uses_bt_matchfinder() {
             self.collect_optimal_candidates_initialized::<true>(
                 abs_pos,
@@ -3547,19 +3558,6 @@ impl HcMatchGenerator {
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
-        }
-    }
-
-    fn ensure_tables(&mut self) {
-        if self.table.hash_table.is_empty() {
-            self.table.hash_table = alloc::vec![HC_EMPTY; 1 << self.table.hash_log];
-            let hash3_size = if self.table.hash3_log == 0 {
-                0
-            } else {
-                1 << self.table.hash3_log
-            };
-            self.table.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
-            self.table.chain_table = alloc::vec![HC_EMPTY; 1 << self.table.chain_log];
         }
     }
 
@@ -3994,47 +3992,6 @@ impl HcMatchGenerator {
         )
     }
 
-    fn hash_position_with_mls(data: &[u8], hash_log: usize, mls: usize) -> usize {
-        let value = Self::read_le_u32(data);
-        Self::hash_value_with_mls(value, hash_log, mls)
-    }
-
-    #[inline(always)]
-    fn hash_position_at(data: &[u8], idx: usize, hash_log: usize, mls: usize) -> usize {
-        debug_assert!(idx + 4 <= data.len());
-        let value = unsafe { Self::read_le_u32_ptr(data.as_ptr().add(idx)) };
-        Self::hash_value_with_mls(value, hash_log, mls)
-    }
-
-    #[inline(always)]
-    fn hash_value_with_mls(value: u32, hash_log: usize, mls: usize) -> usize {
-        match mls {
-            3 => (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize,
-            _ => ((value.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hash_log)) as usize,
-        }
-    }
-
-    fn hash_position(&self, data: &[u8]) -> usize {
-        Self::hash_position_with_mls(data, self.table.hash_log, 4)
-    }
-
-    #[cfg(test)]
-    fn hash3_position(data: &[u8], hash_log: usize) -> usize {
-        let value = Self::read_le_u32(data);
-        (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize
-    }
-
-    #[inline(always)]
-    fn read_le_u32(data: &[u8]) -> u32 {
-        debug_assert!(data.len() >= 4);
-        unsafe { Self::read_le_u32_ptr(data.as_ptr()) }
-    }
-
-    #[inline(always)]
-    unsafe fn read_le_u32_ptr(ptr: *const u8) -> u32 {
-        unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
-    }
-
     /// Cross-platform entry. Dispatches to the kernel-specific variant.
     /// Retained so external callers / future code still have a stable shim;
     /// the on-encode hot path bypasses this dispatcher via the kernel-specific
@@ -4156,7 +4113,12 @@ impl HcMatchGenerator {
         let Some(relative_pos) = self.table.relative_position(abs_pos) else {
             return;
         };
-        let hash3 = Self::hash_position_at(concat, idx, self.table.hash3_log, 3);
+        let hash3 = super::match_table::storage::MatchTable::hash_position_at(
+            concat,
+            idx,
+            self.table.hash3_log,
+            3,
+        );
         self.table.hash3_table[hash3] = relative_pos + 1;
     }
 
@@ -4256,7 +4218,12 @@ impl HcMatchGenerator {
         if idx + 4 > concat.len() {
             return;
         }
-        let hash = Self::hash_position_at(concat, idx, self.table.hash_log, 4);
+        let hash = super::match_table::storage::MatchTable::hash_position_at(
+            concat,
+            idx,
+            self.table.hash_log,
+            4,
+        );
         let Some(relative_pos) = self.table.relative_position(abs_pos) else {
             return;
         };
@@ -4309,7 +4276,7 @@ impl HcMatchGenerator {
         if idx + 4 > concat.len() {
             return buf;
         }
-        let hash = self.hash_position(&concat[idx..]);
+        let hash = self.table.hash_position(&concat[idx..]);
         let chain_mask = (1 << self.table.chain_log) - 1;
 
         let mut cur = self.table.hash_table[hash];
@@ -4674,7 +4641,8 @@ impl HcMatchGenerator {
         }
 
         // Lazy2 check: also evaluate pos+2
-        if self.hc.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= self.table.history_abs_end() {
+        if self.hc.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= self.table.history_abs_end()
+        {
             let next2 = self.find_best_match(abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2 {
                 let next2_gain = Self::match_gain(next2.match_len, next2.offset);
@@ -5440,7 +5408,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     hc.table.position_base = 0;
     hc.hc.search_depth = 32;
     let abs_pos = 6usize;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.insert_positions(0, abs_pos);
 
     let profile = HcOptimalCostProfile {
@@ -5478,7 +5446,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     hc.table.position_base = 0;
     hc.hc.search_depth = 32;
     let abs_pos = 9usize;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.insert_positions(0, abs_pos);
     hc.table.skip_insert_until_abs = 0;
 
@@ -5516,7 +5484,7 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
     hc.table.position_base = 0;
     hc.hc.search_depth = 32;
     let abs_pos = 9usize;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.insert_positions(0, abs_pos);
     hc.table.skip_insert_until_abs = 0;
 
@@ -5562,7 +5530,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
     hc.hc.search_depth = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
 
     let abs_pos = 8usize;
     hc.table.skip_insert_until_abs = 0;
@@ -5602,7 +5570,7 @@ fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
     hc.table.position_base = 0;
     hc.hc.search_depth = 0;
     let abs_pos = 9usize; // second "abcde"
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.insert_positions(0, abs_pos);
     // Donor hash3 has an independent nextToUpdate3 cursor; main-table
     // insertion does not imply the HC3 side table has been filled.
@@ -5642,7 +5610,7 @@ fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
     hc.hc.search_depth = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     // Simulate donor-like nextToUpdate3 path: no explicit hash/chain insertions
     // were done for prefix positions, so hash3 must fill them on demand.
     hc.table.next_to_update3 = 0;
@@ -5682,7 +5650,7 @@ fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
     hc.hc.search_depth = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.table.next_to_update3 = 0;
 
     let abs_pos = 6usize; // second "abcde", match reaches current end
@@ -5774,7 +5742,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
     hc.hc.search_depth = 32;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.insert_positions(0, abs_pos);
 
     let profile = HcOptimalCostProfile {
@@ -6829,7 +6797,7 @@ fn hc_hash3_position_matches_donor_formula() {
     let read32 = u32::from_le_bytes(bytes);
     let expected = (((read32 << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - HC3_HASH_LOG)) as usize;
     assert_eq!(
-        HcMatchGenerator::hash3_position(&bytes, HC3_HASH_LOG),
+        super::match_table::storage::MatchTable::hash3_position(&bytes, HC3_HASH_LOG),
         expected
     );
 }
@@ -6841,7 +6809,7 @@ fn hc_hash_position_matches_donor_hash4_formula() {
     let bytes = [b'a', b'b', b'c', b'd'];
     let read32 = u32::from_le_bytes(bytes);
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
-    assert_eq!(hc.hash_position(&bytes), expected);
+    assert_eq!(hc.table.hash_position(&bytes), expected);
 }
 
 #[test]
@@ -6851,8 +6819,11 @@ fn btultra2_main_hash_uses_donor_hash4_formula() {
     let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
     let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
-    let actual =
-        HcMatchGenerator::hash_position_with_mls(&bytes, hc.table.hash_log, hc.bt_hash_mls());
+    let actual = super::match_table::storage::MatchTable::hash_position_with_mls(
+        &bytes,
+        hc.table.hash_log,
+        hc.bt_hash_mls(),
+    );
     assert_eq!(actual, expected);
 }
 
@@ -6873,7 +6844,7 @@ fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
     hc.table.history = b"abc".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
 
     let candidates = hc.chain_candidates(0);
     assert!(candidates.iter().all(|&pos| pos == usize::MAX));
@@ -6883,7 +6854,7 @@ fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
 fn hc_reset_refills_existing_tables_with_empty_sentinel() {
     let mut hc = HcMatchGenerator::new(32);
     hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     assert!(!hc.table.hash_table.is_empty());
     assert!(!hc.table.chain_table.is_empty());
     hc.table.hash_table.fill(123);
@@ -7272,7 +7243,7 @@ fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
     hc.table.history = b"abcdefghijklmnop".to_vec();
     hc.table.history_abs_start = 0;
     hc.table.position_base = 1;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     let before_hash = hc.table.hash_table.clone();
     let before_chain = hc.table.chain_table.clone();
 
@@ -7289,7 +7260,7 @@ fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.table.next_to_update3 = 0;
 
     hc.insert_positions(0, 9);
@@ -7307,7 +7278,7 @@ fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges(
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
-    hc.ensure_tables();
+    hc.table.ensure_tables();
     hc.table.next_to_update3 = 0;
 
     hc.insert_positions_with_step(0, 16, 4);
@@ -7451,7 +7422,7 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
 fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
-    matcher.ensure_tables();
+    matcher.table.ensure_tables();
     matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
         Ok(value) => value,
@@ -7488,7 +7459,7 @@ fn hc_rebases_positions_after_u32_boundary() {
 fn hc_rebase_rebuilds_only_inserted_prefix() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
-    matcher.ensure_tables();
+    matcher.table.ensure_tables();
     matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
         Ok(value) => value,
@@ -7499,7 +7470,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
 
     let mut expected = HcMatchGenerator::new(64);
     expected.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
-    expected.ensure_tables();
+    expected.table.ensure_tables();
     expected.table.history_abs_start = history_abs_start;
     expected.table.position_base = expected.table.history_abs_start;
     expected.table.hash_table.fill(HC_EMPTY);

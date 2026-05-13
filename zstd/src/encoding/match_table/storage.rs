@@ -18,6 +18,14 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+/// Knuth-style 3-byte hash multiplier. Donor parity:
+/// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
+/// by the HC3 short-match side table and by the 3-byte branch of the
+/// generic `hash_value_with_mls`.
+pub(crate) const HC_PRIME3BYTES: u32 = 506_832_829;
+/// Knuth-style 4-byte hash multiplier. Donor parity: `ZSTD_HASHPRIME`.
+pub(crate) const HC_PRIME4BYTES: u32 = 2_654_435_761;
+
 /// Hash / chain / hash3 sentinel marking an empty slot.
 ///
 /// The donor uses position `0` as the sentinel because absolute
@@ -99,6 +107,84 @@ impl MatchTable {
             dictionary_primed_for_frame: false,
             allow_zero_relative_position: false,
         }
+    }
+
+    /// Allocate the hash / chain / hash3 tables sized to the current
+    /// `hash_log` / `chain_log` / `hash3_log` configuration. No-op if
+    /// the main hash_table is already sized; the backend-switch path
+    /// clears it to `Vec::new()` to force a fresh allocation here on
+    /// the next frame.
+    pub(crate) fn ensure_tables(&mut self) {
+        if self.hash_table.is_empty() {
+            self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
+            let hash3_size = if self.hash3_log == 0 {
+                0
+            } else {
+                1 << self.hash3_log
+            };
+            self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
+            self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
+        }
+    }
+
+    /// Unaligned little-endian `u32` load. Hot helper for every
+    /// `hash_position*` site. Donor parity: `MEM_readLE32`.
+    #[inline(always)]
+    pub(crate) fn read_le_u32(data: &[u8]) -> u32 {
+        debug_assert!(data.len() >= 4);
+        unsafe { Self::read_le_u32_ptr(data.as_ptr()) }
+    }
+
+    /// Pointer variant of [`read_le_u32`]. Used from macros that
+    /// already hold a raw pointer.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for a `u32` read.
+    #[inline(always)]
+    pub(crate) unsafe fn read_le_u32_ptr(ptr: *const u8) -> u32 {
+        unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
+    }
+
+    /// MLS-parameterised hash of a 32-bit value into a `hash_log`-bit
+    /// index. Donor parity: the `mls`-switch in `ZSTD_hashPtr`.
+    #[inline(always)]
+    pub(crate) fn hash_value_with_mls(value: u32, hash_log: usize, mls: usize) -> usize {
+        match mls {
+            3 => (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize,
+            _ => ((value.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hash_log)) as usize,
+        }
+    }
+
+    /// Hash a 4-byte window at the head of `data`.
+    #[inline(always)]
+    pub(crate) fn hash_position_with_mls(data: &[u8], hash_log: usize, mls: usize) -> usize {
+        let value = Self::read_le_u32(data);
+        Self::hash_value_with_mls(value, hash_log, mls)
+    }
+
+    /// Hash a 4-byte window starting at `idx` inside `data`. Skips the
+    /// slice subrange to keep the bounds check off the per-byte hot
+    /// path.
+    #[inline(always)]
+    pub(crate) fn hash_position_at(data: &[u8], idx: usize, hash_log: usize, mls: usize) -> usize {
+        debug_assert!(idx + 4 <= data.len());
+        let value = unsafe { Self::read_le_u32_ptr(data.as_ptr().add(idx)) };
+        Self::hash_value_with_mls(value, hash_log, mls)
+    }
+
+    /// Main hash for the current matcher (4-byte MLS, `hash_log` from
+    /// the table's configuration).
+    #[inline(always)]
+    pub(crate) fn hash_position(&self, data: &[u8]) -> usize {
+        Self::hash_position_with_mls(data, self.hash_log, 4)
+    }
+
+    /// 3-byte hash used by the HC3 side table. Test-only — the
+    /// production path uses inlined per-kernel variants.
+    #[cfg(test)]
+    pub(crate) fn hash3_position(data: &[u8], hash_log: usize) -> usize {
+        let value = Self::read_le_u32(data);
+        (((value << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - hash_log)) as usize
     }
 
     /// Mark this frame as dictionary-primed so the HC / BT seed paths
