@@ -24,7 +24,9 @@ use super::dfast::DfastMatchGenerator;
 #[cfg(test)]
 use super::match_table::helpers::FAST_HASH_FILL_STEP;
 use super::match_table::helpers::{INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN, common_prefix_len};
-use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
+#[cfg(test)]
+use super::opt::ldm::HcRawSeq;
+use super::opt::ldm::{HcOptLdmState, HcRawSeqStore};
 use super::opt::types::{
     HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
     MatchCandidate,
@@ -967,22 +969,12 @@ struct HcMatchGenerator {
     /// through the chain-walk path.
     hc: super::hc::HcMatcher,
     parse_mode: HcParseMode,
-    ldm_sequences: Vec<HcRawSeq>,
-    opt_state: HcOptState,
-    opt_nodes_scratch: Vec<HcOptimalNode>,
-    opt_candidates_scratch: Vec<MatchCandidate>,
-    opt_store_scratch: Vec<HcOptimalNode>,
-    opt_segment_plan_scratch: Vec<HcOptimalSequence>,
-    opt_seed_plan_scratch: Vec<HcOptimalSequence>,
-    opt_ll_price_scratch: Vec<u32>,
-    opt_ll_price_generation: Vec<u32>,
-    opt_ll_price_stamp: u32,
-    opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
-    opt_lit_price_generation: [u32; HC_MAX_LIT + 1],
-    opt_lit_price_stamp: u32,
-    opt_ml_price_scratch: Vec<u32>,
-    opt_ml_price_generation: Vec<u32>,
-    opt_ml_price_stamp: u32,
+    /// BT (btopt / btultra / btultra2) runtime state — cost model,
+    /// optimal-parser scratch arenas, LDM candidate buffer. Method
+    /// bodies still live on this struct; they'll move onto
+    /// `impl BtMatcher` with `&mut MatchTable` threaded through in a
+    /// follow-up stage.
+    bt: super::bt::BtMatcher,
 }
 
 // Plain-data types relocated to [`crate::encoding::opt::types`] and
@@ -1140,35 +1132,35 @@ macro_rules! build_optimal_plan_impl_body {
             $self.parse_mode,
             HcParseMode::BtUltra | HcParseMode::BtUltra2
         );
-        let mut nodes = core::mem::take(&mut $self.opt_nodes_scratch);
+        let mut nodes = core::mem::take(&mut $self.bt.opt_nodes_scratch);
         if nodes.len() < frontier_limit.saturating_add(2) {
             nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
         }
-        let mut candidates = core::mem::take(&mut $self.opt_candidates_scratch);
+        let mut candidates = core::mem::take(&mut $self.bt.opt_candidates_scratch);
         candidates.clear();
         if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
             candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
         }
-        let mut store = core::mem::take(&mut $self.opt_store_scratch);
+        let mut store = core::mem::take(&mut $self.bt.opt_store_scratch);
         store.clear();
-        let mut ll_prices = core::mem::take(&mut $self.opt_ll_price_scratch);
-        let mut ll_price_generations = core::mem::take(&mut $self.opt_ll_price_generation);
+        let mut ll_prices = core::mem::take(&mut $self.bt.opt_ll_price_scratch);
+        let mut ll_price_generations = core::mem::take(&mut $self.bt.opt_ll_price_generation);
         if ll_prices.len() <= frontier_limit {
             ll_prices.resize(frontier_limit + 1, 0);
             ll_price_generations.resize(frontier_limit + 1, 0);
         }
-        $self.opt_ll_price_stamp = $self.opt_ll_price_stamp.wrapping_add(1).max(1);
-        let ll_price_stamp = $self.opt_ll_price_stamp;
-        $self.opt_lit_price_stamp = $self.opt_lit_price_stamp.wrapping_add(1).max(1);
-        let lit_price_stamp = $self.opt_lit_price_stamp;
-        let mut ml_prices = core::mem::take(&mut $self.opt_ml_price_scratch);
-        let mut ml_price_generations = core::mem::take(&mut $self.opt_ml_price_generation);
+        $self.bt.opt_ll_price_stamp = $self.bt.opt_ll_price_stamp.wrapping_add(1).max(1);
+        let ll_price_stamp = $self.bt.opt_ll_price_stamp;
+        $self.bt.opt_lit_price_stamp = $self.bt.opt_lit_price_stamp.wrapping_add(1).max(1);
+        let lit_price_stamp = $self.bt.opt_lit_price_stamp;
+        let mut ml_prices = core::mem::take(&mut $self.bt.opt_ml_price_scratch);
+        let mut ml_price_generations = core::mem::take(&mut $self.bt.opt_ml_price_generation);
         if ml_prices.len() <= frontier_limit {
             ml_prices.resize(frontier_limit + 1, 0);
             ml_price_generations.resize(frontier_limit + 1, 0);
         }
-        $self.opt_ml_price_stamp = $self.opt_ml_price_stamp.wrapping_add(1).max(1);
-        let ml_price_stamp = $self.opt_ml_price_stamp;
+        $self.bt.opt_ml_price_stamp = $self.bt.opt_ml_price_stamp.wrapping_add(1).max(1);
+        let ml_price_stamp = $self.bt.opt_ml_price_stamp;
         nodes[0] = HcOptimalNode {
             price: HcMatchGenerator::cached_lit_length_price(
                 profile,
@@ -1208,11 +1200,11 @@ macro_rules! build_optimal_plan_impl_body {
             seq_store: HcRawSeqStore {
                 pos: 0,
                 pos_in_sequence: 0,
-                size: $self.ldm_sequences.len(),
+                size: $self.bt.ldm_sequences.len(),
             },
             ..HcOptLdmState::default()
         };
-        let has_ldm = !$self.ldm_sequences.is_empty();
+        let has_ldm = !$self.bt.ldm_sequences.is_empty();
         if has_ldm {
             $self.ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
         }
@@ -1359,8 +1351,8 @@ macro_rules! build_optimal_plan_impl_body {
                     profile,
                     $stats,
                     $current[pos - 1],
-                    &mut $self.opt_lit_price_scratch,
-                    &mut $self.opt_lit_price_generation,
+                    &mut $self.bt.opt_lit_price_scratch,
+                    &mut $self.bt.opt_lit_price_generation,
                     lit_price_stamp,
                 );
                 let ll_delta = HcMatchGenerator::cached_lit_length_delta_price(
@@ -1391,8 +1383,8 @@ macro_rules! build_optimal_plan_impl_body {
                                 profile,
                                 $stats,
                                 $current[pos],
-                                &mut $self.opt_lit_price_scratch,
-                                &mut $self.opt_lit_price_generation,
+                                &mut $self.bt.opt_lit_price_scratch,
+                                &mut $self.bt.opt_lit_price_generation,
                                 lit_price_stamp,
                             );
                             let with1literal = HcMatchGenerator::add_price_delta(
@@ -1638,8 +1630,8 @@ macro_rules! build_optimal_plan_impl_body {
                 profile,
                 $stats,
                 $current[0],
-                &mut $self.opt_lit_price_scratch,
-                &mut $self.opt_lit_price_generation,
+                &mut $self.bt.opt_lit_price_scratch,
+                &mut $self.bt.opt_lit_price_generation,
                 lit_price_stamp,
             );
             let next_litlen = initial_litlen.saturating_add(1);
@@ -2280,10 +2272,10 @@ impl HcMatchGenerator {
 
     fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
         self.parse_mode == HcParseMode::BtUltra2
-            && self.opt_state.lit_length_sum == 0
-            && self.opt_state.dictionary_seed.is_none()
+            && self.bt.opt_state.lit_length_sum == 0
+            && self.bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
-            && self.ldm_sequences.is_empty()
+            && self.bt.ldm_sequences.is_empty()
             && self.table.window_size == current_len
             && self.table.history_abs_start == 0
             && self.table.window.len() == 1
@@ -2386,22 +2378,7 @@ impl HcMatchGenerator {
             table: super::match_table::storage::MatchTable::new(max_window_size),
             hc: super::hc::HcMatcher::new(2, HC_SEARCH_DEPTH, HC_TARGET_LEN),
             parse_mode: HcParseMode::Lazy2,
-            ldm_sequences: Vec::new(),
-            opt_state: HcOptState::new(),
-            opt_nodes_scratch: Vec::new(),
-            opt_candidates_scratch: Vec::new(),
-            opt_store_scratch: Vec::new(),
-            opt_segment_plan_scratch: Vec::new(),
-            opt_seed_plan_scratch: Vec::new(),
-            opt_ll_price_scratch: Vec::new(),
-            opt_ll_price_generation: Vec::new(),
-            opt_ll_price_stamp: 0,
-            opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
-            opt_lit_price_generation: [0; HC_MAX_LIT + 1],
-            opt_lit_price_stamp: 0,
-            opt_ml_price_scratch: Vec::new(),
-            opt_ml_price_generation: Vec::new(),
-            opt_ml_price_stamp: 0,
+            bt: super::bt::BtMatcher::new(),
         }
     }
 
@@ -2442,27 +2419,12 @@ impl HcMatchGenerator {
         ml: Option<&crate::fse::fse_encoder::FSETable>,
         of: Option<&crate::fse::fse_encoder::FSETable>,
     ) {
-        self.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
+        self.bt.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
     }
 
     fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
         self.table.reset(reuse_space);
-        self.ldm_sequences.clear();
-        self.opt_state.reset();
-        self.opt_nodes_scratch.clear();
-        self.opt_candidates_scratch.clear();
-        self.opt_store_scratch.clear();
-        self.opt_segment_plan_scratch.clear();
-        self.opt_seed_plan_scratch.clear();
-        self.opt_ll_price_scratch.clear();
-        self.opt_ll_price_generation.clear();
-        self.opt_ll_price_stamp = 0;
-        self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
-        self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
-        self.opt_lit_price_stamp = 0;
-        self.opt_ml_price_scratch.clear();
-        self.opt_ml_price_generation.clear();
-        self.opt_ml_price_stamp = 0;
+        self.bt.reset();
     }
 
     fn get_last_space(&self) -> &[u8] {
@@ -2692,9 +2654,9 @@ impl HcMatchGenerator {
         } else {
             HcOptimalCostProfile::for_mode(self.parse_mode, false)
         };
-        let mut opt_state = core::mem::replace(&mut self.opt_state, HcOptState::new());
+        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, profile);
-        let mut best_plan = core::mem::take(&mut self.opt_segment_plan_scratch);
+        let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
         best_plan.clear();
         let mut plan_reps = self.table.offset_hist;
         let (mut cursor, mut plan_litlen) =
@@ -2733,8 +2695,8 @@ impl HcMatchGenerator {
 
         self.emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
         best_plan.clear();
-        self.opt_segment_plan_scratch = best_plan;
-        self.opt_state = opt_state;
+        self.bt.opt_segment_plan_scratch = best_plan;
+        self.bt.opt_state = opt_state;
     }
 
     fn run_btultra2_seed_pass(
@@ -2744,13 +2706,13 @@ impl HcMatchGenerator {
         current_len: usize,
     ) {
         let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
-        let mut opt_state = core::mem::replace(&mut self.opt_state, HcOptState::new());
+        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
         let mut seed_reps = self.table.offset_hist;
         let (mut cursor, mut seed_litlen) =
             self.donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
-        let mut seed_plan = core::mem::take(&mut self.opt_seed_plan_scratch);
+        let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
         seed_plan.clear();
         let match_loop_limit = current_len.saturating_sub(8);
         while cursor < match_loop_limit {
@@ -2784,8 +2746,8 @@ impl HcMatchGenerator {
             cursor += consumed_len;
         }
         seed_plan.clear();
-        self.opt_seed_plan_scratch = seed_plan;
-        self.opt_state = opt_state;
+        self.bt.opt_seed_plan_scratch = seed_plan;
+        self.bt.opt_state = opt_state;
 
         // Donor initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
@@ -3082,13 +3044,13 @@ impl HcMatchGenerator {
             ml_price_generations,
         } = buffers;
         candidates.clear();
-        self.opt_nodes_scratch = nodes;
-        self.opt_candidates_scratch = candidates;
-        self.opt_store_scratch = store;
-        self.opt_ll_price_scratch = ll_prices;
-        self.opt_ll_price_generation = ll_price_generations;
-        self.opt_ml_price_scratch = ml_prices;
-        self.opt_ml_price_generation = ml_price_generations;
+        self.bt.opt_nodes_scratch = nodes;
+        self.bt.opt_candidates_scratch = candidates;
+        self.bt.opt_store_scratch = store;
+        self.bt.opt_ll_price_scratch = ll_prices;
+        self.bt.opt_ll_price_generation = ll_price_generations;
+        self.bt.opt_ml_price_scratch = ml_prices;
+        self.bt.opt_ml_price_generation = ml_price_generations;
         result
     }
 
@@ -3460,7 +3422,7 @@ impl HcMatchGenerator {
     fn ldm_skip_raw_seq_store_bytes(&self, seq_store: &mut HcRawSeqStore, nb_bytes: usize) {
         let mut curr_pos = seq_store.pos_in_sequence.saturating_add(nb_bytes);
         while curr_pos > 0 && seq_store.pos < seq_store.size {
-            let curr_seq = self.ldm_sequences[seq_store.pos];
+            let curr_seq = self.bt.ldm_sequences[seq_store.pos];
             let seq_len = curr_seq.lit_length.saturating_add(curr_seq.match_length);
             if curr_pos >= seq_len {
                 curr_pos -= seq_len;
@@ -3486,7 +3448,7 @@ impl HcMatchGenerator {
             opt_ldm.end_pos_in_block = usize::MAX;
             return;
         }
-        let curr_seq = self.ldm_sequences[opt_ldm.seq_store.pos];
+        let curr_seq = self.bt.ldm_sequences[opt_ldm.seq_store.pos];
         let curr_block_end_pos = curr_pos_in_block.saturating_add(block_bytes_remaining);
         let literals_bytes_remaining = curr_seq
             .lit_length
@@ -3575,7 +3537,7 @@ impl HcMatchGenerator {
     }
 
     fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
-        self.ldm_sequences.clear();
+        self.bt.ldm_sequences.clear();
         let _ = (current_abs_start, current_len);
         // Donor parity: btopt/btultra/btultra2 only merge LDM candidates when
         // a real ldmSeqStore exists (`enableLdm == ZSTD_ps_enable`).
@@ -5134,11 +5096,11 @@ fn btultra2_seed_pass_initializes_opt_state() {
     hc.add_data(data, |_| {});
     hc.start_matching(|_| {});
     assert!(
-        hc.opt_state.lit_length_sum > 0,
+        hc.bt.opt_state.lit_length_sum > 0,
         "btultra2 first block should seed non-zero sequence statistics"
     );
     assert!(
-        hc.opt_state.off_code_sum > 0,
+        hc.bt.opt_state.off_code_sum > 0,
         "btultra2 first block should seed offset-code statistics"
     );
 }
@@ -5234,7 +5196,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
 
-    hc.opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
@@ -5245,15 +5207,15 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     ];
 
     assert_ne!(
-        hc.opt_state.lit_length_freq, base_ll_freqs,
+        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
         "dictionary entropy should override fallback LL bootstrap frequencies"
     );
     assert!(
-        hc.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
         "dictionary entropy should seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.opt_state.off_code_freq[0], 6,
+        hc.bt.opt_state.off_code_freq[0], 6,
         "dictionary entropy should override fallback OF bootstrap frequencies"
     );
 }
@@ -5267,7 +5229,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
-    hc.opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
@@ -5277,15 +5239,15 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
         1, 1, 1, 1, 1, 1,
     ];
     assert_ne!(
-        hc.opt_state.lit_length_freq, base_ll_freqs,
+        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
         "FSE seed should still override LL bootstrap frequencies without huffman seed"
     );
     assert!(
-        hc.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
         "FSE seed should still seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.opt_state.off_code_freq[0], 6,
+        hc.bt.opt_state.off_code_freq[0], 6,
         "FSE seed should still override OF bootstrap frequencies without huffman seed"
     );
 }
@@ -5299,12 +5261,12 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
-    hc.opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abc",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
     assert!(
-        matches!(hc.opt_state.price_type, HcOptPriceType::Dynamic),
+        matches!(hc.bt.opt_state.price_type, HcOptPriceType::Dynamic),
         "dictionary-seeded first block should stay in dynamic mode even for tiny src"
     );
 }
@@ -5384,7 +5346,7 @@ fn btultra2_seed_pass_disabled_for_tiny_block() {
 fn btultra2_seed_pass_disabled_after_stats_initialized() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(BTULTRA2_HC_CONFIG, 26);
-    hc.opt_state.lit_length_sum = 1;
+    hc.bt.opt_state.lit_length_sum = 1;
     assert!(
         !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup should run only for first block before stats are initialized"
@@ -5415,7 +5377,7 @@ fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
     hc.table
         .window
         .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 64]);
-    hc.ldm_sequences.push(HcRawSeq {
+    hc.bt.ldm_sequences.push(HcRawSeq {
         lit_length: 8,
         offset: 16,
         match_length: 32,
