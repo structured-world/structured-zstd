@@ -22,6 +22,7 @@ pub(crate) mod cost_model;
 pub(crate) mod hc;
 pub(crate) mod match_table;
 pub(crate) mod opt;
+pub(crate) mod row;
 pub(crate) mod strategy;
 
 mod frame_compressor;
