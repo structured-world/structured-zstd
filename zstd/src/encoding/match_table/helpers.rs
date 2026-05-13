@@ -1,14 +1,50 @@
-//! Shared helpers consumed by every match finder (Simple / Dfast / Row /
-//! Hc). Extracted from `match_generator.rs` as part of #111 Phase 1b so
-//! later commits can move each matcher into its own module without
-//! duplicating these primitives.
+//! Shared helpers and constants consumed by every match finder (Simple
+//! / Dfast / Row / Hc). Extracted from `match_generator.rs` as part of
+//! #111 Phase 1b so later commits can move each matcher into its own
+//! module without duplicating these primitives.
+//!
+//! Phase 1c additionally hosts `common_prefix_len` and the shared
+//! match-finder constants (`MIN_MATCH_LEN`, `FAST_HASH_FILL_STEP`,
+//! `INCOMPRESSIBLE_SKIP_STEP`) here so the per-matcher modules
+//! (`simple`, `dfast`, `row`) depend on this shared infra rather than on
+//! each other — breaking the `match_generator` ↔ `simple` reverse
+//! dependency the original Phase 1c split introduced.
 //!
 //! Mechanical move — names, signatures, and bodies are byte-for-byte
 //! identical to the pre-extraction monolith; the only intentional API
 //! change is `pub(crate)` visibility on the moved items.
 
 use super::super::opt::types::MatchCandidate;
-use super::super::simple::MatchGenerator;
+
+/// Minimum match length emitted by the Simple / level-1 matcher (and the
+/// donor `ZSTD_fast.c` baseline). Lives here so every matcher and the
+/// `match_generator` driver can reference the shared minimum without
+/// importing one matcher module from another.
+pub(crate) const MIN_MATCH_LEN: usize = 5;
+/// Hash-fill stride used by the Simple / level-1 fast pass when
+/// backfilling the suffix store. Donor parity: matches
+/// `ZSTD_FAST_HASH_FILL_STEP` in `zstd_fast.c`.
+pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
+/// Sparse step used when a block was determined to be incompressible —
+/// every matcher inserts hash entries with this stride instead of the
+/// per-byte dense pattern so the rest of the block costs less CPU.
+pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+
+/// Length of the common prefix of two byte slices, capped at
+/// `min(a.len(), b.len())`. Hot path on every match finder; dispatches to
+/// the per-CPU `common_prefix_len_ptr` kernel (NEON / SSE4.2 / AVX2+BMI2 /
+/// scalar) so the SIMD/CRC heavy lifting lives in one place. See
+/// [`crate::encoding::fastpath`] for the per-CPU implementations.
+#[inline(always)]
+pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let max = a.len().min(b.len());
+    // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
+    // bytes; `max` is the minimum so both pointers are valid for `max`
+    // bytes.
+    unsafe {
+        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
+    }
+}
 
 /// Pick the better of two candidate matches: longer wins, ties go to
 /// the smaller offset (cheaper to encode and better for decompression
@@ -120,10 +156,8 @@ pub(crate) fn repcode_candidate_shared(
                 let candidate_pos = abs_pos - rep;
                 if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    let match_len = MatchGenerator::common_prefix_len(
-                        &concat[candidate_idx..],
-                        &concat[current_idx..],
-                    );
+                    let match_len =
+                        common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
                     if match_len >= min_match_len {
                         let candidate = extend_backwards_shared(
                             concat,

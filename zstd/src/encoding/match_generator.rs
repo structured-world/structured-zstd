@@ -22,6 +22,9 @@ use super::cost_model::{
 #[cfg(test)]
 use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOptPriceType};
 use super::dfast::DfastMatchGenerator;
+#[cfg(test)]
+use super::match_table::helpers::FAST_HASH_FILL_STEP;
+use super::match_table::helpers::{INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN, common_prefix_len};
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{
     HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
@@ -44,9 +47,6 @@ use std::arch::is_aarch64_feature_detected;
 ))]
 use std::arch::is_x86_feature_detected;
 
-pub(crate) const MIN_MATCH_LEN: usize = 5;
-pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
-pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
@@ -4538,8 +4538,7 @@ impl HcMatchGenerator {
                 break;
             }
             let candidate_idx = candidate_abs - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_abs, abs_pos, match_len, lit_len);
                 best = Self::better_candidate(best, Some(candidate));
@@ -4582,8 +4581,7 @@ impl HcMatchGenerator {
                 continue;
             }
             let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = Self::better_candidate(best, Some(candidate));
@@ -6775,7 +6773,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
             let a = &base[start..];
             let b = a.to_vec();
             assert_eq!(
-                MatchGenerator::common_prefix_len(a, &b),
+                common_prefix_len(a, &b),
                 scalar_reference(a, &b),
                 "equal slices total_len={total_len} start={start}"
             );
@@ -6788,7 +6786,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0x5A;
                 assert_eq!(
-                    MatchGenerator::common_prefix_len(a, &altered),
+                    common_prefix_len(a, &altered),
                     scalar_reference(a, &altered),
                     "total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -6799,7 +6797,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0xA5;
                 assert_eq!(
-                    MatchGenerator::common_prefix_len(a, &altered),
+                    common_prefix_len(a, &altered),
                     scalar_reference(a, &altered),
                     "tail mismatch total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -6810,7 +6808,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
     let long = alloc::vec![0xAB; 320];
     let shorter = alloc::vec![0xAB; 137];
     assert_eq!(
-        MatchGenerator::common_prefix_len(&long, &shorter),
+        common_prefix_len(&long, &shorter),
         scalar_reference(&long, &shorter)
     );
 }

@@ -20,7 +20,9 @@ use core::num::NonZeroUsize;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-use super::match_generator::{FAST_HASH_FILL_STEP, INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN};
+use super::match_table::helpers::{
+    FAST_HASH_FILL_STEP, INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN, common_prefix_len,
+};
 
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
@@ -186,7 +188,7 @@ impl MatchGenerator {
                     let match_slice = &match_entry.data[match_index..];
 
                     // Check how long the common prefix actually is
-                    let match_len = Self::common_prefix_len(match_slice, data_slice);
+                    let match_len = common_prefix_len(match_slice, data_slice);
 
                     // Collisions in the suffix store might make this check fail
                     if match_len >= MIN_MATCH_LEN {
@@ -247,21 +249,6 @@ impl MatchGenerator {
                 last_entry.suffixes.insert(key, self.suffix_idx);
             }
             self.suffix_idx += 1;
-        }
-    }
-
-    /// Find the common prefix length between two byte slices. Delegates to
-    /// the fastpath dispatcher so kernel selection (NEON / SSE4.2 /
-    /// AVX2+BMI2 / scalar) lives in one place. See
-    /// [`crate::encoding::fastpath`] for the per-CPU implementations.
-    #[inline(always)]
-    pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-        let max = a.len().min(b.len());
-        // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
-        // bytes; `max` is the minimum so both pointers are valid for `max`
-        // bytes.
-        unsafe {
-            crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
         }
     }
 
@@ -420,7 +407,7 @@ impl MatchGenerator {
         let match_entry = &self.window[entry_idx];
         let match_slice = &match_entry.data[match_index..];
 
-        Some(Self::common_prefix_len(match_slice, data_slice))
+        Some(common_prefix_len(match_slice, data_slice))
     }
 
     /// Skip matching for the whole current window entry.
