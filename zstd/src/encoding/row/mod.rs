@@ -18,14 +18,15 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::match_generator::{
-    INCOMPRESSIBLE_SKIP_STEP, MatchGenerator, ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN,
-    ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH, ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
+    INCOMPRESSIBLE_SKIP_STEP, ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG,
+    ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH, ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
 };
 use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared, pick_lazy_match_shared,
     repcode_candidate_shared,
 };
 use super::opt::types::MatchCandidate;
+use super::simple::MatchGenerator;
 
 pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,

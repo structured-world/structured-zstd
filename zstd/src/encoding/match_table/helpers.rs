@@ -7,8 +7,8 @@
 //! identical to the pre-extraction monolith; the only intentional API
 //! change is `pub(crate)` visibility on the moved items.
 
-use super::super::match_generator::MatchGenerator;
 use super::super::opt::types::MatchCandidate;
+use super::super::simple::MatchGenerator;
 
 /// Pick the better of two candidate matches: longer wins, ties go to
 /// the smaller offset (cheaper to encode and better for decompression

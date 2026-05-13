@@ -20,13 +20,14 @@ use super::incompressible::{block_looks_incompressible, block_looks_incompressib
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
     DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_SEARCH_DEPTH, DFAST_SHORT_HASH_LOOKAHEAD,
-    DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG, MatchGenerator,
+    DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared, pick_lazy_match_shared,
     repcode_candidate_shared,
 };
 use super::opt::types::MatchCandidate;
+use super::simple::MatchGenerator;
 
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
