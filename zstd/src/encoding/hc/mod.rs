@@ -287,6 +287,212 @@ impl HcMatcher {
         Some(best)
     }
 
+    /// Cross-platform dispatcher for the rep-code probe used by the
+    /// optimal-parser pipeline. Routes to the kernel-specific variant
+    /// so the per-rep `common_prefix_len_ptr` call inlines under the
+    /// callee's `target_feature` umbrella. Test / external callers
+    /// only — the on-encode hot path bypasses this dispatcher via the
+    /// kernel-specific variants invoked from inside
+    /// `collect_optimal_candidates_initialized_<kernel>`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_each_repcode_candidate_with_reps(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        f: impl FnMut(MatchCandidate),
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of
+        // the callee (same shape as the BT walk dispatchers).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.for_each_repcode_candidate_with_reps_neon(
+                table,
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_avx2_bmi2(
+                        table,
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_sse42(
+                        table,
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Scalar => self.for_each_repcode_candidate_with_reps_scalar(
+                    table,
+                    abs_pos,
+                    lit_len,
+                    reps,
+                    current_abs_end,
+                    min_match_len,
+                    f,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.for_each_repcode_candidate_with_reps_scalar(
+                table,
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+    }
+
+    /// NEON umbrella variant of the rep-code probe.
+    ///
+    /// # Safety
+    /// Caller must be running on an AArch64 target with NEON
+    /// available (baseline on AArch64).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_neon(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        crate::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    /// SSE4.2 umbrella variant.
+    ///
+    /// # Safety
+    /// Caller must be running on x86/x86_64 with SSE4.2 available.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_sse42(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        crate::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    ///
+    /// # Safety
+    /// Caller must be running on x86/x86_64 with AVX2 + BMI2 available.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_avx2_bmi2(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        crate::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_each_repcode_candidate_with_reps_scalar(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        crate::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
+    }
+
     /// Walk a candidate match backwards over the literal run so the
     /// matcher can absorb literal bytes that happen to match the byte
     /// preceding the candidate. Donor parity: equivalent to the back
