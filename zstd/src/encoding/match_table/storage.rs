@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
 use super::super::cost_model::HcOptimalCostProfile;
+use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
+use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
@@ -1079,6 +1081,117 @@ impl MatchTable {
                 break;
             }
             pos = next;
+        }
+    }
+
+    /// Backfill the last `< 4` bytes of the previous slice (which couldn't
+    /// be hashed at the time because `insert_position` needs 4 bytes of
+    /// lookahead) before the next slice's matching pass.
+    pub(crate) fn backfill_boundary_positions(
+        &mut self,
+        current_abs_start: usize,
+        current_abs_end: usize,
+    ) {
+        let backfill_start = current_abs_start
+            .saturating_sub(3)
+            .max(self.history_abs_start);
+        if backfill_start < current_abs_start {
+            if self.uses_bt {
+                self.bt_update_tree_until(current_abs_start, current_abs_end);
+            } else {
+                self.insert_positions(backfill_start, current_abs_start);
+            }
+        }
+    }
+
+    /// After a long BT match the optimal parser may have skipped a huge
+    /// stretch of `skip_insert_until_abs`. Cap the gap at 384 to bound
+    /// the worst-case BT tree update on the next match search.
+    pub(crate) fn apply_limited_update_after_long_match(&mut self, current_abs_start: usize) {
+        if !self.uses_bt {
+            return;
+        }
+        let gap = current_abs_start.saturating_sub(self.skip_insert_until_abs);
+        if gap > 384 {
+            self.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
+        }
+    }
+
+    /// BT-mode counterpart of the HC sparse skip path. Inserts every
+    /// `INCOMPRESSIBLE_SKIP_STEP`-th position through the BT walker
+    /// (which threads the binary tree) and then densely inserts the
+    /// final `HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP` positions so
+    /// the very last hashable starts are present for the next slice.
+    pub(crate) fn bt_insert_sparse_incompressible_block(
+        &mut self,
+        current_abs_start: usize,
+        current_abs_end: usize,
+    ) {
+        let mut pos = current_abs_start;
+        while pos < current_abs_end {
+            self.maybe_rebase_positions(pos);
+            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            self.insert_hash3_only_no_rebase(pos);
+            let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
+            if next <= pos {
+                break;
+            }
+            pos = next;
+        }
+
+        let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
+        let tail_start = current_abs_end
+            .saturating_sub(dense_tail)
+            .max(self.history_abs_start)
+            .max(current_abs_start);
+        for pos in tail_start..current_abs_end {
+            if (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
+                continue;
+            }
+            self.maybe_rebase_positions(pos);
+            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            self.insert_hash3_only_no_rebase(pos);
+        }
+
+        self.skip_insert_until_abs = self.skip_insert_until_abs.max(current_abs_end);
+        self.next_to_update3 = self.next_to_update3.max(current_abs_end);
+    }
+
+    /// `skip_matching` body — backfill the slice boundary and then walk
+    /// the current slice in either dense or sparse mode (driven by the
+    /// `incompressible_hint`). BT and HC modes branch via `uses_bt`.
+    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+        self.ensure_tables();
+        let current_len = self.window.back().unwrap().len();
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        if self.uses_bt {
+            if incompressible_hint == Some(true) {
+                self.bt_insert_sparse_incompressible_block(current_abs_start, current_abs_end);
+                return;
+            }
+            self.bt_update_tree_until(current_abs_end, current_abs_end);
+            return;
+        }
+        if incompressible_hint == Some(true) {
+            self.insert_positions_with_step(
+                current_abs_start,
+                current_abs_end,
+                INCOMPRESSIBLE_SKIP_STEP,
+            );
+            let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
+            let tail_start = current_abs_end
+                .saturating_sub(dense_tail)
+                .max(self.history_abs_start);
+            let tail_start = tail_start.max(current_abs_start);
+            for pos in tail_start..current_abs_end {
+                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
+                    self.insert_position(pos);
+                }
+            }
+        } else {
+            self.insert_positions(current_abs_start, current_abs_end);
         }
     }
 

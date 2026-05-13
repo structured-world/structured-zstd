@@ -27,8 +27,10 @@ use super::dfast::DfastMatchGenerator;
 #[cfg(test)]
 use super::match_table::helpers::FAST_HASH_FILL_STEP;
 #[cfg(test)]
+use super::match_table::helpers::INCOMPRESSIBLE_SKIP_STEP;
+use super::match_table::helpers::MIN_MATCH_LEN;
+#[cfg(test)]
 use super::match_table::helpers::common_prefix_len;
-use super::match_table::helpers::{INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN};
 #[cfg(test)]
 use super::opt::ldm::HcRawSeq;
 use super::opt::ldm::{HcOptLdmState, HcRawSeqStore};
@@ -2380,105 +2382,8 @@ impl HcMatchGenerator {
 
     /// Backfill positions from the tail of the previous slice that couldn't be
     /// hashed at the time (insert_position needs 4 bytes of lookahead).
-    fn backfill_boundary_positions(&mut self, current_abs_start: usize, current_abs_end: usize) {
-        let backfill_start = current_abs_start
-            .saturating_sub(3)
-            .max(self.table.history_abs_start);
-        if backfill_start < current_abs_start {
-            if self.uses_bt_matchfinder() {
-                self.table
-                    .bt_update_tree_until(current_abs_start, current_abs_end);
-            } else {
-                self.table
-                    .insert_positions(backfill_start, current_abs_start);
-            }
-        }
-    }
-
-    fn apply_limited_update_after_long_match(&mut self, current_abs_start: usize) {
-        if !self.uses_bt_matchfinder() {
-            return;
-        }
-        let gap = current_abs_start.saturating_sub(self.table.skip_insert_until_abs);
-        if gap > 384 {
-            self.table.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
-        }
-    }
-
     fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
-        self.table.ensure_tables();
-        let current_len = self.table.window.back().unwrap().len();
-        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
-        let current_abs_end = current_abs_start + current_len;
-        self.backfill_boundary_positions(current_abs_start, current_abs_end);
-        if self.uses_bt_matchfinder() {
-            if incompressible_hint == Some(true) {
-                self.bt_insert_sparse_incompressible_block(current_abs_start, current_abs_end);
-                return;
-            }
-            self.table
-                .bt_update_tree_until(current_abs_end, current_abs_end);
-            return;
-        }
-        if incompressible_hint == Some(true) {
-            self.table.insert_positions_with_step(
-                current_abs_start,
-                current_abs_end,
-                INCOMPRESSIBLE_SKIP_STEP,
-            );
-            let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
-            let tail_start = current_abs_end
-                .saturating_sub(dense_tail)
-                .max(self.table.history_abs_start);
-            let tail_start = tail_start.max(current_abs_start);
-            for pos in tail_start..current_abs_end {
-                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                    self.table.insert_position(pos);
-                }
-            }
-        } else {
-            self.table
-                .insert_positions(current_abs_start, current_abs_end);
-        }
-    }
-
-    fn bt_insert_sparse_incompressible_block(
-        &mut self,
-        current_abs_start: usize,
-        current_abs_end: usize,
-    ) {
-        let mut pos = current_abs_start;
-        while pos < current_abs_end {
-            self.table.maybe_rebase_positions(pos);
-            let _ = self
-                .table
-                .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
-            self.table.insert_hash3_only_no_rebase(pos);
-            let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
-            if next <= pos {
-                break;
-            }
-            pos = next;
-        }
-
-        let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
-        let tail_start = current_abs_end
-            .saturating_sub(dense_tail)
-            .max(self.table.history_abs_start)
-            .max(current_abs_start);
-        for pos in tail_start..current_abs_end {
-            if (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                continue;
-            }
-            self.table.maybe_rebase_positions(pos);
-            let _ = self
-                .table
-                .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
-            self.table.insert_hash3_only_no_rebase(pos);
-        }
-
-        self.table.skip_insert_until_abs = self.table.skip_insert_until_abs.max(current_abs_end);
-        self.table.next_to_update3 = self.table.next_to_update3.max(current_abs_end);
+        self.table.skip_matching(incompressible_hint);
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -2500,7 +2405,8 @@ impl HcMatchGenerator {
 
         let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
-        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        self.table
+            .backfill_boundary_positions(current_abs_start, current_abs_end);
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
@@ -2562,12 +2468,14 @@ impl HcMatchGenerator {
 
         let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
-        self.apply_limited_update_after_long_match(current_abs_start);
+        self.table
+            .apply_limited_update_after_long_match(current_abs_start);
         let hash3_start_cursor = self
             .table
             .skip_insert_until_abs
             .max(self.table.history_abs_start);
-        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        self.table
+            .backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
         self.bt
             .prepare_ldm_candidates(current_abs_start, current_len);
@@ -2941,7 +2849,7 @@ impl HcMatchGenerator {
         out: &mut Vec<MatchCandidate>,
     ) {
         self.table.ensure_tables();
-        if self.uses_bt_matchfinder() {
+        if self.table.uses_bt {
             self.collect_optimal_candidates_initialized::<true>(
                 abs_pos,
                 current_abs_end,
@@ -3146,10 +3054,6 @@ impl HcMatchGenerator {
             hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
         )
-    }
-
-    fn uses_bt_matchfinder(&self) -> bool {
-        self.table.uses_bt
     }
 
     /// Stage D: mirrored onto [`MatchTable::is_btultra2`] during
