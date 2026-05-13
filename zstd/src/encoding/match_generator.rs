@@ -74,17 +74,16 @@ pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
 const HC_PRIME3BYTES: u32 = 506_832_829;
 const HC_PRIME4BYTES: u32 = 2_654_435_761;
 
-const HC_HASH_LOG: usize = 20;
-const HC_CHAIN_LOG: usize = 19;
-const HC3_HASH_LOG: usize = 17;
+// HC_HASH_LOG / HC_CHAIN_LOG / HC3_HASH_LOG / HC_EMPTY live on the
+// shared storage module so MatchTable methods can reference them
+// without pulling in this module. Re-imported here so existing
+// macros / configs / tests keep their unqualified names.
+use super::match_table::storage::{HC_CHAIN_LOG, HC_EMPTY, HC_HASH_LOG, HC3_HASH_LOG};
 const HC3_MAX_OFFSET: usize = 1 << 18;
 const HC_SEARCH_DEPTH: usize = 16;
 const HC_MIN_MATCH_LEN: usize = 4;
 const HC_OPT_MIN_MATCH_LEN: usize = HC_FORMAT_MINMATCH;
 const HC_TARGET_LEN: usize = 48;
-// Positions are stored as (relative_pos + 1) so that 0 is a safe empty
-// sentinel that can never collide with any valid position.
-const HC_EMPTY: u32 = 0;
 
 // Maximum search depth across all HC-based levels. Used to size the
 // fixed-length candidate array returned by chain_candidates().
@@ -627,8 +626,14 @@ impl Matcher for MatchGeneratorDriver {
                     if let Some(hc) = self.hc_match_generator.as_mut() {
                         // Release oversized tables when switching away from
                         // HashChain so Best's larger allocations don't persist.
+                        // hash3_table must be released alongside the other two —
+                        // otherwise BtUltra2's 1 << HC3_HASH_LOG entries stay
+                        // pinned, and the empty-guard in `MatchTable::reset`
+                        // (`if !hash_table.is_empty()`) skips clearing them on
+                        // the next frame too.
                         hc.table.hash_table = Vec::new();
                         hc.table.chain_table = Vec::new();
+                        hc.table.hash3_table = Vec::new();
                         let vec_pool = &mut self.vec_pool;
                         hc.reset(|mut data| {
                             data.resize(data.capacity(), 0);
