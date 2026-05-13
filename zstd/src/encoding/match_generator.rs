@@ -981,24 +981,60 @@ impl Matcher for MatchGeneratorDriver {
     }
 }
 
+/// Stage D: backend storage discriminator.
+///
+/// HC (lazy / lazy2) modes carry no extra per-frame state beyond the
+/// shared `MatchTable` and `HcMatcher` runtime knobs, so the
+/// [`HcBackend::Hc`] variant is zero-sized — no BT scratch is
+/// allocated. BT-flavoured modes (`btopt` / `btultra` / `btultra2`)
+/// hold the full [`super::bt::BtMatcher`] inside the
+/// [`HcBackend::Bt`] variant (cost model, optimal-parser scratch
+/// arenas, LDM candidate buffer).
+///
+/// The discriminator lives next to `parse_mode` so `configure()` can
+/// promote between the two on a level change without touching the
+/// `MatchTable` storage.
+pub(crate) enum HcBackend {
+    /// Lazy / lazy2 modes — no per-frame backend state.
+    Hc,
+    /// BT-driven modes — owns the optimal parser's per-frame scratch.
+    /// Boxed so the enum stays pointer-sized: HC-only matchers pay
+    /// just the `Box`-niche, not the 4 KiB `BtMatcher` payload.
+    Bt(alloc::boxed::Box<super::bt::BtMatcher>),
+}
+
+impl HcBackend {
+    /// Mutable accessor on the BT matcher; panics if the active
+    /// backend is `Hc`. The HC-or-Bt branches in orchestrator code use
+    /// `let HcBackend::Bt(bt) = &self.backend` directly for readonly
+    /// access — this helper exists so macro bodies that already drive
+    /// a mutable BT update through the optimal parser can write
+    /// `$self.backend.bt_mut().X` without an outer `match` ladder.
+    #[inline(always)]
+    pub(crate) fn bt_mut(&mut self) -> &mut super::bt::BtMatcher {
+        match self {
+            Self::Bt(bt) => bt,
+            Self::Hc => unreachable!("BT-only accessor called in HC mode"),
+        }
+    }
+}
+
 struct HcMatchGenerator {
     /// Shared match-finder storage (window, history, hash / chain /
     /// hash3 tables, dictionary-priming flags). Used identically by HC
     /// and BT modes; backend-specific table interpretation lives in the
     /// matcher methods on this struct.
     table: super::match_table::storage::MatchTable,
-    /// HC (lazy / lazy2) runtime knobs. Owns lazy_depth, search_depth,
-    /// target_len; method bodies still live on this struct but will
-    /// move onto `impl HcMatcher` once Stage 2b threads `&mut MatchTable`
-    /// through the chain-walk path.
+    /// HC runtime knobs (lazy_depth, search_depth, target_len). Always
+    /// present — BT modes still consult `hc.search_depth` for repcode
+    /// probing and chain candidate enumeration.
     hc: super::hc::HcMatcher,
     parse_mode: HcParseMode,
-    /// BT (btopt / btultra / btultra2) runtime state — cost model,
-    /// optimal-parser scratch arenas, LDM candidate buffer. Method
-    /// bodies still live on this struct; they'll move onto
-    /// `impl BtMatcher` with `&mut MatchTable` threaded through in a
-    /// follow-up stage.
-    bt: super::bt::BtMatcher,
+    /// Backend discriminator. [`HcBackend::Hc`] is zero-sized for the
+    /// lazy / lazy2 path so HC-only generators don't carry the BT
+    /// optimal-parser scratch buffers. [`HcBackend::Bt`] holds the
+    /// `BtMatcher` when an optimal mode is configured.
+    backend: HcBackend,
 }
 
 // Plain-data types relocated to [`crate::encoding::opt::types`] and
@@ -1159,35 +1195,52 @@ macro_rules! build_optimal_plan_impl_body {
             $self.parse_mode,
             HcParseMode::BtUltra | HcParseMode::BtUltra2
         );
-        let mut nodes = core::mem::take(&mut $self.bt.opt_nodes_scratch);
+        let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
         if nodes.len() < frontier_limit.saturating_add(2) {
             nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
         }
-        let mut candidates = core::mem::take(&mut $self.bt.opt_candidates_scratch);
+        let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
         candidates.clear();
         if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
             candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
         }
-        let mut store = core::mem::take(&mut $self.bt.opt_store_scratch);
+        let mut store = core::mem::take(&mut $self.backend.bt_mut().opt_store_scratch);
         store.clear();
-        let mut ll_prices = core::mem::take(&mut $self.bt.opt_ll_price_scratch);
-        let mut ll_price_generations = core::mem::take(&mut $self.bt.opt_ll_price_generation);
+        let mut ll_prices = core::mem::take(&mut $self.backend.bt_mut().opt_ll_price_scratch);
+        let mut ll_price_generations =
+            core::mem::take(&mut $self.backend.bt_mut().opt_ll_price_generation);
         if ll_prices.len() <= frontier_limit {
             ll_prices.resize(frontier_limit + 1, 0);
             ll_price_generations.resize(frontier_limit + 1, 0);
         }
-        $self.bt.opt_ll_price_stamp = $self.bt.opt_ll_price_stamp.wrapping_add(1).max(1);
-        let ll_price_stamp = $self.bt.opt_ll_price_stamp;
-        $self.bt.opt_lit_price_stamp = $self.bt.opt_lit_price_stamp.wrapping_add(1).max(1);
-        let lit_price_stamp = $self.bt.opt_lit_price_stamp;
-        let mut ml_prices = core::mem::take(&mut $self.bt.opt_ml_price_scratch);
-        let mut ml_price_generations = core::mem::take(&mut $self.bt.opt_ml_price_generation);
+        $self.backend.bt_mut().opt_ll_price_stamp = $self
+            .backend
+            .bt_mut()
+            .opt_ll_price_stamp
+            .wrapping_add(1)
+            .max(1);
+        let ll_price_stamp = $self.backend.bt_mut().opt_ll_price_stamp;
+        $self.backend.bt_mut().opt_lit_price_stamp = $self
+            .backend
+            .bt_mut()
+            .opt_lit_price_stamp
+            .wrapping_add(1)
+            .max(1);
+        let lit_price_stamp = $self.backend.bt_mut().opt_lit_price_stamp;
+        let mut ml_prices = core::mem::take(&mut $self.backend.bt_mut().opt_ml_price_scratch);
+        let mut ml_price_generations =
+            core::mem::take(&mut $self.backend.bt_mut().opt_ml_price_generation);
         if ml_prices.len() <= frontier_limit {
             ml_prices.resize(frontier_limit + 1, 0);
             ml_price_generations.resize(frontier_limit + 1, 0);
         }
-        $self.bt.opt_ml_price_stamp = $self.bt.opt_ml_price_stamp.wrapping_add(1).max(1);
-        let ml_price_stamp = $self.bt.opt_ml_price_stamp;
+        $self.backend.bt_mut().opt_ml_price_stamp = $self
+            .backend
+            .bt_mut()
+            .opt_ml_price_stamp
+            .wrapping_add(1)
+            .max(1);
+        let ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
         nodes[0] = HcOptimalNode {
             price: BtMatcher::cached_lit_length_price(
                 profile,
@@ -1227,14 +1280,15 @@ macro_rules! build_optimal_plan_impl_body {
             seq_store: HcRawSeqStore {
                 pos: 0,
                 pos_in_sequence: 0,
-                size: $self.bt.ldm_sequences.len(),
+                size: $self.backend.bt_mut().ldm_sequences.len(),
             },
             ..HcOptLdmState::default()
         };
-        let has_ldm = !$self.bt.ldm_sequences.is_empty();
+        let has_ldm = !$self.backend.bt_mut().ldm_sequences.is_empty();
         if has_ldm {
             $self
-                .bt
+                .backend
+                .bt_mut()
                 .ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
         }
 
@@ -1242,9 +1296,12 @@ macro_rules! build_optimal_plan_impl_body {
         // at current position before entering the generic forward DP loop.
         if $current_len >= min_match_len {
             let seed_ldm = if has_ldm {
-                $self
-                    .bt
-                    .ldm_process_match_candidate(&mut opt_ldm, 0, $current_len, min_match_len)
+                $self.backend.bt_mut().ldm_process_match_candidate(
+                    &mut opt_ldm,
+                    0,
+                    $current_len,
+                    min_match_len,
+                )
             } else {
                 None
             };
@@ -1378,14 +1435,17 @@ macro_rules! build_optimal_plan_impl_body {
             let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
             if prev_node.price != u32::MAX {
                 let lit_len = prev_node.litlen as usize + 1;
-                let lit_price = BtMatcher::cached_literal_price(
-                    profile,
-                    $stats,
-                    $current[pos - 1],
-                    &mut $self.bt.opt_lit_price_scratch,
-                    &mut $self.bt.opt_lit_price_generation,
-                    lit_price_stamp,
-                );
+                let lit_price = {
+                    let bt = $self.backend.bt_mut();
+                    BtMatcher::cached_literal_price(
+                        profile,
+                        $stats,
+                        $current[pos - 1],
+                        &mut bt.opt_lit_price_scratch,
+                        &mut bt.opt_lit_price_generation,
+                        lit_price_stamp,
+                    )
+                };
                 let ll_delta = BtMatcher::cached_lit_length_delta_price(
                     profile,
                     $stats,
@@ -1409,14 +1469,17 @@ macro_rules! build_optimal_plan_impl_body {
                         && pos < $current_len
                     {
                         if ll1_price < ll0_price {
-                            let next_lit_price = BtMatcher::cached_literal_price(
-                                profile,
-                                $stats,
-                                $current[pos],
-                                &mut $self.bt.opt_lit_price_scratch,
-                                &mut $self.bt.opt_lit_price_generation,
-                                lit_price_stamp,
-                            );
+                            let next_lit_price = {
+                                let bt = $self.backend.bt_mut();
+                                BtMatcher::cached_literal_price(
+                                    profile,
+                                    $stats,
+                                    $current[pos],
+                                    &mut bt.opt_lit_price_scratch,
+                                    &mut bt.opt_lit_price_generation,
+                                    lit_price_stamp,
+                                )
+                            };
                             let with1literal = BtMatcher::add_price_delta(
                                 prev_match.price,
                                 next_lit_price,
@@ -1501,7 +1564,7 @@ macro_rules! build_optimal_plan_impl_body {
 
             let abs_pos = $current_abs_start + pos;
             let ldm_candidate = if has_ldm {
-                $self.bt.ldm_process_match_candidate(
+                $self.backend.bt_mut().ldm_process_match_candidate(
                     &mut opt_ldm,
                     pos,
                     $current_len - pos,
@@ -1639,7 +1702,7 @@ macro_rules! build_optimal_plan_impl_body {
         if last_pos == 0 {
             if $current_len == 0 {
                 let price = nodes[0].price;
-                return $self.bt.finish_optimal_plan(
+                return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
                         candidates,
@@ -1652,14 +1715,17 @@ macro_rules! build_optimal_plan_impl_body {
                     (price, initial_reps, initial_litlen, 0),
                 );
             }
-            let lit_price = BtMatcher::cached_literal_price(
-                profile,
-                $stats,
-                $current[0],
-                &mut $self.bt.opt_lit_price_scratch,
-                &mut $self.bt.opt_lit_price_generation,
-                lit_price_stamp,
-            );
+            let lit_price = {
+                let bt = $self.backend.bt_mut();
+                BtMatcher::cached_literal_price(
+                    profile,
+                    $stats,
+                    $current[0],
+                    &mut bt.opt_lit_price_scratch,
+                    &mut bt.opt_lit_price_generation,
+                    lit_price_stamp,
+                )
+            };
             let next_litlen = initial_litlen.saturating_add(1);
             let ll_delta = BtMatcher::cached_lit_length_delta_price(
                 profile,
@@ -1670,7 +1736,7 @@ macro_rules! build_optimal_plan_impl_body {
                 ll_price_stamp,
             );
             let price = BtMatcher::add_price_delta(nodes[0].price, lit_price, ll_delta);
-            return $self.bt.finish_optimal_plan(
+            return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1691,7 +1757,7 @@ macro_rules! build_optimal_plan_impl_body {
             nodes[target_pos]
         };
         if last_stretch.price == u32::MAX {
-            return $self.bt.finish_optimal_plan(
+            return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1706,7 +1772,7 @@ macro_rules! build_optimal_plan_impl_body {
         }
 
         if last_stretch.mlen == 0 {
-            return $self.bt.finish_optimal_plan(
+            return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1737,7 +1803,7 @@ macro_rules! build_optimal_plan_impl_body {
         } else {
             let tail_literals = last_stretch.litlen as usize;
             if cur < tail_literals {
-                return $self.bt.finish_optimal_plan(
+                return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
                         candidates,
@@ -1824,7 +1890,7 @@ macro_rules! build_optimal_plan_impl_body {
             },
             target_pos.min($current_len),
         );
-        $self.bt.finish_optimal_plan(
+        $self.backend.bt_mut().finish_optimal_plan(
             HcOptimalPlanBuffers {
                 nodes,
                 candidates,
@@ -1936,8 +2002,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
             // SAFETY: same umbrella for hash3_candidate.
             if let Some(h3) = unsafe {
                 $self
-                    .bt
-                    .$hash3(&$self.table, $abs_pos, $current_abs_end, min_match_len)
+                    .table
+                    .$hash3($abs_pos, $current_abs_end, min_match_len)
             } {
                 let _ = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
@@ -2306,11 +2372,14 @@ macro_rules! bt_insert_and_collect_matches_body {
 
 impl HcMatchGenerator {
     fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
+        let HcBackend::Bt(bt) = &self.backend else {
+            return false;
+        };
         self.is_btultra2()
-            && self.bt.opt_state.lit_length_sum == 0
-            && self.bt.opt_state.dictionary_seed.is_none()
+            && bt.opt_state.lit_length_sum == 0
+            && bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
-            && self.bt.ldm_sequences.is_empty()
+            && bt.ldm_sequences.is_empty()
             && self.table.window_size == current_len
             && self.table.history_abs_start == 0
             && self.table.window.len() == 1
@@ -2322,7 +2391,9 @@ impl HcMatchGenerator {
             table: super::match_table::storage::MatchTable::new(max_window_size),
             hc: super::hc::HcMatcher::new(2, HC_SEARCH_DEPTH, HC_TARGET_LEN),
             parse_mode: HcParseMode::Lazy2,
-            bt: super::bt::BtMatcher::new(),
+            // Default to the zero-sized HC backend; `configure()` swaps
+            // in a `BtMatcher` only when an optimal parse mode lands.
+            backend: HcBackend::Hc,
         }
     }
 
@@ -2357,6 +2428,18 @@ impl HcMatchGenerator {
             config.parse_mode,
             HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
         );
+        // Stage D: promote the backend discriminator. HC modes drop the
+        // BT scratch buffers entirely; switching back into a BT mode
+        // allocates a fresh `BtMatcher` on demand.
+        match (&self.backend, self.table.uses_bt) {
+            (HcBackend::Hc, true) => {
+                self.backend = HcBackend::Bt(alloc::boxed::Box::new(super::bt::BtMatcher::new()));
+            }
+            (HcBackend::Bt(_), false) => {
+                self.backend = HcBackend::Hc;
+            }
+            _ => {}
+        }
         if resize && !self.table.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
             self.table.hash_table.clear();
@@ -2372,12 +2455,16 @@ impl HcMatchGenerator {
         ml: Option<&crate::fse::fse_encoder::FSETable>,
         of: Option<&crate::fse::fse_encoder::FSETable>,
     ) {
-        self.bt.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
+        if let HcBackend::Bt(bt) = &mut self.backend {
+            bt.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
+        }
     }
 
     fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
         self.table.reset(reuse_space);
-        self.bt.reset();
+        if let HcBackend::Bt(bt) = &mut self.backend {
+            bt.reset();
+        }
     }
 
     /// Backfill positions from the tail of the previous slice that couldn't be
@@ -2477,7 +2564,8 @@ impl HcMatchGenerator {
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
-        self.bt
+        self.backend
+            .bt_mut()
             .prepare_ldm_candidates(current_abs_start, current_len);
 
         if self.should_run_btultra2_seed_pass(current_len) {
@@ -2490,9 +2578,10 @@ impl HcMatchGenerator {
         } else {
             HcOptimalCostProfile::for_mode(self.parse_mode, false)
         };
-        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
+        let mut opt_state =
+            core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, profile);
-        let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
+        let mut best_plan = core::mem::take(&mut self.backend.bt_mut().opt_segment_plan_scratch);
         best_plan.clear();
         let mut plan_reps = self.table.offset_hist;
         let (mut cursor, mut plan_litlen) = self
@@ -2533,8 +2622,8 @@ impl HcMatchGenerator {
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
         best_plan.clear();
-        self.bt.opt_segment_plan_scratch = best_plan;
-        self.bt.opt_state = opt_state;
+        self.backend.bt_mut().opt_segment_plan_scratch = best_plan;
+        self.backend.bt_mut().opt_state = opt_state;
     }
 
     fn run_btultra2_seed_pass(
@@ -2544,14 +2633,15 @@ impl HcMatchGenerator {
         current_len: usize,
     ) {
         let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
-        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
+        let mut opt_state =
+            core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
         let mut seed_reps = self.table.offset_hist;
         let (mut cursor, mut seed_litlen) = self
             .table
             .donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
-        let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
+        let mut seed_plan = core::mem::take(&mut self.backend.bt_mut().opt_seed_plan_scratch);
         seed_plan.clear();
         let match_loop_limit = current_len.saturating_sub(8);
         while cursor < match_loop_limit {
@@ -2585,8 +2675,8 @@ impl HcMatchGenerator {
             cursor += consumed_len;
         }
         seed_plan.clear();
-        self.bt.opt_seed_plan_scratch = seed_plan;
-        self.bt.opt_state = opt_state;
+        self.backend.bt_mut().opt_seed_plan_scratch = seed_plan;
+        self.backend.bt_mut().opt_state = opt_state;
 
         // Donor initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
@@ -3367,11 +3457,11 @@ fn btultra2_seed_pass_initializes_opt_state() {
     hc.table.add_data(data, |_| {});
     hc.start_matching(|_| {});
     assert!(
-        hc.bt.opt_state.lit_length_sum > 0,
+        hc.backend.bt_mut().opt_state.lit_length_sum > 0,
         "btultra2 first block should seed non-zero sequence statistics"
     );
     assert!(
-        hc.bt.opt_state.off_code_sum > 0,
+        hc.backend.bt_mut().opt_state.off_code_sum > 0,
         "btultra2 first block should seed offset-code statistics"
     );
 }
@@ -3467,7 +3557,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
 
-    hc.bt.opt_state.rescale_freqs(
+    hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
@@ -3478,15 +3568,22 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     ];
 
     assert_ne!(
-        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
+        hc.backend.bt_mut().opt_state.lit_length_freq,
+        base_ll_freqs,
         "dictionary entropy should override fallback LL bootstrap frequencies"
     );
     assert!(
-        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        hc.backend
+            .bt_mut()
+            .opt_state
+            .match_length_freq
+            .iter()
+            .any(|&v| v != 1),
         "dictionary entropy should seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.bt.opt_state.off_code_freq[0], 6,
+        hc.backend.bt_mut().opt_state.off_code_freq[0],
+        6,
         "dictionary entropy should override fallback OF bootstrap frequencies"
     );
 }
@@ -3500,7 +3597,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
-    hc.bt.opt_state.rescale_freqs(
+    hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
@@ -3510,15 +3607,22 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
         1, 1, 1, 1, 1, 1,
     ];
     assert_ne!(
-        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
+        hc.backend.bt_mut().opt_state.lit_length_freq,
+        base_ll_freqs,
         "FSE seed should still override LL bootstrap frequencies without huffman seed"
     );
     assert!(
-        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
+        hc.backend
+            .bt_mut()
+            .opt_state
+            .match_length_freq
+            .iter()
+            .any(|&v| v != 1),
         "FSE seed should still seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.bt.opt_state.off_code_freq[0], 6,
+        hc.backend.bt_mut().opt_state.off_code_freq[0],
+        6,
         "FSE seed should still override OF bootstrap frequencies without huffman seed"
     );
 }
@@ -3532,12 +3636,15 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
-    hc.bt.opt_state.rescale_freqs(
+    hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abc",
         HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
     );
     assert!(
-        matches!(hc.bt.opt_state.price_type, HcOptPriceType::Dynamic),
+        matches!(
+            hc.backend.bt_mut().opt_state.price_type,
+            HcOptPriceType::Dynamic
+        ),
         "dictionary-seeded first block should stay in dynamic mode even for tiny src"
     );
 }
@@ -3617,7 +3724,7 @@ fn btultra2_seed_pass_disabled_for_tiny_block() {
 fn btultra2_seed_pass_disabled_after_stats_initialized() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(BTULTRA2_HC_CONFIG, 26);
-    hc.bt.opt_state.lit_length_sum = 1;
+    hc.backend.bt_mut().opt_state.lit_length_sum = 1;
     assert!(
         !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup should run only for first block before stats are initialized"
@@ -3648,7 +3755,7 @@ fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
     hc.table
         .window
         .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 64]);
-    hc.bt.ldm_sequences.push(HcRawSeq {
+    hc.backend.bt_mut().ldm_sequences.push(HcRawSeq {
         lit_length: 8,
         offset: 16,
         match_length: 32,
@@ -4168,6 +4275,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     hc.table.is_btultra2 = true;
     hc.table.uses_bt = true;
     hc.table.search_depth = hc.hc.search_depth;
+    hc.backend = HcBackend::Bt(alloc::boxed::Box::new(super::bt::BtMatcher::new()));
     hc.table.dictionary_limit_abs = Some(64);
     hc.collect_optimal_candidates(
         abs_pos,

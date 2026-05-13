@@ -1195,6 +1195,127 @@ impl MatchTable {
         }
     }
 
+    /// Stage D: HC3 short-match probe. Cross-platform dispatcher.
+    /// External / test callers only — the on-encode hot path bypasses
+    /// this via the per-kernel variant from inside the surrounding
+    /// `collect_optimal_candidates_initialized_<kernel>` umbrella.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn hash3_candidate(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.hash3_candidate_neon(abs_pos, current_abs_end, min_match_len)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
+                },
+                FastpathKernel::Scalar => {
+                    self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
+        }
+    }
+
+    /// NEON umbrella HC3 probe.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline). Body inlines via macro.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn hash3_candidate_neon(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        crate::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    /// SSE4.2 umbrella HC3 probe.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    pub(crate) unsafe fn hash3_candidate_sse42(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        crate::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella HC3 probe.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 + BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    pub(crate) unsafe fn hash3_candidate_avx2_bmi2(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        crate::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    /// Scalar fallback HC3 probe (used on non-AArch64 targets).
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub(crate) fn hash3_candidate_scalar(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        crate::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
+    }
+
     pub(crate) fn begin_rebase(&mut self) {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
