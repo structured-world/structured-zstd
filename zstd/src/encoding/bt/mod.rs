@@ -842,4 +842,258 @@ impl BtMatcher {
         self.ldm_sequences.clear();
         let _ = (current_abs_start, current_len);
     }
+
+    /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
+    /// donor's compact offset base (1/2/3 for rep slots, otherwise
+    /// `actual_offset + 3`) and update the rolling `reps` window in
+    /// lock-step. Returns `(off_base, next_reps)`.
+    pub(crate) fn encode_offset_with_reps(
+        actual_offset: u32,
+        lit_len: usize,
+        reps: [u32; 3],
+    ) -> (u32, [u32; 3]) {
+        let mut next_reps = reps;
+        let encoded = if lit_len > 0 {
+            if actual_offset == reps[0] {
+                1
+            } else if actual_offset == reps[1] {
+                2
+            } else if actual_offset == reps[2] {
+                3
+            } else {
+                actual_offset.saturating_add(3)
+            }
+        } else if actual_offset == reps[1] {
+            1
+        } else if actual_offset == reps[2] {
+            2
+        } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
+            3
+        } else {
+            actual_offset.saturating_add(3)
+        };
+
+        if lit_len > 0 {
+            match encoded {
+                1 => {}
+                2 => {
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+                _ => {
+                    next_reps[2] = next_reps[1];
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+            }
+        } else {
+            match encoded {
+                1 => {
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+                _ => {
+                    next_reps[2] = next_reps[1];
+                    next_reps[1] = next_reps[0];
+                    next_reps[0] = actual_offset;
+                }
+            }
+        }
+
+        (encoded, next_reps)
+    }
+
+    /// `encode_offset_with_reps` minus the rep-history update — used in
+    /// the optimal parser's per-candidate price probe where the rep
+    /// window hasn't been committed yet.
+    #[inline(always)]
+    pub(crate) fn encode_offset_base_with_reps(
+        actual_offset: u32,
+        lit_len: usize,
+        reps: [u32; 3],
+    ) -> u32 {
+        if lit_len > 0 {
+            if actual_offset == reps[0] {
+                1
+            } else if actual_offset == reps[1] {
+                2
+            } else if actual_offset == reps[2] {
+                3
+            } else {
+                actual_offset.saturating_add(3)
+            }
+        } else if actual_offset == reps[1] {
+            1
+        } else if actual_offset == reps[2] {
+            2
+        } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
+            3
+        } else {
+            actual_offset.saturating_add(3)
+        }
+    }
+
+    /// Donor parity: replay an already-emitted plan segment through the
+    /// `optStatePtr_t` stats updater so the next parse pass sees frozen
+    /// counts. Pure static helper — only mutates the caller-owned
+    /// `opt_state` / `reps` / `literals_start`.
+    pub(crate) fn update_plan_stats_segment(
+        current: &[u8],
+        current_len: usize,
+        plan: &[HcOptimalSequence],
+        literals_start: &mut usize,
+        reps: &mut [u32; 3],
+        opt_state: &mut HcOptState,
+        accurate: bool,
+    ) {
+        if plan.is_empty() {
+            return;
+        }
+        for item in plan {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < *literals_start || start + match_len > current_len {
+                continue;
+            }
+            let literals = &current[*literals_start..start];
+            let (off_base, next_reps) =
+                Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
+            opt_state.update_stats(literals.len(), literals, off_base, match_len);
+            *reps = next_reps;
+            *literals_start = start + match_len;
+        }
+        opt_state.set_base_prices(accurate);
+    }
+
+    #[inline(always)]
+    pub(crate) fn reset_opt_nodes(nodes: &mut [HcOptimalNode], start: usize, end: usize) {
+        for node in &mut nodes[start..=end] {
+            Self::reset_opt_node(node);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
+        node.price = u32::MAX;
+        // Donor only marks the slot as unreachable and not end-of-match here;
+        // stale mlen is ignored while price is MAX and litlen is non-zero.
+        node.litlen = u32::MAX;
+    }
+
+    #[inline(always)]
+    pub(crate) fn add_price_delta(price: u32, add: u32, delta: i32) -> u32 {
+        #[cfg(debug_assertions)]
+        {
+            let sum = price as i64 + add as i64 + delta as i64;
+            debug_assert!((0..=u32::MAX as i64).contains(&sum));
+        }
+        price.wrapping_add(add).wrapping_add_signed(delta)
+    }
+
+    #[inline(always)]
+    pub(crate) fn add_prices(lhs: u32, rhs: u32) -> u32 {
+        let sum = lhs + rhs;
+        debug_assert!(sum >= lhs);
+        sum
+    }
+
+    #[inline(always)]
+    pub(crate) fn cached_literal_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        byte: u8,
+        prices: &mut [u32; HC_MAX_LIT + 1],
+        generations: &mut [u32; HC_MAX_LIT + 1],
+        stamp: u32,
+    ) -> u32 {
+        // SAFETY: `byte as usize` is `0..256` and the fixed-size arrays are
+        // `[u32; HC_MAX_LIT + 1 = 257]`, so the index is statically in bounds.
+        // Each cached_*_price call sits inside the optimal parser per-byte
+        // hot loop where these bounds checks are pure overhead.
+        let idx = byte as usize;
+        unsafe {
+            if *generations.get_unchecked(idx) == stamp {
+                return *prices.get_unchecked(idx);
+            }
+            let price = profile.literal_price(stats, byte);
+            *prices.get_unchecked_mut(idx) = price;
+            *generations.get_unchecked_mut(idx) = stamp;
+            price
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn cached_lit_length_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        lit_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> u32 {
+        if lit_len >= prices.len() {
+            return profile.lit_length_price(stats, lit_len);
+        }
+        // SAFETY: the early-return above proves `lit_len < prices.len()`. The
+        // matching `generations` slice is sized identically by the caller in
+        // `build_optimal_plan_impl` (`opt_ll_price_scratch` /
+        // `opt_ll_price_generation` are `resize`d together), so the same
+        // index is in bounds for both.
+        unsafe {
+            if *generations.get_unchecked(lit_len) == stamp {
+                return *prices.get_unchecked(lit_len);
+            }
+            let price = profile.lit_length_price(stats, lit_len);
+            *prices.get_unchecked_mut(lit_len) = price;
+            *generations.get_unchecked_mut(lit_len) = stamp;
+            price
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn cached_lit_length_delta_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        lit_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> i32 {
+        if lit_len == 0 {
+            return profile.lit_length_price(stats, lit_len) as i32
+                - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
+        }
+        let price =
+            Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);
+        let previous =
+            Self::cached_lit_length_price(profile, stats, lit_len - 1, prices, generations, stamp);
+        price as i32 - previous as i32
+    }
+
+    #[inline(always)]
+    pub(crate) fn cached_match_length_price(
+        profile: HcOptimalCostProfile,
+        stats: &HcOptState,
+        match_len: usize,
+        prices: &mut [u32],
+        generations: &mut [u32],
+        stamp: u32,
+    ) -> u32 {
+        if match_len >= prices.len() {
+            return profile.match_length_price(stats, match_len);
+        }
+        // SAFETY: see `cached_lit_length_price` — the caller co-sizes
+        // `opt_ml_price_scratch` and `opt_ml_price_generation`, and the
+        // early return proves `match_len < prices.len()`.
+        unsafe {
+            if *generations.get_unchecked(match_len) == stamp {
+                return *prices.get_unchecked(match_len);
+            }
+            let price = profile.match_length_price(stats, match_len);
+            *prices.get_unchecked_mut(match_len) = price;
+            *generations.get_unchecked_mut(match_len) = stamp;
+            price
+        }
+    }
 }
