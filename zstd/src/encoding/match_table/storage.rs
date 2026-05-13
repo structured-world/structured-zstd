@@ -569,7 +569,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        crate::bt_insert_step_no_rebase_body!(
+        super::super::match_generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -592,7 +592,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        crate::bt_insert_step_no_rebase_body!(
+        super::super::match_generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -615,7 +615,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        crate::bt_insert_step_no_rebase_body!(
+        super::super::match_generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -634,7 +634,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        crate::bt_insert_step_no_rebase_body!(
+        super::super::match_generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -739,7 +739,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        crate::bt_insert_and_collect_matches_body!(
+        super::super::match_generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -769,7 +769,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        crate::bt_insert_and_collect_matches_body!(
+        super::super::match_generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -799,7 +799,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        crate::bt_insert_and_collect_matches_body!(
+        super::super::match_generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -825,7 +825,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        crate::bt_insert_and_collect_matches_body!(
+        super::super::match_generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -1242,7 +1242,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        crate::hash3_candidate_body!(
+        super::super::match_generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -1263,7 +1263,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        crate::hash3_candidate_body!(
+        super::super::match_generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -1284,7 +1284,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        crate::hash3_candidate_body!(
+        super::super::match_generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -1301,7 +1301,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        crate::hash3_candidate_body!(
+        super::super::match_generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -1356,7 +1356,7 @@ impl MatchTable {
             let lit_len = item.lit_len as usize;
             let match_len = item.match_len as usize;
             let start = literals_start.saturating_add(lit_len);
-            if start < literals_start || start + match_len > current_len {
+            if start + match_len > current_len {
                 continue;
             }
             let literals = &current[literals_start..start];
@@ -1374,5 +1374,125 @@ impl MatchTable {
                 literals: &current[literals_start..],
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    //! Stage D coverage for `MatchTable` entry points that the
+    //! end-to-end compression path doesn't naturally hit on CI:
+    //!  * `set_dictionary_limit_from_primed_bytes(0)` — the "clear"
+    //!    branch is only entered when a dictionary frame is reset.
+    //!  * BT-mode incompressible-block skip path on `skip_matching`.
+    //!  * `replay_history_for_rebase_bt` — exercised only when the
+    //!    BT cursor crosses the rolling-rebase threshold (~`u32::MAX`),
+    //!    so we drive it directly here.
+    use alloc::vec;
+
+    use super::*;
+
+    fn new_table(window: usize) -> MatchTable {
+        let mut t = MatchTable::new(window);
+        t.window_size = window;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t
+    }
+
+    #[test]
+    fn set_dictionary_limit_from_primed_bytes_zero_clears_limit() {
+        let mut t = new_table(64);
+        t.history_abs_start = 100;
+        t.dictionary_limit_abs = Some(123);
+        t.set_dictionary_limit_from_primed_bytes(0);
+        assert_eq!(t.dictionary_limit_abs, None);
+    }
+
+    #[test]
+    fn set_dictionary_limit_from_primed_bytes_offsets_from_history_start() {
+        let mut t = new_table(64);
+        t.history_abs_start = 100;
+        t.set_dictionary_limit_from_primed_bytes(40);
+        assert_eq!(t.dictionary_limit_abs, Some(140));
+    }
+
+    #[test]
+    fn skip_matching_bt_incompressible_routes_through_sparse_block() {
+        let mut t = new_table(32);
+        t.window.push_back(vec![0u8; 32]);
+        t.ensure_tables();
+        t.uses_bt = true;
+        t.is_btultra2 = false;
+        t.search_depth = 4;
+        let before_skip_until = t.skip_insert_until_abs;
+        t.skip_matching(Some(true));
+        // BT + incompressible path must take the
+        // `bt_insert_sparse_incompressible_block` branch and advance
+        // `skip_insert_until_abs` to current_abs_end.
+        assert!(t.skip_insert_until_abs >= t.window_size);
+        assert!(t.skip_insert_until_abs > before_skip_until);
+    }
+
+    #[test]
+    fn skip_matching_bt_dense_routes_through_bt_update_tree() {
+        let mut t = new_table(32);
+        t.window.push_back(vec![1u8; 32]);
+        t.ensure_tables();
+        t.uses_bt = true;
+        t.is_btultra2 = false;
+        t.search_depth = 4;
+        // `incompressible_hint = None` → dense bt_update_tree_until path
+        t.skip_matching(None);
+        assert_eq!(t.skip_insert_until_abs, t.history_abs_start + t.window_size);
+    }
+
+    #[test]
+    fn replay_history_for_rebase_bt_walks_inserted_prefix() {
+        let mut t = new_table(64);
+        // Construct a contiguous mirror long enough for the BT walker
+        // (`bt_insert_step_no_rebase` reads 8-byte prefixes).
+        t.history = vec![0u8; 64];
+        for (i, slot) in t.history.iter_mut().enumerate() {
+            *slot = (i % 17) as u8;
+        }
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = 64;
+        t.position_base = 0;
+        t.search_depth = 4;
+        t.uses_bt = true;
+        t.ensure_tables();
+        // Replay the first 32 positions; the BT walker writes entries
+        // into the hash table (via `hash_table[hash] = stored`) so the
+        // ground-truth observation is "some hash slots are no longer
+        // HC_EMPTY".
+        assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
+        t.replay_history_for_rebase_bt(0, 32);
+        assert!(
+            t.hash_table.iter().any(|&v| v != HC_EMPTY),
+            "BT replay must populate hash table"
+        );
+    }
+
+    #[test]
+    fn begin_rebase_clears_index_tables_and_resets_base() {
+        let mut t = new_table(32);
+        t.hash_table = vec![7; 16];
+        t.chain_table = vec![9; 16];
+        t.hash3_table = vec![5; 16];
+        t.history_abs_start = 50;
+        t.position_base = 0;
+        t.index_shift = 4;
+        t.allow_zero_relative_position = false;
+
+        t.begin_rebase();
+
+        assert_eq!(t.position_base, 50);
+        assert_eq!(t.index_shift, 0);
+        assert!(t.allow_zero_relative_position);
+        assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
+        assert!(t.chain_table.iter().all(|&v| v == HC_EMPTY));
+        assert!(t.hash3_table.iter().all(|&v| v == HC_EMPTY));
     }
 }

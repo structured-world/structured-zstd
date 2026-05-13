@@ -396,7 +396,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        crate::for_each_repcode_candidate_body!(
+        super::match_generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -426,7 +426,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        crate::for_each_repcode_candidate_body!(
+        super::match_generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -456,7 +456,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        crate::for_each_repcode_candidate_body!(
+        super::match_generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -482,7 +482,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        crate::for_each_repcode_candidate_body!(
+        super::match_generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,

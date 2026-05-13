@@ -1048,7 +1048,10 @@ struct HcMatchGenerator {
 /// path so the call resolves inside the wrapper's `#[target_feature]`
 /// umbrella and inlines instead of paying the function-call ABI per BT walk
 /// iteration. Used only by `HcMatchGenerator` BT walk wrappers below.
-#[macro_export]
+///
+/// Crate-private: the macro body references private `encoding::*`
+/// modules via `$crate::...`, so it is unusable downstream and is
+/// re-exported only inside this crate via `pub(crate) use` below.
 macro_rules! bt_insert_step_no_rebase_body {
     ($table:expr, $search_depth:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
         let idx = $abs_pos - $table.history_abs_start;
@@ -1157,6 +1160,7 @@ macro_rules! bt_insert_step_no_rebase_body {
         speed_positions.max(match_end_abs.saturating_sub($abs_pos.saturating_add(8)))
     }};
 }
+pub(crate) use bt_insert_step_no_rebase_body;
 
 /// `build_optimal_plan_impl` body parameterized over the per-CPU
 /// `collect_optimal_candidates_initialized_<kernel>` method name. Caller
@@ -2107,8 +2111,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
 /// `hash3_candidate` body parameterized over the per-CPU
 /// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
 /// position when invoked, so the per-call ABI savings compound across the
-/// segment.
-#[macro_export]
+/// segment. Crate-private (see `bt_insert_step_no_rebase_body!`).
 macro_rules! hash3_candidate_body {
     (
         $table:expr,
@@ -2162,6 +2165,7 @@ macro_rules! hash3_candidate_body {
         })
     }};
 }
+pub(crate) use hash3_candidate_body;
 
 /// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
 /// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
@@ -2170,8 +2174,8 @@ macro_rules! hash3_candidate_body {
 /// thousands per segment, so the per-call barrier was non-trivial.
 ///
 /// The callback `f` runs in the wrapper's umbrella context too, so closures
-/// that capture mutable state still work (FnMut).
-#[macro_export]
+/// that capture mutable state still work (FnMut). Crate-private
+/// (see `bt_insert_step_no_rebase_body!`).
 macro_rules! for_each_repcode_candidate_body {
     (
         $table:expr,
@@ -2232,13 +2236,14 @@ macro_rules! for_each_repcode_candidate_body {
         }
     }};
 }
+pub(crate) use for_each_repcode_candidate_body;
 
 /// `bt_insert_and_collect_matches` body parameterized over the per-CPU
 /// `count_match_from_indices` symbol. Same shape as
 /// [`bt_insert_step_no_rebase_body`] — picks up the matching kernel through
 /// `$cmf` so the per-iteration vector probe inlines under the wrapper's
 /// `target_feature` umbrella. Returns nothing (matches the original method).
-#[macro_export]
+/// Crate-private (see `bt_insert_step_no_rebase_body!`).
 macro_rules! bt_insert_and_collect_matches_body {
     (
         $table:expr,
@@ -2369,6 +2374,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         $table.skip_insert_until_abs = match_end_abs.saturating_sub(8);
     }};
 }
+pub(crate) use bt_insert_and_collect_matches_body;
 
 impl HcMatchGenerator {
     fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
