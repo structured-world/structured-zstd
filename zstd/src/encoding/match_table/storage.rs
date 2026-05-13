@@ -101,6 +101,85 @@ impl MatchTable {
         }
     }
 
+    /// Mark this frame as dictionary-primed so the HC / BT seed paths
+    /// know to honour the dictionary boundary.
+    pub(crate) fn mark_dictionary_primed(&mut self) {
+        self.dictionary_primed_for_frame = true;
+    }
+
+    /// Set the per-frame dictionary boundary in absolute coordinates.
+    /// `primed_len == 0` clears the limit.
+    pub(crate) fn set_dictionary_limit_from_primed_bytes(&mut self, primed_len: usize) {
+        self.dictionary_limit_abs = if primed_len == 0 {
+            None
+        } else {
+            Some(self.history_abs_start.saturating_add(primed_len))
+        };
+    }
+
+    /// Append a freshly committed buffer to the rolling window. Evicts
+    /// the oldest slices until the new total fits inside
+    /// `max_window_size`, hands them back through `reuse_space` for
+    /// pool reuse, then extends the contiguous `history` mirror.
+    ///
+    /// History duplicates window data for O(1) contiguous access during
+    /// match finding (`common_prefix_len`, `extend_backwards`). Peak:
+    /// ~2x window size for data buffers + 6 MB tables.
+    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
+        assert!(data.len() <= self.max_window_size);
+        while self.window_size + data.len() > self.max_window_size {
+            let removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            reuse_space(removed);
+        }
+        self.compact_history();
+        self.history.extend_from_slice(&data);
+        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
+        self.window_size += data.len();
+        self.window.push_back(data);
+    }
+
+    /// Drop window slices that have rolled past `max_window_size`.
+    /// Used after `max_window_size` shrinks (dictionary release path).
+    pub(crate) fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+        while self.window_size > self.max_window_size {
+            let removed = self.window.pop_front().unwrap();
+            self.window_size -= removed.len();
+            self.history_start += removed.len();
+            self.history_abs_start += removed.len();
+            reuse_space(removed);
+        }
+    }
+
+    /// Drain the dead prefix of `history` (already-rolled-out bytes)
+    /// when it has grown to at least half the live region. Keeps the
+    /// contiguous mirror compact so reallocation costs stay amortised.
+    pub(crate) fn compact_history(&mut self) {
+        if self.history_start == 0 {
+            return;
+        }
+        if self.history_start >= self.max_window_size
+            || self.history_start * 2 >= self.history.len()
+        {
+            self.history.drain(..self.history_start);
+            self.history_start = 0;
+        }
+    }
+
+    /// The live (post-`history_start`) slice of the contiguous history
+    /// mirror. Match finders operate on this slice rather than the raw
+    /// `history` Vec.
+    pub(crate) fn live_history(&self) -> &[u8] {
+        &self.history[self.history_start..]
+    }
+
+    /// Absolute position one past the end of the live history.
+    pub(crate) fn history_abs_end(&self) -> usize {
+        self.history_abs_start + self.live_history().len()
+    }
+
     /// Get a reference to the last committed window slice. Returns
     /// the most recent buffer in the rolling window — panics if no
     /// data has been committed yet.
