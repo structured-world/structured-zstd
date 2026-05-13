@@ -4264,7 +4264,7 @@ impl HcMatchGenerator {
     fn find_best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         let hash = self.hash_chain_candidate(abs_pos, lit_len);
-        Self::better_candidate(rep, hash)
+        super::hc::HcMatcher::better_candidate(rep, hash)
     }
 
     fn hash_chain_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
@@ -4282,8 +4282,8 @@ impl HcMatchGenerator {
             let candidate_idx = candidate_abs - self.table.history_abs_start;
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_abs, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                let candidate = super::hc::HcMatcher::extend_backwards(&self.table, candidate_abs, abs_pos, match_len, lit_len);
+                best = super::hc::HcMatcher::better_candidate(best, Some(candidate));
                 if best.is_some_and(|b| b.match_len >= self.hc.target_len) {
                     return best;
                 }
@@ -4325,8 +4325,8 @@ impl HcMatchGenerator {
             let candidate_idx = candidate_pos - self.table.history_abs_start;
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                let candidate = super::hc::HcMatcher::extend_backwards(&self.table, candidate_pos, abs_pos, match_len, lit_len);
+                best = super::hc::HcMatcher::better_candidate(best, Some(candidate));
             }
         }
         best
@@ -4508,58 +4508,6 @@ impl HcMatchGenerator {
         )
     }
 
-    fn extend_backwards(
-        &self,
-        mut candidate_pos: usize,
-        mut abs_pos: usize,
-        mut match_len: usize,
-        lit_len: usize,
-    ) -> MatchCandidate {
-        let concat = self.table.live_history();
-        let min_abs_pos = abs_pos - lit_len;
-        while abs_pos > min_abs_pos
-            && candidate_pos > self.table.history_abs_start
-            && concat[candidate_pos - self.table.history_abs_start - 1]
-                == concat[abs_pos - self.table.history_abs_start - 1]
-        {
-            candidate_pos -= 1;
-            abs_pos -= 1;
-            match_len += 1;
-        }
-        MatchCandidate {
-            start: abs_pos,
-            offset: abs_pos - candidate_pos,
-            match_len,
-        }
-    }
-
-    fn better_candidate(
-        lhs: Option<MatchCandidate>,
-        rhs: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        match (lhs, rhs) {
-            (None, other) | (other, None) => other,
-            (Some(lhs), Some(rhs)) => {
-                let lhs_gain = Self::match_gain(lhs.match_len, lhs.offset);
-                let rhs_gain = Self::match_gain(rhs.match_len, rhs.offset);
-                if rhs_gain > lhs_gain {
-                    Some(rhs)
-                } else {
-                    Some(lhs)
-                }
-            }
-        }
-    }
-
-    fn match_gain(match_len: usize, offset: usize) -> i32 {
-        debug_assert!(
-            offset > 0,
-            "zstd offsets are 1-indexed, offset=0 is invalid"
-        );
-        let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
-        (match_len as i32) * 4 - offset_bits
-    }
-
     // Lazy lookahead queries pos+1/pos+2 before they are inserted into hash
     // tables — matching C zstd behavior. Seeding before comparing would let a
     // position match against itself, changing semantics.
@@ -4576,12 +4524,12 @@ impl HcMatchGenerator {
             return Some(best);
         }
 
-        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
+        let current_gain = super::hc::HcMatcher::match_gain(best.match_len, best.offset) + 4;
 
         // Lazy check: evaluate pos+1
         let next = self.find_best_match(abs_pos + 1, lit_len + 1);
         if let Some(next) = next {
-            let next_gain = Self::match_gain(next.match_len, next.offset);
+            let next_gain = super::hc::HcMatcher::match_gain(next.match_len, next.offset);
             if next_gain > current_gain {
                 return None;
             }
@@ -4592,7 +4540,7 @@ impl HcMatchGenerator {
         {
             let next2 = self.find_best_match(abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2 {
-                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
+                let next2_gain = super::hc::HcMatcher::match_gain(next2.match_len, next2.offset);
                 // Must beat current gain + extra literal cost
                 if next2_gain > current_gain + 4 {
                     return None;
