@@ -85,7 +85,10 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 // without pulling in this module. Re-imported here so existing
 // macros / configs / tests keep their unqualified names.
 use super::match_table::storage::{HC_CHAIN_LOG, HC_EMPTY, HC_HASH_LOG, HC3_HASH_LOG};
-const HC3_MAX_OFFSET: usize = 1 << 18;
+// HC3_MAX_OFFSET moved to encoding::bt alongside the hash3 candidate
+// probe macro that consumes it; the macro references it via the
+// fully-qualified `$crate::encoding::bt::HC3_MAX_OFFSET` path so this
+// module no longer needs a local import.
 const HC_SEARCH_DEPTH: usize = 16;
 // HC_MIN_MATCH_LEN moved to encoding::hc; re-imported here so
 // existing references compile unchanged.
@@ -1924,7 +1927,11 @@ macro_rules! collect_optimal_candidates_initialized_body {
         if !skip_further_match_search && best_len_for_skip < min_match_len {
             $self.update_hash3_until($abs_pos);
             // SAFETY: same umbrella for hash3_candidate.
-            if let Some(h3) = unsafe { $self.$hash3($abs_pos, $current_abs_end, min_match_len) } {
+            if let Some(h3) = unsafe {
+                $self
+                    .bt
+                    .$hash3(&$self.table, $abs_pos, $current_abs_end, min_match_len)
+            } {
                 let _ = super::bt::BtMatcher::push_candidate_ladder(
                     $out,
                     &mut best_len_for_skip,
@@ -2028,53 +2035,54 @@ macro_rules! collect_optimal_candidates_initialized_body {
 /// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
 /// position when invoked, so the per-call ABI savings compound across the
 /// segment.
+#[macro_export]
 macro_rules! hash3_candidate_body {
     (
-        $self:expr,
+        $table:expr,
         $abs_pos:ident,
         $current_abs_end:ident,
         $min_match_len:ident,
         $cpl:path $(,)?
     ) => {{
-        if $self.table.hash3_log == 0 {
+        if $table.hash3_log == 0 {
             return None;
         }
-        let idx = $abs_pos.checked_sub($self.table.history_abs_start)?;
-        let concat = $self.table.live_history();
+        let idx = $abs_pos.checked_sub($table.history_abs_start)?;
+        let concat = $table.live_history();
         if idx + 4 > concat.len() {
             return None;
         }
-        let hash3 = super::match_table::storage::MatchTable::hash_position_at(
+        let hash3 = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
-            $self.table.hash3_log,
+            $table.hash3_log,
             3,
         );
-        let entry = $self
-            .table
+        let entry = $table
             .hash3_table
             .get(hash3)
             .copied()
-            .unwrap_or(HC_EMPTY);
-        let candidate_abs = super::match_table::storage::MatchTable::stored_abs_position_fast(
-            entry,
-            $self.table.position_base,
-            $self.table.index_shift,
-        )?;
-        if candidate_abs < $self.table.history_abs_start || candidate_abs >= $abs_pos {
+            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
+        let candidate_abs =
+            $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
+                entry,
+                $table.position_base,
+                $table.index_shift,
+            )?;
+        if candidate_abs < $table.history_abs_start || candidate_abs >= $abs_pos {
             return None;
         }
         let offset = $abs_pos - candidate_abs;
-        if offset >= HC3_MAX_OFFSET {
+        if offset >= $crate::encoding::bt::HC3_MAX_OFFSET {
             return None;
         }
-        let candidate_idx = candidate_abs - $self.table.history_abs_start;
+        let candidate_idx = candidate_abs - $table.history_abs_start;
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
         let base = concat.as_ptr();
-        // SAFETY: candidate/idx are within history range; tail_limit bounds
-        // the scan within `concat`.
+        // SAFETY: candidate/idx are within history range; tail_limit
+        // bounds the scan within `concat`.
         let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(idx), tail_limit) };
-        (match_len >= $min_match_len).then_some(MatchCandidate {
+        (match_len >= $min_match_len).then_some($crate::encoding::opt::types::MatchCandidate {
             start: $abs_pos,
             offset,
             match_len,
@@ -3988,115 +3996,6 @@ impl HcMatchGenerator {
             best_len_for_skip,
             out,
             crate::encoding::fastpath::scalar::count_match_from_indices,
-        )
-    }
-
-    /// Cross-platform entry. Dispatches to the kernel-specific variant.
-    /// Retained so external callers / future code still have a stable shim;
-    /// the on-encode hot path bypasses this dispatcher via the kernel-specific
-    /// `_neon`/`_sse42`/`_avx2_bmi2`/`_scalar` variants invoked from inside
-    /// `collect_optimal_candidates_initialized_<kernel>`.
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn hash3_candidate(
-        &self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        min_match_len: usize,
-    ) -> Option<MatchCandidate> {
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        unsafe {
-            self.hash3_candidate_neon(abs_pos, current_abs_end, min_match_len)
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
-                },
-                FastpathKernel::Sse42 => unsafe {
-                    self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
-                },
-                FastpathKernel::Scalar => {
-                    self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
-                }
-            }
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
-            target_arch = "x86",
-            target_arch = "x86_64"
-        )))]
-        {
-            self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn hash3_candidate_neon(
-        &self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        min_match_len: usize,
-    ) -> Option<MatchCandidate> {
-        hash3_candidate_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            min_match_len,
-            crate::encoding::fastpath::neon::common_prefix_len_ptr,
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn hash3_candidate_sse42(
-        &self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        min_match_len: usize,
-    ) -> Option<MatchCandidate> {
-        hash3_candidate_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            min_match_len,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn hash3_candidate_avx2_bmi2(
-        &self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        min_match_len: usize,
-    ) -> Option<MatchCandidate> {
-        hash3_candidate_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            min_match_len,
-            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
-        )
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-    fn hash3_candidate_scalar(
-        &self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        min_match_len: usize,
-    ) -> Option<MatchCandidate> {
-        hash3_candidate_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            min_match_len,
-            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
         )
     }
 
