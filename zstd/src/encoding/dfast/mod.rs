@@ -20,11 +20,11 @@ use super::incompressible::{block_looks_incompressible, block_looks_incompressib
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
     DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_SEARCH_DEPTH, DFAST_SHORT_HASH_LOOKAHEAD,
-    DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG, MatchGenerator,
+    DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
-    LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared, pick_lazy_match_shared,
-    repcode_candidate_shared,
+    LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
+    pick_lazy_match_shared, repcode_candidate_shared,
 };
 use super::opt::types::MatchCandidate;
 
@@ -491,10 +491,7 @@ impl DfastMatchGenerator {
                     continue;
                 }
                 let candidate_idx = candidate_pos - history_abs_start;
-                let match_len = MatchGenerator::common_prefix_len(
-                    &concat[candidate_idx..],
-                    &concat[current_idx..],
-                );
+                let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
                 if match_len >= DFAST_MIN_MATCH_LEN {
                     let candidate =
                         self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
@@ -518,10 +515,7 @@ impl DfastMatchGenerator {
                     continue;
                 }
                 let candidate_idx = candidate_pos - history_abs_start;
-                let match_len = MatchGenerator::common_prefix_len(
-                    &concat[candidate_idx..],
-                    &concat[current_idx..],
-                );
+                let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
                 if match_len >= DFAST_MIN_MATCH_LEN {
                     let candidate =
                         self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);

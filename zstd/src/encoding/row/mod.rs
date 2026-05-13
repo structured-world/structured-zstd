@@ -18,12 +18,12 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::match_generator::{
-    INCOMPRESSIBLE_SKIP_STEP, MatchGenerator, ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN,
-    ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH, ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
+    ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
+    ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
 };
 use super::match_table::helpers::{
-    LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared, pick_lazy_match_shared,
-    repcode_candidate_shared,
+    INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, common_prefix_len,
+    extend_backwards_shared, pick_lazy_match_shared, repcode_candidate_shared,
 };
 use super::opt::types::MatchCandidate;
 
@@ -340,8 +340,7 @@ impl RowMatchGenerator {
                 continue;
             }
             let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len =
-                MatchGenerator::common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = best_len_offset_candidate(best, Some(candidate));
