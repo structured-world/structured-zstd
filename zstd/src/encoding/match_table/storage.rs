@@ -513,12 +513,6 @@ impl MatchTable {
         (start_cursor, start_cursor)
     }
 
-    /// Reset the rebase-derived bookkeeping (rolling `position_base` /
-    /// `index_shift`) so every stored position re-encodes from
-    /// `history_abs_start`, then clear the three index tables. Hot
-    /// path for `rebase_positions_cold`; the caller is responsible
-    /// for re-inserting any positions the active matchfinder still
-    /// needs.
     /// Stage D: BT walker step. Cross-platform dispatcher that picks
     /// the per-kernel variant so the per-iteration
     /// `count_match_from_indices` symbol inlines under the kernel's
@@ -1316,6 +1310,12 @@ impl MatchTable {
         )
     }
 
+    /// Reset the rebase-derived bookkeeping (rolling `position_base` /
+    /// `index_shift`) so every stored position re-encodes from
+    /// `history_abs_start`, then clear the three index tables. Hot
+    /// path for [`Self::rebase_positions_cold`]; the caller is
+    /// responsible for re-inserting any positions the active
+    /// matchfinder still needs.
     pub(crate) fn begin_rebase(&mut self) {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
