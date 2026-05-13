@@ -1005,44 +1005,45 @@ struct HcMatchGenerator {
 /// path so the call resolves inside the wrapper's `#[target_feature]`
 /// umbrella and inlines instead of paying the function-call ABI per BT walk
 /// iteration. Used only by `HcMatchGenerator` BT walk wrappers below.
+#[macro_export]
 macro_rules! bt_insert_step_no_rebase_body {
-    ($self:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
-        let idx = $abs_pos - $self.table.history_abs_start;
-        let concat = &$self.table.history[$self.table.history_start..];
+    ($table:expr, $search_depth:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
+        let idx = $abs_pos - $table.history_abs_start;
+        let concat = &$table.history[$table.history_start..];
         if idx + 8 > concat.len() {
             return 1;
         }
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let hash = super::match_table::storage::MatchTable::hash_position_at(
+        let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
-            $self.table.hash_log,
-            super::bt::BtMatcher::HASH_MLS,
+            $table.hash_log,
+            $crate::encoding::bt::BtMatcher::HASH_MLS,
         );
-        let Some(relative_pos) = $self.table.relative_position($abs_pos) else {
+        let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return 1;
         };
         let stored = relative_pos + 1;
-        let bt_mask = $self.table.bt_mask();
+        let bt_mask = $table.bt_mask();
         let bt_low = $abs_pos.saturating_sub(bt_mask);
-        let window_low = $self.table.window_low_abs_for_target($target_abs);
+        let window_low = $table.window_low_abs_for_target($target_abs);
         let mut match_end_abs = $abs_pos.saturating_add(9);
         let mut best_len = 8usize;
-        let mut compares_left = $self.hc.search_depth;
+        let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
-        let pair_idx = $self.table.bt_pair_index_for_abs($abs_pos);
+        let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $self.table.hash_table[hash];
-        $self.table.hash_table[hash] = stored;
+        let mut match_stored = $table.hash_table[hash];
+        $table.hash_table[hash] = stored;
 
         while compares_left > 0 {
             let Some(candidate_abs) =
-                super::match_table::storage::MatchTable::stored_abs_position_fast(
+                $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
                     match_stored,
-                    $self.table.position_base,
-                    $self.table.index_shift,
+                    $table.position_base,
+                    $table.index_shift,
                 )
             else {
                 break;
@@ -1052,11 +1053,11 @@ macro_rules! bt_insert_step_no_rebase_body {
             }
             compares_left -= 1;
 
-            let next_pair_idx = $self.table.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = $self.table.chain_table[next_pair_idx];
-            let next_larger = $self.table.chain_table[next_pair_idx + 1];
+            let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
+            let next_smaller = $table.chain_table[next_pair_idx];
+            let next_larger = $table.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - $self.table.history_abs_start;
+            let candidate_idx = candidate_abs - $table.history_abs_start;
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
             // concat.len()` since the candidate is within
             // `[history_abs_start, abs_pos)` and `tail_limit ≤
@@ -1078,7 +1079,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
-                $self.table.chain_table[smaller_slot] = match_stored;
+                $table.chain_table[smaller_slot] = match_stored;
                 common_length_smaller = match_len;
                 if candidate_abs <= bt_low {
                     smaller_slot = usize::MAX;
@@ -1087,7 +1088,7 @@ macro_rules! bt_insert_step_no_rebase_body {
                 smaller_slot = next_pair_idx + 1;
                 match_stored = next_larger;
             } else {
-                $self.table.chain_table[larger_slot] = match_stored;
+                $table.chain_table[larger_slot] = match_stored;
                 common_length_larger = match_len;
                 if candidate_abs <= bt_low {
                     larger_slot = usize::MAX;
@@ -1099,10 +1100,10 @@ macro_rules! bt_insert_step_no_rebase_body {
         }
 
         if smaller_slot != usize::MAX {
-            $self.table.chain_table[smaller_slot] = HC_EMPTY;
+            $table.chain_table[smaller_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
         }
         if larger_slot != usize::MAX {
-            $self.table.chain_table[larger_slot] = HC_EMPTY;
+            $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
         }
 
         let speed_positions = if best_len > 384 {
@@ -2519,7 +2520,7 @@ impl HcMatchGenerator {
         let mut pos = current_abs_start;
         while pos < current_abs_end {
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            let _ = self.bt.bt_insert_step_no_rebase(&mut self.table, self.hc.search_depth, pos, current_abs_end, current_abs_end);
             self.table.insert_hash3_only_no_rebase(pos);
             let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
             if next <= pos {
@@ -2538,7 +2539,7 @@ impl HcMatchGenerator {
                 continue;
             }
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            let _ = self.bt.bt_insert_step_no_rebase(&mut self.table, self.hc.search_depth, pos, current_abs_end, current_abs_end);
             self.table.insert_hash3_only_no_rebase(pos);
         }
 
@@ -3567,124 +3568,6 @@ impl HcMatchGenerator {
         )
     }
 
-    /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
-    /// body executes inside one `target_feature` umbrella and inlines the
-    /// vectorized `count_match_from_indices` directly.
-    #[inline(always)]
-    fn bt_insert_step_no_rebase(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        target_abs: usize,
-    ) -> usize {
-        // SAFETY: each branch verifies the target_feature requirement of the
-        // callee — aarch64 NEON is baseline; x86 AVX2/BMI2 and SSE4.2 are
-        // selected only when the runtime detector reports them present.
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        unsafe {
-            self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
-                },
-                FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
-                },
-                FastpathKernel::Scalar => {
-                    self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
-                }
-            }
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
-            target_arch = "x86",
-            target_arch = "x86_64"
-        )))]
-        {
-            self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
-        }
-    }
-
-    /// NEON-umbrella variant: body inlines `fastpath::neon::count_match_from_indices`.
-    /// AArch64 only. Future x86 variants (`_sse42`, `_avx2_bmi2`) follow the
-    /// same pattern with their respective umbrellas.
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn bt_insert_step_no_rebase_neon(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        target_abs: usize,
-    ) -> usize {
-        bt_insert_step_no_rebase_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            target_abs,
-            crate::encoding::fastpath::neon::count_match_from_indices
-        )
-    }
-
-    /// SSE4.2-umbrella variant. Calls `fastpath::sse42::count_match_from_indices`.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn bt_insert_step_no_rebase_sse42(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        target_abs: usize,
-    ) -> usize {
-        bt_insert_step_no_rebase_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            target_abs,
-            crate::encoding::fastpath::sse42::count_match_from_indices
-        )
-    }
-
-    /// AVX2+BMI2-umbrella variant. Calls
-    /// `fastpath::avx2_bmi2::count_match_from_indices`.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        target_abs: usize,
-    ) -> usize {
-        bt_insert_step_no_rebase_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            target_abs,
-            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
-        )
-    }
-
-    /// Scalar fallback used on non-AArch64 targets (and when no SIMD kernel
-    /// is selected). Routes through `fastpath::scalar::count_match_from_indices`
-    /// directly so the call site remains the same shape as the SIMD variants.
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-    fn bt_insert_step_no_rebase_scalar(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-        target_abs: usize,
-    ) -> usize {
-        bt_insert_step_no_rebase_body!(
-            self,
-            abs_pos,
-            current_abs_end,
-            target_abs,
-            crate::encoding::fastpath::scalar::count_match_from_indices
-        )
-    }
-
     /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
     /// update loop runs inside the same `target_feature` umbrella as the per-
     /// position `bt_insert_step_no_rebase` it calls — eliminating one ABI
@@ -3742,7 +3625,7 @@ impl HcMatchGenerator {
             }
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward =
-                unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
+                unsafe { self.bt.bt_insert_step_no_rebase_neon(&mut self.table, self.hc.search_depth, update_abs, current_abs_end, abs_pos) };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
         self.table.skip_insert_until_abs = abs_pos;
@@ -3765,7 +3648,7 @@ impl HcMatchGenerator {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
-                self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
+                self.bt.bt_insert_step_no_rebase_sse42(&mut self.table, self.hc.search_depth, update_abs, current_abs_end, abs_pos)
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -3789,7 +3672,7 @@ impl HcMatchGenerator {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
-                self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
+                self.bt.bt_insert_step_no_rebase_avx2_bmi2(&mut self.table, self.hc.search_depth, update_abs, current_abs_end, abs_pos)
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -3812,7 +3695,7 @@ impl HcMatchGenerator {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward =
-                self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
+                self.bt.bt_insert_step_no_rebase_scalar(&mut self.table, self.hc.search_depth, update_abs, current_abs_end, abs_pos);
             update_abs = update_abs.saturating_add(forward.max(1));
         }
         self.table.skip_insert_until_abs = abs_pos;
@@ -4057,7 +3940,7 @@ impl HcMatchGenerator {
             let rebuild_end = self.table.history_abs_end();
             let mut pos = history_start;
             while pos < abs_pos {
-                let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
+                let forward = self.bt.bt_insert_step_no_rebase(&mut self.table, self.hc.search_depth, pos, rebuild_end, abs_pos);
                 pos = pos.saturating_add(forward.max(1));
             }
         } else {

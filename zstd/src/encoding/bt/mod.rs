@@ -232,6 +232,176 @@ impl BtMatcher {
         )
     }
 
+    /// Cross-platform dispatcher for the per-position BT walker. The
+    /// per-iteration `count_match_from_indices` symbol inlines under
+    /// the kernel-specific `target_feature` umbrella so the entire
+    /// walk runs as one straight-line hot path.
+    #[inline(always)]
+    pub(crate) fn bt_insert_step_no_rebase(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        // SAFETY: each branch verifies the target_feature requirement
+        // of the callee — aarch64 NEON is baseline; x86 AVX2/BMI2 and
+        // SSE4.2 are selected only when the runtime detector reports
+        // them present.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_step_no_rebase_neon(
+                table,
+                search_depth,
+                abs_pos,
+                current_abs_end,
+                target_abs,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_step_no_rebase_avx2_bmi2(
+                        table,
+                        search_depth,
+                        abs_pos,
+                        current_abs_end,
+                        target_abs,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_step_no_rebase_sse42(
+                        table,
+                        search_depth,
+                        abs_pos,
+                        current_abs_end,
+                        target_abs,
+                    )
+                },
+                FastpathKernel::Scalar => self.bt_insert_step_no_rebase_scalar(
+                    table,
+                    search_depth,
+                    abs_pos,
+                    current_abs_end,
+                    target_abs,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_step_no_rebase_scalar(
+                table,
+                search_depth,
+                abs_pos,
+                current_abs_end,
+                target_abs,
+            )
+        }
+    }
+
+    /// NEON umbrella variant of the BT walker. Body inlines via macro.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_neon(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let _ = self;
+        crate::bt_insert_step_no_rebase_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::neon::count_match_from_indices
+        )
+    }
+
+    /// SSE4.2 umbrella BT walker.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_sse42(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let _ = self;
+        crate::bt_insert_step_no_rebase_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::sse42::count_match_from_indices
+        )
+    }
+
+    /// AVX2+BMI2 umbrella BT walker.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 + BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let _ = self;
+        crate::bt_insert_step_no_rebase_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
+        )
+    }
+
+    /// Scalar fallback BT walker (used on non-AArch64 targets).
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub(crate) fn bt_insert_step_no_rebase_scalar(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let _ = self;
+        crate::bt_insert_step_no_rebase_body!(
+            table,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::scalar::count_match_from_indices
+        )
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             opt_state: HcOptState::new(),
