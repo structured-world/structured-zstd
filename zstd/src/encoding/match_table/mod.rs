@@ -1,4 +1,4 @@
-//! Hash / chain / BT tables used by the encoder match finders.
+//! Hash / chain / BT tables and shared match-finder helpers.
 //!
 //! Will host the shared `MatchTable` abstraction plus the concrete
 //! storage layouts:
@@ -10,7 +10,12 @@
 //!   frame so per-frame `Vec` reallocation disappears from the hot
 //!   path)
 //!
-//! Empty in #111 Phase 1.0 (scaffold). Subsequent Phase 1 commits will
-//! move table storage out of `super::match_generator` here.
+//! Phase 1b (this commit) populates [`helpers`] with the shared
+//! match-finder primitives (back-extend, rep-code probe, lazy
+//! decision) so subsequent per-matcher extractions don't have to drag
+//! those helpers along. Storage abstractions are still scoped for the
+//! Phase 2 arena allocator work.
 
 #![allow(dead_code)]
+
+pub(crate) mod helpers;

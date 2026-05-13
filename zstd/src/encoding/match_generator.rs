@@ -25,6 +25,10 @@ use super::cost_model::{
 #[cfg(test)]
 use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOptPriceType};
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
+use super::match_table::helpers::{
+    LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared, pick_lazy_match_shared,
+    repcode_candidate_shared,
+};
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{
     HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
@@ -1183,7 +1187,7 @@ impl MatchGenerator {
     /// AVX2+BMI2 / scalar) lives in one place. See
     /// [`crate::encoding::fastpath`] for the per-CPU implementations.
     #[inline(always)]
-    fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
         let max = a.len().min(b.len());
         // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
         // bytes; `max` is the minimum so both pointers are valid for `max`
@@ -1447,174 +1451,11 @@ struct DfastMatchGenerator {
     lazy_depth: u8,
 }
 
-fn best_len_offset_candidate(
-    lhs: Option<MatchCandidate>,
-    rhs: Option<MatchCandidate>,
-) -> Option<MatchCandidate> {
-    match (lhs, rhs) {
-        (None, other) | (other, None) => other,
-        (Some(lhs), Some(rhs)) => {
-            if rhs.match_len > lhs.match_len
-                || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
-            {
-                Some(rhs)
-            } else {
-                Some(lhs)
-            }
-        }
-    }
-}
-
-#[inline]
-fn extend_backwards_shared(
-    concat: &[u8],
-    history_abs_start: usize,
-    mut candidate_pos: usize,
-    mut abs_pos: usize,
-    mut match_len: usize,
-    lit_len: usize,
-) -> MatchCandidate {
-    let min_abs_pos = abs_pos - lit_len;
-    let concat_ptr = concat.as_ptr();
-    let concat_len = concat.len();
-    // SAFETY: loop guard `candidate_pos > history_abs_start` and
-    // `abs_pos > min_abs_pos` keep both `candidate_pos - history_abs_start - 1`
-    // and `abs_pos - history_abs_start - 1` strictly positive (no underflow).
-    // Their upper bound is `concat.len() - 1` because both `candidate_pos` and
-    // `abs_pos` point at currently-live history. Asserted in debug builds.
-    while abs_pos > min_abs_pos && candidate_pos > history_abs_start {
-        let cand_off = candidate_pos - history_abs_start - 1;
-        let cur_off = abs_pos - history_abs_start - 1;
-        debug_assert!(cand_off < concat_len && cur_off < concat_len);
-        let cand_byte = unsafe { *concat_ptr.add(cand_off) };
-        let cur_byte = unsafe { *concat_ptr.add(cur_off) };
-        if cand_byte != cur_byte {
-            break;
-        }
-        candidate_pos -= 1;
-        abs_pos -= 1;
-        match_len += 1;
-    }
-    MatchCandidate {
-        start: abs_pos,
-        offset: abs_pos - candidate_pos,
-        match_len,
-    }
-}
-
-#[inline]
-fn repcode_candidate_shared(
-    concat: &[u8],
-    history_abs_start: usize,
-    offset_hist: [u32; 3],
-    abs_pos: usize,
-    lit_len: usize,
-    min_match_len: usize,
-) -> Option<MatchCandidate> {
-    let current_idx = abs_pos - history_abs_start;
-    if current_idx + min_match_len > concat.len() {
-        return None;
-    }
-
-    // Called once per input byte (10% exclusive on default-level profile).
-    // The previous form built an `[Option<usize>; 3]` and walked it via
-    // `into_iter().flatten()`, which the compiler couldn't always unroll
-    // through the conditional `then_some` on the last slot. Unroll the
-    // 3-rep probe by hand: each branch is a couple of compares + one
-    // `common_prefix_len` (already SIMD).
-    let mut best: Option<MatchCandidate> = None;
-
-    let (rep0, rep1, rep2_opt) = if lit_len == 0 {
-        let r2 = if offset_hist[0] > 1 {
-            Some(offset_hist[0] as usize - 1)
-        } else {
-            None
-        };
-        (offset_hist[1] as usize, offset_hist[2] as usize, r2)
-    } else {
-        (
-            offset_hist[0] as usize,
-            offset_hist[1] as usize,
-            Some(offset_hist[2] as usize),
-        )
-    };
-
-    macro_rules! probe {
-        ($rep:expr) => {{
-            let rep = $rep;
-            if rep != 0 && rep <= abs_pos {
-                let candidate_pos = abs_pos - rep;
-                if candidate_pos >= history_abs_start {
-                    let candidate_idx = candidate_pos - history_abs_start;
-                    let match_len = MatchGenerator::common_prefix_len(
-                        &concat[candidate_idx..],
-                        &concat[current_idx..],
-                    );
-                    if match_len >= min_match_len {
-                        let candidate = extend_backwards_shared(
-                            concat,
-                            history_abs_start,
-                            candidate_pos,
-                            abs_pos,
-                            match_len,
-                            lit_len,
-                        );
-                        best = best_len_offset_candidate(best, Some(candidate));
-                    }
-                }
-            }
-        }};
-    }
-
-    probe!(rep0);
-    probe!(rep1);
-    if let Some(rep2) = rep2_opt {
-        probe!(rep2);
-    }
-    best
-}
-
-#[derive(Copy, Clone)]
-struct LazyMatchConfig {
-    target_len: usize,
-    min_match_len: usize,
-    lazy_depth: u8,
-    history_abs_end: usize,
-}
-
-fn pick_lazy_match_shared(
-    abs_pos: usize,
-    lit_len: usize,
-    best: Option<MatchCandidate>,
-    config: LazyMatchConfig,
-    mut best_match_at: impl FnMut(usize, usize) -> Option<MatchCandidate>,
-) -> Option<MatchCandidate> {
-    let best = best?;
-    if best.match_len >= config.target_len
-        || abs_pos + 1 + config.min_match_len > config.history_abs_end
-    {
-        return Some(best);
-    }
-
-    let next = best_match_at(abs_pos + 1, lit_len + 1);
-    if let Some(next) = next
-        && (next.match_len > best.match_len
-            || (next.match_len == best.match_len && next.offset < best.offset))
-    {
-        return None;
-    }
-
-    if config.lazy_depth >= 2 && abs_pos + 2 + config.min_match_len <= config.history_abs_end {
-        let next2 = best_match_at(abs_pos + 2, lit_len + 2);
-        if let Some(next2) = next2
-            && next2.match_len > best.match_len + 1
-        {
-            return None;
-        }
-    }
-
-    Some(best)
-}
+// Shared match-finder helpers (`best_len_offset_candidate`,
+// `extend_backwards_shared`, `repcode_candidate_shared`,
+// `pick_lazy_match_shared`) plus the `LazyMatchConfig` they take live
+// in `crate::encoding::match_table::helpers` since #111 Phase 1b. The
+// use statement at the top of this file brings them back into scope.
 
 impl DfastMatchGenerator {
     // Keep a short dense tail at block boundaries for two related reasons:
