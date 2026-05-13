@@ -15,8 +15,17 @@
 
 #![allow(dead_code)]
 
-use super::match_table::storage::MatchTable;
+use super::match_table::helpers::common_prefix_len;
+use super::match_table::storage::{HC_EMPTY, MatchTable};
 use super::opt::types::MatchCandidate;
+
+/// Minimum match length emitted by the lazy / lazy2 chain walker.
+/// Donor parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
+pub(crate) const HC_MIN_MATCH_LEN: usize = 4;
+
+/// Hard cap on chain-walk depth. Used to size the fixed-length
+/// candidate buffer returned by [`HcMatcher::chain_candidates`].
+pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
 
 /// Hash-chain matcher state used by the `Lazy2` parse mode (and the
 /// short-history fast path of the BT cascade's initial pass).
@@ -84,6 +93,198 @@ impl HcMatcher {
                 }
             }
         }
+    }
+
+    /// Walk the hash chain at `abs_pos` and collect up to
+    /// [`HcMatcher::search_depth`] absolute positions of in-window
+    /// candidates. Stale chain entries (positions evicted from the
+    /// window) are skipped rather than terminating the walk; the
+    /// chain is bounded by `search_depth` total iterations to keep
+    /// pathological self-loops from spinning.
+    pub(crate) fn chain_candidates(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+    ) -> [usize; MAX_HC_SEARCH_DEPTH] {
+        let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
+        let idx = abs_pos - table.history_abs_start;
+        let concat = table.live_history();
+        if idx + 4 > concat.len() {
+            return buf;
+        }
+        let hash = table.hash_position(&concat[idx..]);
+        let chain_mask = (1 << table.chain_log) - 1;
+
+        let mut cur = table.hash_table[hash];
+        let mut filled = 0;
+        let mut steps = 0;
+        let max_chain_steps = self.search_depth;
+        while filled < self.search_depth && steps < max_chain_steps {
+            if cur == HC_EMPTY {
+                break;
+            }
+            let candidate_rel = cur.wrapping_sub(1) as usize;
+            let candidate_abs = table.position_base + candidate_rel;
+            let next = table.chain_table[candidate_rel & chain_mask];
+            steps += 1;
+            if next == cur {
+                // Self-loop: two positions share chain_idx, stop to
+                // avoid spinning on the same candidate forever.
+                if candidate_abs >= table.history_abs_start && candidate_abs < abs_pos {
+                    buf[filled] = candidate_abs;
+                }
+                break;
+            }
+            cur = next;
+            if candidate_abs < table.history_abs_start || candidate_abs >= abs_pos {
+                continue;
+            }
+            buf[filled] = candidate_abs;
+            filled += 1;
+        }
+        buf
+    }
+
+    /// Probe the 3 rep-code offsets (with the donor `ll0 ↦ rep[0] − 1`
+    /// fallback) and return the best in-range match. Pure helper —
+    /// only reads from `MatchTable`, no HcMatcher state needed.
+    pub(crate) fn repcode_candidate(
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let reps = if lit_len == 0 {
+            [
+                Some(table.offset_hist[1] as usize),
+                Some(table.offset_hist[2] as usize),
+                (table.offset_hist[0] > 1).then_some((table.offset_hist[0] - 1) as usize),
+            ]
+        } else {
+            [
+                Some(table.offset_hist[0] as usize),
+                Some(table.offset_hist[1] as usize),
+                Some(table.offset_hist[2] as usize),
+            ]
+        };
+
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best = None;
+        for rep in reps.into_iter().flatten() {
+            if rep == 0 || rep > abs_pos {
+                continue;
+            }
+            let candidate_pos = abs_pos - rep;
+            if candidate_pos < table.history_abs_start {
+                continue;
+            }
+            let candidate_idx = candidate_pos - table.history_abs_start;
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate =
+                    Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+            }
+        }
+        best
+    }
+
+    /// Best hash-chain match at `abs_pos`. Walks the chain via
+    /// [`Self::chain_candidates`], extends each survivor backwards
+    /// over the literal run, and short-circuits as soon as a
+    /// candidate crosses `target_len`.
+    pub(crate) fn hash_chain_candidate(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best: Option<MatchCandidate> = None;
+        for candidate_abs in self.chain_candidates(table, abs_pos) {
+            if candidate_abs == usize::MAX {
+                break;
+            }
+            let candidate_idx = candidate_abs - table.history_abs_start;
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate =
+                    Self::extend_backwards(table, candidate_abs, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+                if best.is_some_and(|b| b.match_len >= self.target_len) {
+                    return best;
+                }
+            }
+        }
+        best
+    }
+
+    /// Combine the rep-code and chain-walk candidates and pick the
+    /// better of the two.
+    pub(crate) fn find_best_match(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let rep = Self::repcode_candidate(table, abs_pos, lit_len);
+        let hash = self.hash_chain_candidate(table, abs_pos, lit_len);
+        Self::better_candidate(rep, hash)
+    }
+
+    /// Donor `lazy` / `lazy2` lookahead: evaluate the match a byte
+    /// (and optionally two) ahead before committing the current one.
+    /// Returns `Some(best)` if the current match wins, `None` if the
+    /// caller should defer.
+    ///
+    /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
+    /// inserted into the hash tables — matching the C zstd ordering.
+    /// Seeding before comparing would let a position match against
+    /// itself, changing semantics.
+    pub(crate) fn pick_lazy_match(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        best: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        let best = best?;
+        if best.match_len >= self.target_len
+            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_end()
+        {
+            return Some(best);
+        }
+
+        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
+
+        let next = self.find_best_match(table, abs_pos + 1, lit_len + 1);
+        if let Some(next) = next {
+            let next_gain = Self::match_gain(next.match_len, next.offset);
+            if next_gain > current_gain {
+                return None;
+            }
+        }
+
+        if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
+            let next2 = self.find_best_match(table, abs_pos + 2, lit_len + 2);
+            if let Some(next2) = next2 {
+                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
+                if next2_gain > current_gain + 4 {
+                    return None;
+                }
+            }
+        }
+
+        Some(best)
     }
 
     /// Walk a candidate match backwards over the literal run so the

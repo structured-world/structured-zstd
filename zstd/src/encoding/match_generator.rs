@@ -23,7 +23,9 @@ use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOp
 use super::dfast::DfastMatchGenerator;
 #[cfg(test)]
 use super::match_table::helpers::FAST_HASH_FILL_STEP;
-use super::match_table::helpers::{INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN, common_prefix_len};
+#[cfg(test)]
+use super::match_table::helpers::common_prefix_len;
+use super::match_table::helpers::{INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN};
 #[cfg(test)]
 use super::opt::ldm::HcRawSeq;
 use super::opt::ldm::{HcOptLdmState, HcRawSeqStore};
@@ -85,13 +87,14 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 use super::match_table::storage::{HC_CHAIN_LOG, HC_EMPTY, HC_HASH_LOG, HC3_HASH_LOG};
 const HC3_MAX_OFFSET: usize = 1 << 18;
 const HC_SEARCH_DEPTH: usize = 16;
-const HC_MIN_MATCH_LEN: usize = 4;
+// HC_MIN_MATCH_LEN moved to encoding::hc; re-imported here so
+// existing references compile unchanged.
+use super::hc::HC_MIN_MATCH_LEN;
 const HC_OPT_MIN_MATCH_LEN: usize = HC_FORMAT_MINMATCH;
 const HC_TARGET_LEN: usize = 48;
 
-// Maximum search depth across all HC-based levels. Used to size the
-// fixed-length candidate array returned by chain_candidates().
-const MAX_HC_SEARCH_DEPTH: usize = 512;
+// MAX_HC_SEARCH_DEPTH moved to encoding::hc alongside chain_candidates.
+use super::hc::MAX_HC_SEARCH_DEPTH;
 
 // `HcParseMode` lives in `crate::encoding::strategy` so the extracted
 // `cost_model::HcOptimalCostProfile::for_mode` can branch on it without
@@ -1954,8 +1957,11 @@ macro_rules! collect_optimal_candidates_initialized_body {
             let concat = &$self.table.history[$self.table.history_start..];
             let mut match_end_abs = $abs_pos.saturating_add(9);
             if max_chain_depth > 0 {
-                for (visited, candidate_abs) in
-                    $self.chain_candidates($abs_pos).into_iter().enumerate()
+                for (visited, candidate_abs) in $self
+                    .hc
+                    .chain_candidates(&$self.table, $abs_pos)
+                    .into_iter()
+                    .enumerate()
                 {
                     if visited >= max_chain_depth {
                         break;
@@ -2557,8 +2563,8 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self.find_best_match(abs_pos, lit_len);
-            if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
+            let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
+            if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
                 self.insert_positions(abs_pos, candidate.start + candidate.match_len);
                 let current = self.table.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
@@ -4214,124 +4220,6 @@ impl HcMatchGenerator {
         }
     }
 
-    // Fixed-size stack array is intentional: it avoids heap allocation on
-    // the hot path and the sentinel loop exits at self.hc.search_depth.
-    fn chain_candidates(&self, abs_pos: usize) -> [usize; MAX_HC_SEARCH_DEPTH] {
-        let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
-        let idx = abs_pos - self.table.history_abs_start;
-        let concat = self.table.live_history();
-        if idx + 4 > concat.len() {
-            return buf;
-        }
-        let hash = self.table.hash_position(&concat[idx..]);
-        let chain_mask = (1 << self.table.chain_log) - 1;
-
-        let mut cur = self.table.hash_table[hash];
-        let mut filled = 0;
-        // Follow chain up to search_depth valid candidates, skipping stale
-        // entries (evicted from window) instead of stopping at them.
-        // Stored values are (relative_pos + 1); decode with wrapping_sub(1)
-        // and recover absolute position via position_base + relative.
-        // Break on self-loops (masked chain_idx collision at periodicity).
-        let mut steps = 0;
-        let max_chain_steps = self.hc.search_depth;
-        while filled < self.hc.search_depth && steps < max_chain_steps {
-            if cur == HC_EMPTY {
-                break;
-            }
-            let candidate_rel = cur.wrapping_sub(1) as usize;
-            let candidate_abs = self.table.position_base + candidate_rel;
-            let next = self.table.chain_table[candidate_rel & chain_mask];
-            steps += 1;
-            if next == cur {
-                // Self-loop: two positions share chain_idx, stop to avoid
-                // spinning on the same candidate forever.
-                if candidate_abs >= self.table.history_abs_start && candidate_abs < abs_pos {
-                    buf[filled] = candidate_abs;
-                }
-                break;
-            }
-            cur = next;
-            if candidate_abs < self.table.history_abs_start || candidate_abs >= abs_pos {
-                continue;
-            }
-            buf[filled] = candidate_abs;
-            filled += 1;
-        }
-        buf
-    }
-
-    fn find_best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let rep = self.repcode_candidate(abs_pos, lit_len);
-        let hash = self.hash_chain_candidate(abs_pos, lit_len);
-        super::hc::HcMatcher::better_candidate(rep, hash)
-    }
-
-    fn hash_chain_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let concat = self.table.live_history();
-        let current_idx = abs_pos - self.table.history_abs_start;
-        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
-        }
-
-        let mut best: Option<MatchCandidate> = None;
-        for candidate_abs in self.chain_candidates(abs_pos) {
-            if candidate_abs == usize::MAX {
-                break;
-            }
-            let candidate_idx = candidate_abs - self.table.history_abs_start;
-            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= HC_MIN_MATCH_LEN {
-                let candidate = super::hc::HcMatcher::extend_backwards(&self.table, candidate_abs, abs_pos, match_len, lit_len);
-                best = super::hc::HcMatcher::better_candidate(best, Some(candidate));
-                if best.is_some_and(|b| b.match_len >= self.hc.target_len) {
-                    return best;
-                }
-            }
-        }
-        best
-    }
-
-    fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let reps = if lit_len == 0 {
-            [
-                Some(self.table.offset_hist[1] as usize),
-                Some(self.table.offset_hist[2] as usize),
-                (self.table.offset_hist[0] > 1).then_some((self.table.offset_hist[0] - 1) as usize),
-            ]
-        } else {
-            [
-                Some(self.table.offset_hist[0] as usize),
-                Some(self.table.offset_hist[1] as usize),
-                Some(self.table.offset_hist[2] as usize),
-            ]
-        };
-
-        let concat = self.table.live_history();
-        let current_idx = abs_pos - self.table.history_abs_start;
-        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
-        }
-
-        let mut best = None;
-        for rep in reps.into_iter().flatten() {
-            if rep == 0 || rep > abs_pos {
-                continue;
-            }
-            let candidate_pos = abs_pos - rep;
-            if candidate_pos < self.table.history_abs_start {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.table.history_abs_start;
-            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= HC_MIN_MATCH_LEN {
-                let candidate = super::hc::HcMatcher::extend_backwards(&self.table, candidate_pos, abs_pos, match_len, lit_len);
-                best = super::hc::HcMatcher::better_candidate(best, Some(candidate));
-            }
-        }
-        best
-    }
-
     /// Cross-platform entry. Dispatches to the kernel-specific variant so the
     /// per-rep prefix probe inlines without an ABI barrier per call. The
     /// on-encode hot path bypasses this dispatcher via the kernel-specific
@@ -4506,49 +4394,6 @@ impl HcMatchGenerator {
             f,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
         )
-    }
-
-    // Lazy lookahead queries pos+1/pos+2 before they are inserted into hash
-    // tables — matching C zstd behavior. Seeding before comparing would let a
-    // position match against itself, changing semantics.
-    fn pick_lazy_match(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-        best: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        let best = best?;
-        if best.match_len >= self.hc.target_len
-            || abs_pos + 1 + HC_MIN_MATCH_LEN > self.table.history_abs_end()
-        {
-            return Some(best);
-        }
-
-        let current_gain = super::hc::HcMatcher::match_gain(best.match_len, best.offset) + 4;
-
-        // Lazy check: evaluate pos+1
-        let next = self.find_best_match(abs_pos + 1, lit_len + 1);
-        if let Some(next) = next {
-            let next_gain = super::hc::HcMatcher::match_gain(next.match_len, next.offset);
-            if next_gain > current_gain {
-                return None;
-            }
-        }
-
-        // Lazy2 check: also evaluate pos+2
-        if self.hc.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= self.table.history_abs_end()
-        {
-            let next2 = self.find_best_match(abs_pos + 2, lit_len + 2);
-            if let Some(next2) = next2 {
-                let next2_gain = super::hc::HcMatcher::match_gain(next2.match_len, next2.offset);
-                // Must beat current gain + extra literal cost
-                if next2_gain > current_gain + 4 {
-                    return None;
-                }
-            }
-        }
-
-        Some(best)
     }
 }
 
@@ -6741,7 +6586,7 @@ fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
     hc.table.history_abs_start = 0;
     hc.table.ensure_tables();
 
-    let candidates = hc.chain_candidates(0);
+    let candidates = hc.hc.chain_candidates(&hc.table, 0);
     assert!(candidates.iter().all(|&pos| pos == usize::MAX));
 }
 
@@ -7343,7 +7188,7 @@ fn hc_rebases_positions_after_u32_boundary() {
 
     // Verify rebasing preserves candidate lookup, not just table population.
     let abs_pos = matcher.table.history_abs_start + 10;
-    let candidates = matcher.chain_candidates(abs_pos);
+    let candidates = matcher.hc.chain_candidates(&matcher.table, abs_pos);
     assert!(
         candidates.iter().any(|candidate| *candidate != usize::MAX),
         "chain_candidates should return valid matches after rebase"
