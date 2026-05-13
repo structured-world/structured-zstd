@@ -118,11 +118,14 @@ impl MatchTable {
         self.dictionary_limit_abs = None;
         self.dictionary_primed_for_frame = false;
         self.allow_zero_relative_position = false;
-        if !self.hash_table.is_empty() {
-            self.hash_table.fill(HC_EMPTY);
-            self.hash3_table.fill(HC_EMPTY);
-            self.chain_table.fill(HC_EMPTY);
-        }
+        // Clear each table independently — `Vec::fill` on an empty Vec
+        // is a no-op, so unconditional fills are safe even when a table
+        // hasn't been allocated yet (HC mode keeps hash3_table empty,
+        // and the backend-switch path swaps every table for Vec::new()
+        // to release oversized allocations).
+        self.hash_table.fill(HC_EMPTY);
+        self.hash3_table.fill(HC_EMPTY);
+        self.chain_table.fill(HC_EMPTY);
         for mut data in self.window.drain(..) {
             data.resize(data.capacity(), 0);
             reuse_space(data);
