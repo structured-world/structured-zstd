@@ -19,6 +19,7 @@ pub(crate) mod util;
 // the per-phase boundary is `perf/post-pr-110-baseline`.
 pub(crate) mod bt;
 pub(crate) mod cost_model;
+pub(crate) mod dfast;
 pub(crate) mod hc;
 pub(crate) mod match_table;
 pub(crate) mod opt;

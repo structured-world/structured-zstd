@@ -296,7 +296,11 @@ impl RowMatchGenerator {
         )
     }
 
-    pub(crate) fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+    pub(crate) fn repcode_candidate(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
         repcode_candidate_shared(
             self.live_history(),
             self.history_abs_start,
