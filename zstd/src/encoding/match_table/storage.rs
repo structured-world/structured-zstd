@@ -109,6 +109,61 @@ impl MatchTable {
         }
     }
 
+    /// Insert a position into the HC3 short-match side table without
+    /// running the rebase check. Caller is responsible for ensuring
+    /// the position is already representable (or that the rebase
+    /// guard upstream already cleared it). Donor parity: the inner
+    /// `ZSTD_insertAndFindFirstIndexHash3` body.
+    pub(crate) fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
+        if self.hash3_log == 0 {
+            return;
+        }
+        let idx = abs_pos - self.history_abs_start;
+        let concat = &self.history[self.history_start..];
+        if idx + 4 > concat.len() {
+            return;
+        }
+        let Some(relative_pos) = self.relative_position(abs_pos) else {
+            return;
+        };
+        let hash3 = Self::hash_position_at(concat, idx, self.hash3_log, 3);
+        self.hash3_table[hash3] = relative_pos + 1;
+    }
+
+    /// Insert a position into the main hash / chain table without
+    /// running the rebase check. Caller pre-validates that the
+    /// position is representable as a `(rel + 1)` u32, either via
+    /// `maybe_rebase_positions` (HC) or `bt_update_tree_until` (BT).
+    /// Donor parity: `ZSTD_insertAndFindFirstIndex` inner body.
+    #[inline]
+    pub(crate) fn insert_position_no_rebase(&mut self, abs_pos: usize) {
+        let idx = abs_pos.wrapping_sub(self.history_abs_start);
+        let concat = &self.history[self.history_start..];
+        if idx + 4 > concat.len() {
+            return;
+        }
+        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
+        let Some(relative_pos) = self.relative_position(abs_pos) else {
+            return;
+        };
+        let stored = relative_pos + 1;
+        let chain_mask = (1usize << self.chain_log) - 1;
+        let chain_idx = relative_pos as usize & chain_mask;
+        // SAFETY: `hash` is produced by `hash_value_with_mls` which masks
+        // the result down to `hash_log` bits, and `hash_table.len() == 1 <<
+        // hash_log` (`ensure_tables`). `chain_idx` is `& chain_mask` so
+        // `< chain_table.len() == 1 << chain_log`. Both indices are
+        // provably in bounds, so the elided bounds checks save ~4
+        // instructions per call on this per-byte-of-input hot path.
+        debug_assert!(hash < self.hash_table.len());
+        debug_assert!(chain_idx < self.chain_table.len());
+        unsafe {
+            let prev = *self.hash_table.get_unchecked(hash);
+            *self.chain_table.get_unchecked_mut(chain_idx) = prev;
+            *self.hash_table.get_unchecked_mut(hash) = stored;
+        }
+    }
+
     /// Allocate the hash / chain / hash3 tables sized to the current
     /// `hash_log` / `chain_log` / `hash3_log` configuration. No-op if
     /// the main hash_table is already sized; the backend-switch path

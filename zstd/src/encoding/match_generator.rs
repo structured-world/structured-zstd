@@ -2504,7 +2504,7 @@ impl HcMatchGenerator {
         while pos < current_abs_end {
             self.maybe_rebase_positions(pos);
             let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
-            self.insert_hash3_only_no_rebase(pos);
+            self.table.insert_hash3_only_no_rebase(pos);
             let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
             if next <= pos {
                 break;
@@ -2523,7 +2523,7 @@ impl HcMatchGenerator {
             }
             self.maybe_rebase_positions(pos);
             let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
-            self.insert_hash3_only_no_rebase(pos);
+            self.table.insert_hash3_only_no_rebase(pos);
         }
 
         self.table.skip_insert_until_abs = self.table.skip_insert_until_abs.max(current_abs_end);
@@ -4101,27 +4101,6 @@ impl HcMatchGenerator {
         )
     }
 
-    fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
-        if self.table.hash3_log == 0 {
-            return;
-        }
-        let idx = abs_pos - self.table.history_abs_start;
-        let concat = &self.table.history[self.table.history_start..];
-        if idx + 4 > concat.len() {
-            return;
-        }
-        let Some(relative_pos) = self.table.relative_position(abs_pos) else {
-            return;
-        };
-        let hash3 = super::match_table::storage::MatchTable::hash_position_at(
-            concat,
-            idx,
-            self.table.hash3_log,
-            3,
-        );
-        self.table.hash3_table[hash3] = relative_pos + 1;
-    }
-
     fn update_hash3_until(&mut self, abs_pos: usize) {
         if self.table.next_to_update3 < self.table.history_abs_start {
             self.table.next_to_update3 = self.table.history_abs_start;
@@ -4133,7 +4112,7 @@ impl HcMatchGenerator {
             if !self.can_skip_rebase_check_at(self.table.next_to_update3, abs_pos) {
                 self.maybe_rebase_positions(self.table.next_to_update3);
             }
-            self.insert_hash3_only_no_rebase(self.table.next_to_update3);
+            self.table.insert_hash3_only_no_rebase(self.table.next_to_update3);
             self.table.next_to_update3 = self.table.next_to_update3.saturating_add(1);
         }
     }
@@ -4199,7 +4178,7 @@ impl HcMatchGenerator {
             }
         } else {
             for pos in history_start..abs_pos {
-                self.insert_position_no_rebase(pos);
+                self.table.insert_position_no_rebase(pos);
             }
         }
         self.table.next_to_update3 = self.table.next_to_update3.max(abs_pos);
@@ -4208,41 +4187,7 @@ impl HcMatchGenerator {
     #[inline]
     fn insert_position(&mut self, abs_pos: usize) {
         self.maybe_rebase_positions(abs_pos);
-        self.insert_position_no_rebase(abs_pos);
-    }
-
-    #[inline]
-    fn insert_position_no_rebase(&mut self, abs_pos: usize) {
-        let idx = abs_pos.wrapping_sub(self.table.history_abs_start);
-        let concat = &self.table.history[self.table.history_start..];
-        if idx + 4 > concat.len() {
-            return;
-        }
-        let hash = super::match_table::storage::MatchTable::hash_position_at(
-            concat,
-            idx,
-            self.table.hash_log,
-            4,
-        );
-        let Some(relative_pos) = self.table.relative_position(abs_pos) else {
-            return;
-        };
-        let stored = relative_pos + 1;
-        let chain_mask = (1usize << self.table.chain_log) - 1;
-        let chain_idx = relative_pos as usize & chain_mask;
-        // SAFETY: `hash` is produced by `hash_value_with_mls` which masks the
-        // result down to `hash_log` bits, and `hash_table.len() == 1 <<
-        // hash_log` (`ensure_tables`). `chain_idx` is `& chain_mask` so
-        // `< chain_table.len() == 1 << chain_log`. Both indices are provably
-        // in bounds, so the elided bounds checks save ~4 instructions per
-        // call on this per-byte-of-input hot path.
-        debug_assert!(hash < self.table.hash_table.len());
-        debug_assert!(chain_idx < self.table.chain_table.len());
-        unsafe {
-            let prev = *self.table.hash_table.get_unchecked(hash);
-            *self.table.chain_table.get_unchecked_mut(chain_idx) = prev;
-            *self.table.hash_table.get_unchecked_mut(hash) = stored;
-        }
+        self.table.insert_position_no_rebase(abs_pos);
     }
 
     fn insert_positions(&mut self, start: usize, end: usize) {
@@ -7247,7 +7192,7 @@ fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
     let before_hash = hc.table.hash_table.clone();
     let before_chain = hc.table.chain_table.clone();
 
-    hc.insert_position_no_rebase(0);
+    hc.table.insert_position_no_rebase(0);
 
     assert_eq!(hc.table.hash_table, before_hash);
     assert_eq!(hc.table.chain_table, before_chain);
@@ -7476,7 +7421,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     expected.table.hash_table.fill(HC_EMPTY);
     expected.table.chain_table.fill(HC_EMPTY);
     for pos in expected.table.history_abs_start..abs_pos {
-        expected.insert_position_no_rebase(pos);
+        expected.table.insert_position_no_rebase(pos);
     }
 
     matcher.maybe_rebase_positions(abs_pos);
