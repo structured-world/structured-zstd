@@ -854,6 +854,234 @@ impl MatchTable {
         }
     }
 
+    /// Stage D: BT-tree update dispatcher. Picks the kernel-specific
+    /// variant so the per-iteration BT walker inlines under the
+    /// surrounding `target_feature` umbrella.
+    #[inline(always)]
+    pub(crate) fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_update_tree_until_neon(abs_pos, current_abs_end)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+        }
+    }
+
+    /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
+    /// inlines into the body because both share the
+    /// `target_feature = "neon"` umbrella.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn bt_update_tree_until_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
+            let forward =
+                unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// SSE4.2 umbrella variant.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    pub(crate) unsafe fn bt_update_tree_until_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 + BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    pub(crate) unsafe fn bt_update_tree_until_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
+            };
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub(crate) fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward =
+                self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
+            update_abs = update_abs.saturating_add(forward.max(1));
+        }
+        self.skip_insert_until_abs = abs_pos;
+    }
+
+    /// Hash3-only fill up to (but not including) `abs_pos`. Rebase
+    /// guard fires only when `can_skip_rebase_check_at` says we can't
+    /// trivially skip — the fast path is a tight loop over `hash3_table`
+    /// writes.
+    pub(crate) fn update_hash3_until(&mut self, abs_pos: usize) {
+        let is_btultra2 = self.is_btultra2;
+        if self.next_to_update3 < self.history_abs_start {
+            self.next_to_update3 = self.history_abs_start;
+        }
+        if self.next_to_update3 >= abs_pos {
+            return;
+        }
+        while self.next_to_update3 < abs_pos {
+            if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(self.next_to_update3);
+            }
+            self.insert_hash3_only_no_rebase(self.next_to_update3);
+            self.next_to_update3 = self.next_to_update3.saturating_add(1);
+        }
+    }
+
+    /// Hot wrapper for the rebase guard. Fast path is a single
+    /// [`Self::needs_rebase`] check; the cold rebuild is a separate
+    /// `#[cold]` function so the i-cache stays warm on the common
+    /// "no rebase needed" branch.
+    #[inline]
+    pub(crate) fn maybe_rebase_positions(&mut self, abs_pos: usize) {
+        let is_btultra2 = self.is_btultra2;
+        if self.needs_rebase(abs_pos, is_btultra2) {
+            self.rebase_positions_cold(abs_pos);
+        }
+    }
+
+    /// Cold rebase: clear the hash / hash3 / chain tables and replay
+    /// the inserted history prefix through the active backend's walker
+    /// so the new `position_base` is consistent. The `uses_bt` flag
+    /// (mirrored from `HcParseMode`) selects between the HC and BT
+    /// replay variants.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn rebase_positions_cold(&mut self, abs_pos: usize) {
+        self.begin_rebase();
+        let history_start = self.history_abs_start;
+        // Rebuild only the already-inserted prefix. The caller inserts abs_pos
+        // immediately after this, and later positions are added in-order.
+        if self.uses_bt {
+            self.replay_history_for_rebase_bt(history_start, abs_pos);
+        } else {
+            self.replay_history_for_rebase_hc(history_start, abs_pos);
+        }
+        self.next_to_update3 = self.next_to_update3.max(abs_pos);
+    }
+
+    /// Insert a single position into the hash / chain tables, rebasing
+    /// first if required.
+    #[inline]
+    pub(crate) fn insert_position(&mut self, abs_pos: usize) {
+        self.maybe_rebase_positions(abs_pos);
+        self.insert_position_no_rebase(abs_pos);
+    }
+
+    /// Insert every position in `[start, end)` into the hash / chain
+    /// tables and advance the hash3 fill cursor past `end`.
+    pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
+        for pos in start..end {
+            self.insert_position(pos);
+        }
+        self.next_to_update3 = self.next_to_update3.max(end);
+    }
+
+    /// Insert every `step`-th position in `[start, end)` — the sparse
+    /// counterpart to [`Self::insert_positions`]. Skipped positions are
+    /// *not* advanced through `next_to_update3` (the donor's behaviour
+    /// for the "incompressible block" skip path).
+    pub(crate) fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        if step == 0 {
+            return;
+        }
+        let mut pos = start;
+        while pos < end {
+            self.insert_position(pos);
+            let next = pos.saturating_add(step);
+            if next <= pos {
+                break;
+            }
+            pos = next;
+        }
+    }
+
     pub(crate) fn begin_rebase(&mut self) {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;

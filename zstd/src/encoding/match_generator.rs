@@ -1883,7 +1883,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         if $bt_matchfinder {
             // SAFETY: caller is in the same target_feature umbrella as
             // `$bt_update`; the runtime kernel detector already gated entry.
-            unsafe { $self.$bt_update($abs_pos, $current_abs_end) };
+            unsafe { $self.table.$bt_update($abs_pos, $current_abs_end) };
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
         if current_idx + 4 > $self.table.live_history().len() {
@@ -1930,7 +1930,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             )
         };
         if !skip_further_match_search && best_len_for_skip < min_match_len {
-            $self.update_hash3_until($abs_pos);
+            $self.table.update_hash3_until($abs_pos);
             // SAFETY: same umbrella for hash3_candidate.
             if let Some(h3) = unsafe {
                 $self
@@ -1965,7 +1965,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 )
             };
         } else if !skip_further_match_search {
-            $self.insert_position($abs_pos);
+            $self.table.insert_position($abs_pos);
             let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
             let concat = &$self.table.history[$self.table.history_start..];
             let mut match_end_abs = $abs_pos.saturating_add(9);
@@ -2386,9 +2386,11 @@ impl HcMatchGenerator {
             .max(self.table.history_abs_start);
         if backfill_start < current_abs_start {
             if self.uses_bt_matchfinder() {
-                self.bt_update_tree_until(current_abs_start, current_abs_end);
+                self.table
+                    .bt_update_tree_until(current_abs_start, current_abs_end);
             } else {
-                self.insert_positions(backfill_start, current_abs_start);
+                self.table
+                    .insert_positions(backfill_start, current_abs_start);
             }
         }
     }
@@ -2414,11 +2416,12 @@ impl HcMatchGenerator {
                 self.bt_insert_sparse_incompressible_block(current_abs_start, current_abs_end);
                 return;
             }
-            self.bt_update_tree_until(current_abs_end, current_abs_end);
+            self.table
+                .bt_update_tree_until(current_abs_end, current_abs_end);
             return;
         }
         if incompressible_hint == Some(true) {
-            self.insert_positions_with_step(
+            self.table.insert_positions_with_step(
                 current_abs_start,
                 current_abs_end,
                 INCOMPRESSIBLE_SKIP_STEP,
@@ -2430,11 +2433,12 @@ impl HcMatchGenerator {
             let tail_start = tail_start.max(current_abs_start);
             for pos in tail_start..current_abs_end {
                 if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                    self.insert_position(pos);
+                    self.table.insert_position(pos);
                 }
             }
         } else {
-            self.insert_positions(current_abs_start, current_abs_end);
+            self.table
+                .insert_positions(current_abs_start, current_abs_end);
         }
     }
 
@@ -2445,7 +2449,7 @@ impl HcMatchGenerator {
     ) {
         let mut pos = current_abs_start;
         while pos < current_abs_end {
-            self.maybe_rebase_positions(pos);
+            self.table.maybe_rebase_positions(pos);
             let _ = self
                 .table
                 .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
@@ -2466,7 +2470,7 @@ impl HcMatchGenerator {
             if (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
                 continue;
             }
-            self.maybe_rebase_positions(pos);
+            self.table.maybe_rebase_positions(pos);
             let _ = self
                 .table
                 .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
@@ -2506,7 +2510,8 @@ impl HcMatchGenerator {
 
             let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
             if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
-                self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+                self.table
+                    .insert_positions(abs_pos, candidate.start + candidate.match_len);
                 let current = self.table.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
@@ -2523,7 +2528,7 @@ impl HcMatchGenerator {
                 pos = start + candidate.match_len;
                 literals_start = pos;
             } else {
-                self.insert_position(abs_pos);
+                self.table.insert_position(abs_pos);
                 pos += 1;
             }
         }
@@ -2531,7 +2536,7 @@ impl HcMatchGenerator {
         // Insert remaining hashable positions in the tail (the matching loop
         // stops at HC_MIN_MATCH_LEN but insert_position only needs 4 bytes).
         while pos + 4 <= current_len {
-            self.insert_position(current_abs_start + pos);
+            self.table.insert_position(current_abs_start + pos);
             pos += 1;
         }
 
@@ -3154,229 +3159,6 @@ impl HcMatchGenerator {
     #[inline]
     fn is_btultra2(&self) -> bool {
         self.table.is_btultra2
-    }
-
-    /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
-    /// update loop runs inside the same `target_feature` umbrella as the per-
-    /// position `bt_insert_step_no_rebase` it calls — eliminating one ABI
-    /// barrier per fill iteration.
-    #[inline(always)]
-    fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
-        // SAFETY: each branch verifies the target_feature requirement of the
-        // callee (see `bt_insert_step_no_rebase` dispatcher).
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        unsafe {
-            self.bt_update_tree_until_neon(abs_pos, current_abs_end)
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
-                },
-                FastpathKernel::Sse42 => unsafe {
-                    self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
-                },
-                FastpathKernel::Scalar => {
-                    self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
-                }
-            }
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
-            target_arch = "x86",
-            target_arch = "x86_64"
-        )))]
-        {
-            self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
-        }
-    }
-
-    /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
-    /// inlines into the body because both share the `target_feature = "neon"`
-    /// umbrella.
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn bt_update_tree_until_neon(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.table.skip_insert_until_abs < self.table.history_abs_start {
-            self.table.skip_insert_until_abs = self.table.history_abs_start;
-        }
-        let mut update_abs = self.table.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            let is_btultra2 = self.is_btultra2();
-            if !self
-                .table
-                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
-            {
-                self.maybe_rebase_positions(update_abs);
-            }
-            // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
-            let forward = unsafe {
-                self.table
-                    .bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos)
-            };
-            update_abs = update_abs.saturating_add(forward.max(1));
-        }
-        self.table.skip_insert_until_abs = abs_pos;
-    }
-
-    /// SSE4.2 umbrella variant.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn bt_update_tree_until_sse42(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.table.skip_insert_until_abs < self.table.history_abs_start {
-            self.table.skip_insert_until_abs = self.table.history_abs_start;
-        }
-        let mut update_abs = self.table.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            let is_btultra2 = self.is_btultra2();
-            if !self
-                .table
-                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
-            {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward = unsafe {
-                self.table
-                    .bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
-            };
-            update_abs = update_abs.saturating_add(forward.max(1));
-        }
-        self.table.skip_insert_until_abs = abs_pos;
-    }
-
-    /// AVX2+BMI2 umbrella variant.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn bt_update_tree_until_avx2_bmi2(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.table.skip_insert_until_abs < self.table.history_abs_start {
-            self.table.skip_insert_until_abs = self.table.history_abs_start;
-        }
-        let mut update_abs = self.table.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            let is_btultra2 = self.is_btultra2();
-            if !self
-                .table
-                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
-            {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward = unsafe {
-                self.table
-                    .bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
-            };
-            update_abs = update_abs.saturating_add(forward.max(1));
-        }
-        self.table.skip_insert_until_abs = abs_pos;
-    }
-
-    /// Scalar fallback used on non-AArch64 targets.
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-    fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.table.skip_insert_until_abs < self.table.history_abs_start {
-            self.table.skip_insert_until_abs = self.table.history_abs_start;
-        }
-        let mut update_abs = self.table.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            let is_btultra2 = self.is_btultra2();
-            if !self
-                .table
-                .can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2)
-            {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward =
-                self.table
-                    .bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            update_abs = update_abs.saturating_add(forward.max(1));
-        }
-        self.table.skip_insert_until_abs = abs_pos;
-    }
-
-    fn update_hash3_until(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.is_btultra2();
-        if self.table.next_to_update3 < self.table.history_abs_start {
-            self.table.next_to_update3 = self.table.history_abs_start;
-        }
-        if self.table.next_to_update3 >= abs_pos {
-            return;
-        }
-        while self.table.next_to_update3 < abs_pos {
-            if !self.table.can_skip_rebase_check_at(
-                self.table.next_to_update3,
-                abs_pos,
-                is_btultra2,
-            ) {
-                self.maybe_rebase_positions(self.table.next_to_update3);
-            }
-            self.table
-                .insert_hash3_only_no_rebase(self.table.next_to_update3);
-            self.table.next_to_update3 = self.table.next_to_update3.saturating_add(1);
-        }
-    }
-
-    /// Hot wrapper: every `insert_position*` call passes through here.
-    /// The fast path is "no rebase needed" — a single
-    /// [`MatchTable::needs_rebase`] check including the `BtUltra2`
-    /// first-position skip. The actual table rebuild fires once per
-    /// ~`u32::MAX` positions on rolling streams and never for typical
-    /// single-shot inputs, so it lives in a separate `#[cold]`
-    /// function on this struct (it still needs to drive the BT
-    /// matchfinder, which can't move onto `MatchTable`). Inlining the
-    /// hot wrapper lets the compiler fold the early return into the
-    /// caller and keep the cold path off the i-cache.
-    #[inline]
-    fn maybe_rebase_positions(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.is_btultra2();
-        if self.table.needs_rebase(abs_pos, is_btultra2) {
-            self.rebase_positions_cold(abs_pos);
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn rebase_positions_cold(&mut self, abs_pos: usize) {
-        self.table.begin_rebase();
-        let history_start = self.table.history_abs_start;
-        // Rebuild only the already-inserted prefix. The caller inserts abs_pos
-        // immediately after this, and later positions are added in-order.
-        if self.table.uses_bt {
-            self.table
-                .replay_history_for_rebase_bt(history_start, abs_pos);
-        } else {
-            self.table
-                .replay_history_for_rebase_hc(history_start, abs_pos);
-        }
-        self.table.next_to_update3 = self.table.next_to_update3.max(abs_pos);
-    }
-
-    #[inline]
-    fn insert_position(&mut self, abs_pos: usize) {
-        self.maybe_rebase_positions(abs_pos);
-        self.table.insert_position_no_rebase(abs_pos);
-    }
-
-    fn insert_positions(&mut self, start: usize, end: usize) {
-        for pos in start..end {
-            self.insert_position(pos);
-        }
-        self.table.next_to_update3 = self.table.next_to_update3.max(end);
-    }
-
-    fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
-        if step == 0 {
-            return;
-        }
-        let mut pos = start;
-        while pos < end {
-            self.insert_position(pos);
-            let next = pos.saturating_add(step);
-            if next <= pos {
-                break;
-            }
-            pos = next;
-        }
     }
 }
 
@@ -4134,7 +3916,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     hc.hc.search_depth = 32;
     let abs_pos = 6usize;
     hc.table.ensure_tables();
-    hc.insert_positions(0, abs_pos);
+    hc.table.insert_positions(0, abs_pos);
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 32,
@@ -4172,7 +3954,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     hc.hc.search_depth = 32;
     let abs_pos = 9usize;
     hc.table.ensure_tables();
-    hc.insert_positions(0, abs_pos);
+    hc.table.insert_positions(0, abs_pos);
     hc.table.skip_insert_until_abs = 0;
 
     let profile = HcOptimalCostProfile {
@@ -4210,7 +3992,7 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
     hc.hc.search_depth = 32;
     let abs_pos = 9usize;
     hc.table.ensure_tables();
-    hc.insert_positions(0, abs_pos);
+    hc.table.insert_positions(0, abs_pos);
     hc.table.skip_insert_until_abs = 0;
 
     let profile = HcOptimalCostProfile {
@@ -4296,7 +4078,7 @@ fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
     hc.hc.search_depth = 0;
     let abs_pos = 9usize; // second "abcde"
     hc.table.ensure_tables();
-    hc.insert_positions(0, abs_pos);
+    hc.table.insert_positions(0, abs_pos);
     // Donor hash3 has an independent nextToUpdate3 cursor; main-table
     // insertion does not imply the HC3 side table has been filled.
     hc.table.next_to_update3 = 0;
@@ -4468,7 +4250,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     hc.table.position_base = 0;
     hc.hc.search_depth = 32;
     hc.table.ensure_tables();
-    hc.insert_positions(0, abs_pos);
+    hc.table.insert_positions(0, abs_pos);
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 32,
@@ -5993,7 +5775,7 @@ fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
     hc.table.ensure_tables();
     hc.table.next_to_update3 = 0;
 
-    hc.insert_positions(0, 9);
+    hc.table.insert_positions(0, 9);
 
     assert_eq!(
         hc.table.next_to_update3, 9,
@@ -6011,7 +5793,7 @@ fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges(
     hc.table.ensure_tables();
     hc.table.next_to_update3 = 0;
 
-    hc.insert_positions_with_step(0, 16, 4);
+    hc.table.insert_positions_with_step(0, 16, 4);
 
     assert_eq!(
         hc.table.next_to_update3, 0,
@@ -6209,7 +5991,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
         expected.table.insert_position_no_rebase(pos);
     }
 
-    matcher.maybe_rebase_positions(abs_pos);
+    matcher.table.maybe_rebase_positions(abs_pos);
 
     assert_eq!(
         matcher.table.position_base, matcher.table.history_abs_start,
