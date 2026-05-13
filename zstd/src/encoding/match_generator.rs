@@ -87,7 +87,9 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 // shared storage module so MatchTable methods can reference them
 // without pulling in this module. Re-imported here so existing
 // macros / configs / tests keep their unqualified names.
-use super::match_table::storage::{HC_CHAIN_LOG, HC_EMPTY, HC_HASH_LOG, HC3_HASH_LOG};
+#[cfg(test)]
+use super::match_table::storage::HC_EMPTY;
+use super::match_table::storage::{HC_CHAIN_LOG, HC_HASH_LOG, HC3_HASH_LOG};
 // HC3_MAX_OFFSET moved to encoding::bt alongside the hash3 candidate
 // probe macro that consumes it; the macro references it via the
 // fully-qualified `$crate::encoding::bt::HC3_MAX_OFFSET` path so this
@@ -3349,34 +3351,20 @@ impl HcMatchGenerator {
     #[cold]
     #[inline(never)]
     fn rebase_positions_cold(&mut self, abs_pos: usize) {
-        // Keep all live history addressable after rebase.
-        self.table.position_base = self.table.history_abs_start;
-        self.table.index_shift = 0;
-        self.table.allow_zero_relative_position = true;
-        self.table.hash_table.fill(HC_EMPTY);
-        self.table.hash3_table.fill(HC_EMPTY);
-        self.table.chain_table.fill(HC_EMPTY);
-
+        self.table.begin_rebase();
         let history_start = self.table.history_abs_start;
         // Rebuild only the already-inserted prefix. The caller inserts abs_pos
         // immediately after this, and later positions are added in-order.
         if self.uses_bt_matchfinder() {
-            let rebuild_end = self.table.history_abs_end();
-            let mut pos = history_start;
-            while pos < abs_pos {
-                let forward = self.bt.bt_insert_step_no_rebase(
-                    &mut self.table,
-                    self.hc.search_depth,
-                    pos,
-                    rebuild_end,
-                    abs_pos,
-                );
-                pos = pos.saturating_add(forward.max(1));
-            }
+            self.bt.replay_history_for_rebase(
+                &mut self.table,
+                self.hc.search_depth,
+                history_start,
+                abs_pos,
+            );
         } else {
-            for pos in history_start..abs_pos {
-                self.table.insert_position_no_rebase(pos);
-            }
+            self.table
+                .replay_history_for_rebase_hc(history_start, abs_pos);
         }
         self.table.next_to_update3 = self.table.next_to_update3.max(abs_pos);
     }

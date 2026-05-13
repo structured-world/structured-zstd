@@ -843,6 +843,28 @@ impl BtMatcher {
         let _ = (current_abs_start, current_len);
     }
 
+    /// BT-side history replay after [`MatchTable::begin_rebase`].
+    /// Walks `history_start..abs_pos` through the BT walker so the
+    /// pointer-pair table is consistent with the fresh
+    /// `position_base`. `rebuild_end` is fixed at the live
+    /// `history_abs_end()` so the BT inserts don't probe beyond the
+    /// already-mirrored bytes.
+    pub(crate) fn replay_history_for_rebase(
+        &self,
+        table: &mut MatchTable,
+        search_depth: usize,
+        history_start: usize,
+        abs_pos: usize,
+    ) {
+        let rebuild_end = table.history_abs_end();
+        let mut pos = history_start;
+        while pos < abs_pos {
+            let forward =
+                self.bt_insert_step_no_rebase(table, search_depth, pos, rebuild_end, abs_pos);
+            pos = pos.saturating_add(forward.max(1));
+        }
+    }
+
     /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
     /// donor's compact offset base (1/2/3 for rep slots, otherwise
     /// `actual_offset + 3`) and update the rolling `reps` window in

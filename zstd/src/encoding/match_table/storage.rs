@@ -494,6 +494,32 @@ impl MatchTable {
         (start_cursor, start_cursor)
     }
 
+    /// Reset the rebase-derived bookkeeping (rolling `position_base` /
+    /// `index_shift`) so every stored position re-encodes from
+    /// `history_abs_start`, then clear the three index tables. Hot
+    /// path for `rebase_positions_cold`; the caller is responsible
+    /// for re-inserting any positions the active matchfinder still
+    /// needs.
+    pub(crate) fn begin_rebase(&mut self) {
+        self.position_base = self.history_abs_start;
+        self.index_shift = 0;
+        self.allow_zero_relative_position = true;
+        self.hash_table.fill(HC_EMPTY);
+        self.hash3_table.fill(HC_EMPTY);
+        self.chain_table.fill(HC_EMPTY);
+    }
+
+    /// HC-side history replay after [`begin_rebase`]. Re-inserts every
+    /// position from `history_start` (inclusive) to `abs_pos`
+    /// (exclusive) into the HC chain/hash tables without re-checking
+    /// the rebase guard — the caller has just rebased, so positions
+    /// are by construction representable.
+    pub(crate) fn replay_history_for_rebase_hc(&mut self, history_start: usize, abs_pos: usize) {
+        for pos in history_start..abs_pos {
+            self.insert_position_no_rebase(pos);
+        }
+    }
+
     /// Donor parity: replay an optimal-parser plan into the consumer's
     /// sequence sink. Reads the current input frame off `window` and
     /// advances `offset_hist` exactly like the donor block-store walker.
