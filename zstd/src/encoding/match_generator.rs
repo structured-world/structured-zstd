@@ -5,7 +5,6 @@
 //!
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
@@ -500,7 +499,8 @@ impl MatchGeneratorDriver {
             }
             MatcherBackend::HashChain => {
                 let matcher = self.hc_matcher_mut();
-                matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
+                matcher.table.max_window_size =
+                    matcher.table.max_window_size.saturating_sub(reclaimed);
             }
         }
     }
@@ -625,8 +625,8 @@ impl Matcher for MatchGeneratorDriver {
                     if let Some(hc) = self.hc_match_generator.as_mut() {
                         // Release oversized tables when switching away from
                         // HashChain so Best's larger allocations don't persist.
-                        hc.hash_table = Vec::new();
-                        hc.chain_table = Vec::new();
+                        hc.table.hash_table = Vec::new();
+                        hc.table.chain_table = Vec::new();
                         let vec_pool = &mut self.vec_pool;
                         hc.reset(|mut data| {
                             data.resize(data.capacity(), 0);
@@ -697,7 +697,7 @@ impl Matcher for MatchGeneratorDriver {
                 let hc = self
                     .hc_match_generator
                     .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
-                hc.max_window_size = max_window_size;
+                hc.table.max_window_size = max_window_size;
                 hc.lazy_depth = params.lazy_depth;
                 hc.configure(params.hc, params.window_log);
                 let vec_pool = &mut self.vec_pool;
@@ -716,7 +716,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherBackend::Row => self.row_matcher_mut().offset_hist = offset_hist,
             MatcherBackend::HashChain => {
                 let matcher = self.hc_matcher_mut();
-                matcher.offset_hist = offset_hist;
+                matcher.table.offset_hist = offset_hist;
                 matcher.mark_dictionary_primed();
             }
         }
@@ -747,8 +747,10 @@ impl Matcher for MatchGeneratorDriver {
             }
             MatcherBackend::HashChain => {
                 let matcher = self.hc_matcher_mut();
-                matcher.max_window_size =
-                    matcher.max_window_size.saturating_add(retained_dict_budget);
+                matcher.table.max_window_size = matcher
+                    .table
+                    .max_window_size
+                    .saturating_add(retained_dict_budget);
             }
         }
 
@@ -798,7 +800,8 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherBackend::HashChain => {
                     let matcher = self.hc_matcher_mut();
-                    matcher.max_window_size = matcher
+                    matcher.table.max_window_size = matcher
+                        .table
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
@@ -953,31 +956,16 @@ impl Matcher for MatchGeneratorDriver {
 }
 
 struct HcMatchGenerator {
-    max_window_size: usize,
-    window: VecDeque<Vec<u8>>,
-    window_size: usize,
-    history: Vec<u8>,
-    history_start: usize,
-    history_abs_start: usize,
-    position_base: usize,
-    index_shift: usize,
-    offset_hist: [u32; 3],
-    hash_table: Vec<u32>,
-    hash3_table: Vec<u32>,
-    chain_table: Vec<u32>,
+    /// Shared match-finder storage (window, history, hash / chain /
+    /// hash3 tables, dictionary-priming flags). Used identically by HC
+    /// and BT modes; backend-specific table interpretation lives in the
+    /// matcher methods on this struct.
+    table: super::match_table::storage::MatchTable,
     lazy_depth: u8,
-    hash_log: usize,
-    chain_log: usize,
     search_depth: usize,
     target_len: usize,
     parse_mode: HcParseMode,
     ldm_sequences: Vec<HcRawSeq>,
-    next_to_update3: usize,
-    hash3_log: usize,
-    skip_insert_until_abs: usize,
-    dictionary_limit_abs: Option<usize>,
-    dictionary_primed_for_frame: bool,
-    allow_zero_relative_position: bool,
     opt_state: HcOptState,
     opt_nodes_scratch: Vec<HcOptimalNode>,
     opt_candidates_scratch: Vec<MatchCandidate>,
@@ -1008,14 +996,18 @@ struct HcMatchGenerator {
 /// iteration. Used only by `HcMatchGenerator` BT walk wrappers below.
 macro_rules! bt_insert_step_no_rebase_body {
     ($self:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
-        let idx = $abs_pos - $self.history_abs_start;
-        let concat = &$self.history[$self.history_start..];
+        let idx = $abs_pos - $self.table.history_abs_start;
+        let concat = &$self.table.history[$self.table.history_start..];
         if idx + 8 > concat.len() {
             return 1;
         }
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let hash =
-            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let hash = HcMatchGenerator::hash_position_at(
+            concat,
+            idx,
+            $self.table.hash_log,
+            $self.bt_hash_mls(),
+        );
         let Some(relative_pos) = $self.relative_position($abs_pos) else {
             return 1;
         };
@@ -1031,14 +1023,14 @@ macro_rules! bt_insert_step_no_rebase_body {
         let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $self.hash_table[hash];
-        $self.hash_table[hash] = stored;
+        let mut match_stored = $self.table.hash_table[hash];
+        $self.table.hash_table[hash] = stored;
 
         while compares_left > 0 {
             let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
                 match_stored,
-                $self.position_base,
-                $self.index_shift,
+                $self.table.position_base,
+                $self.table.index_shift,
             ) else {
                 break;
             };
@@ -1048,10 +1040,10 @@ macro_rules! bt_insert_step_no_rebase_body {
             compares_left -= 1;
 
             let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = $self.chain_table[next_pair_idx];
-            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let next_smaller = $self.table.chain_table[next_pair_idx];
+            let next_larger = $self.table.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - $self.history_abs_start;
+            let candidate_idx = candidate_abs - $self.table.history_abs_start;
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
             // concat.len()` since the candidate is within
             // `[history_abs_start, abs_pos)` and `tail_limit ≤
@@ -1073,7 +1065,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
-                $self.chain_table[smaller_slot] = match_stored;
+                $self.table.chain_table[smaller_slot] = match_stored;
                 common_length_smaller = match_len;
                 if candidate_abs <= bt_low {
                     smaller_slot = usize::MAX;
@@ -1082,7 +1074,7 @@ macro_rules! bt_insert_step_no_rebase_body {
                 smaller_slot = next_pair_idx + 1;
                 match_stored = next_larger;
             } else {
-                $self.chain_table[larger_slot] = match_stored;
+                $self.table.chain_table[larger_slot] = match_stored;
                 common_length_larger = match_len;
                 if candidate_abs <= bt_low {
                     larger_slot = usize::MAX;
@@ -1094,10 +1086,10 @@ macro_rules! bt_insert_step_no_rebase_body {
         }
 
         if smaller_slot != usize::MAX {
-            $self.chain_table[smaller_slot] = HC_EMPTY;
+            $self.table.chain_table[smaller_slot] = HC_EMPTY;
         }
         if larger_slot != usize::MAX {
-            $self.chain_table[larger_slot] = HC_EMPTY;
+            $self.table.chain_table[larger_slot] = HC_EMPTY;
         }
 
         let speed_positions = if best_len > 384 {
@@ -1850,15 +1842,15 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $hash3:ident,
         $cpl:path $(,)?
     ) => {{
-        debug_assert!(!$self.hash_table.is_empty());
-        debug_assert!($self.hash3_log == 0 || !$self.hash3_table.is_empty());
-        debug_assert!(!$self.chain_table.is_empty());
+        debug_assert!(!$self.table.hash_table.is_empty());
+        debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table.is_empty());
+        debug_assert!(!$self.table.chain_table.is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let reps = $query.reps;
         let lit_len = $query.lit_len;
         let ldm_candidate = $query.ldm_candidate;
         $out.clear();
-        if $abs_pos < $self.skip_insert_until_abs {
+        if $abs_pos < $self.table.skip_insert_until_abs {
             if let Some(ldm) = ldm_candidate {
                 let mut best_len_for_skip = 0usize;
                 let _ = HcMatchGenerator::push_candidate_ladder(
@@ -1875,7 +1867,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             // `$bt_update`; the runtime kernel detector already gated entry.
             unsafe { $self.$bt_update($abs_pos, $current_abs_end) };
         }
-        let current_idx = $abs_pos - $self.history_abs_start;
+        let current_idx = $abs_pos - $self.table.history_abs_start;
         if current_idx + 4 > $self.live_history().len() {
             if let Some(ldm) = ldm_candidate {
                 let mut best_len_for_skip = 0usize;
@@ -1932,7 +1924,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     && (h3.match_len > $profile.sufficient_match_len
                         || $abs_pos.saturating_add(h3.match_len) >= $current_abs_end)
                 {
-                    $self.skip_insert_until_abs = $abs_pos.saturating_add(1);
+                    $self.table.skip_insert_until_abs = $abs_pos.saturating_add(1);
                     skip_further_match_search = true;
                 }
             }
@@ -1952,7 +1944,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         } else if !skip_further_match_search {
             $self.insert_position($abs_pos);
             let max_chain_depth = $profile.max_chain_depth.min($self.search_depth);
-            let concat = &$self.history[$self.history_start..];
+            let concat = &$self.table.history[$self.table.history_start..];
             let mut match_end_abs = $abs_pos.saturating_add(9);
             if max_chain_depth > 0 {
                 for (visited, candidate_abs) in
@@ -1964,10 +1956,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     if candidate_abs == usize::MAX {
                         break;
                     }
-                    if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+                    if candidate_abs < $self.table.history_abs_start || candidate_abs >= $abs_pos {
                         continue;
                     }
-                    let candidate_idx = candidate_abs - $self.history_abs_start;
+                    let candidate_idx = candidate_abs - $self.table.history_abs_start;
                     let tail_limit = $current_abs_end.saturating_sub($abs_pos);
                     let base = concat.as_ptr();
                     // SAFETY: history-relative indices; `tail_limit` bounds
@@ -2002,7 +1994,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     }
                 }
             }
-            $self.skip_insert_until_abs = $self
+            $self.table.skip_insert_until_abs = $self
+                .table
                 .skip_insert_until_abs
                 .max(match_end_abs.saturating_sub(8));
         }
@@ -2029,29 +2022,34 @@ macro_rules! hash3_candidate_body {
         $min_match_len:ident,
         $cpl:path $(,)?
     ) => {{
-        if $self.hash3_log == 0 {
+        if $self.table.hash3_log == 0 {
             return None;
         }
-        let idx = $abs_pos.checked_sub($self.history_abs_start)?;
+        let idx = $abs_pos.checked_sub($self.table.history_abs_start)?;
         let concat = $self.live_history();
         if idx + 4 > concat.len() {
             return None;
         }
-        let hash3 = HcMatchGenerator::hash_position_at(concat, idx, $self.hash3_log, 3);
-        let entry = $self.hash3_table.get(hash3).copied().unwrap_or(HC_EMPTY);
+        let hash3 = HcMatchGenerator::hash_position_at(concat, idx, $self.table.hash3_log, 3);
+        let entry = $self
+            .table
+            .hash3_table
+            .get(hash3)
+            .copied()
+            .unwrap_or(HC_EMPTY);
         let candidate_abs = HcMatchGenerator::stored_abs_position_fast(
             entry,
-            $self.position_base,
-            $self.index_shift,
+            $self.table.position_base,
+            $self.table.index_shift,
         )?;
-        if candidate_abs < $self.history_abs_start || candidate_abs >= $abs_pos {
+        if candidate_abs < $self.table.history_abs_start || candidate_abs >= $abs_pos {
             return None;
         }
         let offset = $abs_pos - candidate_abs;
         if offset >= HC3_MAX_OFFSET {
             return None;
         }
-        let candidate_idx = candidate_abs - $self.history_abs_start;
+        let candidate_idx = candidate_abs - $self.table.history_abs_start;
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
         let base = concat.as_ptr();
         // SAFETY: candidate/idx are within history range; tail_limit bounds
@@ -2098,7 +2096,7 @@ macro_rules! for_each_repcode_candidate_body {
             ]
         };
         let concat = $self.live_history();
-        let current_idx = $abs_pos - $self.history_abs_start;
+        let current_idx = $abs_pos - $self.table.history_abs_start;
         if current_idx + 4 > concat.len() {
             return;
         }
@@ -2110,10 +2108,10 @@ macro_rules! for_each_repcode_candidate_body {
                 continue;
             }
             let candidate_pos = $abs_pos - rep;
-            if candidate_pos < $self.history_abs_start {
+            if candidate_pos < $self.table.history_abs_start {
                 continue;
             }
-            let candidate_idx = candidate_pos - $self.history_abs_start;
+            let candidate_idx = candidate_pos - $self.table.history_abs_start;
             // SAFETY: `candidate_idx ≤ current_idx < concat_len` (since
             // candidate_pos ≤ abs_pos and we early-returned on
             // `current_idx + 4 > concat_len`). `max` clamps to the shorter
@@ -2150,14 +2148,18 @@ macro_rules! bt_insert_and_collect_matches_body {
         $out:ident,
         $cmf:path $(,)?
     ) => {{
-        let idx = $abs_pos - $self.history_abs_start;
-        let concat = &$self.history[$self.history_start..];
+        let idx = $abs_pos - $self.table.history_abs_start;
+        let concat = &$self.table.history[$self.table.history_start..];
         if idx + 8 > concat.len() {
             return;
         }
         let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let hash =
-            HcMatchGenerator::hash_position_at(concat, idx, $self.hash_log, $self.bt_hash_mls());
+        let hash = HcMatchGenerator::hash_position_at(
+            concat,
+            idx,
+            $self.table.hash_log,
+            $self.bt_hash_mls(),
+        );
         let Some(relative_pos) = $self.relative_position($abs_pos) else {
             return;
         };
@@ -2172,8 +2174,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         let pair_idx = $self.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $self.hash_table[hash];
-        $self.hash_table[hash] = stored;
+        let mut match_stored = $self.table.hash_table[hash];
+        $self.table.hash_table[hash] = stored;
         // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         let mut best_len = (*$best_len_for_skip).max($min_match_len.saturating_sub(1));
@@ -2181,8 +2183,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         while compares_left > 0 {
             let Some(candidate_abs) = HcMatchGenerator::stored_abs_position_fast(
                 match_stored,
-                $self.position_base,
-                $self.index_shift,
+                $self.table.position_base,
+                $self.table.index_shift,
             ) else {
                 break;
             };
@@ -2192,10 +2194,10 @@ macro_rules! bt_insert_and_collect_matches_body {
             compares_left -= 1;
 
             let next_pair_idx = $self.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = $self.chain_table[next_pair_idx];
-            let next_larger = $self.chain_table[next_pair_idx + 1];
+            let next_smaller = $self.table.chain_table[next_pair_idx];
+            let next_larger = $self.table.chain_table[next_pair_idx + 1];
             let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - $self.history_abs_start;
+            let candidate_idx = candidate_abs - $self.table.history_abs_start;
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
             // concat.len()`.
             let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
@@ -2231,7 +2233,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
-                $self.chain_table[smaller_slot] = match_stored;
+                $self.table.chain_table[smaller_slot] = match_stored;
                 common_length_smaller = match_len;
                 if candidate_abs <= bt_low {
                     smaller_slot = usize::MAX;
@@ -2240,7 +2242,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 smaller_slot = next_pair_idx + 1;
                 match_stored = next_larger;
             } else {
-                $self.chain_table[larger_slot] = match_stored;
+                $self.table.chain_table[larger_slot] = match_stored;
                 common_length_larger = match_len;
                 if candidate_abs <= bt_low {
                     larger_slot = usize::MAX;
@@ -2252,18 +2254,18 @@ macro_rules! bt_insert_and_collect_matches_body {
         }
 
         if smaller_slot != usize::MAX {
-            $self.chain_table[smaller_slot] = HC_EMPTY;
+            $self.table.chain_table[smaller_slot] = HC_EMPTY;
         }
         if larger_slot != usize::MAX {
-            $self.chain_table[larger_slot] = HC_EMPTY;
+            $self.table.chain_table[larger_slot] = HC_EMPTY;
         }
-        $self.skip_insert_until_abs = match_end_abs.saturating_sub(8);
+        $self.table.skip_insert_until_abs = match_end_abs.saturating_sub(8);
     }};
 }
 
 impl HcMatchGenerator {
     fn donor_opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
-        let start_cursor = usize::from(current_abs_start == self.history_abs_start);
+        let start_cursor = usize::from(current_abs_start == self.table.history_abs_start);
         (start_cursor, start_cursor)
     }
 
@@ -2278,23 +2280,23 @@ impl HcMatchGenerator {
         self.parse_mode == HcParseMode::BtUltra2
             && self.opt_state.lit_length_sum == 0
             && self.opt_state.dictionary_seed.is_none()
-            && !self.dictionary_primed_for_frame
+            && !self.table.dictionary_primed_for_frame
             && self.ldm_sequences.is_empty()
-            && self.window_size == current_len
-            && self.history_abs_start == 0
-            && self.window.len() == 1
+            && self.table.window_size == current_len
+            && self.table.history_abs_start == 0
+            && self.table.window.len() == 1
             && current_len > HC_PREDEF_THRESHOLD
     }
 
     fn mark_dictionary_primed(&mut self) {
-        self.dictionary_primed_for_frame = true;
+        self.table.dictionary_primed_for_frame = true;
     }
 
     fn set_dictionary_limit_from_primed_bytes(&mut self, primed_len: usize) {
-        self.dictionary_limit_abs = if primed_len == 0 {
+        self.table.dictionary_limit_abs = if primed_len == 0 {
             None
         } else {
-            Some(self.history_abs_start.saturating_add(primed_len))
+            Some(self.table.history_abs_start.saturating_add(primed_len))
         };
     }
 
@@ -2379,31 +2381,12 @@ impl HcMatchGenerator {
 
     fn new(max_window_size: usize) -> Self {
         Self {
-            max_window_size,
-            window: VecDeque::new(),
-            window_size: 0,
-            history: Vec::new(),
-            history_start: 0,
-            history_abs_start: 0,
-            position_base: 0,
-            index_shift: 0,
-            offset_hist: [1, 4, 8],
-            hash_table: Vec::new(),
-            hash3_table: Vec::new(),
-            chain_table: Vec::new(),
+            table: super::match_table::storage::MatchTable::new(max_window_size),
             lazy_depth: 2,
-            hash_log: HC_HASH_LOG,
-            chain_log: HC_CHAIN_LOG,
             search_depth: HC_SEARCH_DEPTH,
             target_len: HC_TARGET_LEN,
             parse_mode: HcParseMode::Lazy2,
             ldm_sequences: Vec::new(),
-            next_to_update3: 0,
-            hash3_log: HC3_HASH_LOG,
-            skip_insert_until_abs: 0,
-            dictionary_limit_abs: None,
-            dictionary_primed_for_frame: false,
-            allow_zero_relative_position: false,
             opt_state: HcOptState::new(),
             opt_nodes_scratch: Vec::new(),
             opt_candidates_scratch: Vec::new(),
@@ -2428,12 +2411,12 @@ impl HcMatchGenerator {
         } else {
             0
         };
-        let resize = self.hash_log != config.hash_log
-            || self.chain_log != config.chain_log
-            || self.hash3_log != next_hash3_log;
-        self.hash_log = config.hash_log;
-        self.chain_log = config.chain_log;
-        self.hash3_log = next_hash3_log;
+        let resize = self.table.hash_log != config.hash_log
+            || self.table.chain_log != config.chain_log
+            || self.table.hash3_log != next_hash3_log;
+        self.table.hash_log = config.hash_log;
+        self.table.chain_log = config.chain_log;
+        self.table.hash3_log = next_hash3_log;
         self.search_depth = if matches!(
             config.parse_mode,
             HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
@@ -2444,11 +2427,11 @@ impl HcMatchGenerator {
         };
         self.target_len = config.target_len;
         self.parse_mode = config.parse_mode;
-        if resize && !self.hash_table.is_empty() {
+        if resize && !self.table.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
-            self.hash_table.clear();
-            self.hash3_table.clear();
-            self.chain_table.clear();
+            self.table.hash_table.clear();
+            self.table.hash3_table.clear();
+            self.table.chain_table.clear();
         }
     }
 
@@ -2462,20 +2445,9 @@ impl HcMatchGenerator {
         self.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
     }
 
-    fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
-        self.window_size = 0;
-        self.history.clear();
-        self.history_start = 0;
-        self.history_abs_start = 0;
-        self.position_base = 0;
-        self.index_shift = 0;
-        self.offset_hist = [1, 4, 8];
+    fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
+        self.table.reset(reuse_space);
         self.ldm_sequences.clear();
-        self.next_to_update3 = 0;
-        self.skip_insert_until_abs = 0;
-        self.dictionary_limit_abs = None;
-        self.dictionary_primed_for_frame = false;
-        self.allow_zero_relative_position = false;
         self.opt_state.reset();
         self.opt_nodes_scratch.clear();
         self.opt_candidates_scratch.clear();
@@ -2491,46 +2463,37 @@ impl HcMatchGenerator {
         self.opt_ml_price_scratch.clear();
         self.opt_ml_price_generation.clear();
         self.opt_ml_price_stamp = 0;
-        if !self.hash_table.is_empty() {
-            self.hash_table.fill(HC_EMPTY);
-            self.hash3_table.fill(HC_EMPTY);
-            self.chain_table.fill(HC_EMPTY);
-        }
-        for mut data in self.window.drain(..) {
-            data.resize(data.capacity(), 0);
-            reuse_space(data);
-        }
     }
 
     fn get_last_space(&self) -> &[u8] {
-        self.window.back().unwrap().as_slice()
+        self.table.window.back().unwrap().as_slice()
     }
 
     // History duplicates window data for O(1) contiguous access during match
     // finding (common_prefix_len, extend_backwards). Same pattern as
     // DfastMatchGenerator. Peak: ~2x window size for data buffers + 6 MB tables.
     fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        while self.window_size + data.len() > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
+        assert!(data.len() <= self.table.max_window_size);
+        while self.table.window_size + data.len() > self.table.max_window_size {
+            let removed = self.table.window.pop_front().unwrap();
+            self.table.window_size -= removed.len();
+            self.table.history_start += removed.len();
+            self.table.history_abs_start += removed.len();
             reuse_space(removed);
         }
         self.compact_history();
-        self.history.extend_from_slice(&data);
-        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
-        self.window_size += data.len();
-        self.window.push_back(data);
+        self.table.history.extend_from_slice(&data);
+        self.table.next_to_update3 = self.table.next_to_update3.max(self.table.history_abs_start);
+        self.table.window_size += data.len();
+        self.table.window.push_back(data);
     }
 
     fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
-        while self.window_size > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
+        while self.table.window_size > self.table.max_window_size {
+            let removed = self.table.window.pop_front().unwrap();
+            self.table.window_size -= removed.len();
+            self.table.history_start += removed.len();
+            self.table.history_abs_start += removed.len();
             reuse_space(removed);
         }
     }
@@ -2540,7 +2503,7 @@ impl HcMatchGenerator {
     fn backfill_boundary_positions(&mut self, current_abs_start: usize, current_abs_end: usize) {
         let backfill_start = current_abs_start
             .saturating_sub(3)
-            .max(self.history_abs_start);
+            .max(self.table.history_abs_start);
         if backfill_start < current_abs_start {
             if self.uses_bt_matchfinder() {
                 self.bt_update_tree_until(current_abs_start, current_abs_end);
@@ -2554,16 +2517,16 @@ impl HcMatchGenerator {
         if !self.uses_bt_matchfinder() {
             return;
         }
-        let gap = current_abs_start.saturating_sub(self.skip_insert_until_abs);
+        let gap = current_abs_start.saturating_sub(self.table.skip_insert_until_abs);
         if gap > 384 {
-            self.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
+            self.table.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
         }
     }
 
     fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
-        let current_len = self.window.back().unwrap().len();
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_len = self.table.window.back().unwrap().len();
+        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
         if self.uses_bt_matchfinder() {
@@ -2583,7 +2546,7 @@ impl HcMatchGenerator {
             let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
             let tail_start = current_abs_end
                 .saturating_sub(dense_tail)
-                .max(self.history_abs_start);
+                .max(self.table.history_abs_start);
             let tail_start = tail_start.max(current_abs_start);
             for pos in tail_start..current_abs_end {
                 if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
@@ -2615,7 +2578,7 @@ impl HcMatchGenerator {
         let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
         let tail_start = current_abs_end
             .saturating_sub(dense_tail)
-            .max(self.history_abs_start)
+            .max(self.table.history_abs_start)
             .max(current_abs_start);
         for pos in tail_start..current_abs_end {
             if (pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
@@ -2626,8 +2589,8 @@ impl HcMatchGenerator {
             self.insert_hash3_only_no_rebase(pos);
         }
 
-        self.skip_insert_until_abs = self.skip_insert_until_abs.max(current_abs_end);
-        self.next_to_update3 = self.next_to_update3.max(current_abs_end);
+        self.table.skip_insert_until_abs = self.table.skip_insert_until_abs.max(current_abs_end);
+        self.table.next_to_update3 = self.table.next_to_update3.max(current_abs_end);
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -2642,12 +2605,12 @@ impl HcMatchGenerator {
     fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = self.table.window.back().unwrap().len();
         if current_len == 0 {
             return;
         }
 
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
 
@@ -2660,7 +2623,7 @@ impl HcMatchGenerator {
             let best = self.find_best_match(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
                 self.insert_positions(abs_pos, candidate.start + candidate.match_len);
-                let current = self.window.back().unwrap().as_slice();
+                let current = self.table.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
                 handle_sequence(Sequence::Triple {
@@ -2671,7 +2634,7 @@ impl HcMatchGenerator {
                 let _ = encode_offset_with_history(
                     candidate.offset as u32,
                     literals.len() as u32,
-                    &mut self.offset_hist,
+                    &mut self.table.offset_hist,
                 );
                 pos = start + candidate.match_len;
                 literals_start = pos;
@@ -2689,7 +2652,7 @@ impl HcMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.window.back().unwrap().as_slice();
+            let current = self.table.window.back().unwrap().as_slice();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -2698,22 +2661,25 @@ impl HcMatchGenerator {
 
     fn start_matching_optimal(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = self.table.window.back().unwrap().len();
         if current_len == 0 {
             return;
         }
-        let current_ptr = self.window.back().unwrap().as_ptr();
+        let current_ptr = self.table.window.back().unwrap().as_ptr();
         // `start_matching_optimal()` mutates tables/state but never mutates or
-        // reorders `self.window`, so this block slice remains valid for the
+        // reorders `self.table.window`, so this block slice remains valid for the
         // duration of the routine and avoids cloning the full block.
         let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.apply_limited_update_after_long_match(current_abs_start);
-        let hash3_start_cursor = self.skip_insert_until_abs.max(self.history_abs_start);
+        let hash3_start_cursor = self
+            .table
+            .skip_insert_until_abs
+            .max(self.table.history_abs_start);
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
-        self.next_to_update3 = hash3_start_cursor;
+        self.table.next_to_update3 = hash3_start_cursor;
         self.prepare_ldm_candidates(current_abs_start, current_len);
 
         if self.should_run_btultra2_seed_pass(current_len) {
@@ -2730,7 +2696,7 @@ impl HcMatchGenerator {
         opt_state.rescale_freqs(current, profile);
         let mut best_plan = core::mem::take(&mut self.opt_segment_plan_scratch);
         best_plan.clear();
-        let mut plan_reps = self.offset_hist;
+        let mut plan_reps = self.table.offset_hist;
         let (mut cursor, mut plan_litlen) =
             self.donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut plan_literals_cursor = 0usize;
@@ -2780,7 +2746,7 @@ impl HcMatchGenerator {
         let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
         let mut opt_state = core::mem::replace(&mut self.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
-        let mut seed_reps = self.offset_hist;
+        let mut seed_reps = self.table.offset_hist;
         let (mut cursor, mut seed_litlen) =
             self.donor_opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
@@ -2823,16 +2789,16 @@ impl HcMatchGenerator {
 
         // Donor initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
-        self.position_base = self.history_abs_start;
-        self.index_shift = current_len;
-        self.next_to_update3 = current_abs_start;
-        self.skip_insert_until_abs = current_abs_start;
+        self.table.position_base = self.table.history_abs_start;
+        self.table.index_shift = current_len;
+        self.table.next_to_update3 = current_abs_start;
+        self.table.skip_insert_until_abs = current_abs_start;
         // Donor `ZSTD_initStats_ultra()` invalidates the first scan by moving
         // `window.base` back by `srcSize`, making the real pass start at
         // `curr == srcSize` instead of 0. Position 0 is therefore a valid
         // table entry in the second pass even though raw C tables reserve
         // value 0 as empty during an unshifted first pass.
-        self.allow_zero_relative_position = true;
+        self.table.allow_zero_relative_position = true;
     }
 
     fn update_plan_stats_segment(
@@ -3623,7 +3589,7 @@ impl HcMatchGenerator {
         plan: &[HcOptimalSequence],
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        let current = self.window.back().unwrap().as_slice();
+        let current = self.table.window.back().unwrap().as_slice();
         if plan.is_empty() {
             handle_sequence(Sequence::Literals { literals: current });
             return;
@@ -3643,7 +3609,11 @@ impl HcMatchGenerator {
                 offset: item.offset as usize,
                 match_len,
             });
-            encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
+            encode_offset_with_history(
+                item.offset,
+                literals.len() as u32,
+                &mut self.table.offset_hist,
+            );
             literals_start = start + match_len;
         }
 
@@ -3655,36 +3625,36 @@ impl HcMatchGenerator {
     }
 
     fn ensure_tables(&mut self) {
-        if self.hash_table.is_empty() {
-            self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
-            let hash3_size = if self.hash3_log == 0 {
+        if self.table.hash_table.is_empty() {
+            self.table.hash_table = alloc::vec![HC_EMPTY; 1 << self.table.hash_log];
+            let hash3_size = if self.table.hash3_log == 0 {
                 0
             } else {
-                1 << self.hash3_log
+                1 << self.table.hash3_log
             };
-            self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
-            self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
+            self.table.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
+            self.table.chain_table = alloc::vec![HC_EMPTY; 1 << self.table.chain_log];
         }
     }
 
     fn compact_history(&mut self) {
-        if self.history_start == 0 {
+        if self.table.history_start == 0 {
             return;
         }
-        if self.history_start >= self.max_window_size
-            || self.history_start * 2 >= self.history.len()
+        if self.table.history_start >= self.table.max_window_size
+            || self.table.history_start * 2 >= self.table.history.len()
         {
-            self.history.drain(..self.history_start);
-            self.history_start = 0;
+            self.table.history.drain(..self.table.history_start);
+            self.table.history_start = 0;
         }
     }
 
     fn live_history(&self) -> &[u8] {
-        &self.history[self.history_start..]
+        &self.table.history[self.table.history_start..]
     }
 
     fn history_abs_end(&self) -> usize {
-        self.history_abs_start + self.live_history().len()
+        self.table.history_abs_start + self.live_history().len()
     }
 
     fn uses_bt_matchfinder(&self) -> bool {
@@ -3695,7 +3665,7 @@ impl HcMatchGenerator {
     }
 
     fn bt_log(&self) -> usize {
-        self.chain_log.saturating_sub(1)
+        self.table.chain_log.saturating_sub(1)
     }
 
     fn bt_mask(&self) -> usize {
@@ -3703,7 +3673,7 @@ impl HcMatchGenerator {
     }
 
     fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        2 * (abs_pos.saturating_add(self.index_shift) & self.bt_mask())
+        2 * (abs_pos.saturating_add(self.table.index_shift) & self.bt_mask())
     }
 
     #[inline(always)]
@@ -3723,8 +3693,8 @@ impl HcMatchGenerator {
     }
 
     fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
-        let history_low = self.history_abs_start;
-        let window_low = target_abs.saturating_sub(self.max_window_size);
+        let history_low = self.table.history_abs_start;
+        let window_low = target_abs.saturating_sub(self.table.max_window_size);
         history_low.max(window_low)
     }
 
@@ -3897,10 +3867,10 @@ impl HcMatchGenerator {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
     unsafe fn bt_update_tree_until_neon(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
+        if self.table.skip_insert_until_abs < self.table.history_abs_start {
+            self.table.skip_insert_until_abs = self.table.history_abs_start;
         }
-        let mut update_abs = self.skip_insert_until_abs;
+        let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
@@ -3910,17 +3880,17 @@ impl HcMatchGenerator {
                 unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
-        self.skip_insert_until_abs = abs_pos;
+        self.table.skip_insert_until_abs = abs_pos;
     }
 
     /// SSE4.2 umbrella variant.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
     unsafe fn bt_update_tree_until_sse42(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
+        if self.table.skip_insert_until_abs < self.table.history_abs_start {
+            self.table.skip_insert_until_abs = self.table.history_abs_start;
         }
-        let mut update_abs = self.skip_insert_until_abs;
+        let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
@@ -3930,17 +3900,17 @@ impl HcMatchGenerator {
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
-        self.skip_insert_until_abs = abs_pos;
+        self.table.skip_insert_until_abs = abs_pos;
     }
 
     /// AVX2+BMI2 umbrella variant.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn bt_update_tree_until_avx2_bmi2(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
+        if self.table.skip_insert_until_abs < self.table.history_abs_start {
+            self.table.skip_insert_until_abs = self.table.history_abs_start;
         }
-        let mut update_abs = self.skip_insert_until_abs;
+        let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
@@ -3950,16 +3920,16 @@ impl HcMatchGenerator {
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
-        self.skip_insert_until_abs = abs_pos;
+        self.table.skip_insert_until_abs = abs_pos;
     }
 
     /// Scalar fallback used on non-AArch64 targets.
     #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
     fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
+        if self.table.skip_insert_until_abs < self.table.history_abs_start {
+            self.table.skip_insert_until_abs = self.table.history_abs_start;
         }
-        let mut update_abs = self.skip_insert_until_abs;
+        let mut update_abs = self.table.skip_insert_until_abs;
         while update_abs < abs_pos {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos) {
                 self.maybe_rebase_positions(update_abs);
@@ -3968,7 +3938,7 @@ impl HcMatchGenerator {
                 self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
             update_abs = update_abs.saturating_add(forward.max(1));
         }
-        self.skip_insert_until_abs = abs_pos;
+        self.table.skip_insert_until_abs = abs_pos;
     }
 
     /// Cross-platform entry. Picks the kernel-specific variant so the BT walk
@@ -4173,7 +4143,7 @@ impl HcMatchGenerator {
     }
 
     fn hash_position(&self, data: &[u8]) -> usize {
-        Self::hash_position_with_mls(data, self.hash_log, 4)
+        Self::hash_position_with_mls(data, self.table.hash_log, 4)
     }
 
     #[cfg(test)]
@@ -4303,45 +4273,46 @@ impl HcMatchGenerator {
     }
 
     fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
-        if self.hash3_log == 0 {
+        if self.table.hash3_log == 0 {
             return;
         }
-        let idx = abs_pos - self.history_abs_start;
-        let concat = &self.history[self.history_start..];
+        let idx = abs_pos - self.table.history_abs_start;
+        let concat = &self.table.history[self.table.history_start..];
         if idx + 4 > concat.len() {
             return;
         }
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
-        let hash3 = Self::hash_position_at(concat, idx, self.hash3_log, 3);
-        self.hash3_table[hash3] = relative_pos + 1;
+        let hash3 = Self::hash_position_at(concat, idx, self.table.hash3_log, 3);
+        self.table.hash3_table[hash3] = relative_pos + 1;
     }
 
     fn update_hash3_until(&mut self, abs_pos: usize) {
-        if self.next_to_update3 < self.history_abs_start {
-            self.next_to_update3 = self.history_abs_start;
+        if self.table.next_to_update3 < self.table.history_abs_start {
+            self.table.next_to_update3 = self.table.history_abs_start;
         }
-        if self.next_to_update3 >= abs_pos {
+        if self.table.next_to_update3 >= abs_pos {
             return;
         }
-        while self.next_to_update3 < abs_pos {
-            if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos) {
-                self.maybe_rebase_positions(self.next_to_update3);
+        while self.table.next_to_update3 < abs_pos {
+            if !self.can_skip_rebase_check_at(self.table.next_to_update3, abs_pos) {
+                self.maybe_rebase_positions(self.table.next_to_update3);
             }
-            self.insert_hash3_only_no_rebase(self.next_to_update3);
-            self.next_to_update3 = self.next_to_update3.saturating_add(1);
+            self.insert_hash3_only_no_rebase(self.table.next_to_update3);
+            self.table.next_to_update3 = self.table.next_to_update3.saturating_add(1);
         }
     }
 
     fn relative_position(&self, abs_pos: usize) -> Option<u32> {
-        let shifted_abs = abs_pos.checked_add(self.index_shift)?;
-        let rel = shifted_abs.checked_sub(self.position_base)?;
+        let shifted_abs = abs_pos.checked_add(self.table.index_shift)?;
+        let rel = shifted_abs.checked_sub(self.table.position_base)?;
         let rel_u32 = u32::try_from(rel).ok()?;
         // Donor parity: raw BT/HC tables use 0 as the empty sentinel, so the
         // very first absolute position in the first block (curr == 0) is not a
         // representable candidate index.
-        if !self.allow_zero_relative_position && self.position_base == 0 && rel_u32 == 0 {
+        if !self.table.allow_zero_relative_position && self.table.position_base == 0 && rel_u32 == 0
+        {
             return None;
         }
         // Positions are stored as (relative_pos + 1), with 0 reserved as the
@@ -4353,12 +4324,13 @@ impl HcMatchGenerator {
     #[inline(always)]
     fn can_skip_rebase_check_at(&self, abs_pos: usize, max_abs_pos: usize) -> bool {
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        self.position_base == 0
-            && self.index_shift == 0
+        self.table.position_base == 0
+            && self.table.index_shift == 0
             && max_abs_pos <= max_rel_no_rebase
-            && (self.allow_zero_relative_position
-                || abs_pos > self.history_abs_start
-                || (self.parse_mode == HcParseMode::BtUltra2 && abs_pos == self.history_abs_start))
+            && (self.table.allow_zero_relative_position
+                || abs_pos > self.table.history_abs_start
+                || (self.parse_mode == HcParseMode::BtUltra2
+                    && abs_pos == self.table.history_abs_start))
     }
 
     /// Hot wrapper: every `insert_position*` call passes through here. The
@@ -4371,8 +4343,8 @@ impl HcMatchGenerator {
     #[inline]
     fn maybe_rebase_positions(&mut self, abs_pos: usize) {
         if self.parse_mode == HcParseMode::BtUltra2
-            && !self.allow_zero_relative_position
-            && self.position_base == 0
+            && !self.table.allow_zero_relative_position
+            && self.table.position_base == 0
             && abs_pos == 0
         {
             return;
@@ -4390,14 +4362,14 @@ impl HcMatchGenerator {
     #[inline(never)]
     fn rebase_positions_cold(&mut self, abs_pos: usize) {
         // Keep all live history addressable after rebase.
-        self.position_base = self.history_abs_start;
-        self.index_shift = 0;
-        self.allow_zero_relative_position = true;
-        self.hash_table.fill(HC_EMPTY);
-        self.hash3_table.fill(HC_EMPTY);
-        self.chain_table.fill(HC_EMPTY);
+        self.table.position_base = self.table.history_abs_start;
+        self.table.index_shift = 0;
+        self.table.allow_zero_relative_position = true;
+        self.table.hash_table.fill(HC_EMPTY);
+        self.table.hash3_table.fill(HC_EMPTY);
+        self.table.chain_table.fill(HC_EMPTY);
 
-        let history_start = self.history_abs_start;
+        let history_start = self.table.history_abs_start;
         // Rebuild only the already-inserted prefix. The caller inserts abs_pos
         // immediately after this, and later positions are added in-order.
         if self.uses_bt_matchfinder() {
@@ -4412,7 +4384,7 @@ impl HcMatchGenerator {
                 self.insert_position_no_rebase(pos);
             }
         }
-        self.next_to_update3 = self.next_to_update3.max(abs_pos);
+        self.table.next_to_update3 = self.table.next_to_update3.max(abs_pos);
     }
 
     #[inline]
@@ -4423,17 +4395,17 @@ impl HcMatchGenerator {
 
     #[inline]
     fn insert_position_no_rebase(&mut self, abs_pos: usize) {
-        let idx = abs_pos.wrapping_sub(self.history_abs_start);
-        let concat = &self.history[self.history_start..];
+        let idx = abs_pos.wrapping_sub(self.table.history_abs_start);
+        let concat = &self.table.history[self.table.history_start..];
         if idx + 4 > concat.len() {
             return;
         }
-        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
+        let hash = Self::hash_position_at(concat, idx, self.table.hash_log, 4);
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
         let stored = relative_pos + 1;
-        let chain_mask = (1usize << self.chain_log) - 1;
+        let chain_mask = (1usize << self.table.chain_log) - 1;
         let chain_idx = relative_pos as usize & chain_mask;
         // SAFETY: `hash` is produced by `hash_value_with_mls` which masks the
         // result down to `hash_log` bits, and `hash_table.len() == 1 <<
@@ -4441,12 +4413,12 @@ impl HcMatchGenerator {
         // `< chain_table.len() == 1 << chain_log`. Both indices are provably
         // in bounds, so the elided bounds checks save ~4 instructions per
         // call on this per-byte-of-input hot path.
-        debug_assert!(hash < self.hash_table.len());
-        debug_assert!(chain_idx < self.chain_table.len());
+        debug_assert!(hash < self.table.hash_table.len());
+        debug_assert!(chain_idx < self.table.chain_table.len());
         unsafe {
-            let prev = *self.hash_table.get_unchecked(hash);
-            *self.chain_table.get_unchecked_mut(chain_idx) = prev;
-            *self.hash_table.get_unchecked_mut(hash) = stored;
+            let prev = *self.table.hash_table.get_unchecked(hash);
+            *self.table.chain_table.get_unchecked_mut(chain_idx) = prev;
+            *self.table.hash_table.get_unchecked_mut(hash) = stored;
         }
     }
 
@@ -4454,7 +4426,7 @@ impl HcMatchGenerator {
         for pos in start..end {
             self.insert_position(pos);
         }
-        self.next_to_update3 = self.next_to_update3.max(end);
+        self.table.next_to_update3 = self.table.next_to_update3.max(end);
     }
 
     fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
@@ -4476,15 +4448,15 @@ impl HcMatchGenerator {
     // the hot path and the sentinel loop exits at self.search_depth.
     fn chain_candidates(&self, abs_pos: usize) -> [usize; MAX_HC_SEARCH_DEPTH] {
         let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
-        let idx = abs_pos - self.history_abs_start;
+        let idx = abs_pos - self.table.history_abs_start;
         let concat = self.live_history();
         if idx + 4 > concat.len() {
             return buf;
         }
         let hash = self.hash_position(&concat[idx..]);
-        let chain_mask = (1 << self.chain_log) - 1;
+        let chain_mask = (1 << self.table.chain_log) - 1;
 
-        let mut cur = self.hash_table[hash];
+        let mut cur = self.table.hash_table[hash];
         let mut filled = 0;
         // Follow chain up to search_depth valid candidates, skipping stale
         // entries (evicted from window) instead of stopping at them.
@@ -4498,19 +4470,19 @@ impl HcMatchGenerator {
                 break;
             }
             let candidate_rel = cur.wrapping_sub(1) as usize;
-            let candidate_abs = self.position_base + candidate_rel;
-            let next = self.chain_table[candidate_rel & chain_mask];
+            let candidate_abs = self.table.position_base + candidate_rel;
+            let next = self.table.chain_table[candidate_rel & chain_mask];
             steps += 1;
             if next == cur {
                 // Self-loop: two positions share chain_idx, stop to avoid
                 // spinning on the same candidate forever.
-                if candidate_abs >= self.history_abs_start && candidate_abs < abs_pos {
+                if candidate_abs >= self.table.history_abs_start && candidate_abs < abs_pos {
                     buf[filled] = candidate_abs;
                 }
                 break;
             }
             cur = next;
-            if candidate_abs < self.history_abs_start || candidate_abs >= abs_pos {
+            if candidate_abs < self.table.history_abs_start || candidate_abs >= abs_pos {
                 continue;
             }
             buf[filled] = candidate_abs;
@@ -4527,7 +4499,7 @@ impl HcMatchGenerator {
 
     fn hash_chain_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
+        let current_idx = abs_pos - self.table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
             return None;
         }
@@ -4537,7 +4509,7 @@ impl HcMatchGenerator {
             if candidate_abs == usize::MAX {
                 break;
             }
-            let candidate_idx = candidate_abs - self.history_abs_start;
+            let candidate_idx = candidate_abs - self.table.history_abs_start;
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_abs, abs_pos, match_len, lit_len);
@@ -4553,20 +4525,20 @@ impl HcMatchGenerator {
     fn repcode_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let reps = if lit_len == 0 {
             [
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
-                (self.offset_hist[0] > 1).then_some((self.offset_hist[0] - 1) as usize),
+                Some(self.table.offset_hist[1] as usize),
+                Some(self.table.offset_hist[2] as usize),
+                (self.table.offset_hist[0] > 1).then_some((self.table.offset_hist[0] - 1) as usize),
             ]
         } else {
             [
-                Some(self.offset_hist[0] as usize),
-                Some(self.offset_hist[1] as usize),
-                Some(self.offset_hist[2] as usize),
+                Some(self.table.offset_hist[0] as usize),
+                Some(self.table.offset_hist[1] as usize),
+                Some(self.table.offset_hist[2] as usize),
             ]
         };
 
         let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
+        let current_idx = abs_pos - self.table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
             return None;
         }
@@ -4577,10 +4549,10 @@ impl HcMatchGenerator {
                 continue;
             }
             let candidate_pos = abs_pos - rep;
-            if candidate_pos < self.history_abs_start {
+            if candidate_pos < self.table.history_abs_start {
                 continue;
             }
-            let candidate_idx = candidate_pos - self.history_abs_start;
+            let candidate_idx = candidate_pos - self.table.history_abs_start;
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
@@ -4776,9 +4748,9 @@ impl HcMatchGenerator {
         let concat = self.live_history();
         let min_abs_pos = abs_pos - lit_len;
         while abs_pos > min_abs_pos
-            && candidate_pos > self.history_abs_start
-            && concat[candidate_pos - self.history_abs_start - 1]
-                == concat[abs_pos - self.history_abs_start - 1]
+            && candidate_pos > self.table.history_abs_start
+            && concat[candidate_pos - self.table.history_abs_start - 1]
+                == concat[abs_pos - self.table.history_abs_start - 1]
         {
             candidate_pos -= 1;
             abs_pos -= 1;
@@ -5148,10 +5120,10 @@ fn level22_small_source_size_hint_matches_donor_cparams() {
 fn level22_small_source_uses_window_bounded_hash3_log() {
     let mut hc = HcMatchGenerator::new(1 << 14);
     hc.configure(BTULTRA2_HC_CONFIG_L22_16K, 14);
-    assert_eq!(hc.hash3_log, 14);
+    assert_eq!(hc.table.hash3_log, 14);
 
     hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
-    assert_eq!(hc.hash3_log, HC3_HASH_LOG);
+    assert_eq!(hc.table.hash3_log, HC3_HASH_LOG);
 }
 
 #[test]
@@ -5390,8 +5362,8 @@ fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
 fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(BTULTRA2_HC_CONFIG, 26);
-    hc.history_abs_start = 17;
-    hc.window.push_back(b"abcdefghijklmnop".to_vec());
+    hc.table.history_abs_start = 17;
+    hc.table.window.push_back(b"abcdefghijklmnop".to_vec());
     assert!(
         !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 9),
         "btultra2 warmup must be first-block only (no prefix history)"
@@ -5425,8 +5397,8 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
     hc.configure(BTULTRA2_HC_CONFIG, 26);
     // Simulate non-first block state: current block has no prefix in deque,
     // but total produced window already includes prior output.
-    hc.window_size = HC_PREDEF_THRESHOLD + 64;
-    hc.window
+    hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
+    hc.table.window
         .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 32]);
     assert!(
         !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
@@ -5438,8 +5410,8 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
 fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(BTULTRA2_HC_CONFIG, 26);
-    hc.window_size = HC_PREDEF_THRESHOLD + 64;
-    hc.window
+    hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
+    hc.table.window
         .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 64]);
     hc.ldm_sequences.push(HcRawSeq {
         lit_length: 8,
@@ -5522,12 +5494,12 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
 #[test]
 fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.history = b"xxxxxxABCDEFABCDEF".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
+    hc.table.history = b"xxxxxxABCDEFABCDEF".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
 
     let abs_pos = 12usize; // points at second "ABCDEF"
-    let current_abs_end = hc.history.len();
+    let current_abs_end = hc.table.history.len();
     let reps = [6u32, 3u32, 9u32];
 
     let mut lit_pos_candidates = Vec::new();
@@ -5567,12 +5539,12 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
 fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     let mut hc = HcMatchGenerator::new(64);
     hc.search_depth = 0;
-    hc.history = b"xyzxyzxyzxyz".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
+    hc.table.history = b"xyzxyzxyzxyz".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
 
     let abs_pos = 6usize;
-    let current_abs_end = hc.history.len();
+    let current_abs_end = hc.table.history.len();
     let profile = HcOptimalCostProfile {
         max_chain_depth: 0,
         sufficient_match_len: usize::MAX / 2,
@@ -5604,10 +5576,10 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
 #[test]
 fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.history = b"aaaaaaaaaa".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"aaaaaaaaaa".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 32;
     let abs_pos = 6usize;
     hc.ensure_tables();
@@ -5622,7 +5594,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 4, 8],
@@ -5642,15 +5614,15 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
 #[test]
 fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let mut hc = HcMatchGenerator::new(128);
-    hc.history = b"abcabcabcabcabcabcabcabc".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 32;
     let abs_pos = 9usize;
     hc.ensure_tables();
     hc.insert_positions(0, abs_pos);
-    hc.skip_insert_until_abs = 0;
+    hc.table.skip_insert_until_abs = 0;
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 32,
@@ -5661,7 +5633,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 4, 8],
@@ -5672,7 +5644,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     );
 
     assert!(
-        hc.skip_insert_until_abs > abs_pos,
+        hc.table.skip_insert_until_abs > abs_pos,
         "long chain match should advance skip window to avoid redundant immediate insertions"
     );
 }
@@ -5680,15 +5652,15 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 #[test]
 fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
     let mut hc = HcMatchGenerator::new(128);
-    hc.history = b"abcabcabcabcabcabcabcabc".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 32;
     let abs_pos = 9usize;
     hc.ensure_tables();
     hc.insert_positions(0, abs_pos);
-    hc.skip_insert_until_abs = 0;
+    hc.table.skip_insert_until_abs = 0;
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 32,
@@ -5699,7 +5671,7 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 4, 8],
@@ -5715,11 +5687,11 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
         .max()
         .expect("expected at least one candidate");
     assert!(
-        hc.skip_insert_until_abs > abs_pos,
+        hc.table.skip_insert_until_abs > abs_pos,
         "chain fast-skip must advance past current position"
     );
     assert!(
-        hc.skip_insert_until_abs <= best_match_end.saturating_sub(8),
+        hc.table.skip_insert_until_abs <= best_match_end.saturating_sub(8),
         "chain fast-skip must not exceed donor-style matchEndIdx - 8 bound"
     );
 }
@@ -5727,15 +5699,15 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
 #[test]
 fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut hc = HcMatchGenerator::new(256);
-    hc.history = b"abcdefghijklmnop".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcdefghijklmnop".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 0;
     hc.ensure_tables();
 
     let abs_pos = 8usize;
-    hc.skip_insert_until_abs = 0;
+    hc.table.skip_insert_until_abs = 0;
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 0,
@@ -5746,7 +5718,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 4, 8],
@@ -5757,7 +5729,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     );
 
     assert_eq!(
-        hc.skip_insert_until_abs,
+        hc.table.skip_insert_until_abs,
         abs_pos.saturating_add(1),
         "plain BT path should advance skip window by 1 via donor matchEndIdx baseline"
     );
@@ -5766,17 +5738,17 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 #[test]
 fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
     let mut hc = HcMatchGenerator::new(256);
-    hc.history = b"abcde1234abcdeZZZZ".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcde1234abcdeZZZZ".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 0;
     let abs_pos = 9usize; // second "abcde"
     hc.ensure_tables();
     hc.insert_positions(0, abs_pos);
     // Donor hash3 has an independent nextToUpdate3 cursor; main-table
     // insertion does not imply the HC3 side table has been filled.
-    hc.next_to_update3 = 0;
+    hc.table.next_to_update3 = 0;
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 0,
@@ -5787,7 +5759,7 @@ fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 2, 3],
@@ -5807,15 +5779,15 @@ fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
 #[test]
 fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
     let mut hc = HcMatchGenerator::new(256);
-    hc.history = b"abcdeZabcdeYY".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcdeZabcdeYY".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 0;
     hc.ensure_tables();
     // Simulate donor-like nextToUpdate3 path: no explicit hash/chain insertions
     // were done for prefix positions, so hash3 must fill them on demand.
-    hc.next_to_update3 = 0;
+    hc.table.next_to_update3 = 0;
 
     let abs_pos = 6usize; // second "abcde"
     let profile = HcOptimalCostProfile {
@@ -5827,7 +5799,7 @@ fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 2, 3],
@@ -5847,13 +5819,13 @@ fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
 #[test]
 fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
     let mut hc = HcMatchGenerator::new(256);
-    hc.history = b"abcdeZabcde".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcdeZabcde".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 0;
     hc.ensure_tables();
-    hc.next_to_update3 = 0;
+    hc.table.next_to_update3 = 0;
 
     let abs_pos = 6usize; // second "abcde", match reaches current end
     let profile = HcOptimalCostProfile {
@@ -5865,7 +5837,7 @@ fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
-        hc.history.len(),
+        hc.table.history.len(),
         profile,
         HcCandidateQuery {
             reps: [1, 2, 3],
@@ -5876,11 +5848,11 @@ fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
     );
 
     assert!(
-        hc.next_to_update3 >= abs_pos,
+        hc.table.next_to_update3 >= abs_pos,
         "tail-reaching hash3 lookup should fill the update cursor to current position"
     );
     assert!(
-        hc.skip_insert_until_abs > abs_pos,
+        hc.table.skip_insert_until_abs > abs_pos,
         "tail-reaching hash3 early return should request skipping current-position hash insertion"
     );
 }
@@ -5888,9 +5860,9 @@ fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
 #[test]
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
     let mut hc = HcMatchGenerator::new(512);
-    hc.history = (0..256).map(|i| (i % 251) as u8).collect();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
+    hc.table.history = (0..256).map(|i| (i % 251) as u8).collect();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
 
     let abs_pos = 128usize;
     let current_abs_end = 256usize;
@@ -5929,20 +5901,20 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
 #[test]
 fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut hc = HcMatchGenerator::new(256);
-    hc.history = alloc::vec![0u8; 160];
+    hc.table.history = alloc::vec![0u8; 160];
     for i in 0..64 {
-        hc.history[i] = b'a' + (i % 7) as u8;
+        hc.table.history[i] = b'a' + (i % 7) as u8;
     }
     for i in 64..160 {
-        hc.history[i] = b'k' + (i % 5) as u8;
+        hc.table.history[i] = b'k' + (i % 5) as u8;
     }
     let abs_pos = 96usize;
     for i in 0..24 {
-        hc.history[abs_pos + i] = hc.history[16 + i];
+        hc.table.history[abs_pos + i] = hc.table.history[16 + i];
     }
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.search_depth = 32;
     hc.ensure_tables();
     hc.insert_positions(0, abs_pos);
@@ -5956,7 +5928,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut out = Vec::new();
 
     hc.parse_mode = HcParseMode::BtUltra2;
-    hc.dictionary_limit_abs = Some(64);
+    hc.table.dictionary_limit_abs = Some(64);
     hc.collect_optimal_candidates(
         abs_pos,
         160,
@@ -5974,7 +5946,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     );
 
     hc.parse_mode = HcParseMode::BtUltra;
-    hc.skip_insert_until_abs = 0;
+    hc.table.skip_insert_until_abs = 0;
     hc.collect_optimal_candidates(
         abs_pos,
         160,
@@ -6341,11 +6313,11 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     // HC matcher should have empty tables after backend switch.
     let hc = driver.hc_match_generator.as_ref().unwrap();
     assert!(
-        hc.hash_table.is_empty(),
+        hc.table.hash_table.is_empty(),
         "HC hash_table should be released after switching away from Best"
     );
     assert!(
-        hc.chain_table.is_empty(),
+        hc.table.chain_table.is_empty(),
         "HC chain_table should be released after switching away from Best"
     );
 }
@@ -6365,8 +6337,8 @@ fn driver_better_to_best_resizes_hc_tables() {
     driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
-    let better_hash_len = hc.hash_table.len();
-    let better_chain_len = hc.chain_table.len();
+    let better_hash_len = hc.table.hash_table.len();
+    let better_chain_len = hc.table.chain_table.len();
 
     // Switch to Best — must resize to larger tables.
     driver.reset(CompressionLevel::Best);
@@ -6381,15 +6353,15 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     let hc = driver.hc_match_generator.as_ref().unwrap();
     assert!(
-        hc.hash_table.len() > better_hash_len,
+        hc.table.hash_table.len() > better_hash_len,
         "Best hash_table ({}) should be larger than Better ({})",
-        hc.hash_table.len(),
+        hc.table.hash_table.len(),
         better_hash_len
     );
     assert!(
-        hc.chain_table.len() > better_chain_len,
+        hc.table.chain_table.len() > better_chain_len,
         "Best chain_table ({}) should be larger than Better ({})",
-        hc.chain_table.len(),
+        hc.table.chain_table.len(),
         better_chain_len
     );
 }
@@ -6477,7 +6449,7 @@ fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
 
     driver.prime_with_dictionary(&[], [11, 7, 3]);
 
-    assert_eq!(driver.hc_matcher().offset_hist, [11, 7, 3]);
+    assert_eq!(driver.hc_matcher().table.offset_hist, [11, 7, 3]);
     assert!(
         !driver
             .hc_matcher()
@@ -7010,7 +6982,7 @@ fn hc_hash_position_matches_donor_hash4_formula() {
     hc.configure(HC_CONFIG, 22);
     let bytes = [b'a', b'b', b'c', b'd'];
     let read32 = u32::from_le_bytes(bytes);
-    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.hash_log)) as usize;
+    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
     assert_eq!(hc.hash_position(&bytes), expected);
 }
 
@@ -7020,8 +6992,8 @@ fn btultra2_main_hash_uses_donor_hash4_formula() {
     hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
     let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
     let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.hash_log)) as usize;
-    let actual = HcMatchGenerator::hash_position_with_mls(&bytes, hc.hash_log, hc.bt_hash_mls());
+    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
+    let actual = HcMatchGenerator::hash_position_with_mls(&bytes, hc.table.hash_log, hc.bt_hash_mls());
     assert_eq!(actual, expected);
 }
 
@@ -7039,9 +7011,9 @@ fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
 #[test]
 fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
     let mut hc = HcMatchGenerator::new(32);
-    hc.history = b"abc".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
+    hc.table.history = b"abc".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
     hc.ensure_tables();
 
     let candidates = hc.chain_candidates(0);
@@ -7053,15 +7025,15 @@ fn hc_reset_refills_existing_tables_with_empty_sentinel() {
     let mut hc = HcMatchGenerator::new(32);
     hc.add_data(b"abcdeabcde".to_vec(), |_| {});
     hc.ensure_tables();
-    assert!(!hc.hash_table.is_empty());
-    assert!(!hc.chain_table.is_empty());
-    hc.hash_table.fill(123);
-    hc.chain_table.fill(456);
+    assert!(!hc.table.hash_table.is_empty());
+    assert!(!hc.table.chain_table.is_empty());
+    hc.table.hash_table.fill(123);
+    hc.table.chain_table.fill(456);
 
     hc.reset(|_| {});
 
-    assert!(hc.hash_table.iter().all(|&v| v == HC_EMPTY));
-    assert!(hc.chain_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(hc.table.hash_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(hc.table.chain_table.iter().all(|&v| v == HC_EMPTY));
 }
 
 #[test]
@@ -7400,12 +7372,12 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     matcher.skip_matching(Some(true));
 
     let current_len = first.len();
-    let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
+    let current_abs_start = matcher.table.history_abs_start + matcher.table.window_size - current_len;
     let current_abs_end = current_abs_start + current_len;
     let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
     let tail_start = current_abs_end
         .saturating_sub(dense_tail)
-        .max(matcher.history_abs_start)
+        .max(matcher.table.history_abs_start)
         .max(current_abs_start);
 
     let overlap_pos = (tail_start..current_abs_end)
@@ -7415,9 +7387,9 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     let rel = matcher
         .relative_position(overlap_pos)
         .expect("overlap position should be representable as relative position");
-    let chain_idx = rel as usize & ((1 << matcher.chain_log) - 1);
+    let chain_idx = rel as usize & ((1 << matcher.table.chain_log) - 1);
     assert_ne!(
-        matcher.chain_table[chain_idx],
+        matcher.table.chain_table[chain_idx],
         rel + 1,
         "sparse-grid tail positions must not be reinserted (self-loop chain entry)"
     );
@@ -7426,43 +7398,43 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
 #[test]
 fn hc_compact_history_drains_when_threshold_crossed() {
     let mut hc = HcMatchGenerator::new(8);
-    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-    hc.history_start = 16;
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history_start = 16;
     hc.compact_history();
-    assert_eq!(hc.history_start, 0);
-    assert_eq!(hc.history, b"qrstuvwxyz");
+    assert_eq!(hc.table.history_start, 0);
+    assert_eq!(hc.table.history, b"qrstuvwxyz");
 }
 
 #[test]
 fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
     let mut hc = HcMatchGenerator::new(32);
-    hc.history = b"abcdefghijklmnop".to_vec();
-    hc.history_abs_start = 0;
-    hc.position_base = 1;
+    hc.table.history = b"abcdefghijklmnop".to_vec();
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 1;
     hc.ensure_tables();
-    let before_hash = hc.hash_table.clone();
-    let before_chain = hc.chain_table.clone();
+    let before_hash = hc.table.hash_table.clone();
+    let before_chain = hc.table.chain_table.clone();
 
     hc.insert_position_no_rebase(0);
 
-    assert_eq!(hc.hash_table, before_hash);
-    assert_eq!(hc.chain_table, before_chain);
+    assert_eq!(hc.table.hash_table, before_hash);
+    assert_eq!(hc.table.chain_table, before_chain);
 }
 
 #[test]
 fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.ensure_tables();
-    hc.next_to_update3 = 0;
+    hc.table.next_to_update3 = 0;
 
     hc.insert_positions(0, 9);
 
     assert_eq!(
-        hc.next_to_update3, 9,
+        hc.table.next_to_update3, 9,
         "contiguous insert_positions should advance hash3 update cursor"
     );
 }
@@ -7470,17 +7442,17 @@ fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
 #[test]
 fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-    hc.history_start = 0;
-    hc.history_abs_start = 0;
-    hc.position_base = 0;
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.position_base = 0;
     hc.ensure_tables();
-    hc.next_to_update3 = 0;
+    hc.table.next_to_update3 = 0;
 
     hc.insert_positions_with_step(0, 16, 4);
 
     assert_eq!(
-        hc.next_to_update3, 0,
+        hc.table.next_to_update3, 0,
         "sparse insert_positions_with_step must not mark skipped positions as hash3-updated"
     );
 }
@@ -7588,12 +7560,12 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Better);
     // Use a small live window so dictionary-primed slices are evicted quickly.
-    driver.hc_matcher_mut().max_window_size = 8;
+    driver.hc_matcher_mut().table.max_window_size = 8;
     driver.reported_window_size = 8;
 
-    let base_window = driver.hc_matcher().max_window_size;
+    let base_window = driver.hc_matcher().table.max_window_size;
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-    assert_eq!(driver.hc_matcher().max_window_size, base_window + 24);
+    assert_eq!(driver.hc_matcher().table.max_window_size, base_window + 24);
 
     for block in [b"AAAAAAAA", b"BBBBBBBB"] {
         let mut space = driver.get_next_space();
@@ -7608,7 +7580,7 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         "dictionary budget should be fully retired once primed dict slices are evicted"
     );
     assert_eq!(
-        driver.hc_matcher().max_window_size,
+        driver.hc_matcher().table.max_window_size,
         base_window,
         "retired dictionary budget must not remain reusable for live history"
     );
@@ -7619,27 +7591,27 @@ fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
     matcher.ensure_tables();
-    matcher.position_base = 0;
+    matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
         Ok(value) => value,
         Err(_) => return,
     };
     // Simulate a long-running stream where absolute history positions crossed
     // the u32 range. Before #51 this disabled HC inserts entirely.
-    matcher.history_abs_start = history_abs_start;
+    matcher.table.history_abs_start = history_abs_start;
     matcher.skip_matching(None);
     assert_eq!(
-        matcher.position_base, matcher.history_abs_start,
+        matcher.table.position_base, matcher.table.history_abs_start,
         "rebase should anchor to the oldest live absolute position"
     );
 
     assert!(
-        matcher.hash_table.iter().any(|entry| *entry != HC_EMPTY),
+        matcher.table.hash_table.iter().any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
     );
 
     // Verify rebasing preserves candidate lookup, not just table population.
-    let abs_pos = matcher.history_abs_start + 10;
+    let abs_pos = matcher.table.history_abs_start + 10;
     let candidates = matcher.chain_candidates(abs_pos);
     assert!(
         candidates.iter().any(|candidate| *candidate != usize::MAX),
@@ -7652,37 +7624,37 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
     matcher.ensure_tables();
-    matcher.position_base = 0;
+    matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
         Ok(value) => value,
         Err(_) => return,
     };
-    matcher.history_abs_start = history_abs_start;
-    let abs_pos = matcher.history_abs_start + 6;
+    matcher.table.history_abs_start = history_abs_start;
+    let abs_pos = matcher.table.history_abs_start + 6;
 
     let mut expected = HcMatchGenerator::new(64);
     expected.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
     expected.ensure_tables();
-    expected.history_abs_start = history_abs_start;
-    expected.position_base = expected.history_abs_start;
-    expected.hash_table.fill(HC_EMPTY);
-    expected.chain_table.fill(HC_EMPTY);
-    for pos in expected.history_abs_start..abs_pos {
+    expected.table.history_abs_start = history_abs_start;
+    expected.table.position_base = expected.table.history_abs_start;
+    expected.table.hash_table.fill(HC_EMPTY);
+    expected.table.chain_table.fill(HC_EMPTY);
+    for pos in expected.table.history_abs_start..abs_pos {
         expected.insert_position_no_rebase(pos);
     }
 
     matcher.maybe_rebase_positions(abs_pos);
 
     assert_eq!(
-        matcher.position_base, matcher.history_abs_start,
+        matcher.table.position_base, matcher.table.history_abs_start,
         "rebase should still anchor to the oldest live absolute position"
     );
     assert_eq!(
-        matcher.hash_table, expected.hash_table,
+        matcher.table.hash_table, expected.table.hash_table,
         "rebase must rebuild only positions already inserted before abs_pos"
     );
     assert_eq!(
-        matcher.chain_table, expected.chain_table,
+        matcher.table.chain_table, expected.table.chain_table,
         "future positions must not be pre-seeded into HC chains during rebase"
     );
 }
