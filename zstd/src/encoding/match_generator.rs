@@ -626,11 +626,11 @@ impl Matcher for MatchGeneratorDriver {
                     if let Some(hc) = self.hc_match_generator.as_mut() {
                         // Release oversized tables when switching away from
                         // HashChain so Best's larger allocations don't persist.
-                        // hash3_table must be released alongside the other two —
-                        // otherwise BtUltra2's 1 << HC3_HASH_LOG entries stay
-                        // pinned, and the empty-guard in `MatchTable::reset`
-                        // (`if !hash_table.is_empty()`) skips clearing them on
-                        // the next frame too.
+                        // hash3_table must be released alongside the other
+                        // two: BtUltra2's `1 << HC3_HASH_LOG` entries would
+                        // otherwise stay pinned across the backend switch,
+                        // even though no future caller of this backend will
+                        // touch them.
                         hc.table.hash_table = Vec::new();
                         hc.table.chain_table = Vec::new();
                         hc.table.hash3_table = Vec::new();

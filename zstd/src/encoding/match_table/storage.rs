@@ -33,9 +33,11 @@ pub(crate) const HC_EMPTY: u32 = 0;
 // the two copies caused Phase 1d review feedback that this comment
 // guards against re-introducing.
 
-/// Default `hash_log` for the level-7 hash-chain matcher prior to
-/// [`MatchTable::configure_logs`]. Real values are overridden per
-/// compression level during driver setup.
+/// Default `hash_log` for the level-7 hash-chain matcher. Real values
+/// are written directly into [`MatchTable::hash_log`] by the matcher's
+/// `configure()` call once the driver resolves the compression level;
+/// this constant only seeds the field for matchers that haven't been
+/// configured yet.
 pub(crate) const HC_HASH_LOG: usize = 20;
 /// Default `chain_log` for HC mode (also the pointer-pair log for BT
 /// mode — same table reused).
