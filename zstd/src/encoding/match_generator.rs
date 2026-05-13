@@ -1955,9 +1955,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         if !skip_further_match_search && $bt_matchfinder {
             // SAFETY: same umbrella for bt_insert_and_collect_matches.
             unsafe {
-                $self.bt.$bt_insert(
-                    &mut $self.table,
-                    $self.hc.search_depth,
+                $self.table.$bt_insert(
                     $abs_pos,
                     $current_abs_end,
                     $profile,
@@ -2348,6 +2346,15 @@ impl HcMatchGenerator {
         };
         self.hc.target_len = config.target_len;
         self.parse_mode = config.parse_mode;
+        // Stage D: mirror parse_mode flags + HC search depth onto MatchTable
+        // so the BT walker and rebase machinery can read them directly
+        // without dispatching back through HcMatchGenerator.
+        self.table.search_depth = self.hc.search_depth;
+        self.table.is_btultra2 = matches!(config.parse_mode, HcParseMode::BtUltra2);
+        self.table.uses_bt = matches!(
+            config.parse_mode,
+            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
+        );
         if resize && !self.table.hash_table.is_empty() {
             // Force reallocation on next ensure_tables() call.
             self.table.hash_table.clear();
@@ -2439,13 +2446,9 @@ impl HcMatchGenerator {
         let mut pos = current_abs_start;
         while pos < current_abs_end {
             self.maybe_rebase_positions(pos);
-            let _ = self.bt.bt_insert_step_no_rebase(
-                &mut self.table,
-                self.hc.search_depth,
-                pos,
-                current_abs_end,
-                current_abs_end,
-            );
+            let _ = self
+                .table
+                .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
             self.table.insert_hash3_only_no_rebase(pos);
             let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
             if next <= pos {
@@ -2464,13 +2467,9 @@ impl HcMatchGenerator {
                 continue;
             }
             self.maybe_rebase_positions(pos);
-            let _ = self.bt.bt_insert_step_no_rebase(
-                &mut self.table,
-                self.hc.search_depth,
-                pos,
-                current_abs_end,
-                current_abs_end,
-            );
+            let _ = self
+                .table
+                .bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
             self.table.insert_hash3_only_no_rebase(pos);
         }
 
@@ -3145,20 +3144,16 @@ impl HcMatchGenerator {
     }
 
     fn uses_bt_matchfinder(&self) -> bool {
-        matches!(
-            self.parse_mode,
-            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
-        )
+        self.table.uses_bt
     }
 
-    /// Stage D prep: consolidate the donor "btultra2 special case"
-    /// boolean so all rebase / hash3-fill / parse-mode-conditional
-    /// sites read from a single named accessor. Once `parse_mode` is
-    /// folded into the `HcBackend` enum this becomes a one-line
-    /// `matches!(self.backend, …)` without touching call sites.
+    /// Stage D: mirrored onto [`MatchTable::is_btultra2`] during
+    /// `configure()`, so every former site that read `self.parse_mode`
+    /// now consults the table flag instead. Kept as a thin accessor on
+    /// `HcMatchGenerator` for call sites that haven't migrated yet.
     #[inline]
     fn is_btultra2(&self) -> bool {
-        self.parse_mode == HcParseMode::BtUltra2
+        self.table.is_btultra2
     }
 
     /// Cross-platform entry. Picks the kernel-specific variant so the BT-tree
@@ -3218,13 +3213,8 @@ impl HcMatchGenerator {
             }
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward = unsafe {
-                self.bt.bt_insert_step_no_rebase_neon(
-                    &mut self.table,
-                    self.hc.search_depth,
-                    update_abs,
-                    current_abs_end,
-                    abs_pos,
-                )
+                self.table
+                    .bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos)
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -3248,13 +3238,8 @@ impl HcMatchGenerator {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
-                self.bt.bt_insert_step_no_rebase_sse42(
-                    &mut self.table,
-                    self.hc.search_depth,
-                    update_abs,
-                    current_abs_end,
-                    abs_pos,
-                )
+                self.table
+                    .bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -3278,13 +3263,8 @@ impl HcMatchGenerator {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
-                self.bt.bt_insert_step_no_rebase_avx2_bmi2(
-                    &mut self.table,
-                    self.hc.search_depth,
-                    update_abs,
-                    current_abs_end,
-                    abs_pos,
-                )
+                self.table
+                    .bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
             };
             update_abs = update_abs.saturating_add(forward.max(1));
         }
@@ -3306,13 +3286,9 @@ impl HcMatchGenerator {
             {
                 self.maybe_rebase_positions(update_abs);
             }
-            let forward = self.bt.bt_insert_step_no_rebase_scalar(
-                &mut self.table,
-                self.hc.search_depth,
-                update_abs,
-                current_abs_end,
-                abs_pos,
-            );
+            let forward =
+                self.table
+                    .bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
             update_abs = update_abs.saturating_add(forward.max(1));
         }
         self.table.skip_insert_until_abs = abs_pos;
@@ -3365,13 +3341,9 @@ impl HcMatchGenerator {
         let history_start = self.table.history_abs_start;
         // Rebuild only the already-inserted prefix. The caller inserts abs_pos
         // immediately after this, and later positions are added in-order.
-        if self.uses_bt_matchfinder() {
-            self.bt.replay_history_for_rebase(
-                &mut self.table,
-                self.hc.search_depth,
-                history_start,
-                abs_pos,
-            );
+        if self.table.uses_bt {
+            self.table
+                .replay_history_for_rebase_bt(history_start, abs_pos);
         } else {
             self.table
                 .replay_history_for_rebase_hc(history_start, abs_pos);
@@ -4507,6 +4479,9 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut out = Vec::new();
 
     hc.parse_mode = HcParseMode::BtUltra2;
+    hc.table.is_btultra2 = true;
+    hc.table.uses_bt = true;
+    hc.table.search_depth = hc.hc.search_depth;
     hc.table.dictionary_limit_abs = Some(64);
     hc.collect_optimal_candidates(
         abs_pos,
@@ -4525,6 +4500,8 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     );
 
     hc.parse_mode = HcParseMode::BtUltra;
+    hc.table.is_btultra2 = false;
+    hc.table.uses_bt = true;
     hc.table.skip_insert_until_abs = 0;
     hc.collect_optimal_candidates(
         abs_pos,

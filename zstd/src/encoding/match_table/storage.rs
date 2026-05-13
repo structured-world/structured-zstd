@@ -20,7 +20,8 @@ use alloc::vec::Vec;
 
 use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
-use super::super::opt::types::HcOptimalSequence;
+use super::super::cost_model::HcOptimalCostProfile;
+use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
 
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
@@ -85,6 +86,19 @@ pub(crate) struct MatchTable {
     pub(crate) dictionary_limit_abs: Option<usize>,
     pub(crate) dictionary_primed_for_frame: bool,
     pub(crate) allow_zero_relative_position: bool,
+    /// HC chain-walk depth, mirrored from `HcMatcher::search_depth` during
+    /// `configure()`. Stage D moves the BT walker onto this struct, and the
+    /// walker macros read the depth from `$table.search_depth` directly so
+    /// the call sites don't have to plumb it through.
+    pub(crate) search_depth: usize,
+    /// Whether the active parser is `btultra2`. Stage D mirrors it from
+    /// `HcParseMode::BtUltra2` so the BT walker and rebase machinery can
+    /// stay on `MatchTable` without consulting the outer generator.
+    pub(crate) is_btultra2: bool,
+    /// Whether the active backend is one of the BT parsers (`btopt`,
+    /// `btultra`, `btultra2`). Mirrored from `HcParseMode` for the same
+    /// reason as `is_btultra2`.
+    pub(crate) uses_bt: bool,
 }
 
 impl MatchTable {
@@ -110,6 +124,9 @@ impl MatchTable {
             dictionary_limit_abs: None,
             dictionary_primed_for_frame: false,
             allow_zero_relative_position: false,
+            search_depth: 0,
+            is_btultra2: false,
+            uses_bt: false,
         }
     }
 
@@ -500,6 +517,343 @@ impl MatchTable {
     /// path for `rebase_positions_cold`; the caller is responsible
     /// for re-inserting any positions the active matchfinder still
     /// needs.
+    /// Stage D: BT walker step. Cross-platform dispatcher that picks
+    /// the per-kernel variant so the per-iteration
+    /// `count_match_from_indices` symbol inlines under the kernel's
+    /// `target_feature` umbrella. Previously lived on `BtMatcher`
+    /// but the body uses only table state plus `self.search_depth`,
+    /// so it migrates onto `MatchTable` and clears the cross-struct
+    /// borrow that blocked the rest of the BT update chain.
+    #[inline(always)]
+    pub(crate) fn bt_insert_step_no_rebase(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
+                },
+                FastpathKernel::Scalar => {
+                    self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+        }
+    }
+
+    /// NEON umbrella BT walker step.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let search_depth = self.search_depth;
+        crate::bt_insert_step_no_rebase_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::neon::count_match_from_indices
+        )
+    }
+
+    /// SSE4.2 umbrella BT walker step.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let search_depth = self.search_depth;
+        crate::bt_insert_step_no_rebase_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::sse42::count_match_from_indices
+        )
+    }
+
+    /// AVX2+BMI2 umbrella BT walker step.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 + BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let search_depth = self.search_depth;
+        crate::bt_insert_step_no_rebase_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
+        )
+    }
+
+    /// Scalar fallback BT walker step (used on non-AArch64 targets).
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub(crate) fn bt_insert_step_no_rebase_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let search_depth = self.search_depth;
+        crate::bt_insert_step_no_rebase_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::scalar::count_match_from_indices
+        )
+    }
+
+    /// Stage D: cross-platform dispatcher for the BT collect-matches walker.
+    /// External / test entry — the hot path bypasses this and calls the
+    /// per-kernel variant from inside the surrounding
+    /// `collect_optimal_candidates_initialized_<kernel>` umbrella.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn bt_insert_and_collect_matches(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.bt_insert_and_collect_matches_neon(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.bt_insert_and_collect_matches_avx2_bmi2(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.bt_insert_and_collect_matches_sse42(
+                        abs_pos,
+                        current_abs_end,
+                        profile,
+                        min_match_len,
+                        best_len_for_skip,
+                        out,
+                    )
+                },
+                FastpathKernel::Scalar => self.bt_insert_and_collect_matches_scalar(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    min_match_len,
+                    best_len_for_skip,
+                    out,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.bt_insert_and_collect_matches_scalar(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+            )
+        }
+    }
+
+    /// NEON-umbrella variant of `bt_insert_and_collect_matches`.
+    ///
+    /// # Safety
+    /// AArch64 with NEON (baseline).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_neon(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let search_depth = self.search_depth;
+        crate::bt_insert_and_collect_matches_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::neon::count_match_from_indices,
+        )
+    }
+
+    /// SSE4.2 umbrella variant of `bt_insert_and_collect_matches`.
+    ///
+    /// # Safety
+    /// x86/x86_64 with SSE4.2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_sse42(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let search_depth = self.search_depth;
+        crate::bt_insert_and_collect_matches_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::sse42::count_match_from_indices,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant of `bt_insert_and_collect_matches`.
+    ///
+    /// # Safety
+    /// x86/x86_64 with AVX2 + BMI2.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_avx2_bmi2(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let search_depth = self.search_depth;
+        crate::bt_insert_and_collect_matches_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
+        )
+    }
+
+    /// Scalar fallback BT collect-matches walker.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bt_insert_and_collect_matches_scalar(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        let search_depth = self.search_depth;
+        crate::bt_insert_and_collect_matches_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            crate::encoding::fastpath::scalar::count_match_from_indices,
+        )
+    }
+
+    /// BT-side history replay after [`Self::begin_rebase`]. Re-walks
+    /// `history_start..abs_pos` through the BT step so the pointer-pair
+    /// table is consistent with the freshly reset `position_base`.
+    pub(crate) fn replay_history_for_rebase_bt(&mut self, history_start: usize, abs_pos: usize) {
+        let rebuild_end = self.history_abs_end();
+        let mut pos = history_start;
+        while pos < abs_pos {
+            let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
+            pos = pos.saturating_add(forward.max(1));
+        }
+    }
+
     pub(crate) fn begin_rebase(&mut self) {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
