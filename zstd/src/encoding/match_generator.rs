@@ -1226,14 +1226,18 @@ macro_rules! build_optimal_plan_impl_body {
         };
         let has_ldm = !$self.bt.ldm_sequences.is_empty();
         if has_ldm {
-            $self.bt.ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
+            $self
+                .bt
+                .ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
         }
 
         // Donor-like seed at rPos=0: initialize frontier with matches starting
         // at current position before entering the generic forward DP loop.
         if $current_len >= min_match_len {
             let seed_ldm = if has_ldm {
-                $self.bt.ldm_process_match_candidate(&mut opt_ldm, 0, $current_len, min_match_len)
+                $self
+                    .bt
+                    .ldm_process_match_candidate(&mut opt_ldm, 0, $current_len, min_match_len)
             } else {
                 None
             };
@@ -1633,7 +1637,7 @@ macro_rules! build_optimal_plan_impl_body {
         if last_pos == 0 {
             if $current_len == 0 {
                 let price = nodes[0].price;
-                return $self.finish_optimal_plan(
+                return $self.bt.finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
                         candidates,
@@ -1664,7 +1668,7 @@ macro_rules! build_optimal_plan_impl_body {
                 ll_price_stamp,
             );
             let price = HcMatchGenerator::add_price_delta(nodes[0].price, lit_price, ll_delta);
-            return $self.finish_optimal_plan(
+            return $self.bt.finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1685,7 +1689,7 @@ macro_rules! build_optimal_plan_impl_body {
             nodes[target_pos]
         };
         if last_stretch.price == u32::MAX {
-            return $self.finish_optimal_plan(
+            return $self.bt.finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1700,7 +1704,7 @@ macro_rules! build_optimal_plan_impl_body {
         }
 
         if last_stretch.mlen == 0 {
-            return $self.finish_optimal_plan(
+            return $self.bt.finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
                     candidates,
@@ -1731,7 +1735,7 @@ macro_rules! build_optimal_plan_impl_body {
         } else {
             let tail_literals = last_stretch.litlen as usize;
             if cur < tail_literals {
-                return $self.finish_optimal_plan(
+                return $self.bt.finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
                         candidates,
@@ -1818,7 +1822,7 @@ macro_rules! build_optimal_plan_impl_body {
             },
             target_pos.min($current_len),
         );
-        $self.finish_optimal_plan(
+        $self.bt.finish_optimal_plan(
             HcOptimalPlanBuffers {
                 nodes,
                 candidates,
@@ -2692,7 +2696,8 @@ impl HcMatchGenerator {
             cursor += consumed_len;
         }
 
-        self.emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
+        self.table
+            .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
         best_plan.clear();
         self.bt.opt_segment_plan_scratch = best_plan;
         self.bt.opt_state = opt_state;
@@ -3027,31 +3032,6 @@ impl HcMatchGenerator {
             out,
             collect_optimal_candidates_initialized_scalar,
         )
-    }
-
-    fn finish_optimal_plan(
-        &mut self,
-        buffers: HcOptimalPlanBuffers,
-        result: (u32, [u32; 3], usize, usize),
-    ) -> (u32, [u32; 3], usize, usize) {
-        let HcOptimalPlanBuffers {
-            nodes,
-            mut candidates,
-            store,
-            ll_prices,
-            ll_price_generations,
-            ml_prices,
-            ml_price_generations,
-        } = buffers;
-        candidates.clear();
-        self.bt.opt_nodes_scratch = nodes;
-        self.bt.opt_candidates_scratch = candidates;
-        self.bt.opt_store_scratch = store;
-        self.bt.opt_ll_price_scratch = ll_prices;
-        self.bt.opt_ll_price_generation = ll_price_generations;
-        self.bt.opt_ml_price_scratch = ml_prices;
-        self.bt.opt_ml_price_generation = ml_price_generations;
-        result
     }
 
     #[inline(always)]
@@ -3409,47 +3389,6 @@ impl HcMatchGenerator {
         // a real ldmSeqStore exists (`enableLdm == ZSTD_ps_enable`).
         // This Rust encoder does not expose a donor-equivalent LDM producer or
         // runtime switch yet, so the ordinary level-22 path must remain LDM-free.
-    }
-
-    fn emit_optimal_plan(
-        &mut self,
-        current_len: usize,
-        plan: &[HcOptimalSequence],
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        let current = self.table.window.back().unwrap().as_slice();
-        if plan.is_empty() {
-            handle_sequence(Sequence::Literals { literals: current });
-            return;
-        }
-
-        let mut literals_start = 0usize;
-        for item in plan {
-            let lit_len = item.lit_len as usize;
-            let match_len = item.match_len as usize;
-            let start = literals_start.saturating_add(lit_len);
-            if start < literals_start || start + match_len > current_len {
-                continue;
-            }
-            let literals = &current[literals_start..start];
-            handle_sequence(Sequence::Triple {
-                literals,
-                offset: item.offset as usize,
-                match_len,
-            });
-            encode_offset_with_history(
-                item.offset,
-                literals.len() as u32,
-                &mut self.table.offset_hist,
-            );
-            literals_start = start + match_len;
-        }
-
-        if literals_start < current_len {
-            handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
-            });
-        }
     }
 
     fn uses_bt_matchfinder(&self) -> bool {

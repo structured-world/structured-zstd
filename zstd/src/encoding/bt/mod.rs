@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 use super::match_table::storage::MatchTable;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
-use super::opt::types::{HcOptimalNode, HcOptimalSequence, MatchCandidate};
+use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
 
 /// Maximum offset reachable by the HC3 short-match probe. Donor
 /// parity: keeps the 3-byte side table from emitting offsets that
@@ -800,5 +800,35 @@ impl BtMatcher {
             );
         }
         self.ldm_maybe_add_match(opt_ldm, curr_pos_in_block, min_match)
+    }
+
+    /// Donor parity: restore the seven per-frame scratch buffers that
+    /// `build_optimal_plan_impl!` borrowed via `core::mem::take`. The
+    /// passed `result` tuple is the parser's `(offset, reps, litlen,
+    /// match_len)` return value — kept untouched and returned so the
+    /// macro chains the move-out in a single expression.
+    pub(crate) fn finish_optimal_plan(
+        &mut self,
+        buffers: HcOptimalPlanBuffers,
+        result: (u32, [u32; 3], usize, usize),
+    ) -> (u32, [u32; 3], usize, usize) {
+        let HcOptimalPlanBuffers {
+            nodes,
+            mut candidates,
+            store,
+            ll_prices,
+            ll_price_generations,
+            ml_prices,
+            ml_price_generations,
+        } = buffers;
+        candidates.clear();
+        self.opt_nodes_scratch = nodes;
+        self.opt_candidates_scratch = candidates;
+        self.opt_store_scratch = store;
+        self.opt_ll_price_scratch = ll_prices;
+        self.opt_ll_price_generation = ll_price_generations;
+        self.opt_ml_price_scratch = ml_prices;
+        self.opt_ml_price_generation = ml_price_generations;
+        result
     }
 }

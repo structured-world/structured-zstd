@@ -18,6 +18,10 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+use super::super::Sequence;
+use super::super::blocks::encode_offset_with_history;
+use super::super::opt::types::HcOptimalSequence;
+
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
 /// by the HC3 short-match side table and by the 3-byte branch of the
@@ -488,5 +492,45 @@ impl MatchTable {
     ) -> (usize, usize) {
         let start_cursor = usize::from(current_abs_start == self.history_abs_start);
         (start_cursor, start_cursor)
+    }
+
+    /// Donor parity: replay an optimal-parser plan into the consumer's
+    /// sequence sink. Reads the current input frame off `window` and
+    /// advances `offset_hist` exactly like the donor block-store walker.
+    pub(crate) fn emit_optimal_plan(
+        &mut self,
+        current_len: usize,
+        plan: &[HcOptimalSequence],
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let current = self.window.back().unwrap().as_slice();
+        if plan.is_empty() {
+            handle_sequence(Sequence::Literals { literals: current });
+            return;
+        }
+
+        let mut literals_start = 0usize;
+        for item in plan {
+            let lit_len = item.lit_len as usize;
+            let match_len = item.match_len as usize;
+            let start = literals_start.saturating_add(lit_len);
+            if start < literals_start || start + match_len > current_len {
+                continue;
+            }
+            let literals = &current[literals_start..start];
+            handle_sequence(Sequence::Triple {
+                literals,
+                offset: item.offset as usize,
+                match_len,
+            });
+            encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
+            literals_start = start + match_len;
+        }
+
+        if literals_start < current_len {
+            handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
     }
 }
