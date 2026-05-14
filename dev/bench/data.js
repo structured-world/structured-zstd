@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778756321159,
+  "lastUpdate": 1778777005129,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -30170,6 +30170,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.238,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2e9c99ddfad4e82a03d29619a9c4e42793f28e33",
+          "message": "perf(encoding): #111 Phase 2 — saturating_* cleanup on hot path (#121)\n\n* perf(encoding): drop saturating_* from BT walker / DP / collect hot path\n\nPR #110 already cleaned the cost-model subset (yielding +9.5% on level22,\n+34% on default). This batch removes the residual `saturating_*` from\nthe four hot-path macros that drive per-byte work in the optimal /\nbtultra2 cascade:\n\n  * `bt_insert_step_no_rebase_body!` (BT walker step, per BT-update\n    iteration)\n  * `bt_insert_and_collect_matches_body!` (BT match collector, per\n    optimal-parser frontier position)\n  * `collect_optimal_candidates_initialized_body!` (rep + hash3 + chain\n    probe orchestrator)\n  * `build_optimal_plan_impl_body!` (DP inner loop)\n\nPattern: each `saturating_add` / `saturating_sub` site is either\n\n  (a) replaced with raw arithmetic + an in-macro `debug_assert!` (or\n      code comment) pinning the precondition that makes the raw op\n      safe, OR\n  (b) kept saturating with a comment explaining the legitimate edge\n      case the saturation guards (e.g. `abs_pos < bt_mask` on the\n      first BT walk of a fresh frame).\n\nPreconditions that justify (a):\n  * `tail_limit = current_abs_end - abs_pos` — caller is processing a\n    position inside the current block.\n  * `match_end_abs = abs_pos + 9` — encode blocks cap at\n    HC_BLOCKSIZE_MAX, far below `usize::MAX - 9`.\n  * `candidate_end = candidate_abs + match_len` — both bounded by\n    `current_abs_end + HC_OPT_NUM`.\n  * `match_end_abs - 8` — `match_end_abs` is initialized to\n    `abs_pos + 9` and monotonically grows, so `>= 8` invariant holds.\n  * `min_match_len - 1` — `min_match_len = HC_FORMAT_MINMATCH (4)`.\n  * `frontier_limit - pos` — outer loop guards `pos <= frontier_limit`.\n\n`saturating_*` retained for:\n  * `bt_low = abs_pos - bt_mask` — first BT walk of a fresh frame has\n    `abs_pos < bt_mask`; raw subtraction underflows into a huge\n    sentinel that always trips `candidate_abs <= bt_low`.\n  * price arithmetic (`base_cost + HC_BITCOST_MULTIPLIER / 2`) — u32\n    overflow protection on accumulated prices.\n  * cleanup-path arithmetic in store walkers — defensive on edge\n    `last_stretch.mlen > target_pos` cases.\n\nDiff: 30 saturating_* removals from `match_generator.rs` (63 -> 33).\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* perf(encoding): drop saturating_* from BT walker dispatcher and offset encoder\n\nReplace `saturating_*` with raw arithmetic + comments / debug_asserts\nwhere the invariant is proven, in the per-iteration dispatchers and\nhelpers that don't run inside a macro:\n\n`match_table/storage.rs`:\n- `bt_pair_index_for_abs`: `abs_pos + index_shift` is always safe\n  (`index_shift = 0` today; reserved for future rebase variants).\n- 5 BT walker SIMD dispatchers: `update_abs += forward.max(1)` per\n  iteration — `forward >= 1` guard ensures the increment is bounded.\n- `update_hash3_until`: `self.next_to_update3 += 1` inside the loop\n  body — strict less-than guard on `abs_pos`.\n\n`bt/mod.rs`:\n- `encode_offset_with_reps` / `encode_offset_base_with_reps`: replace\n  `actual_offset.saturating_add(3)` with `actual_offset + 3`. Window\n  cap (<= 8 MiB practical max) keeps the result far below\n  `u32::MAX`.\n- `cached_lit_length_delta_price` `lit_len == 0` branch: return `0`\n  directly instead of computing `price(0) - price(saturating_sub(0,\n  1))`. The old expression evaluated to `price(0) - price(0) = 0`;\n  the new code skips two `lit_length_price` calls and one\n  subtraction for the same result.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* perf(encoding): drop saturating_* from dfast hot loops (level 2 / default)\n\nReplace 10 `saturating_*` sites in `DfastMatchGenerator::start_matching`\ninner loop with raw arithmetic + `+=` assigns. All positions are\nbounded by `current_len <= HC_BLOCKSIZE_MAX (128 KiB)`; small\nincrements (1, 2, 3, DFAST_SKIP_STEP_GROWTH_INTERVAL, skip_step\n<= DFAST_MAX_SKIP_STEP) cannot overflow `usize`.\n\nSites:\n- `ip0.saturating_add(N)` for N in {1, 2, 3} — sub-position offsets.\n- `pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL)`\n- `next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL)`\n- `miss_run.saturating_add(1)`\n- `pos.saturating_add(skip_step)`\n\ndfast drives the level 2 / default compression cascade. The level 22\nhot path doesn't touch dfast, but the default level (~27x slower than\nC donor today) is the next perf target after this phase lands.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate (level22 decodecorpus median\n406 ms — within --quick noise band of post-batch-1 385 ms; the\n13-18 % gain from batch 1 is durable).\n\n* fix(encoding): correct safety claims on unchecked arithmetic + 32-bit hardening\n\nTen sites where the \"safe because <X>\" comments cited an invariant\nthat didn't match the code. None of the arithmetic was unsafe but\nthe rationales were misleading. Rewrite every flagged comment against\nthe actual code and add `debug_assert!` / `try_from` / `checked_add`\nwhere the stronger invariant deserves an explicit panic on violation.\n\nstorage.rs:\n- `bt_pair_index_for_abs`: `index_shift` is `current_len` during the\n  btultra2 seed pass (`run_btultra2_seed_pass`), not always 0. Use\n  `checked_add` and a real invariant comment.\n\ndfast/mod.rs:\n- Document the loop's `pos + DFAST_MIN_MATCH_LEN <= current_len` bound\n  on the inner-loop unchecked additions.\n\nmatch_generator.rs:\n- `bt_insert_step_no_rebase_body!` `match_end_abs = abs_pos + 9`:\n  proof is the frame-level history budget, not \"blocks cap at\n  `HC_BLOCKSIZE_MAX`\". Added `debug_assert!(abs_pos <= usize::MAX -\n  9)`. Critical on i686 where `usize` is 32-bit.\n- Optimal-plan seed `nodes[p].litlen = (initial_litlen + p) as u32`:\n  `initial_litlen` is carried across optimal-plan segments and\n  bounded by the current block length, not by the segment's\n  `current_len`. Use `u32::try_from` to panic on truncation.\n- HC_FORMAT_MINMATCH parenthetical: 3 (not 4) at both sites.\n- `pos == frontier_limit` loop comment: outer guard is `<=`, not `<`.\n- Stretch walker `litlen + mlen`: state the real \"single stretch\n  bounded by current segment length\" invariant + `debug_assert!`\n  instead of \"two u32 fit in usize\" (false on i686).\n- Repcode tail check: `rep.match_len` is capped by `tail_limit`\n  inside `for_each_repcode_candidate_with_reps`, not by `HC_OPT_NUM`.\n- `bt_insert_and_collect_matches_body!` `candidate_end`: cite the BT\n  walker invariants so the sum stays within the current block on\n  every supported target.\n- Test-only `is_x86_feature_detected` import: restrict cfg to\n  `target_arch = \"x86_64\"` (the only test site uses it from x86_64).\n\nbt/mod.rs:\n- `encode_offset_with_reps` / `encode_offset_base_with_reps`: restore\n  `actual_offset.saturating_add(3)` and document why. The function\n  accepts any `u32`; raw `+ 3` overflows for malformed external\n  input above `u32::MAX - 3` and would wrap into a small rep-code\n  value (silent stream corruption).\n\nCI workflow:\n- macos-latest runner image ships a Homebrew rustup proxy that also\n  breaks `rustc` (not just `cargo`), so `rustup run stable cargo`\n  fails when its launched cargo invokes `rustc -vV`. Prepend the\n  toolchain's actual `bin/` to `GITHUB_PATH` on macOS so every nested\n  binary resolves to a real shim.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* fix(encoding): tighten unchecked-arithmetic safety on optimal seed and BT pair index\n\nmatch_generator.rs:\n- `nodes[p].litlen = u32::try_from(initial_litlen + p)`: the inner\n  `usize` addition runs BEFORE `try_from`, so on 32-bit i686 (where\n  `usize` is `u32`) it can panic / wrap before the conversion checks\n  bounds. Split into an explicit `checked_add(p).and_then(u32::try_from)\n  .expect(...)` chain so overflow is caught at the addition itself.\n- Correct the off-by-one in the bt_insert_and_collect doc: with\n  `min_match_len >= HC_FORMAT_MINMATCH (3)`, `min_match_len - 1 >= 2`,\n  not `>= 3`.\n\nstorage.rs:\n- `bt_pair_index_for_abs`: revert the previous `checked_add().expect()`\n  to `debug_assert!` + raw `+`. This function runs on the BT walker\n  per-iteration hot path; release builds should not pay a\n  release-mode overflow branch when the invariant is structurally\n  guaranteed by the caller.\n\ndfast/mod.rs:\n- Add the matching invariant note to `start_matching_general` (the\n  slow path) so both dfast inner loops document the\n  `pos + DFAST_MIN_MATCH_LEN <= current_len` precondition that\n  justifies the unchecked increments inside.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* refactor(encoding): tighten min_match_len debug_assert to HC_FORMAT_MINMATCH\n\nThe doc-comment immediately above the assertion claims\n`min_match_len >= HC_FORMAT_MINMATCH (3)`, but the assertion itself\nchecked the weaker invariant `>= 1`. Make the assert match the doc:\npanic in debug builds whenever the configure-time invariant is broken,\nnot just on a literal zero. Use `$crate::encoding::cost_model::HC_FORMAT_MINMATCH`\nso the macro resolves the constant from any expansion site.\n\n* fix(encoding): guard the second initial_litlen + 1 site with checked_add\n\nCodeRabbit thread on PR #121 flagged TWO sites where the `usize`\naddition runs before `u32::try_from` / before being fed into a\nfixed-width consumer. The first site (`nodes[p].litlen = …`) was\nalready fixed in f3a3d4f4; the second site (`let next_litlen =\ninitial_litlen + 1`) is at line 1775 and was missed.\n\n`initial_litlen` is carried across optimal-plan segments and is only\nbounded by the current block length, not by the segment's\n`current_len`. On i686 (32-bit `usize`) a wrapping `+ 1` would slip\ninto the price lookup unnoticed. Use `checked_add(1).expect(...)` so\noverflow panics at the addition itself.\n\n* fix(encoding): tighten unchecked-arithmetic claims on absolute stream positions\n\n`abs_pos` is a frame-lifetime absolute stream cursor (it grows across\nblocks), not a block-local offset. Earlier safety claims that bound\n`abs_pos` arithmetic by `current_len` or `HC_BLOCKSIZE_MAX` were\nincorrect for long-running streams on 32-bit targets — both reviewers\nflagged this.\n\nstorage.rs:\n- `bt_pair_index_for_abs`: the function masks the sum down to\n  `bt_mask()` width anyway, so the modulo semantics of `wrapping_add`\n  give the same ring slot as an unchecked `+` and avoid both\n  release-mode overflow branches and debug-mode panics when the\n  absolute cursor + block-local `index_shift` approaches `usize::MAX`.\n\ndfast/mod.rs (both inner loops):\n- Split the safety comment into two distinct invariants: block-local\n  arithmetic bounded by `current_len <= HC_BLOCKSIZE_MAX`, and\n  absolute-position arithmetic (`current_abs_start + pos`) bounded\n  by the host's `usize` (we'd need that much RAM to hold history).\n\nmatch_generator.rs (three `match_end_abs = abs_pos + 9` sites):\n- Replace the fictitious `history_abs_start + window_size <=\n  usize::MAX - 16` cap with the real invariant: `abs_pos` can only\n  reach `usize::MAX - 9` if the encoder has already processed\n  ~`usize::MAX` bytes, which is impossible because that much history\n  would itself exceed addressable memory. `debug_assert!` still\n  catches the case in tests; release builds use the raw `+`.\n- Add the same invariant block to the two sibling sites\n  (`collect_optimal_candidates_initialized_body!` chain fallback and\n  `bt_insert_and_collect_matches_body!`) so all three macros document\n  the same precondition.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* fix(encoding): saturating arithmetic for absolute stream cursors on 32-bit\n\nCodeRabbit caught two genuine 32-bit streaming bugs in my prior\n\"the cursor cannot overflow because we can't allocate that much\nmemory\" reasoning. The reasoning is wrong for streaming encodes:\nthe window stays bounded by `window_size` but the absolute stream\ncursor advances cumulatively and can pass `usize::MAX` on i686.\n\nstorage.rs (5 walker dispatchers):\n- `replay_history_for_rebase_bt` and the 4 BT walker SIMD variants\n  (`bt_update_tree_until_*`) advanced via `pos += forward.max(1)` /\n  `update_abs += forward.max(1)`. On a long 32-bit stream with `pos`\n  near `usize::MAX`, `forward` can be large enough (up to\n  `HC_OPT_NUM`) that the addition wraps and the loop guard\n  `pos < abs_pos` re-fires with a wrapped cursor — infinite loop or\n  panic. Cap the step at the remaining distance:\n  `forward.max(1).min(abs_pos - pos)`. The result-of-step is\n  guaranteed `<= abs_pos < usize::MAX`.\n\nmatch_generator.rs (3 `match_end_abs = abs_pos + 9` sites):\n- `bt_insert_step_no_rebase_body!`,\n  `collect_optimal_candidates_initialized_body!`, and\n  `bt_insert_and_collect_matches_body!` all initialize\n  `match_end_abs = abs_pos + 9`. Restore `saturating_add(9)` and\n  document why: streaming on 32-bit can advance `abs_pos` past\n  `usize::MAX - 9` even with bounded memory, and `saturating_add`\n  clamps to `usize::MAX` — downstream comparisons treat this as\n  \"no further extension possible\", a safe degenerate state near\n  the stream tail. The previous `debug_assert!` claim was wrong;\n  the encoder has no hard cap preventing this case.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest including level22 ratio gate.\n\n* docs(encoding): correct dfast loop comments for 32-bit streaming semantics\n\nBoth dfast inner loops carried the same \"we'd need that much RAM to\nhold history\" invariant claim that the BT macros just dropped. The\nclaim is false for streaming encoders: a long 32-bit stream advances\n`current_abs_start` cumulatively with total bytes processed while\nmemory usage stays bounded by `window_size`, so `current_abs_start\n+ pos` can still wrap on i686 even when only a sliding window is\nretained.\n\nRewrite both `start_matching_general` and the fast-loop comments to\nstate the actual contract: the loops rely on the frame-compressor's\ndocumented `usize::MAX` total-input cap; new raw arithmetic on\nabsolute cursors should either preserve that contract or switch to\n`saturating_add` like the BT macros do.\n\nNo code changes — only comment accuracy.\n\n* perf(encoding): hoist 32-bit abs_pos overflow guard to MatchTable::add_data\n\nIntroduce a frame-level `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16` cap in\n`MatchTable::add_data` that fails fast (with a clear panic message) if\nthe next data ingest would push the absolute stream cursor past\n`usize::MAX`. With this upstream gate in place, every per-position\n`abs_pos + 9` arithmetic site in the BT walker bodies can run as raw\n`+` instead of `saturating_add`, eliminating the per-call clamp on\ni686 hot paths.\n\n- Replace `saturating_add(9)` at three sites in\n  `bt_insert_step_no_rebase_body!`, `bt_insert_and_collect_matches_body!`,\n  and the optimal-parser candidate seed with raw `+ 9`, referencing the\n  new upstream cap in each comment.\n- Leave `bt_low`/`tail_limit` `saturating_sub` sites untouched: those\n  are underflow guards for the first frame positions / EOF, where a\n  wraparound would translate into OOB reads — not a candidate for\n  hoisting.\n\nRefs #111 Phase 2.\n\n* docs(encoding): point dfast invariants at concrete add_data cap\n\n* refactor(encoding): extract stream-headroom gate + remove dfast saturating_add\n\n- Introduce `check_stream_abs_headroom` helper in `match_table::storage`\n  so `MatchTable::add_data` and `DfastMatchGenerator::add_data` share\n  a single source of truth for the frame-level overflow gate.\n- Wire dfast through the helper (was already mirroring the inline\n  check from the previous commit).\n- Replace the lingering `pos.saturating_add(step)` in\n  `DfastMatchGenerator::insert_positions_with_step` with raw `pos +=\n  step`: end of loop is capped by `history_abs_end()`, which sits\n  below `usize::MAX - STREAM_ABS_HEADROOM` thanks to the gate.\n- Reword the `bt_pair_index_for_abs` comment to describe the\n  modulo-ring identity (the prior phrasing compared `wrapping_add` to\n  a panicking `+`, which is nonsensical: a panic has no resulting\n  slot to compare against).\n- Update the dfast loop comments so they cite\n  `DfastMatchGenerator::add_data`/`check_stream_abs_headroom` (the\n  real enforcement site for this backend) instead of\n  `MatchTable::add_data`, and stop claiming the block-local bound is\n  `HC_BLOCKSIZE_MAX` — the actual invariant is `current_len`, the\n  block-size limit is only an informational note about the production\n  frame compressor.\n\nRefs #111 Phase 2.\n\n* refactor(encoding): cover row backend with headroom gate + harden boundaries\n\n- Route `RowMatchGenerator::add_data` through `check_stream_abs_headroom`\n  so every match-finder backend (`MatchTable`, `DfastMatchGenerator`,\n  `RowMatchGenerator`) shares the single overflow gate. Update the\n  helper docstring to name all three backends and state the contract\n  for any future backend.\n- Reword the gate panic message: the cursor is not \"past `usize::MAX`\",\n  it is too close to `usize::MAX` for the encoder's absolute-position\n  lookahead (the failure mode is exhausting `STREAM_ABS_HEADROOM`\n  slack, not arithmetic overflow).\n- Add unit tests for `check_stream_abs_headroom` accept/reject at the\n  near-`usize::MAX` boundary so future changes cannot silently weaken\n  the invariant.\n- Promote the step bound on `DfastMatchGenerator::insert_positions_with_\n  step` to a hard `assert!` so a future caller cannot pass a step\n  larger than `DFAST_INCOMPRESSIBLE_SKIP_STEP` and quietly reintroduce\n  the overflow risk the raw `pos += step` cleanup relies on.\n\nRefs #111 Phase 2.\n\n* docs(encoding): correct match_end_abs invariant chain in BT walker\n\n* test(encoding): cover bt_pair_index_for_abs wraparound ring identity",
+          "timestamp": "2026-05-14T19:06:16+03:00",
+          "tree_id": "4b6c5331fc4a063a2b34af0ad9aaa6fdc488a0f6",
+          "url": "https://github.com/structured-world/structured-zstd/commit/2e9c99ddfad4e82a03d29619a9c4e42793f28e33"
+        },
+        "date": 1778777003784,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.158,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.232,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.186,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.016,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.29,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
+            "value": 25.5,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.764,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 119.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.073,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 110.025,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 12.355,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/pure_rust",
+            "value": 64.675,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.364,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
+            "value": 117.475,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
+            "value": 18.415,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/pure_rust",
+            "value": 498.574,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/c_ffi",
+            "value": 239.466,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.798,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.231,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 13.554,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.397,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.64,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 6.787,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.326,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 5.619,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.527,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.466,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.067,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.954,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.042,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.623,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.039,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.916,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.908,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.195,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.67,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.074,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.525,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.984,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.934,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.118,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.863,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.179,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.596,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.048,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 8.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.815,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.945,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.349,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
             "unit": "ms"
           }
         ]
