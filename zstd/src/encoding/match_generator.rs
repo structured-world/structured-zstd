@@ -2353,7 +2353,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
         // so `min_match_len - 1 >= 2` cannot underflow.
-        debug_assert!($min_match_len >= 1, "min_match_len must be at least 1");
+        debug_assert!(
+            $min_match_len >= $crate::encoding::cost_model::HC_FORMAT_MINMATCH,
+            "min_match_len must be at least HC_FORMAT_MINMATCH"
+        );
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
         while compares_left > 0 {
