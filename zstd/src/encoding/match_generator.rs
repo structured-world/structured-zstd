@@ -2637,6 +2637,13 @@ impl HcMatchGenerator {
         self.table.skip_matching(incompressible_hint);
     }
 
+    /// Runtime-dispatched entry kept only for in-crate tests. Production
+    /// callers reach the inner loops through
+    /// [`Self::start_matching_strategy`] / [`MatchGeneratorDriver::compress_block`]
+    /// which pick the lazy / optimal arm from `S::USE_BT` at
+    /// monomorphisation time. Removed alongside `parse_mode` in the
+    /// final cleanup commit.
+    #[cfg(test)]
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         match self.parse_mode {
             HcParseMode::Lazy2 => self.start_matching_lazy(&mut handle_sequence),
@@ -2647,14 +2654,16 @@ impl HcMatchGenerator {
     }
 
     /// Strategy-aware entry point used by
-    /// [`MatchGeneratorDriver::compress_block`]. The next commit
-    /// replaces the inner `match self.parse_mode` with an `if
-    /// S::USE_BT` so each monomorphisation keeps only the lazy or the
-    /// optimal arm. Today it just delegates — the
-    /// `debug_assert_eq!` enforces that `self.parse_mode` (set by
-    /// `configure`) and `S::PARSE_MODE` agree on every call so the
-    /// bridge cannot silently drift while we migrate the inner
-    /// loops.
+    /// [`MatchGeneratorDriver::compress_block`]. Branches on
+    /// `S::USE_BT` — a compile-time `const` — so each
+    /// monomorphisation keeps exactly one arm: `Lazy` /
+    /// `Fast` / `Dfast` / `Greedy` see only `start_matching_lazy`,
+    /// `BtOpt` / `BtUltra` / `BtUltra2` see only
+    /// `start_matching_optimal`. The runtime `match self.parse_mode`
+    /// at the inherent [`HcMatchGenerator::start_matching`] entry is
+    /// no longer reached from `MatchGeneratorDriver`; it stays in
+    /// place for direct in-crate callers (mostly tests) until the
+    /// final cleanup commit drops `parse_mode` entirely.
     pub(crate) fn start_matching_strategy<S: super::strategy::Strategy>(
         &mut self,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
@@ -2664,7 +2673,11 @@ impl HcMatchGenerator {
             S::PARSE_MODE,
             "Strategy::PARSE_MODE disagrees with runtime parse_mode at HC dispatch"
         );
-        self.start_matching(handle_sequence)
+        if S::USE_BT {
+            self.start_matching_optimal(handle_sequence)
+        } else {
+            self.start_matching_lazy(handle_sequence)
+        }
     }
 
     fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {

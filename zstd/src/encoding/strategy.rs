@@ -334,12 +334,16 @@ mod tests {
         assert_eq!(StrategyTag::for_level(22), StrategyTag::BtUltra2);
     }
 
-    #[test]
-    fn use_bt_aligns_with_parse_mode() {
-        // Lazy2 strategies must not walk the BT; BtOpt / BtUltra /
-        // BtUltra2 must. This is the invariant that lets the inner
-        // optimal parser drop the `if self.parse_mode == Lazy2 …`
-        // branch in favour of `if !S::USE_BT`.
+    // The next three blocks live at module scope (not inside `#[test]`)
+    // so the assertions run at compile time and never reach the
+    // `cargo nextest` runner. `clippy::assertions_on_constants`
+    // requires this form for const-only inputs.
+
+    // `use_bt_aligns_with_parse_mode`: Lazy2 strategies must not walk
+    // the BT; BtOpt / BtUltra / BtUltra2 must. Invariant that lets
+    // the inner optimal parser drop the `if self.parse_mode == Lazy2
+    // …` branch in favour of `if !S::USE_BT`.
+    const _USE_BT_LAYOUT: () = {
         assert!(!Fast::USE_BT);
         assert!(!Dfast::USE_BT);
         assert!(!Greedy::USE_BT);
@@ -347,11 +351,11 @@ mod tests {
         assert!(BtOpt::USE_BT);
         assert!(BtUltra::USE_BT);
         assert!(BtUltra2::USE_BT);
-    }
+    };
 
-    #[test]
-    fn use_hash3_only_set_for_btultra2() {
-        // Donor parity: hash3 is exclusively a BtUltra2 feature.
+    // `use_hash3_only_set_for_btultra2`: hash3 is exclusively a
+    // BtUltra2 feature (donor parity).
+    const _USE_HASH3_LAYOUT: () = {
         assert!(!Fast::USE_HASH3);
         assert!(!Dfast::USE_HASH3);
         assert!(!Greedy::USE_HASH3);
@@ -359,15 +363,15 @@ mod tests {
         assert!(!BtOpt::USE_HASH3);
         assert!(!BtUltra::USE_HASH3);
         assert!(BtUltra2::USE_HASH3);
-    }
+    };
 
-    #[test]
-    fn accurate_and_favor_small_offsets_track_cost_model_for_mode() {
-        // Mirror the `HcOptimalCostProfile::for_mode` runtime table so
-        // the eventual `const_for::<S>` rewrite is a mechanical swap.
+    // `accurate_and_favor_small_offsets_track_cost_model_for_mode`:
+    // mirror `HcOptimalCostProfile::for_mode` so the eventual
+    // `const_for::<S>` rewrite is a mechanical swap.
+    const _COST_MODEL_LAYOUT: () = {
         assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
         assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
-    }
+    };
 }
