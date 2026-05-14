@@ -262,6 +262,11 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
+        // Loop invariant: `pos + DFAST_MIN_MATCH_LEN <= current_len <=
+        // HC_BLOCKSIZE_MAX (128 KiB)`. Each unchecked `+` below is on a
+        // sub-position offset (`ip0..ip3`) or a step (`skip_step <=
+        // DFAST_MAX_SKIP_STEP`) bounded by `current_len`, so no usize
+        // arithmetic in this hot loop can overflow.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
             let ip1 = ip0 + 1;

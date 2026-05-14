@@ -319,7 +319,11 @@ impl BtMatcher {
     /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
     /// donor's compact offset base (1/2/3 for rep slots, otherwise
     /// `actual_offset + 3`) and update the rolling `reps` window in
-    /// lock-step. Returns `(off_base, next_reps)`.
+    /// lock-step. Returns `(off_base, next_reps)`. The non-rep branch
+    /// uses `saturating_add` so a `u32` near `u32::MAX` (only possible
+    /// via malformed external input) clamps to `u32::MAX` rather than
+    /// wrapping into a small rep-code value that would silently corrupt
+    /// the encoded stream.
     pub(crate) fn encode_offset_with_reps(
         actual_offset: u32,
         lit_len: usize,
@@ -334,7 +338,7 @@ impl BtMatcher {
             } else if actual_offset == reps[2] {
                 3
             } else {
-                actual_offset + 3
+                actual_offset.saturating_add(3)
             }
         } else if actual_offset == reps[1] {
             1
@@ -343,7 +347,7 @@ impl BtMatcher {
         } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
             3
         } else {
-            actual_offset + 3
+            actual_offset.saturating_add(3)
         };
 
         if lit_len > 0 {
@@ -393,7 +397,7 @@ impl BtMatcher {
             } else if actual_offset == reps[2] {
                 3
             } else {
-                actual_offset + 3
+                actual_offset.saturating_add(3)
             }
         } else if actual_offset == reps[1] {
             1
@@ -402,7 +406,7 @@ impl BtMatcher {
         } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
             3
         } else {
-            actual_offset + 3
+            actual_offset.saturating_add(3)
         }
     }
 

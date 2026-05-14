@@ -50,19 +50,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepend toolchain bin to PATH (macos shim workaround)
+        if: runner.os == 'macOS'
+        # macos-latest preinstalled rustup ships via Homebrew without the
+        # `~/.cargo/bin/{cargo,rustc}` proxy shims. `rustup run stable cargo`
+        # works for the outer call but the cargo it launches then invokes
+        # `rustc -vV` through the same broken proxy. Putting the toolchain's
+        # actual `bin/` ahead on PATH gives every nested invocation the
+        # real binaries.
+        run: |
+          TC="$(rustup show active-toolchain | awk '{print $1}')"
+          echo "$HOME/.rustup/toolchains/$TC/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ runner.os }}-cargo
       - name: Test
         working-directory: zstd
-        # `rustup run stable cargo` instead of bare `cargo` so the dispatch
-        # works on macos-latest where the Homebrew rustup install omits the
-        # `~/.cargo/bin/cargo` proxy shim. No-op on Linux / Windows runners
-        # whose `cargo` proxy is intact.
-        run: rustup run stable cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
       - name: Doc tests
-        run: rustup run stable cargo test --doc -p structured-zstd --features hash,std,dict_builder
+        run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
 
   cross-i686:
     needs: lint

@@ -48,11 +48,7 @@ use super::strategy::HcParseMode;
     target_endian = "little"
 ))]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(all(
-    test,
-    feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
@@ -1082,8 +1078,15 @@ macro_rules! bt_insert_step_no_rebase_body {
         // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($target_abs);
-        // `abs_pos + 9` only overflows on usize::MAX-adjacent input which
-        // never occurs in practice — encode blocks cap at HC_BLOCKSIZE_MAX.
+        // The caller has already proven `idx + 8 <= concat.len()` and
+        // `idx = abs_pos - history_abs_start`. So
+        // `abs_pos + 8 <= history_abs_start + concat.len() = history_abs_end`,
+        // which the frame compressor caps at a value the BT walker can
+        // address (`window_size + history_abs_start <= usize::MAX - 16`).
+        // `abs_pos + 9` therefore stays in `usize` even on 32-bit i686
+        // — the bound is the frame-level history budget, not a
+        // "blocks cap" claim.
+        debug_assert!($abs_pos <= usize::MAX - 9);
         let mut match_end_abs = $abs_pos + 9;
         let mut best_len = 8usize;
         let mut compares_left = $search_depth;
@@ -1348,13 +1351,20 @@ macro_rules! build_optimal_plan_impl_body {
                 )
             };
             if !candidates.is_empty() {
-                // `min_match_len >= HC_FORMAT_MINMATCH (4)` by invariant.
+                // `min_match_len >= HC_FORMAT_MINMATCH (3)` by invariant.
                 last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(nodes.len()) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
-                    // `initial_litlen + p <= u32::MAX`: lit_len capped well
-                    // below 2^32 by HC_OPT_NUM.
-                    nodes[p].litlen = (initial_litlen + p) as u32;
+                    // `initial_litlen` is the litlen carried from prior
+                    // optimal-plan segments — its real bound is the
+                    // current block length (the frame compressor caps
+                    // block scan at `HC_BLOCKSIZE_MAX`), not the segment
+                    // `current_len`. `p < min_match_len` (small constant),
+                    // so the seed-position litlen stays well within
+                    // `u32::MAX`; `u32::try_from` panics rather than
+                    // silently truncates if the invariant is ever broken.
+                    nodes[p].litlen = u32::try_from(initial_litlen + p)
+                        .expect("optimal parser seed litlen out of u32 range");
                 }
             }
 
@@ -1657,7 +1667,9 @@ macro_rules! build_optimal_plan_impl_body {
             }
             let mut prev_max_len = min_match_len - 1;
             for candidate in candidates.iter() {
-                // `pos < frontier_limit` is the outer loop's invariant.
+                // Outer loop guards `pos <= frontier_limit` (see the
+                // `while ... pos <= frontier_limit` condition); the
+                // subtraction below is therefore safe.
                 debug_assert!(pos <= frontier_limit);
                 let max_match_len = candidate
                     .match_len
@@ -1884,9 +1896,16 @@ macro_rules! build_optimal_plan_impl_body {
             }
             store_start -= 1;
             store[store_start] = next_stretch;
-            // `litlen + mlen` are both u32 stored in `HcOptimalNode` —
-            // sum fits in usize on any supported target.
-            let step = (next_stretch.litlen as usize) + (next_stretch.mlen as usize);
+            // Parser invariant: every emitted stretch is bounded by the
+            // current block, so `litlen + mlen <= current_len <=
+            // HC_BLOCKSIZE_MAX (128 KiB)`. The `as usize` widening + raw
+            // `+` is safe on 32-bit targets — two u32 values do NOT
+            // automatically fit in `usize` on i686, the block bound is
+            // what makes this addition safe.
+            let litlen = next_stretch.litlen as usize;
+            let mlen = next_stretch.mlen as usize;
+            debug_assert!(litlen + mlen <= $current_len);
+            let step = litlen + mlen;
             if step == 0 || stretch_pos < step {
                 break;
             }
@@ -2023,9 +2042,12 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     if rep.match_len > $profile.sufficient_match_len {
                         skip_further_match_search = true;
                     }
-                    // `abs_pos + rep.match_len` is bounded by
-                    // `current_abs_end + HC_OPT_NUM` (donor caps match_len
-                    // there) — far below usize::MAX.
+                    // `for_each_repcode_candidate_with_reps` caps
+                    // `rep.match_len` at the per-call `tail_limit =
+                    // current_abs_end - abs_pos`, so `abs_pos +
+                    // rep.match_len <= current_abs_end`. The raw sum
+                    // therefore stays in `usize` on every supported
+                    // target.
                     if $abs_pos + rep.match_len >= $current_abs_end {
                         skip_further_match_search = true;
                     }
@@ -2325,7 +2347,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         $table.hash_table[hash] = stored;
         // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
-        // `min_match_len >= HC_FORMAT_MINMATCH (4)` by configure invariant,
+        // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
         // so `min_match_len - 1 >= 3` cannot underflow.
         debug_assert!($min_match_len >= 1, "min_match_len must be at least 1");
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
@@ -2368,10 +2390,13 @@ macro_rules! bt_insert_and_collect_matches_body {
                 );
                 if accepted {
                     best_len = match_len;
-                    // `match_len <= tail_limit` and `candidate_abs < abs_pos
-                    // <= current_abs_end`, so `candidate_abs + match_len` is
-                    // bounded by `current_abs_end + tail_limit < 2 *
-                    // current_abs_end` — far below usize::MAX.
+                    // BT walker invariants: `candidate_abs < abs_pos`
+                    // and `match_len <= tail_limit = current_abs_end -
+                    // abs_pos`. So `candidate_abs + match_len <
+                    // abs_pos + tail_limit = current_abs_end`, which
+                    // fits in `usize` on every supported target (32-bit
+                    // i686 included) — the addition stays within the
+                    // current block.
                     let candidate_end = candidate_abs + match_len;
                     if candidate_end > match_end_abs {
                         match_end_abs = candidate_end;

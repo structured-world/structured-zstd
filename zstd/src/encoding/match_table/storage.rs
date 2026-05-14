@@ -450,10 +450,17 @@ impl MatchTable {
     /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        // `index_shift` is always 0 today (reserved for future rebase
-        // variants); raw `+` is safe — `abs_pos + index_shift` fits in
-        // usize across all encode block sizes.
-        2 * ((abs_pos + self.index_shift) & self.bt_mask())
+        // `index_shift` is `current_len` during the btultra2 seed pass
+        // (see `run_btultra2_seed_pass`) and `0` elsewhere, so it can
+        // reach the configured block length. `abs_pos` is bounded by
+        // the same block scan that called us. Their sum is therefore
+        // bounded by ~`2 * block_size`, well below `usize::MAX` on
+        // every supported target; `checked_add` makes the invariant
+        // explicit and panics rather than wraps if it is ever violated.
+        let shifted_abs = abs_pos
+            .checked_add(self.index_shift)
+            .expect("bt_pair_index_for_abs: abs_pos + index_shift overflowed usize");
+        2 * (shifted_abs & self.bt_mask())
     }
 
     /// Decode a stored hash / chain table entry back into its absolute
