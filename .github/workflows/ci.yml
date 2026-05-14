@@ -151,6 +151,14 @@ jobs:
       # — which requires `-Z sanitizer` from nightly — gets a nightly
       # compiler inside the fuzz crate sub-build.
       RUSTUP_TOOLCHAIN: nightly
+      # Explicit target: the prebuilt `cargo-fuzz` binary installed via
+      # taiki-e/install-action is statically linked against musl and its
+      # `default_target()` probe picks `x86_64-unknown-linux-musl`,
+      # which fails because libFuzzer's AddressSanitizer cannot link
+      # against a static libc (`sanitizer is incompatible with
+      # statically linked libc`). Pinning the gnu target sidesteps the
+      # probe and matches the toolchain rustc actually has stdlib for.
+      FUZZ_TARGET_TRIPLE: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -171,7 +179,7 @@ jobs:
           target=${{ matrix.target }}
           if [ -d "artifacts/$target" ] && [ -n "$(ls artifacts/$target 2>/dev/null)" ]; then
             echo "Replaying $(ls artifacts/$target | wc -l) regression artifacts for $target"
-            cargo fuzz run "$target" artifacts/"$target"/*
+            cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" artifacts/"$target"/*
           else
             echo "No regression artifacts for $target — skipping replay"
           fi
@@ -180,7 +188,7 @@ jobs:
         # `-max_total_time` is libFuzzer's own time cap; on top of
         # the GitHub Actions timeout-minutes it gives us a hard
         # ceiling even if a target wedges in setup.
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=90 -timeout=30
+        run: cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" ${{ matrix.target }} -- -max_total_time=90 -timeout=30
       - name: Upload new crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
