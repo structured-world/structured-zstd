@@ -867,7 +867,13 @@ impl MatchTable {
         let mut pos = history_start;
         while pos < abs_pos {
             let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
-            pos += forward.max(1);
+            // `pos` is a frame-lifetime absolute cursor that can approach
+            // `usize::MAX` on long 32-bit streams. Cap the step at the
+            // remaining distance to `abs_pos` so the addition stays
+            // within `usize` even when the BT walker returns a large
+            // `forward` near the stream end.
+            let step = forward.max(1).min(abs_pos - pos);
+            pos += step;
         }
     }
 
@@ -930,7 +936,7 @@ impl MatchTable {
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward =
                 unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
-            update_abs += forward.max(1);
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -958,7 +964,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
             };
-            update_abs += forward.max(1);
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -986,7 +992,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
             };
-            update_abs += forward.max(1);
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1005,7 +1011,7 @@ impl MatchTable {
             }
             let forward =
                 self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            update_abs += forward.max(1);
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
