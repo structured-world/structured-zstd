@@ -2566,12 +2566,23 @@ macro_rules! bt_insert_and_collect_matches_body {
 pub(crate) use bt_insert_and_collect_matches_body;
 
 impl HcMatchGenerator {
-    fn should_run_btultra2_seed_pass(&self, current_len: usize) -> bool {
+    fn should_run_btultra2_seed_pass<S: super::strategy::Strategy>(
+        &self,
+        current_len: usize,
+    ) -> bool {
+        // Donor `initStats_ultra` (the seed pass) is the BtUltra2-only
+        // first-pass dynamic stats refinement. With `S` plumbed in,
+        // every non-BtUltra2 monomorphisation drops both this call
+        // and the seed-pass body at codegen time — the const below
+        // resolves to `false` for Fast / Dfast / Greedy / Lazy /
+        // BtOpt / BtUltra and short-circuits the entire predicate.
+        if !(S::OPT_LEVEL == 2 && S::USE_HASH3) {
+            return false;
+        }
         let HcBackend::Bt(bt) = &self.backend else {
             return false;
         };
-        self.is_btultra2()
-            && bt.opt_state.lit_length_sum == 0
+        bt.opt_state.lit_length_sum == 0
             && bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
             && bt.ldm_sequences.is_empty()
@@ -2807,7 +2818,7 @@ impl HcMatchGenerator {
             .bt_mut()
             .prepare_ldm_candidates(current_abs_start, current_len);
 
-        if self.should_run_btultra2_seed_pass(current_len) {
+        if self.should_run_btultra2_seed_pass::<S>(current_len) {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);
         }
 
@@ -4044,7 +4055,7 @@ fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "dictionary-seeded first block should skip btultra2 warmup pass"
     );
 }
@@ -4056,7 +4067,7 @@ fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
     hc.table.history_abs_start = 17;
     hc.table.window.push_back(b"abcdefghijklmnop".to_vec());
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 9),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 9),
         "btultra2 warmup must be first-block only (no prefix history)"
     );
 }
@@ -4066,7 +4077,7 @@ fn btultra2_seed_pass_disabled_for_tiny_block() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(BTULTRA2_HC_CONFIG, 26);
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD),
         "btultra2 warmup should not run at or below predefined threshold"
     );
 }
@@ -4077,7 +4088,7 @@ fn btultra2_seed_pass_disabled_after_stats_initialized() {
     hc.configure(BTULTRA2_HC_CONFIG, 26);
     hc.backend.bt_mut().opt_state.lit_length_sum = 1;
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup should run only for first block before stats are initialized"
     );
 }
@@ -4093,7 +4104,7 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
         .window
         .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 32]);
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup must not run after frame start"
     );
 }
@@ -4112,7 +4123,7 @@ fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
         match_length: 32,
     });
     assert!(
-        !hc.should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 32),
+        !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup must not run when LDM already produced sequences"
     );
 }
@@ -5154,7 +5165,7 @@ fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
     assert!(
         !driver
             .hc_matcher()
-            .should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+            .should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "btultra2 warmup must stay disabled after dictionary priming, even when dict content is empty"
     );
 }
@@ -5169,7 +5180,7 @@ fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     assert!(
         !driver
             .hc_matcher()
-            .should_run_btultra2_seed_pass(HC_PREDEF_THRESHOLD + 1),
+            .should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "btultra2 warmup must stay disabled after dictionary priming with content"
     );
 }
