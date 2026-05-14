@@ -269,6 +269,9 @@ jobs:
             benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
             benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
           if-no-files-found: error
+          # Intermediate inputs to `benchmark-aggregate`; match the
+          # 7-day retention used for `bench-binary-*`.
+          retention-days: 7
 
   benchmark-aggregate:
     name: Aggregate benchmark shards per target

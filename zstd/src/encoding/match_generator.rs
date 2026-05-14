@@ -195,15 +195,28 @@ const ROW_CONFIG: RowConfig = RowConfig {
     target_len: ROW_TARGET_LEN,
 };
 
-/// Resolved tuning parameters for a compression level.
+/// Resolved tuning parameters for a compression level. The
+/// [`StrategyTag`] is the single source of truth for the backend
+/// family and the compile-time strategy consts; the runtime
+/// [`BackendTag`] used by the driver dispatcher is derived via
+/// [`StrategyTag::backend`] so the two cannot drift.
 #[derive(Copy, Clone)]
 struct LevelParams {
-    backend: super::strategy::BackendTag,
+    strategy_tag: super::strategy::StrategyTag,
     window_log: u8,
     hash_fill_step: usize,
     lazy_depth: u8,
     hc: HcConfig,
     row: RowConfig,
+}
+
+impl LevelParams {
+    /// Backend family for the driver dispatcher. Always derived from
+    /// `strategy_tag` so there is no second authoritative mapping
+    /// for the `(level → backend)` decision.
+    fn backend(&self) -> super::strategy::BackendTag {
+        self.strategy_tag.backend()
+    }
 }
 
 fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
@@ -227,28 +240,28 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 const LEVEL_TABLE: [LevelParams; 22] = [
     // Lvl  Strategy       wlog  step  lazy  HC config                                   row config
     // ---  -------------- ----  ----  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { backend: super::strategy::BackendTag::Simple,    window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { backend: super::strategy::BackendTag::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 3 */ LevelParams { backend: super::strategy::BackendTag::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { backend: super::strategy::BackendTag::Row,       window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
-    /* 6 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
-    /*12 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*17 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*18 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*20 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*21 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*22 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
+    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -286,14 +299,15 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // For HC backend: also cap hash_log and chain_log so tables are
     // proportional to the source, avoiding multi-MB allocations for
     // tiny inputs.
-    if params.backend == super::strategy::BackendTag::HashChain {
+    let backend = params.backend();
+    if backend == super::strategy::BackendTag::HashChain {
         if (src_log + 2) < params.hc.hash_log as u8 {
             params.hc.hash_log = (src_log + 2) as usize;
         }
         if (src_log + 1) < params.hc.chain_log as u8 {
             params.hc.chain_log = (src_log + 1) as usize;
         }
-    } else if params.backend == super::strategy::BackendTag::Row {
+    } else if backend == super::strategy::BackendTag::Row {
         let max_window_size = 1usize << params.window_log;
         params.row.hash_bits = row_hash_bits_for_window(max_window_size);
     }
@@ -327,7 +341,7 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
         hc.chain_log = hc.chain_log.min(adjusted_table_log);
     }
     LevelParams {
-        backend: super::strategy::BackendTag::HashChain,
+        strategy_tag: super::strategy::StrategyTag::BtUltra2,
         window_log,
         hash_fill_step: 1,
         lazy_depth: 2,
@@ -344,7 +358,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     }
     let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
-            backend: super::strategy::BackendTag::Simple,
+            strategy_tag: super::strategy::StrategyTag::Fast,
             window_log: 17,
             hash_fill_step: 1,
             lazy_depth: 0,
@@ -370,7 +384,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                     (n.saturating_abs() as usize).min((-CompressionLevel::MIN_LEVEL) as usize);
                 let step = (acceleration + 3).min(128);
                 LevelParams {
-                    backend: super::strategy::BackendTag::Simple,
+                    strategy_tag: super::strategy::StrategyTag::Fast,
                     window_log: 17,
                     hash_fill_step: step,
                     lazy_depth: 0,
@@ -594,9 +608,10 @@ impl Matcher for MatchGeneratorDriver {
         let hint = self.source_size_hint.take();
         let hinted = hint.is_some();
         let params = Self::level_params(level, hint);
+        let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
-        if self.active_backend != params.backend {
+        if self.active_backend != next_backend {
             match self.active_backend {
                 super::strategy::BackendTag::Simple => {
                     let vec_pool = &mut self.vec_pool;
@@ -652,22 +667,13 @@ impl Matcher for MatchGeneratorDriver {
             }
         }
 
-        self.active_backend = params.backend;
-        self.strategy_tag = super::strategy::StrategyTag::for_compression_level(level);
-        // Lock-step invariant: the compile-time strategy tag's backend
-        // must agree with the runtime `BackendTag` chosen by
-        // `resolve_level_params`. This is what lets future commits
-        // dispatch on `self.strategy_tag` and trust the existing
-        // backend storage / setup paths unchanged.
-        // Once `MatcherBackend` was replaced by `BackendTag` the two
-        // values share a type, so the lock-step invariant collapses
-        // to a direct equality between the strategy-derived backend
-        // and the runtime backend selected by `resolve_level_params`.
-        debug_assert_eq!(
-            self.strategy_tag.backend(),
-            self.active_backend,
-            "strategy_tag backend drift vs active_backend after reset()",
-        );
+        // Single source of truth: `LevelParams::strategy_tag` is the
+        // authoritative mapping from `CompressionLevel` to strategy.
+        // Both runtime fields are derived from it — no separate
+        // `for_compression_level` recomputation that could drift
+        // against `LEVEL_TABLE`.
+        self.strategy_tag = params.strategy_tag;
+        self.active_backend = next_backend;
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         match self.active_backend {
@@ -3242,14 +3248,11 @@ impl HcMatchGenerator {
     ) {
         use super::strategy::{self, StrategyTag};
         self.table.ensure_tables();
-        // Dispatch on the mirrored `strategy_tag` (set by
-        // `configure()`); each BT-using strategy reaches its own
-        // monomorphisation. Tests that wire up `table.hash3_log`
-        // without calling `configure()` keep the legacy fallback —
-        // if `hash3_log != 0` while the tag is non-BT-ultra2, route
-        // through `BtUltra2` so the hash3 const-gate inside the
-        // body still fires.
-        let has_hash3 = self.table.hash3_log != 0;
+        // Dispatch purely from `self.strategy_tag` (set by
+        // `configure()`). Tests must configure the matcher the same
+        // way production does — wiring up `table.hash3_log` directly
+        // without setting a matching `strategy_tag` is no longer
+        // allowed.
         match self.strategy_tag {
             StrategyTag::BtUltra2 => self
                 .collect_optimal_candidates_initialized::<strategy::BtUltra2, true>(
@@ -3275,21 +3278,6 @@ impl HcMatchGenerator {
                     query,
                     out,
                 ),
-            StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy
-                if has_hash3 =>
-            {
-                // Legacy artificial-fixture path: tests that wired
-                // up `table.hash3_log` directly (without
-                // `configure()`) rely on the hash3 lookup running
-                // even when no BT strategy is configured.
-                self.collect_optimal_candidates_initialized::<strategy::BtUltra2, false>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    out,
-                )
-            }
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
                 self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
                     abs_pos,
@@ -3752,8 +3740,8 @@ fn level_16_17_map_to_btopt_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
     let p16 = resolve_level_params(CompressionLevel::Level(16), None);
     let p17 = resolve_level_params(CompressionLevel::Level(17), None);
-    assert_eq!(p16.backend, BackendTag::HashChain);
-    assert_eq!(p17.backend, BackendTag::HashChain);
+    assert_eq!(p16.backend(), BackendTag::HashChain);
+    assert_eq!(p17.backend(), BackendTag::HashChain);
     assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
     assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
 }
@@ -3763,8 +3751,8 @@ fn level_18_19_map_to_btultra_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
     let p18 = resolve_level_params(CompressionLevel::Level(18), None);
     let p19 = resolve_level_params(CompressionLevel::Level(19), None);
-    assert_eq!(p18.backend, BackendTag::HashChain);
-    assert_eq!(p19.backend, BackendTag::HashChain);
+    assert_eq!(p18.backend(), BackendTag::HashChain);
+    assert_eq!(p19.backend(), BackendTag::HashChain);
     assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
     assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
 }
@@ -3774,7 +3762,7 @@ fn level_20_22_map_to_btultra2_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
     for level in 20..=22 {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
-        assert_eq!(params.backend, BackendTag::HashChain);
+        assert_eq!(params.backend(), BackendTag::HashChain);
         assert_eq!(StrategyTag::for_level(level as u8), StrategyTag::BtUltra2);
     }
 }
@@ -4511,127 +4499,17 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     );
 }
 
-#[test]
-fn hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero() {
-    let mut hc = HcMatchGenerator::new(256);
-    hc.table.history = b"abcde1234abcdeZZZZ".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 0;
-    let abs_pos = 9usize; // second "abcde"
-    hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
-    // Donor hash3 has an independent nextToUpdate3 cursor; main-table
-    // insertion does not imply the HC3 side table has been filled.
-    hc.table.next_to_update3 = 0;
-
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
-    let mut out = Vec::new();
-    hc.collect_optimal_candidates(
-        abs_pos,
-        hc.table.history.len(),
-        profile,
-        HcCandidateQuery {
-            reps: [1, 2, 3],
-            lit_len: 1,
-            ldm_candidate: None,
-        },
-        &mut out,
-    );
-
-    assert!(
-        out.iter()
-            .any(|candidate| candidate.offset == 9 && candidate.match_len >= HC_MIN_MATCH_LEN),
-        "hash3 candidate should supply at least one valid match when chain search is disabled"
-    );
-}
-
-#[test]
-fn hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions() {
-    let mut hc = HcMatchGenerator::new(256);
-    hc.table.history = b"abcdeZabcdeYY".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 0;
-    hc.table.ensure_tables();
-    // Simulate donor-like nextToUpdate3 path: no explicit hash/chain insertions
-    // were done for prefix positions, so hash3 must fill them on demand.
-    hc.table.next_to_update3 = 0;
-
-    let abs_pos = 6usize; // second "abcde"
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
-    let mut out = Vec::new();
-    hc.collect_optimal_candidates(
-        abs_pos,
-        hc.table.history.len(),
-        profile,
-        HcCandidateQuery {
-            reps: [1, 2, 3],
-            lit_len: 1,
-            ldm_candidate: None,
-        },
-        &mut out,
-    );
-
-    assert!(
-        out.iter()
-            .any(|candidate| candidate.offset == 6 && candidate.match_len >= HC_MIN_MATCH_LEN),
-        "hash3 incremental update should surface prefix match even without explicit insert_positions"
-    );
-}
-
-#[test]
-fn hc_hash3_tail_match_advances_update_cursor_on_early_return() {
-    let mut hc = HcMatchGenerator::new(256);
-    hc.table.history = b"abcdeZabcde".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 0;
-    hc.table.ensure_tables();
-    hc.table.next_to_update3 = 0;
-
-    let abs_pos = 6usize; // second "abcde", match reaches current end
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
-    let mut out = Vec::new();
-    hc.collect_optimal_candidates(
-        abs_pos,
-        hc.table.history.len(),
-        profile,
-        HcCandidateQuery {
-            reps: [1, 2, 3],
-            lit_len: 1,
-            ldm_candidate: None,
-        },
-        &mut out,
-    );
-
-    assert!(
-        hc.table.next_to_update3 >= abs_pos,
-        "tail-reaching hash3 lookup should fill the update cursor to current position"
-    );
-    assert!(
-        hc.table.skip_insert_until_abs > abs_pos,
-        "tail-reaching hash3 early return should request skipping current-position hash insertion"
-    );
-}
+// Removed: the three `hc_collect_optimal_candidates_*_hash3_*` /
+// `hc_hash3_tail_match_*` tests forced `search_depth = 0` together
+// with `hash3_log != 0`, an HC-chain-walker-only fixture state that
+// production never reaches (hash3 is BtUltra2-only and BtUltra2 always
+// runs `search_depth = 512`). They depended on the `has_hash3 =>
+// BtUltra2` escape hatch in the test dispatcher; with that hatch gone
+// (CR review on PR #123) and the dispatcher routing purely from
+// `self.strategy_tag`, there is no production-shaped configuration
+// that reproduces what those tests asserted. The corresponding hash3
+// invariants are exercised end-to-end by the existing level22 roundtrip
+// + donor-parity ratio gate.
 
 #[test]
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
