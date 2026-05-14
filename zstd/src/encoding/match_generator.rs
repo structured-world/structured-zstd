@@ -971,15 +971,24 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        match self.active_backend {
-            MatcherBackend::Simple => {
-                while self.match_generator.next_sequence(&mut handle_sequence) {}
+        use super::strategy::{self, StrategyTag};
+        // 7-arm match over the compile-time strategy tag fires once
+        // per block and hands off to a monomorphised
+        // `compress_block::<S>` that the optimiser specialises per
+        // strategy. Future commits will replace runtime `match
+        // self.parse_mode` branches inside the inner loops with
+        // `if S::USE_BT` / `if S::USE_HASH3` so each monomorphisation
+        // drops the dead paths at codegen time.
+        match self.strategy_tag {
+            StrategyTag::Fast => self.compress_block::<strategy::Fast>(&mut handle_sequence),
+            StrategyTag::Dfast => self.compress_block::<strategy::Dfast>(&mut handle_sequence),
+            StrategyTag::Greedy => self.compress_block::<strategy::Greedy>(&mut handle_sequence),
+            StrategyTag::Lazy => self.compress_block::<strategy::Lazy>(&mut handle_sequence),
+            StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
+            StrategyTag::BtUltra => self.compress_block::<strategy::BtUltra>(&mut handle_sequence),
+            StrategyTag::BtUltra2 => {
+                self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
             }
-            MatcherBackend::Dfast => self
-                .dfast_matcher_mut()
-                .start_matching(&mut handle_sequence),
-            MatcherBackend::Row => self.row_matcher_mut().start_matching(&mut handle_sequence),
-            MatcherBackend::HashChain => self.hc_matcher_mut().start_matching(&mut handle_sequence),
         }
     }
 
@@ -997,6 +1006,33 @@ impl Matcher for MatchGeneratorDriver {
                 .row_matcher_mut()
                 .skip_matching_with_hint(incompressible_hint),
             MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(incompressible_hint),
+        }
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// Monomorphised per-block encoder entry point. Each call from
+    /// [`Matcher::start_matching`] picks one concrete `S: Strategy` via
+    /// the [`super::strategy::StrategyTag`] resolved at `reset()`, so
+    /// the optimiser compiles a separate copy of this body per
+    /// strategy with `S::USE_BT` / `S::USE_HASH3` / `S::ACCURATE_PRICE`
+    /// inlined as compile-time constants. The backend dispatch below
+    /// is a `match S::BACKEND` over an associated `const`, so the
+    /// compiler keeps exactly one arm per monomorphisation.
+    fn compress_block<S: super::strategy::Strategy>(
+        &mut self,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        use super::strategy::BackendTag;
+        match S::BACKEND {
+            BackendTag::Simple => {
+                while self.match_generator.next_sequence(&mut *handle_sequence) {}
+            }
+            BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
+            BackendTag::Row => self.row_matcher_mut().start_matching(handle_sequence),
+            BackendTag::HashChain => self
+                .hc_matcher_mut()
+                .start_matching_strategy::<S>(handle_sequence),
         }
     }
 }
@@ -2608,6 +2644,27 @@ impl HcMatchGenerator {
                 self.start_matching_optimal(&mut handle_sequence)
             }
         }
+    }
+
+    /// Strategy-aware entry point used by
+    /// [`MatchGeneratorDriver::compress_block`]. The next commit
+    /// replaces the inner `match self.parse_mode` with an `if
+    /// S::USE_BT` so each monomorphisation keeps only the lazy or the
+    /// optimal arm. Today it just delegates — the
+    /// `debug_assert_eq!` enforces that `self.parse_mode` (set by
+    /// `configure`) and `S::PARSE_MODE` agree on every call so the
+    /// bridge cannot silently drift while we migrate the inner
+    /// loops.
+    pub(crate) fn start_matching_strategy<S: super::strategy::Strategy>(
+        &mut self,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        debug_assert_eq!(
+            self.parse_mode,
+            S::PARSE_MODE,
+            "Strategy::PARSE_MODE disagrees with runtime parse_mode at HC dispatch"
+        );
+        self.start_matching(handle_sequence)
     }
 
     fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
