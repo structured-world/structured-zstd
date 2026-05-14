@@ -208,21 +208,26 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
-        // Loop invariants (two distinct bounds):
+        // Loop invariants:
         //
         // 1. Block-local arithmetic (`pos`, `skip_step`, `start +
         //    candidate.match_len`, `DFAST_SKIP_STEP_GROWTH_INTERVAL`):
         //    bounded by `current_len <= HC_BLOCKSIZE_MAX (128 KiB)`.
         //    The `while pos + DFAST_MIN_MATCH_LEN <= current_len`
         //    guard keeps every offset well within that bound.
-        // 2. Absolute-position arithmetic (`current_abs_start + pos`,
-        //    `current_abs_start + ip2`): `current_abs_start` is the
-        //    frame-lifetime cursor at the start of the current block.
-        //    The frame compressor's total processed bytes cannot
-        //    exceed the host's `usize` (we'd need that much RAM to
-        //    hold history), so `current_abs_start + pos <= usize::MAX`
-        //    is structurally guaranteed across all supported targets,
-        //    i686 included.
+        // 2. Absolute-position arithmetic (`current_abs_start + pos`):
+        //    `current_abs_start` is the frame-lifetime cursor and
+        //    advances with total bytes processed, NOT with the
+        //    retained window size. A long streaming encode on i686
+        //    can therefore push `current_abs_start + pos` past
+        //    `usize::MAX` even though memory usage stays bounded by
+        //    `window_size`. This loop assumes the caller respects the
+        //    documented `usize::MAX` total-input cap (enforced at
+        //    the frame compressor boundary); raw `+` here is
+        //    deliberate donor parity but DOES depend on that
+        //    upstream guard. New raw arithmetic on absolute cursors
+        //    should preserve that contract or switch to
+        //    `saturating_add` like the BT macros do.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
@@ -287,12 +292,15 @@ impl DfastMatchGenerator {
         //    offset well within that bound.
         // 2. Absolute-position arithmetic (`current_abs_start + ip0`,
         //    `current_abs_start + ip2`, etc.): `current_abs_start` is
-        //    the frame-lifetime cursor at the start of the current
-        //    block. The frame compressor's total processed bytes
-        //    cannot exceed the host's `usize` (we'd need that much
-        //    RAM to hold history), so `current_abs_start + ipN <=
-        //    usize::MAX` is structurally guaranteed across all
-        //    supported targets, i686 included.
+        //    the frame-lifetime cursor and advances with total bytes
+        //    processed, NOT with the retained window size. A long
+        //    streaming encode on i686 can push `current_abs_start +
+        //    ipN` past `usize::MAX` even though memory stays bounded
+        //    by `window_size`. This loop assumes the caller respects
+        //    the documented `usize::MAX` total-input cap enforced at
+        //    the frame compressor boundary; new raw arithmetic on
+        //    absolute cursors should either preserve that contract
+        //    or switch to `saturating_add` like the BT macros do.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
             let ip1 = ip0 + 1;
