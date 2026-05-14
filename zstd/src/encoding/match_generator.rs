@@ -1264,6 +1264,7 @@ pub(crate) use bt_insert_step_no_rebase_body;
 macro_rules! build_optimal_plan_impl_body {
     (
         $self:expr,
+        $strategy_ty:ty,
         $current:ident,
         $current_abs_start:ident,
         $current_len:ident,
@@ -1280,11 +1281,24 @@ macro_rules! build_optimal_plan_impl_body {
         let initial_litlen = $initial_state.litlen;
         let mut profile = $initial_state.profile;
         profile.sufficient_match_len = $self.hc.sufficient_match_len_for_pass(profile);
-        let abort_on_worse_match = $self.parse_mode == HcParseMode::BtOpt;
-        let opt_level = matches!(
-            $self.parse_mode,
-            HcParseMode::BtUltra | HcParseMode::BtUltra2
+        // Const-fold from the strategy's associated `OPT_LEVEL`
+        // (donor `optLevel`): BtOpt = 0, BtUltra / BtUltra2 = 2.
+        // The two flags below are the only places the inner DP loop
+        // used to consult `parse_mode`; lifting them into const
+        // expressions drops one indirect read + one branch on every
+        // candidate insertion and every traceback step.
+        // `let` (not `const`) — nested `const` items inside a
+        // generic fn cannot project through the outer fn's type
+        // parameter, but a `let` binding from a const expression
+        // does get folded by the optimiser per monomorphisation,
+        // which is what we actually want here.
+        debug_assert!(
+            <$strategy_ty as super::strategy::Strategy>::USE_BT,
+            "build_optimal_plan_impl_body called on non-BT strategy"
         );
+        let abort_on_worse_match: bool =
+            <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL == 0;
+        let opt_level: bool = <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL >= 2;
         let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
         // `frontier_limit + 2 <= HC_OPT_NUM + 1` — bounded by const.
         let frontier_buffer_size = frontier_limit + 2;
@@ -2645,10 +2659,17 @@ impl HcMatchGenerator {
     /// final cleanup commit.
     #[cfg(test)]
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        use super::strategy;
         match self.parse_mode {
             HcParseMode::Lazy2 => self.start_matching_lazy(&mut handle_sequence),
-            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2 => {
-                self.start_matching_optimal(&mut handle_sequence)
+            HcParseMode::BtOpt => {
+                self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
+            }
+            HcParseMode::BtUltra => {
+                self.start_matching_optimal::<strategy::BtUltra>(&mut handle_sequence)
+            }
+            HcParseMode::BtUltra2 => {
+                self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
             }
         }
     }
@@ -2674,7 +2695,7 @@ impl HcMatchGenerator {
             "Strategy::PARSE_MODE disagrees with runtime parse_mode at HC dispatch"
         );
         if S::USE_BT {
-            self.start_matching_optimal(handle_sequence)
+            self.start_matching_optimal::<S>(handle_sequence)
         } else {
             self.start_matching_lazy(handle_sequence)
         }
@@ -2739,7 +2760,10 @@ impl HcMatchGenerator {
         }
     }
 
-    fn start_matching_optimal(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching_optimal<S: super::strategy::Strategy>(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
         self.table.ensure_tables();
         let current_len = self.table.window.back().unwrap().len();
         if current_len == 0 {
@@ -2791,7 +2815,7 @@ impl HcMatchGenerator {
             let remaining_len = current_len - cursor;
             let segment_abs_start = current_abs_start + cursor;
             let segment_start = best_plan.len();
-            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan(
+            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan::<S>(
                 &current[cursor..],
                 segment_abs_start,
                 remaining_len,
@@ -2830,6 +2854,9 @@ impl HcMatchGenerator {
         current_abs_start: usize,
         current_len: usize,
     ) {
+        // The seed pass is BtUltra2-exclusive by name (`is_btultra2()`
+        // gates the only call site), so pin S to BtUltra2 here.
+        type S = super::strategy::BtUltra2;
         let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
@@ -2846,7 +2873,7 @@ impl HcMatchGenerator {
             let remaining_len = current_len - cursor;
             let segment_abs_start = current_abs_start + cursor;
             let segment_start = seed_plan.len();
-            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan(
+            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan::<S>(
                 &current[cursor..],
                 segment_abs_start,
                 remaining_len,
@@ -2890,7 +2917,7 @@ impl HcMatchGenerator {
         self.table.allow_zero_relative_position = true;
     }
 
-    fn build_optimal_plan(
+    fn build_optimal_plan<S: super::strategy::Strategy>(
         &mut self,
         current: &[u8],
         current_abs_start: usize,
@@ -2899,9 +2926,21 @@ impl HcMatchGenerator {
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
     ) -> (u32, [u32; 3], usize, usize) {
+        debug_assert!(S::USE_BT, "build_optimal_plan called on non-BT strategy");
+        debug_assert_eq!(initial_state.profile.accurate, S::ACCURATE_PRICE);
+        debug_assert_eq!(
+            initial_state.profile.favor_small_offsets,
+            S::FAVOR_SMALL_OFFSETS
+        );
+        // `S::ACCURATE_PRICE` / `S::FAVOR_SMALL_OFFSETS` cannot appear
+        // as const-generic arguments yet (`generic_const_exprs` is
+        // still unstable), so we keep the 4-arm runtime dispatch here.
+        // Each S monomorphisation only reaches one arm in practice
+        // (BtOpt → false/true, BtUltra/BtUltra2 → true/false), so the
+        // optimiser folds away the others.
         let profile = initial_state.profile;
         match (profile.accurate, profile.favor_small_offsets) {
-            (true, false) => self.build_optimal_plan_impl::<true, false>(
+            (true, false) => self.build_optimal_plan_impl::<S, true, false>(
                 current,
                 current_abs_start,
                 current_len,
@@ -2909,7 +2948,7 @@ impl HcMatchGenerator {
                 stats,
                 out,
             ),
-            (true, true) => self.build_optimal_plan_impl::<true, true>(
+            (true, true) => self.build_optimal_plan_impl::<S, true, true>(
                 current,
                 current_abs_start,
                 current_len,
@@ -2917,7 +2956,7 @@ impl HcMatchGenerator {
                 stats,
                 out,
             ),
-            (false, false) => self.build_optimal_plan_impl::<false, false>(
+            (false, false) => self.build_optimal_plan_impl::<S, false, false>(
                 current,
                 current_abs_start,
                 current_len,
@@ -2925,7 +2964,7 @@ impl HcMatchGenerator {
                 stats,
                 out,
             ),
-            (false, true) => self.build_optimal_plan_impl::<false, true>(
+            (false, true) => self.build_optimal_plan_impl::<S, false, true>(
                 current,
                 current_abs_start,
                 current_len,
@@ -2945,7 +2984,11 @@ impl HcMatchGenerator {
     /// one straight-line inline chain from DP body down through BT walk
     /// and match-length probes.
     #[inline(always)]
-    fn build_optimal_plan_impl<const ACCURATE_PRICE: bool, const FAVOR_SMALL_OFFSETS: bool>(
+    fn build_optimal_plan_impl<
+        S: super::strategy::Strategy,
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
         &mut self,
         current: &[u8],
         current_abs_start: usize,
@@ -2956,7 +2999,7 @@ impl HcMatchGenerator {
     ) -> (u32, [u32; 3], usize, usize) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
-            self.build_optimal_plan_impl_neon::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+            self.build_optimal_plan_impl_neon::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
                 current,
                 current_abs_start,
                 current_len,
@@ -2970,7 +3013,7 @@ impl HcMatchGenerator {
             use crate::encoding::fastpath::{FastpathKernel, select_kernel};
             match select_kernel() {
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.build_optimal_plan_impl_avx2_bmi2::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                    self.build_optimal_plan_impl_avx2_bmi2::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
                         current,
                         current_abs_start,
                         current_len,
@@ -2980,7 +3023,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Sse42 => unsafe {
-                    self.build_optimal_plan_impl_sse42::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                    self.build_optimal_plan_impl_sse42::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
                         current,
                         current_abs_start,
                         current_len,
@@ -2990,7 +3033,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Scalar => self
-                    .build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                    .build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
                         current,
                         current_abs_start,
                         current_len,
@@ -3006,7 +3049,7 @@ impl HcMatchGenerator {
             target_arch = "x86_64"
         )))]
         {
-            self.build_optimal_plan_impl_scalar::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+            self.build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
                 current,
                 current_abs_start,
                 current_len,
@@ -3023,6 +3066,7 @@ impl HcMatchGenerator {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
     unsafe fn build_optimal_plan_impl_neon<
+        S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
     >(
@@ -3036,6 +3080,7 @@ impl HcMatchGenerator {
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
+            S,
             current,
             current_abs_start,
             current_len,
@@ -3049,6 +3094,7 @@ impl HcMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
     unsafe fn build_optimal_plan_impl_sse42<
+        S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
     >(
@@ -3062,6 +3108,7 @@ impl HcMatchGenerator {
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
+            S,
             current,
             current_abs_start,
             current_len,
@@ -3075,6 +3122,7 @@ impl HcMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn build_optimal_plan_impl_avx2_bmi2<
+        S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
     >(
@@ -3088,6 +3136,7 @@ impl HcMatchGenerator {
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
+            S,
             current,
             current_abs_start,
             current_len,
@@ -3104,6 +3153,7 @@ impl HcMatchGenerator {
     // through safe fns, so those blocks are redundant on this path.
     #[allow(unused_unsafe)]
     fn build_optimal_plan_impl_scalar<
+        S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
     >(
@@ -3117,6 +3167,7 @@ impl HcMatchGenerator {
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
+            S,
             current,
             current_abs_start,
             current_len,
