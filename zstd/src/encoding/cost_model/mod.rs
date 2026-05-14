@@ -466,6 +466,21 @@ impl HcOptimalCostProfile {
         }
     }
 
+    /// Const-generic peer of [`for_mode`]. Every field is read from
+    /// the strategy's associated consts, so the optimiser builds the
+    /// `HcOptimalCostProfile` literal at codegen time without a
+    /// runtime match. Hot-path callers from
+    /// `start_matching_optimal::<S>` should prefer this.
+    #[inline]
+    pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
+        Self {
+            max_chain_depth: S::MAX_CHAIN_DEPTH,
+            sufficient_match_len: S::SUFFICIENT_MATCH_LEN,
+            accurate: S::ACCURATE_PRICE,
+            favor_small_offsets: S::FAVOR_SMALL_OFFSETS,
+        }
+    }
+
     pub(crate) fn literal_price(&self, stats: &HcOptState, byte: u8) -> u32 {
         if !stats.literals_compressed() {
             return 8 * HC_BITCOST_MULTIPLIER;

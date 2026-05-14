@@ -2822,12 +2822,13 @@ impl HcMatchGenerator {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);
         }
 
-        let profile = if self.is_btultra2() {
-            // Donor btultra2 runs one accurate opt pass after initStats_ultra.
-            HcOptimalCostProfile::for_mode(self.parse_mode, true)
-        } else {
-            HcOptimalCostProfile::for_mode(self.parse_mode, false)
-        };
+        // Const-generic profile selection: every field is folded from
+        // S's associated consts (MAX_CHAIN_DEPTH /
+        // SUFFICIENT_MATCH_LEN / ACCURATE_PRICE / FAVOR_SMALL_OFFSETS),
+        // so the optimiser produces the literal at codegen time
+        // without a runtime match. Replaces the old
+        // `for_mode(self.parse_mode, self.is_btultra2())` pair.
+        let profile = HcOptimalCostProfile::const_for_strategy::<S>();
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, profile);
@@ -3467,15 +3468,6 @@ impl HcMatchGenerator {
             hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
         )
-    }
-
-    /// Stage D: mirrored onto [`MatchTable::is_btultra2`] during
-    /// `configure()`, so every former site that read `self.parse_mode`
-    /// now consults the table flag instead. Kept as a thin accessor on
-    /// `HcMatchGenerator` for call sites that haven't migrated yet.
-    #[inline]
-    fn is_btultra2(&self) -> bool {
-        self.table.is_btultra2
     }
 }
 

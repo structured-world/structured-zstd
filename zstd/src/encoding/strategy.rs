@@ -87,6 +87,17 @@ pub(crate) trait Strategy: Copy + 'static {
     /// transitional bridge between `Strategy` and the runtime
     /// [`HcParseMode`] enum stays cheap to write.
     const PARSE_MODE: HcParseMode;
+
+    /// Donor `max_chain_depth` for the optimal-parser cost profile.
+    /// Mirrors `HcOptimalCostProfile::for_mode` row-for-row so the
+    /// per-block profile selection becomes a compile-time
+    /// `HcOptimalCostProfile::const_for_strategy::<S>()` call.
+    const MAX_CHAIN_DEPTH: usize;
+
+    /// Donor `sufficient_match_len` — the BT walker bails out as soon
+    /// as a candidate at or above this length is seen.
+    /// `usize::MAX` means "never bail early".
+    const SUFFICIENT_MATCH_LEN: usize;
 }
 
 /// Level 1 — donor `ZSTD_fast`. Single-table Simple matcher.
@@ -104,6 +115,10 @@ impl Strategy for Fast {
     // Simple backend does not actually consult parse_mode; pick the
     // narrowest variant for the bridge.
     const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
+    // Optimal-parser consts are unreachable for Simple/Dfast/Greedy —
+    // pin them to the Lazy2 row so the trait stays total.
+    const MAX_CHAIN_DEPTH: usize = 8;
+    const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
 /// Levels 2-3 — donor `ZSTD_dfast`. Two parallel hash chains.
@@ -119,6 +134,8 @@ impl Strategy for Dfast {
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
     const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
+    const MAX_CHAIN_DEPTH: usize = 8;
+    const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
 /// Level 4 — donor `ZSTD_greedy` with row hashing.
@@ -134,6 +151,8 @@ impl Strategy for Greedy {
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
     const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
+    const MAX_CHAIN_DEPTH: usize = 8;
+    const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
 /// Levels 5-15 — donor `ZSTD_lazy2` on a hash chain. Differ from each
@@ -152,6 +171,8 @@ impl Strategy for Lazy {
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
     const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
+    const MAX_CHAIN_DEPTH: usize = 8;
+    const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
 /// Levels 16-17 — donor `ZSTD_btopt`. BT + opt without the ultra
@@ -168,6 +189,8 @@ impl Strategy for BtOpt {
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 0;
     const PARSE_MODE: HcParseMode = HcParseMode::BtOpt;
+    const MAX_CHAIN_DEPTH: usize = 32;
+    const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
 /// Levels 18-19 — donor `ZSTD_btultra`. BT + opt with refined price
@@ -184,6 +207,8 @@ impl Strategy for BtUltra {
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
     const PARSE_MODE: HcParseMode = HcParseMode::BtUltra;
+    const MAX_CHAIN_DEPTH: usize = 32;
+    const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
 /// Levels 20-22 — donor `ZSTD_btultra2`. BT + opt with the two-pass
@@ -200,6 +225,8 @@ impl Strategy for BtUltra2 {
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
     const PARSE_MODE: HcParseMode = HcParseMode::BtUltra2;
+    const MAX_CHAIN_DEPTH: usize = 512;
+    const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
 /// Compile-time strategy tag for the per-level dispatcher. Each
