@@ -190,6 +190,54 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  bench-matrix:
+    # Canonical bench target inventory. Every downstream bench job
+    # (`bench-build`, `benchmark`, `benchmark-aggregate`,
+    # `benchmark-pages`) consumes this so a new target ID is added
+    # in exactly one place. `build_setup` runs only on `bench-build`;
+    # `runtime_setup` runs only on the bench shards (e.g. `i686-gnu`
+    # needs gcc-multilib's 32-bit loader at runtime, while `x86_64-musl`
+    # only needs `musl-tools` for the build).
+    name: Resolve bench target matrix
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set.outputs.targets }}
+      ids_csv: ${{ steps.set.outputs.ids_csv }}
+    steps:
+      - id: set
+        run: |
+          cat > targets.json <<'EOF'
+          [
+            {
+              "id": "x86_64-gnu",
+              "target_triple": "x86_64-unknown-linux-gnu",
+              "build_setup": "",
+              "runtime_setup": "",
+              "timeout_minutes": 25
+            },
+            {
+              "id": "i686-gnu",
+              "target_triple": "i686-unknown-linux-gnu",
+              "build_setup": "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386",
+              "runtime_setup": "sudo apt-get update && sudo apt-get install -y libc6-dev-i386",
+              "timeout_minutes": 30
+            },
+            {
+              "id": "x86_64-musl",
+              "target_triple": "x86_64-unknown-linux-musl",
+              "build_setup": "sudo apt-get update && sudo apt-get install -y musl-tools",
+              "runtime_setup": "",
+              "timeout_minutes": 25
+            }
+          ]
+          EOF
+          targets_compact=$(jq -c . targets.json)
+          ids_csv=$(jq -r '[.[].id] | join(",")' targets.json)
+          echo "targets=$targets_compact" >> "$GITHUB_OUTPUT"
+          echo "ids_csv=$ids_csv" >> "$GITHUB_OUTPUT"
+          echo "Bench targets: $ids_csv"
+
   bench-build:
     # Build the criterion `compare_ffi` binary once per target. Every
     # downstream bench shard (target × level) downloads the binary
@@ -197,30 +245,21 @@ jobs:
     # rebuild per shard. Saves ~4-7 min on each of the 18 shard
     # runners.
     name: Build bench binary (${{ matrix.bench.id }})
-    needs: lint
+    needs: [lint, bench-matrix]
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        bench:
-          - id: x86_64-gnu
-            target_triple: x86_64-unknown-linux-gnu
-            setup_command: ""
-          - id: i686-gnu
-            target_triple: i686-unknown-linux-gnu
-            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
-          - id: x86_64-musl
-            target_triple: x86_64-unknown-linux-musl
-            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
+        bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install benchmark target
         run: rustup target add ${{ matrix.bench.target_triple }}
-      - name: Install target toolchain dependencies
-        if: matrix.bench.setup_command != ''
-        run: ${{ matrix.bench.setup_command }}
+      - name: Install build toolchain dependencies
+        if: matrix.bench.build_setup != ''
+        run: ${{ matrix.bench.build_setup }}
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: bench-${{ matrix.bench.id }}
@@ -254,7 +293,7 @@ jobs:
 
   benchmark:
     name: Bench ${{ matrix.bench.id }} / ${{ matrix.level }}
-    needs: bench-build
+    needs: [bench-build, bench-matrix]
     timeout-minutes: ${{ matrix.bench.timeout_minutes }}
     strategy:
       # Matrix split target × level. The pre-built binary from
@@ -265,19 +304,7 @@ jobs:
       # finishes well under 10 min.
       fail-fast: false
       matrix:
-        bench:
-          - id: x86_64-gnu
-            target_triple: x86_64-unknown-linux-gnu
-            timeout_minutes: 25
-            setup_command: ""
-          - id: i686-gnu
-            target_triple: i686-unknown-linux-gnu
-            timeout_minutes: 30
-            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
-          - id: x86_64-musl
-            target_triple: x86_64-unknown-linux-musl
-            timeout_minutes: 25
-            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
+        bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
         level:
           - fastest
           - default
@@ -293,8 +320,8 @@ jobs:
         # the python post-processor.
 
       - name: Install target runtime dependencies
-        if: matrix.bench.setup_command != ''
-        run: ${{ matrix.bench.setup_command }}
+        if: matrix.bench.runtime_setup != ''
+        run: ${{ matrix.bench.runtime_setup }}
 
       - name: Download pre-built bench binary
         uses: actions/download-artifact@v4
@@ -339,7 +366,7 @@ jobs:
 
   benchmark-aggregate:
     name: Aggregate benchmark shards per target
-    needs: benchmark
+    needs: [benchmark, bench-matrix]
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
@@ -361,40 +388,25 @@ jobs:
 
       - name: Aggregate level shards into per-target files
         env:
-          AGGREGATE_TARGETS: x86_64-gnu,i686-gnu,x86_64-musl
+          AGGREGATE_TARGETS: ${{ needs.bench-matrix.outputs.ids_csv }}
         run: python3 .github/scripts/aggregate-bench-levels.py
 
-      - name: Upload per-target consolidated artifacts
+      - name: Upload aggregated benchmark artifact
+        # Single combined artifact carrying per-target consolidated
+        # files. `merge-benchmarks.py` rglob's the download root so
+        # it picks them up regardless of subdir layout; this lets
+        # bench-pages download one artifact instead of one per target.
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-x86_64-gnu
+          name: benchmark-aggregated
           path: |
-            benchmark-results.x86_64-gnu.json
-            benchmark-report.x86_64-gnu.md
-            benchmark-delta.x86_64-gnu.json
-            benchmark-delta.x86_64-gnu.md
-            benchmark-relative.x86_64-gnu.json
+            benchmark-results.*.json
+            benchmark-report.*.md
+            benchmark-delta.*.json
+            benchmark-delta.*.md
+            benchmark-relative.*.json
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-i686-gnu
-          path: |
-            benchmark-results.i686-gnu.json
-            benchmark-report.i686-gnu.md
-            benchmark-delta.i686-gnu.json
-            benchmark-delta.i686-gnu.md
-            benchmark-relative.i686-gnu.json
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-x86_64-musl
-          path: |
-            benchmark-results.x86_64-musl.json
-            benchmark-report.x86_64-musl.md
-            benchmark-delta.x86_64-musl.json
-            benchmark-delta.x86_64-musl.md
-            benchmark-relative.x86_64-musl.json
-          if-no-files-found: error
+          retention-days: 7
 
       - name: Store benchmark results (x86_64-gnu only)
         if: steps.bot-token.outputs.token != ''
@@ -438,25 +450,16 @@ jobs:
           token: ${{ steps.bot-token.outputs.token }}
           path: gh-pages
 
-      # Only the aggregated per-target artifacts feed
-      # merge-benchmarks.py. The level shards (benchmark-shard-*) are
-      # intermediate inputs to `benchmark-aggregate` and would
-      # otherwise pollute merge-benchmarks.py's per-target name
-      # extraction with `<target>.<level>` keys. Download each
-      # target explicitly so the artifact dir contains exactly the
-      # expected file set.
+      # Only the aggregated per-target files feed merge-benchmarks.py.
+      # The level shards (benchmark-shard-*) are intermediate inputs
+      # to `benchmark-aggregate` and would otherwise pollute
+      # merge-benchmarks.py's per-target name extraction with
+      # `<target>.<level>` keys, so we download just the single
+      # combined `benchmark-aggregated` artifact here.
       - uses: actions/download-artifact@v4
         with:
-          name: benchmark-x86_64-gnu
-          path: benchmark-artifacts/x86_64-gnu
-      - uses: actions/download-artifact@v4
-        with:
-          name: benchmark-i686-gnu
-          path: benchmark-artifacts/i686-gnu
-      - uses: actions/download-artifact@v4
-        with:
-          name: benchmark-x86_64-musl
-          path: benchmark-artifacts/x86_64-musl
+          name: benchmark-aggregated
+          path: benchmark-artifacts
 
       - name: Merge relative/delta payloads
         run: python3 .github/scripts/merge-benchmarks.py

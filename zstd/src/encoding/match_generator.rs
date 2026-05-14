@@ -411,11 +411,15 @@ pub struct MatchGeneratorDriver {
     hc_match_generator: Option<HcMatchGenerator>,
     active_backend: super::strategy::BackendTag,
     // Compile-time strategy tag resolved at `reset()` from the
-    // requested `CompressionLevel`. Stays in lock-step with
-    // `active_backend` (a `debug_assert!` in `reset()` enforces the
-    // invariant). Future Phase 3 commits will branch the hot dispatch
-    // on this field to enter `compress_block::<S>` monomorphisations,
-    // at which point `active_backend` will become a derived view.
+    // requested `CompressionLevel`'s `LevelParams`. The driver's
+    // hot-block dispatcher in `blocks/compressed.rs` matches on
+    // this tag to enter the corresponding `Strategy`
+    // monomorphisation (`compress_block::<S>`). `active_backend`
+    // is the parse-family derivation of the tag and is kept here
+    // only because matcher state ownership (`row_match_generator`
+    // vs `hc_match_generator`) is reused across levels within the
+    // same backend; `strategy_tag.backend()` is the canonical
+    // source of truth.
     strategy_tag: super::strategy::StrategyTag,
     slice_size: usize,
     base_slice_size: usize,
@@ -973,10 +977,11 @@ impl Matcher for MatchGeneratorDriver {
         // 7-arm match over the compile-time strategy tag fires once
         // per block and hands off to a monomorphised
         // `compress_block::<S>` that the optimiser specialises per
-        // strategy. Future commits will replace runtime `match
-        // self.parse_mode` branches inside the inner loops with
-        // `if S::USE_BT` / `if S::USE_HASH3` so each monomorphisation
-        // drops the dead paths at codegen time.
+        // strategy. Strategy-shaped predicates (`S::USE_BT`,
+        // `S::USE_HASH3`, `S::OPTIMAL_PASS_COUNT`) compile to constants
+        // inside each monomorphisation, so the dead arms drop out at
+        // codegen time — there is no remaining runtime parse-mode
+        // dispatch on the per-block hot path.
         match self.strategy_tag {
             StrategyTag::Fast => self.compress_block::<strategy::Fast>(&mut handle_sequence),
             StrategyTag::Dfast => self.compress_block::<strategy::Dfast>(&mut handle_sequence),
@@ -2738,9 +2743,9 @@ impl HcMatchGenerator {
     /// `BtOpt` / `BtUltra` / `BtUltra2` see only
     /// `start_matching_optimal`. The runtime `match self.parse_mode`
     /// at the inherent [`HcMatchGenerator::start_matching`] entry is
-    /// no longer reached from `MatchGeneratorDriver`; it stays in
-    /// place for direct in-crate callers (mostly tests) until the
-    /// final cleanup commit drops `parse_mode` entirely.
+    /// no longer reached from the production hot path; the field
+    /// remains live only for in-crate callers (mostly tests) that
+    /// invoke the inherent entry directly.
     pub(crate) fn start_matching_strategy<S: super::strategy::Strategy>(
         &mut self,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
