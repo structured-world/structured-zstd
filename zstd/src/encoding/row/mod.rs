@@ -108,6 +108,11 @@ impl RowMatchGenerator {
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        super::match_table::storage::check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            data.len(),
+        );
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();

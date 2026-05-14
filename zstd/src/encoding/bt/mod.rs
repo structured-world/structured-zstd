@@ -319,7 +319,11 @@ impl BtMatcher {
     /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
     /// donor's compact offset base (1/2/3 for rep slots, otherwise
     /// `actual_offset + 3`) and update the rolling `reps` window in
-    /// lock-step. Returns `(off_base, next_reps)`.
+    /// lock-step. Returns `(off_base, next_reps)`. The non-rep branch
+    /// uses `saturating_add` so a `u32` near `u32::MAX` (only possible
+    /// via malformed external input) clamps to `u32::MAX` rather than
+    /// wrapping into a small rep-code value that would silently corrupt
+    /// the encoded stream.
     pub(crate) fn encode_offset_with_reps(
         actual_offset: u32,
         lit_len: usize,
@@ -544,8 +548,11 @@ impl BtMatcher {
         stamp: u32,
     ) -> i32 {
         if lit_len == 0 {
-            return profile.lit_length_price(stats, lit_len) as i32
-                - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
+            // The `lit_len == 0` branch is the rare case where computing
+            // `lit_len - 1` would underflow; we feed `0` to both
+            // `lit_length_price` calls so the delta is 0 by construction.
+            // No need to compute `0_usize - 1`.
+            return 0;
         }
         let price =
             Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);

@@ -20,10 +20,140 @@ use alloc::vec::Vec;
 
 use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
-use super::super::cost_model::HcOptimalCostProfile;
+use super::super::cost_model::{HC_OPT_NUM, HcOptimalCostProfile};
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
+
+/// Lookahead bytes the BT walker / optimal parser will read past the
+/// per-position absolute cursor (`abs_pos + 9` for match-end sentinels,
+/// `abs_pos + HC_OPT_NUM` for the optimal-parser match-length cap, etc.).
+/// `MatchTable::add_data` rejects input that would advance
+/// `history_abs_end` past `usize::MAX - STREAM_ABS_HEADROOM`, which lets
+/// every downstream raw `abs_pos + N` arithmetic stay within `usize` on
+/// 32-bit targets without per-call saturating guards.
+pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
+
+/// Frame-level overflow gate shared by `MatchTable`,
+/// `DfastMatchGenerator`, and `RowMatchGenerator`.
+///
+/// Each backend owns its own rolling window and `history_abs_start`
+/// cursor but they all hand absolute positions to inner loops that add
+/// small constants without per-iteration overflow checks. This helper
+/// enforces a single contract: the next `data.len()` bytes — together
+/// with the still-resident `window_size` — must leave at least
+/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
+/// lets every downstream `abs_pos + N` site stay raw and keeps i686
+/// streams correct. New match-finder backends with their own
+/// `add_data` path must route through this helper.
+#[inline]
+pub(crate) fn check_stream_abs_headroom(
+    history_abs_start: usize,
+    window_size: usize,
+    data_len: usize,
+) {
+    let _future_abs_end = history_abs_start
+        .checked_add(window_size)
+        .and_then(|p| p.checked_add(data_len))
+        .and_then(|p| p.checked_add(STREAM_ABS_HEADROOM))
+        .expect(
+            "structured-zstd: cumulative input would leave less than \
+             STREAM_ABS_HEADROOM (HC_OPT_NUM + 16) slack below \
+             `usize::MAX` for the encoder's absolute-position \
+             lookahead; on 32-bit targets, split the input into \
+             smaller frames or use a 64-bit build",
+        );
+}
+
+#[cfg(test)]
+mod bt_pair_index_wrap_tests {
+    use super::MatchTable;
+
+    /// `bt_pair_index_for_abs` switched from `+` to `wrapping_add` so the
+    /// release-mode overflow branch and the debug-mode panic stay off
+    /// the hot path on rare 32-bit streams where `abs_pos + index_shift`
+    /// overflows `usize`. This test forces that overflow and verifies
+    /// the returned BT slot still equals what the modulo-ring identity
+    /// promises: `(abs_pos + index_shift) mod 2^bt_log`, doubled
+    /// because the table stores pointer pairs.
+    #[test]
+    fn bt_pair_index_matches_modulo_ring_after_wraparound() {
+        let mut table = MatchTable::new(1 << 20);
+        // Small BT ring (`bt_log = chain_log - 1 = 3` → mask = 0b0111) so
+        // the modular identity is easy to read at a glance.
+        table.chain_log = 4;
+        // Use a wide `index_shift` so the addition wraps for many of
+        // the `abs_pos` values we probe below.
+        table.index_shift = usize::MAX - 5;
+
+        let bt_mask = table.bt_mask();
+        assert_eq!(bt_mask, 0b0111);
+
+        for abs_pos in [0usize, 1, 4, 5, 6, 7, 8, 12, 17] {
+            let got = table.bt_pair_index_for_abs(abs_pos);
+            let expected = 2 * (abs_pos.wrapping_add(table.index_shift) & bt_mask);
+            assert_eq!(
+                got, expected,
+                "abs_pos={abs_pos}: wrapping_add ring slot must match the masked sum"
+            );
+        }
+
+        // Spot-check one value where overflow is certain (abs_pos > 5)
+        // and the ring index has a stable closed form.
+        // abs_pos=7, index_shift=usize::MAX-5: sum wraps to 1, mask -> 1, doubled -> 2.
+        assert_eq!(table.bt_pair_index_for_abs(7), 2);
+        // abs_pos=14: sum wraps to 8, masked -> 0, doubled -> 0.
+        assert_eq!(table.bt_pair_index_for_abs(14), 0);
+    }
+
+    /// Sanity check the non-overflow path keeps the same identity so a
+    /// future refactor cannot regress the common case while leaving the
+    /// overflow case green.
+    #[test]
+    fn bt_pair_index_matches_modulo_ring_without_overflow() {
+        let mut table = MatchTable::new(1 << 20);
+        table.chain_log = 8; // bt_log = 7, mask = 0x7f
+        table.index_shift = 17;
+
+        let bt_mask = table.bt_mask();
+        for abs_pos in [0usize, 1, 16, 32, 64, 127, 128, 255, 1 << 20] {
+            let got = table.bt_pair_index_for_abs(abs_pos);
+            let expected = 2 * ((abs_pos + table.index_shift) & bt_mask);
+            assert_eq!(got, expected, "abs_pos={abs_pos}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_abs_headroom_tests {
+    use super::{STREAM_ABS_HEADROOM, check_stream_abs_headroom};
+
+    #[test]
+    fn accepts_exactly_at_the_boundary() {
+        // `history_abs_start + window_size + data_len + STREAM_ABS_HEADROOM == usize::MAX`.
+        let history_abs_start = usize::MAX - STREAM_ABS_HEADROOM - 2;
+        check_stream_abs_headroom(history_abs_start, 1, 1);
+    }
+
+    #[test]
+    fn accepts_well_below_the_boundary() {
+        check_stream_abs_headroom(0, 1 << 20, 1 << 20);
+    }
+
+    #[test]
+    #[should_panic(expected = "STREAM_ABS_HEADROOM")]
+    fn rejects_one_byte_past_the_boundary() {
+        // One byte over: sum = usize::MAX + 1 → checked_add returns None.
+        let history_abs_start = usize::MAX - STREAM_ABS_HEADROOM - 1;
+        check_stream_abs_headroom(history_abs_start, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "STREAM_ABS_HEADROOM")]
+    fn rejects_history_abs_start_already_too_high() {
+        check_stream_abs_headroom(usize::MAX - 10, 0, 0);
+    }
+}
 
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
@@ -342,6 +472,7 @@ impl MatchTable {
     /// ~2x window size for data buffers + 6 MB tables.
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
@@ -450,7 +581,20 @@ impl MatchTable {
     /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        2 * (abs_pos.saturating_add(self.index_shift) & self.bt_mask())
+        // Hot per-iteration BT walker entry. `abs_pos` is a
+        // frame-lifetime absolute stream cursor (capped by
+        // `check_stream_abs_headroom`); `index_shift` is block-local
+        // (`current_len` during the btultra2 seed pass, `0` otherwise).
+        // The result is immediately masked down to the BT ring width
+        // by `& bt_mask()`, so what matters here is only the modulo-
+        // ring identity `(a + b) mod m == ((a mod 2^bits) + (b mod
+        // 2^bits)) mod m` for `m | 2^bits`: `wrapping_add` preserves
+        // that identity even on the rare i686 streams where the raw
+        // `usize` sum overflows. Using `wrapping_add` instead of `+`
+        // (or `saturating_add`) also keeps the release-mode overflow
+        // branch and the debug-mode overflow panic off this hot path.
+        let bt_pos = abs_pos.wrapping_add(self.index_shift);
+        2 * (bt_pos & self.bt_mask())
     }
 
     /// Decode a stored hash / chain table entry back into its absolute
@@ -855,7 +999,13 @@ impl MatchTable {
         let mut pos = history_start;
         while pos < abs_pos {
             let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
-            pos = pos.saturating_add(forward.max(1));
+            // `pos` is a frame-lifetime absolute cursor that can approach
+            // `usize::MAX` on long 32-bit streams. Cap the step at the
+            // remaining distance to `abs_pos` so the addition stays
+            // within `usize` even when the BT walker returns a large
+            // `forward` near the stream end.
+            let step = forward.max(1).min(abs_pos - pos);
+            pos += step;
         }
     }
 
@@ -918,7 +1068,7 @@ impl MatchTable {
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward =
                 unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -946,7 +1096,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
             };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -974,7 +1124,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
             };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -993,7 +1143,7 @@ impl MatchTable {
             }
             let forward =
                 self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1).min(abs_pos - update_abs);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1015,7 +1165,9 @@ impl MatchTable {
                 self.maybe_rebase_positions(self.next_to_update3);
             }
             self.insert_hash3_only_no_rebase(self.next_to_update3);
-            self.next_to_update3 = self.next_to_update3.saturating_add(1);
+            // hash3 cursor strictly less than `abs_pos` here (loop guard);
+            // `+ 1` cannot overflow within encode block sizes.
+            self.next_to_update3 += 1;
         }
     }
 

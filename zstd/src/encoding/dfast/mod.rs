@@ -26,6 +26,7 @@ use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
+use super::match_table::storage::check_stream_abs_headroom;
 use super::opt::types::MatchCandidate;
 
 pub(crate) struct DfastMatchGenerator {
@@ -108,6 +109,7 @@ impl DfastMatchGenerator {
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
@@ -208,6 +210,32 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
+        // Loop invariants:
+        //
+        // 1. Block-local arithmetic (`pos`, `skip_step`, `start +
+        //    candidate.match_len`, `DFAST_SKIP_STEP_GROWTH_INTERVAL`):
+        //    the dynamic bound is `current_len` itself — the `while
+        //    pos + DFAST_MIN_MATCH_LEN <= current_len` guard keeps
+        //    every offset within that bound regardless of how the
+        //    caller sized `max_window_size`. In production this also
+        //    happens to be `≤ HC_BLOCKSIZE_MAX (128 KiB)` because the
+        //    frame compressor never hands out larger blocks, but the
+        //    safety argument above does not rely on that limit.
+        // 2. Absolute-position arithmetic (`current_abs_start + pos`):
+        //    `current_abs_start` is the frame-lifetime cursor and
+        //    advances with total bytes processed, NOT with the
+        //    retained window size. A long streaming encode on i686
+        //    can therefore push `current_abs_start + pos` past
+        //    `usize::MAX` even though memory usage stays bounded by
+        //    `window_size`. The runtime enforcement lives in
+        //    `DfastMatchGenerator::add_data`, which routes through
+        //    `check_stream_abs_headroom` (the same gate used by
+        //    `MatchTable::add_data`): every ingest fails fast with a
+        //    clear panic if cumulative input would push the cursor
+        //    within `STREAM_ABS_HEADROOM` (`= HC_OPT_NUM + 16`) of
+        //    `usize::MAX`. Raw `+` here is donor parity and is
+        //    correct precisely because that upstream gate runs before
+        //    this loop sees any new bytes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
@@ -222,11 +250,11 @@ impl DfastMatchGenerator {
                 );
                 pos = start + candidate.match_len;
                 skip_step = 1;
-                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
             } else {
                 self.insert_position(abs_pos);
-                miss_run = miss_run.saturating_add(1);
+                miss_run += 1;
                 let use_local_adaptive_skip = miss_run >= DFAST_LOCAL_SKIP_TRIGGER;
                 if use_adaptive_skip || use_local_adaptive_skip {
                     let skip_cap = if use_adaptive_skip {
@@ -236,10 +264,9 @@ impl DfastMatchGenerator {
                     };
                     if pos >= next_skip_growth_pos {
                         skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos =
-                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     }
-                    pos = pos.saturating_add(skip_step);
+                    pos += skip_step;
                 } else {
                     pos += 1;
                 }
@@ -263,11 +290,37 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
+        // Loop invariants (two distinct bounds):
+        //
+        // 1. Block-local arithmetic (`ip0..ip3 = pos + N` for small
+        //    `N`, `pos + skip_step` with `skip_step <=
+        //    DFAST_MAX_SKIP_STEP`): the dynamic bound is `current_len`
+        //    itself — the `while pos + DFAST_MIN_MATCH_LEN <=
+        //    current_len` guard keeps every offset within that bound
+        //    regardless of how the caller sized `max_window_size`.
+        //    In production this also happens to be `≤
+        //    HC_BLOCKSIZE_MAX (128 KiB)` because the frame compressor
+        //    never hands out larger blocks, but the safety argument
+        //    above does not rely on that limit.
+        // 2. Absolute-position arithmetic (`current_abs_start + ip0`,
+        //    `current_abs_start + ip2`, etc.): `current_abs_start` is
+        //    the frame-lifetime cursor and advances with total bytes
+        //    processed, NOT with the retained window size. A long
+        //    streaming encode on i686 can push `current_abs_start +
+        //    ipN` past `usize::MAX` even though memory stays bounded
+        //    by `window_size`. The runtime enforcement lives in
+        //    `DfastMatchGenerator::add_data` via
+        //    `check_stream_abs_headroom`: every ingest fails fast if
+        //    cumulative input would advance the cursor within
+        //    `STREAM_ABS_HEADROOM` of `usize::MAX`, which keeps the
+        //    raw `current_abs_start + ipN` arithmetic below
+        //    `usize::MAX` for every position
+        //    this loop ever observes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
-            let ip1 = ip0.saturating_add(1);
-            let ip2 = ip0.saturating_add(2);
-            let ip3 = ip0.saturating_add(3);
+            let ip1 = ip0 + 1;
+            let ip2 = ip0 + 2;
+            let ip3 = ip0 + 3;
 
             let abs_ip0 = current_abs_start + ip0;
             let lit_len_ip0 = ip0 - literals_start;
@@ -287,7 +340,7 @@ impl DfastMatchGenerator {
                     );
                     pos = start + rep.match_len;
                     skip_step = 1;
-                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     miss_run = 0;
                     continue;
                 }
@@ -303,7 +356,7 @@ impl DfastMatchGenerator {
                 );
                 pos = start + candidate.match_len;
                 skip_step = 1;
-                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
             } else {
                 self.insert_position(abs_ip0);
@@ -316,18 +369,17 @@ impl DfastMatchGenerator {
                 if ip3 + 4 <= current_len {
                     self.insert_position(current_abs_start + ip3);
                 }
-                miss_run = miss_run.saturating_add(1);
+                miss_run += 1;
                 if block_is_strict_incompressible || miss_run >= DFAST_LOCAL_SKIP_TRIGGER {
                     let skip_cap = DFAST_MAX_SKIP_STEP;
                     if pos >= next_skip_growth_pos {
                         skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos =
-                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     }
-                    pos = pos.saturating_add(skip_step);
+                    pos += skip_step;
                 } else {
                     skip_step = 1;
-                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     pos += 1;
                 }
             }
@@ -555,6 +607,18 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        // The raw `pos += step` below is correct only while `step` is
+        // bounded by `DFAST_INCOMPRESSIBLE_SKIP_STEP` (the only value
+        // any in-tree caller passes here). Asserting it locally keeps
+        // a future caller from quietly reintroducing the overflow risk
+        // that the upstream `check_stream_abs_headroom` gate is sized
+        // for.
+        assert!(
+            step <= DFAST_INCOMPRESSIBLE_SKIP_STEP,
+            "insert_positions_with_step: step ({step}) exceeds \
+             DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
+             eat into the STREAM_ABS_HEADROOM reserve"
+        );
         let start = start.max(self.history_abs_start);
         let end = end.min(self.history_abs_end());
         if step <= 1 {
@@ -564,7 +628,12 @@ impl DfastMatchGenerator {
         let mut pos = start;
         while pos < end {
             self.insert_position(pos);
-            pos = pos.saturating_add(step);
+            // `pos + step` is safe: `pos < end <= history_abs_end()` and
+            // `history_abs_end <= usize::MAX - STREAM_ABS_HEADROOM` by
+            // the upstream `check_stream_abs_headroom` gate, while
+            // `step` is bounded above by the assertion at function
+            // entry.
+            pos += step;
         }
     }
 
