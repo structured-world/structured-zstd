@@ -126,16 +126,79 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  bench-build:
+    # Build the criterion `compare_ffi` binary once per target. Every
+    # downstream bench shard (target × level) downloads the binary
+    # via `bench-binary-<target>` artifact and runs it directly — no
+    # rebuild per shard. Saves ~4-7 min on each of the 18 shard
+    # runners.
+    name: Build bench binary (${{ matrix.bench.id }})
+    needs: lint
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        bench:
+          - id: x86_64-gnu
+            target_triple: x86_64-unknown-linux-gnu
+            setup_command: ""
+          - id: i686-gnu
+            target_triple: i686-unknown-linux-gnu
+            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
+          - id: x86_64-musl
+            target_triple: x86_64-unknown-linux-musl
+            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark target
+        run: rustup target add ${{ matrix.bench.target_triple }}
+      - name: Install target toolchain dependencies
+        if: matrix.bench.setup_command != ''
+        run: ${{ matrix.bench.setup_command }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench-${{ matrix.bench.id }}
+      - name: Build compare_ffi bench binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          # `--no-run` builds without executing; `--message-format=json`
+          # exposes the resolved binary path in the build log so we
+          # can ship just the executable to shards.
+          cargo bench --bench compare_ffi -p structured-zstd --features dict_builder \
+            --target ${{ matrix.bench.target_triple }} --no-run \
+            --message-format=json > build.log
+          bin_path=$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)
+          if [ -z "$bin_path" ] || [ ! -x "$bin_path" ]; then
+            echo "ERROR: failed to locate compare_ffi binary in cargo output" >&2
+            cat build.log | jq -r 'select(.executable != null) | "\(.target.name)  \(.executable)"' >&2
+            exit 1
+          fi
+          mkdir -p bench-binary
+          cp "$bin_path" bench-binary/compare_ffi
+          chmod +x bench-binary/compare_ffi
+          echo "Bench binary size: $(wc -c < bench-binary/compare_ffi) bytes"
+      - name: Upload bench binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-binary-${{ matrix.bench.id }}
+          path: bench-binary/
+          if-no-files-found: error
+          retention-days: 7
+
   benchmark:
     name: Bench ${{ matrix.bench.id }} / ${{ matrix.level }}
-    needs: lint
+    needs: bench-build
     timeout-minutes: ${{ matrix.bench.timeout_minutes }}
     strategy:
-      # The bench matrix is split target × level. `level22` on i686 is
-      # the natural bottleneck (~20 min); every other (target, level)
-      # combo finishes well under 10 min, so wall-clock falls from
-      # ~45 min to ~25 min while keeping the full per-(target, level)
-      # coverage we had before.
+      # Matrix split target × level. The pre-built binary from
+      # `bench-build` is what each shard executes, so the runtime
+      # budget per shard is purely the criterion measurement +
+      # post-processing. `level22` on i686 is still the natural
+      # bottleneck (~20 min); every other (target, level) combo
+      # finishes well under 10 min.
       fail-fast: false
       matrix:
         bench:
@@ -161,18 +224,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        # Needed for: corpus files referenced via `env!("CARGO_MANIFEST_DIR")`
+        # inside the bench binary, the run-benchmarks.sh script, and
+        # the python post-processor.
 
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install benchmark target
-        run: rustup target add ${{ matrix.bench.target_triple }}
-
-      - name: Install target toolchain dependencies
+      - name: Install target runtime dependencies
         if: matrix.bench.setup_command != ''
         run: ${{ matrix.bench.setup_command }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Download pre-built bench binary
+        uses: actions/download-artifact@v4
         with:
-          prefix-key: bench-${{ matrix.bench.id }}
+          name: bench-binary-${{ matrix.bench.id }}
+          path: bench-binary
+      - name: Mark bench binary executable
+        run: chmod +x bench-binary/compare_ffi
 
       - name: Run benchmarks (filtered to single level)
         env:
@@ -180,7 +246,8 @@ jobs:
           STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
           STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
           STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.level }}
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          # run-benchmarks.sh: re-exec this binary instead of `cargo bench`.
+          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
         run: bash .github/scripts/run-benchmarks.sh
 
       - name: Rename benchmark outputs for matrix artifact

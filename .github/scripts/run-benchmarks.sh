@@ -24,11 +24,25 @@ BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 trap 'rm -f "$BENCH_RAW_FILE"' EXIT
 
 export STRUCTURED_ZSTD_EMIT_REPORT=1
-BENCH_CMD=(cargo bench --bench compare_ffi -p structured-zstd --features dict_builder)
-if [ -n "$BENCH_TARGET_TRIPLE" ]; then
-  BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
+# CI matrix splits build (per target) from execution (per target × level):
+# the `bench-build` job hands the compiled criterion binary to every
+# shard via `STRUCTURED_ZSTD_BENCH_BIN`, so we re-exec it directly
+# instead of going through `cargo bench`. When the env var is not set
+# (local dev runs, single-runner CI), fall back to building on demand.
+if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
+  if [ ! -x "$STRUCTURED_ZSTD_BENCH_BIN" ]; then
+    echo "STRUCTURED_ZSTD_BENCH_BIN=$STRUCTURED_ZSTD_BENCH_BIN is not executable" >&2
+    exit 2
+  fi
+  echo "Running pre-built bench binary: $STRUCTURED_ZSTD_BENCH_BIN" >&2
+  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher | tee "$BENCH_RAW_FILE"
+else
+  BENCH_CMD=(cargo bench --bench compare_ffi -p structured-zstd --features dict_builder)
+  if [ -n "$BENCH_TARGET_TRIPLE" ]; then
+    BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
+  fi
+  "${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
 fi
-"${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
 
 echo "Parsing results..." >&2
 
