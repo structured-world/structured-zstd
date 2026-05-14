@@ -146,6 +146,11 @@ jobs:
           - huff0
           - fse
     runs-on: ubuntu-latest
+    env:
+      # Override `rust-toolchain.toml` (which pins stable) so `cargo fuzz`
+      # — which requires `-Z sanitizer` from nightly — gets a nightly
+      # compiler inside the fuzz crate sub-build.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
