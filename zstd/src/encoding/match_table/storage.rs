@@ -450,21 +450,19 @@ impl MatchTable {
     /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        // Called inside the BT walker for the current node and each
-        // visited candidate — a hot per-iteration path. `index_shift`
-        // is `current_len` during the btultra2 seed pass (see
-        // `run_btultra2_seed_pass`) and `0` everywhere else, so it
-        // never exceeds the configured block length. `abs_pos` is
-        // bounded by the same block scan that called us. Their sum
-        // therefore stays well below `usize::MAX` on every supported
-        // target (i686 included). Enforce the invariant with a
-        // debug-only assertion so release builds run the raw `+` with
-        // zero overhead.
-        debug_assert!(
-            abs_pos.checked_add(self.index_shift).is_some(),
-            "bt_pair_index_for_abs: abs_pos + index_shift overflowed usize"
-        );
-        2 * ((abs_pos + self.index_shift) & self.bt_mask())
+        // Hot per-iteration BT walker entry. `abs_pos` is a
+        // frame-lifetime absolute stream cursor — it grows monotonically
+        // across blocks and could in principle wrap around `usize::MAX`
+        // on long-running 32-bit streams, even though `index_shift` is
+        // block-local (`current_len` during the btultra2 seed pass, `0`
+        // otherwise). The result is immediately masked down to the BT
+        // ring width by `& bt_mask()`, so the modulo semantics of
+        // `wrapping_add` give the same slot as a panicking `+` would,
+        // and we avoid both the release-mode overflow branch and the
+        // debug-mode panic that an unchecked stream cursor + offset
+        // would otherwise trigger.
+        let bt_pos = abs_pos.wrapping_add(self.index_shift);
+        2 * (bt_pos & self.bt_mask())
     }
 
     /// Decode a stored hash / chain table entry back into its absolute

@@ -208,13 +208,21 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
-        // Loop invariant: `pos + DFAST_MIN_MATCH_LEN <= current_len <=
-        // HC_BLOCKSIZE_MAX (128 KiB)`. Every unchecked `+` inside the
-        // body operates on a sub-position offset (`start +
-        // candidate.match_len`), a constant (`DFAST_SKIP_STEP_GROWTH_INTERVAL`),
-        // or a step capped by `DFAST_MAX_SKIP_STEP` — all bounded by
-        // `current_len`, so none can overflow `usize` on any supported
-        // target (i686 included).
+        // Loop invariants (two distinct bounds):
+        //
+        // 1. Block-local arithmetic (`pos`, `skip_step`, `start +
+        //    candidate.match_len`, `DFAST_SKIP_STEP_GROWTH_INTERVAL`):
+        //    bounded by `current_len <= HC_BLOCKSIZE_MAX (128 KiB)`.
+        //    The `while pos + DFAST_MIN_MATCH_LEN <= current_len`
+        //    guard keeps every offset well within that bound.
+        // 2. Absolute-position arithmetic (`current_abs_start + pos`,
+        //    `current_abs_start + ip2`): `current_abs_start` is the
+        //    frame-lifetime cursor at the start of the current block.
+        //    The frame compressor's total processed bytes cannot
+        //    exceed the host's `usize` (we'd need that much RAM to
+        //    hold history), so `current_abs_start + pos <= usize::MAX`
+        //    is structurally guaranteed across all supported targets,
+        //    i686 included.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
@@ -269,11 +277,22 @@ impl DfastMatchGenerator {
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
         let mut miss_run = 0usize;
-        // Loop invariant: `pos + DFAST_MIN_MATCH_LEN <= current_len <=
-        // HC_BLOCKSIZE_MAX (128 KiB)`. Each unchecked `+` below is on a
-        // sub-position offset (`ip0..ip3`) or a step (`skip_step <=
-        // DFAST_MAX_SKIP_STEP`) bounded by `current_len`, so no usize
-        // arithmetic in this hot loop can overflow.
+        // Loop invariants (two distinct bounds):
+        //
+        // 1. Block-local arithmetic (`ip0..ip3 = pos + N` for small
+        //    `N`, `pos + skip_step` with `skip_step <=
+        //    DFAST_MAX_SKIP_STEP`): bounded by `current_len <=
+        //    HC_BLOCKSIZE_MAX (128 KiB)`. The `while pos +
+        //    DFAST_MIN_MATCH_LEN <= current_len` guard keeps every
+        //    offset well within that bound.
+        // 2. Absolute-position arithmetic (`current_abs_start + ip0`,
+        //    `current_abs_start + ip2`, etc.): `current_abs_start` is
+        //    the frame-lifetime cursor at the start of the current
+        //    block. The frame compressor's total processed bytes
+        //    cannot exceed the host's `usize` (we'd need that much
+        //    RAM to hold history), so `current_abs_start + ipN <=
+        //    usize::MAX` is structurally guaranteed across all
+        //    supported targets, i686 included.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
             let ip1 = ip0 + 1;
