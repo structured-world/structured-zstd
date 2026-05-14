@@ -73,6 +73,54 @@ pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
 }
 
 /// Benchmark levels mapped to comparable Rust and FFI compression settings.
+/// Read `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` and return the comma-
+/// separated list of level names to keep. Empty or unset means
+/// "run every level". Used by CI to split the bench matrix across
+/// one runner per level.
+pub(crate) fn level_filter_from_env() -> Option<Vec<String>> {
+    let raw = env::var("STRUCTURED_ZSTD_BENCH_LEVEL_FILTER").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = trimmed
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+/// Same as [`supported_levels`] but honours `STRUCTURED_ZSTD_BENCH_
+/// LEVEL_FILTER` so a CI job can run a single named level. Panics
+/// if any requested name in the filter is not a known level — that
+/// catches typos in the CI matrix entry early instead of letting the
+/// shard succeed silently with no samples (which would skip the
+/// downstream regression alert for that level). A partial match
+/// (`STRUCTURED_ZSTD_BENCH_LEVEL_FILTER=default,typo`) also panics,
+/// so a typo never hides behind a valid sibling token.
+pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
+    let all = supported_levels();
+    let Some(keep) = level_filter_from_env() else {
+        return all.to_vec();
+    };
+    let known: Vec<&'static str> = all.iter().map(|cfg| cfg.name).collect();
+    let unknown: Vec<String> = keep
+        .iter()
+        .filter(|name| !known.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "STRUCTURED_ZSTD_BENCH_LEVEL_FILTER contained unknown level(s) {unknown:?}; \
+         supported: {known:?} — fix the CI matrix entry or rename the level in \
+         `supported_levels()`."
+    );
+    all.into_iter()
+        .filter(|cfg| keep.iter().any(|name| name == cfg.name))
+        .collect()
+}
+
 pub(crate) fn supported_levels() -> [LevelConfig; 6] {
     [
         LevelConfig {

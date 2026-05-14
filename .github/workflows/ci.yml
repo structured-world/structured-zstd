@@ -126,26 +126,262 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  benchmark:
-    name: Performance regression check (${{ matrix.bench.id }})
+  fuzz:
+    # Short-budget libFuzzer smoke run across all targets in a single
+    # runner. The asan+sancov sub-build of `structured-zstd` is the
+    # dominant cost (~2 min); running the five targets sequentially in
+    # one job amortises that build (cargo cache reuse drops targets
+    # 2..5 to a few seconds each) and halves the compute vs a per-
+    # target matrix. Wall-clock stays bounded by the bench matrix,
+    # which runs in parallel and takes far longer.
+    #
+    # The repo ships a regression corpus in `zstd/fuzz/artifacts/`;
+    # for every target cargo-fuzz replays that corpus first (any old
+    # crash that resurfaces fails the job), then runs
+    # `-max_total_time` seconds of fresh fuzzing on top.
+    name: Fuzz smoke
     needs: lint
-    timeout-minutes: ${{ matrix.bench.timeout_minutes }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    env:
+      # Override `rust-toolchain.toml` (which pins stable) so `cargo fuzz`
+      # — which requires `-Z sanitizer` from nightly — gets a nightly
+      # compiler inside the fuzz crate sub-build.
+      RUSTUP_TOOLCHAIN: nightly
+      # Explicit target: the prebuilt `cargo-fuzz` binary installed via
+      # taiki-e/install-action is statically linked against musl and its
+      # `default_target()` probe picks `x86_64-unknown-linux-musl`,
+      # which fails because libFuzzer's AddressSanitizer cannot link
+      # against a static libc (`sanitizer is incompatible with
+      # statically linked libc`). Pinning the gnu target sidesteps the
+      # probe and matches the toolchain rustc actually has stdlib for.
+      FUZZ_TARGET_TRIPLE: x86_64-unknown-linux-gnu
+      # Single source of truth for the fuzz target inventory; both the
+      # corpus replay step and the fresh-fuzz step iterate over this.
+      FUZZ_TARGETS: "decode encode interop huff0 fse"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fuzz
+          workspaces: zstd/fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Replay regression corpus
+        # Drive the existing crash artifacts through each target so
+        # any reintroduction of a previously-fixed bug fails CI on
+        # the same input that originally surfaced it.
+        working-directory: zstd/fuzz
+        run: |
+          for target in $FUZZ_TARGETS; do
+            if [ -d "artifacts/$target" ] && [ -n "$(ls artifacts/$target 2>/dev/null)" ]; then
+              echo "Replaying $(ls artifacts/$target | wc -l) regression artifacts for $target"
+              cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" artifacts/"$target"/*
+            else
+              echo "No regression artifacts for $target — skipping replay"
+            fi
+          done
+      - name: Fuzz (90s per target)
+        working-directory: zstd/fuzz
+        # `-max_total_time` is libFuzzer's own time cap; on top of
+        # the GitHub Actions timeout-minutes it gives us a hard
+        # ceiling even if a target wedges in setup.
+        run: |
+          for target in $FUZZ_TARGETS; do
+            echo "::group::Fuzz $target"
+            cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" -- -max_total_time=90 -timeout=30
+            echo "::endgroup::"
+          done
+      - name: Upload new crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: zstd/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  bench-matrix:
+    # Canonical bench target inventory. Every downstream bench job
+    # (`bench-build`, `benchmark`, `benchmark-aggregate`,
+    # `benchmark-pages`) consumes this so a new target ID is added
+    # in exactly one place. `build_setup` runs only on `bench-build`;
+    # `runtime_setup` runs only on the bench shards (e.g. `i686-gnu`
+    # needs gcc-multilib's 32-bit loader at runtime, while `x86_64-musl`
+    # only needs `musl-tools` for the build).
+    name: Resolve bench target matrix
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set.outputs.targets }}
+      ids_csv: ${{ steps.set.outputs.ids_csv }}
+    steps:
+      - id: set
+        run: |
+          cat > targets.json <<'EOF'
+          [
+            {
+              "id": "x86_64-gnu",
+              "target_triple": "x86_64-unknown-linux-gnu",
+              "build_setup": "",
+              "runtime_setup": "",
+              "timeout_minutes": 25
+            },
+            {
+              "id": "i686-gnu",
+              "target_triple": "i686-unknown-linux-gnu",
+              "build_setup": "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386",
+              "runtime_setup": "sudo apt-get update && sudo apt-get install -y libc6-dev-i386",
+              "timeout_minutes": 30
+            },
+            {
+              "id": "x86_64-musl",
+              "target_triple": "x86_64-unknown-linux-musl",
+              "build_setup": "sudo apt-get update && sudo apt-get install -y musl-tools",
+              "runtime_setup": "",
+              "timeout_minutes": 25
+            }
+          ]
+          EOF
+          targets_compact=$(jq -c . targets.json)
+          ids_csv=$(jq -r '[.[].id] | join(",")' targets.json)
+          echo "targets=$targets_compact" >> "$GITHUB_OUTPUT"
+          echo "ids_csv=$ids_csv" >> "$GITHUB_OUTPUT"
+          echo "Bench targets: $ids_csv"
+
+  bench-build:
+    # Build the criterion `compare_ffi` binary once per target. Every
+    # downstream bench shard (target × level) downloads the binary
+    # via `bench-binary-<target>` artifact and runs it directly — no
+    # rebuild per shard. Saves ~4-7 min on each of the 18 shard
+    # runners.
+    name: Build bench binary (${{ matrix.bench.id }})
+    needs: [lint, bench-matrix]
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        bench:
-          - id: x86_64-gnu
-            target_triple: x86_64-unknown-linux-gnu
-            timeout_minutes: 40
-            setup_command: ""
-          - id: i686-gnu
-            target_triple: i686-unknown-linux-gnu
-            timeout_minutes: 55
-            setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
-          - id: x86_64-musl
-            target_triple: x86_64-unknown-linux-musl
-            timeout_minutes: 40
-            setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
+        bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark target
+        run: rustup target add ${{ matrix.bench.target_triple }}
+      - name: Install build toolchain dependencies
+        if: matrix.bench.build_setup != ''
+        run: ${{ matrix.bench.build_setup }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench-${{ matrix.bench.id }}
+      - name: Build compare_ffi bench binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          # `--no-run` builds without executing; `--message-format=json`
+          # exposes the resolved binary path in the build log so we
+          # can ship just the executable to shards.
+          cargo bench --bench compare_ffi -p structured-zstd --features dict_builder \
+            --target ${{ matrix.bench.target_triple }} --no-run \
+            --message-format=json > build.log
+          bin_path=$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)
+          if [ -z "$bin_path" ] || [ ! -x "$bin_path" ]; then
+            echo "ERROR: failed to locate compare_ffi binary in cargo output" >&2
+            cat build.log | jq -r 'select(.executable != null) | "\(.target.name)  \(.executable)"' >&2
+            exit 1
+          fi
+          mkdir -p bench-binary
+          cp "$bin_path" bench-binary/compare_ffi
+          chmod +x bench-binary/compare_ffi
+          echo "Bench binary size: $(wc -c < bench-binary/compare_ffi) bytes"
+      - name: Upload bench binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-binary-${{ matrix.bench.id }}
+          path: bench-binary/
+          if-no-files-found: error
+          retention-days: 7
+
+  benchmark:
+    name: Bench ${{ matrix.bench.id }} / ${{ matrix.level }}
+    needs: [bench-build, bench-matrix]
+    timeout-minutes: ${{ matrix.bench.timeout_minutes }}
+    strategy:
+      # Matrix split target × level. The pre-built binary from
+      # `bench-build` is what each shard executes, so the runtime
+      # budget per shard is purely the criterion measurement +
+      # post-processing. `level22` on i686 is still the natural
+      # bottleneck (~20 min); every other (target, level) combo
+      # finishes well under 10 min.
+      fail-fast: false
+      matrix:
+        bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
+        level:
+          - fastest
+          - default
+          - better
+          - level4-row
+          - best
+          - level22
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        # Needed for: corpus files referenced via `env!("CARGO_MANIFEST_DIR")`
+        # inside the bench binary, the run-benchmarks.sh script, and
+        # the python post-processor.
+
+      - name: Install target runtime dependencies
+        if: matrix.bench.runtime_setup != ''
+        run: ${{ matrix.bench.runtime_setup }}
+
+      - name: Download pre-built bench binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-binary-${{ matrix.bench.id }}
+          path: bench-binary
+      - name: Mark bench binary executable
+        run: chmod +x bench-binary/compare_ffi
+
+      - name: Run benchmarks (filtered to single level)
+        env:
+          STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
+          STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
+          STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
+          STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.level }}
+          # run-benchmarks.sh: re-exec this binary instead of `cargo bench`.
+          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+        run: bash .github/scripts/run-benchmarks.sh
+
+      - name: Rename benchmark outputs for matrix artifact
+        run: |
+          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
+          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
+          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
+
+      - name: Upload benchmark shard artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-shard-${{ matrix.bench.id }}-${{ matrix.level }}
+          path: |
+            benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
+            benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
+            benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          if-no-files-found: error
+          # Intermediate inputs to `benchmark-aggregate`; match the
+          # 7-day retention used for `bench-binary-*`.
+          retention-days: 7
+
+  benchmark-aggregate:
+    name: Aggregate benchmark shards per target
+    needs: [benchmark, bench-matrix]
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -158,69 +394,54 @@ jobs:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install benchmark target
-        run: rustup target add ${{ matrix.bench.target_triple }}
-
-      - name: Install target toolchain dependencies
-        if: matrix.bench.setup_command != ''
-        run: ${{ matrix.bench.setup_command }}
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Download benchmark shard artifacts
+        uses: actions/download-artifact@v4
         with:
-          prefix-key: bench-${{ matrix.bench.id }}
+          pattern: benchmark-shard-*
+          path: benchmark-artifacts
 
-      - name: Run benchmarks
+      - name: Aggregate level shards into per-target files
         env:
-          STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
-          STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
-          STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
-          CC_x86_64_unknown_linux_musl: musl-gcc
-        run: bash .github/scripts/run-benchmarks.sh
+          AGGREGATE_TARGETS: ${{ needs.bench-matrix.outputs.ids_csv }}
+        run: python3 .github/scripts/aggregate-bench-levels.py
 
-      - name: Rename benchmark outputs for matrix artifact
-        run: |
-          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.json
-          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.md
-          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.json
-          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.md
-          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.json
-
-      - name: Upload benchmark artifacts
+      - name: Upload aggregated benchmark artifact
+        # Single combined artifact carrying per-target consolidated
+        # files. `merge-benchmarks.py` rglob's the download root so
+        # it picks them up regardless of subdir layout; this lets
+        # bench-pages download one artifact instead of one per target.
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ matrix.bench.id }}
+          name: benchmark-aggregated
           path: |
-            benchmark-results.${{ matrix.bench.id }}.json
-            benchmark-report.${{ matrix.bench.id }}.md
-            benchmark-delta.${{ matrix.bench.id }}.json
-            benchmark-delta.${{ matrix.bench.id }}.md
-            benchmark-relative.${{ matrix.bench.id }}.json
+            benchmark-results.*.json
+            benchmark-report.*.md
+            benchmark-delta.*.json
+            benchmark-delta.*.md
+            benchmark-relative.*.json
           if-no-files-found: error
+          retention-days: 7
 
-      - name: Store benchmark results
-        if: steps.bot-token.outputs.token != '' && matrix.bench.id == 'x86_64-gnu'
+      - name: Store benchmark results (x86_64-gnu only)
+        if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: "structured-zstd vs C FFI (${{ matrix.bench.id }})"
+          name: "structured-zstd vs C FFI (x86_64-gnu)"
           tool: customSmallerIsBetter
-          output-file-path: benchmark-results.${{ matrix.bench.id }}.json
+          output-file-path: benchmark-results.x86_64-gnu.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          # Keep matrix execution parallel; persist benchmark baseline only for one
-          # canonical target to avoid concurrent gh-pages writes from matrix jobs.
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
-          comment-on-alert: ${{ matrix.bench.id == 'x86_64-gnu' }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
           alert-comment-cc-users: "@polaz"
-          # GitHub-hosted runners are noisy across runs; keep perf checks advisory on PRs.
           alert-threshold: "130%"
           fail-threshold: "160%"
-          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
+          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
   benchmark-pages:
     name: Publish benchmark pages payloads
-    needs: benchmark
+    needs: benchmark-aggregate
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 20
     runs-on: ubuntu-latest
@@ -243,10 +464,15 @@ jobs:
           token: ${{ steps.bot-token.outputs.token }}
           path: gh-pages
 
-      - name: Download benchmark matrix artifacts
-        uses: actions/download-artifact@v4
+      # Only the aggregated per-target files feed merge-benchmarks.py.
+      # The level shards (benchmark-shard-*) are intermediate inputs
+      # to `benchmark-aggregate` and would otherwise pollute
+      # merge-benchmarks.py's per-target name extraction with
+      # `<target>.<level>` keys, so we download just the single
+      # combined `benchmark-aggregated` artifact here.
+      - uses: actions/download-artifact@v4
         with:
-          pattern: benchmark-*
+          name: benchmark-aggregated
           path: benchmark-artifacts
 
       - name: Merge relative/delta payloads

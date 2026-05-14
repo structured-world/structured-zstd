@@ -21,8 +21,6 @@
 //! (structural split). No behaviour change — types, constants, and
 //! method names are identical to the pre-extraction monolith.
 
-use super::strategy::HcParseMode;
-
 pub(crate) const HC_MAX_LIT: usize = 255;
 pub(crate) const HC_MAX_LL: usize = 35;
 pub(crate) const HC_MAX_ML: usize = 52;
@@ -432,37 +430,31 @@ pub(crate) struct HcOptimalCostProfile {
 }
 
 impl HcOptimalCostProfile {
-    pub(crate) fn for_mode(mode: HcParseMode, pass2: bool) -> Self {
-        match mode {
-            HcParseMode::Lazy2 => Self {
-                max_chain_depth: 8,
-                sufficient_match_len: 32,
-                accurate: false,
-                favor_small_offsets: true,
-            },
-            HcParseMode::BtOpt => Self {
-                max_chain_depth: 32,
-                sufficient_match_len: usize::MAX,
-                accurate: false,
-                favor_small_offsets: true,
-            },
-            HcParseMode::BtUltra => Self {
-                max_chain_depth: 32,
-                sufficient_match_len: usize::MAX,
-                accurate: true,
-                favor_small_offsets: false,
-            },
-            HcParseMode::BtUltra2 => {
-                let _ = pass2;
-                Self {
-                    max_chain_depth: 512,
-                    sufficient_match_len: usize::MAX,
-                    accurate: true,
-                    // Donor opt2 path doesn't apply the small-offset
-                    // decompression-speed handicap.
-                    favor_small_offsets: false,
-                }
-            }
+    /// Build the optimal-parser cost profile for a compile-time
+    /// strategy. Every field is read from `S`'s associated consts so
+    /// the optimiser materialises the literal at codegen time
+    /// (no runtime branch). Every production call site goes through
+    /// this entry — there is no runtime peer.
+    ///
+    /// The `debug_assert!(S::USE_BT, …)` enforces that
+    /// `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are only consulted
+    /// for BT-walking strategies, since non-BT strategies
+    /// (`Fast` / `Dfast` / `Greedy` / `Lazy`) carry placeholder
+    /// values for those consts — see the `MAX_CHAIN_DEPTH` doc
+    /// comment on each of those strategy types.
+    #[inline]
+    pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
+        debug_assert!(
+            S::USE_BT,
+            "HcOptimalCostProfile::const_for_strategy::<S>() called with a \
+             non-BT strategy (S::USE_BT == false). The optimal-parser cost \
+             profile is only meaningful when the BT walker is active.",
+        );
+        Self {
+            max_chain_depth: S::MAX_CHAIN_DEPTH,
+            sufficient_match_len: S::SUFFICIENT_MATCH_LEN,
+            accurate: S::ACCURATE_PRICE,
+            favor_small_offsets: S::FAVOR_SMALL_OFFSETS,
         }
     }
 
