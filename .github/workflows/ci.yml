@@ -39,7 +39,11 @@ jobs:
     needs: lint
     timeout-minutes: 15
     strategy:
-      fail-fast: true
+      # Each OS hits its own runner-image regressions (macos-latest currently
+      # ships Homebrew rustup without `cargo`/`rustc` shims under
+      # `~/.cargo/bin`, so plain `cargo …` resolves to `rustup-init`). Run
+      # every OS so one glitchy image doesn't mask the others.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -52,9 +56,13 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo
       - name: Test
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+        # `rustup run stable cargo` instead of bare `cargo` so the dispatch
+        # works on macos-latest where the Homebrew rustup install omits the
+        # `~/.cargo/bin/cargo` proxy shim. No-op on Linux / Windows runners
+        # whose `cargo` proxy is intact.
+        run: rustup run stable cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
       - name: Doc tests
-        run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
+        run: rustup run stable cargo test --doc -p structured-zstd --features hash,std,dict_builder
 
   cross-i686:
     needs: lint
