@@ -126,6 +126,65 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  fuzz:
+    # Short-budget libFuzzer smoke run per target. The repo already
+    # ships a regression corpus in `zstd/fuzz/artifacts/`; cargo-fuzz
+    # replays it first (any old crash that resurfaces fails the
+    # job), then runs `-max_total_time` seconds of fresh fuzzing on
+    # top. Five targets run in parallel, so the overall wall-clock
+    # stays under ~5 min — comparable to a single bench shard.
+    name: Fuzz smoke (${{ matrix.target }})
+    needs: lint
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decode
+          - encode
+          - interop
+          - huff0
+          - fse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fuzz-${{ matrix.target }}
+          workspaces: zstd/fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Replay regression corpus
+        # Drive the existing crash artifacts through the target so
+        # any reintroduction of a previously-fixed bug fails CI on
+        # the same input that originally surfaced it.
+        working-directory: zstd/fuzz
+        run: |
+          target=${{ matrix.target }}
+          if [ -d "artifacts/$target" ] && [ -n "$(ls artifacts/$target 2>/dev/null)" ]; then
+            echo "Replaying $(ls artifacts/$target | wc -l) regression artifacts for $target"
+            cargo fuzz run "$target" artifacts/"$target"/*
+          else
+            echo "No regression artifacts for $target — skipping replay"
+          fi
+      - name: Fuzz ${{ matrix.target }} (90s budget)
+        working-directory: zstd/fuzz
+        # `-max_total_time` is libFuzzer's own time cap; on top of
+        # the GitHub Actions timeout-minutes it gives us a hard
+        # ceiling even if a target wedges in setup.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=90 -timeout=30
+      - name: Upload new crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: zstd/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
   bench-build:
     # Build the criterion `compare_ffi` binary once per target. Every
     # downstream bench shard (target × level) downloads the binary
