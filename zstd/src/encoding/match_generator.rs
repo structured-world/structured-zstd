@@ -1173,10 +1173,15 @@ macro_rules! bt_insert_step_no_rebase_body {
         } else {
             0
         };
-        // `match_end_abs` is initialized to `abs_pos + 9` and only ever
-        // monotonically increased by `candidate_end` (also `> abs_pos`).
-        // So `match_end_abs > abs_pos + 8` is invariant — raw subtraction
-        // is safe.
+        // `match_end_abs` is initialized to `abs_pos + 9` and is only
+        // reassigned inside the `candidate_end > match_end_abs` branch
+        // above. So even though an individual `candidate_end =
+        // candidate_abs + match_len` can land below `abs_pos` (the
+        // candidate sits earlier in history and the match runs short),
+        // the variable itself never drops below its initial value.
+        // That gives `match_end_abs ≥ abs_pos + 9 > abs_pos + 8` as a
+        // loop-wide invariant, so the raw subtraction below cannot
+        // underflow.
         speed_positions.max(match_end_abs - ($abs_pos + 8))
     }};
 }
