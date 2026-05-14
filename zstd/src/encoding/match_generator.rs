@@ -40,7 +40,6 @@ use super::opt::types::{
 };
 use super::row::RowMatchGenerator;
 use super::simple::{MatchGenerator, SuffixStore};
-use super::strategy::HcParseMode;
 #[cfg(all(
     test,
     feature = "std",
@@ -102,10 +101,10 @@ const HC_TARGET_LEN: usize = 48;
 // MAX_HC_SEARCH_DEPTH moved to encoding::hc alongside chain_candidates.
 use super::hc::MAX_HC_SEARCH_DEPTH;
 
-// `HcParseMode` lives in `crate::encoding::strategy` so the extracted
-// `cost_model::HcOptimalCostProfile::for_mode` can branch on it without
-// importing back from this monolith — see the use statement at the top
-// of the file.
+// `Strategy` and `StrategyTag` live in `crate::encoding::strategy`.
+// The driver carries a `StrategyTag` field set at `reset()` and
+// dispatches each block into a monomorphised `compress_block::<S>`
+// per concrete strategy.
 
 /// Bundled tuning knobs for the hash-chain matcher. Using a typed config
 /// instead of positional `usize` args eliminates parameter-order hazards.
@@ -115,7 +114,6 @@ struct HcConfig {
     chain_log: usize,
     search_depth: usize,
     target_len: usize,
-    parse_mode: HcParseMode,
 }
 
 #[derive(Copy, Clone)]
@@ -131,7 +129,6 @@ const HC_CONFIG: HcConfig = HcConfig {
     chain_log: HC_CHAIN_LOG,
     search_depth: HC_SEARCH_DEPTH,
     target_len: HC_TARGET_LEN,
-    parse_mode: HcParseMode::Lazy2,
 };
 
 /// Best-level: deeper search, larger tables, higher target length.
@@ -140,7 +137,6 @@ const BEST_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 20,
     search_depth: 32,
     target_len: 128,
-    parse_mode: HcParseMode::Lazy2,
 };
 
 const BTOPT_HC_CONFIG: HcConfig = HcConfig {
@@ -148,7 +144,6 @@ const BTOPT_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 22,
     search_depth: 32,
     target_len: 256,
-    parse_mode: HcParseMode::BtOpt,
 };
 
 const BTULTRA_HC_CONFIG: HcConfig = HcConfig {
@@ -156,7 +151,6 @@ const BTULTRA_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 23,
     search_depth: 32,
     target_len: 256,
-    parse_mode: HcParseMode::BtUltra,
 };
 
 const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
@@ -164,7 +158,6 @@ const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 24,
     search_depth: 512,
     target_len: 256,
-    parse_mode: HcParseMode::BtUltra2,
 };
 
 const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
@@ -172,7 +165,6 @@ const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
     chain_log: 27,
     search_depth: 512,
     target_len: 999,
-    parse_mode: HcParseMode::BtUltra2,
 };
 
 const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
@@ -180,7 +172,6 @@ const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
     chain_log: 19,
     search_depth: 1 << 13,
     target_len: 999,
-    parse_mode: HcParseMode::BtUltra2,
 };
 
 const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
@@ -188,7 +179,6 @@ const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
     chain_log: 18,
     search_depth: 1 << 11,
     target_len: 999,
-    parse_mode: HcParseMode::BtUltra2,
 };
 
 const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
@@ -196,7 +186,6 @@ const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
     chain_log: 15,
     search_depth: 1 << 10,
     target_len: 999,
-    parse_mode: HcParseMode::BtUltra2,
 };
 
 const ROW_CONFIG: RowConfig = RowConfig {
@@ -209,7 +198,7 @@ const ROW_CONFIG: RowConfig = RowConfig {
 /// Resolved tuning parameters for a compression level.
 #[derive(Copy, Clone)]
 struct LevelParams {
-    backend: MatcherBackend,
+    backend: super::strategy::BackendTag,
     window_log: u8,
     hash_fill_step: usize,
     lazy_depth: u8,
@@ -238,28 +227,28 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 const LEVEL_TABLE: [LevelParams; 22] = [
     // Lvl  Strategy       wlog  step  lazy  HC config                                   row config
     // ---  -------------- ----  ----  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { backend: MatcherBackend::Simple,    window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 3 */ LevelParams { backend: MatcherBackend::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { backend: MatcherBackend::Row,       window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /* 6 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { backend: MatcherBackend::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96,  parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
-    /*12 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192, parse_mode: HcParseMode::Lazy2 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*17 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*18 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*20 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*21 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*22 */ LevelParams { backend: MatcherBackend::HashChain, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
+    /* 1 */ LevelParams { backend: super::strategy::BackendTag::Simple,    window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 2 */ LevelParams { backend: super::strategy::BackendTag::Dfast,     window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 3 */ LevelParams { backend: super::strategy::BackendTag::Dfast,     window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 4 */ LevelParams { backend: super::strategy::BackendTag::Row,       window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 5 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
+    /*12 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*16 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*17 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*18 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*19 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*20 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*21 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*22 */ LevelParams { backend: super::strategy::BackendTag::HashChain, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -297,14 +286,14 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // For HC backend: also cap hash_log and chain_log so tables are
     // proportional to the source, avoiding multi-MB allocations for
     // tiny inputs.
-    if params.backend == MatcherBackend::HashChain {
+    if params.backend == super::strategy::BackendTag::HashChain {
         if (src_log + 2) < params.hc.hash_log as u8 {
             params.hc.hash_log = (src_log + 2) as usize;
         }
         if (src_log + 1) < params.hc.chain_log as u8 {
             params.hc.chain_log = (src_log + 1) as usize;
         }
-    } else if params.backend == MatcherBackend::Row {
+    } else if params.backend == super::strategy::BackendTag::Row {
         let max_window_size = 1usize << params.window_log;
         params.row.hash_bits = row_hash_bits_for_window(max_window_size);
     }
@@ -338,7 +327,7 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
         hc.chain_log = hc.chain_log.min(adjusted_table_log);
     }
     LevelParams {
-        backend: MatcherBackend::HashChain,
+        backend: super::strategy::BackendTag::HashChain,
         window_log,
         hash_fill_step: 1,
         lazy_depth: 2,
@@ -355,7 +344,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     }
     let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
-            backend: MatcherBackend::Simple,
+            backend: super::strategy::BackendTag::Simple,
             window_log: 17,
             hash_fill_step: 1,
             lazy_depth: 0,
@@ -381,7 +370,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                     (n.saturating_abs() as usize).min((-CompressionLevel::MIN_LEVEL) as usize);
                 let step = (acceleration + 3).min(128);
                 LevelParams {
-                    backend: MatcherBackend::Simple,
+                    backend: super::strategy::BackendTag::Simple,
                     window_log: 17,
                     hash_fill_step: step,
                     lazy_depth: 0,
@@ -398,14 +387,6 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum MatcherBackend {
-    Simple,
-    Dfast,
-    Row,
-    HashChain,
-}
-
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
     vec_pool: Vec<Vec<u8>>,
@@ -414,7 +395,7 @@ pub struct MatchGeneratorDriver {
     dfast_match_generator: Option<DfastMatchGenerator>,
     row_match_generator: Option<RowMatchGenerator>,
     hc_match_generator: Option<HcMatchGenerator>,
-    active_backend: MatcherBackend,
+    active_backend: super::strategy::BackendTag,
     // Compile-time strategy tag resolved at `reset()` from the
     // requested `CompressionLevel`. Stays in lock-step with
     // `active_backend` (a `debug_assert!` in `reset()` enforces the
@@ -448,7 +429,7 @@ impl MatchGeneratorDriver {
             dfast_match_generator: None,
             row_match_generator: None,
             hc_match_generator: None,
-            active_backend: MatcherBackend::Simple,
+            active_backend: super::strategy::BackendTag::Simple,
             strategy_tag: super::strategy::StrategyTag::Fast,
             slice_size,
             base_slice_size: slice_size,
@@ -505,21 +486,21 @@ impl MatchGeneratorDriver {
         }
         self.dictionary_retained_budget -= reclaimed;
         match self.active_backend {
-            MatcherBackend::Simple => {
+            super::strategy::BackendTag::Simple => {
                 self.match_generator.max_window_size = self
                     .match_generator
                     .max_window_size
                     .saturating_sub(reclaimed);
             }
-            MatcherBackend::Dfast => {
+            super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
-            MatcherBackend::Row => {
+            super::strategy::BackendTag::Row => {
                 let matcher = self.row_matcher_mut();
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
-            MatcherBackend::HashChain => {
+            super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
                 matcher.table.max_window_size =
                     matcher.table.max_window_size.saturating_sub(reclaimed);
@@ -531,7 +512,7 @@ impl MatchGeneratorDriver {
         loop {
             let mut evicted_bytes = 0usize;
             match self.active_backend {
-                MatcherBackend::Simple => {
+                super::strategy::BackendTag::Simple => {
                     let vec_pool = &mut self.vec_pool;
                     let suffix_pool = &mut self.suffix_pool;
                     self.match_generator.reserve(0, |mut data, mut suffixes| {
@@ -543,7 +524,7 @@ impl MatchGeneratorDriver {
                         suffix_pool.push(suffixes);
                     });
                 }
-                MatcherBackend::Dfast => {
+                super::strategy::BackendTag::Dfast => {
                     let mut retired = Vec::new();
                     self.dfast_matcher_mut().trim_to_window(|data| {
                         evicted_bytes += data.len();
@@ -554,7 +535,7 @@ impl MatchGeneratorDriver {
                         self.vec_pool.push(data);
                     }
                 }
-                MatcherBackend::Row => {
+                super::strategy::BackendTag::Row => {
                     let mut retired = Vec::new();
                     self.row_matcher_mut().trim_to_window(|data| {
                         evicted_bytes += data.len();
@@ -565,7 +546,7 @@ impl MatchGeneratorDriver {
                         self.vec_pool.push(data);
                     }
                 }
-                MatcherBackend::HashChain => {
+                super::strategy::BackendTag::HashChain => {
                     let mut retired = Vec::new();
                     self.hc_matcher_mut().table.trim_to_window(|data| {
                         evicted_bytes += data.len();
@@ -586,10 +567,16 @@ impl MatchGeneratorDriver {
 
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.skip_matching_with_hint(Some(false)),
-            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
-            MatcherBackend::Row => self.row_matcher_mut().skip_matching_with_hint(Some(false)),
-            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(Some(false)),
+            super::strategy::BackendTag::Simple => {
+                self.match_generator.skip_matching_with_hint(Some(false))
+            }
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
+            super::strategy::BackendTag::Row => {
+                self.row_matcher_mut().skip_matching_with_hint(Some(false))
+            }
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().skip_matching(Some(false))
+            }
         }
     }
 }
@@ -611,7 +598,7 @@ impl Matcher for MatchGeneratorDriver {
         self.dictionary_retained_budget = 0;
         if self.active_backend != params.backend {
             match self.active_backend {
-                MatcherBackend::Simple => {
+                super::strategy::BackendTag::Simple => {
                     let vec_pool = &mut self.vec_pool;
                     let suffix_pool = &mut self.suffix_pool;
                     self.match_generator.reset(|mut data, mut suffixes| {
@@ -622,7 +609,7 @@ impl Matcher for MatchGeneratorDriver {
                         suffix_pool.push(suffixes);
                     });
                 }
-                MatcherBackend::Dfast => {
+                super::strategy::BackendTag::Dfast => {
                     if let Some(dfast) = self.dfast_match_generator.as_mut() {
                         let vec_pool = &mut self.vec_pool;
                         dfast.reset(|mut data| {
@@ -631,7 +618,7 @@ impl Matcher for MatchGeneratorDriver {
                         });
                     }
                 }
-                MatcherBackend::Row => {
+                super::strategy::BackendTag::Row => {
                     if let Some(row) = self.row_match_generator.as_mut() {
                         row.row_heads = Vec::new();
                         row.row_positions = Vec::new();
@@ -643,7 +630,7 @@ impl Matcher for MatchGeneratorDriver {
                         });
                     }
                 }
-                MatcherBackend::HashChain => {
+                super::strategy::BackendTag::HashChain => {
                     if let Some(hc) = self.hc_match_generator.as_mut() {
                         // Release oversized tables when switching away from
                         // HashChain so Best's larger allocations don't persist.
@@ -668,24 +655,24 @@ impl Matcher for MatchGeneratorDriver {
         self.active_backend = params.backend;
         self.strategy_tag = super::strategy::StrategyTag::for_compression_level(level);
         // Lock-step invariant: the compile-time strategy tag's backend
-        // must agree with the runtime `MatcherBackend` chosen by
+        // must agree with the runtime `BackendTag` chosen by
         // `resolve_level_params`. This is what lets future commits
         // dispatch on `self.strategy_tag` and trust the existing
         // backend storage / setup paths unchanged.
         debug_assert_eq!(
             self.strategy_tag.backend(),
             match self.active_backend {
-                MatcherBackend::Simple => super::strategy::BackendTag::Simple,
-                MatcherBackend::Dfast => super::strategy::BackendTag::Dfast,
-                MatcherBackend::Row => super::strategy::BackendTag::Row,
-                MatcherBackend::HashChain => super::strategy::BackendTag::HashChain,
+                super::strategy::BackendTag::Simple => super::strategy::BackendTag::Simple,
+                super::strategy::BackendTag::Dfast => super::strategy::BackendTag::Dfast,
+                super::strategy::BackendTag::Row => super::strategy::BackendTag::Row,
+                super::strategy::BackendTag::HashChain => super::strategy::BackendTag::HashChain,
             },
             "strategy_tag backend drift vs active_backend after reset()",
         );
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         match self.active_backend {
-            MatcherBackend::Simple => {
+            super::strategy::BackendTag::Simple => {
                 let vec_pool = &mut self.vec_pool;
                 let suffix_pool = &mut self.suffix_pool;
                 self.match_generator.max_window_size = max_window_size;
@@ -698,7 +685,7 @@ impl Matcher for MatchGeneratorDriver {
                     suffix_pool.push(suffixes);
                 });
             }
-            MatcherBackend::Dfast => {
+            super::strategy::BackendTag::Dfast => {
                 let dfast = self
                     .dfast_match_generator
                     .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
@@ -721,7 +708,7 @@ impl Matcher for MatchGeneratorDriver {
                     vec_pool.push(data);
                 });
             }
-            MatcherBackend::Row => {
+            super::strategy::BackendTag::Row => {
                 let row = self
                     .row_match_generator
                     .get_or_insert_with(|| RowMatchGenerator::new(max_window_size));
@@ -737,13 +724,13 @@ impl Matcher for MatchGeneratorDriver {
                     vec_pool.push(data);
                 });
             }
-            MatcherBackend::HashChain => {
+            super::strategy::BackendTag::HashChain => {
                 let hc = self
                     .hc_match_generator
                     .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
-                hc.configure(params.hc, params.window_log);
+                hc.configure(params.hc, self.strategy_tag, params.window_log);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -755,10 +742,12 @@ impl Matcher for MatchGeneratorDriver {
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.offset_hist = offset_hist,
-            MatcherBackend::Dfast => self.dfast_matcher_mut().offset_hist = offset_hist,
-            MatcherBackend::Row => self.row_matcher_mut().offset_hist = offset_hist,
-            MatcherBackend::HashChain => {
+            super::strategy::BackendTag::Simple => self.match_generator.offset_hist = offset_hist,
+            super::strategy::BackendTag::Dfast => {
+                self.dfast_matcher_mut().offset_hist = offset_hist
+            }
+            super::strategy::BackendTag::Row => self.row_matcher_mut().offset_hist = offset_hist,
+            super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
                 matcher.table.offset_hist = offset_hist;
                 matcher.table.mark_dictionary_primed();
@@ -773,23 +762,23 @@ impl Matcher for MatchGeneratorDriver {
         // itself exceeds the live window size.
         let retained_dict_budget = dict_content.len();
         match self.active_backend {
-            MatcherBackend::Simple => {
+            super::strategy::BackendTag::Simple => {
                 self.match_generator.max_window_size = self
                     .match_generator
                     .max_window_size
                     .saturating_add(retained_dict_budget);
             }
-            MatcherBackend::Dfast => {
+            super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
                 matcher.max_window_size =
                     matcher.max_window_size.saturating_add(retained_dict_budget);
             }
-            MatcherBackend::Row => {
+            super::strategy::BackendTag::Row => {
                 let matcher = self.row_matcher_mut();
                 matcher.max_window_size =
                     matcher.max_window_size.saturating_add(retained_dict_budget);
             }
-            MatcherBackend::HashChain => {
+            super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
                 matcher.table.max_window_size = matcher
                     .table
@@ -804,8 +793,10 @@ impl Matcher for MatchGeneratorDriver {
         // backfill_boundary_positions re-visits tail positions once the
         // next slice extends history, but cannot hash <4 byte fragments.
         let min_primed_tail = match self.active_backend {
-            MatcherBackend::Simple => MIN_MATCH_LEN,
-            MatcherBackend::Dfast | MatcherBackend::Row | MatcherBackend::HashChain => 4,
+            super::strategy::BackendTag::Simple => MIN_MATCH_LEN,
+            super::strategy::BackendTag::Dfast
+            | super::strategy::BackendTag::Row
+            | super::strategy::BackendTag::HashChain => 4,
         };
         while start < dict_content.len() {
             let end = (start + self.slice_size).min(dict_content.len());
@@ -824,25 +815,25 @@ impl Matcher for MatchGeneratorDriver {
         let uncommitted_tail_budget = retained_dict_budget.saturating_sub(committed_dict_budget);
         if uncommitted_tail_budget > 0 {
             match self.active_backend {
-                MatcherBackend::Simple => {
+                super::strategy::BackendTag::Simple => {
                     self.match_generator.max_window_size = self
                         .match_generator
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
-                MatcherBackend::Dfast => {
+                super::strategy::BackendTag::Dfast => {
                     let matcher = self.dfast_matcher_mut();
                     matcher.max_window_size = matcher
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
-                MatcherBackend::Row => {
+                super::strategy::BackendTag::Row => {
                     let matcher = self.row_matcher_mut();
                     matcher.max_window_size = matcher
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
-                MatcherBackend::HashChain => {
+                super::strategy::BackendTag::HashChain => {
                     let matcher = self.hc_matcher_mut();
                     matcher.table.max_window_size = matcher
                         .table
@@ -856,7 +847,7 @@ impl Matcher for MatchGeneratorDriver {
                 .dictionary_retained_budget
                 .saturating_add(committed_dict_budget);
         }
-        if self.active_backend == MatcherBackend::HashChain {
+        if self.active_backend == super::strategy::BackendTag::HashChain {
             self.hc_matcher_mut()
                 .table
                 .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
@@ -870,7 +861,7 @@ impl Matcher for MatchGeneratorDriver {
         ml: Option<&crate::fse::fse_encoder::FSETable>,
         of: Option<&crate::fse::fse_encoder::FSETable>,
     ) {
-        if self.active_backend == MatcherBackend::HashChain {
+        if self.active_backend == super::strategy::BackendTag::HashChain {
             self.hc_matcher_mut()
                 .seed_dictionary_entropy(huff, ll, ml, of);
         }
@@ -895,16 +886,18 @@ impl Matcher for MatchGeneratorDriver {
 
     fn get_last_space(&mut self) -> &[u8] {
         match self.active_backend {
-            MatcherBackend::Simple => self.match_generator.window.last().unwrap().data.as_slice(),
-            MatcherBackend::Dfast => self.dfast_matcher().get_last_space(),
-            MatcherBackend::Row => self.row_matcher().get_last_space(),
-            MatcherBackend::HashChain => self.hc_matcher().table.get_last_space(),
+            super::strategy::BackendTag::Simple => {
+                self.match_generator.window.last().unwrap().data.as_slice()
+            }
+            super::strategy::BackendTag::Dfast => self.dfast_matcher().get_last_space(),
+            super::strategy::BackendTag::Row => self.row_matcher().get_last_space(),
+            super::strategy::BackendTag::HashChain => self.hc_matcher().table.get_last_space(),
         }
     }
 
     fn commit_space(&mut self, space: Vec<u8>) {
         match self.active_backend {
-            MatcherBackend::Simple => {
+            super::strategy::BackendTag::Simple => {
                 let vec_pool = &mut self.vec_pool;
                 let mut evicted_bytes = 0usize;
                 let suffixes = match self.suffix_pool.pop() {
@@ -924,7 +917,7 @@ impl Matcher for MatchGeneratorDriver {
                 self.retire_dictionary_budget(evicted_bytes);
                 self.trim_after_budget_retire();
             }
-            MatcherBackend::Dfast => {
+            super::strategy::BackendTag::Dfast => {
                 let vec_pool = &mut self.vec_pool;
                 let mut evicted_bytes = 0usize;
                 self.dfast_match_generator
@@ -938,7 +931,7 @@ impl Matcher for MatchGeneratorDriver {
                 self.retire_dictionary_budget(evicted_bytes);
                 self.trim_after_budget_retire();
             }
-            MatcherBackend::Row => {
+            super::strategy::BackendTag::Row => {
                 let vec_pool = &mut self.vec_pool;
                 let mut evicted_bytes = 0usize;
                 self.row_match_generator
@@ -952,7 +945,7 @@ impl Matcher for MatchGeneratorDriver {
                 self.retire_dictionary_budget(evicted_bytes);
                 self.trim_after_budget_retire();
             }
-            MatcherBackend::HashChain => {
+            super::strategy::BackendTag::HashChain => {
                 let vec_pool = &mut self.vec_pool;
                 let mut evicted_bytes = 0usize;
                 self.hc_match_generator
@@ -998,14 +991,18 @@ impl Matcher for MatchGeneratorDriver {
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend {
-            MatcherBackend::Simple => self
+            super::strategy::BackendTag::Simple => self
                 .match_generator
                 .skip_matching_with_hint(incompressible_hint),
-            MatcherBackend::Dfast => self.dfast_matcher_mut().skip_matching(incompressible_hint),
-            MatcherBackend::Row => self
+            super::strategy::BackendTag::Dfast => {
+                self.dfast_matcher_mut().skip_matching(incompressible_hint)
+            }
+            super::strategy::BackendTag::Row => self
                 .row_matcher_mut()
                 .skip_matching_with_hint(incompressible_hint),
-            MatcherBackend::HashChain => self.hc_matcher_mut().skip_matching(incompressible_hint),
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().skip_matching(incompressible_hint)
+            }
         }
     }
 }
@@ -1085,7 +1082,6 @@ struct HcMatchGenerator {
     /// present — BT modes still consult `hc.search_depth` for repcode
     /// probing and chain candidate enumeration.
     hc: super::hc::HcMatcher,
-    parse_mode: HcParseMode,
     /// Backend discriminator. [`HcBackend::Hc`] is zero-sized for the
     /// lazy / lazy2 path so HC-only generators don't carry the BT
     /// optimal-parser scratch buffers. [`HcBackend::Bt`] holds the
@@ -2596,15 +2592,20 @@ impl HcMatchGenerator {
         Self {
             table: super::match_table::storage::MatchTable::new(max_window_size),
             hc: super::hc::HcMatcher::new(2, HC_SEARCH_DEPTH, HC_TARGET_LEN),
-            parse_mode: HcParseMode::Lazy2,
             // Default to the zero-sized HC backend; `configure()` swaps
-            // in a `BtMatcher` only when an optimal parse mode lands.
+            // in a `BtMatcher` only when an optimal strategy lands.
             backend: HcBackend::Hc,
         }
     }
 
-    fn configure(&mut self, config: HcConfig, window_log: u8) {
-        let next_hash3_log = if config.parse_mode == HcParseMode::BtUltra2 {
+    fn configure(&mut self, config: HcConfig, tag: super::strategy::StrategyTag, window_log: u8) {
+        use super::strategy::StrategyTag;
+        let is_btultra2 = tag == StrategyTag::BtUltra2;
+        let uses_bt = matches!(
+            tag,
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+        );
+        let next_hash3_log = if is_btultra2 {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0
@@ -2615,25 +2616,18 @@ impl HcMatchGenerator {
         self.table.hash_log = config.hash_log;
         self.table.chain_log = config.chain_log;
         self.table.hash3_log = next_hash3_log;
-        self.hc.search_depth = if matches!(
-            config.parse_mode,
-            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
-        ) {
+        self.hc.search_depth = if uses_bt {
             config.search_depth
         } else {
             config.search_depth.min(MAX_HC_SEARCH_DEPTH)
         };
         self.hc.target_len = config.target_len;
-        self.parse_mode = config.parse_mode;
-        // Stage D: mirror parse_mode flags + HC search depth onto MatchTable
+        // Mirror strategy-derived flags + HC search depth onto MatchTable
         // so the BT walker and rebase machinery can read them directly
         // without dispatching back through HcMatchGenerator.
         self.table.search_depth = self.hc.search_depth;
-        self.table.is_btultra2 = matches!(config.parse_mode, HcParseMode::BtUltra2);
-        self.table.uses_bt = matches!(
-            config.parse_mode,
-            HcParseMode::BtOpt | HcParseMode::BtUltra | HcParseMode::BtUltra2
-        );
+        self.table.is_btultra2 = is_btultra2;
+        self.table.uses_bt = uses_bt;
         // Stage D: promote the backend discriminator. HC modes drop the
         // BT scratch buffers entirely; switching back into a BT mode
         // allocates a fresh `BtMatcher` on demand.
@@ -2683,21 +2677,27 @@ impl HcMatchGenerator {
     /// callers reach the inner loops through
     /// [`Self::start_matching_strategy`] / [`MatchGeneratorDriver::compress_block`]
     /// which pick the lazy / optimal arm from `S::USE_BT` at
-    /// monomorphisation time. Removed alongside `parse_mode` in the
-    /// final cleanup commit.
+    /// monomorphisation time.
     #[cfg(test)]
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         use super::strategy;
-        match self.parse_mode {
-            HcParseMode::Lazy2 => self.start_matching_lazy(&mut handle_sequence),
-            HcParseMode::BtOpt => {
-                self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
-            }
-            HcParseMode::BtUltra => {
-                self.start_matching_optimal::<strategy::BtUltra>(&mut handle_sequence)
-            }
-            HcParseMode::BtUltra2 => {
+        // Tests don't carry a strategy tag — pick one from runtime
+        // table flags (the same fields production sets via configure)
+        // so the const-generic dispatch still routes correctly.
+        match (
+            self.table.uses_bt,
+            self.table.is_btultra2,
+            self.table.hash3_log != 0,
+        ) {
+            (false, _, _) => self.start_matching_lazy(&mut handle_sequence),
+            (true, true, _) => {
                 self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
+            }
+            (true, false, _) => {
+                // BtOpt vs BtUltra is distinguished by the accurate
+                // flag — read from MatchTable so artificial test
+                // setups can route either way.
+                self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
             }
         }
     }
@@ -2718,9 +2718,9 @@ impl HcMatchGenerator {
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
         debug_assert_eq!(
-            self.parse_mode,
-            S::PARSE_MODE,
-            "Strategy::PARSE_MODE disagrees with runtime parse_mode at HC dispatch"
+            self.table.uses_bt,
+            S::USE_BT,
+            "Strategy::USE_BT disagrees with runtime table.uses_bt at HC dispatch"
         );
         if S::USE_BT {
             self.start_matching_optimal::<S>(handle_sequence)
@@ -2886,7 +2886,7 @@ impl HcMatchGenerator {
         // The seed pass is BtUltra2-exclusive by name (`is_btultra2()`
         // gates the only call site), so pin S to BtUltra2 here.
         type S = super::strategy::BtUltra2;
-        let seed_profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+        let seed_profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
@@ -3631,7 +3631,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Default);
-    assert_eq!(driver.active_backend, MatcherBackend::Dfast);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Dfast);
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut first = driver.get_next_space();
@@ -3672,7 +3672,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
-    assert_eq!(driver.active_backend, MatcherBackend::Row);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Row);
 }
 
 #[test]
@@ -3687,10 +3687,10 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
             "strategy_tag wrong for {level:?}"
         );
         let runtime_backend = match driver.active_backend {
-            MatcherBackend::Simple => BackendTag::Simple,
-            MatcherBackend::Dfast => BackendTag::Dfast,
-            MatcherBackend::Row => BackendTag::Row,
-            MatcherBackend::HashChain => BackendTag::HashChain,
+            super::strategy::BackendTag::Simple => BackendTag::Simple,
+            super::strategy::BackendTag::Dfast => BackendTag::Dfast,
+            super::strategy::BackendTag::Row => BackendTag::Row,
+            super::strategy::BackendTag::HashChain => BackendTag::HashChain,
         };
         assert_eq!(
             driver.strategy_tag.backend(),
@@ -3715,31 +3715,34 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
 }
 
 #[test]
-fn level_16_17_use_btopt_parse_mode() {
+fn level_16_17_map_to_btopt_strategy() {
+    use super::strategy::{BackendTag, StrategyTag};
     let p16 = resolve_level_params(CompressionLevel::Level(16), None);
     let p17 = resolve_level_params(CompressionLevel::Level(17), None);
-    assert_eq!(p16.backend, MatcherBackend::HashChain);
-    assert_eq!(p17.backend, MatcherBackend::HashChain);
-    assert_eq!(p16.hc.parse_mode, HcParseMode::BtOpt);
-    assert_eq!(p17.hc.parse_mode, HcParseMode::BtOpt);
+    assert_eq!(p16.backend, BackendTag::HashChain);
+    assert_eq!(p17.backend, BackendTag::HashChain);
+    assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
+    assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
 }
 
 #[test]
-fn level_18_19_use_btultra_parse_mode() {
+fn level_18_19_map_to_btultra_strategy() {
+    use super::strategy::{BackendTag, StrategyTag};
     let p18 = resolve_level_params(CompressionLevel::Level(18), None);
     let p19 = resolve_level_params(CompressionLevel::Level(19), None);
-    assert_eq!(p18.backend, MatcherBackend::HashChain);
-    assert_eq!(p19.backend, MatcherBackend::HashChain);
-    assert_eq!(p18.hc.parse_mode, HcParseMode::BtUltra);
-    assert_eq!(p19.hc.parse_mode, HcParseMode::BtUltra);
+    assert_eq!(p18.backend, BackendTag::HashChain);
+    assert_eq!(p19.backend, BackendTag::HashChain);
+    assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
+    assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
 }
 
 #[test]
-fn level_20_22_use_btultra2_parse_mode() {
+fn level_20_22_map_to_btultra2_strategy() {
+    use super::strategy::{BackendTag, StrategyTag};
     for level in 20..=22 {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
-        assert_eq!(params.backend, MatcherBackend::HashChain);
-        assert_eq!(params.hc.parse_mode, HcParseMode::BtUltra2);
+        assert_eq!(params.backend, BackendTag::HashChain);
+        assert_eq!(StrategyTag::for_level(level as u8), StrategyTag::BtUltra2);
     }
 }
 
@@ -3796,17 +3799,29 @@ fn level22_small_source_size_hint_matches_donor_cparams() {
 #[test]
 fn level22_small_source_uses_window_bounded_hash3_log() {
     let mut hc = HcMatchGenerator::new(1 << 14);
-    hc.configure(BTULTRA2_HC_CONFIG_L22_16K, 14);
+    hc.configure(
+        BTULTRA2_HC_CONFIG_L22_16K,
+        super::strategy::StrategyTag::BtUltra2,
+        14,
+    );
     assert_eq!(hc.table.hash3_log, 14);
 
-    hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
+    hc.configure(
+        BTULTRA2_HC_CONFIG_L22,
+        super::strategy::StrategyTag::BtUltra2,
+        27,
+    );
     assert_eq!(hc.table.hash3_log, HC3_HASH_LOG);
 }
 
 #[test]
 fn btultra2_seed_pass_initializes_opt_state() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     let data: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
     hc.table.add_data(data, |_| {});
     hc.start_matching(|_| {});
@@ -3822,8 +3837,8 @@ fn btultra2_seed_pass_initializes_opt_state() {
 
 #[test]
 fn btultra2_profile_disables_small_offset_handicap() {
-    let p1 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
-    let p2 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let p1 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
+    let p2 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert!(
         !p1.favor_small_offsets,
         "btultra2 primary profile should match donor opt2 offset pricing"
@@ -3836,8 +3851,8 @@ fn btultra2_profile_disables_small_offset_handicap() {
 
 #[test]
 fn btultra2_profile_is_single_pass_opt2() {
-    let p1 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
-    let p2 = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let p1 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
+    let p2 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert_eq!(p1.max_chain_depth, p2.max_chain_depth);
     assert_eq!(p1.sufficient_match_len, p2.sufficient_match_len);
     assert_eq!(p1.accurate, p2.accurate);
@@ -3850,7 +3865,7 @@ fn btultra2_profile_is_single_pass_opt2() {
 
 #[test]
 fn btultra_profile_keeps_donor_search_depth_budget() {
-    let p = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra, false);
+    let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra>();
     assert_eq!(
         p.max_chain_depth, 32,
         "btultra should not cap chain depth below donor opt2 search budget"
@@ -3859,7 +3874,7 @@ fn btultra_profile_keeps_donor_search_depth_budget() {
 
 #[test]
 fn btopt_profile_keeps_donor_search_depth_budget() {
-    let p = HcOptimalCostProfile::for_mode(HcParseMode::BtOpt, false);
+    let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtOpt>();
     assert_eq!(
         p.max_chain_depth, 32,
         "btopt should not cap chain depth below donor btopt search budget"
@@ -3869,23 +3884,27 @@ fn btopt_profile_keeps_donor_search_depth_budget() {
 #[test]
 fn sufficient_match_len_is_clamped_by_target_len() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     hc.hc.target_len = 13;
-    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), 13);
 }
 
 #[test]
 fn opt_modes_use_target_len_as_sufficient_len() {
+    use super::strategy;
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.hc.target_len = 57;
-    for (mode, pass2) in [
-        (HcParseMode::BtOpt, false),
-        (HcParseMode::BtUltra, false),
-        (HcParseMode::BtUltra2, false),
-        (HcParseMode::BtUltra2, true),
-    ] {
-        let profile = HcOptimalCostProfile::for_mode(mode, pass2);
+    let profiles = [
+        HcOptimalCostProfile::const_for_strategy::<strategy::BtOpt>(),
+        HcOptimalCostProfile::const_for_strategy::<strategy::BtUltra>(),
+        HcOptimalCostProfile::const_for_strategy::<strategy::BtUltra2>(),
+    ];
+    for profile in profiles {
         assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), 57);
     }
 }
@@ -3894,14 +3913,18 @@ fn opt_modes_use_target_len_as_sufficient_len() {
 fn sufficient_match_len_is_capped_by_opt_num() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.hc.target_len = usize::MAX / 2;
-    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert_eq!(hc.hc.sufficient_match_len_for_pass(profile), HC_OPT_NUM - 1);
 }
 
 #[test]
 fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
 
     let huff = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
         b"aaabbbbccccddddeeeeefffffgggg",
@@ -3913,7 +3936,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
 
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+        HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
     );
 
     let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
@@ -3945,7 +3968,11 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
 #[test]
 fn dictionary_fse_seed_applies_without_huffman_seed() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
 
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
@@ -3953,7 +3980,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+        HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
     );
 
     let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
@@ -3984,7 +4011,11 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
 #[test]
 fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
 
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
@@ -3992,7 +4023,7 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abc",
-        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+        HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
     );
     assert!(
         matches!(
@@ -4005,7 +4036,7 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
 
 #[test]
 fn lit_length_price_blocksize_max_costs_one_extra_bit() {
-    let profile_predef = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let profile_predef = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     let mut stats_predef = HcOptState::new();
     stats_predef.price_type = HcOptPriceType::Predefined;
     let predef_max = profile_predef.lit_length_price(&stats_predef, HC_BLOCKSIZE_MAX);
@@ -4017,7 +4048,7 @@ fn lit_length_price_blocksize_max_costs_one_extra_bit() {
         "predefined litLength pricing at BLOCKSIZE_MAX must add exactly one bit"
     );
 
-    let profile_dyn = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, true);
+    let profile_dyn = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     let mut stats_dyn = HcOptState::new();
     stats_dyn.price_type = HcOptPriceType::Dynamic;
     stats_dyn.lit_length_freq.fill(1);
@@ -4041,7 +4072,11 @@ fn lit_length_price_blocksize_max_costs_one_extra_bit() {
 #[test]
 fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
@@ -4055,7 +4090,11 @@ fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
 #[test]
 fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     hc.table.history_abs_start = 17;
     hc.table.window.push_back(b"abcdefghijklmnop".to_vec());
     assert!(
@@ -4067,7 +4106,11 @@ fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
 #[test]
 fn btultra2_seed_pass_disabled_for_tiny_block() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD),
         "btultra2 warmup should not run at or below predefined threshold"
@@ -4077,7 +4120,11 @@ fn btultra2_seed_pass_disabled_for_tiny_block() {
 #[test]
 fn btultra2_seed_pass_disabled_after_stats_initialized() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     hc.backend.bt_mut().opt_state.lit_length_sum = 1;
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 32),
@@ -4088,7 +4135,11 @@ fn btultra2_seed_pass_disabled_after_stats_initialized() {
 #[test]
 fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     // Simulate non-first block state: current block has no prefix in deque,
     // but total produced window already includes prior output.
     hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
@@ -4104,7 +4155,11 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
 #[test]
 fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG, 26);
+    hc.configure(
+        BTULTRA2_HC_CONFIG,
+        super::strategy::StrategyTag::BtUltra2,
+        26,
+    );
     hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
     hc.table
         .window
@@ -4122,7 +4177,7 @@ fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
 
 #[test]
 fn literal_price_uses_eight_bits_when_literals_uncompressed() {
-    let profile = HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false);
+    let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     let mut stats = HcOptState::new();
     stats.set_literals_compressed_for_tests(false);
     stats.price_type = HcOptPriceType::Predefined;
@@ -4174,7 +4229,7 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     stats.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
     stats.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::for_mode(HcParseMode::BtUltra2, false),
+        HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
     );
     assert_eq!(
         stats.lit_sum, 0,
@@ -4625,7 +4680,6 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     };
     let mut out = Vec::new();
 
-    hc.parse_mode = HcParseMode::BtUltra2;
     hc.table.is_btultra2 = true;
     hc.table.uses_bt = true;
     hc.table.search_depth = hc.hc.search_depth;
@@ -4647,7 +4701,6 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         "btultra2 should retain dictionary candidates on donor-parity path"
     );
 
-    hc.parse_mode = HcParseMode::BtUltra;
     hc.table.is_btultra2 = false;
     hc.table.uses_bt = true;
     hc.table.skip_insert_until_abs = 0;
@@ -5371,7 +5424,7 @@ fn row_get_last_space_and_reset_to_fastest_clears_window() {
     assert_eq!(driver.get_last_space(), b"row-data");
 
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
     assert!(driver.row_matcher().window.is_empty());
 }
 
@@ -5380,7 +5433,7 @@ fn row_get_last_space_and_reset_to_fastest_clears_window() {
 fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(4));
-    assert_eq!(driver.active_backend, MatcherBackend::Row);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Row);
 
     // Ensure the row matcher option is initialized so reset() executes
     // the Row backend retirement path.
@@ -5392,7 +5445,7 @@ fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     let before_pool = driver.vec_pool.len();
     driver.reset(CompressionLevel::Fastest);
 
-    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
     let row = driver
         .row_match_generator
         .as_ref()
@@ -5410,12 +5463,12 @@ fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
 #[test]
 fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.active_backend = MatcherBackend::Row;
+    driver.active_backend = super::strategy::BackendTag::Row;
     driver.row_match_generator = None;
 
     driver.reset(CompressionLevel::Fastest);
 
-    assert_eq!(driver.active_backend, MatcherBackend::Simple);
+    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
 }
 
 #[test]
@@ -5683,7 +5736,7 @@ fn hc_hash3_position_matches_donor_formula() {
 #[test]
 fn hc_hash_position_matches_donor_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(HC_CONFIG, 22);
+    hc.configure(HC_CONFIG, super::strategy::StrategyTag::Lazy, 22);
     let bytes = [b'a', b'b', b'c', b'd'];
     let read32 = u32::from_le_bytes(bytes);
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
@@ -5693,7 +5746,11 @@ fn hc_hash_position_matches_donor_hash4_formula() {
 #[test]
 fn btultra2_main_hash_uses_donor_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(BTULTRA2_HC_CONFIG_L22, 27);
+    hc.configure(
+        BTULTRA2_HC_CONFIG_L22,
+        super::strategy::StrategyTag::BtUltra2,
+        27,
+    );
     let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
     let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
@@ -6028,7 +6085,11 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
 #[test]
 fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut matcher = HcMatchGenerator::new(1 << 20);
-    matcher.configure(BTULTRA2_HC_CONFIG_L22, 20);
+    matcher.configure(
+        BTULTRA2_HC_CONFIG_L22,
+        super::strategy::StrategyTag::BtUltra2,
+        20,
+    );
     let tail = b"Bt9kLm2Rp";
     let mut first = deterministic_high_entropy_bytes(0xA9C3_7F21_D4E8_510B, 4096);
     let tail_start = first.len() - tail.len();
@@ -6394,7 +6455,10 @@ fn fastest_reset_uses_interleaved_hash_fill_step() {
     // Better uses the HashChain backend with lazy2; verify that the backend switch
     // happened and the lazy_depth is configured correctly.
     driver.reset(CompressionLevel::Better);
-    assert_eq!(driver.active_backend, MatcherBackend::HashChain);
+    assert_eq!(
+        driver.active_backend,
+        super::strategy::BackendTag::HashChain
+    );
     assert_eq!(driver.window_size(), (1u64 << 23));
     assert_eq!(driver.hc_matcher().hc.lazy_depth, 2);
 }

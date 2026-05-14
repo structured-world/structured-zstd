@@ -21,8 +21,6 @@
 //! (structural split). No behaviour change — types, constants, and
 //! method names are identical to the pre-extraction monolith.
 
-use super::strategy::HcParseMode;
-
 pub(crate) const HC_MAX_LIT: usize = 255;
 pub(crate) const HC_MAX_LL: usize = 35;
 pub(crate) const HC_MAX_ML: usize = 52;
@@ -432,45 +430,11 @@ pub(crate) struct HcOptimalCostProfile {
 }
 
 impl HcOptimalCostProfile {
-    pub(crate) fn for_mode(mode: HcParseMode, pass2: bool) -> Self {
-        match mode {
-            HcParseMode::Lazy2 => Self {
-                max_chain_depth: 8,
-                sufficient_match_len: 32,
-                accurate: false,
-                favor_small_offsets: true,
-            },
-            HcParseMode::BtOpt => Self {
-                max_chain_depth: 32,
-                sufficient_match_len: usize::MAX,
-                accurate: false,
-                favor_small_offsets: true,
-            },
-            HcParseMode::BtUltra => Self {
-                max_chain_depth: 32,
-                sufficient_match_len: usize::MAX,
-                accurate: true,
-                favor_small_offsets: false,
-            },
-            HcParseMode::BtUltra2 => {
-                let _ = pass2;
-                Self {
-                    max_chain_depth: 512,
-                    sufficient_match_len: usize::MAX,
-                    accurate: true,
-                    // Donor opt2 path doesn't apply the small-offset
-                    // decompression-speed handicap.
-                    favor_small_offsets: false,
-                }
-            }
-        }
-    }
-
-    /// Const-generic peer of [`for_mode`]. Every field is read from
-    /// the strategy's associated consts, so the optimiser builds the
-    /// `HcOptimalCostProfile` literal at codegen time without a
-    /// runtime match. Hot-path callers from
-    /// `start_matching_optimal::<S>` should prefer this.
+    /// Build the optimal-parser cost profile for a compile-time
+    /// strategy. Every field is read from `S`'s associated consts so
+    /// the optimiser materialises the literal at codegen time
+    /// (no runtime branch). Every production call site goes through
+    /// this entry — there is no runtime peer.
     #[inline]
     pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
         Self {

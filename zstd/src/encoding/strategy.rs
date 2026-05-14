@@ -1,37 +1,45 @@
-//! Encoder strategy enum + const-generic strategy dispatch (Phase 3 of
-//! #111).
+//! Encoder strategy types — Phase 3 of #111.
 //!
-//! Phase 1 introduced the [`HcParseMode`] runtime enum that gates the
-//! Lazy2 / BtOpt / BtUltra / BtUltra2 code paths inside `HcMatchGenerator`
-//! and `cost_model`. Phase 3 lifts that decision (and the parallel
-//! `MatcherBackend` runtime tag in `match_generator`) into the type
-//! system: each `level → Strategy` mapping is a concrete ZST that
-//! implements the [`Strategy`] trait. Hot-path entry points become
-//! generic over `S: Strategy` and the compiler monomorphises the inner
-//! loops per variant, dropping every dead `if S::FOO` branch at
-//! `codegen` time.
+//! Every per-position branch the encoder used to dispatch at runtime
+//! (lazy / optimal split, BT walker on/off, hash3 short-match probe,
+//! refined / coarse cost model) now reads from a compile-time
+//! `S: Strategy` parameter. The compiler monomorphises the inner
+//! loops per concrete `S` and drops the dead arms during codegen.
 //!
-//! The runtime enums survive until the per-call-site migration is
-//! complete; this module documents the bridge.
+//! ## Dispatch flow
+//!
+//! ```text
+//! Matcher::start_matching                       // 7-arm match on StrategyTag (per block)
+//!  └─ compress_block::<S>                       // S::BACKEND const match
+//!      ├─ Simple/Dfast/Row                      // backends without parse_mode
+//!      └─ HcMatchGenerator::start_matching_strategy::<S>
+//!          ├─ S::USE_BT == false → start_matching_lazy
+//!          └─ S::USE_BT == true  → start_matching_optimal::<S>
+//!              ├─ HcOptimalCostProfile::const_for_strategy::<S>()
+//!              ├─ should_run_btultra2_seed_pass::<S>          // const false unless S = BtUltra2
+//!              └─ build_optimal_plan::<S>
+//!                  └─ build_optimal_plan_impl::<S, ACC, FAV>
+//!                      └─ SIMD wrapper::<S, ACC, FAV>
+//!                          └─ build_optimal_plan_impl_body!(S)
+//!                              ├─ S::OPT_LEVEL == 0  → abort_on_worse_match
+//!                              ├─ S::OPT_LEVEL >= 2  → opt_level (refined)
+//!                              └─ $collect::<S, true>
+//!                                  └─ collect_optimal_candidates_initialized_body!(S)
+//!                                      └─ S::USE_HASH3 → hash3 lookup (const-gated)
+//! ```
+//!
+//! Donor parity reference: `ZSTD_compressionParameters` in
+//! `lib/compress/zstd_compress_internal.h` and the per-level table in
+//! `lib/compress/clevels.h`.
 
 #![allow(dead_code)]
 
-/// Runtime dispatch tag selecting which optimal-parser / match-finder
-/// pipeline `HcMatchGenerator` should execute. The cost-model profile
-/// and the matcher's `start_matching` body both branch on this enum
-/// until the Phase 3 `Strategy` trait replaces the runtime match.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HcParseMode {
-    Lazy2,
-    BtOpt,
-    BtUltra,
-    BtUltra2,
-}
-
 /// Donor `ZSTD_compressionParameters.strategy` equivalent — names the
-/// concrete match-finder backend a [`Strategy`] is paired with. Used in
-/// the transitional bridge between the [`Strategy`] trait and the
-/// existing `MatcherBackend` runtime enum.
+/// concrete match-finder backend a [`Strategy`] runs on top of. The
+/// runtime [`StrategyTag`] dispatcher and the [`Strategy::BACKEND`]
+/// associated const both produce values of this type, so the
+/// per-block driver dispatch and the per-strategy backend selection
+/// stay in lock-step.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendTag {
     /// `SimpleMatchGenerator` — level 1.
@@ -46,13 +54,9 @@ pub(crate) enum BackendTag {
 
 /// Compile-time encoder strategy. Each concrete implementor is a ZST
 /// whose associated `const`s tell the optimal parser / match finder
-/// which donor-equivalent path to execute. The runtime [`HcParseMode`]
-/// enum will be removed once every read site is migrated to `if
-/// S::USE_BT` / `if S::USE_HASH3` / etc.
-///
-/// Donor parity reference: `ZSTD_compressionParameters` in
-/// `lib/compress/zstd_compress_internal.h` and the per-level table in
-/// `lib/compress/clevels.h`.
+/// which donor-equivalent path to execute. Hot entry points are
+/// generic over `S: Strategy`, so monomorphisation strips every
+/// dead `if S::FOO` arm at codegen time.
 pub(crate) trait Strategy: Copy + 'static {
     /// Match-finder backend this strategy runs on.
     const BACKEND: BackendTag;
@@ -83,20 +87,13 @@ pub(crate) trait Strategy: Copy + 'static {
     /// `build_optimal_plan_impl_body!`.
     const OPT_LEVEL: u8;
 
-    /// Donor `parse_mode` mirror — kept as an associated const so the
-    /// transitional bridge between `Strategy` and the runtime
-    /// [`HcParseMode`] enum stays cheap to write.
-    const PARSE_MODE: HcParseMode;
-
     /// Donor `max_chain_depth` for the optimal-parser cost profile.
-    /// Mirrors `HcOptimalCostProfile::for_mode` row-for-row so the
-    /// per-block profile selection becomes a compile-time
-    /// `HcOptimalCostProfile::const_for_strategy::<S>()` call.
+    /// Used by `HcOptimalCostProfile::const_for_strategy::<S>()`.
     const MAX_CHAIN_DEPTH: usize;
 
     /// Donor `sufficient_match_len` — the BT walker bails out as soon
-    /// as a candidate at or above this length is seen.
-    /// `usize::MAX` means "never bail early".
+    /// as a candidate at or above this length is seen. `usize::MAX`
+    /// means "never bail early".
     const SUFFICIENT_MATCH_LEN: usize;
 }
 
@@ -112,10 +109,7 @@ impl Strategy for Fast {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Simple backend does not actually consult parse_mode; pick the
-    // narrowest variant for the bridge.
-    const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
-    // Optimal-parser consts are unreachable for Simple/Dfast/Greedy —
+    // Optimal-parser consts are unreachable for non-BT strategies —
     // pin them to the Lazy2 row so the trait stays total.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
@@ -133,7 +127,6 @@ impl Strategy for Dfast {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -150,15 +143,14 @@ impl Strategy for Greedy {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 5-15 — donor `ZSTD_lazy2` on a hash chain. Differ from each
-/// other by runtime `search_depth` / `hash_log` / `chain_log` /
-/// `target_len` / `lazy_depth` only — those are runtime
-/// `HcConfig` fields, not compile-time `Strategy` consts.
+/// Levels 5-15 — donor `ZSTD_lazy2` on a hash chain. Levels inside
+/// the band differ only by runtime `HcConfig` fields (`search_depth`,
+/// `hash_log`, `chain_log`, `target_len`, `lazy_depth`), not by
+/// compile-time `Strategy` consts, so they share a single type.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Lazy;
 
@@ -170,7 +162,6 @@ impl Strategy for Lazy {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    const PARSE_MODE: HcParseMode = HcParseMode::Lazy2;
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -188,7 +179,6 @@ impl Strategy for BtOpt {
     const USE_HASH3: bool = false;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 0;
-    const PARSE_MODE: HcParseMode = HcParseMode::BtOpt;
     const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
@@ -206,7 +196,6 @@ impl Strategy for BtUltra {
     const USE_HASH3: bool = false;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    const PARSE_MODE: HcParseMode = HcParseMode::BtUltra;
     const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
@@ -224,16 +213,15 @@ impl Strategy for BtUltra2 {
     const USE_HASH3: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    const PARSE_MODE: HcParseMode = HcParseMode::BtUltra2;
     const MAX_CHAIN_DEPTH: usize = 512;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Compile-time strategy tag for the per-level dispatcher. Each
-/// variant maps to exactly one [`Strategy`] implementor; the dispatcher
-/// stays runtime-tagged because it only fires once per frame on
-/// `reset()`, so the cost of a 7-arm match is invisible compared to
-/// the per-block hot-loop work it dispatches into.
+/// Runtime strategy tag for the per-level dispatcher. Each variant
+/// maps to exactly one [`Strategy`] implementor; the dispatcher
+/// itself stays runtime-tagged because it only fires once per frame
+/// on `reset()`, so the cost of a 7-arm match is invisible compared
+/// to the per-block hot-loop work it dispatches into.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StrategyTag {
     Fast,
@@ -265,18 +253,12 @@ impl StrategyTag {
             5..=15 => Self::Lazy,
             16 | 17 => Self::BtOpt,
             18 | 19 => Self::BtUltra,
-            // Out-of-range levels collapse onto BtUltra2 — the
-            // existing `resolve_level_params` already clamps the
-            // numeric level into the table, this is just the matching
-            // tail.
             _ => Self::BtUltra2,
         }
     }
 
     /// Map a [`CompressionLevel`] to its [`StrategyTag`]. Mirrors the
-    /// per-level dispatch in `match_generator::resolve_level_params`
-    /// so the runtime `active_backend` field and the future
-    /// const-generic strategy stay in lock-step.
+    /// per-level dispatch in `match_generator::resolve_level_params`.
     pub(crate) fn for_compression_level(level: crate::encoding::CompressionLevel) -> Self {
         use crate::encoding::CompressionLevel;
         match level {
@@ -287,9 +269,6 @@ impl StrategyTag {
             CompressionLevel::Best => Self::Lazy,
             CompressionLevel::Level(n) => {
                 if n <= 0 {
-                    // Level 0 → default (Dfast). Negative levels →
-                    // ultra-fast Simple matcher with elevated
-                    // `hash_fill_step` (see resolve_level_params).
                     if n == 0 { Self::Dfast } else { Self::Fast }
                 } else {
                     let clamped = (n as u8).min(CompressionLevel::MAX_LEVEL as u8);
@@ -299,20 +278,7 @@ impl StrategyTag {
         }
     }
 
-    /// Bridge to the runtime [`HcParseMode`] enum that the existing
-    /// `HcMatchGenerator` paths still consume. Will go away in the
-    /// final cleanup commit when the runtime enum is deleted.
-    pub(crate) const fn parse_mode(self) -> HcParseMode {
-        match self {
-            Self::Fast | Self::Dfast | Self::Greedy | Self::Lazy => HcParseMode::Lazy2,
-            Self::BtOpt => HcParseMode::BtOpt,
-            Self::BtUltra => HcParseMode::BtUltra,
-            Self::BtUltra2 => HcParseMode::BtUltra2,
-        }
-    }
-
-    /// Bridge to the runtime [`BackendTag`] for the dispatcher entry
-    /// point.
+    /// Bridge to [`BackendTag`] for the dispatcher entry point.
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
@@ -329,7 +295,6 @@ mod tests {
 
     fn assert_strategy_matches_tag<S: Strategy>(tag: StrategyTag) {
         assert_eq!(S::BACKEND, tag.backend(), "backend mismatch");
-        assert_eq!(S::PARSE_MODE, tag.parse_mode(), "parse_mode mismatch");
     }
 
     #[test]
@@ -361,10 +326,10 @@ mod tests {
         assert_eq!(StrategyTag::for_level(22), StrategyTag::BtUltra2);
     }
 
-    // The next three blocks live at module scope (not inside `#[test]`)
-    // so the assertions run at compile time and never reach the
-    // `cargo nextest` runner. `clippy::assertions_on_constants`
-    // requires this form for const-only inputs.
+    // The next three blocks live at module scope so the assertions
+    // run at compile time and never reach the `cargo nextest` runner.
+    // `clippy::assertions_on_constants` requires this form for
+    // const-only inputs.
 
     // `use_bt_aligns_with_parse_mode`: Lazy2 strategies must not walk
     // the BT; BtOpt / BtUltra / BtUltra2 must. Invariant that lets
@@ -392,13 +357,20 @@ mod tests {
         assert!(BtUltra2::USE_HASH3);
     };
 
-    // `accurate_and_favor_small_offsets_track_cost_model_for_mode`:
-    // mirror `HcOptimalCostProfile::for_mode` so the eventual
-    // `const_for::<S>` rewrite is a mechanical swap.
+    // Mirror the per-strategy fields the optimal-parser cost profile
+    // is built from, so the layout (accurate / favor_small_offsets /
+    // max_chain_depth / sufficient_match_len) cannot regress
+    // silently.
     const _COST_MODEL_LAYOUT: () = {
         assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
         assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
+        assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
+        assert!(BtUltra::MAX_CHAIN_DEPTH == 32);
+        assert!(BtUltra2::MAX_CHAIN_DEPTH == 512);
+        assert!(BtOpt::SUFFICIENT_MATCH_LEN == usize::MAX);
+        assert!(BtUltra::SUFFICIENT_MATCH_LEN == usize::MAX);
+        assert!(BtUltra2::SUFFICIENT_MATCH_LEN == usize::MAX);
     };
 }

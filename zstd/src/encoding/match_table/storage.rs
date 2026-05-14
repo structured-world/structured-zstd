@@ -223,13 +223,14 @@ pub(crate) struct MatchTable {
     /// walker macros read the depth from `$table.search_depth` directly so
     /// the call sites don't have to plumb it through.
     pub(crate) search_depth: usize,
-    /// Whether the active parser is `btultra2`. Stage D mirrors it from
-    /// `HcParseMode::BtUltra2` so the BT walker and rebase machinery can
-    /// stay on `MatchTable` without consulting the outer generator.
+    /// Whether the active parser is `btultra2`. Mirrored from the
+    /// current [`super::super::strategy::StrategyTag`] during
+    /// `configure()` so the BT walker and rebase machinery can stay
+    /// on `MatchTable` without consulting the outer generator.
     pub(crate) is_btultra2: bool,
     /// Whether the active backend is one of the BT parsers (`btopt`,
-    /// `btultra`, `btultra2`). Mirrored from `HcParseMode` for the same
-    /// reason as `is_btultra2`.
+    /// `btultra`, `btultra2`). Mirrored from the active strategy for
+    /// the same reason as `is_btultra2`.
     pub(crate) uses_bt: bool,
 }
 
