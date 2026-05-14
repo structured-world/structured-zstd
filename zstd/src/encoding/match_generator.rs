@@ -2741,11 +2741,10 @@ impl HcMatchGenerator {
     /// monomorphisation keeps exactly one arm: `Lazy` /
     /// `Fast` / `Dfast` / `Greedy` see only `start_matching_lazy`,
     /// `BtOpt` / `BtUltra` / `BtUltra2` see only
-    /// `start_matching_optimal`. The runtime `match self.parse_mode`
-    /// at the inherent [`HcMatchGenerator::start_matching`] entry is
-    /// no longer reached from the production hot path; the field
-    /// remains live only for in-crate callers (mostly tests) that
-    /// invoke the inherent entry directly.
+    /// `start_matching_optimal`. The inherent test-only
+    /// [`HcMatchGenerator::start_matching`] reaches the same arms by
+    /// runtime-matching on `self.strategy_tag` (the parse-mode field
+    /// has been removed); production never invokes that path.
     pub(crate) fn start_matching_strategy<S: super::strategy::Strategy>(
         &mut self,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
@@ -2859,8 +2858,7 @@ impl HcMatchGenerator {
         // S's associated consts (MAX_CHAIN_DEPTH /
         // SUFFICIENT_MATCH_LEN / ACCURATE_PRICE / FAVOR_SMALL_OFFSETS),
         // so the optimiser produces the literal at codegen time
-        // without a runtime match. Replaces the old
-        // `for_mode(self.parse_mode, self.is_btultra2())` pair.
+        // without a runtime match.
         let profile = HcOptimalCostProfile::const_for_strategy::<S>();
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
@@ -4559,24 +4557,42 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
 
 #[test]
 fn btultra_and_btultra2_both_keep_dictionary_candidates() {
-    let mut hc = HcMatchGenerator::new(256);
-    hc.table.history = alloc::vec![0u8; 160];
-    for i in 0..64 {
-        hc.table.history[i] = b'a' + (i % 7) as u8;
-    }
-    for i in 64..160 {
-        hc.table.history[i] = b'k' + (i % 5) as u8;
-    }
-    let abs_pos = 96usize;
-    for i in 0..24 {
-        hc.table.history[abs_pos + i] = hc.table.history[16 + i];
-    }
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 32;
-    hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
+    // Routes the BtUltra2 / BtUltra fixture through the production
+    // `configure()` path so derived state (`hash3_log`, `is_btultra2`,
+    // `uses_bt`, `backend`) stays consistent — manually flipping the
+    // strategy flags here used to leave `hash3_log` / `hash3_table` in
+    // the previous mode's shape and trip the
+    // `Strategy::USE_HASH3 ⇒ hash3_log != 0` debug invariant inside
+    // `collect_optimal_candidates_initialized_body`.
+    use super::strategy::StrategyTag;
+
+    let test_config = HcConfig {
+        hash_log: 23,
+        chain_log: 22,
+        search_depth: 32,
+        target_len: 256,
+    };
+    let window_log = 20u8;
+
+    let prepare_history = |hc: &mut HcMatchGenerator, abs_pos: usize| {
+        hc.table.history = alloc::vec![0u8; 160];
+        for i in 0..64 {
+            hc.table.history[i] = b'a' + (i % 7) as u8;
+        }
+        for i in 64..160 {
+            hc.table.history[i] = b'k' + (i % 5) as u8;
+        }
+        for i in 0..24 {
+            hc.table.history[abs_pos + i] = hc.table.history[16 + i];
+        }
+        hc.table.history_start = 0;
+        hc.table.history_abs_start = 0;
+        hc.table.position_base = 0;
+        hc.table.ensure_tables();
+        hc.table.insert_positions(0, abs_pos);
+        hc.table.dictionary_limit_abs = Some(64);
+        hc.table.skip_insert_until_abs = 0;
+    };
 
     let profile = HcOptimalCostProfile {
         max_chain_depth: 32,
@@ -4584,14 +4600,12 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         accurate: true,
         favor_small_offsets: false,
     };
+    let abs_pos = 96usize;
     let mut out = Vec::new();
 
-    hc.strategy_tag = super::strategy::StrategyTag::BtUltra2;
-    hc.table.is_btultra2 = true;
-    hc.table.uses_bt = true;
-    hc.table.search_depth = hc.hc.search_depth;
-    hc.backend = HcBackend::Bt(alloc::boxed::Box::new(super::bt::BtMatcher::new()));
-    hc.table.dictionary_limit_abs = Some(64);
+    let mut hc = HcMatchGenerator::new(256);
+    hc.configure(test_config, StrategyTag::BtUltra2, window_log);
+    prepare_history(&mut hc, abs_pos);
     hc.collect_optimal_candidates(
         abs_pos,
         160,
@@ -4608,10 +4622,9 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         "btultra2 should retain dictionary candidates on donor-parity path"
     );
 
-    hc.strategy_tag = super::strategy::StrategyTag::BtUltra;
-    hc.table.is_btultra2 = false;
-    hc.table.uses_bt = true;
-    hc.table.skip_insert_until_abs = 0;
+    let mut hc = HcMatchGenerator::new(256);
+    hc.configure(test_config, StrategyTag::BtUltra, window_log);
+    prepare_history(&mut hc, abs_pos);
     hc.collect_optimal_candidates(
         abs_pos,
         160,
