@@ -607,6 +607,18 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+        // The raw `pos += step` below is correct only while `step` is
+        // bounded by `DFAST_INCOMPRESSIBLE_SKIP_STEP` (the only value
+        // any in-tree caller passes here). Asserting it locally keeps
+        // a future caller from quietly reintroducing the overflow risk
+        // that the upstream `check_stream_abs_headroom` gate is sized
+        // for.
+        assert!(
+            step <= DFAST_INCOMPRESSIBLE_SKIP_STEP,
+            "insert_positions_with_step: step ({step}) exceeds \
+             DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
+             eat into the STREAM_ABS_HEADROOM reserve"
+        );
         let start = start.max(self.history_abs_start);
         let end = end.min(self.history_abs_end());
         if step <= 1 {
@@ -619,7 +631,8 @@ impl DfastMatchGenerator {
             // `pos + step` is safe: `pos < end <= history_abs_end()` and
             // `history_abs_end <= usize::MAX - STREAM_ABS_HEADROOM` by
             // the upstream `check_stream_abs_headroom` gate, while
-            // `step` is bounded by `DFAST_INCOMPRESSIBLE_SKIP_STEP`.
+            // `step` is bounded above by the assertion at function
+            // entry.
             pos += step;
         }
     }

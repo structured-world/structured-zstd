@@ -34,16 +34,18 @@ use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 /// 32-bit targets without per-call saturating guards.
 pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 
-/// Frame-level overflow gate shared by every match-finder backend.
+/// Frame-level overflow gate shared by `MatchTable`,
+/// `DfastMatchGenerator`, and `RowMatchGenerator`.
 ///
-/// Each backend (`MatchTable`, `DfastMatchGenerator`, …) owns its own
-/// rolling window and `history_abs_start` cursor but they all hand
-/// absolute positions to inner loops that add small constants without
-/// overflow checks. This helper enforces a single contract: the next
-/// `data.len()` bytes — together with the still-resident `window_size`
-/// — must leave at least `STREAM_ABS_HEADROOM` slack below
-/// `usize::MAX`. Failing fast here lets every downstream `abs_pos + N`
-/// site stay raw and keeps i686 streams correct.
+/// Each backend owns its own rolling window and `history_abs_start`
+/// cursor but they all hand absolute positions to inner loops that add
+/// small constants without per-iteration overflow checks. This helper
+/// enforces a single contract: the next `data.len()` bytes — together
+/// with the still-resident `window_size` — must leave at least
+/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
+/// lets every downstream `abs_pos + N` site stay raw and keeps i686
+/// streams correct. New match-finder backends with their own
+/// `add_data` path must route through this helper.
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -55,10 +57,43 @@ pub(crate) fn check_stream_abs_headroom(
         .and_then(|p| p.checked_add(data_len))
         .and_then(|p| p.checked_add(STREAM_ABS_HEADROOM))
         .expect(
-            "structured-zstd: total input would advance the absolute \
-             stream cursor past `usize::MAX`; on 32-bit targets, split \
-             the input into smaller frames or use a 64-bit build",
+            "structured-zstd: cumulative input would leave less than \
+             STREAM_ABS_HEADROOM (HC_OPT_NUM + 16) slack below \
+             `usize::MAX` for the encoder's absolute-position \
+             lookahead; on 32-bit targets, split the input into \
+             smaller frames or use a 64-bit build",
         );
+}
+
+#[cfg(test)]
+mod stream_abs_headroom_tests {
+    use super::{STREAM_ABS_HEADROOM, check_stream_abs_headroom};
+
+    #[test]
+    fn accepts_exactly_at_the_boundary() {
+        // `history_abs_start + window_size + data_len + STREAM_ABS_HEADROOM == usize::MAX`.
+        let history_abs_start = usize::MAX - STREAM_ABS_HEADROOM - 2;
+        check_stream_abs_headroom(history_abs_start, 1, 1);
+    }
+
+    #[test]
+    fn accepts_well_below_the_boundary() {
+        check_stream_abs_headroom(0, 1 << 20, 1 << 20);
+    }
+
+    #[test]
+    #[should_panic(expected = "STREAM_ABS_HEADROOM")]
+    fn rejects_one_byte_past_the_boundary() {
+        // One byte over: sum = usize::MAX + 1 → checked_add returns None.
+        let history_abs_start = usize::MAX - STREAM_ABS_HEADROOM - 1;
+        check_stream_abs_headroom(history_abs_start, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "STREAM_ABS_HEADROOM")]
+    fn rejects_history_abs_start_already_too_high() {
+        check_stream_abs_headroom(usize::MAX - 10, 0, 0);
+    }
 }
 
 /// Knuth-style 3-byte hash multiplier. Donor parity:
