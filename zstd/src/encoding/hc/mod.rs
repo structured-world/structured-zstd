@@ -119,24 +119,41 @@ impl HcMatcher {
         let mut cur = table.hash_table[hash];
         let mut filled = 0;
         let mut steps = 0;
-        let max_chain_steps = self.search_depth;
-        while filled < self.search_depth && steps < max_chain_steps {
+        // Cap both the loop bound and the result-fill bound at
+        // MAX_HC_SEARCH_DEPTH so a misconfigured `search_depth >
+        // MAX_HC_SEARCH_DEPTH` (BT modes set it from the donor config,
+        // which can exceed 64) cannot index past `buf`'s fixed size.
+        let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        while filled < max_chain_steps && steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
             }
             let candidate_rel = cur.wrapping_sub(1) as usize;
-            let candidate_abs = table.position_base + candidate_rel;
+            // Decode through `stored_abs_position_fast` so a non-zero
+            // `index_shift` (set by future rebase variants) is honored;
+            // raw `position_base + candidate_rel` would silently
+            // misread rebased entries.
+            let candidate_abs = super::match_table::storage::MatchTable::stored_abs_position_fast(
+                cur,
+                table.position_base,
+                table.index_shift,
+            );
             let next = table.chain_table[candidate_rel & chain_mask];
             steps += 1;
             if next == cur {
                 // Self-loop: two positions share chain_idx, stop to
                 // avoid spinning on the same candidate forever.
-                if candidate_abs >= table.history_abs_start && candidate_abs < abs_pos {
+                if let Some(candidate_abs) =
+                    candidate_abs.filter(|&p| p >= table.history_abs_start && p < abs_pos)
+                {
                     buf[filled] = candidate_abs;
                 }
                 break;
             }
             cur = next;
+            let Some(candidate_abs) = candidate_abs else {
+                continue;
+            };
             if candidate_abs < table.history_abs_start || candidate_abs >= abs_pos {
                 continue;
             }

@@ -1039,7 +1039,15 @@ impl MatchTable {
         } else {
             self.replay_history_for_rebase_hc(history_start, abs_pos);
         }
-        self.next_to_update3 = self.next_to_update3.max(abs_pos);
+        // begin_rebase() also clears `hash3_table`. Rewind `next_to_update3`
+        // to the inserted prefix start so `update_hash3_until` re-fills the
+        // HC3 side table — without this, every HC3 probe up to `abs_pos`
+        // returns "empty" until the encoder catches up, which silently
+        // changes btultra2 short-match selection on long-running streams.
+        self.next_to_update3 = history_start;
+        if self.hash3_log != 0 {
+            self.update_hash3_until(abs_pos);
+        }
     }
 
     /// Insert a single position into the hash / chain tables, rebasing
@@ -1494,5 +1502,45 @@ mod storage_tests {
         assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
         assert!(t.chain_table.iter().all(|&v| v == HC_EMPTY));
         assert!(t.hash3_table.iter().all(|&v| v == HC_EMPTY));
+    }
+
+    /// Regression: `rebase_positions_cold` must replay the HC3 side
+    /// table along with the main hash / chain replay. `begin_rebase`
+    /// zeroes `hash3_table`, so without an explicit refill every HC3
+    /// probe before `abs_pos` returns "empty" until the next encode
+    /// position falls due. On long-running btultra2 streams that
+    /// silently changes match selection (the btultra2 cascade leans
+    /// heavily on HC3 short matches).
+    #[test]
+    fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
+        let mut t = new_table(64);
+        t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.window.push_back(t.history.clone());
+        t.hash_log = 8;
+        t.chain_log = 8;
+        // btultra2-style: HC3 side table allocated.
+        t.hash3_log = 6;
+        t.is_btultra2 = true;
+        t.search_depth = 4;
+        t.ensure_tables();
+
+        // Pre-fill the HC3 table the way the encoder would by walking
+        // positions up to the would-be rebase point.
+        t.update_hash3_until(20);
+        assert!(
+            t.hash3_table.iter().any(|&v| v != HC_EMPTY),
+            "fixture precondition: hash3 must be non-empty before rebase"
+        );
+
+        t.rebase_positions_cold(20);
+
+        assert!(
+            t.hash3_table.iter().any(|&v| v != HC_EMPTY),
+            "rebase must repopulate the HC3 side table — \
+             btultra2 short-match selection depends on it"
+        );
     }
 }

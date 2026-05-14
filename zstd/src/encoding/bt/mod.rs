@@ -425,8 +425,18 @@ impl BtMatcher {
         for item in plan {
             let lit_len = item.lit_len as usize;
             let match_len = item.match_len as usize;
-            let start = literals_start.saturating_add(lit_len);
-            if start < *literals_start || start + match_len > current_len {
+            // `checked_add` on both edges so a malformed / partially-built
+            // plan can't overflow `usize` arithmetic before the
+            // bounds guard fires. `saturating_add` would have masked
+            // overflow as "clamp to usize::MAX" which then bypasses the
+            // `> current_len` check.
+            let Some(start) = literals_start.checked_add(lit_len) else {
+                continue;
+            };
+            let Some(end) = start.checked_add(match_len) else {
+                continue;
+            };
+            if end > current_len {
                 continue;
             }
             let literals = &current[*literals_start..start];
@@ -434,7 +444,7 @@ impl BtMatcher {
                 Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
             opt_state.update_stats(literals.len(), literals, off_base, match_len);
             *reps = next_reps;
-            *literals_start = start + match_len;
+            *literals_start = end;
         }
         opt_state.set_base_prices(accurate);
     }
