@@ -15,6 +15,19 @@
 
 #![allow(dead_code)]
 
+use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
+use super::match_table::helpers::common_prefix_len;
+use super::match_table::storage::{HC_EMPTY, MatchTable};
+use super::opt::types::MatchCandidate;
+
+/// Minimum match length emitted by the lazy / lazy2 chain walker.
+/// Donor parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
+pub(crate) const HC_MIN_MATCH_LEN: usize = 4;
+
+/// Hard cap on chain-walk depth. Used to size the fixed-length
+/// candidate buffer returned by [`HcMatcher::chain_candidates`].
+pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
+
 /// Hash-chain matcher state used by the `Lazy2` parse mode (and the
 /// short-history fast path of the BT cascade's initial pass).
 ///
@@ -46,5 +59,589 @@ impl HcMatcher {
             search_depth,
             target_len,
         }
+    }
+
+    /// Donor "match gain" heuristic: `match_len * 4 - offset_bits`.
+    /// The lazy lookahead uses this to compare a candidate at the
+    /// current position against one a byte (or two) ahead. Pure
+    /// associated function — kept off `&self` so it can be called
+    /// statically from inside `better_candidate`.
+    #[inline]
+    pub(crate) fn match_gain(match_len: usize, offset: usize) -> i32 {
+        debug_assert!(
+            offset > 0,
+            "zstd offsets are 1-indexed, offset=0 is invalid"
+        );
+        let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
+        (match_len as i32) * 4 - offset_bits
+    }
+
+    /// Pick the better of two candidate matches by [`match_gain`].
+    /// `None` arms pass the surviving `Some` through.
+    pub(crate) fn better_candidate(
+        lhs: Option<MatchCandidate>,
+        rhs: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        match (lhs, rhs) {
+            (None, other) | (other, None) => other,
+            (Some(lhs), Some(rhs)) => {
+                let lhs_gain = Self::match_gain(lhs.match_len, lhs.offset);
+                let rhs_gain = Self::match_gain(rhs.match_len, rhs.offset);
+                if rhs_gain > lhs_gain {
+                    Some(rhs)
+                } else {
+                    Some(lhs)
+                }
+            }
+        }
+    }
+
+    /// Walk the hash chain at `abs_pos` and collect up to
+    /// [`HcMatcher::search_depth`] absolute positions of in-window
+    /// candidates. Stale chain entries (positions evicted from the
+    /// window) are skipped rather than terminating the walk; the
+    /// chain is bounded by `search_depth` total iterations to keep
+    /// pathological self-loops from spinning.
+    pub(crate) fn chain_candidates(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+    ) -> [usize; MAX_HC_SEARCH_DEPTH] {
+        let mut buf = [usize::MAX; MAX_HC_SEARCH_DEPTH];
+        let idx = abs_pos - table.history_abs_start;
+        let concat = table.live_history();
+        if idx + 4 > concat.len() {
+            return buf;
+        }
+        let hash = table.hash_position(&concat[idx..]);
+        let chain_mask = (1 << table.chain_log) - 1;
+
+        let mut cur = table.hash_table[hash];
+        let mut filled = 0;
+        let mut steps = 0;
+        // Cap both the loop bound and the result-fill bound at
+        // MAX_HC_SEARCH_DEPTH so a misconfigured `search_depth >
+        // MAX_HC_SEARCH_DEPTH` (BT modes set it from the donor config,
+        // which can exceed 64) cannot index past `buf`'s fixed size.
+        let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        while filled < max_chain_steps && steps < max_chain_steps {
+            if cur == HC_EMPTY {
+                break;
+            }
+            let candidate_rel = cur.wrapping_sub(1) as usize;
+            // Decode through `stored_abs_position_fast` so a non-zero
+            // `index_shift` (set by future rebase variants) is honored;
+            // raw `position_base + candidate_rel` would silently
+            // misread rebased entries.
+            let candidate_abs = super::match_table::storage::MatchTable::stored_abs_position_fast(
+                cur,
+                table.position_base,
+                table.index_shift,
+            );
+            let next = table.chain_table[candidate_rel & chain_mask];
+            steps += 1;
+            if next == cur {
+                // Self-loop: two positions share chain_idx, stop to
+                // avoid spinning on the same candidate forever.
+                if let Some(candidate_abs) =
+                    candidate_abs.filter(|&p| p >= table.history_abs_start && p < abs_pos)
+                {
+                    buf[filled] = candidate_abs;
+                }
+                break;
+            }
+            cur = next;
+            let Some(candidate_abs) = candidate_abs else {
+                continue;
+            };
+            if candidate_abs < table.history_abs_start || candidate_abs >= abs_pos {
+                continue;
+            }
+            buf[filled] = candidate_abs;
+            filled += 1;
+        }
+        buf
+    }
+
+    /// Probe the 3 rep-code offsets (with the donor `ll0 ↦ rep[0] − 1`
+    /// fallback) and return the best in-range match. Pure helper —
+    /// only reads from `MatchTable`, no HcMatcher state needed.
+    pub(crate) fn repcode_candidate(
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let reps = if lit_len == 0 {
+            [
+                Some(table.offset_hist[1] as usize),
+                Some(table.offset_hist[2] as usize),
+                (table.offset_hist[0] > 1).then_some((table.offset_hist[0] - 1) as usize),
+            ]
+        } else {
+            [
+                Some(table.offset_hist[0] as usize),
+                Some(table.offset_hist[1] as usize),
+                Some(table.offset_hist[2] as usize),
+            ]
+        };
+
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best = None;
+        for rep in reps.into_iter().flatten() {
+            if rep == 0 || rep > abs_pos {
+                continue;
+            }
+            let candidate_pos = abs_pos - rep;
+            if candidate_pos < table.history_abs_start {
+                continue;
+            }
+            let candidate_idx = candidate_pos - table.history_abs_start;
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate =
+                    Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+            }
+        }
+        best
+    }
+
+    /// Best hash-chain match at `abs_pos`. Walks the chain via
+    /// [`Self::chain_candidates`], extends each survivor backwards
+    /// over the literal run, and short-circuits as soon as a
+    /// candidate crosses `target_len`.
+    pub(crate) fn hash_chain_candidate(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+
+        let mut best: Option<MatchCandidate> = None;
+        for candidate_abs in self.chain_candidates(table, abs_pos) {
+            if candidate_abs == usize::MAX {
+                break;
+            }
+            let candidate_idx = candidate_abs - table.history_abs_start;
+            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            if match_len >= HC_MIN_MATCH_LEN {
+                let candidate =
+                    Self::extend_backwards(table, candidate_abs, abs_pos, match_len, lit_len);
+                best = Self::better_candidate(best, Some(candidate));
+                if best.is_some_and(|b| b.match_len >= self.target_len) {
+                    return best;
+                }
+            }
+        }
+        best
+    }
+
+    /// Combine the rep-code and chain-walk candidates and pick the
+    /// better of the two.
+    pub(crate) fn find_best_match(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let rep = Self::repcode_candidate(table, abs_pos, lit_len);
+        let hash = self.hash_chain_candidate(table, abs_pos, lit_len);
+        Self::better_candidate(rep, hash)
+    }
+
+    /// Donor `lazy` / `lazy2` lookahead: evaluate the match a byte
+    /// (and optionally two) ahead before committing the current one.
+    /// Returns `Some(best)` if the current match wins, `None` if the
+    /// caller should defer.
+    ///
+    /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
+    /// inserted into the hash tables — matching the C zstd ordering.
+    /// Seeding before comparing would let a position match against
+    /// itself, changing semantics.
+    pub(crate) fn pick_lazy_match(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        best: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        let best = best?;
+        if best.match_len >= self.target_len
+            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_end()
+        {
+            return Some(best);
+        }
+
+        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
+
+        let next = self.find_best_match(table, abs_pos + 1, lit_len + 1);
+        if let Some(next) = next {
+            let next_gain = Self::match_gain(next.match_len, next.offset);
+            if next_gain > current_gain {
+                return None;
+            }
+        }
+
+        if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
+            let next2 = self.find_best_match(table, abs_pos + 2, lit_len + 2);
+            if let Some(next2) = next2 {
+                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
+                if next2_gain > current_gain + 4 {
+                    return None;
+                }
+            }
+        }
+
+        Some(best)
+    }
+
+    /// Cross-platform dispatcher for the rep-code probe used by the
+    /// optimal-parser pipeline. Routes to the kernel-specific variant
+    /// so the per-rep `common_prefix_len_ptr` call inlines under the
+    /// callee's `target_feature` umbrella. Test / external callers
+    /// only — the on-encode hot path bypasses this dispatcher via the
+    /// kernel-specific variants invoked from inside
+    /// `collect_optimal_candidates_initialized_<kernel>`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_each_repcode_candidate_with_reps(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        f: impl FnMut(MatchCandidate),
+    ) {
+        // SAFETY: each branch verifies the target_feature requirement of
+        // the callee (same shape as the BT walk dispatchers).
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.for_each_repcode_candidate_with_reps_neon(
+                table,
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_avx2_bmi2(
+                        table,
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.for_each_repcode_candidate_with_reps_sse42(
+                        table,
+                        abs_pos,
+                        lit_len,
+                        reps,
+                        current_abs_end,
+                        min_match_len,
+                        f,
+                    )
+                },
+                FastpathKernel::Scalar => self.for_each_repcode_candidate_with_reps_scalar(
+                    table,
+                    abs_pos,
+                    lit_len,
+                    reps,
+                    current_abs_end,
+                    min_match_len,
+                    f,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.for_each_repcode_candidate_with_reps_scalar(
+                table,
+                abs_pos,
+                lit_len,
+                reps,
+                current_abs_end,
+                min_match_len,
+                f,
+            )
+        }
+    }
+
+    /// NEON umbrella variant of the rep-code probe.
+    ///
+    /// # Safety
+    /// Caller must be running on an AArch64 target with NEON
+    /// available (baseline on AArch64).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_neon(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        super::match_generator::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        )
+    }
+
+    /// SSE4.2 umbrella variant.
+    ///
+    /// # Safety
+    /// Caller must be running on x86/x86_64 with SSE4.2 available.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_sse42(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        super::match_generator::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        )
+    }
+
+    /// AVX2+BMI2 umbrella variant.
+    ///
+    /// # Safety
+    /// Caller must be running on x86/x86_64 with AVX2 + BMI2 available.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_avx2_bmi2(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        super::match_generator::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        )
+    }
+
+    /// Scalar fallback used on non-AArch64 targets.
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_each_repcode_candidate_with_reps_scalar(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        reps: [u32; 3],
+        current_abs_end: usize,
+        min_match_len: usize,
+        mut f: impl FnMut(MatchCandidate),
+    ) {
+        let _ = self;
+        super::match_generator::for_each_repcode_candidate_body!(
+            table,
+            abs_pos,
+            lit_len,
+            reps,
+            current_abs_end,
+            min_match_len,
+            f,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+        )
+    }
+
+    /// Walk a candidate match backwards over the literal run so the
+    /// matcher can absorb literal bytes that happen to match the byte
+    /// preceding the candidate. Donor parity: equivalent to the back
+    /// extend inside `ZSTD_HcFindBestMatch` before committing a
+    /// sequence.
+    ///
+    /// Takes `&MatchTable` because the only thing it needs is read
+    /// access to the contiguous history mirror — kept off `&self` so
+    /// callers don't have to hand it an HcMatcher reference they
+    /// don't otherwise use.
+    pub(crate) fn extend_backwards(
+        table: &MatchTable,
+        mut candidate_pos: usize,
+        mut abs_pos: usize,
+        mut match_len: usize,
+        lit_len: usize,
+    ) -> MatchCandidate {
+        let concat = table.live_history();
+        let min_abs_pos = abs_pos - lit_len;
+        while abs_pos > min_abs_pos
+            && candidate_pos > table.history_abs_start
+            && concat[candidate_pos - table.history_abs_start - 1]
+                == concat[abs_pos - table.history_abs_start - 1]
+        {
+            candidate_pos -= 1;
+            abs_pos -= 1;
+            match_len += 1;
+        }
+        MatchCandidate {
+            start: abs_pos,
+            offset: abs_pos - candidate_pos,
+            match_len,
+        }
+    }
+
+    /// Donor parity: per-pass clamp of the "good enough — stop probing"
+    /// threshold that the optimal parser passes to the BT/HC walkers.
+    /// Reflects donor `ZSTD_compressBlock_opt_generic` which caps the
+    /// profile's `sufficient_match_len` by the user-configured
+    /// `targetLength` and the `HC_OPT_NUM` ceiling.
+    pub(crate) fn sufficient_match_len_for_pass(&self, profile: HcOptimalCostProfile) -> usize {
+        profile
+            .sufficient_match_len
+            .min(self.target_len)
+            .clamp(HC_FORMAT_MINMATCH, HC_OPT_NUM - 1)
+    }
+}
+
+#[cfg(test)]
+mod hc_tests {
+    //! Unit coverage for `HcMatcher` paths the encode-level suite
+    //! doesn't naturally hit: short-suffix early returns on probe
+    //! helpers, chain-walk self-loop branch, and the lazy-pick
+    //! "next match is better" decline paths.
+    use super::*;
+    use crate::encoding::match_table::storage::MatchTable;
+
+    fn table_with_history(buf: &[u8]) -> MatchTable {
+        let mut t = MatchTable::new(buf.len().max(8));
+        t.history = buf.to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = buf.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(buf.to_vec());
+        t
+    }
+
+    #[test]
+    fn chain_candidates_returns_sentinels_when_suffix_too_short() {
+        let hc = HcMatcher::new(2, 4, 32);
+        // History exactly at min-prefix - 1 → idx + 4 > concat.len() →
+        // early return with all-sentinel buffer.
+        let t = table_with_history(b"abc");
+        let buf = hc.chain_candidates(&t, 0);
+        assert!(buf.iter().all(|&v| v == usize::MAX));
+    }
+
+    #[test]
+    fn chain_candidates_terminates_on_self_loop_with_in_range_pick() {
+        // Construct a self-loop in the chain: hash_table → cur,
+        // chain_table[cur_rel] = cur (points back to itself). The walker
+        // must pick the position (in-range) and stop.
+        let mut hc = HcMatcher::new(2, 4, 32);
+        hc.search_depth = 4;
+        let mut t = table_with_history(b"abcdef_abcdef_abcdef");
+        let abs_pos = 10usize;
+        // The walker hashes the suffix at `abs_pos`, not the prefix at 0.
+        let concat = t.live_history();
+        let hash = t.hash_position(&concat[abs_pos..]);
+        // Stored = relative + 1 → stored=6 means candidate_rel=5.
+        t.hash_table[hash] = 6;
+        let chain_mask = (1 << t.chain_log) - 1;
+        t.chain_table[5 & chain_mask] = 6; // self-loop
+
+        let buf = hc.chain_candidates(&t, abs_pos);
+        assert_eq!(
+            buf[0], 5,
+            "self-loop pick must surface the in-range candidate"
+        );
+        assert_eq!(buf[1], usize::MAX, "walker must stop after self-loop");
+    }
+
+    #[test]
+    fn repcode_candidate_returns_none_when_suffix_too_short() {
+        let mut t = table_with_history(b"abc");
+        t.offset_hist = [1, 2, 3];
+        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early None.
+        assert!(HcMatcher::repcode_candidate(&t, 0, 1).is_none());
+    }
+
+    #[test]
+    fn repcode_candidate_skips_rep_at_history_boundary() {
+        // rep=5 but abs_pos=4, so candidate_pos would underflow into
+        // pre-history bytes; the `rep > abs_pos` guard must skip it.
+        let mut t = table_with_history(b"abcdefgh");
+        t.offset_hist = [5, 6, 7];
+        // No match possible at abs_pos=4 because every rep aims past
+        // history start.
+        let result = HcMatcher::repcode_candidate(&t, 4, 1);
+        assert!(result.is_none(), "no rep can land in-range");
+    }
+
+    #[test]
+    fn find_best_match_returns_none_for_short_suffix() {
+        let hc = HcMatcher::new(2, 4, 32);
+        let t = table_with_history(b"abc");
+        assert!(hc.find_best_match(&t, 0, 1).is_none());
     }
 }
