@@ -34,6 +34,33 @@ use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 /// 32-bit targets without per-call saturating guards.
 pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 
+/// Frame-level overflow gate shared by every match-finder backend.
+///
+/// Each backend (`MatchTable`, `DfastMatchGenerator`, …) owns its own
+/// rolling window and `history_abs_start` cursor but they all hand
+/// absolute positions to inner loops that add small constants without
+/// overflow checks. This helper enforces a single contract: the next
+/// `data.len()` bytes — together with the still-resident `window_size`
+/// — must leave at least `STREAM_ABS_HEADROOM` slack below
+/// `usize::MAX`. Failing fast here lets every downstream `abs_pos + N`
+/// site stay raw and keeps i686 streams correct.
+#[inline]
+pub(crate) fn check_stream_abs_headroom(
+    history_abs_start: usize,
+    window_size: usize,
+    data_len: usize,
+) {
+    let _future_abs_end = history_abs_start
+        .checked_add(window_size)
+        .and_then(|p| p.checked_add(data_len))
+        .and_then(|p| p.checked_add(STREAM_ABS_HEADROOM))
+        .expect(
+            "structured-zstd: total input would advance the absolute \
+             stream cursor past `usize::MAX`; on 32-bit targets, split \
+             the input into smaller frames or use a 64-bit build",
+        );
+}
+
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
 /// by the HC3 short-match side table and by the 3-byte branch of the
@@ -351,24 +378,7 @@ impl MatchTable {
     /// ~2x window size for data buffers + 6 MB tables.
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
-        // Hard cap: every absolute stream cursor the encoder hands to the
-        // BT walker / optimal parser stays within `usize::MAX -
-        // STREAM_ABS_HEADROOM`. That is what lets every per-position
-        // `abs_pos + N` arithmetic site downstream run as raw `+` instead
-        // of `saturating_add`. On 64-bit targets this cap is unreachable
-        // in practice; on 32-bit (i686) it fails fast on streams whose
-        // cumulative input would push the cursor near `usize::MAX`,
-        // which is the only platform where the overflow concern is real.
-        let _future_abs_end = self
-            .history_abs_start
-            .checked_add(self.window_size)
-            .and_then(|p| p.checked_add(data.len()))
-            .and_then(|p| p.checked_add(STREAM_ABS_HEADROOM))
-            .expect(
-                "structured-zstd: total input would advance the absolute \
-                 stream cursor past `usize::MAX`; on 32-bit targets, split \
-                 the input into smaller frames or use a 64-bit build",
-            );
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
@@ -478,16 +488,17 @@ impl MatchTable {
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
         // Hot per-iteration BT walker entry. `abs_pos` is a
-        // frame-lifetime absolute stream cursor — it grows monotonically
-        // across blocks and could in principle wrap around `usize::MAX`
-        // on long-running 32-bit streams, even though `index_shift` is
-        // block-local (`current_len` during the btultra2 seed pass, `0`
-        // otherwise). The result is immediately masked down to the BT
-        // ring width by `& bt_mask()`, so the modulo semantics of
-        // `wrapping_add` give the same slot as a panicking `+` would,
-        // and we avoid both the release-mode overflow branch and the
-        // debug-mode panic that an unchecked stream cursor + offset
-        // would otherwise trigger.
+        // frame-lifetime absolute stream cursor (capped by
+        // `check_stream_abs_headroom`); `index_shift` is block-local
+        // (`current_len` during the btultra2 seed pass, `0` otherwise).
+        // The result is immediately masked down to the BT ring width
+        // by `& bt_mask()`, so what matters here is only the modulo-
+        // ring identity `(a + b) mod m == ((a mod 2^bits) + (b mod
+        // 2^bits)) mod m` for `m | 2^bits`: `wrapping_add` preserves
+        // that identity even on the rare i686 streams where the raw
+        // `usize` sum overflows. Using `wrapping_add` instead of `+`
+        // (or `saturating_add`) also keeps the release-mode overflow
+        // branch and the debug-mode overflow panic off this hot path.
         let bt_pos = abs_pos.wrapping_add(self.index_shift);
         2 * (bt_pos & self.bt_mask())
     }

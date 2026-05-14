@@ -26,6 +26,7 @@ use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
+use super::match_table::storage::check_stream_abs_headroom;
 use super::opt::types::MatchCandidate;
 
 pub(crate) struct DfastMatchGenerator {
@@ -108,6 +109,7 @@ impl DfastMatchGenerator {
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
@@ -212,9 +214,13 @@ impl DfastMatchGenerator {
         //
         // 1. Block-local arithmetic (`pos`, `skip_step`, `start +
         //    candidate.match_len`, `DFAST_SKIP_STEP_GROWTH_INTERVAL`):
-        //    bounded by `current_len <= HC_BLOCKSIZE_MAX (128 KiB)`.
-        //    The `while pos + DFAST_MIN_MATCH_LEN <= current_len`
-        //    guard keeps every offset well within that bound.
+        //    the dynamic bound is `current_len` itself — the `while
+        //    pos + DFAST_MIN_MATCH_LEN <= current_len` guard keeps
+        //    every offset within that bound regardless of how the
+        //    caller sized `max_window_size`. In production this also
+        //    happens to be `≤ HC_BLOCKSIZE_MAX (128 KiB)` because the
+        //    frame compressor never hands out larger blocks, but the
+        //    safety argument above does not rely on that limit.
         // 2. Absolute-position arithmetic (`current_abs_start + pos`):
         //    `current_abs_start` is the frame-lifetime cursor and
         //    advances with total bytes processed, NOT with the
@@ -222,13 +228,14 @@ impl DfastMatchGenerator {
         //    can therefore push `current_abs_start + pos` past
         //    `usize::MAX` even though memory usage stays bounded by
         //    `window_size`. The runtime enforcement lives in
-        //    `MatchTable::add_data` (see `STREAM_ABS_HEADROOM` =
-        //    `HC_OPT_NUM + 16`): every ingest fails fast with a
+        //    `DfastMatchGenerator::add_data`, which routes through
+        //    `check_stream_abs_headroom` (the same gate used by
+        //    `MatchTable::add_data`): every ingest fails fast with a
         //    clear panic if cumulative input would push the cursor
-        //    within `STREAM_ABS_HEADROOM` of `usize::MAX`. Raw `+`
-        //    here is donor parity and is correct precisely because
-        //    that upstream gate runs before this loop sees any new
-        //    bytes.
+        //    within `STREAM_ABS_HEADROOM` (`= HC_OPT_NUM + 16`) of
+        //    `usize::MAX`. Raw `+` here is donor parity and is
+        //    correct precisely because that upstream gate runs before
+        //    this loop sees any new bytes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
@@ -287,10 +294,14 @@ impl DfastMatchGenerator {
         //
         // 1. Block-local arithmetic (`ip0..ip3 = pos + N` for small
         //    `N`, `pos + skip_step` with `skip_step <=
-        //    DFAST_MAX_SKIP_STEP`): bounded by `current_len <=
-        //    HC_BLOCKSIZE_MAX (128 KiB)`. The `while pos +
-        //    DFAST_MIN_MATCH_LEN <= current_len` guard keeps every
-        //    offset well within that bound.
+        //    DFAST_MAX_SKIP_STEP`): the dynamic bound is `current_len`
+        //    itself — the `while pos + DFAST_MIN_MATCH_LEN <=
+        //    current_len` guard keeps every offset within that bound
+        //    regardless of how the caller sized `max_window_size`.
+        //    In production this also happens to be `≤
+        //    HC_BLOCKSIZE_MAX (128 KiB)` because the frame compressor
+        //    never hands out larger blocks, but the safety argument
+        //    above does not rely on that limit.
         // 2. Absolute-position arithmetic (`current_abs_start + ip0`,
         //    `current_abs_start + ip2`, etc.): `current_abs_start` is
         //    the frame-lifetime cursor and advances with total bytes
@@ -298,11 +309,12 @@ impl DfastMatchGenerator {
         //    streaming encode on i686 can push `current_abs_start +
         //    ipN` past `usize::MAX` even though memory stays bounded
         //    by `window_size`. The runtime enforcement lives in
-        //    `MatchTable::add_data` (`STREAM_ABS_HEADROOM` cap):
-        //    every ingest fails fast if cumulative input would
-        //    advance the cursor within `STREAM_ABS_HEADROOM` of
-        //    `usize::MAX`, which keeps the raw `current_abs_start +
-        //    ipN` arithmetic below `usize::MAX` for every position
+        //    `DfastMatchGenerator::add_data` via
+        //    `check_stream_abs_headroom`: every ingest fails fast if
+        //    cumulative input would advance the cursor within
+        //    `STREAM_ABS_HEADROOM` of `usize::MAX`, which keeps the
+        //    raw `current_abs_start + ipN` arithmetic below
+        //    `usize::MAX` for every position
         //    this loop ever observes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
@@ -604,7 +616,11 @@ impl DfastMatchGenerator {
         let mut pos = start;
         while pos < end {
             self.insert_position(pos);
-            pos = pos.saturating_add(step);
+            // `pos + step` is safe: `pos < end <= history_abs_end()` and
+            // `history_abs_end <= usize::MAX - STREAM_ABS_HEADROOM` by
+            // the upstream `check_stream_abs_headroom` gate, while
+            // `step` is bounded by `DFAST_INCOMPRESSIBLE_SKIP_STEP`.
+            pos += step;
         }
     }
 
