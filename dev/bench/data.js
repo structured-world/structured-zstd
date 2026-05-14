@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778682521538,
+  "lastUpdate": 1778756321159,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -29606,6 +29606,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.24,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cf289766461d07afb2052ce75b36952b19d7e24c",
+          "message": "refactor(encoding): #111 Phase 1e — migrate methods off HcMatchGenerator (Stages A–D) (#119)\n\n* refactor(encoding): Phase 1e Stage A batch 1 — move trivial accessors onto impl MatchTable\n\nFirst slice of the Phase 1e method migration: relocate the\nself-contained / static helpers that touch only `MatchTable` state\noff `impl HcMatchGenerator` and onto `impl MatchTable`:\n\n  - `get_last_space()` — last committed window slice\n  - `relative_position()` — abs → (rel + 1) conversion\n  - `window_low_abs_for_target()` — windowLow for a given target\n  - `bt_log()` / `bt_mask()` / `bt_pair_index_for_abs()` — BT\n    pointer-pair address math (depend only on `chain_log` and\n    `index_shift`)\n  - `stored_abs_position_fast()` — associated fn that decodes a\n    stored entry back to its absolute position\n\nCall sites switch `self.X(...)` → `self.table.X(...)` and the static\npath moves from `HcMatchGenerator::stored_abs_position_fast` to\n`MatchTable::stored_abs_position_fast`. No behavioural change.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n    (incl. level22_sequences_match_donor_on_corpus_proxy ratio gate)\n\n* refactor(encoding): Phase 1e Stage A batch 2 — move window / history helpers onto impl MatchTable\n\nSecond slice of the Stage A method migration:\n\n  - `add_data` / `trim_to_window` — rolling-window admit + retire\n  - `compact_history` — drain the dead prefix of the history mirror\n  - `live_history` / `history_abs_end` — live view of the contiguous\n    history slice and its absolute end position\n  - `mark_dictionary_primed` / `set_dictionary_limit_from_primed_bytes`\n    — dictionary-priming flag setters\n\nThese touch only `MatchTable` state (window, history*, dictionary_*),\nhave no HC- or BT-specific call edges, and are the natural next\nbatch after the trivial accessors in batch 1.\n\n`can_skip_rebase_check_at` is deferred to a later batch: it still\nreads `self.parse_mode` (HcMatchGenerator state) and won't move\nuntil parse_mode is replaced by the HcBackend enum in Stage D.\n\nCall sites switch `self.X(...)` / `matcher.X(...)` / `hc.X(...)` etc.\nto the corresponding `.table.X(...)` paths. No behavioural change.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage A batch 3 — move ensure_tables + hash helpers onto impl MatchTable\n\nThird slice of Stage A:\n\n  - `ensure_tables` — allocate hash / hash3 / chain tables sized to\n    the configured `*_log` values\n  - `hash_position` / `hash_position_with_mls` / `hash_position_at` /\n    `hash_value_with_mls` — main hash entry points\n  - `hash3_position` (#[cfg(test)]) — 3-byte hash mirror used by\n    donor parity tests\n  - `read_le_u32` / `read_le_u32_ptr` — unaligned LE load helpers\n\n`HC_PRIME3BYTES` / `HC_PRIME4BYTES` move to `match_table::storage`\nalongside the helpers that consume them. The match_generator module\nkeeps a `#[cfg(test)]`-only re-import so the donor-math mirror in\nthe test module continues to compile without dragging the constants\ninto the production build.\n\nCall sites switch:\n  - `Self::hash_position_*` / `Self::read_le_u32*` /\n    `Self::hash_value_with_mls` → `MatchTable::*`\n  - `HcMatchGenerator::hash_position_at` / `::hash3_position` /\n    `::read_le_u32*` (used from BT-walk macros and tests) →\n    `MatchTable::*`\n  - `self.hash_position(...)` / `self.ensure_tables()` /\n    aliased `<var>.ensure_tables()` → `<...>.table.*`\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage A batch 4 — move pure no-rebase inserts onto impl MatchTable\n\nFourth slice of Stage A:\n\n  - `insert_position_no_rebase` — main hash/chain insert without the\n    rebase guard\n  - `insert_hash3_only_no_rebase` — HC3 short-match side-table\n    insert without the rebase guard\n\nBoth are pure storage operations: they touch only `hash_table` /\n`chain_table` / `hash3_table` / `history` plus the `*_log` /\n`*_abs_start` cursors. They get called from inside\n`maybe_rebase_positions` / `rebase_positions_cold` / the BT\nupdate-tree paths after the caller has already validated that the\nposition is representable as a `(rel + 1)` u32 — so they don't need\nthe rebase check themselves and don't carry any HC- vs\nBT-discriminator state.\n\nThe remaining insert / rebase / update_hash3 methods stay on\n`impl HcMatchGenerator` for now: they read `parse_mode` directly\n(via `can_skip_rebase_check_at` / `maybe_rebase_positions`) or call\n`rebase_positions_cold`, which in turn drives `bt_insert_step_no_rebase`.\nThey'll migrate as part of Stage D once the HcBackend enum\nreplaces the `parse_mode` discriminator.\n\nCall sites switch `self.insert_*_no_rebase(...)` and the macro\n`$self.insert_*_no_rebase(...)` paths to the `.table.` form.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage A batch 5 — push rebase predicates onto impl MatchTable\n\nFinal slice of Stage A. The remaining bottleneck on the\n`HcMatchGenerator` side was the duo of cheap pre-checks the rebase\nguard used:\n\n  - `can_skip_rebase_check_at` — fast path predicate that avoids the\n    relative_position probe when the table is still trivially\n    addressable\n  - `maybe_rebase_positions` — decides whether a full table rebuild\n    is needed before inserting `abs_pos`\n\nBoth read `self.parse_mode` (for the BtUltra2 boundary tweak), which\nkept them tied to `HcMatchGenerator` until the discriminator could be\nthreaded explicitly. Lift them onto `impl MatchTable`:\n\n  - `MatchTable::can_skip_rebase_check_at(abs_pos, max_abs_pos, is_btultra2)`\n    — same predicate; takes the BtUltra2 flag as an arg instead of\n    reading the enum field\n  - `MatchTable::needs_rebase(abs_pos, is_btultra2) -> bool` — pure\n    decision; does **not** perform the rebase. The cold rebuild path\n    (`rebase_positions_cold`) stays on `HcMatchGenerator` because it\n    drives `bt_insert_step_no_rebase`, which is BT-side and migrates\n    in Stage C.\n\n`HcMatchGenerator::maybe_rebase_positions` collapses to a thin wrapper\nthat calls `MatchTable::needs_rebase` and, on `true`, dispatches to\nits own `rebase_positions_cold`. `update_hash3_until` and the BT-walk\nupdate-tree path use the new predicate directly.\n\nThis finishes the data-side of Stage A. The remaining insert /\nupdate_hash3 wrappers still live on `HcMatchGenerator` because they\nfunnel through `rebase_positions_cold`; they'll move once that path\nunwinds in Stage C/D.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage B batch 6 — lift HC scoring atoms onto impl HcMatcher\n\nStart the HC method migration with the three self-contained scoring\nhelpers that don't recursively touch the chain walker:\n\n  - `HcMatcher::match_gain(match_len, offset)` — pure associated\n    function, no self\n  - `HcMatcher::better_candidate(lhs, rhs)` — pure, calls match_gain\n  - `HcMatcher::extend_backwards(table, …)` — back-extension over the\n    literal run; takes `&MatchTable` instead of an HcMatcher\n    reference, since the only state it needs is the contiguous\n    history mirror\n\nCall sites switch:\n  - `Self::better_candidate(…)` → `HcMatcher::better_candidate(…)`\n  - `Self::match_gain(…)` → `HcMatcher::match_gain(…)`\n  - `self.extend_backwards(…)` → `HcMatcher::extend_backwards(&self.table, …)`\n\nThese atoms are the building blocks for the upcoming batches that\nmigrate `chain_candidates`, `find_best_match`, `hash_chain_candidate`,\n`repcode_candidate`, and `start_matching_lazy` to `impl HcMatcher`\nwith a threaded `&mut MatchTable`.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage B batch 7 — migrate HC chain walker / find_best_match onto impl HcMatcher\n\nMove the five core methods of the lazy / lazy2 parser onto\n`impl HcMatcher`, threading `&MatchTable` as their storage argument:\n\n  - `chain_candidates(&self, &MatchTable, abs_pos) -> [usize; …]`\n  - `repcode_candidate(&MatchTable, abs_pos, lit_len) -> Option<…>` —\n    no HcMatcher state needed; kept as associated fn for grouping\n  - `hash_chain_candidate(&self, &MatchTable, abs_pos, lit_len)`\n  - `find_best_match(&self, &MatchTable, abs_pos, lit_len)`\n  - `pick_lazy_match(&self, &MatchTable, abs_pos, lit_len, best)`\n\nThe `HC_MIN_MATCH_LEN` and `MAX_HC_SEARCH_DEPTH` constants live in\n`encoding::hc` alongside the methods that consume them; the\n`match_generator` module re-imports them so existing macros and\nconfigs compile unchanged. The runtime `common_prefix_len` helper is\nno longer needed from `match_generator` (only the chain walker used\nit); the import drops to `#[cfg(test)]` for the donor-math mirror.\n\nCall sites flip:\n  - `self.find_best_match(…)` / `self.pick_lazy_match(…)` →\n    `self.hc.find_best_match(&self.table, …)` etc.\n  - `self.chain_candidates(…)` from BT macros →\n    `self.hc.chain_candidates(&self.table, …)`\n  - Test-region `hc.chain_candidates(…)` / `matcher.chain_candidates(…)`\n    aliases gain the `&<var>.table` argument\n\n`start_matching_lazy` still lives on `HcMatchGenerator`: it drives\n`insert_position` and `insert_positions` which both call\n`rebase_positions_cold` (BT-side, migrates in Stage C/D). It now uses\nthe relocated helpers via the `self.hc.` / `&self.table` split borrow.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage B batch 8 — relocate SIMD rep-code probes onto impl HcMatcher\n\nMove the five `for_each_repcode_candidate_with_reps*` functions to\n`impl HcMatcher`:\n\n  - `for_each_repcode_candidate_with_reps` — kernel dispatcher\n  - `for_each_repcode_candidate_with_reps_neon` — AArch64 NEON\n  - `for_each_repcode_candidate_with_reps_sse42` — x86 SSE4.2\n  - `for_each_repcode_candidate_with_reps_avx2_bmi2` — x86 AVX2+BMI2\n  - `for_each_repcode_candidate_with_reps_scalar` — fallback\n\nEach now takes `&MatchTable` explicitly instead of reaching through\n`self.table.X`. The kernel-specific variants keep their\n`#[target_feature]` umbrellas so the per-rep `common_prefix_len_ptr`\ncall still inlines under the SIMD context, matching the donor\nparity guarantee.\n\nThe `for_each_repcode_candidate_body!` macro is rewritten to consume\n`$table` rather than `$self.table.X`, and gains `#[macro_export]` so\n`hc::HcMatcher` can invoke it via `crate::for_each_repcode_candidate_body!`.\nThe `collect_optimal_candidates_initialized_body!` macro now\ndispatches through `$self.hc.$for_each_rep(&$self.table, …)` to reach\nthe relocated methods from the BT side.\n\nTest callers (`hc.for_each_repcode_candidate_with_reps(…)`) gain the\n`&hc.table` arg via the same `<var>.hc.<method>(&<var>.table, …)`\npattern Stage A established for storage accessors.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage C batch 9 — lift BT scoring atoms onto impl BtMatcher\n\nFirst slice of the BT method migration. Move the two self-contained\nscoring helpers that don't recursively touch the BT walker:\n\n  - `BtMatcher::HASH_MLS: usize = 4` — replaces `bt_hash_mls()`,\n    now a const since the body was always the hardcoded donor value\n  - `BtMatcher::push_candidate_ladder(out, best_len_for_skip,\n    candidate, min_match_len)` — pure associated function for the\n    optimal-parser candidate ladder\n\nCall sites switch:\n  - `HcMatchGenerator::push_candidate_ladder(…)` →\n    `BtMatcher::push_candidate_ladder(…)` (7 sites, mostly inside the\n    BT walk and `collect_optimal_candidates_initialized_body!` macro)\n  - `self.bt_hash_mls()` / `$self.bt_hash_mls()` / aliased\n    `hc.bt_hash_mls()` (test region) → `BtMatcher::HASH_MLS`\n\nThese atoms unblock the larger BT method migration (`bt_walk*`,\n`bt_update_tree_until_*`, `bt_insert_step_no_rebase_body!`, etc.)\nthat will follow in subsequent Stage C batches, mirroring how\nStage B Batch 6 prepared the ground for the HC chain walker.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage C batch 10 — relocate HC3 SIMD probes onto impl BtMatcher\n\nMirror the Stage B SIMD relocation for the HC3 short-match probe.\nMove the five `hash3_candidate*` functions onto `impl BtMatcher`:\n\n  - `hash3_candidate` — kernel dispatcher\n  - `hash3_candidate_neon` / `_sse42` / `_avx2_bmi2` / `_scalar` —\n    per-kernel umbrella variants\n\nEach now takes `&MatchTable` explicitly instead of pulling storage\nthrough `self.table.X`. The `target_feature` umbrellas are retained\nso the per-probe `common_prefix_len_ptr` call still inlines under\nthe SIMD context, matching donor parity.\n\nThe `hash3_candidate_body!` macro is rewritten to consume `$table`\nrather than `$self.table.X` and gains `#[macro_export]` so\n`bt::BtMatcher` can invoke it via `crate::hash3_candidate_body!`.\nAll cross-module references inside the macro switch to\n`$crate::encoding::*` paths so it resolves correctly regardless of\nexpansion site. `HC3_MAX_OFFSET` follows the macro to\n`encoding::bt`.\n\nThe `collect_optimal_candidates_initialized_body!` macro now reaches\nthe relocated probe via `$self.bt.$hash3(&$self.table, …)` (matching\nthe `$self.hc.$for_each_rep(&$self.table, …)` pattern from\nBatch 8).\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage C batch 11 — relocate BT walker onto impl BtMatcher\n\nMove the per-position binary-tree walker — the hottest BT inner\nloop — to `impl BtMatcher`:\n\n  - `bt_insert_step_no_rebase` — kernel dispatcher\n  - `bt_insert_step_no_rebase_neon` / `_sse42` / `_avx2_bmi2` /\n    `_scalar` — per-kernel umbrella variants\n\nEach now takes `&mut MatchTable` and `search_depth: usize` (sourced\nfrom the HC matcher at the call site for now; will collapse into a\nBtMatcher field once Stage D unifies the per-frame config under\nHcBackend). `target_feature` umbrellas remain so the per-iteration\n`count_match_from_indices` SIMD probe still inlines under the\nkernel context — matching donor parity.\n\n`bt_insert_step_no_rebase_body!` macro is rewritten to consume\n`$table` + `$search_depth` instead of `$self.{table,hc.search_depth}`\nand gains `#[macro_export]` so `BtMatcher` can invoke it via\n`crate::bt_insert_step_no_rebase_body!`. Every cross-module\nidentifier inside the macro (`HC_EMPTY`, `MatchTable::*`,\n`BtMatcher::HASH_MLS`) switches to fully-qualified\n`$crate::encoding::*` paths.\n\nCallers on `HcMatchGenerator` (the `bt_update_tree_until_*` family,\n`rebase_positions_cold`) now invoke\n`self.bt.bt_insert_step_no_rebase*(&mut self.table, self.hc.search_depth, …)`\n— same split-borrow pattern Stages A / B established for storage\nand HC paths.\n\nVerification:\n  - cargo build (default + --no-default-features) clean\n  - cargo clippy --all-targets -- -D warnings clean\n  - cargo nextest run -p structured-zstd --lib → 381 passed\n\n* refactor(encoding): Phase 1e Stage C batch 12 — relocate BT match collector onto impl BtMatcher\n\nMove `bt_insert_and_collect_matches` dispatcher + 4 SIMD umbrella variants\noff `impl HcMatchGenerator` onto `impl BtMatcher`. Convert the shared body\nmacro to `#[macro_export]` with `$table` / `$search_depth` parameters and\nfully-qualified `$crate::encoding::*` paths so it expands cleanly inside\n`bt/mod.rs`.\n\nCall site inside `collect_optimal_candidates_initialized_body!` now uses\nthe split-borrow pattern `self.bt.\\$bt_insert(&mut self.table,\nself.hc.search_depth, …)`, mirroring the BT walker call sites established\nin batch 11.\n\nBuild (default + --no-default-features), strict clippy, 381 lib tests\nincluding level22_sequences_match_donor_on_corpus_proxy all green.\n\n* refactor(encoding): Phase 1e Stage A+B batch 13 — lift opt-pass clamp helpers\n\nMove `donor_opt_start_cursor_and_litlen` (pure-storage predicate over\n`history_abs_start`) onto `impl MatchTable` and `sufficient_match_len_for_pass`\n(clamp of `profile.sufficient_match_len` by `target_len` / `HC_OPT_NUM-1`)\nonto `impl HcMatcher`. Both methods are read-only and donor-parity helpers\ncalled by `build_optimal_plan_impl!` and `run_btultra2_seed_pass`; their\nfinal-shape ownership is the data they read.\n\nCallers (`self.donor_opt_start_cursor_and_litlen(...)` →\n`self.table.donor_opt_start_cursor_and_litlen(...)`, macro\n`\\$self.sufficient_match_len_for_pass(profile)` → `\\$self.hc.…`, three\ntest sites) updated. Build×2 + strict clippy + 381 lib tests\n(incl. level22 ratio gate) green.\n\n* refactor(encoding): Phase 1e Stage C batch 14 — migrate LDM helpers onto impl BtMatcher\n\nMove all four `ldm_*` helpers (`ldm_skip_raw_seq_store_bytes`,\n`ldm_get_next_match_and_update_seq_store`, `ldm_maybe_add_match`,\n`ldm_process_match_candidate`) off `impl HcMatchGenerator` onto\n`impl BtMatcher` — the LDM seq store sits in `BtMatcher::ldm_sequences`\nand the helpers only read `MatchCandidate` / mutate the caller-owned\n`HcOptLdmState`, so no `MatchTable` borrow is needed.\n\nMacro `build_optimal_plan_impl!` (call sites at the macro definitions\nof `start_matching_optimal` body) and the one HcMatchGenerator-side\ncaller updated to `\\$self.bt.ldm_*` / `self.bt.ldm_*`.\n\nBuild (default + --no-default-features), strict clippy, 381 lib tests\nincl. level22 ratio gate — all green.\n\n* refactor(encoding): Phase 1e Stage A+C batch 15 — lift optimal-plan emit + finish\n\nMigrate `emit_optimal_plan` onto `impl MatchTable` (pure storage helper\nover `window` + `offset_hist`) and `finish_optimal_plan` onto `impl\nBtMatcher` (restores the seven `opt_*_scratch` buffers the parser\nborrowed via `core::mem::take`).\n\nCallers updated: the six `\\$self.finish_optimal_plan(...)` sites inside\n`build_optimal_plan_impl!` switch to `\\$self.bt.finish_optimal_plan(...)`,\nand the single `self.emit_optimal_plan(...)` driver call site switches\nto `self.table.emit_optimal_plan(...)`.\n\nBuild (default + --no-default-features) + strict clippy + 381 lib\ntests (incl. level22 ratio gate) green.\n\n* refactor(encoding): Phase 1e Stage C batch 16 — move prepare_ldm_candidates onto impl BtMatcher\n\n`prepare_ldm_candidates` only resets `BtMatcher::ldm_sequences` (the\ndonor's `ZSTD_ldm_blockCompress` seed step is not wired up in this\nencoder yet, so the body is just a defensive clear). Move to\n`impl BtMatcher` so the entire LDM helper cluster lives in one place;\nthe single caller (`start_matching_optimal`) switches to\n`self.bt.prepare_ldm_candidates(...)`.\n\nBuild (default + --no-default-features) + strict clippy + 381 lib\ntests incl. level22 ratio gate — all green.\n\n* refactor(encoding): Phase 1e Stage C batch 17 — lift optimal-parser pure helpers onto impl BtMatcher\n\nMove all 11 stateless optimal-parser helpers off `impl HcMatchGenerator`\nonto `impl BtMatcher`:\n\n- `encode_offset_with_reps`, `encode_offset_base_with_reps`\n- `update_plan_stats_segment`\n- `reset_opt_node`, `reset_opt_nodes`\n- `add_price_delta`, `add_prices`\n- `cached_literal_price`, `cached_lit_length_price`,\n  `cached_lit_length_delta_price`, `cached_match_length_price`\n\nAll are pure associated functions (no `self`), so the migration is a\nrelocation only — internal `Self::` recursion (e.g.\n`cached_lit_length_delta_price` calling `cached_lit_length_price`)\nkeeps working unchanged.\n\n~37 caller sites across `build_optimal_plan_impl!` and\n`run_btultra2_seed_pass` / `start_matching_optimal` rewritten from\n`HcMatchGenerator::X` / `Self::X` to `BtMatcher::X`.\n\n`BtMatcher` added to imports; `HC_MAX_LIT` gated to `#[cfg(test)]`\nsince the production use moved to `bt/mod.rs`.\n\nBuild (default + --no-default-features), strict clippy, 381 lib tests\nincl. level22 ratio gate — all green.\n\n* refactor(encoding): Phase 1e Stage D prep batch 18 — extract rebase replay onto MatchTable / BtMatcher\n\n`rebase_positions_cold` was the last cross-cutting method that\ninlined both the table-reset bookkeeping and the BT- vs HC-side\nhistory replay. Split it into three named operations:\n\n- `MatchTable::begin_rebase` — resets `position_base` / `index_shift`,\n  flips `allow_zero_relative_position`, and clears the three index\n  tables (the shared part).\n- `MatchTable::replay_history_for_rebase_hc` — re-inserts the HC\n  history prefix via `insert_position_no_rebase`.\n- `BtMatcher::replay_history_for_rebase` — re-inserts the BT history\n  prefix via `bt_insert_step_no_rebase`, threading `search_depth` and\n  the live `history_abs_end()` rebuild end.\n\n`rebase_positions_cold` itself shrinks to a 7-line dispatcher reading\n`uses_bt_matchfinder()` and calling one helper per branch. No\nbehavioural change — `next_to_update3` cursor advance and rebase\nordering preserved.\n\n`HC_EMPTY` import in `match_generator.rs` is now `#[cfg(test)]`\nsince production use moved to `MatchTable::begin_rebase`.\n\nBuild (default + --no-default-features), strict clippy, 381 lib\ntests incl. level22 ratio gate — all green.\n\n* refactor(encoding): Phase 1e Stage D prep batch 19 — consolidate is_btultra2 reads\n\nReplace the seven scattered `self.parse_mode == HcParseMode::BtUltra2`\nchecks with a single `self.is_btultra2()` accessor method. Pure\nnaming change today; the payoff is in Stage D when `parse_mode` folds\ninto the `HcBackend` enum — that swap then becomes a one-line edit\nto the accessor body instead of touching every call site.\n\nBuild (default + --no-default-features), strict clippy, 381 lib\ntests incl. level22 ratio gate — green.\n\n* refactor(encoding): Phase 1e Stage D batch 20a — host BT walker on MatchTable\n\nMirror `search_depth`, `is_btultra2`, and `uses_bt` from `HcMatcher` /\n`HcParseMode` onto new `MatchTable` fields during `configure()`. The\nformer `HcMatchGenerator::is_btultra2()` and `uses_bt_matchfinder()`\naccessors now consult those flags so the BT walker can read its\ndispatch state without going back through the outer generator.\n\nMove the per-position BT walker (`bt_insert_step_no_rebase` plus four\nSIMD variants, ten methods total when counted with\n`bt_insert_and_collect_matches`) from `impl BtMatcher` onto\n`impl MatchTable`. The body macros only ever touched `$table` /\n`$search_depth`, never the matcher itself — the move just drops the\nno-op `let _ = self;` lines and changes the receiver from\n`&self: BtMatcher + table: &mut MatchTable` to `&mut self: MatchTable`,\nreading `self.search_depth` directly.\n\nReplace BT-side `replay_history_for_rebase` (previously on BtMatcher)\nwith `MatchTable::replay_history_for_rebase_bt`. `rebase_positions_cold`\nnow dispatches via `self.table.uses_bt` and calls the appropriate\nMatchTable replay variant directly — the split borrow between\n`&self.bt` and `&mut self.table` is gone.\n\nEvery prior call site (`bt_update_tree_until_*` SIMD variants,\n`bt_insert_sparse_incompressible_block`, the\n`collect_optimal_candidates_initialized_body!` macro) is rewritten:\n`self.bt.bt_insert_step_no_rebase*(&mut self.table, self.hc.search_depth, ...)`\nbecomes `self.table.bt_insert_step_no_rebase*(...)`, and\n`$self.bt.$bt_insert(&mut $self.table, $self.hc.search_depth, ...)`\nbecomes `$self.table.$bt_insert(...)`.\n\nTwo test sites (`btultra_and_btultra2_both_keep_dictionary_candidates`)\nthat bypass `configure()` are taught to write through the new flags\nwhen they mutate `parse_mode` directly.\n\nVerification:\n  cargo build -p structured-zstd\n  cargo build -p structured-zstd --no-default-features\n  cargo clippy --all-targets -p structured-zstd -- -D warnings\n  cargo nextest run -p structured-zstd --lib    # 381/381, level22 ratio gate green\n\n* refactor(encoding): Phase 1e Stage D batch 20b — lift BT/HC update chain onto MatchTable\n\nMove the BT-tree update loop and the rebase / insert chain off\n`HcMatchGenerator` onto `MatchTable`:\n\n  * `bt_update_tree_until` cross-platform entry plus four kernel-\n    specific variants (`*_neon`, `*_sse42`, `*_avx2_bmi2`,\n    `*_scalar`). Each variant reads `self.is_btultra2` directly\n    instead of dispatching back through the outer generator.\n  * `update_hash3_until` — pure hash3 fill loop, same rebase guard\n    pattern.\n  * `maybe_rebase_positions` (hot wrapper) and `rebase_positions_cold`\n    (cold rebuild). The cold path now reads `self.uses_bt` to pick the\n    BT vs HC history-replay variant; the former cross-struct borrow\n    (`&self.bt` + `&mut self.table`) is gone.\n  * `insert_position`, `insert_positions`, `insert_positions_with_step`\n    — the public single / range / sparse insert entry points.\n\nCallers in `HcMatchGenerator` (backfill_boundary_positions,\napply_limited_update_after_long_match path, skip_matching, the\nbt_insert_sparse_incompressible_block helper, start_matching_lazy,\nstart_matching_optimal, and the `collect_optimal_candidates_initialized_body!`\nmacro) are rewritten from `self.foo(...)` to `self.table.foo(...)` /\n`$self.table.foo(...)`. The macro that drives the BT update is also\nfixed: `$self.$bt_update(...)` → `$self.table.$bt_update(...)`.\n\nTest sites that hand-poked `hc.insert_positions*` /\n`matcher.maybe_rebase_positions` are mechanically retargeted to\n`hc.table.*` / `matcher.table.*`.\n\nAfter this batch, `HcMatchGenerator` no longer owns *any* part of the\nhash / chain / BT-tree update machinery — every walker, every rebase\nguard, every insert lives on `MatchTable`. The facade is shrinking to\nits final shape: configure(), the start_matching_* orchestrators, and\nthe optimal-parser glue.\n\nDiff stats:\n  match_generator.rs:  6922 → 6681 (-241)\n  match_table/storage.rs: 562 → 1144 (+582)\n\nVerification:\n  cargo build -p structured-zstd\n  cargo build -p structured-zstd --no-default-features\n  cargo clippy --all-targets -p structured-zstd -- -D warnings\n  cargo nextest run -p structured-zstd --lib    # 381/381, level22 ratio gate green\n\n* refactor(encoding): Phase 1e Stage D batch 21 — lift skip_matching family onto MatchTable\n\nAfter batch 20 every walker / rebase guard / insert path lived on\n`MatchTable`, but `HcMatchGenerator` still owned the four orchestration\nhelpers that drove them:\n\n  * `backfill_boundary_positions` — fills the final `< 4` bytes of the\n    previous slice (which couldn't be hashed at the time because the\n    insert needs 4 bytes of lookahead).\n  * `apply_limited_update_after_long_match` — caps the BT-mode insert\n    gap at 384 / 192 to bound the next BT tree update.\n  * `bt_insert_sparse_incompressible_block` — the BT counterpart of the\n    HC sparse skip path; sparse stride through the block with a dense\n    tail of the last `HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP`\n    positions.\n  * `skip_matching` — the slice-level entry point that backfills then\n    walks either dense or sparse depending on `incompressible_hint`.\n\nAll four read only `self.table.*` plus the parse-mode flags\n(`is_btultra2` / `uses_bt`) that batch 20 mirrored onto `MatchTable`,\nso they migrate cleanly onto `impl MatchTable` (`&mut self` receiver).\n\n`HcMatchGenerator::skip_matching` is reduced to a one-line shim\n`self.table.skip_matching(incompressible_hint)` so the\n`MatchGeneratorDriver` ABI is unchanged. Internal call sites in\n`start_matching_lazy` / `start_matching_optimal` rewrite\n`self.backfill_boundary_positions(...)` →\n`self.table.backfill_boundary_positions(...)` and\n`self.apply_limited_update_after_long_match(...)` →\n`self.table.apply_limited_update_after_long_match(...)`.\n\nThe now-redundant `HcMatchGenerator::uses_bt_matchfinder()` accessor is\ndeleted; its sole remaining caller (`collect_optimal_candidates`)\nreads `self.table.uses_bt` directly. `INCOMPRESSIBLE_SKIP_STEP` import\nis gated `#[cfg(test)]` since only test code references it from this\nmodule after the migration.\n\nDiff stats:\n  match_generator.rs:  6681 → 6573 (-108)\n  match_table/storage.rs: 1144 → 1262 (+118)\n\nVerification:\n  cargo build -p structured-zstd\n  cargo build -p structured-zstd --no-default-features\n  cargo clippy --all-targets -p structured-zstd -- -D warnings\n  cargo nextest run -p structured-zstd --lib    # 381/381, level22 ratio gate green\n\n* refactor(encoding): Phase 1e Stage D batch 22 — enum HcBackend; HC modes drop the BT scratch payload\n\nReplace the always-present bt: BtMatcher field on HcMatchGenerator\nwith a discriminator enum:\n\n    pub(crate) enum HcBackend {\n        Hc,                                  // lazy / lazy2 — zero-sized\n        Bt(alloc::boxed::Box<BtMatcher>),    // btopt / btultra / btultra2\n    }\n\nThe Bt variant is boxed (~4 KiB BtMatcher payload behind a pointer)\nso the enum stays pointer-sized; HC matchers pay the niche only and\nnever allocate the BT cost-model / optimal-parser scratch arenas.\n\nconfigure() is the gate that promotes the discriminator: switching\ninto one of the BT parse modes constructs a fresh\nBox::new(BtMatcher::new()); switching back into Lazy2 drops it.\nreset() and seed_dictionary_entropy() short-circuit on HcBackend::Hc.\nshould_run_btultra2_seed_pass() rewrites its &&-chain so the BT\nfield reads only happen after a `let HcBackend::Bt(bt) = ...` pattern\nmatch, returning false early in HC mode.\n\nThe macro hot path (build_optimal_plan_impl_body!,\ncollect_optimal_candidates_initialized_body!) goes through\nHcBackend::bt_mut() for &mut BtMatcher access. Routing the mutable\nborrow through $self.backend.bt_mut() (rather than a helper on\nHcMatchGenerator) is deliberate — it borrows only the backend field,\nleaving $self.table / $self.hc available for disjoint immutable\naccess. Three call sites that take two &mut BtMatcher fields in the\nsame expression now bind `let bt = $self.backend.bt_mut()` once so\nthe disjoint-field split-borrow succeeds.\n\nStage D also frees BtMatcher from another no-state straggler: the\nhash3_candidate* family (cross-platform + 4 SIMD variants) had\n`let _ = self;` and used only $table — now lives on impl MatchTable\nas &self methods. The hot path inside\ncollect_optimal_candidates_initialized_body! rewrites\n\\$self.bt.\\$hash3(&\\$self.table, ...) to \\$self.table.\\$hash3(...) which\nmeans the HC3 short-match probe no longer panics on HC-mode\ngenerators (the previous bt field was always present but trivially\nignored; the boxed enum is not).\n\nTest sites that hand-poke parse_mode and table.is_btultra2 now also\ninstall HcBackend::Bt(Box::new(BtMatcher::new())) so the\nshort-circuit invariants hold. The hc.bt.X shorthand in tests is\nmechanically retargeted to hc.backend.bt_mut().X.\n\nDiff stats:\n  match_generator.rs:    6573 to 6693 (+120, enum + dispatch helpers)\n  bt/mod.rs:              706 to  572 (-134, hash3_candidate x5 moved)\n  match_table/storage.rs:1262 to 1378 (+116, hash3_candidate x5 received)\n\nVerification: build default + no-default, clippy strict, 381/381\nnextest including level22 ratio gate.\n\n* docs(encoding): restore begin_rebase doc comment\n\nBatch 20a inserted the BT walker cluster before begin_rebase and the\nexisting `///` block landed orphaned on top of `bt_insert_step_no_rebase`,\nso its rendered rustdoc described \"rebase-derived bookkeeping reset\"\ninstead of the BT walker step. Move the begin_rebase paragraph back to\nits method and keep only the Stage D BT walker doc on\nbt_insert_step_no_rebase.\n\nSpotted by Copilot on PR #119.\n\n* refactor(encoding): demote shared body macros to crate-private + drop dead branch\n\nTwo changes:\n\n1. `MatchTable::emit_optimal_plan` drops the\n   `start < literals_start` check after `saturating_add` on a `usize`.\n   The branch is unreachable — `saturating_add` cannot decrease its\n   first operand on an unsigned type. The remaining\n   `start + match_len > current_len` overflow guard is kept.\n\n2. The four shared body macros (`bt_insert_step_no_rebase_body`,\n   `hash3_candidate_body`, `for_each_repcode_candidate_body`,\n   `bt_insert_and_collect_matches_body`) lose `#[macro_export]`. Their\n   bodies reference private `encoding::*` modules via `$crate::...`,\n   so they cannot be invoked from downstream crates — yet\n   `#[macro_export]` was placing them in the crate root's public\n   macro namespace, exposing them as semver-load-bearing API.\n\n   Replace with `pub(crate) use <macro>;` re-export from the defining\n   module so sibling modules can still call them by path. Callers in\n   `hc/mod.rs` (4 sites) and `match_table/storage.rs` (12 sites) move\n   from `crate::<name>!(...)` to `super::[super::]match_generator::<name>!(...)`.\n   The macros remain crate-private; nothing leaks past the crate\n   boundary anymore.\n\nVerification: build default + no-default, clippy strict, 399/399\nnextest including level22 ratio gate.\n\n* fix(encoding): rebuild HC3 in cold rebase, harden chain walk + plan replay overflow\n\n1. MatchTable::rebase_positions_cold rebuilds the HC3 side table.\n   `begin_rebase()` zeroes `hash3_table`, but the cold path only\n   replayed the main hash/chain (or BT tree) state and then bumped\n   `next_to_update3` past the rebase point. After the first rebase\n   every HC3 probe up to `abs_pos` returned \"empty\" until the\n   encoder's next position fell due, silently changing btultra2\n   short-match selection on long-running streams. Reset\n   `next_to_update3 = history_start` after the main replay and call\n   `update_hash3_until(abs_pos)` when `hash3_log != 0`.\n\n   Regression test `storage_tests::rebase_positions_cold_rebuilds_\n   hash3_for_btultra2` asserts the HC3 table is non-empty after a\n   cold rebase from a btultra2-style configuration.\n\n2. HcMatcher::chain_candidates decodes entries through\n   `MatchTable::stored_abs_position_fast`. Raw\n   `position_base + candidate_rel` ignored `index_shift`; while the\n   field is always 0 today, rebased entries would have been silently\n   misdecoded once a future donor-parity variant set the shift. Also\n   cap the loop / fill bound at `MAX_HC_SEARCH_DEPTH` so a\n   misconfigured `self.search_depth > MAX_HC_SEARCH_DEPTH` (BT modes\n   pass donor depth values that can exceed 64) cannot index past the\n   fixed-size `buf`.\n\n3. BtMatcher::update_plan_stats_segment drops the unreachable\n   `start < *literals_start` check after `saturating_add` and hardens\n   the rest with `checked_add` for both `start` and `end`. Plain\n   `start + match_len` would have panicked under\n   `overflow-checks = true` on a malformed plan; `saturating_add`\n   would have silently produced `usize::MAX` and slipped past the\n   `> current_len` guard.\n\nVerification: build default + no-default, clippy strict, 400/400\nnextest (399 prior + 1 new regression) including level22 ratio gate.\n\n* refactor(encoding): harden emit_optimal_plan plan replay with checked_add\n\n`MatchTable::emit_optimal_plan` (storage.rs:1366) used\n`saturating_add` for `start` but plain `+` for `start + match_len`\nand `literals_start = start + match_len`. The latter would panic\nunder overflow checks on a malformed plan entry; `saturating_add`\non the former would silently clamp to `usize::MAX` and slip past\nthe `> current_len` guard.\n\nMirror `BtMatcher::update_plan_stats_segment`: `checked_add` on\nboth `start` and `end`, continue on either overflow, reuse the\ncomputed `end` for `literals_start = end`.\n\n* fix(encoding): resize MatchTable index tables per-config-log width\n\n`MatchTable::ensure_tables` only reallocated on first use\n(`if self.hash_table.is_empty()`). That made correctness depend on\nthe convention that `HcMatchGenerator::configure()` explicitly\n`.clear()`s the three tables whenever it overwrites `hash_log` /\n`chain_log` / `hash3_log` to force re-allocation on the next frame.\n\nAny path that updates the `*_log` fields directly — tests that\nhand-poke them, future code that bypasses `configure()` — would leave\nthe tables sized at the OLD widths. `hash_position_at` / `bt_pair_index_for_abs`\nwould then compute indices for the NEW chain mask while\n`insert_position_no_rebase` writes via `get_unchecked` against the\nstale slot count — out-of-bounds UB on the very next encode.\n\nSwitch to a per-table length check: if the current `len()` doesn't\nmatch the size implied by the active `*_log`, reallocate that one\ntable. The convention with `configure()` still works (cleared tables\nhave `len == 0 != expected_size`); the change just removes the\nsilent-UB landmine for any caller that doesn't follow the\nconvention.\n\nSpotted by CodeRabbit on PR #119 (Critical).\n\n* test(encoding): cover MatchTable boundary paths (zero-step, gap-cap, empty plan)\n\nSeven new unit tests target the remaining testable branches on\nMatchTable:\n\n- insert_positions_with_step(start, end, step=0) early-returns\n  without touching the index tables.\n- insert_positions_with_step with step=usize::MAX hits the\n  `next <= pos` guard after a single saturating-add iteration and\n  breaks the loop instead of spinning.\n- apply_limited_update_after_long_match:\n    * HC mode (`uses_bt = false`) — early-return path, the skip\n      cursor must stay put.\n    * BT mode with gap > 384 — cursor is capped at\n      `current_abs_start - (gap - 384).min(192)`.\n    * BT mode with gap < 384 — no adjustment.\n- emit_optimal_plan with an empty plan emits a single\n  `Sequence::Literals { literals: full window }` and returns early.\n- emit_optimal_plan with a plan item whose `start + match_len`\n  overshoots `current_len` skips that item (the `checked_add` /\n  `> current_len` guards) and still emits the trailing literals at\n  the end of the loop.\n\nVerification: build default + no-default, clippy strict, 416/416\nnextest (409 + 7 new) including level22 ratio gate.\n\n* ci: route test job's cargo invocations through rustup run stable\n\nmacos-latest runner image now ships Homebrew rustup which intentionally\nomits the `~/.cargo/bin/cargo` proxy shim. `dtolnay/rust-toolchain@stable`\nruns `rustup default stable` successfully (the toolchain is installed)\nbut the plain `cargo` shim is missing, so bare `cargo nextest run` ends\nup invoking `rustup-init` and prints `Usage: rustup-init[EXE]` instead\nof dispatching to the active toolchain's cargo.\n\nRoute the test job's `cargo nextest run` and `cargo test --doc` through\n`rustup run stable cargo …` so the dispatch works on macos-latest. No\nbehaviour change on Linux / Windows runners — `rustup run` is the\ncanonical way to invoke a toolchain binary regardless of shim presence.\n\nAlso switch the matrix to `fail-fast: false`. Previously one macOS\nglitch cancelled the ubuntu and windows test jobs at the toolchain\ninstall step, masking whether the failure was platform-specific.\n\nThe msrv / cross-i686 / codecov jobs all run on ubuntu-latest where\nthe `cargo` proxy is intact — left untouched.",
+          "timestamp": "2026-05-14T13:20:56+03:00",
+          "tree_id": "002eac1bcc54ebace75d5d6c388758c990820514",
+          "url": "https://github.com/structured-world/structured-zstd/commit/cf289766461d07afb2052ce75b36952b19d7e24c"
+        },
+        "date": 1778756320163,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.161,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.203,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.189,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.204,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.017,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.299,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/pure_rust",
+            "value": 25.69,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.812,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/pure_rust",
+            "value": 121.708,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.149,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/pure_rust",
+            "value": 111.175,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-z000033/matrix/c_ffi",
+            "value": 12.47,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/pure_rust",
+            "value": 65.893,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.412,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/pure_rust",
+            "value": 127.018,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-z000033/matrix/c_ffi",
+            "value": 17.928,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/pure_rust",
+            "value": 528.631,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-z000033/matrix/c_ffi",
+            "value": 248.073,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.828,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.262,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 13.646,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.324,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.395,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.669,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 7.351,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 5.67,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.06,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.577,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.032,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.044,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.707,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.037,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.014,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.112,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.988,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.193,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.752,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.073,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.598,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.985,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.013,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.934,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.663,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.049,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 8.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.038,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.872,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.95,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.349,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
             "unit": "ms"
           }
         ]
