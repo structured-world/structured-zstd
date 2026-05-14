@@ -20,7 +20,9 @@ use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
 };
-use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered};
+use support::{
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered,
+};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
