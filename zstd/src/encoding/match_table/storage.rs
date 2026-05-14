@@ -230,20 +230,29 @@ impl MatchTable {
     }
 
     /// Allocate the hash / chain / hash3 tables sized to the current
-    /// `hash_log` / `chain_log` / `hash3_log` configuration. No-op if
-    /// the main hash_table is already sized; the backend-switch path
-    /// clears it to `Vec::new()` to force a fresh allocation here on
-    /// the next frame.
+    /// `hash_log` / `chain_log` / `hash3_log` configuration. Each table
+    /// is reallocated whenever its current length doesn't match the
+    /// width implied by its `*_log` field — `insert_position_no_rebase`
+    /// reaches via `get_unchecked`, so a stale-width table after a
+    /// level change would index out of bounds (UB) on the next encode.
     pub(crate) fn ensure_tables(&mut self) {
-        if self.hash_table.is_empty() {
-            self.hash_table = alloc::vec![HC_EMPTY; 1 << self.hash_log];
-            let hash3_size = if self.hash3_log == 0 {
-                0
-            } else {
-                1 << self.hash3_log
-            };
+        let hash_size = 1 << self.hash_log;
+        if self.hash_table.len() != hash_size {
+            self.hash_table = alloc::vec![HC_EMPTY; hash_size];
+        }
+
+        let chain_size = 1 << self.chain_log;
+        if self.chain_table.len() != chain_size {
+            self.chain_table = alloc::vec![HC_EMPTY; chain_size];
+        }
+
+        let hash3_size = if self.hash3_log == 0 {
+            0
+        } else {
+            1 << self.hash3_log
+        };
+        if self.hash3_table.len() != hash3_size {
             self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
-            self.chain_table = alloc::vec![HC_EMPTY; 1 << self.chain_log];
         }
     }
 
