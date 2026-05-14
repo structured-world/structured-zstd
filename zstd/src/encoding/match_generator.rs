@@ -1772,7 +1772,15 @@ macro_rules! build_optimal_plan_impl_body {
                     lit_price_stamp,
                 )
             };
-            let next_litlen = initial_litlen + 1;
+            // `initial_litlen` is carried across optimal-plan segments;
+            // its real bound is the current block length, not
+            // `current_len`. On i686 (32-bit `usize`) `+ 1` could
+            // theoretically wrap if the invariant ever broke. Catch
+            // that explicitly via `checked_add` rather than letting a
+            // wrapping sum slip into the price lookup.
+            let next_litlen = initial_litlen
+                .checked_add(1)
+                .expect("optimal parser next litlen out of usize range");
             let ll_delta = BtMatcher::cached_lit_length_delta_price(
                 profile,
                 $stats,
