@@ -659,14 +659,13 @@ impl Matcher for MatchGeneratorDriver {
         // `resolve_level_params`. This is what lets future commits
         // dispatch on `self.strategy_tag` and trust the existing
         // backend storage / setup paths unchanged.
+        // Once `MatcherBackend` was replaced by `BackendTag` the two
+        // values share a type, so the lock-step invariant collapses
+        // to a direct equality between the strategy-derived backend
+        // and the runtime backend selected by `resolve_level_params`.
         debug_assert_eq!(
             self.strategy_tag.backend(),
-            match self.active_backend {
-                super::strategy::BackendTag::Simple => super::strategy::BackendTag::Simple,
-                super::strategy::BackendTag::Dfast => super::strategy::BackendTag::Dfast,
-                super::strategy::BackendTag::Row => super::strategy::BackendTag::Row,
-                super::strategy::BackendTag::HashChain => super::strategy::BackendTag::HashChain,
-            },
+            self.active_backend,
             "strategy_tag backend drift vs active_backend after reset()",
         );
         self.slice_size = self.base_slice_size.min(max_window_size);
@@ -2906,10 +2905,12 @@ impl HcMatchGenerator {
         current_abs_start: usize,
         current_len: usize,
     ) {
-        // The seed pass is BtUltra2-exclusive by name (`is_btultra2()`
-        // gates the only call site), so pin S to BtUltra2 here.
+        // The seed pass is BtUltra2-exclusive by name (the only
+        // caller is `should_run_btultra2_seed_pass`), so pin `S` to
+        // `BtUltra2` for both the cost-profile lookup and the
+        // `build_optimal_plan::<S>` call below.
         type S = super::strategy::BtUltra2;
-        let seed_profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
+        let seed_profile = HcOptimalCostProfile::const_for_strategy::<S>();
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
@@ -3715,7 +3716,7 @@ fn driver_level4_selects_row_backend() {
 
 #[test]
 fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
-    use super::strategy::{BackendTag, StrategyTag};
+    use super::strategy::StrategyTag;
 
     fn check(level: CompressionLevel, expected: StrategyTag) {
         let mut driver = MatchGeneratorDriver::new(32, 2);
@@ -3724,15 +3725,9 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
             driver.strategy_tag, expected,
             "strategy_tag wrong for {level:?}"
         );
-        let runtime_backend = match driver.active_backend {
-            super::strategy::BackendTag::Simple => BackendTag::Simple,
-            super::strategy::BackendTag::Dfast => BackendTag::Dfast,
-            super::strategy::BackendTag::Row => BackendTag::Row,
-            super::strategy::BackendTag::HashChain => BackendTag::HashChain,
-        };
         assert_eq!(
             driver.strategy_tag.backend(),
-            runtime_backend,
+            driver.active_backend,
             "strategy_tag backend disagrees with active_backend for {level:?}"
         );
     }
@@ -3875,29 +3870,19 @@ fn btultra2_seed_pass_initializes_opt_state() {
 
 #[test]
 fn btultra2_profile_disables_small_offset_handicap() {
-    let p1 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
-    let p2 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
+    // Pre-Phase-3 this test duplicated the profile build with
+    // `pass2=false` and `pass2=true` since `for_mode` differentiated
+    // them. With `const_for_strategy::<BtUltra2>()` there is only one
+    // profile — the donor `opt2` pricing — so a single binding
+    // captures the invariant the test is asserting.
+    let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert!(
-        !p1.favor_small_offsets,
-        "btultra2 primary profile should match donor opt2 offset pricing"
+        !profile.favor_small_offsets,
+        "btultra2 should match donor opt2 offset pricing"
     );
     assert!(
-        !p2.favor_small_offsets,
-        "btultra2 secondary profile should match donor opt2 offset pricing"
-    );
-}
-
-#[test]
-fn btultra2_profile_is_single_pass_opt2() {
-    let p1 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
-    let p2 = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
-    assert_eq!(p1.max_chain_depth, p2.max_chain_depth);
-    assert_eq!(p1.sufficient_match_len, p2.sufficient_match_len);
-    assert_eq!(p1.accurate, p2.accurate);
-    assert_eq!(p1.favor_small_offsets, p2.favor_small_offsets);
-    assert!(
-        p1.accurate,
-        "btultra2 should use donor opt2 accurate pricing in the main pass"
+        profile.accurate,
+        "btultra2 should use donor opt2 accurate pricing"
     );
 }
 

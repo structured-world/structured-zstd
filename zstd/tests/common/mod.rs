@@ -45,7 +45,14 @@ pub fn parse_zstd_block_breakdown(frame: &[u8]) -> Option<BlockBreakdown> {
         2 => 4,
         _ => 8,
     };
-    let mut off = 5 + window_descriptor_len + dict_id_len + fcs_len;
+    let header_len = 5 + window_descriptor_len + dict_id_len + fcs_len;
+    // Guard against truncated frame headers — without this check the
+    // function would happily return `Some(BlockBreakdown::default())`
+    // for a 4-byte-magic-only input, which contradicts the docstring.
+    if frame.len() < header_len {
+        return None;
+    }
+    let mut off = header_len;
     let mut out = BlockBreakdown::default();
     while off + 3 <= frame.len() {
         let h = u32::from_le_bytes([frame[off], frame[off + 1], frame[off + 2], 0]);

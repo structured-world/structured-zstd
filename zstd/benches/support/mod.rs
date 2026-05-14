@@ -93,32 +93,32 @@ pub(crate) fn level_filter_from_env() -> Option<Vec<String>> {
 
 /// Same as [`supported_levels`] but honours `STRUCTURED_ZSTD_BENCH_
 /// LEVEL_FILTER` so a CI job can run a single named level. Panics
-/// if the filter is non-empty but matches zero known levels — that
+/// if any requested name in the filter is not a known level — that
 /// catches typos in the CI matrix entry early instead of letting the
 /// shard succeed silently with no samples (which would skip the
-/// downstream regression alert for that level).
+/// downstream regression alert for that level). A partial match
+/// (`STRUCTURED_ZSTD_BENCH_LEVEL_FILTER=default,typo`) also panics,
+/// so a typo never hides behind a valid sibling token.
 pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
     let all = supported_levels();
-    match level_filter_from_env() {
-        None => all.to_vec(),
-        Some(keep) => {
-            let kept: Vec<LevelConfig> = all
-                .into_iter()
-                .filter(|cfg| keep.iter().any(|name| name == cfg.name))
-                .collect();
-            if kept.is_empty() {
-                let known: Vec<&'static str> =
-                    supported_levels().iter().map(|cfg| cfg.name).collect();
-                panic!(
-                    "STRUCTURED_ZSTD_BENCH_LEVEL_FILTER={:?} matched none of the \
-                     known levels {known:?} — fix the CI matrix entry or rename \
-                     the level in `supported_levels()`.",
-                    keep,
-                );
-            }
-            kept
-        }
-    }
+    let Some(keep) = level_filter_from_env() else {
+        return all.to_vec();
+    };
+    let known: Vec<&'static str> = all.iter().map(|cfg| cfg.name).collect();
+    let unknown: Vec<String> = keep
+        .iter()
+        .filter(|name| !known.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "STRUCTURED_ZSTD_BENCH_LEVEL_FILTER contained unknown level(s) {unknown:?}; \
+         supported: {known:?} — fix the CI matrix entry or rename the level in \
+         `supported_levels()`."
+    );
+    all.into_iter()
+        .filter(|cfg| keep.iter().any(|name| name == cfg.name))
+        .collect()
 }
 
 pub(crate) fn supported_levels() -> [LevelConfig; 6] {
