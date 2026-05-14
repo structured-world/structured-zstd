@@ -415,6 +415,13 @@ pub struct MatchGeneratorDriver {
     row_match_generator: Option<RowMatchGenerator>,
     hc_match_generator: Option<HcMatchGenerator>,
     active_backend: MatcherBackend,
+    // Compile-time strategy tag resolved at `reset()` from the
+    // requested `CompressionLevel`. Stays in lock-step with
+    // `active_backend` (a `debug_assert!` in `reset()` enforces the
+    // invariant). Future Phase 3 commits will branch the hot dispatch
+    // on this field to enter `compress_block::<S>` monomorphisations,
+    // at which point `active_backend` will become a derived view.
+    strategy_tag: super::strategy::StrategyTag,
     slice_size: usize,
     base_slice_size: usize,
     // Frame header window size must stay at the configured live-window budget.
@@ -442,6 +449,7 @@ impl MatchGeneratorDriver {
             row_match_generator: None,
             hc_match_generator: None,
             active_backend: MatcherBackend::Simple,
+            strategy_tag: super::strategy::StrategyTag::Fast,
             slice_size,
             base_slice_size: slice_size,
             reported_window_size: max_window_size,
@@ -658,6 +666,22 @@ impl Matcher for MatchGeneratorDriver {
         }
 
         self.active_backend = params.backend;
+        self.strategy_tag = super::strategy::StrategyTag::for_compression_level(level);
+        // Lock-step invariant: the compile-time strategy tag's backend
+        // must agree with the runtime `MatcherBackend` chosen by
+        // `resolve_level_params`. This is what lets future commits
+        // dispatch on `self.strategy_tag` and trust the existing
+        // backend storage / setup paths unchanged.
+        debug_assert_eq!(
+            self.strategy_tag.backend(),
+            match self.active_backend {
+                MatcherBackend::Simple => super::strategy::BackendTag::Simple,
+                MatcherBackend::Dfast => super::strategy::BackendTag::Dfast,
+                MatcherBackend::Row => super::strategy::BackendTag::Row,
+                MatcherBackend::HashChain => super::strategy::BackendTag::HashChain,
+            },
+            "strategy_tag backend drift vs active_backend after reset()",
+        );
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         match self.active_backend {
@@ -3462,6 +3486,45 @@ fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
     assert_eq!(driver.active_backend, MatcherBackend::Row);
+}
+
+#[test]
+fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
+    use super::strategy::{BackendTag, StrategyTag};
+
+    fn check(level: CompressionLevel, expected: StrategyTag) {
+        let mut driver = MatchGeneratorDriver::new(32, 2);
+        driver.reset(level);
+        assert_eq!(
+            driver.strategy_tag, expected,
+            "strategy_tag wrong for {level:?}"
+        );
+        let runtime_backend = match driver.active_backend {
+            MatcherBackend::Simple => BackendTag::Simple,
+            MatcherBackend::Dfast => BackendTag::Dfast,
+            MatcherBackend::Row => BackendTag::Row,
+            MatcherBackend::HashChain => BackendTag::HashChain,
+        };
+        assert_eq!(
+            driver.strategy_tag.backend(),
+            runtime_backend,
+            "strategy_tag backend disagrees with active_backend for {level:?}"
+        );
+    }
+
+    check(CompressionLevel::Level(1), StrategyTag::Fast);
+    check(CompressionLevel::Level(2), StrategyTag::Dfast);
+    check(CompressionLevel::Level(3), StrategyTag::Dfast);
+    check(CompressionLevel::Level(4), StrategyTag::Greedy);
+    check(CompressionLevel::Level(7), StrategyTag::Lazy);
+    check(CompressionLevel::Level(15), StrategyTag::Lazy);
+    check(CompressionLevel::Level(16), StrategyTag::BtOpt);
+    check(CompressionLevel::Level(18), StrategyTag::BtUltra);
+    check(CompressionLevel::Level(22), StrategyTag::BtUltra2);
+    check(CompressionLevel::Fastest, StrategyTag::Fast);
+    check(CompressionLevel::Default, StrategyTag::Dfast);
+    check(CompressionLevel::Better, StrategyTag::Lazy);
+    check(CompressionLevel::Best, StrategyTag::Lazy);
 }
 
 #[test]

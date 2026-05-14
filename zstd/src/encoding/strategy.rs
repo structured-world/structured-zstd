@@ -246,6 +246,32 @@ impl StrategyTag {
         }
     }
 
+    /// Map a [`CompressionLevel`] to its [`StrategyTag`]. Mirrors the
+    /// per-level dispatch in `match_generator::resolve_level_params`
+    /// so the runtime `active_backend` field and the future
+    /// const-generic strategy stay in lock-step.
+    pub(crate) fn for_compression_level(level: crate::encoding::CompressionLevel) -> Self {
+        use crate::encoding::CompressionLevel;
+        match level {
+            CompressionLevel::Uncompressed => Self::Fast,
+            CompressionLevel::Fastest => Self::Fast,
+            CompressionLevel::Default => Self::Dfast,
+            CompressionLevel::Better => Self::Lazy,
+            CompressionLevel::Best => Self::Lazy,
+            CompressionLevel::Level(n) => {
+                if n <= 0 {
+                    // Level 0 → default (Dfast). Negative levels →
+                    // ultra-fast Simple matcher with elevated
+                    // `hash_fill_step` (see resolve_level_params).
+                    if n == 0 { Self::Dfast } else { Self::Fast }
+                } else {
+                    let clamped = (n as u8).min(CompressionLevel::MAX_LEVEL as u8);
+                    Self::for_level(clamped)
+                }
+            }
+        }
+    }
+
     /// Bridge to the runtime [`HcParseMode`] enum that the existing
     /// `HcMatchGenerator` paths still consume. Will go away in the
     /// final cleanup commit when the runtime enum is deleted.
