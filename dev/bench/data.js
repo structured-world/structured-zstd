@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778777005129,
+  "lastUpdate": 1778798335906,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -30734,6 +30734,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.239,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b486614a1c20293c6f4b3dc7d9edad4d94904b76",
+          "message": "perf(encoding): #111 Phase 3 — const-generic Strategy dispatch (#123)\n\n* feat(encoding): introduce Strategy trait and 7 marker types\n\nPhase 3 commit 1: lay down the type-level skeleton that future commits\nwill route the encoder hot paths through. No call sites change — this\ncommit only adds new types alongside the existing runtime\n`HcParseMode` / `MatcherBackend` dispatch.\n\n- `Strategy` trait with associated consts mirroring the donor\n  `ZSTD_compressionParameters` template parameters: `BACKEND`,\n  `MIN_MATCH`, `ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`, `USE_HASH3`,\n  `USE_BT`, `OPT_LEVEL`, plus a `PARSE_MODE` bridge to the existing\n  runtime enum.\n- 7 concrete strategy types `Fast` / `Dfast` / `Greedy` / `Lazy` /\n  `BtOpt` / `BtUltra` / `BtUltra2`. Levels 5-15 collapse onto `Lazy`\n  because their differences are runtime `HcConfig` fields, not\n  compile-time consts.\n- `BackendTag` enum + `StrategyTag` runtime dispatcher with a\n  `for_level(u8) -> StrategyTag` const fn that mirrors the donor\n  `clevels.h` mapping (1 → Fast, 2-3 → Dfast, 4 → Greedy, 5-15 → Lazy,\n  16-17 → BtOpt, 18-19 → BtUltra, 20-22 → BtUltra2).\n- Bridge methods `StrategyTag::parse_mode()` / `::backend()` so the\n  next commits can introduce a generic entry point that still hands\n  off to the runtime-enum-consuming code.\n- Test coverage:\n  - Each `Strategy` impl's `PARSE_MODE` and `BACKEND` agree with the\n    matching `StrategyTag` arm.\n  - `for_level` returns the right tag at every band boundary plus a\n    mid-band level.\n  - `USE_BT` aligns with parse_mode (only BtOpt / BtUltra / BtUltra2\n    walk the BT).\n  - `USE_HASH3` is set exclusively for BtUltra2 (donor parity).\n  - `ACCURATE_PRICE` / `FAVOR_SMALL_OFFSETS` track the\n    `HcOptimalCostProfile::for_mode` runtime table row-for-row so the\n    eventual `const_for::<S>` rewrite is a mechanical swap.\n\nRefs #122 Phase 3.\n\n* feat(encoding): plumb StrategyTag into MatchGeneratorDriver\n\nPhase 3 commit 2: resolve the compile-time strategy tag once per\n`reset()` and store it on the driver alongside the existing\n`active_backend` runtime enum. No hot-path dispatch changes yet — the\nfield is set, debug-asserted to stay in lock-step with\n`active_backend`, and covered by a new test.\n\n- Add `StrategyTag::for_compression_level(CompressionLevel)` mirroring\n  `resolve_level_params` exactly: named variants (`Uncompressed` →\n  Fast, `Default` → Dfast, `Better`/`Best` → Lazy) and numeric\n  `Level(n)` clamped through the existing `for_level(u8)` band map.\n  Negative levels fall back to `Fast` (Simple matcher with elevated\n  `hash_fill_step`), matching the `resolve_level_params` Simple-arm.\n- Add `strategy_tag: StrategyTag` to `MatchGeneratorDriver`. Initialise\n  to `StrategyTag::Fast` to match the existing `active_backend =\n  MatcherBackend::Simple` default.\n- Resolve `strategy_tag` from the requested `CompressionLevel` inside\n  `reset()`, immediately after the existing `active_backend`\n  assignment. A `debug_assert!` enforces the invariant\n  `strategy_tag.backend() == active_backend` so future drift in\n  `for_compression_level` or `resolve_level_params` is caught in\n  debug builds.\n- New regression test\n  `driver_reset_keeps_strategy_tag_in_sync_with_active_backend` walks\n  every band boundary (1, 2-3, 4, 5-15, 16-17, 18-19, 20-22) plus all\n  four named variants and asserts both the expected tag and the\n  matching backend.\n\nThis commit is purely additive — no behaviour change for any caller.\nSets up the data flow that commit 3 will branch the hot dispatch on\nto enter `compress_block::<S>` monomorphisations.\n\nRefs #122 Phase 3.\n\n* feat(encoding): route start_matching through compress_block<S>\n\nPhase 3 commit 3: introduce the monomorphised per-block entry point\nwithout changing any inner hot-loop behaviour. Each\n`Matcher::start_matching` call now picks a concrete `S: Strategy`\nfrom `self.strategy_tag` (resolved at `reset()` in commit 2) and\nhands off to `compress_block::<S>`. The body still uses runtime\ndispatch internally, so this commit is behaviour-preserving — it\nexists to plumb the type parameter into the HC matcher so later\ncommits can replace inner `match self.parse_mode` branches with\n`if S::USE_BT` / `if S::USE_HASH3` const checks.\n\n- `MatchGeneratorDriver::start_matching` becomes a 7-arm match over\n  `self.strategy_tag` dispatching into `compress_block::<S>` per\n  variant.\n- `compress_block<S: Strategy>(&mut self, …)` lives next to the\n  `impl Matcher` block. Body switches on `S::BACKEND` (an associated\n  `const`), so each monomorphisation keeps exactly one backend arm\n  after const-eval folds the `match` — verified by inspection of the\n  generated IR before/after.\n- For the `HashChain` backend, `compress_block` calls a new\n  `HcMatchGenerator::start_matching_strategy<S>` method that today\n  just delegates back to the existing runtime-dispatched\n  `start_matching`. A `debug_assert_eq!` enforces\n  `S::PARSE_MODE == self.parse_mode` so the bridge cannot drift\n  silently while we migrate the inner loops in commits 4-7.\n\n463/463 nextest, clippy clean, build × 2.\n\nRefs #122 Phase 3.\n\n* perf(encoding): branch HC dispatch on S::USE_BT const instead of parse_mode\n\nPhase 3 commit 4: the strategy-aware entry on `HcMatchGenerator` now\nbranches on the compile-time `S::USE_BT` constant. Each\nmonomorphisation (Lazy / BtOpt / BtUltra / BtUltra2) keeps exactly\none of `start_matching_lazy` / `start_matching_optimal` — the dead\narm is dropped at codegen time, so the per-block dispatch no longer\npays for a runtime tag check.\n\nThe lazy/optimal split is the outer-most parse_mode branch — every\nencoded position inside the block already runs the right inner\nparser, but until now the dispatch *itself* re-evaluated\n`self.parse_mode` on every block call.\n\n- `HcMatchGenerator::start_matching_strategy<S>` body becomes\n  `if S::USE_BT { start_matching_optimal } else { start_matching_lazy }`.\n- The runtime-dispatched inherent `start_matching` is now `#[cfg(test)]`\n  — the production driver path goes through `start_matching_strategy`\n  exclusively. Tests that exercise HcMatchGenerator directly still\n  use the inherent method; the final cleanup commit removes both the\n  inherent method and the `parse_mode` field.\n- `debug_assert_eq!(self.parse_mode, S::PARSE_MODE)` at the entry\n  catches any future drift between the runtime field (still set by\n  `configure`) and the const passed by the dispatcher.\n- Cost-model and parse-mode parity assertions in\n  `strategy::tests` moved from `#[test] fn` into compile-time\n  `const _: () = { assert!(…) }` blocks per\n  `clippy::assertions_on_constants` (the asserts only inspect\n  associated `const`s — they belong at compile time, not in\n  the runner).\n\n460/460 nextest, clippy clean (default + `--tests`), build × 2.\n\nRefs #122 Phase 3.\n\n* perf(encoding): const-fold optimal DP body branches from Strategy\n\nPhase 3 commit 5: thread the const-generic `S: Strategy` through the\noptimal parser entry, BT dispatcher, and the four SIMD-kernel\nwrappers down to the `build_optimal_plan_impl_body!` macro. Inside\nthe macro the two `parse_mode` reads that previously drove every\ncandidate insertion and traceback step are replaced with\nstrategy-projected `let` bindings — each is a compile-time constant\nper monomorphisation, so LLVM folds them and drops the dead arms in\neach strategy's instance.\n\n- `build_optimal_plan_impl_body!` gains a `$strategy_ty:ty` parameter\n  and computes `abort_on_worse_match = <S>::OPT_LEVEL == 0` /\n  `opt_level = <S>::OPT_LEVEL >= 2`. A `debug_assert!` enforces\n  `<S>::USE_BT` so the body never runs for a non-BT strategy.\n- Each of `build_optimal_plan_impl_neon` / `_sse42` / `_avx2_bmi2` /\n  `_scalar` gains `S: Strategy` as a leading type parameter\n  alongside the existing `ACCURATE_PRICE` / `FAVOR_SMALL_OFFSETS`\n  const-generics; they pass S through into the macro body.\n- `build_optimal_plan_impl<S>` plumbs S into the 4 kernel\n  dispatchers. The runtime 4-arm match on\n  `(profile.accurate, profile.favor_small_offsets)` stays for now —\n  `generic_const_exprs` would be needed to project the bool consts\n  directly into a const-generic argument list, and the dispatch is\n  per-block, not per-position. In practice only two arms are reached\n  (BtOpt → (false, true), BtUltra / BtUltra2 → (true, false)).\n- `build_optimal_plan<S>` and `start_matching_optimal<S>` follow.\n  Both `start_matching_strategy<S>` (production path) and the\n  `#[cfg(test)]` inherent `start_matching` (now 4-arm on\n  `HcParseMode` → concrete `BtOpt` / `BtUltra` / `BtUltra2` types)\n  invoke the generic entry. `run_btultra2_seed_pass` pins\n  `S = BtUltra2` locally — by name it is BtUltra2-exclusive.\n- `nested const items cannot project through outer generics`:\n  switched the per-strategy flags from `const ABORT_ON_WORSE_MATCH:\n  bool = …` to `let abort_on_worse_match: bool = …` so the\n  expressions live in the parent fn's substitution scope. The\n  optimiser still folds them per monomorphisation.\n\n460/460 nextest, clippy clean (default + `--tests`), build × 2.\n\nRefs #122 Phase 3.\n\n* test(encoding): add level22 ratio/speed diagnostic probes\n\nThree ignored manual probes that document the level22 perf claims\nwith executable evidence. All gated on `#[ignore]` so they do not\nrun in CI by default; invoke with\n`cargo nextest run --release ... --run-ignored ignored-only`.\n\n- `he_level22_ratio` — confirms the high-entropy-1m scenario\n  speedup (~10x vs C FFI) is driven by the source-size-hinted\n  raw-fast-path; toggles the hint off to verify the slow-path\n  matches C-zstd timing.\n- `incompressibility_falsepos` — exercises the\n  `block_looks_incompressible` heuristic on hard-random, mixed,\n  textish, and pattern-only inputs to confirm zero false positives\n  (rust/C output sizes match within a 7-byte frame overhead).\n- `corpus_level22_gap` — quantifies the +0.08 % decodecorpus-z000033\n  output gap as a block-split heuristic divergence (233 vs 256\n  compressed blocks), not a core-compression regression.\n\nRefs #122 Phase 3 perf accounting.\n\n* perf(encoding): const-fold hash3 lookup via S::USE_HASH3\n\nPhase 3 commit 6: thread S through the optimal-candidates body and\nits four SIMD-kernel wrappers, then gate the hash3 short-match\nlookup (donor `static (mls==3)` probe) on `S::USE_HASH3`. Only\n`BtUltra2` sets `USE_HASH3 = true`; every other monomorphisation\ndrops the entire `update_hash3_until` + `$hash3` block at codegen\ntime. On the level22 hot path this removes one indirect read +\nbranch + table walk per encoded position.\n\n- `collect_optimal_candidates_initialized_body!` gains\n  `$strategy_ty:ty` and a `let use_hash3: bool = <S>::USE_HASH3`\n  binding. The hash3 sub-block becomes `if use_hash3 && … { … }`\n  so the dead arm folds away per S.\n- `debug_assert!` confirms the runtime/compile-time invariant\n  (`USE_HASH3 = true` implies `hash3_log != 0`).\n- Each of the four SIMD wrappers (`collect_optimal_candidates_\n  initialized_neon` / `_sse42` / `_avx2_bmi2` / `_scalar`) gains\n  `S: Strategy` alongside the existing `USE_BT_MATCHFINDER` const.\n  The cross-platform dispatcher (`collect_optimal_candidates_\n  initialized`) plumbs S through to all four arms.\n- The DP body call sites in `build_optimal_plan_impl_body!`\n  (`$self.$collect::<$strategy_ty, true>(…)`) thread S into the\n  per-position pipeline.\n- `#[cfg(test)] collect_optimal_candidates` rewritten as a four-arm\n  match on `(uses_bt, hash3_log != 0)` so artificial test\n  configurations still reach the right monomorphisation —\n  production callers never hit this helper.\n\n460/460 nextest, clippy clean, build × 2.\n\nRefs #122 Phase 3.\n\n* perf(encoding): gate btultra2 seed pass on S::OPT_LEVEL + S::USE_HASH3\n\nPhase 3 commit 7: make `should_run_btultra2_seed_pass` generic over\n`S: Strategy` and short-circuit the predicate at compile time for\nevery non-BtUltra2 monomorphisation. Only `BtUltra2` satisfies\n`S::OPT_LEVEL == 2 && S::USE_HASH3`, so Fast / Dfast / Greedy /\nLazy / BtOpt / BtUltra now drop both the predicate body and the\ninlined call to `run_btultra2_seed_pass` after the per-strategy\nmonomorphisation pass.\n\n- `should_run_btultra2_seed_pass<S>` starts with\n  `if !(S::OPT_LEVEL == 2 && S::USE_HASH3) { return false; }` —\n  a const expression per S, so LLVM folds it and the rest of the\n  predicate (HcBackend::Bt unwrap, frame-start checks, dictionary\n  state) only emits for BtUltra2.\n- Replaced the runtime `self.is_btultra2()` read inside the\n  predicate with the const path; the `is_btultra2` helper stays\n  for the (single remaining) profile-selection site.\n- `start_matching_optimal::<S>` now invokes\n  `self.should_run_btultra2_seed_pass::<S>(current_len)`.\n- All test call sites pin `S = BtUltra2` (the only strategy where\n  the predicate is interesting); the corresponding assertions\n  remain unchanged.\n\n460/460 nextest, clippy clean, build × 2.\n\nRefs #122 Phase 3.\n\n* perf(encoding): const-fold optimal cost profile from Strategy\n\nPhase 3 commit 8: replace the runtime profile selection in\n`start_matching_optimal::<S>` with `HcOptimalCostProfile::\nconst_for_strategy::<S>()`. The four profile fields (max chain\ndepth, sufficient match length, accurate flag, favor-small-offsets\nflag) come straight from the strategy's associated consts, so the\noptimiser folds the whole profile into a single literal at codegen\ntime. The old two-arm runtime read (`if self.is_btultra2() {\nfor_mode(parse_mode, true) } else { for_mode(parse_mode, false) }`)\ndisappears.\n\n- Add `Strategy::MAX_CHAIN_DEPTH` and `Strategy::SUFFICIENT_MATCH_LEN`\n  associated consts, mirroring the `HcOptimalCostProfile::for_mode`\n  table row-for-row. Non-BT strategies (Fast / Dfast / Greedy) get\n  the Lazy2 row so the trait stays total — those values are never\n  read because USE_BT short-circuits the path.\n- Add `HcOptimalCostProfile::const_for_strategy<S>()` next to the\n  existing `for_mode`. Marked `#[inline]` so the literal lands at\n  the call site after monomorphisation.\n- `start_matching_optimal::<S>` calls the new const peer; the\n  inherent `HcMatchGenerator::is_btultra2()` accessor is gone (no\n  remaining readers).\n- `for_mode` itself stays — it has callers in tests and in\n  `run_btultra2_seed_pass` (which pins `S = BtUltra2` and could\n  switch to `const_for_strategy` later, but the call is once per\n  frame so it is not on the hot path).\n\n460/460 nextest, clippy clean (default + `--tests`), build × 2.\n\nRefs #122 Phase 3.\n\n* refactor(encoding): remove HcParseMode and MatcherBackend runtime enums\n\nPhase 3 commit 9 (close-out): delete both legacy runtime dispatch\nenums and every read site that depended on them. The encoder now\nselects its match-finder backend exclusively through the\nconst-generic `S: Strategy` trait and the once-per-frame\n`StrategyTag` resolved at `reset()`.\n\n- `HcParseMode` (Lazy2 / BtOpt / BtUltra / BtUltra2) deleted from\n  `strategy.rs`. The `Strategy::PARSE_MODE` associated const and the\n  `StrategyTag::parse_mode()` bridge are gone with it — nothing\n  reads them now that every dispatch routes through `S::USE_BT`,\n  `S::USE_HASH3`, `S::OPT_LEVEL`, etc.\n- `MatcherBackend` (Simple / Dfast / Row / HashChain) deleted from\n  `match_generator.rs`. All references (`LevelParams::backend`,\n  `MatchGeneratorDriver::active_backend`, plus the\n  `retire_dictionary_budget` / `trim_after_budget_retire` /\n  `skip_matching_for_dictionary_priming` 4-arm matches) now use the\n  unified `super::strategy::BackendTag`. Same 4-variant shape, one\n  enum.\n- `HcConfig` drops its `parse_mode: HcParseMode` field; every\n  `HcConfig` literal in `LEVEL_TABLE` and the per-source-size\n  variants (`BTOPT_HC_CONFIG`, `BTULTRA_HC_CONFIG`,\n  `BTULTRA2_HC_CONFIG`, etc.) shrinks by one line.\n- `HcMatchGenerator::parse_mode` field deleted.\n  `HcMatchGenerator::configure` gains an explicit\n  `tag: StrategyTag` argument from which it derives `is_btultra2`,\n  `uses_bt`, and the search-depth cap. The driver passes\n  `self.strategy_tag` (set at `reset()`) on the single production\n  call site.\n- `HcOptimalCostProfile::for_mode(HcParseMode, bool)` deleted from\n  `cost_model::mod`. `const_for_strategy::<S>()` is now the only\n  way to build a profile. Every call site (production +\n  `run_btultra2_seed_pass` + the cost-model tests) was migrated to\n  pass an explicit `S = strategy::{Lazy, BtOpt, BtUltra, BtUltra2}`.\n- The three `level_*_use_*_parse_mode` donor-parity tests are\n  rewritten to assert against `StrategyTag::for_level(level)`\n  directly (the data they were checking lives in the const-generic\n  trait now). The `#[cfg(test)] HcMatchGenerator::start_matching`\n  helper picks a strategy from the runtime table flags\n  (`uses_bt`/`is_btultra2`/`hash3_log`) so artificial test setups\n  still reach the right monomorphisation.\n- `start_matching_strategy::<S>`'s `debug_assert_eq!` now compares\n  `S::USE_BT` against `self.table.uses_bt` (the field set by\n  `configure`) instead of the deleted `self.parse_mode` /\n  `S::PARSE_MODE` pair.\n- Module-level docs in `strategy.rs` are rewritten as a single\n  Phase-3 dispatch flow diagram covering every const-folded gate\n  (`USE_BT`, `USE_HASH3`, `OPT_LEVEL`, `ACCURATE_PRICE`,\n  `FAVOR_SMALL_OFFSETS`, `MAX_CHAIN_DEPTH`, `SUFFICIENT_MATCH_LEN`).\n  `encoding/mod.rs` header updated to drop the now-stale\n  `HcParseMode` reference and to add `perf/post-pr-121-baseline`.\n\n460/460 nextest, clippy clean (default + `--tests`), build × 2.\nPhase 3 acceptance criterion \"HcParseMode enum deleted\" — done.\n\nRefs #122 Phase 3.\n\n* ci(bench): split benchmark matrix per level for ~25min wall-clock\n\nBefore: a single CI runner per target ran every level back-to-back\n(~45 min on i686, with level22 dominating ~20 min on its own).\n\nAfter: matrix split target × level (3 targets × 6 levels = 18\nparallel runners) plus a single aggregation job that consolidates\nper-target shards back into the existing per-target artifact\nshape, so the cross-target merge step downstream stays unchanged.\n\n- `support::supported_levels_filtered()` honours\n  `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` (comma-separated level names);\n  every loop in `compare_ffi.rs` that used to iterate over\n  `supported_levels()` now uses the filtered variant. With no env\n  var, behaviour is identical to before.\n- `.github/scripts/aggregate-bench-levels.py` reads\n  `benchmark-{results,delta,relative,report}.<target>.<level>.<ext>`\n  shards (uploaded as `benchmark-shard-<target>-<level>` artifacts)\n  and emits per-target consolidated\n  `benchmark-{results,delta,relative,report}.<target>.<ext>` files\n  matching the pre-split naming. Markdown shards are concatenated\n  under per-level `## Level: <name>` sections.\n- CI workflow:\n  - `benchmark` job: matrix becomes `bench × level`. Each runner\n    sets `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` and uploads its\n    `benchmark-shard-<target>-<level>` artifact.\n  - new `benchmark-aggregate` job (post-benchmark): downloads\n    every `benchmark-shard-*` artifact, runs the aggregation\n    script, and re-uploads three target-shaped artifacts\n    (`benchmark-x86_64-gnu`, `benchmark-i686-gnu`,\n    `benchmark-x86_64-musl`). `github-action-benchmark` moved\n    here so the regression alert fires on the consolidated\n    x86_64-gnu result.\n  - `benchmark-pages` now depends on `benchmark-aggregate` and\n    downloads the three per-target artifacts explicitly (instead\n    of the previous `benchmark-*` glob) so the shard artifacts\n    don't leak into `merge-benchmarks.py`'s `<target>.<level>`\n    name extraction.\n  - Per-runner `timeout-minutes` cut from 40/55/40 to 25/30/25\n    matching the new per-level work share.\n\nSmoke-test:\n- `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER=fastest cargo bench\n  --list` emits only `fastest` benchmarks; no env var → all 6\n  levels.\n- Aggregator round-trips a synthetic two-shard fixture and\n  produces the expected consolidated JSON + markdown files.\n- Local nextest 460/460, clippy clean (default + benches).\n\nRefs #122 Phase 3 — supporting infrastructure.\n\n* style: wrap compare_ffi imports for rustfmt\n\n* refactor(encoding): preserve full StrategyTag on HcMatchGenerator\n\nSix review findings from PR #123:\n\n(1) HcMatchGenerator now mirrors the driver-resolved StrategyTag in a\n    new `strategy_tag` field set by `configure()`. The\n    `#[cfg(test)] start_matching` dispatcher branches on it, so\n    BtOpt / BtUltra / BtUltra2 each reach their own monomorphisation\n    instead of collapsing onto BtOpt whenever\n    `is_btultra2 == false`. The matching `collect_optimal_candidates`\n    helper does the same, with a legacy `hash3_log != 0` fallback for\n    artificial tests that wire `hash3_log` directly without calling\n    `configure()`.\n\n(2) `HcOptimalCostProfile::const_for_strategy::<S>()` opens with\n    `debug_assert!(S::USE_BT, …)`. The `MAX_CHAIN_DEPTH` and\n    `SUFFICIENT_MATCH_LEN` consts on `Fast` / `Dfast` / `Greedy` /\n    `Lazy` carry placeholder values (the optimal parser entry point\n    is unreachable from those strategies). The debug assert plus\n    fresh doc comments on each non-BT strategy point at the\n    placeholder contract.\n\n(3) `supported_levels_filtered()` panics when\n    `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` is non-empty but matches\n    zero known levels, with a message listing every known level. CI\n    matrix typos (e.g. renaming a level in `supported_levels()`\n    without updating ci.yml) now fail loudly on the affected shard\n    instead of silently producing an empty bench run and a missing\n    regression alert downstream.\n\n(4) `StrategyTag::for_compression_level(Level(n))` clamps `n` in\n    `i32` BEFORE casting to `u8`. The previous `(n as u8).min(22)`\n    truncated values >= 256 (e.g. `Level(256)` wrapped to `0` and\n    routed to `Dfast`); now `Level(i32::MAX)` saturates to BtUltra2\n    as expected. Regression test\n    `for_compression_level_clamps_oversized_numeric_levels_to_btultra2`\n    added.\n\n(5) `tests/common/mod.rs` hosts a shared `parse_zstd_block_breakdown`\n    + `dump_block_breakdown` helper. Both `corpus_level22_gap.rs` and\n    `he_level22_ratio.rs` route through it instead of carrying\n    near-identical local copies (the corpus probe had a 256-iter cap,\n    the high-entropy probe had a 64-iter cap — both replaced with a\n    bounded `while off + 3 <= frame.len()` walk so large frames are\n    no longer truncated).\n\n461/461 nextest (+1 regression test for #4), clippy clean (default +\n--tests), fmt clean, build × 2.\n\nRefs #122 Phase 3.\n\n* refactor(encoding): drop pass2-era profile duplications and identity matches\n\nFour follow-up findings from PR #123:\n\n- The two `btultra2_profile_*` cost-model tests built `p1` and `p2`\n  with identical `const_for_strategy::<BtUltra2>()` calls (the\n  `pass2: bool` parameter that distinguished them in the runtime\n  `for_mode` API is gone), so `assert_eq!(p1.field, p2.field)`\n  became a tautology. Collapsed\n  `btultra2_profile_disables_small_offset_handicap` to a single\n  profile binding asserting both the small-offset flag and the\n  accurate-pricing flag; deleted\n  `btultra2_profile_is_single_pass_opt2` outright (the only\n  invariant left was the now-trivial reflexive equality).\n- The `MatcherBackend` → `BackendTag` consolidation made\n  `match self.active_backend { Simple => Simple, … }` an identity\n  mapping. Replaced both the `reset()` debug_assert and the\n  matching `driver_reset_keeps_strategy_tag_in_sync_with_active_backend`\n  test scaffolding with a direct\n  `assert_eq!(strategy_tag.backend(), active_backend, …)`.\n- `run_btultra2_seed_pass` declared `type S = BtUltra2;` but only\n  used the alias in the `build_optimal_plan::<S>` call site, while\n  the adjacent `const_for_strategy::<super::strategy::BtUltra2>()`\n  spelled the type out. Routed the cost-profile call through `S`\n  too so the seed-pass body stays uniform.\n- `tests/common::parse_zstd_block_breakdown` returns `None` on\n  truncated frame headers (`frame.len() < header_len`) — without\n  the guard a 4-byte-magic-only input returned\n  `Some(BlockBreakdown::default())`, contradicting the docstring.\n- `supported_levels_filtered()` panics for *any* unknown token in\n  `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER`, not just for the \"every\n  token unknown\" case. Partial typos (`default,typo`) previously\n  silently dropped the bad token — they now fail loudly with a\n  message listing the supported levels.\n\nRefs #122 Phase 3.\n\n* ci(bench): split bench-build from bench shards to skip rebuilds\n\nCI bench matrix used to rebuild the `compare_ffi` criterion binary\non every shard (3 targets × 6 levels = 18 cargo builds, each\n~4-7 min on the GitHub runner). Phase-2 cache hits brought it down\nbut the cold-cache penalty was still ~120-150 min of accumulated\nbuild time per CI run.\n\nNew layout:\n\n- `bench-build` matrix (3 jobs, one per target) builds the criterion\n  binary with `cargo bench --no-run --message-format=json`, locates\n  the resolved executable via `jq`, and uploads it as\n  `bench-binary-<target>`. ~20 min budget per build, retention\n  7 days.\n- `benchmark` matrix (3 × 6 = 18 shards) now `needs: bench-build`,\n  downloads the matching `bench-binary-<target>` artifact, marks\n  it executable, and points `run-benchmarks.sh` at it through a\n  new `STRUCTURED_ZSTD_BENCH_BIN` env var.\n- `run-benchmarks.sh` re-execs `$STRUCTURED_ZSTD_BENCH_BIN --bench\n  --output-format bencher` when the var is set; otherwise it\n  falls back to the original `cargo bench` path (so local\n  invocations and any non-CI use stay unchanged).\n- Shard runners no longer install the rust toolchain or run\n  `cargo` at all — only the target-specific runtime packages\n  (`gcc-multilib`/`musl-tools`) needed to execute a non-host-arch\n  binary.\n- The `decodecorpus_files/z000033` fixture is referenced via\n  `env!(\"CARGO_MANIFEST_DIR\")` (compile-time absolute path).\n  GitHub Actions always checks out into `$GITHUB_WORKSPACE` which\n  is identical across all `ubuntu-latest` runners, so the\n  embedded path resolves on every shard.\n\nSmoke-tested locally: copying the host-target bench binary to\n`/tmp/compare_ffi_bin` and running `STRUCTURED_ZSTD_BENCH_BIN=...\nbash run-benchmarks.sh` re-executed the binary directly, no\ncargo invocation.\n\nExpected wall-clock impact: each shard drops ~5 min of build,\nleaving the criterion measurement itself as the dominant cost.\ni686-level22 (the bottleneck shard) was ~30 min, now closer to\n~20-22 min — full CI bench matrix should land around ~25 min\nend-to-end including the 3 bench-build jobs running in parallel\nwith the lint/test phase.\n\nRefs #122 Phase 3.\n\n* refactor(encoding): collapse strategy resolution to a single source\n\nTwo more findings from PR #123 review:\n\n(A) `LevelParams` now carries `strategy_tag: StrategyTag` instead of\n    a stand-alone `backend: BackendTag`. The backend family is\n    derived via `LevelParams::backend() -> StrategyTag::backend()`\n    so there is no second authoritative mapping from\n    `CompressionLevel` to backend, and `BtOpt`/`BtUltra`/`BtUltra2`\n    drift inside the `HashChain` family is no longer possible (the\n    pre-fix `params.backend == HashChain` check was equally happy\n    with any of the three).\n    `MatchGeneratorDriver::reset()` reads `params.strategy_tag`\n    directly and drops the parallel\n    `StrategyTag::for_compression_level(level)` call, eliminating\n    the drift surface the review flagged.\n\n(B) The `#[cfg(test)] HcMatchGenerator::collect_optimal_candidates`\n    dispatcher no longer carries the `hash3_log != 0 => BtUltra2`\n    escape hatch. Tests that wired `hash3_log` directly without\n    calling `configure()` are gone or migrated:\n    - `hc_collect_optimal_candidates_uses_hash3_when_chain_depth_zero`\n    - `hc_collect_optimal_candidates_hash3_updates_skipped_prefix_positions`\n    - `hc_hash3_tail_match_advances_update_cursor_on_early_return`\n    All three forced `search_depth = 0` together with\n    `hash3_log != 0` — an HC-chain-walker-only fixture state that\n    production never reaches (hash3 is BtUltra2-exclusive and\n    BtUltra2 always uses `search_depth = 512`). The end-to-end\n    hash3 invariants stay covered by the level22 roundtrip + donor\n    parity ratio gate.\n\nPlus the inline #13 nit: `retention-days: 7` on the benchmark shard\nupload-artifact step.\n\nLEVEL_TABLE entries migrate from `backend: BackendTag::*` to\n`strategy_tag: StrategyTag::{Fast,Dfast,Greedy,Lazy,BtOpt,BtUltra,\nBtUltra2}` per band. `resolve_level_params` override sites\n(`Uncompressed`, negative levels, level22 source-size override)\nemit a `strategy_tag` directly.\n\n457/457 nextest (was 460, minus 3 deleted tests), clippy clean\n(default + tests + benches), fmt clean, build × 2.\n\nRefs #122 Phase 3.\n\n* ci(fuzz): add short-budget libFuzzer smoke matrix\n\nThe repo ships a `zstd/fuzz/` setup (5 targets — decode / encode /\ninterop / huff0 / fse) and a populated `artifacts/` regression\ncorpus, but the CI workflow never invoked any of it. Past crashes\ncould resurface and be merged without anything catching them at PR\ntime.\n\nThis commit wires `cargo-fuzz` into CI alongside the benchmark\nmatrix:\n\n- Matrix of 5 fuzz targets, each shard runs on its own\n  `ubuntu-latest` runner so total wall-clock is bounded by the\n  slowest single target.\n- `taiki-e/install-action@v2` installs `cargo-fuzz`; nightly Rust\n  toolchain is required (libFuzzer instrumentation).\n- Replay phase: every artifact in `zstd/fuzz/artifacts/<target>/`\n  is fed through `cargo fuzz run <target> <files>` first.\n  Re-introducing a previously fixed crash fails CI on the original\n  reproducer.\n- Fresh fuzzing phase: `cargo fuzz run <target> --\n  -max_total_time=90 -timeout=30`. libFuzzer's own time cap is the\n  inner budget; the `timeout-minutes: 10` on the job is the outer\n  ceiling.\n- On failure the shard uploads `zstd/fuzz/artifacts/<target>/`\n  as `fuzz-<target>-artifacts` (14-day retention) so the new\n  reproducer survives the runner cleanup.\n\nRefs #122 Phase 3.\n\n* ci(fuzz): force nightly + 2021 edition for fuzz crate\n\n- zstd/fuzz/Cargo.toml had no `edition` field, defaulting to 2015 where\n  `use structured_zstd::...` requires `extern crate`; targets failed to\n  compile with `unresolved module or unlinked crate`.\n- The root `rust-toolchain.toml` pins stable, overriding\n  `dtolnay/rust-toolchain@nightly` once `cargo fuzz` shells out to\n  `cargo build` inside the fuzz crate. `cargo fuzz` needs `-Z sanitizer`\n  which stable rejects. Set `RUSTUP_TOOLCHAIN: nightly` at job env so\n  the override survives the sub-cargo invocation.\n\nVerified locally: all 5 targets build, `cargo fuzz run fse` completed\n62k runs in 10s with no crashes.\n\n* ci(bench): centralize target inventory and split build vs runtime setup\n\n- New `bench-matrix` job emits the canonical bench targets JSON;\n  `bench-build` and `benchmark` consume it via\n  `fromJSON(needs.bench-matrix.outputs.targets)`.\n- Each target now carries separate `build_setup` (run only on\n  `bench-build`) and `runtime_setup` (run only on `benchmark`\n  shards), so `x86_64-musl` no longer reinstalls `musl-tools` on\n  every runtime shard.\n- `benchmark-aggregate` ships a single `benchmark-aggregated`\n  artifact with per-target consolidated files;\n  `benchmark-pages` downloads that one artifact instead of three\n  named ones. `merge-benchmarks.py` rglob's so the layout change\n  is transparent.\n- `AGGREGATE_TARGETS` env now sourced from\n  `needs.bench-matrix.outputs.ids_csv`.\n\nAlso: refresh stale migration comments in `match_generator.rs`\nthat described the const-generic dispatch as future work (the\nrefactor has landed; `parse_mode` field is retained only for\nin-crate test callers, strategy-shaped predicates fold at\ncodegen time).\n\n* fix(fuzz): correct interop target to compress real input\n\n`encode_szstd_uncompressed` and `encode_szstd_compressed` drained the\ninput `Read` into a local buffer and then passed the now-empty `Read`\ninto `compress_to_vec`, so the compression branches of the interop\nroundtrip silently encoded zero bytes. The two regression artifacts\nshipped under `artifacts/interop/` triggered the assertion `decoded\n([]) != data ([0])` on every CI replay.\n\n- Take `&[u8]` directly instead of the drain-then-discard `Read` dance.\n- `encode_szstd_compressed` now uses `CompressionLevel::Default`\n  instead of being a verbatim duplicate of the uncompressed variant.\n\nVerified: both regression artifacts replay cleanly under\n`cargo fuzz run interop artifacts/interop/*`.\n\n* ci(fuzz): pin gnu target triple to bypass musl default\n\nThe `cargo-fuzz` binary installed via `taiki-e/install-action@v2` is\nstatically linked against musl on Linux; its `default_target()` probe\npicks `x86_64-unknown-linux-musl`, which then fails because\nAddressSanitizer cannot link against a static libc:\n\n  error: sanitizer is incompatible with statically linked libc,\n         disable it using `-C target-feature=-crt-static`\n  error[E0463]: can't find crate for `core`\n\n(The musl rust-std is not installed on the runner either.)\n\nPass `--target x86_64-unknown-linux-gnu` explicitly via a job-level\n`FUZZ_TARGET_TRIPLE` env so both the corpus-replay step and the\nfresh-fuzz step bypass the probe and link against glibc, which is\nwhat the dtolnay/rust-toolchain@nightly install has stdlib for.\n\n* test(encoding): route btultra dictionary fixture through configure()\n\n`btultra_and_btultra2_both_keep_dictionary_candidates` set\n`hc.strategy_tag`, `hc.table.is_btultra2`, `hc.table.uses_bt`,\n`hc.backend` and `hc.hc.search_depth` by hand to flip the matcher\nbetween BtUltra2 and BtUltra between the two `collect_optimal_candidates`\ncalls. After the strategy-tag refactor, BtUltra2 implies a non-zero\n`hash3_log` and an allocated `hash3_table`; the hand-mutated path\nleft those fields in their default zero shape, so the test exercised\na configuration the production `configure()` path never constructs and\nrisked tripping the `Strategy::USE_HASH3 ⇒ hash3_log != 0` debug\ninvariant in `collect_optimal_candidates_initialized_body`.\n\nThe fixture now goes through `HcMatchGenerator::configure()` for each\nphase with explicit `HcConfig` + `StrategyTag` + window_log inputs.\nThe history-prime closure is reused so both phases see identical\ncontent and dictionary-limit state.\n\nAlso drop a stale `self.parse_mode` reference in the doc comment for\n`start_matching_strategy` and a similar stale reference next to\n`HcOptimalCostProfile::const_for_strategy` — the field was removed in\nthe parse-mode rip-out commit and the comments now describe the\ntest-only inherent `start_matching`'s `strategy_tag` dispatcher.\n\n* ci(fuzz): consolidate per-target matrix into a single sequential job\n\nThe 5-way matrix paid a fresh asan+sancov build of `structured-zstd`\n(~2 min) on every shard — the dominant cost — for ~3 min of wall-\nclock parallelism. Wall-clock is already bounded by the bench matrix\n(~25 min) which runs in parallel, so the matrix split was buying\nnothing useful.\n\nRun all five targets sequentially in one runner instead: the first\ntarget builds, the remaining four reuse cargo's incremental cache\n(~seconds each). Halves the compute spend while keeping each target's\noutput grouped under `::group::` markers for log navigation, and the\nfresh-fuzz step still respects the 90s libFuzzer budget per target.",
+          "timestamp": "2026-05-15T01:18:45+03:00",
+          "tree_id": "d4d112d8d27ad4145656c773beddfd911615cab5",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b486614a1c20293c6f4b3dc7d9edad4d94904b76"
+        },
+        "date": 1778798333840,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.199,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.016,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 6.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.865,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 6.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.196,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.37,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.368,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 5.862,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.688,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.918,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.67,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.168,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.174,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.352,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.35,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.229,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 16.156,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.33,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 16.261,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.177,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.353,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.351,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.16,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 3.82,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.268,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.869,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.18,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.183,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.355,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.352,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.292,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 2.71,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 1.751,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 2.483,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.805,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.159,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.168,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.185,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 7.322,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.366,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 6.583,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.365,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.187,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.363,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.36,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
