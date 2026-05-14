@@ -1078,16 +1078,15 @@ macro_rules! bt_insert_step_no_rebase_body {
         // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($target_abs);
-        // `abs_pos` is a frame-lifetime stream cursor. A long 32-bit
-        // streaming encode keeps memory bounded by `window_size` but
-        // advances `abs_pos` past `usize::MAX` cumulatively — so the
-        // addition genuinely can overflow on i686 even though no
-        // single allocation ever reaches `usize::MAX`. `saturating_add`
-        // clamps to `usize::MAX`, which downstream comparisons
-        // (`if candidate_end > match_end_abs`) treat as "no further
-        // extension possible" — a safe degenerate state near the
-        // stream tail.
-        let mut match_end_abs = $abs_pos.saturating_add(9);
+        // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
+        // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
+        // `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16`), so every
+        // frame-lifetime absolute cursor passed to the BT walker stays
+        // below `usize::MAX - 9` regardless of stream length or
+        // pointer width. The guard is hoisted to the data-ingest
+        // boundary so this per-position site pays zero arithmetic
+        // overhead in the hot loop.
+        let mut match_end_abs = $abs_pos + 9;
         let mut best_len = 8usize;
         let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
@@ -2105,11 +2104,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.table.insert_position($abs_pos);
             let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
             let concat = &$self.table.history[$self.table.history_start..];
-            // `abs_pos` is a frame-lifetime stream cursor; see
-            // `bt_insert_step_no_rebase_body!` for the full discussion
-            // of why `saturating_add` is required on 32-bit streaming
-            // encodes that can advance the cursor past `usize::MAX`.
-            let mut match_end_abs = $abs_pos.saturating_add(9);
+            // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
+            // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
+            // cap in `MatchTable::add_data`.
+            let mut match_end_abs = $abs_pos + 9;
             if max_chain_depth > 0 {
                 for (visited, candidate_abs) in $self
                     .hc
@@ -2352,11 +2350,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($abs_pos);
-        // `abs_pos` is a frame-lifetime stream cursor; see
-        // `bt_insert_step_no_rebase_body!` for the full discussion of
-        // why `saturating_add` is required on 32-bit streaming
-        // encodes that can advance the cursor past `usize::MAX`.
-        let mut match_end_abs = $abs_pos.saturating_add(9);
+        // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
+        // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
+        // cap in `MatchTable::add_data`.
+        let mut match_end_abs = $abs_pos + 9;
         let mut compares_left = $profile.max_chain_depth.min($search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;

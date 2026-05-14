@@ -20,10 +20,19 @@ use alloc::vec::Vec;
 
 use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
-use super::super::cost_model::HcOptimalCostProfile;
+use super::super::cost_model::{HC_OPT_NUM, HcOptimalCostProfile};
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
+
+/// Lookahead bytes the BT walker / optimal parser will read past the
+/// per-position absolute cursor (`abs_pos + 9` for match-end sentinels,
+/// `abs_pos + HC_OPT_NUM` for the optimal-parser match-length cap, etc.).
+/// `MatchTable::add_data` rejects input that would advance
+/// `history_abs_end` past `usize::MAX - STREAM_ABS_HEADROOM`, which lets
+/// every downstream raw `abs_pos + N` arithmetic stay within `usize` on
+/// 32-bit targets without per-call saturating guards.
+pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 
 /// Knuth-style 3-byte hash multiplier. Donor parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
@@ -342,6 +351,24 @@ impl MatchTable {
     /// ~2x window size for data buffers + 6 MB tables.
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        // Hard cap: every absolute stream cursor the encoder hands to the
+        // BT walker / optimal parser stays within `usize::MAX -
+        // STREAM_ABS_HEADROOM`. That is what lets every per-position
+        // `abs_pos + N` arithmetic site downstream run as raw `+` instead
+        // of `saturating_add`. On 64-bit targets this cap is unreachable
+        // in practice; on 32-bit (i686) it fails fast on streams whose
+        // cumulative input would push the cursor near `usize::MAX`,
+        // which is the only platform where the overflow concern is real.
+        let _future_abs_end = self
+            .history_abs_start
+            .checked_add(self.window_size)
+            .and_then(|p| p.checked_add(data.len()))
+            .and_then(|p| p.checked_add(STREAM_ABS_HEADROOM))
+            .expect(
+                "structured-zstd: total input would advance the absolute \
+                 stream cursor past `usize::MAX`; on 32-bit targets, split \
+                 the input into smaller frames or use a 64-bit build",
+            );
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
             self.window_size -= removed.len();
