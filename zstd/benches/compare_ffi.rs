@@ -20,7 +20,7 @@ use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
 };
-use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels};
+use support::{LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered};
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
@@ -65,7 +65,7 @@ fn emit_reports_enabled() -> bool {
 fn bench_compress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
-        for level in supported_levels() {
+        for level in supported_levels_filtered() {
             if emit_reports {
                 let rust_compressed = structured_zstd::encoding::compress_to_vec(
                     &scenario.bytes[..],
@@ -110,7 +110,7 @@ fn bench_compress(c: &mut Criterion) {
 fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
-        for level in supported_levels() {
+        for level in supported_levels_filtered() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
             let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
@@ -332,7 +332,7 @@ fn bench_dictionary(c: &mut Criterion) {
 
         group.finish();
 
-        for level in supported_levels() {
+        for level in supported_levels_filtered() {
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
             let mut with_dict =
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();

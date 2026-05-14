@@ -127,36 +127,40 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   benchmark:
-    name: Performance regression check (${{ matrix.bench.id }})
+    name: Bench ${{ matrix.bench.id }} / ${{ matrix.level }}
     needs: lint
     timeout-minutes: ${{ matrix.bench.timeout_minutes }}
     strategy:
+      # The bench matrix is split target × level. `level22` on i686 is
+      # the natural bottleneck (~20 min); every other (target, level)
+      # combo finishes well under 10 min, so wall-clock falls from
+      # ~45 min to ~25 min while keeping the full per-(target, level)
+      # coverage we had before.
       fail-fast: false
       matrix:
         bench:
           - id: x86_64-gnu
             target_triple: x86_64-unknown-linux-gnu
-            timeout_minutes: 40
+            timeout_minutes: 25
             setup_command: ""
           - id: i686-gnu
             target_triple: i686-unknown-linux-gnu
-            timeout_minutes: 55
+            timeout_minutes: 30
             setup_command: "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386"
           - id: x86_64-musl
             target_triple: x86_64-unknown-linux-musl
-            timeout_minutes: 40
+            timeout_minutes: 25
             setup_command: "sudo apt-get update && sudo apt-get install -y musl-tools"
+        level:
+          - fastest
+          - default
+          - better
+          - level4-row
+          - best
+          - level22
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Generate bot token
-        id: bot-token
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
       - name: Install benchmark target
@@ -170,57 +174,114 @@ jobs:
         with:
           prefix-key: bench-${{ matrix.bench.id }}
 
-      - name: Run benchmarks
+      - name: Run benchmarks (filtered to single level)
         env:
           STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
           STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
           STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
+          STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.level }}
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: bash .github/scripts/run-benchmarks.sh
 
       - name: Rename benchmark outputs for matrix artifact
         run: |
-          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.json
-          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.md
-          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.json
-          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.md
-          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.json
+          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
+          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
+          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
 
-      - name: Upload benchmark artifacts
+      - name: Upload benchmark shard artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ matrix.bench.id }}
+          name: benchmark-shard-${{ matrix.bench.id }}-${{ matrix.level }}
           path: |
-            benchmark-results.${{ matrix.bench.id }}.json
-            benchmark-report.${{ matrix.bench.id }}.md
-            benchmark-delta.${{ matrix.bench.id }}.json
-            benchmark-delta.${{ matrix.bench.id }}.md
-            benchmark-relative.${{ matrix.bench.id }}.json
+            benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
+            benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
+            benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
           if-no-files-found: error
 
-      - name: Store benchmark results
-        if: steps.bot-token.outputs.token != '' && matrix.bench.id == 'x86_64-gnu'
+  benchmark-aggregate:
+    name: Aggregate benchmark shards per target
+    needs: benchmark
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Download benchmark shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-shard-*
+          path: benchmark-artifacts
+
+      - name: Aggregate level shards into per-target files
+        env:
+          AGGREGATE_TARGETS: x86_64-gnu,i686-gnu,x86_64-musl
+        run: python3 .github/scripts/aggregate-bench-levels.py
+
+      - name: Upload per-target consolidated artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-x86_64-gnu
+          path: |
+            benchmark-results.x86_64-gnu.json
+            benchmark-report.x86_64-gnu.md
+            benchmark-delta.x86_64-gnu.json
+            benchmark-delta.x86_64-gnu.md
+            benchmark-relative.x86_64-gnu.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-i686-gnu
+          path: |
+            benchmark-results.i686-gnu.json
+            benchmark-report.i686-gnu.md
+            benchmark-delta.i686-gnu.json
+            benchmark-delta.i686-gnu.md
+            benchmark-relative.i686-gnu.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-x86_64-musl
+          path: |
+            benchmark-results.x86_64-musl.json
+            benchmark-report.x86_64-musl.md
+            benchmark-delta.x86_64-musl.json
+            benchmark-delta.x86_64-musl.md
+            benchmark-relative.x86_64-musl.json
+          if-no-files-found: error
+
+      - name: Store benchmark results (x86_64-gnu only)
+        if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: "structured-zstd vs C FFI (${{ matrix.bench.id }})"
+          name: "structured-zstd vs C FFI (x86_64-gnu)"
           tool: customSmallerIsBetter
-          output-file-path: benchmark-results.${{ matrix.bench.id }}.json
+          output-file-path: benchmark-results.x86_64-gnu.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          # Keep matrix execution parallel; persist benchmark baseline only for one
-          # canonical target to avoid concurrent gh-pages writes from matrix jobs.
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
-          comment-on-alert: ${{ matrix.bench.id == 'x86_64-gnu' }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
           alert-comment-cc-users: "@polaz"
-          # GitHub-hosted runners are noisy across runs; keep perf checks advisory on PRs.
           alert-threshold: "130%"
           fail-threshold: "160%"
-          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.bench.id == 'x86_64-gnu' }}
+          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
   benchmark-pages:
     name: Publish benchmark pages payloads
-    needs: benchmark
+    needs: benchmark-aggregate
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 20
     runs-on: ubuntu-latest
@@ -243,11 +304,25 @@ jobs:
           token: ${{ steps.bot-token.outputs.token }}
           path: gh-pages
 
-      - name: Download benchmark matrix artifacts
-        uses: actions/download-artifact@v4
+      # Only the aggregated per-target artifacts feed
+      # merge-benchmarks.py. The level shards (benchmark-shard-*) are
+      # intermediate inputs to `benchmark-aggregate` and would
+      # otherwise pollute merge-benchmarks.py's per-target name
+      # extraction with `<target>.<level>` keys. Download each
+      # target explicitly so the artifact dir contains exactly the
+      # expected file set.
+      - uses: actions/download-artifact@v4
         with:
-          pattern: benchmark-*
-          path: benchmark-artifacts
+          name: benchmark-x86_64-gnu
+          path: benchmark-artifacts/x86_64-gnu
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-i686-gnu
+          path: benchmark-artifacts/i686-gnu
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-x86_64-musl
+          path: benchmark-artifacts/x86_64-musl
 
       - name: Merge relative/delta payloads
         run: python3 .github/scripts/merge-benchmarks.py
