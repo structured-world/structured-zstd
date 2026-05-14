@@ -1360,11 +1360,15 @@ macro_rules! build_optimal_plan_impl_body {
                     // current block length (the frame compressor caps
                     // block scan at `HC_BLOCKSIZE_MAX`), not the segment
                     // `current_len`. `p < min_match_len` (small constant),
-                    // so the seed-position litlen stays well within
-                    // `u32::MAX`; `u32::try_from` panics rather than
-                    // silently truncates if the invariant is ever broken.
-                    nodes[p].litlen = u32::try_from(initial_litlen + p)
+                    // so the sum stays well within `u32::MAX`. Use
+                    // `checked_add` FIRST so the `usize` addition itself
+                    // cannot overflow on i686 (where `usize` is 32-bit
+                    // and a wrapping `+` would slip past `try_from`).
+                    let seed_litlen = initial_litlen
+                        .checked_add(p)
+                        .and_then(|s| u32::try_from(s).ok())
                         .expect("optimal parser seed litlen out of u32 range");
+                    nodes[p].litlen = seed_litlen;
                 }
             }
 
@@ -2348,7 +2352,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
-        // so `min_match_len - 1 >= 3` cannot underflow.
+        // so `min_match_len - 1 >= 2` cannot underflow.
         debug_assert!($min_match_len >= 1, "min_match_len must be at least 1");
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
