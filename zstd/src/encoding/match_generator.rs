@@ -401,25 +401,67 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     }
 }
 
+/// Backend storage for [`MatchGeneratorDriver`]. Exactly one match-finder
+/// state lives in the driver at a time — the active variant. Backend
+/// transitions in [`Matcher::reset`] drain the current variant's allocations
+/// into the shared `vec_pool` and then replace `storage` with a freshly
+/// constructed variant for the new backend.
+///
+/// Replaces the prior pattern of four parallel fields (`match_generator`,
+/// `dfast_match_generator: Option<…>`, `row_match_generator: Option<…>`,
+/// `hc_match_generator: Option<…>`) + an `active_backend: BackendTag`
+/// discriminator: the parallel layout kept drained inner structures
+/// allocated across backend switches, and every per-frame/per-slice
+/// driver operation had to dispatch on `active_backend` to pick the
+/// right field. A single enum collapses the storage and makes the
+/// dispatcher pattern-match on the storage variant directly — same
+/// number of arms, but `storage.backend()` is now the canonical source
+/// of truth and dead variants are dropped when the active backend
+/// changes.
+enum MatcherStorage {
+    /// Level 1 — donor `ZSTD_fast`. Single-table Simple matcher; always
+    /// the initial variant constructed by [`MatchGeneratorDriver::new`].
+    Simple(MatchGenerator),
+    /// Levels 2-3 — donor `ZSTD_dfast`. Two-table hash chain.
+    Dfast(DfastMatchGenerator),
+    /// Level 4 — donor `ZSTD_greedy` with row hashing.
+    Row(RowMatchGenerator),
+    /// Levels 5-22 — donor `ZSTD_lazy2` and the BT-based optimal modes
+    /// (`btopt` / `btultra` / `btultra2`). Holds an [`HcMatchGenerator`]
+    /// whose internal [`HcBackend`] discriminator decides whether BT
+    /// scratch is allocated.
+    HashChain(HcMatchGenerator),
+}
+
+impl MatcherStorage {
+    /// [`super::strategy::BackendTag`] family of the active variant.
+    fn backend(&self) -> super::strategy::BackendTag {
+        use super::strategy::BackendTag;
+        match self {
+            Self::Simple(_) => BackendTag::Simple,
+            Self::Dfast(_) => BackendTag::Dfast,
+            Self::Row(_) => BackendTag::Row,
+            Self::HashChain(_) => BackendTag::HashChain,
+        }
+    }
+}
+
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
     vec_pool: Vec<Vec<u8>>,
     suffix_pool: Vec<SuffixStore>,
-    match_generator: MatchGenerator,
-    dfast_match_generator: Option<DfastMatchGenerator>,
-    row_match_generator: Option<RowMatchGenerator>,
-    hc_match_generator: Option<HcMatchGenerator>,
-    active_backend: super::strategy::BackendTag,
+    /// Active match-finder state. Exactly one backend lives here at a
+    /// time; [`Matcher::reset`] drains the previous variant into
+    /// `vec_pool` before swapping in a freshly constructed variant for
+    /// the new backend. `storage.backend()` is the canonical source of
+    /// truth for the parse family; `strategy_tag` carries the
+    /// compile-time strategy chosen at the last `reset()`.
+    storage: MatcherStorage,
     // Compile-time strategy tag resolved at `reset()` from the
     // requested `CompressionLevel`'s `LevelParams`. The driver's
     // hot-block dispatcher in `blocks/compressed.rs` matches on
     // this tag to enter the corresponding `Strategy`
-    // monomorphisation (`compress_block::<S>`). `active_backend`
-    // is the parse-family derivation of the tag and is kept here
-    // only because matcher state ownership (`row_match_generator`
-    // vs `hc_match_generator`) is reused across levels within the
-    // same backend; `strategy_tag.backend()` is the canonical
-    // source of truth.
+    // monomorphisation (`compress_block::<S>`).
     strategy_tag: super::strategy::StrategyTag,
     slice_size: usize,
     base_slice_size: usize,
@@ -443,11 +485,7 @@ impl MatchGeneratorDriver {
         Self {
             vec_pool: Vec::new(),
             suffix_pool: Vec::new(),
-            match_generator: MatchGenerator::new(max_window_size),
-            dfast_match_generator: None,
-            row_match_generator: None,
-            hc_match_generator: None,
-            active_backend: super::strategy::BackendTag::Simple,
+            storage: MatcherStorage::Simple(MatchGenerator::new(max_window_size)),
             strategy_tag: super::strategy::StrategyTag::Fast,
             slice_size,
             base_slice_size: slice_size,
@@ -461,40 +499,70 @@ impl MatchGeneratorDriver {
         resolve_level_params(level, source_size)
     }
 
+    /// Active backend family derived from the storage variant. Single
+    /// source of truth — no separate runtime tag to drift against.
+    fn active_backend(&self) -> super::strategy::BackendTag {
+        self.storage.backend()
+    }
+
+    #[cfg(test)]
+    fn simple(&self) -> &MatchGenerator {
+        match &self.storage {
+            MatcherStorage::Simple(m) => m,
+            _ => panic!("simple backend must be initialized by reset() before use"),
+        }
+    }
+
+    fn simple_mut(&mut self) -> &mut MatchGenerator {
+        match &mut self.storage {
+            MatcherStorage::Simple(m) => m,
+            _ => panic!("simple backend must be initialized by reset() before use"),
+        }
+    }
+
+    #[cfg(test)]
     fn dfast_matcher(&self) -> &DfastMatchGenerator {
-        self.dfast_match_generator
-            .as_ref()
-            .expect("dfast backend must be initialized by reset() before use")
+        match &self.storage {
+            MatcherStorage::Dfast(m) => m,
+            _ => panic!("dfast backend must be initialized by reset() before use"),
+        }
     }
 
     fn dfast_matcher_mut(&mut self) -> &mut DfastMatchGenerator {
-        self.dfast_match_generator
-            .as_mut()
-            .expect("dfast backend must be initialized by reset() before use")
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => m,
+            _ => panic!("dfast backend must be initialized by reset() before use"),
+        }
     }
 
+    #[cfg(test)]
     fn row_matcher(&self) -> &RowMatchGenerator {
-        self.row_match_generator
-            .as_ref()
-            .expect("row backend must be initialized by reset() before use")
+        match &self.storage {
+            MatcherStorage::Row(m) => m,
+            _ => panic!("row backend must be initialized by reset() before use"),
+        }
     }
 
     fn row_matcher_mut(&mut self) -> &mut RowMatchGenerator {
-        self.row_match_generator
-            .as_mut()
-            .expect("row backend must be initialized by reset() before use")
+        match &mut self.storage {
+            MatcherStorage::Row(m) => m,
+            _ => panic!("row backend must be initialized by reset() before use"),
+        }
     }
 
+    #[cfg(test)]
     fn hc_matcher(&self) -> &HcMatchGenerator {
-        self.hc_match_generator
-            .as_ref()
-            .expect("hash chain backend must be initialized by reset() before use")
+        match &self.storage {
+            MatcherStorage::HashChain(m) => m,
+            _ => panic!("hash chain backend must be initialized by reset() before use"),
+        }
     }
 
     fn hc_matcher_mut(&mut self) -> &mut HcMatchGenerator {
-        self.hc_match_generator
-            .as_mut()
-            .expect("hash chain backend must be initialized by reset() before use")
+        match &mut self.storage {
+            MatcherStorage::HashChain(m) => m,
+            _ => panic!("hash chain backend must be initialized by reset() before use"),
+        }
     }
 
     fn retire_dictionary_budget(&mut self, evicted_bytes: usize) {
@@ -503,12 +571,10 @@ impl MatchGeneratorDriver {
             return;
         }
         self.dictionary_retained_budget -= reclaimed;
-        match self.active_backend {
+        match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                self.match_generator.max_window_size = self
-                    .match_generator
-                    .max_window_size
-                    .saturating_sub(reclaimed);
+                let matcher = self.simple_mut();
+                matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
             super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
@@ -529,11 +595,14 @@ impl MatchGeneratorDriver {
     fn trim_after_budget_retire(&mut self) {
         loop {
             let mut evicted_bytes = 0usize;
-            match self.active_backend {
+            match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
                     let vec_pool = &mut self.vec_pool;
                     let suffix_pool = &mut self.suffix_pool;
-                    self.match_generator.reserve(0, |mut data, mut suffixes| {
+                    let MatcherStorage::Simple(m) = &mut self.storage else {
+                        unreachable!("active_backend() == Simple proven above");
+                    };
+                    m.reserve(0, |mut data, mut suffixes| {
                         evicted_bytes += data.len();
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
@@ -584,9 +653,9 @@ impl MatchGeneratorDriver {
     }
 
     fn skip_matching_for_dictionary_priming(&mut self) {
-        match self.active_backend {
+        match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                self.match_generator.skip_matching_with_hint(Some(false))
+                self.simple_mut().skip_matching_with_hint(Some(false))
             }
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
             super::strategy::BackendTag::Row => {
@@ -615,12 +684,17 @@ impl Matcher for MatchGeneratorDriver {
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
-        if self.active_backend != next_backend {
-            match self.active_backend {
-                super::strategy::BackendTag::Simple => {
+        if self.active_backend() != next_backend {
+            // Drain the outgoing backend's allocations into the shared
+            // pool. The `match &mut self.storage { ... }` block runs to
+            // completion before the assignment below replaces the
+            // variant, so the inner state we just drained is dropped
+            // with the old variant.
+            match &mut self.storage {
+                MatcherStorage::Simple(m) => {
                     let vec_pool = &mut self.vec_pool;
                     let suffix_pool = &mut self.suffix_pool;
-                    self.match_generator.reset(|mut data, mut suffixes| {
+                    m.reset(|mut data, mut suffixes| {
                         data.resize(data.capacity(), 0);
                         vec_pool.push(data);
                         suffixes.slots.clear();
@@ -628,65 +702,75 @@ impl Matcher for MatchGeneratorDriver {
                         suffix_pool.push(suffixes);
                     });
                 }
-                super::strategy::BackendTag::Dfast => {
-                    if let Some(dfast) = self.dfast_match_generator.as_mut() {
-                        let vec_pool = &mut self.vec_pool;
-                        dfast.reset(|mut data| {
-                            data.resize(data.capacity(), 0);
-                            vec_pool.push(data);
-                        });
-                    }
+                MatcherStorage::Dfast(m) => {
+                    let vec_pool = &mut self.vec_pool;
+                    m.reset(|mut data| {
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                    });
                 }
-                super::strategy::BackendTag::Row => {
-                    if let Some(row) = self.row_match_generator.as_mut() {
-                        row.row_heads = Vec::new();
-                        row.row_positions = Vec::new();
-                        row.row_tags = Vec::new();
-                        let vec_pool = &mut self.vec_pool;
-                        row.reset(|mut data| {
-                            data.resize(data.capacity(), 0);
-                            vec_pool.push(data);
-                        });
-                    }
+                MatcherStorage::Row(m) => {
+                    m.row_heads = Vec::new();
+                    m.row_positions = Vec::new();
+                    m.row_tags = Vec::new();
+                    let vec_pool = &mut self.vec_pool;
+                    m.reset(|mut data| {
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                    });
                 }
-                super::strategy::BackendTag::HashChain => {
-                    if let Some(hc) = self.hc_match_generator.as_mut() {
-                        // Release oversized tables when switching away from
-                        // HashChain so Best's larger allocations don't persist.
-                        // hash3_table must be released alongside the other
-                        // two: BtUltra2's `1 << HC3_HASH_LOG` entries would
-                        // otherwise stay pinned across the backend switch,
-                        // even though no future caller of this backend will
-                        // touch them.
-                        hc.table.hash_table = Vec::new();
-                        hc.table.chain_table = Vec::new();
-                        hc.table.hash3_table = Vec::new();
-                        let vec_pool = &mut self.vec_pool;
-                        hc.reset(|mut data| {
-                            data.resize(data.capacity(), 0);
-                            vec_pool.push(data);
-                        });
-                    }
+                MatcherStorage::HashChain(m) => {
+                    // Release oversized tables when switching away from
+                    // HashChain so Best's larger allocations don't persist.
+                    // hash3_table must be released alongside the other
+                    // two: BtUltra2's `1 << HC3_HASH_LOG` entries would
+                    // otherwise stay pinned across the backend switch,
+                    // even though no future caller of this backend will
+                    // touch them.
+                    m.table.hash_table = Vec::new();
+                    m.table.chain_table = Vec::new();
+                    m.table.hash3_table = Vec::new();
+                    let vec_pool = &mut self.vec_pool;
+                    m.reset(|mut data| {
+                        data.resize(data.capacity(), 0);
+                        vec_pool.push(data);
+                    });
                 }
             }
+            // Swap in a fresh variant for the new backend. The previous
+            // `storage` is dropped here.
+            self.storage = match next_backend {
+                super::strategy::BackendTag::Simple => {
+                    MatcherStorage::Simple(MatchGenerator::new(max_window_size))
+                }
+                super::strategy::BackendTag::Dfast => {
+                    MatcherStorage::Dfast(DfastMatchGenerator::new(max_window_size))
+                }
+                super::strategy::BackendTag::Row => {
+                    MatcherStorage::Row(RowMatchGenerator::new(max_window_size))
+                }
+                super::strategy::BackendTag::HashChain => {
+                    MatcherStorage::HashChain(HcMatchGenerator::new(max_window_size))
+                }
+            };
         }
 
         // Single source of truth: `LevelParams::strategy_tag` is the
         // authoritative mapping from `CompressionLevel` to strategy.
-        // Both runtime fields are derived from it — no separate
-        // `for_compression_level` recomputation that could drift
-        // against `LEVEL_TABLE`.
+        // `storage.backend()` derives the parse family from the variant,
+        // so there is no separate runtime tag that could drift against
+        // `LEVEL_TABLE`.
         self.strategy_tag = params.strategy_tag;
-        self.active_backend = next_backend;
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
-        match self.active_backend {
-            super::strategy::BackendTag::Simple => {
+        let strategy_tag = self.strategy_tag;
+        match &mut self.storage {
+            MatcherStorage::Simple(m) => {
                 let vec_pool = &mut self.vec_pool;
                 let suffix_pool = &mut self.suffix_pool;
-                self.match_generator.max_window_size = max_window_size;
-                self.match_generator.hash_fill_step = params.hash_fill_step;
-                self.match_generator.reset(|mut data, mut suffixes| {
+                m.max_window_size = max_window_size;
+                m.hash_fill_step = params.hash_fill_step;
+                m.reset(|mut data, mut suffixes| {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                     suffixes.slots.clear();
@@ -694,10 +778,7 @@ impl Matcher for MatchGeneratorDriver {
                     suffix_pool.push(suffixes);
                 });
             }
-            super::strategy::BackendTag::Dfast => {
-                let dfast = self
-                    .dfast_match_generator
-                    .get_or_insert_with(|| DfastMatchGenerator::new(max_window_size));
+            MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
                 dfast.use_fast_loop = matches!(
@@ -717,10 +798,7 @@ impl Matcher for MatchGeneratorDriver {
                     vec_pool.push(data);
                 });
             }
-            super::strategy::BackendTag::Row => {
-                let row = self
-                    .row_match_generator
-                    .get_or_insert_with(|| RowMatchGenerator::new(max_window_size));
+            MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
                 row.configure(params.row);
@@ -733,13 +811,10 @@ impl Matcher for MatchGeneratorDriver {
                     vec_pool.push(data);
                 });
             }
-            super::strategy::BackendTag::HashChain => {
-                let hc = self
-                    .hc_match_generator
-                    .get_or_insert_with(|| HcMatchGenerator::new(max_window_size));
+            MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
-                hc.configure(params.hc, self.strategy_tag, params.window_log);
+                hc.configure(params.hc, strategy_tag, params.window_log);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -750,8 +825,8 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
-        match self.active_backend {
-            super::strategy::BackendTag::Simple => self.match_generator.offset_hist = offset_hist,
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().offset_hist = offset_hist,
             super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().offset_hist = offset_hist
             }
@@ -770,12 +845,11 @@ impl Matcher for MatchGeneratorDriver {
         // Dictionary bytes should stay addressable until produced frame output
         // itself exceeds the live window size.
         let retained_dict_budget = dict_content.len();
-        match self.active_backend {
+        match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                self.match_generator.max_window_size = self
-                    .match_generator
-                    .max_window_size
-                    .saturating_add(retained_dict_budget);
+                let matcher = self.simple_mut();
+                matcher.max_window_size =
+                    matcher.max_window_size.saturating_add(retained_dict_budget);
             }
             super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
@@ -801,7 +875,7 @@ impl Matcher for MatchGeneratorDriver {
         // insert_position needs 4 bytes of lookahead for hashing;
         // backfill_boundary_positions re-visits tail positions once the
         // next slice extends history, but cannot hash <4 byte fragments.
-        let min_primed_tail = match self.active_backend {
+        let min_primed_tail = match self.active_backend() {
             super::strategy::BackendTag::Simple => MIN_MATCH_LEN,
             super::strategy::BackendTag::Dfast
             | super::strategy::BackendTag::Row
@@ -823,10 +897,10 @@ impl Matcher for MatchGeneratorDriver {
 
         let uncommitted_tail_budget = retained_dict_budget.saturating_sub(committed_dict_budget);
         if uncommitted_tail_budget > 0 {
-            match self.active_backend {
+            match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
-                    self.match_generator.max_window_size = self
-                        .match_generator
+                    let matcher = self.simple_mut();
+                    matcher.max_window_size = matcher
                         .max_window_size
                         .saturating_sub(uncommitted_tail_budget);
                 }
@@ -856,7 +930,7 @@ impl Matcher for MatchGeneratorDriver {
                 .dictionary_retained_budget
                 .saturating_add(committed_dict_budget);
         }
-        if self.active_backend == super::strategy::BackendTag::HashChain {
+        if self.active_backend() == super::strategy::BackendTag::HashChain {
             self.hc_matcher_mut()
                 .table
                 .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
@@ -870,7 +944,7 @@ impl Matcher for MatchGeneratorDriver {
         ml: Option<&crate::fse::fse_encoder::FSETable>,
         of: Option<&crate::fse::fse_encoder::FSETable>,
     ) {
-        if self.active_backend == super::strategy::BackendTag::HashChain {
+        if self.active_backend() == super::strategy::BackendTag::HashChain {
             self.hc_matcher_mut()
                 .seed_dictionary_entropy(huff, ll, ml, of);
         }
@@ -894,82 +968,60 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn get_last_space(&mut self) -> &[u8] {
-        match self.active_backend {
-            super::strategy::BackendTag::Simple => {
-                self.match_generator.window.last().unwrap().data.as_slice()
-            }
-            super::strategy::BackendTag::Dfast => self.dfast_matcher().get_last_space(),
-            super::strategy::BackendTag::Row => self.row_matcher().get_last_space(),
-            super::strategy::BackendTag::HashChain => self.hc_matcher().table.get_last_space(),
+        match &self.storage {
+            MatcherStorage::Simple(m) => m.window.last().unwrap().data.as_slice(),
+            MatcherStorage::Dfast(m) => m.get_last_space(),
+            MatcherStorage::Row(m) => m.get_last_space(),
+            MatcherStorage::HashChain(m) => m.table.get_last_space(),
         }
     }
 
     fn commit_space(&mut self, space: Vec<u8>) {
-        match self.active_backend {
-            super::strategy::BackendTag::Simple => {
-                let vec_pool = &mut self.vec_pool;
-                let mut evicted_bytes = 0usize;
-                let suffixes = match self.suffix_pool.pop() {
+        let mut evicted_bytes = 0usize;
+        // Split borrows manually so the `add_data` closures can write
+        // into `vec_pool`/`suffix_pool` while the backend itself holds
+        // an exclusive borrow via `storage`.
+        let vec_pool = &mut self.vec_pool;
+        let suffix_pool = &mut self.suffix_pool;
+        match &mut self.storage {
+            MatcherStorage::Simple(m) => {
+                let suffixes = match suffix_pool.pop() {
                     Some(store) if store.slots.len() >= space.len() => store,
                     _ => SuffixStore::with_capacity(space.len()),
                 };
-                let suffix_pool = &mut self.suffix_pool;
-                self.match_generator
-                    .add_data(space, suffixes, |mut data, mut suffixes| {
-                        evicted_bytes += data.len();
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                        suffixes.slots.clear();
-                        suffixes.slots.resize(suffixes.slots.capacity(), None);
-                        suffix_pool.push(suffixes);
-                    });
-                self.retire_dictionary_budget(evicted_bytes);
-                self.trim_after_budget_retire();
+                m.add_data(space, suffixes, |mut data, mut suffixes| {
+                    evicted_bytes += data.len();
+                    data.resize(data.capacity(), 0);
+                    vec_pool.push(data);
+                    suffixes.slots.clear();
+                    suffixes.slots.resize(suffixes.slots.capacity(), None);
+                    suffix_pool.push(suffixes);
+                });
             }
-            super::strategy::BackendTag::Dfast => {
-                let vec_pool = &mut self.vec_pool;
-                let mut evicted_bytes = 0usize;
-                self.dfast_match_generator
-                    .as_mut()
-                    .expect("dfast backend must be initialized by reset() before use")
-                    .add_data(space, |mut data| {
-                        evicted_bytes += data.len();
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
-                self.retire_dictionary_budget(evicted_bytes);
-                self.trim_after_budget_retire();
+            MatcherStorage::Dfast(m) => {
+                m.add_data(space, |mut data| {
+                    evicted_bytes += data.len();
+                    data.resize(data.capacity(), 0);
+                    vec_pool.push(data);
+                });
             }
-            super::strategy::BackendTag::Row => {
-                let vec_pool = &mut self.vec_pool;
-                let mut evicted_bytes = 0usize;
-                self.row_match_generator
-                    .as_mut()
-                    .expect("row backend must be initialized by reset() before use")
-                    .add_data(space, |mut data| {
-                        evicted_bytes += data.len();
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
-                self.retire_dictionary_budget(evicted_bytes);
-                self.trim_after_budget_retire();
+            MatcherStorage::Row(m) => {
+                m.add_data(space, |mut data| {
+                    evicted_bytes += data.len();
+                    data.resize(data.capacity(), 0);
+                    vec_pool.push(data);
+                });
             }
-            super::strategy::BackendTag::HashChain => {
-                let vec_pool = &mut self.vec_pool;
-                let mut evicted_bytes = 0usize;
-                self.hc_match_generator
-                    .as_mut()
-                    .expect("hash chain backend must be initialized by reset() before use")
-                    .table
-                    .add_data(space, |mut data| {
-                        evicted_bytes += data.len();
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
-                self.retire_dictionary_budget(evicted_bytes);
-                self.trim_after_budget_retire();
+            MatcherStorage::HashChain(m) => {
+                m.table.add_data(space, |mut data| {
+                    evicted_bytes += data.len();
+                    data.resize(data.capacity(), 0);
+                    vec_pool.push(data);
+                });
             }
         }
+        self.retire_dictionary_budget(evicted_bytes);
+        self.trim_after_budget_retire();
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -1000,9 +1052,9 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
-        match self.active_backend {
+        match self.active_backend() {
             super::strategy::BackendTag::Simple => self
-                .match_generator
+                .simple_mut()
                 .skip_matching_with_hint(incompressible_hint),
             super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().skip_matching(incompressible_hint)
@@ -1032,9 +1084,7 @@ impl MatchGeneratorDriver {
     ) {
         use super::strategy::BackendTag;
         match S::BACKEND {
-            BackendTag::Simple => {
-                while self.match_generator.next_sequence(&mut *handle_sequence) {}
-            }
+            BackendTag::Simple => while self.simple_mut().next_sequence(&mut *handle_sequence) {},
             BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
             BackendTag::Row => self.row_matcher_mut().start_matching(handle_sequence),
             BackendTag::HashChain => self
@@ -3661,7 +3711,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Default);
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Dfast);
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Dfast);
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut first = driver.get_next_space();
@@ -3702,7 +3752,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Row);
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 }
 
 #[test]
@@ -3718,7 +3768,7 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
         );
         assert_eq!(
             driver.strategy_tag.backend(),
-            driver.active_backend,
+            driver.active_backend(),
             "strategy_tag backend disagrees with active_backend for {level:?}"
         );
     }
@@ -4920,7 +4970,7 @@ fn simple_backend_rejects_undersized_pooled_suffix_store() {
     driver.commit_space(space);
 
     let last_suffix_slots = driver
-        .match_generator
+        .simple()
         .window
         .last()
         .expect("window entry must exist after commit")
@@ -4984,20 +5034,19 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    // Switch to Fastest — must release HC tables.
+    // Switch to Fastest — the [`MatcherStorage`] enum swaps to the
+    // `Simple` variant and drops the `HashChain` variant entirely (the
+    // HC reset closure pre-drop pushes any retained data buffers into
+    // `vec_pool`, and the `hash_table` / `chain_table` / `hash3_table`
+    // are emptied by hand before drop so their backing allocations
+    // release immediately rather than waiting for the variant's `Drop`
+    // to run on the way out of the swap). Post-switch the HC variant
+    // no longer exists — there is nothing to inspect by accessor; the
+    // assertion that storage is now `Simple` covers the invariant the
+    // old hash_table/chain_table checks were proxying for.
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), (1u64 << 17));
-
-    // HC matcher should have empty tables after backend switch.
-    let hc = driver.hc_match_generator.as_ref().unwrap();
-    assert!(
-        hc.table.hash_table.is_empty(),
-        "HC hash_table should be released after switching away from Best"
-    );
-    assert!(
-        hc.table.chain_table.is_empty(),
-        "HC chain_table should be released after switching away from Best"
-    );
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
 }
 
 #[test]
@@ -5014,7 +5063,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    let hc = driver.hc_match_generator.as_ref().unwrap();
+    let hc = driver.hc_matcher();
     let better_hash_len = hc.table.hash_table.len();
     let better_chain_len = hc.table.chain_table.len();
 
@@ -5029,7 +5078,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    let hc = driver.hc_match_generator.as_ref().unwrap();
+    let hc = driver.hc_matcher();
     assert!(
         hc.table.hash_table.len() > better_hash_len,
         "Best hash_table ({}) should be larger than Better ({})",
@@ -5117,7 +5166,7 @@ fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
 
     driver.prime_with_dictionary(&[], [11, 7, 3]);
 
-    assert_eq!(driver.match_generator.offset_hist, [11, 7, 3]);
+    assert_eq!(driver.simple_mut().offset_hist, [11, 7, 3]);
 }
 
 #[test]
@@ -5210,7 +5259,7 @@ fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
 
     assert!(
         driver
-            .match_generator
+            .simple()
             .window
             .iter()
             .all(|entry| entry.data.len() >= MIN_MATCH_LEN),
@@ -5223,12 +5272,12 @@ fn prime_with_dictionary_counts_only_committed_tail_budget() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Fastest);
 
-    let before = driver.match_generator.max_window_size;
+    let before = driver.simple_mut().max_window_size;
     // One full slice plus a 1-byte tail that cannot be committed.
     driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
 
     assert_eq!(
-        driver.match_generator.max_window_size,
+        driver.simple_mut().max_window_size,
         before + 8,
         "retention budget must account only for dictionary bytes actually committed to history"
     );
@@ -5345,20 +5394,25 @@ fn row_get_last_space_and_reset_to_fastest_clears_window() {
     assert_eq!(driver.get_last_space(), b"row-data");
 
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
-    assert!(driver.row_matcher().window.is_empty());
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
 }
 
-/// Ensures switching from Row to Simple returns pooled buffers and row tables.
+/// Switching from Row to Simple drains row-side buffers into `vec_pool`
+/// before swapping the storage variant. With the [`MatcherStorage`] enum
+/// the old [`RowMatchGenerator`] is dropped on swap, so this test
+/// guards only the pool-recycling side of the transition. The
+/// pre-enum tests (`…reclaims_row_buffer_pool` /
+/// `…tolerates_missing_row_matcher`) checked that the row matcher
+/// stayed allocated across the switch with its internals cleared —
+/// the new invariant is "dead variants are dropped", and the
+/// `row_match_generator: Option<_>` field whose lazy-init recovery
+/// they exercised no longer exists.
 #[test]
-fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
+fn driver_reset_from_row_backend_recycles_row_buffers_into_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(4));
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Row);
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
-    // Ensure the row matcher option is initialized so reset() executes
-    // the Row backend retirement path.
-    let _ = driver.row_matcher();
     let mut space = driver.get_next_space();
     space.extend_from_slice(b"row-data-to-recycle");
     driver.commit_space(space);
@@ -5366,30 +5420,11 @@ fn driver_reset_from_row_backend_reclaims_row_buffer_pool() {
     let before_pool = driver.vec_pool.len();
     driver.reset(CompressionLevel::Fastest);
 
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
-    let row = driver
-        .row_match_generator
-        .as_ref()
-        .expect("row matcher should remain allocated after switch");
-    assert!(row.row_heads.is_empty());
-    assert!(row.row_positions.is_empty());
-    assert!(row.row_tags.is_empty());
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
     assert!(
         driver.vec_pool.len() >= before_pool,
         "row reset should recycle row history buffers"
     );
-}
-
-/// Guards the optional row backend retirement path when no row matcher was allocated.
-#[test]
-fn driver_reset_from_row_backend_tolerates_missing_row_matcher() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.active_backend = super::strategy::BackendTag::Row;
-    driver.row_match_generator = None;
-
-    driver.reset(CompressionLevel::Fastest);
-
-    assert_eq!(driver.active_backend, super::strategy::BackendTag::Simple);
 }
 
 #[test]
@@ -6155,12 +6190,12 @@ fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
     driver.reset(CompressionLevel::Fastest);
     // Use a small live window so dictionary-primed slices are evicted
     // quickly and budget retirement can be asserted deterministically.
-    driver.match_generator.max_window_size = 8;
+    driver.simple_mut().max_window_size = 8;
     driver.reported_window_size = 8;
 
-    let base_window = driver.match_generator.max_window_size;
+    let base_window = driver.simple_mut().max_window_size;
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-    assert_eq!(driver.match_generator.max_window_size, base_window + 24);
+    assert_eq!(driver.simple_mut().max_window_size, base_window + 24);
 
     for block in [b"AAAAAAAA", b"BBBBBBBB"] {
         let mut space = driver.get_next_space();
@@ -6175,7 +6210,8 @@ fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
         "dictionary budget should be fully retired once primed dict slices are evicted"
     );
     assert_eq!(
-        driver.match_generator.max_window_size, base_window,
+        driver.simple_mut().max_window_size,
+        base_window,
         "retired dictionary budget must not remain reusable for live history"
     );
 }
@@ -6368,16 +6404,16 @@ fn fastest_reset_uses_interleaved_hash_fill_step() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Uncompressed);
-    assert_eq!(driver.match_generator.hash_fill_step, 1);
+    assert_eq!(driver.simple().hash_fill_step, 1);
 
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.match_generator.hash_fill_step, FAST_HASH_FILL_STEP);
+    assert_eq!(driver.simple().hash_fill_step, FAST_HASH_FILL_STEP);
 
     // Better uses the HashChain backend with lazy2; verify that the backend switch
     // happened and the lazy_depth is configured correctly.
     driver.reset(CompressionLevel::Better);
     assert_eq!(
-        driver.active_backend,
+        driver.active_backend(),
         super::strategy::BackendTag::HashChain
     );
     assert_eq!(driver.window_size(), (1u64 << 23));
