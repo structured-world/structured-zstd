@@ -1059,7 +1059,11 @@ macro_rules! bt_insert_step_no_rebase_body {
         if idx + 8 > concat.len() {
             return 1;
         }
-        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        debug_assert!(
+            $abs_pos <= $current_abs_end,
+            "BT walker called past current block end"
+        );
+        let tail_limit = $current_abs_end - $abs_pos;
         let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
@@ -1071,9 +1075,16 @@ macro_rules! bt_insert_step_no_rebase_body {
         };
         let stored = relative_pos + 1;
         let bt_mask = $table.bt_mask();
+        // `abs_pos < bt_mask` legitimately happens for the first BT walk of
+        // a fresh frame (bt_low effectively "no floor"). Saturating keeps
+        // the floor at 0 so the `candidate_abs <= bt_low` check never
+        // triggers early; raw subtraction would underflow into a huge
+        // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($target_abs);
-        let mut match_end_abs = $abs_pos.saturating_add(9);
+        // `abs_pos + 9` only overflows on usize::MAX-adjacent input which
+        // never occurs in practice — encode blocks cap at HC_BLOCKSIZE_MAX.
+        let mut match_end_abs = $abs_pos + 9;
         let mut best_len = 8usize;
         let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
@@ -1112,7 +1123,10 @@ macro_rules! bt_insert_step_no_rebase_body {
 
             if match_len > best_len {
                 best_len = match_len;
-                let candidate_end = candidate_abs.saturating_add(match_len);
+                // `candidate_abs + match_len <= current_abs_end` by BT walk
+                // invariant — `match_len <= tail_limit = current_abs_end -
+                // abs_pos` and `candidate_abs < abs_pos`.
+                let candidate_end = candidate_abs + match_len;
                 if candidate_end > match_end_abs {
                     match_end_abs = candidate_end;
                 }
@@ -1157,7 +1171,11 @@ macro_rules! bt_insert_step_no_rebase_body {
         } else {
             0
         };
-        speed_positions.max(match_end_abs.saturating_sub($abs_pos.saturating_add(8)))
+        // `match_end_abs` is initialized to `abs_pos + 9` and only ever
+        // monotonically increased by `candidate_end` (also `> abs_pos`).
+        // So `match_end_abs > abs_pos + 8` is invariant — raw subtraction
+        // is safe.
+        speed_positions.max(match_end_abs - ($abs_pos + 8))
     }};
 }
 pub(crate) use bt_insert_step_no_rebase_body;
@@ -1189,7 +1207,8 @@ macro_rules! build_optimal_plan_impl_body {
     ) => {{
         let current_abs_end = $current_abs_start + $current_len;
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
-        let frontier_limit = $current_len.min(HC_OPT_NUM.saturating_sub(1));
+        // `HC_OPT_NUM > 0` by const definition, so `HC_OPT_NUM - 1` is safe.
+        let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
         let initial_reps = $initial_state.reps;
         let initial_litlen = $initial_state.litlen;
         let mut profile = $initial_state.profile;
@@ -1200,8 +1219,10 @@ macro_rules! build_optimal_plan_impl_body {
             HcParseMode::BtUltra | HcParseMode::BtUltra2
         );
         let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
-        if nodes.len() < frontier_limit.saturating_add(2) {
-            nodes.resize(frontier_limit.saturating_add(2), HcOptimalNode::default());
+        // `frontier_limit + 2 <= HC_OPT_NUM + 1` — bounded by const.
+        let frontier_buffer_size = frontier_limit + 2;
+        if nodes.len() < frontier_buffer_size {
+            nodes.resize(frontier_buffer_size, HcOptimalNode::default());
         }
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
         candidates.clear();
@@ -1327,10 +1348,13 @@ macro_rules! build_optimal_plan_impl_body {
                 )
             };
             if !candidates.is_empty() {
-                last_pos = min_match_len.saturating_sub(1).min(frontier_limit);
+                // `min_match_len >= HC_FORMAT_MINMATCH (4)` by invariant.
+                last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(nodes.len()) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
-                    nodes[p].litlen = initial_litlen.saturating_add(p) as u32;
+                    // `initial_litlen + p <= u32::MAX`: lit_len capped well
+                    // below 2^32 by HC_OPT_NUM.
+                    nodes[p].litlen = (initial_litlen + p) as u32;
                 }
             }
 
@@ -1373,13 +1397,13 @@ macro_rules! build_optimal_plan_impl_body {
                 }
             }
             if !seed_forced_shortest_path {
-                let mut prev_max_len = min_match_len.saturating_sub(1);
+                let mut prev_max_len = min_match_len - 1;
                 for candidate in candidates.iter() {
                     let max_match_len = candidate.match_len.min(frontier_limit);
                     if max_match_len < min_match_len {
                         continue;
                     }
-                    let start_len = prev_max_len.saturating_add(1).max(min_match_len);
+                    let start_len = (prev_max_len + 1).max(min_match_len);
                     if start_len > max_match_len {
                         prev_max_len = prev_max_len.max(max_match_len);
                         continue;
@@ -1492,7 +1516,7 @@ macro_rules! build_optimal_plan_impl_body {
                             let ll_delta_next = BtMatcher::cached_lit_length_delta_price(
                                 profile,
                                 $stats,
-                                lit_len.saturating_add(1),
+                                lit_len + 1,
                                 &mut ll_prices,
                                 &mut ll_price_generations,
                                 ll_price_stamp,
@@ -1631,17 +1655,19 @@ macro_rules! build_optimal_plan_impl_body {
                     break;
                 }
             }
-            let mut prev_max_len = min_match_len.saturating_sub(1);
+            let mut prev_max_len = min_match_len - 1;
             for candidate in candidates.iter() {
+                // `pos < frontier_limit` is the outer loop's invariant.
+                debug_assert!(pos <= frontier_limit);
                 let max_match_len = candidate
                     .match_len
                     .min($current_len - pos)
-                    .min(frontier_limit.saturating_sub(pos));
+                    .min(frontier_limit - pos);
                 let min_len = min_match_len;
                 if max_match_len < min_len {
                     continue;
                 }
-                let start_len = prev_max_len.saturating_add(1).max(min_len);
+                let start_len = (prev_max_len + 1).max(min_len);
                 if start_len > max_match_len {
                     prev_max_len = prev_max_len.max(max_match_len);
                     continue;
@@ -1730,7 +1756,7 @@ macro_rules! build_optimal_plan_impl_body {
                     lit_price_stamp,
                 )
             };
-            let next_litlen = initial_litlen.saturating_add(1);
+            let next_litlen = initial_litlen + 1;
             let ll_delta = BtMatcher::cached_lit_length_delta_price(
                 profile,
                 $stats,
@@ -1858,7 +1884,9 @@ macro_rules! build_optimal_plan_impl_body {
             }
             store_start -= 1;
             store[store_start] = next_stretch;
-            let step = (next_stretch.litlen as usize).saturating_add(next_stretch.mlen as usize);
+            // `litlen + mlen` are both u32 stored in `HcOptimalNode` —
+            // sum fits in usize on any supported target.
+            let step = (next_stretch.litlen as usize) + (next_stretch.mlen as usize);
             if step == 0 || stretch_pos < step {
                 break;
             }
@@ -1995,7 +2023,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     if rep.match_len > $profile.sufficient_match_len {
                         skip_further_match_search = true;
                     }
-                    if $abs_pos.saturating_add(rep.match_len) >= $current_abs_end {
+                    // `abs_pos + rep.match_len` is bounded by
+                    // `current_abs_end + HC_OPT_NUM` (donor caps match_len
+                    // there) — far below usize::MAX.
+                    if $abs_pos + rep.match_len >= $current_abs_end {
                         skip_further_match_search = true;
                     }
                 },
@@ -2017,9 +2048,9 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 );
                 if !rep_len_candidate_found
                     && (h3.match_len > $profile.sufficient_match_len
-                        || $abs_pos.saturating_add(h3.match_len) >= $current_abs_end)
+                        || $abs_pos + h3.match_len >= $current_abs_end)
                 {
-                    $self.table.skip_insert_until_abs = $abs_pos.saturating_add(1);
+                    $self.table.skip_insert_until_abs = $abs_pos + 1;
                     skip_further_match_search = true;
                 }
             }
@@ -2040,7 +2071,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.table.insert_position($abs_pos);
             let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
             let concat = &$self.table.history[$self.table.history_start..];
-            let mut match_end_abs = $abs_pos.saturating_add(9);
+            let mut match_end_abs = $abs_pos + 9;
             if max_chain_depth > 0 {
                 for (visited, candidate_abs) in $self
                     .hc
@@ -2058,7 +2089,11 @@ macro_rules! collect_optimal_candidates_initialized_body {
                         continue;
                     }
                     let candidate_idx = candidate_abs - $self.table.history_abs_start;
-                    let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+                    debug_assert!(
+                        $abs_pos <= $current_abs_end,
+                        "HC chain walker called past current block end"
+                    );
+                    let tail_limit = $current_abs_end - $abs_pos;
                     let base = concat.as_ptr();
                     // SAFETY: history-relative indices; `tail_limit` bounds
                     // the scan within `concat`. `$cpl` is the kernel-specific
@@ -2080,22 +2115,20 @@ macro_rules! collect_optimal_candidates_initialized_body {
                         },
                         min_match_len,
                     ) {
-                        let candidate_end = candidate_abs.saturating_add(match_len);
+                        let candidate_end = candidate_abs + match_len;
                         if candidate_end > match_end_abs {
                             match_end_abs = candidate_end;
                         }
                     }
-                    if match_len > HC_OPT_NUM
-                        || $abs_pos.saturating_add(match_len) >= $current_abs_end
-                    {
+                    if match_len > HC_OPT_NUM || $abs_pos + match_len >= $current_abs_end {
                         break;
                     }
                 }
             }
-            $self.table.skip_insert_until_abs = $self
-                .table
-                .skip_insert_until_abs
-                .max(match_end_abs.saturating_sub(8));
+            // `match_end_abs` initialized to `abs_pos + 9`; monotonic
+            // updates only ever extend it, so `match_end_abs - 8 >= 1`.
+            $self.table.skip_insert_until_abs =
+                $self.table.skip_insert_until_abs.max(match_end_abs - 8);
         }
         if let Some(ldm) = ldm_candidate {
             let _ = super::bt::BtMatcher::push_candidate_ladder(
@@ -2261,7 +2294,11 @@ macro_rules! bt_insert_and_collect_matches_body {
         if idx + 8 > concat.len() {
             return;
         }
-        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
+        debug_assert!(
+            $abs_pos <= $current_abs_end,
+            "BT collect called past current block end"
+        );
+        let tail_limit = $current_abs_end - $abs_pos;
         let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
@@ -2273,9 +2310,11 @@ macro_rules! bt_insert_and_collect_matches_body {
         };
         let stored = relative_pos + 1;
         let bt_mask = $table.bt_mask();
+        // See `bt_insert_step_no_rebase_body!`: saturating is needed for the
+        // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($abs_pos);
-        let mut match_end_abs = $abs_pos.saturating_add(9);
+        let mut match_end_abs = $abs_pos + 9;
         let mut compares_left = $profile.max_chain_depth.min($search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
@@ -2286,7 +2325,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         $table.hash_table[hash] = stored;
         // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
-        let mut best_len = (*$best_len_for_skip).max($min_match_len.saturating_sub(1));
+        // `min_match_len >= HC_FORMAT_MINMATCH (4)` by configure invariant,
+        // so `min_match_len - 1 >= 3` cannot underflow.
+        debug_assert!($min_match_len >= 1, "min_match_len must be at least 1");
+        let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
         while compares_left > 0 {
             let Some(candidate_abs) =
@@ -2326,7 +2368,11 @@ macro_rules! bt_insert_and_collect_matches_body {
                 );
                 if accepted {
                     best_len = match_len;
-                    let candidate_end = candidate_abs.saturating_add(match_len);
+                    // `match_len <= tail_limit` and `candidate_abs < abs_pos
+                    // <= current_abs_end`, so `candidate_abs + match_len` is
+                    // bounded by `current_abs_end + tail_limit < 2 *
+                    // current_abs_end` — far below usize::MAX.
+                    let candidate_end = candidate_abs + match_len;
                     if candidate_end > match_end_abs {
                         match_end_abs = candidate_end;
                     }
@@ -2371,7 +2417,9 @@ macro_rules! bt_insert_and_collect_matches_body {
         if larger_slot != usize::MAX {
             $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
         }
-        $table.skip_insert_until_abs = match_end_abs.saturating_sub(8);
+        // `match_end_abs >= abs_pos + 9 >= 9` (initialized and monotonic),
+        // so `match_end_abs - 8 >= 1` cannot underflow.
+        $table.skip_insert_until_abs = match_end_abs - 8;
     }};
 }
 pub(crate) use bt_insert_and_collect_matches_body;
