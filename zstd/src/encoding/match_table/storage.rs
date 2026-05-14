@@ -1561,4 +1561,110 @@ mod storage_tests {
              btultra2 short-match selection depends on it"
         );
     }
+
+    #[test]
+    fn insert_positions_with_step_zero_step_is_noop() {
+        let mut t = new_table(32);
+        t.history = vec![0u8; 32];
+        t.window.push_back(vec![0u8; 32]);
+        t.ensure_tables();
+        let next_to_update3_before = t.next_to_update3;
+        // step=0 must early-return without touching anything.
+        t.insert_positions_with_step(0, 16, 0);
+        assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
+        assert_eq!(t.next_to_update3, next_to_update3_before);
+    }
+
+    #[test]
+    fn insert_positions_with_step_saturating_step_breaks_loop() {
+        // step = usize::MAX so first iteration overflows
+        // `pos.saturating_add(step)` to usize::MAX, then the `next <= pos`
+        // guard breaks out of the loop after one insert.
+        let mut t = new_table(32);
+        t.history = vec![1u8; 32];
+        t.window.push_back(vec![1u8; 32]);
+        t.ensure_tables();
+        t.insert_positions_with_step(0, 16, usize::MAX);
+        // Exactly one position should have been inserted before the
+        // loop terminated — observe that only one slot is non-empty.
+        let non_empty = t.hash_table.iter().filter(|&&v| v != HC_EMPTY).count();
+        assert!(
+            non_empty <= 1,
+            "step=usize::MAX must break after the first insert"
+        );
+    }
+
+    #[test]
+    fn apply_limited_update_after_long_match_hc_mode_is_noop() {
+        // HC mode (`uses_bt = false`) — function must early-return
+        // without mutating `skip_insert_until_abs`.
+        let mut t = new_table(32);
+        t.uses_bt = false;
+        t.skip_insert_until_abs = 100;
+        t.apply_limited_update_after_long_match(1000);
+        assert_eq!(
+            t.skip_insert_until_abs, 100,
+            "HC mode must not adjust skip cursor"
+        );
+    }
+
+    #[test]
+    fn apply_limited_update_after_long_match_bt_mode_caps_gap_at_384() {
+        // BT mode with gap > 384 → cap the skip cursor so future
+        // `bt_update_tree_until` doesn't walk an unbounded prefix.
+        let mut t = new_table(32);
+        t.uses_bt = true;
+        t.skip_insert_until_abs = 0;
+        // current_abs_start = 1000 → gap = 1000 → cap subtracts
+        // (gap - 384).min(192) = 192, so result is 1000 - 192 = 808.
+        t.apply_limited_update_after_long_match(1000);
+        assert_eq!(t.skip_insert_until_abs, 808);
+    }
+
+    #[test]
+    fn apply_limited_update_after_long_match_small_gap_is_noop() {
+        let mut t = new_table(32);
+        t.uses_bt = true;
+        t.skip_insert_until_abs = 800;
+        // gap = 200 < 384 → no change.
+        t.apply_limited_update_after_long_match(1000);
+        assert_eq!(t.skip_insert_until_abs, 800);
+    }
+
+    #[test]
+    fn emit_optimal_plan_empty_plan_emits_full_literals() {
+        let mut t = new_table(8);
+        t.window.push_back(b"abcdefgh".to_vec());
+        let mut emitted: Vec<u8> = Vec::new();
+        t.emit_optimal_plan(8, &[], &mut |seq| {
+            if let Sequence::Literals { literals } = seq {
+                emitted.extend_from_slice(literals);
+            }
+        });
+        assert_eq!(emitted, b"abcdefgh");
+    }
+
+    #[test]
+    fn emit_optimal_plan_skips_oversized_plan_item_and_emits_trailing_literals() {
+        let mut t = new_table(8);
+        t.window.push_back(b"abcdefgh".to_vec());
+        // Plan item asks for `start + match_len > current_len` → skip.
+        // The function must still emit the trailing literals at the end.
+        let plan = [HcOptimalSequence {
+            offset: 1,
+            lit_len: 4,
+            match_len: 99, // overflows the 8-byte window → continue
+        }];
+        let mut triples = 0usize;
+        let mut trailing: Vec<u8> = Vec::new();
+        t.emit_optimal_plan(8, &plan, &mut |seq| match seq {
+            Sequence::Triple { .. } => triples += 1,
+            Sequence::Literals { literals } => trailing.extend_from_slice(literals),
+        });
+        assert_eq!(triples, 0, "oversized plan item must be skipped");
+        assert_eq!(
+            trailing, b"abcdefgh",
+            "trailing-literals path must emit the full window when plan skipped everything"
+        );
+    }
 }
