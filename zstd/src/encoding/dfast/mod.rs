@@ -222,11 +222,11 @@ impl DfastMatchGenerator {
                 );
                 pos = start + candidate.match_len;
                 skip_step = 1;
-                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
             } else {
                 self.insert_position(abs_pos);
-                miss_run = miss_run.saturating_add(1);
+                miss_run += 1;
                 let use_local_adaptive_skip = miss_run >= DFAST_LOCAL_SKIP_TRIGGER;
                 if use_adaptive_skip || use_local_adaptive_skip {
                     let skip_cap = if use_adaptive_skip {
@@ -236,10 +236,9 @@ impl DfastMatchGenerator {
                     };
                     if pos >= next_skip_growth_pos {
                         skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos =
-                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     }
-                    pos = pos.saturating_add(skip_step);
+                    pos += skip_step;
                 } else {
                     pos += 1;
                 }
@@ -265,9 +264,9 @@ impl DfastMatchGenerator {
         let mut miss_run = 0usize;
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
-            let ip1 = ip0.saturating_add(1);
-            let ip2 = ip0.saturating_add(2);
-            let ip3 = ip0.saturating_add(3);
+            let ip1 = ip0 + 1;
+            let ip2 = ip0 + 2;
+            let ip3 = ip0 + 3;
 
             let abs_ip0 = current_abs_start + ip0;
             let lit_len_ip0 = ip0 - literals_start;
@@ -287,7 +286,7 @@ impl DfastMatchGenerator {
                     );
                     pos = start + rep.match_len;
                     skip_step = 1;
-                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     miss_run = 0;
                     continue;
                 }
@@ -303,7 +302,7 @@ impl DfastMatchGenerator {
                 );
                 pos = start + candidate.match_len;
                 skip_step = 1;
-                next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
             } else {
                 self.insert_position(abs_ip0);
@@ -316,18 +315,17 @@ impl DfastMatchGenerator {
                 if ip3 + 4 <= current_len {
                     self.insert_position(current_abs_start + ip3);
                 }
-                miss_run = miss_run.saturating_add(1);
+                miss_run += 1;
                 if block_is_strict_incompressible || miss_run >= DFAST_LOCAL_SKIP_TRIGGER {
                     let skip_cap = DFAST_MAX_SKIP_STEP;
                     if pos >= next_skip_growth_pos {
                         skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos =
-                            next_skip_growth_pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     }
-                    pos = pos.saturating_add(skip_step);
+                    pos += skip_step;
                 } else {
                     skip_step = 1;
-                    next_skip_growth_pos = pos.saturating_add(DFAST_SKIP_STEP_GROWTH_INTERVAL);
+                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     pos += 1;
                 }
             }
