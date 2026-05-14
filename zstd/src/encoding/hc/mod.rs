@@ -228,11 +228,41 @@ impl HcMatcher {
         }
 
         let mut best: Option<MatchCandidate> = None;
+        // Donor speculative tail check (`zstd_lazy.c:714`,
+        // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
+        // expensive `common_prefix_len` walk on a 4-byte tail compare
+        // proving the candidate can reach `best_ml + 1`. See the
+        // monotonic-offset argument inside the loop for correctness.
+        let history_tail = concat.len();
         for candidate_abs in self.chain_candidates(table, abs_pos) {
             if candidate_abs == usize::MAX {
                 break;
             }
             let candidate_idx = candidate_abs - table.history_abs_start;
+            if let Some(best_ml) = best.map(|b| b.match_len)
+                && best_ml >= 4
+            {
+                let tail_off = best_ml - 3;
+                let m_end = candidate_idx + tail_off + 4;
+                let i_end = current_idx + tail_off + 4;
+                // Chain walk is LIFO (newest first → strictly
+                // increasing offset). Once `best` is set, every
+                // subsequent candidate has `new.offset_bits >=
+                // best.offset_bits`, so `better_candidate` (gain =
+                // `len*4 - offset_bits`) can only return a new
+                // winner when `new.match_len > best_ml`. The 4-byte
+                // tail compare proves that pre-condition without
+                // running `common_prefix_len`. If either side runs
+                // out of room before `best_ml + 1`, the candidate
+                // cannot exceed `best_ml` either — same skip.
+                if i_end > history_tail || m_end > history_tail {
+                    continue;
+                }
+                if concat[candidate_idx + tail_off..m_end] != concat[current_idx + tail_off..i_end]
+                {
+                    continue;
+                }
+            }
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate =
