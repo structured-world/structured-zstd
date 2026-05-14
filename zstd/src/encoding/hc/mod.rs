@@ -558,3 +558,90 @@ impl HcMatcher {
             .clamp(HC_FORMAT_MINMATCH, HC_OPT_NUM - 1)
     }
 }
+
+#[cfg(test)]
+mod hc_tests {
+    //! Unit coverage for `HcMatcher` paths the encode-level suite
+    //! doesn't naturally hit: short-suffix early returns on probe
+    //! helpers, chain-walk self-loop branch, and the lazy-pick
+    //! "next match is better" decline paths.
+    use super::*;
+    use crate::encoding::match_table::storage::MatchTable;
+
+    fn table_with_history(buf: &[u8]) -> MatchTable {
+        let mut t = MatchTable::new(buf.len().max(8));
+        t.history = buf.to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = buf.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(buf.to_vec());
+        t
+    }
+
+    #[test]
+    fn chain_candidates_returns_sentinels_when_suffix_too_short() {
+        let hc = HcMatcher::new(2, 4, 32);
+        // History exactly at min-prefix - 1 → idx + 4 > concat.len() →
+        // early return with all-sentinel buffer.
+        let t = table_with_history(b"abc");
+        let buf = hc.chain_candidates(&t, 0);
+        assert!(buf.iter().all(|&v| v == usize::MAX));
+    }
+
+    #[test]
+    fn chain_candidates_terminates_on_self_loop_with_in_range_pick() {
+        // Construct a self-loop in the chain: hash_table → cur,
+        // chain_table[cur_rel] = cur (points back to itself). The walker
+        // must pick the position (in-range) and stop.
+        let mut hc = HcMatcher::new(2, 4, 32);
+        hc.search_depth = 4;
+        let mut t = table_with_history(b"abcdef_abcdef_abcdef");
+        let abs_pos = 10usize;
+        // The walker hashes the suffix at `abs_pos`, not the prefix at 0.
+        let concat = t.live_history();
+        let hash = t.hash_position(&concat[abs_pos..]);
+        // Stored = relative + 1 → stored=6 means candidate_rel=5.
+        t.hash_table[hash] = 6;
+        let chain_mask = (1 << t.chain_log) - 1;
+        t.chain_table[5 & chain_mask] = 6; // self-loop
+
+        let buf = hc.chain_candidates(&t, abs_pos);
+        assert_eq!(
+            buf[0], 5,
+            "self-loop pick must surface the in-range candidate"
+        );
+        assert_eq!(buf[1], usize::MAX, "walker must stop after self-loop");
+    }
+
+    #[test]
+    fn repcode_candidate_returns_none_when_suffix_too_short() {
+        let mut t = table_with_history(b"abc");
+        t.offset_hist = [1, 2, 3];
+        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early None.
+        assert!(HcMatcher::repcode_candidate(&t, 0, 1).is_none());
+    }
+
+    #[test]
+    fn repcode_candidate_skips_rep_at_history_boundary() {
+        // rep=5 but abs_pos=4, so candidate_pos would underflow into
+        // pre-history bytes; the `rep > abs_pos` guard must skip it.
+        let mut t = table_with_history(b"abcdefgh");
+        t.offset_hist = [5, 6, 7];
+        // No match possible at abs_pos=4 because every rep aims past
+        // history start.
+        let result = HcMatcher::repcode_candidate(&t, 4, 1);
+        assert!(result.is_none(), "no rep can land in-range");
+    }
+
+    #[test]
+    fn find_best_match_returns_none_for_short_suffix() {
+        let hc = HcMatcher::new(2, 4, 32);
+        let t = table_with_history(b"abc");
+        assert!(hc.find_best_match(&t, 0, 1).is_none());
+    }
+}

@@ -1363,8 +1363,17 @@ impl MatchTable {
         for item in plan {
             let lit_len = item.lit_len as usize;
             let match_len = item.match_len as usize;
-            let start = literals_start.saturating_add(lit_len);
-            if start + match_len > current_len {
+            // checked_add on both edges — mirrors
+            // `BtMatcher::update_plan_stats_segment`. A malformed plan
+            // entry can't overflow `usize` arithmetic before the
+            // `> current_len` guard fires.
+            let Some(start) = literals_start.checked_add(lit_len) else {
+                continue;
+            };
+            let Some(end) = start.checked_add(match_len) else {
+                continue;
+            };
+            if end > current_len {
                 continue;
             }
             let literals = &current[literals_start..start];
@@ -1374,7 +1383,7 @@ impl MatchTable {
                 match_len,
             });
             encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
-            literals_start = start + match_len;
+            literals_start = end;
         }
 
         if literals_start < current_len {

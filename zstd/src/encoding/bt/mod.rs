@@ -753,6 +753,84 @@ mod ldm_helper_tests {
     }
 
     #[test]
+    fn push_candidate_ladder_rejects_below_min_match() {
+        let mut out: Vec<MatchCandidate> = vec![];
+        let mut best = 0usize;
+        let accepted = BtMatcher::push_candidate_ladder(
+            &mut out,
+            &mut best,
+            MatchCandidate {
+                start: 10,
+                offset: 5,
+                match_len: 2,
+            },
+            4,
+        );
+        assert!(!accepted);
+        assert!(out.is_empty());
+        assert_eq!(best, 0);
+    }
+
+    #[test]
+    fn push_candidate_ladder_rejects_when_not_strictly_better() {
+        let mut out: Vec<MatchCandidate> = vec![];
+        let mut best = 8usize;
+        let accepted = BtMatcher::push_candidate_ladder(
+            &mut out,
+            &mut best,
+            MatchCandidate {
+                start: 10,
+                offset: 5,
+                match_len: 8,
+            },
+            4,
+        );
+        // match_len == best_len_for_skip → not strictly greater → rejected
+        assert!(!accepted);
+        assert!(out.is_empty());
+        assert_eq!(best, 8);
+    }
+
+    #[test]
+    fn ldm_get_next_match_clamps_window_to_block_end() {
+        // Seq match window extends past the block boundary — the
+        // function clamps `end_pos_in_block` to `curr_block_end_pos`
+        // and skips through the seq store accordingly.
+        let bt = bt_with_seqs(vec![raw(0, 100, 99)]);
+        let mut opt_ldm = HcOptLdmState::default();
+        opt_ldm.seq_store.size = 1;
+        bt.ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 10, 30);
+        // Window would naturally be [10, 110); clamped to [10, 40)
+        // because remaining block bytes only allow that span.
+        assert_eq!(opt_ldm.start_pos_in_block, 10);
+        assert_eq!(opt_ldm.end_pos_in_block, 40);
+        assert_eq!(opt_ldm.offset, 99);
+    }
+
+    #[test]
+    fn ldm_process_match_candidate_handles_overshoot_into_next_seq() {
+        // Parser jumped past the active LDM window — `pos_overshoot`
+        // forces the seq-store cursor forward before re-seeding.
+        let bt = bt_with_seqs(vec![raw(0, 5, 17), raw(0, 5, 33)]);
+        let mut opt_ldm = HcOptLdmState {
+            seq_store: HcRawSeqStore {
+                pos: 1,
+                pos_in_sequence: 0,
+                size: 2,
+            },
+            start_pos_in_block: 0,
+            end_pos_in_block: 5,
+            offset: 17,
+        };
+        // curr_pos = 12 (overshot the previous window's end by 7) → must
+        // consume the overshoot from the next seq, then re-seed.
+        let _ = bt.ldm_process_match_candidate(&mut opt_ldm, 12, 100, 4);
+        // After overshoot consumes 7 bytes from seq 1 (which only had
+        // 5), cursor advances to pos=2 (store exhausted).
+        assert_eq!(opt_ldm.seq_store.pos, 2);
+    }
+
+    #[test]
     fn ldm_process_match_candidate_reseeds_after_overshoot() {
         // Two sequences. Seq 0 was just emitted (cursor advanced past it),
         // so the active window points at seq 1's offset (33). The parser
