@@ -435,8 +435,21 @@ impl HcOptimalCostProfile {
     /// the optimiser materialises the literal at codegen time
     /// (no runtime branch). Every production call site goes through
     /// this entry — there is no runtime peer.
+    ///
+    /// The `debug_assert!(S::USE_BT, …)` enforces that
+    /// `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are only consulted
+    /// for BT-walking strategies, since non-BT strategies
+    /// (`Fast` / `Dfast` / `Greedy` / `Lazy`) carry placeholder
+    /// values for those consts — see the `MAX_CHAIN_DEPTH` doc
+    /// comment on each of those strategy types.
     #[inline]
     pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
+        debug_assert!(
+            S::USE_BT,
+            "HcOptimalCostProfile::const_for_strategy::<S>() called with a \
+             non-BT strategy (S::USE_BT == false). The optimal-parser cost \
+             profile is only meaningful when the BT walker is active.",
+        );
         Self {
             max_chain_depth: S::MAX_CHAIN_DEPTH,
             sufficient_match_len: S::SUFFICIENT_MATCH_LEN,

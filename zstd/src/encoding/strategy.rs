@@ -109,8 +109,17 @@ impl Strategy for Fast {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Optimal-parser consts are unreachable for non-BT strategies —
-    // pin them to the Lazy2 row so the trait stays total.
+    // `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are placeholder
+    // values for non-BT strategies — the trait associated consts
+    // must be total, but only the optimal parser reads them and
+    // it runs exclusively under `S::USE_BT == true`. The
+    // `debug_assert!(<S>::USE_BT, …)` guard in
+    // `HcOptimalCostProfile::const_for_strategy` plus the
+    // `debug_assert!(<S>::USE_BT, …)` at the top of
+    // `build_optimal_plan_impl_body!` make this unreachable in
+    // debug builds. Future refactors that introduce a non-BT
+    // reader must add a fresh guard or replace these placeholders
+    // with real Fast values.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -127,6 +136,8 @@ impl Strategy for Dfast {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
+    // Placeholder optimal-parser consts; see `Fast` for the
+    // unreachable-by-design contract.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -143,6 +154,8 @@ impl Strategy for Greedy {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
+    // Placeholder optimal-parser consts; see `Fast` for the
+    // unreachable-by-design contract.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -162,6 +175,12 @@ impl Strategy for Lazy {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
+    // Lazy is HashChain-backed but `USE_BT == false`, so the optimal
+    // parser entry point is unreachable for this strategy. These
+    // values mirror the donor `lazy2` cost profile (would be the
+    // right defaults if a future caller did build a profile for the
+    // lazy/hc path), but with no current reader the same
+    // unreachable-by-design contract from `Fast` applies.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
@@ -271,8 +290,15 @@ impl StrategyTag {
                 if n <= 0 {
                     if n == 0 { Self::Dfast } else { Self::Fast }
                 } else {
-                    let clamped = (n as u8).min(CompressionLevel::MAX_LEVEL as u8);
-                    Self::for_level(clamped)
+                    // Clamp in `i32` BEFORE casting to `u8`: a bare
+                    // `n as u8` truncates values ≥ 256 (e.g.
+                    // `Level(256)` wraps to `0`, `Level(257)` to
+                    // `1`) and silently routes them to the wrong
+                    // strategy. `MAX_LEVEL` (22) fits a u8 by
+                    // definition, so the cast after the i32 clamp
+                    // is lossless.
+                    let clamped_i32 = n.clamp(1, CompressionLevel::MAX_LEVEL);
+                    Self::for_level(clamped_i32 as u8)
                 }
             }
         }
@@ -306,6 +332,35 @@ mod tests {
         assert_strategy_matches_tag::<BtOpt>(StrategyTag::BtOpt);
         assert_strategy_matches_tag::<BtUltra>(StrategyTag::BtUltra);
         assert_strategy_matches_tag::<BtUltra2>(StrategyTag::BtUltra2);
+    }
+
+    #[test]
+    fn for_compression_level_clamps_oversized_numeric_levels_to_btultra2() {
+        // Regression: pre-fix `Level(256)` cast `n as u8` first,
+        // wrapping to `0` and routing to `Dfast`. After clamp-then-
+        // cast every level above MAX_LEVEL (22) must land on
+        // BtUltra2 (the saturating top of the band).
+        use crate::encoding::CompressionLevel;
+        assert_eq!(
+            StrategyTag::for_compression_level(CompressionLevel::Level(23)),
+            StrategyTag::BtUltra2,
+        );
+        assert_eq!(
+            StrategyTag::for_compression_level(CompressionLevel::Level(255)),
+            StrategyTag::BtUltra2,
+        );
+        assert_eq!(
+            StrategyTag::for_compression_level(CompressionLevel::Level(256)),
+            StrategyTag::BtUltra2,
+        );
+        assert_eq!(
+            StrategyTag::for_compression_level(CompressionLevel::Level(257)),
+            StrategyTag::BtUltra2,
+        );
+        assert_eq!(
+            StrategyTag::for_compression_level(CompressionLevel::Level(i32::MAX)),
+            StrategyTag::BtUltra2,
+        );
     }
 
     #[test]

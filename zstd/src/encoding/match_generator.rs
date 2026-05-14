@@ -1087,6 +1087,18 @@ struct HcMatchGenerator {
     /// optimal-parser scratch buffers. [`HcBackend::Bt`] holds the
     /// `BtMatcher` when an optimal mode is configured.
     backend: HcBackend,
+    /// Compile-time strategy tag mirrored from
+    /// [`MatchGeneratorDriver::strategy_tag`] during `configure()`.
+    /// The driver hot path never reads this — it dispatches to
+    /// `compress_block::<S>` from its own tag — but the
+    /// `#[cfg(test)] start_matching` helper consumes it so artificial
+    /// test setups still pick the correct concrete `S` for the
+    /// const-generic optimal parser (BtOpt vs BtUltra vs BtUltra2).
+    /// Without this field the test path would have to collapse
+    /// `BtOpt` and `BtUltra` onto the same monomorphisation since
+    /// `table.uses_bt` / `table.is_btultra2` alone can't tell them
+    /// apart.
+    strategy_tag: super::strategy::StrategyTag,
 }
 
 // Plain-data types relocated to [`crate::encoding::opt::types`] and
@@ -2595,11 +2607,22 @@ impl HcMatchGenerator {
             // Default to the zero-sized HC backend; `configure()` swaps
             // in a `BtMatcher` only when an optimal strategy lands.
             backend: HcBackend::Hc,
+            // Lazy is the per-construct default — every production
+            // caller calls `configure()` before the first encode and
+            // overwrites this. Tests that drive `HcMatchGenerator`
+            // without calling `configure()` end up in the
+            // `start_matching_lazy` arm of the test dispatcher, which
+            // matches the previous default behaviour.
+            strategy_tag: super::strategy::StrategyTag::Lazy,
         }
     }
 
     fn configure(&mut self, config: HcConfig, tag: super::strategy::StrategyTag, window_log: u8) {
         use super::strategy::StrategyTag;
+        // Mirror the driver-resolved strategy tag so the
+        // `#[cfg(test)] start_matching` dispatcher can route
+        // BtOpt / BtUltra / BtUltra2 to distinct monomorphisations.
+        self.strategy_tag = tag;
         let is_btultra2 = tag == StrategyTag::BtUltra2;
         let uses_bt = matches!(
             tag,
@@ -2680,24 +2703,24 @@ impl HcMatchGenerator {
     /// monomorphisation time.
     #[cfg(test)]
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        use super::strategy;
-        // Tests don't carry a strategy tag — pick one from runtime
-        // table flags (the same fields production sets via configure)
-        // so the const-generic dispatch still routes correctly.
-        match (
-            self.table.uses_bt,
-            self.table.is_btultra2,
-            self.table.hash3_log != 0,
-        ) {
-            (false, _, _) => self.start_matching_lazy(&mut handle_sequence),
-            (true, true, _) => {
-                self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
+        use super::strategy::{self, StrategyTag};
+        // Dispatch on the mirrored `strategy_tag` so each test runs
+        // under the same monomorphisation production would pick.
+        // `BtOpt` / `BtUltra` / `BtUltra2` remain distinct here even
+        // though `table.uses_bt` / `is_btultra2` alone can't separate
+        // BtOpt from BtUltra.
+        match self.strategy_tag {
+            StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
+                self.start_matching_lazy(&mut handle_sequence)
             }
-            (true, false, _) => {
-                // BtOpt vs BtUltra is distinguished by the accurate
-                // flag — read from MatchTable so artificial test
-                // setups can route either way.
+            StrategyTag::BtOpt => {
                 self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
+            }
+            StrategyTag::BtUltra => {
+                self.start_matching_optimal::<strategy::BtUltra>(&mut handle_sequence)
+            }
+            StrategyTag::BtUltra2 => {
+                self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
             }
         }
     }
@@ -3216,17 +3239,18 @@ impl HcMatchGenerator {
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
-        use super::strategy;
+        use super::strategy::{self, StrategyTag};
         self.table.ensure_tables();
-        // Test-only dispatcher. Pick a strategy whose compile-time
-        // flags agree with the runtime fields the test actually wired
-        // up. Production callers go through
-        // `MatchGeneratorDriver::compress_block::<S>` where S is
-        // fixed by the compression level.
-        let uses_bt = self.table.uses_bt;
+        // Dispatch on the mirrored `strategy_tag` (set by
+        // `configure()`); each BT-using strategy reaches its own
+        // monomorphisation. Tests that wire up `table.hash3_log`
+        // without calling `configure()` keep the legacy fallback —
+        // if `hash3_log != 0` while the tag is non-BT-ultra2, route
+        // through `BtUltra2` so the hash3 const-gate inside the
+        // body still fires.
         let has_hash3 = self.table.hash3_log != 0;
-        match (uses_bt, has_hash3) {
-            (true, true) => self
+        match self.strategy_tag {
+            StrategyTag::BtUltra2 => self
                 .collect_optimal_candidates_initialized::<strategy::BtUltra2, true>(
                     abs_pos,
                     current_abs_end,
@@ -3234,32 +3258,46 @@ impl HcMatchGenerator {
                     query,
                     out,
                 ),
-            (true, false) => self.collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
-                abs_pos,
-                current_abs_end,
-                profile,
-                query,
-                out,
-            ),
-            (false, true) => self
-                // BT-off + hash3-on never appears in production. Tests
-                // that hit this arm exercise the donor-parity hash3
-                // fallback when chain depth is zero — route through
-                // BtUltra2 so the hash3 const-gate fires.
-                .collect_optimal_candidates_initialized::<strategy::BtUltra2, false>(
+            StrategyTag::BtUltra => self
+                .collect_optimal_candidates_initialized::<strategy::BtUltra, true>(
                     abs_pos,
                     current_abs_end,
                     profile,
                     query,
                     out,
                 ),
-            (false, false) => self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
-                abs_pos,
-                current_abs_end,
-                profile,
-                query,
-                out,
-            ),
+            StrategyTag::BtOpt => self
+                .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
+            StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy
+                if has_hash3 =>
+            {
+                // Legacy artificial-fixture path: tests that wired
+                // up `table.hash3_log` directly (without
+                // `configure()`) rely on the hash3 lookup running
+                // even when no BT strategy is configured.
+                self.collect_optimal_candidates_initialized::<strategy::BtUltra2, false>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                )
+            }
+            StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
+                self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                )
+            }
         }
     }
 
@@ -4680,6 +4718,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     };
     let mut out = Vec::new();
 
+    hc.strategy_tag = super::strategy::StrategyTag::BtUltra2;
     hc.table.is_btultra2 = true;
     hc.table.uses_bt = true;
     hc.table.search_depth = hc.hc.search_depth;
@@ -4701,6 +4740,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         "btultra2 should retain dictionary candidates on donor-parity path"
     );
 
+    hc.strategy_tag = super::strategy::StrategyTag::BtUltra;
     hc.table.is_btultra2 = false;
     hc.table.uses_bt = true;
     hc.table.skip_insert_until_abs = 0;

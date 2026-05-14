@@ -1,6 +1,8 @@
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 
+mod common;
+
 #[test]
 #[ignore = "manual perf probe — run with --ignored"]
 fn high_entropy_level22_ratio_and_speed() {
@@ -43,71 +45,9 @@ fn high_entropy_level22_ratio_and_speed() {
         our_avg.as_secs_f64() / c_avg.as_secs_f64()
     );
 
-    // Block-type breakdown — frame header at the start, then series of
-    // 3-byte block headers each carrying (last_block, block_type, size).
-    fn dump_block_types(label: &str, frame: &[u8]) {
-        // Frame magic: 4 bytes 0x28 0xB5 0x2F 0xFD. Frame header
-        // descriptor is the next byte; full parsing is non-trivial,
-        // so just scan known offsets by reading the descriptor and
-        // skipping accordingly.
-        if frame.len() < 6 || &frame[..4] != b"\x28\xb5\x2f\xfd" {
-            println!("  {label}: not a zstd frame");
-            return;
-        }
-        let fhd = frame[4];
-        let single_segment = (fhd & 0x20) != 0;
-        let fcs_flag = fhd >> 6;
-        let dict_id_flag = fhd & 0x03;
-        let dict_id_len = match dict_id_flag {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            _ => 4,
-        };
-        let window_descriptor_len = if single_segment { 0 } else { 1 };
-        let fcs_len = match fcs_flag {
-            0 => {
-                if single_segment {
-                    1
-                } else {
-                    0
-                }
-            }
-            1 => 2,
-            2 => 4,
-            _ => 8,
-        };
-        let mut off = 5 + window_descriptor_len + dict_id_len + fcs_len;
-        let mut raw = 0usize;
-        let mut rle = 0usize;
-        let mut compressed = 0usize;
-        let mut total_size = 0usize;
-        for _ in 0..64 {
-            if off + 3 > frame.len() {
-                break;
-            }
-            let h = u32::from_le_bytes([frame[off], frame[off + 1], frame[off + 2], 0]);
-            let last = h & 1;
-            let block_type = (h >> 1) & 3;
-            let block_size = (h >> 3) as usize;
-            match block_type {
-                0 => raw += 1,
-                1 => rle += 1,
-                2 => compressed += 1,
-                _ => {}
-            }
-            total_size += block_size;
-            off += 3 + if block_type == 1 { 1 } else { block_size };
-            if last == 1 {
-                break;
-            }
-        }
-        println!(
-            "  {label}: raw={raw}, rle={rle}, compressed={compressed}, total_block_bytes={total_size}"
-        );
-    }
-    dump_block_types("Rust", &compressed);
-    dump_block_types("C   ", &c_compressed);
+    // Block-type breakdown — shared parser in `tests/common`.
+    common::dump_block_breakdown("Rust", &compressed);
+    common::dump_block_breakdown("C   ", &c_compressed);
 
     // Hypothesis: our raw-fast-path is gated on
     // `compression_level_allows_raw_fast_path(level, window_size)`
