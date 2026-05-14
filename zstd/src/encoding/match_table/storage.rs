@@ -450,7 +450,10 @@ impl MatchTable {
     /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
-        2 * (abs_pos.saturating_add(self.index_shift) & self.bt_mask())
+        // `index_shift` is always 0 today (reserved for future rebase
+        // variants); raw `+` is safe — `abs_pos + index_shift` fits in
+        // usize across all encode block sizes.
+        2 * ((abs_pos + self.index_shift) & self.bt_mask())
     }
 
     /// Decode a stored hash / chain table entry back into its absolute
@@ -855,7 +858,7 @@ impl MatchTable {
         let mut pos = history_start;
         while pos < abs_pos {
             let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
-            pos = pos.saturating_add(forward.max(1));
+            pos += forward.max(1);
         }
     }
 
@@ -918,7 +921,7 @@ impl MatchTable {
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward =
                 unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -946,7 +949,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
             };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -974,7 +977,7 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
             };
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -993,7 +996,7 @@ impl MatchTable {
             }
             let forward =
                 self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            update_abs = update_abs.saturating_add(forward.max(1));
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1015,7 +1018,9 @@ impl MatchTable {
                 self.maybe_rebase_positions(self.next_to_update3);
             }
             self.insert_hash3_only_no_rebase(self.next_to_update3);
-            self.next_to_update3 = self.next_to_update3.saturating_add(1);
+            // hash3 cursor strictly less than `abs_pos` here (loop guard);
+            // `+ 1` cannot overflow within encode block sizes.
+            self.next_to_update3 += 1;
         }
     }
 

@@ -334,7 +334,7 @@ impl BtMatcher {
             } else if actual_offset == reps[2] {
                 3
             } else {
-                actual_offset.saturating_add(3)
+                actual_offset + 3
             }
         } else if actual_offset == reps[1] {
             1
@@ -343,7 +343,7 @@ impl BtMatcher {
         } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
             3
         } else {
-            actual_offset.saturating_add(3)
+            actual_offset + 3
         };
 
         if lit_len > 0 {
@@ -393,7 +393,7 @@ impl BtMatcher {
             } else if actual_offset == reps[2] {
                 3
             } else {
-                actual_offset.saturating_add(3)
+                actual_offset + 3
             }
         } else if actual_offset == reps[1] {
             1
@@ -402,7 +402,7 @@ impl BtMatcher {
         } else if reps[0] > 1 && actual_offset == reps[0] - 1 {
             3
         } else {
-            actual_offset.saturating_add(3)
+            actual_offset + 3
         }
     }
 
@@ -544,8 +544,11 @@ impl BtMatcher {
         stamp: u32,
     ) -> i32 {
         if lit_len == 0 {
-            return profile.lit_length_price(stats, lit_len) as i32
-                - profile.lit_length_price(stats, lit_len.saturating_sub(1)) as i32;
+            // The `lit_len == 0` branch is the rare case where computing
+            // `lit_len - 1` would underflow; we feed `0` to both
+            // `lit_length_price` calls so the delta is 0 by construction.
+            // No need to compute `0_usize - 1`.
+            return 0;
         }
         let price =
             Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);
