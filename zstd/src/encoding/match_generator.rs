@@ -1416,7 +1416,7 @@ macro_rules! build_optimal_plan_impl_body {
             // `$collect` kernel variant; the runtime kernel detector already
             // gated entry into the wrapper.
             unsafe {
-                $self.$collect::<true>(
+                $self.$collect::<$strategy_ty, true>(
                     $current_abs_start,
                     current_abs_end,
                     profile,
@@ -1696,7 +1696,7 @@ macro_rules! build_optimal_plan_impl_body {
             candidates.clear();
             // SAFETY: same umbrella as `$collect`.
             unsafe {
-                $self.$collect::<true>(
+                $self.$collect::<$strategy_ty, true>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2057,6 +2057,7 @@ macro_rules! build_optimal_plan_impl_body {
 macro_rules! collect_optimal_candidates_initialized_body {
     (
         $self:expr,
+        $strategy_ty:ty,
         $abs_pos:ident,
         $current_abs_end:ident,
         $profile:ident,
@@ -2069,8 +2070,21 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $hash3:ident,
         $cpl:path $(,)?
     ) => {{
+        // Per-strategy compile-time const: only BtUltra2 drives the
+        // hash3 short-match table. All other monomorphisations drop
+        // the entire hash3 lookup block at codegen time. The relaxed
+        // implication enforces only the direction we depend on:
+        // if the strategy declares hash3, the table must be live.
+        // The reverse (`hash3_log != 0` without `USE_HASH3`) is OK —
+        // a future caller may pre-allocate hash3 storage without
+        // wiring the BtUltra2 path through.
+        let use_hash3: bool = <$strategy_ty as super::strategy::Strategy>::USE_HASH3;
         debug_assert!(!$self.table.hash_table.is_empty());
         debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table.is_empty());
+        debug_assert!(
+            !use_hash3 || $self.table.hash3_log != 0,
+            "Strategy::USE_HASH3 = true but runtime hash3_log is 0 — call configure() first",
+        );
         debug_assert!(!$self.table.chain_table.is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let reps = $query.reps;
@@ -2144,7 +2158,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 },
             )
         };
-        if !skip_further_match_search && best_len_for_skip < min_match_len {
+        // Hash3 lookup runs only when the strategy enables it. The
+        // `use_hash3` binding above is a per-monomorphisation const,
+        // so non-BtUltra2 instances drop this entire block.
+        if use_hash3 && !skip_further_match_search && best_len_for_skip < min_match_len {
             $self.table.update_hash3_until($abs_pos);
             // SAFETY: same umbrella for hash3_candidate.
             if let Some(h3) = unsafe {
@@ -3187,23 +3204,50 @@ impl HcMatchGenerator {
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
+        use super::strategy;
         self.table.ensure_tables();
-        if self.table.uses_bt {
-            self.collect_optimal_candidates_initialized::<true>(
+        // Test-only dispatcher. Pick a strategy whose compile-time
+        // flags agree with the runtime fields the test actually wired
+        // up. Production callers go through
+        // `MatchGeneratorDriver::compress_block::<S>` where S is
+        // fixed by the compression level.
+        let uses_bt = self.table.uses_bt;
+        let has_hash3 = self.table.hash3_log != 0;
+        match (uses_bt, has_hash3) {
+            (true, true) => self
+                .collect_optimal_candidates_initialized::<strategy::BtUltra2, true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
+            (true, false) => self.collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
                 abs_pos,
                 current_abs_end,
                 profile,
                 query,
                 out,
-            );
-        } else {
-            self.collect_optimal_candidates_initialized::<false>(
+            ),
+            (false, true) => self
+                // BT-off + hash3-on never appears in production. Tests
+                // that hit this arm exercise the donor-parity hash3
+                // fallback when chain depth is zero — route through
+                // BtUltra2 so the hash3 const-gate fires.
+                .collect_optimal_candidates_initialized::<strategy::BtUltra2, false>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
+            (false, false) => self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
                 abs_pos,
                 current_abs_end,
                 profile,
                 query,
                 out,
-            );
+            ),
         }
     }
 
@@ -3218,7 +3262,10 @@ impl HcMatchGenerator {
     /// future caller that isn't already inside a kernel umbrella.
     #[allow(dead_code)]
     #[inline(always)]
-    fn collect_optimal_candidates_initialized<const USE_BT_MATCHFINDER: bool>(
+    fn collect_optimal_candidates_initialized<
+        S: super::strategy::Strategy,
+        const USE_BT_MATCHFINDER: bool,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -3228,7 +3275,7 @@ impl HcMatchGenerator {
     ) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_neon::<S, USE_BT_MATCHFINDER>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -3241,7 +3288,7 @@ impl HcMatchGenerator {
             use crate::encoding::fastpath::{FastpathKernel, select_kernel};
             match select_kernel() {
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.collect_optimal_candidates_initialized_avx2_bmi2::<USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, USE_BT_MATCHFINDER>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -3250,7 +3297,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Sse42 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse42::<USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_sse42::<S, USE_BT_MATCHFINDER>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -3259,7 +3306,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Scalar => self
-                    .collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+                    .collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -3274,7 +3321,7 @@ impl HcMatchGenerator {
             target_arch = "x86_64"
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -3291,7 +3338,10 @@ impl HcMatchGenerator {
     /// pipeline executes as a single straight-line inline sequence.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
-    unsafe fn collect_optimal_candidates_initialized_neon<const USE_BT_MATCHFINDER: bool>(
+    unsafe fn collect_optimal_candidates_initialized_neon<
+        S: super::strategy::Strategy,
+        const USE_BT_MATCHFINDER: bool,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -3301,6 +3351,7 @@ impl HcMatchGenerator {
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
+            S,
             abs_pos,
             current_abs_end,
             profile,
@@ -3317,7 +3368,10 @@ impl HcMatchGenerator {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
-    unsafe fn collect_optimal_candidates_initialized_sse42<const USE_BT_MATCHFINDER: bool>(
+    unsafe fn collect_optimal_candidates_initialized_sse42<
+        S: super::strategy::Strategy,
+        const USE_BT_MATCHFINDER: bool,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -3327,6 +3381,7 @@ impl HcMatchGenerator {
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
+            S,
             abs_pos,
             current_abs_end,
             profile,
@@ -3343,7 +3398,10 @@ impl HcMatchGenerator {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<const USE_BT_MATCHFINDER: bool>(
+    unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
+        S: super::strategy::Strategy,
+        const USE_BT_MATCHFINDER: bool,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -3353,6 +3411,7 @@ impl HcMatchGenerator {
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
+            S,
             abs_pos,
             current_abs_end,
             profile,
@@ -3371,7 +3430,10 @@ impl HcMatchGenerator {
     // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
     // callees are safe so the blocks are redundant here only.
     #[allow(unused_unsafe)]
-    fn collect_optimal_candidates_initialized_scalar<const USE_BT_MATCHFINDER: bool>(
+    fn collect_optimal_candidates_initialized_scalar<
+        S: super::strategy::Strategy,
+        const USE_BT_MATCHFINDER: bool,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -3381,6 +3443,7 @@ impl HcMatchGenerator {
     ) {
         collect_optimal_candidates_initialized_body!(
             self,
+            S,
             abs_pos,
             current_abs_end,
             profile,
