@@ -221,13 +221,14 @@ impl DfastMatchGenerator {
         //    retained window size. A long streaming encode on i686
         //    can therefore push `current_abs_start + pos` past
         //    `usize::MAX` even though memory usage stays bounded by
-        //    `window_size`. This loop assumes the caller respects the
-        //    documented `usize::MAX` total-input cap (enforced at
-        //    the frame compressor boundary); raw `+` here is
-        //    deliberate donor parity but DOES depend on that
-        //    upstream guard. New raw arithmetic on absolute cursors
-        //    should preserve that contract or switch to
-        //    `saturating_add` like the BT macros do.
+        //    `window_size`. The runtime enforcement lives in
+        //    `MatchTable::add_data` (see `STREAM_ABS_HEADROOM` =
+        //    `HC_OPT_NUM + 16`): every ingest fails fast with a
+        //    clear panic if cumulative input would push the cursor
+        //    within `STREAM_ABS_HEADROOM` of `usize::MAX`. Raw `+`
+        //    here is donor parity and is correct precisely because
+        //    that upstream gate runs before this loop sees any new
+        //    bytes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
@@ -296,11 +297,13 @@ impl DfastMatchGenerator {
         //    processed, NOT with the retained window size. A long
         //    streaming encode on i686 can push `current_abs_start +
         //    ipN` past `usize::MAX` even though memory stays bounded
-        //    by `window_size`. This loop assumes the caller respects
-        //    the documented `usize::MAX` total-input cap enforced at
-        //    the frame compressor boundary; new raw arithmetic on
-        //    absolute cursors should either preserve that contract
-        //    or switch to `saturating_add` like the BT macros do.
+        //    by `window_size`. The runtime enforcement lives in
+        //    `MatchTable::add_data` (`STREAM_ABS_HEADROOM` cap):
+        //    every ingest fails fast if cumulative input would
+        //    advance the cursor within `STREAM_ABS_HEADROOM` of
+        //    `usize::MAX`, which keeps the raw `current_abs_start +
+        //    ipN` arithmetic below `usize::MAX` for every position
+        //    this loop ever observes.
         while pos + DFAST_MIN_MATCH_LEN <= current_len {
             let ip0 = pos;
             let ip1 = ip0 + 1;
