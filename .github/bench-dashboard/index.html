@@ -311,6 +311,75 @@
         select.replaceChildren(fragment);
       }
 
+      // Match `level_<N>_<strategy>` (e.g. `level_-7_fast`, `level_3_dfast`,
+      // `level_22_btultra2`) — the canonical bench ID format set by
+      // `supported_levels()` in `zstd/benches/support/mod.rs`. Anything that
+      // doesn't match keeps its raw label and sorts to the bottom so legacy
+      // / ad-hoc bench names don't disappear from the dropdown.
+      const LEVEL_ID_PATTERN = /^level_(-?\d+)_([a-z][a-z0-9]*)$/i;
+
+      function parseLevelId(raw) {
+        const text = String(raw);
+        const match = text.match(LEVEL_ID_PATTERN);
+        if (!match) return null;
+        const numeric = Number.parseInt(match[1], 10);
+        if (!Number.isFinite(numeric)) return null;
+        const tag = match[2].toLowerCase();
+        // Fixed mapping so the dropdown label matches the
+        // `StrategyTag` enum spelling (`BtOpt`, `BtUltra`,
+        // `BtUltra2`) on the Rust side. Unknown / future tags fall
+        // back to a capitalised version of the raw suffix so a new
+        // strategy still gets a readable label without a dashboard
+        // patch.
+        const STRATEGY_LABELS = {
+          fast: "Fast",
+          dfast: "Dfast",
+          greedy: "Greedy",
+          lazy: "Lazy",
+          btopt: "BtOpt",
+          btultra: "BtUltra",
+          btultra2: "BtUltra2",
+        };
+        const pretty = STRATEGY_LABELS[tag]
+          || tag.charAt(0).toUpperCase() + tag.slice(1);
+        return { numeric, tag, label: `${numeric} :: ${pretty}` };
+      }
+
+      function renderLevelOptions(select, values) {
+        const fragment = document.createDocumentFragment();
+        const allOption = document.createElement("option");
+        allOption.value = ALWAYS;
+        allOption.textContent = "all";
+        fragment.appendChild(allOption);
+        // Sort numerically when the raw ID parses (`level_-7_fast` →
+        // numeric -7, sorts before `level_1_fast`). Non-matching IDs
+        // (legacy `level22` / `fastest` from old bench JSON, or a
+        // future variant we haven't taught the parser about) fall to
+        // the bottom in their original lexicographic order so they
+        // stay visible and selectable.
+        const decorated = values.map((value) => ({
+          value: String(value),
+          parsed: parseLevelId(value),
+        }));
+        decorated.sort((a, b) => {
+          if (a.parsed && b.parsed) return a.parsed.numeric - b.parsed.numeric;
+          if (a.parsed) return -1;
+          if (b.parsed) return 1;
+          return a.value.localeCompare(b.value);
+        });
+        for (const entry of decorated) {
+          const option = document.createElement("option");
+          option.value = entry.value;
+          // Filter logic compares against `option.value` (the raw
+          // bench ID), so the human-readable form lives purely in
+          // `textContent` and never leaks into the URL or filter
+          // record matching.
+          option.textContent = entry.parsed ? entry.parsed.label : entry.value;
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
+      }
+
       function renderPointOptions(select, values) {
         const fragment = document.createDocumentFragment();
         for (const value of values) {
@@ -652,7 +721,7 @@
         renderOptions(selectors.metric, metricValues);
         renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
         renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));
-        renderOptions(selectors.level, uniq(state.records.map((r) => r.level)));
+        renderLevelOptions(selectors.level, uniq(state.records.map((r) => r.level)));
         renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
 
         const defaultMetric = "throughput_bytes_per_sec";
