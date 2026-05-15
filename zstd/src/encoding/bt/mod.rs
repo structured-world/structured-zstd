@@ -378,9 +378,25 @@ impl BtMatcher {
         #[cfg(feature = "hash")]
         if let Some(producer) = self.ldm_producer.as_mut() {
             debug_assert!(current_abs_start >= history_abs_start);
-            let block_end_abs = current_abs_start
-                .saturating_add(current_len)
-                .min(history_abs_start + live_history.len());
+            // MatchTable invariant: `live_history.len() ==
+            // window_size`, and `current_abs_start =
+            // history_abs_start + window_size − current_len`
+            // (match_generator.rs around line 1330). The two
+            // sides below must coincide; using `min(...)` would
+            // silently truncate the scanned range and mask an
+            // invariant violation. Raw `+` is safe — the frame-
+            // level `check_stream_abs_headroom`
+            // (`match_table/storage.rs:50`) guarantees
+            // `history_abs_start + window_size +
+            // STREAM_ABS_HEADROOM ≤ usize::MAX`.
+            debug_assert_eq!(
+                current_abs_start + current_len,
+                history_abs_start + live_history.len(),
+                "MatchTable invariant violation: current block range \
+                 `[current_abs_start, +current_len)` must coincide with the \
+                 live-history end (window_size == live_history.len())"
+            );
+            let block_end_abs = current_abs_start + current_len;
             producer.generate_into(
                 live_history,
                 history_abs_start,
