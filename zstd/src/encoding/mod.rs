@@ -1,4 +1,27 @@
-//! Structures and utilities used for compressing/encoding data into the Zstd format.
+//! Zstandard encoder — frame compression, streaming, dictionary support.
+//!
+//! Three entry points cover the common use cases:
+//!
+//! * [`compress`] / [`compress_to_vec`] — one-shot helpers that build a
+//!   self-contained Zstandard frame from a `Read` source. Compact when the
+//!   whole input is already in memory.
+//! * [`StreamingEncoder`] — implements [`std::io::Write`] (`std` feature),
+//!   accepting bytes incrementally and flushing compressed output as blocks
+//!   fill. Requires `set_pledged_content_size` before the first write if
+//!   the Frame Content Size field is to be populated.
+//! * [`FrameCompressor`] — lower-level builder that owns the matcher and
+//!   the per-frame configuration; the streaming and one-shot helpers are
+//!   thin wrappers over it. Reach for it when you need to swap in a custom
+//!   [`Matcher`] implementation or share the matcher across frames.
+//!
+//! Compression intensity is selected via [`CompressionLevel`], which
+//! provides both named presets (`Fastest`, `Default`, `Better`, `Best`) and
+//! numeric levels (`from_level(n)`) that mirror C zstd's level numbering
+//! (negative for ultra-fast, `0` = default, `1..=22` for the standard
+//! range).
+//!
+//! All produced frames are valid RFC 8878 Zstandard streams and decode
+//! through both this crate's [`crate::decoding`] module and upstream C zstd.
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;

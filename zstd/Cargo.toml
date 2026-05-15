@@ -17,6 +17,14 @@ readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
 categories = ["compression"]
 
+# docs.rs builds the crate with all features enabled so feature-gated items
+# (e.g. the `dictionary` module behind `dict_builder`) appear in the published
+# documentation. The `--cfg docsrs` flag activates the `#[cfg_attr(docsrs,
+# doc(cfg(...)))]` annotations that render feature badges on each item.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 # Locked behind the `hash` feature flag
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"], optional = true }

@@ -1,6 +1,25 @@
-//! Structures and utilities used for decoding zstd formatted data.
+//! RFC 8878 Zstandard decoder.
 //!
-//! Use [`DictionaryHandle`] for pre-parsed dictionary reuse across repeated decode paths.
+//! Three entry points are exposed, each with progressively lower-level
+//! control:
+//!
+//! * [`StreamingDecoder`] — implements [`crate::io::Read`] over a compressed
+//!   byte stream, transparently parsing the frame header and concatenated
+//!   frames. The typical choice for application code.
+//! * [`FrameDecoder`] — single-frame interface; use when the caller manages
+//!   the input buffer manually (zero-copy slices, network framing, etc).
+//! * [`DictionaryHandle`] — pre-parsed dictionary handle. Parse the
+//!   dictionary bytes once with [`DictionaryHandle::decode_dict`] and reuse
+//!   the handle across every subsequent decode; saves the per-frame
+//!   dictionary parse cost when the same dictionary is used many times in a
+//!   row.
+//!
+//! Both [`StreamingDecoder`] and [`FrameDecoder`] expose
+//! `_with_dictionary_handle` / `_with_dict_bytes` variants so the dictionary
+//! path can either reuse a parsed handle or pass raw bytes per frame.
+//!
+//! Errors surface through [`errors::FrameDecoderError`] and the per-decoder
+//! error types in the [`errors`] submodule.
 
 pub mod errors;
 mod frame_decoder;
