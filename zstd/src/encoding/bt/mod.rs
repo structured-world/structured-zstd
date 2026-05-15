@@ -20,6 +20,7 @@
 use alloc::vec::Vec;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
+#[cfg(feature = "hash")]
 use super::ldm::LdmProducer;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
@@ -70,7 +71,13 @@ pub(crate) struct BtMatcher {
     /// `prepare_ldm_candidates` call for a frame. `None` while LDM
     /// is opt-out (current default) so the table allocation only
     /// happens for callers that opt in. See
-    /// [`super::ldm::LdmProducer`].
+    /// [`super::ldm::LdmProducer`]. Gated behind the `hash`
+    /// feature because the producer's per-window XXH64 hashing
+    /// depends on the optional `twox-hash` dependency; under
+    /// `default-features = false` the field disappears and the
+    /// `prepare_ldm_candidates` body shrinks to the legacy
+    /// `ldm_sequences.clear()` stub.
+    #[cfg(feature = "hash")]
     pub(crate) ldm_producer: Option<LdmProducer>,
 }
 
@@ -123,6 +130,7 @@ impl BtMatcher {
             opt_ml_price_generation: Vec::new(),
             opt_ml_price_stamp: 0,
             ldm_sequences: Vec::new(),
+            #[cfg(feature = "hash")]
             ldm_producer: None,
         }
     }
@@ -146,6 +154,7 @@ impl BtMatcher {
         self.opt_ml_price_generation.clear();
         self.opt_ml_price_stamp = 0;
         self.ldm_sequences.clear();
+        #[cfg(feature = "hash")]
         if let Some(producer) = self.ldm_producer.as_mut() {
             producer.clear();
         }
@@ -359,6 +368,7 @@ impl BtMatcher {
         current_len: usize,
     ) {
         self.ldm_sequences.clear();
+        #[cfg(feature = "hash")]
         if let Some(producer) = self.ldm_producer.as_mut() {
             debug_assert!(current_abs_start >= history_abs_start);
             let block_end_abs = current_abs_start
@@ -370,6 +380,19 @@ impl BtMatcher {
                 current_abs_start,
                 block_end_abs,
                 &mut self.ldm_sequences,
+            );
+        }
+        #[cfg(not(feature = "hash"))]
+        {
+            // Under `default-features = false` (no `hash`),
+            // `LdmProducer` is not compiled — `live_history` /
+            // `history_abs_start` / `current_abs_start` /
+            // `current_len` would otherwise be unused.
+            let _ = (
+                live_history,
+                history_abs_start,
+                current_abs_start,
+                current_len,
             );
         }
     }
@@ -700,6 +723,7 @@ mod ldm_helper_tests {
     /// panic on the `history[block_start..block_end]` slice access
     /// inside `generate_into`.
     #[test]
+    #[cfg(feature = "hash")]
     fn prepare_ldm_candidates_translates_absolute_positions_to_slice_indices() {
         use crate::encoding::ldm::{LdmProducer, params::LdmParams};
 

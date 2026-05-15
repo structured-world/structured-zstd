@@ -45,6 +45,15 @@ pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
+// LDM uses `twox_hash::XxHash64` (per-window XXH64 over the
+// `min_match_length` byte slice, donor `zstd_ldm.c:315`). The
+// `twox-hash` dependency is gated behind the `hash` feature so
+// `default-features = false` builds (no_std, embedded) don't pull
+// it in. The `BtMatcher::ldm_producer` field and every callsite
+// in `match_generator.rs` share the same `cfg(feature = "hash")`
+// gate so the codepath stays consistent across feature
+// combinations.
+#[cfg(feature = "hash")]
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;

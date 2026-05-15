@@ -17,7 +17,7 @@ structured-zstd = "0.0.20"
 ```rust
 use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 
-let compressed = compress_to_vec(b"hello world", CompressionLevel::from_level(7));
+let compressed = compress_to_vec(&b"hello world"[..], CompressionLevel::from_level(7));
 ```
 
 For `no_std` builds disable the default features:

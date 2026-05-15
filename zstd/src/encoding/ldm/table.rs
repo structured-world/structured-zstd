@@ -271,15 +271,31 @@ impl LdmHashTable {
     /// must call `ensure_room_for` before the first insert that
     /// could exceed the window.
     pub(crate) fn insert_absolute(&mut self, hash_id: u32, abs_pos: usize, checksum: u32) {
-        debug_assert!(abs_pos >= self.position_base);
-        let rel = abs_pos - self.position_base;
-        debug_assert!(
+        // Use runtime panics (rather than `debug_assert!`) for both
+        // preconditions so a contract violation never silently
+        // wraps in release: an unchecked `abs_pos - position_base`
+        // would underflow and the subsequent `as u32` cast would
+        // corrupt the table, hiding the bug far from its source.
+        let rel = abs_pos.checked_sub(self.position_base).unwrap_or_else(|| {
+            panic!(
+                "insert position {abs_pos} is below position_base {}; \
+                 callers must rebase via `ensure_room_for` or clear before \
+                 reaching this state",
+                self.position_base
+            )
+        });
+        assert!(
             rel < u32::MAX as usize,
             "insert position {abs_pos} (rel {rel}) exceeds u32 window; \
              producer must call `ensure_room_for` before insert"
         );
         // +1 bias so 0 stays reserved for the empty-slot sentinel.
-        let stored = (rel + 1) as u32;
+        // The cast happens BEFORE the `+ 1` so the addition runs in
+        // `u32` arithmetic — guarded by the `rel < u32::MAX` assert
+        // above, the `+ 1` cannot overflow, and intermediate `usize`
+        // values stay bounded on 32-bit targets where
+        // `usize == u32`.
+        let stored = (rel as u32) + 1;
         self.insert(
             hash_id,
             LdmEntry {
@@ -573,6 +589,20 @@ mod tests {
         // round-trip.
         t.insert_absolute(2, trigger_pos, 0xCAFE);
         assert_eq!(t.resolve(&t.bucket(2)[0]), Some(trigger_pos));
+    }
+
+    /// `insert_absolute` must panic in BOTH debug and release
+    /// builds when called with an `abs_pos` below the current
+    /// `position_base` — silently underflowing the subtraction
+    /// would store a wraparound relative offset and corrupt the
+    /// table far from the bug's source. Regression for PR #139
+    /// round-6 review (Copilot + CodeRabbit, Major).
+    #[test]
+    #[should_panic(expected = "below position_base")]
+    fn insert_absolute_panics_below_position_base() {
+        let mut t = LdmHashTable::new(4, 2);
+        t.reduce(100); // shift position_base to 100
+        t.insert_absolute(0, 50, 0xCAFE); // 50 < 100 → panic
     }
 
     /// `clear()` must reset `position_base` to 0 so a subsequent
