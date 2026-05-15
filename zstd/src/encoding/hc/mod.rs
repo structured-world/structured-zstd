@@ -228,11 +228,91 @@ impl HcMatcher {
         }
 
         let mut best: Option<MatchCandidate> = None;
+        // Donor speculative tail check (`zstd_lazy.c:714`,
+        // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
+        // expensive `common_prefix_len` walk on a 4-byte tail compare
+        // proving the new candidate can possibly reach the *forward*
+        // length required to outscore `best` under
+        // [`Self::better_candidate`] (gain = `len*4 - offset_bits`).
+        //
+        // Correctness — backward-extension–aware bound:
+        //   `best.match_len` is the *total* length stored by
+        //   [`Self::extend_backwards`]: forward bytes from
+        //   `current_idx` plus up to `lit_len` backward bytes
+        //   (`B_best = abs_pos − best.start`, capped by `lit_len`).
+        //   A new candidate can in principle replace `B_best` of its
+        //   own length with up to `lit_len` backward bytes, so the
+        //   worst-case forward length it needs to outscore `best`
+        //   is `best.match_len − lit_len + 1`. The 4-byte tail probe
+        //   at offset `best.match_len − lit_len − 3` covers exactly
+        //   that boundary (the read includes the byte at the
+        //   required-forward-length position itself). A mismatch
+        //   there is a proof the candidate cannot win regardless of
+        //   how much it later extends backwards.
+        //   When `best.match_len ≤ lit_len + 3` the worst-case
+        //   forward target is so close to `current_idx` that the
+        //   `common_prefix_len` cost is already trivial — the gate
+        //   is skipped via the `checked_sub`.
+        //
+        // Walk-order argument (offset monotonicity — REQUIRED gate
+        // precondition, enforced per-iteration):
+        //   Chain walks are LIFO in their dense form (newest first →
+        //   strictly increasing offset). But the chain table is
+        //   `chain_log`-bits wide; when a position is re-inserted at
+        //   the same masked chain index after the cycle wraps, an
+        //   older chain link can point into a slot that has since
+        //   been OVERWRITTEN with a newer (closer) position. The
+        //   walker then surfaces a candidate with a SMALLER offset
+        //   than ones it has already returned, breaking monotonicity.
+        //
+        //   The gate's bound (`tail_off = best.match_len − lit_len −
+        //   3` covers exactly the "new forward must reach
+        //   best.match_len − lit_len + 1" requirement) is only sound
+        //   when `new.offset_bits ≥ best.offset_bits`. Otherwise a
+        //   smaller-offset candidate can outscore `best` by gain at
+        //   *equal* total length — and the gate would skip it because
+        //   it only proves `match_len > best.match_len`. The
+        //   `new_offset >= best.offset` per-iteration check below
+        //   enforces the monotonicity precondition; on non-monotonic
+        //   walks we fall through to the full `common_prefix_len` so
+        //   the offset-bits advantage is given a chance to win.
+        let history_tail = concat.len();
         for candidate_abs in self.chain_candidates(table, abs_pos) {
             if candidate_abs == usize::MAX {
                 break;
             }
             let candidate_idx = candidate_abs - table.history_abs_start;
+            // `abs_pos > candidate_abs` is invariant for in-range chain
+            // entries (filtered by `chain_candidates`), so the subtraction
+            // never underflows.
+            let new_offset = abs_pos - candidate_abs;
+            if let Some(best_ref) = best
+                && new_offset >= best_ref.offset
+                && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
+            {
+                let m_end = candidate_idx + tail_off + 4;
+                let i_end = current_idx + tail_off + 4;
+                // Bounds-fail (`i_end > history_tail`) is a SAFE skip — not
+                // a missed optimization. Under the per-iteration
+                // precondition `new_offset >= best.offset`, new candidates
+                // have equal-or-worse `offset_bits`, so to outscore `best`
+                // they need strictly *larger* `match_len`. Bounds fail
+                // ⟺ `current_idx + best.match_len − lit_len + 1 >
+                // history_tail` ⟺ forward bytes at `current_idx`
+                // (`F_max := history_tail − current_idx`) satisfy
+                // `F_max ≤ best.match_len − lit_len`. Any candidate at
+                // `current_idx` has `match_len ≤ F_max + lit_len ≤
+                // best.match_len`, so it cannot strictly outscore. Falling
+                // through to `common_prefix_len` would only run a wasted
+                // walk that can never improve `best`.
+                if i_end > history_tail || m_end > history_tail {
+                    continue;
+                }
+                if concat[candidate_idx + tail_off..m_end] != concat[current_idx + tail_off..i_end]
+                {
+                    continue;
+                }
+            }
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate =
@@ -643,5 +723,217 @@ mod hc_tests {
         let hc = HcMatcher::new(2, 4, 32);
         let t = table_with_history(b"abc");
         assert!(hc.find_best_match(&t, 0, 1).is_none());
+    }
+
+    /// Regression test for the speculative tail check's
+    /// backward-extension bound. The pre-fix gate used `tail_off =
+    /// best.match_len − 3` and was unaware that `extend_backwards`
+    /// could have added up to `lit_len` backward bytes to
+    /// `best.match_len`. The post-fix formula subtracts `lit_len`
+    /// via `checked_sub(lit_len + 3)`.
+    ///
+    /// To actually fail for the pre-fix gate (Copilot review on
+    /// `c16ca32b` flagged that an earlier round of this test did
+    /// not), the fixture is constructed so the first LIFO candidate
+    /// cannot extend backward but a later candidate can — only the
+    /// later candidate's *total* match length (`forward +
+    /// backward_extension`) reaches the new best.
+    ///
+    /// Fixture (40 bytes, indices `0..=39`):
+    ///   `"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK"`
+    ///    0123456789012345678901234567890123456789   (ones digit)
+    ///              1111111111222222222233333333     (tens digit, aligned)
+    ///
+    /// Probing `abs_pos = 24, lit_len = 3`:
+    ///   - The 4-byte hash at `idx 24` ("abcd") collides with the
+    ///     hashes at `idx 3` and `idx 12` (also "abcd"). All other
+    ///     positions in `0..24` hash to other buckets, so the chain
+    ///     walker visits exactly `[12, 3]` in LIFO order.
+    ///   - Candidate at `idx 12`: forward 8 bytes (`"abcdefIJ"`
+    ///     matches the probe `"abcdefIJ"` at `24..32` exactly), but
+    ///     the byte right before — `concat[11] = 'Q'` — does NOT
+    ///     equal `concat[23] = 'A'`, so `extend_backwards` cannot
+    ///     extend even one byte despite `lit_len = 3` of available
+    ///     headroom. Total `match_len = 8`, offset = 12.
+    ///   - Candidate at `idx 3`: forward only 6 bytes (`"abcdef"`
+    ///     matches, byte 7 at `idx 9 = 'Z'` differs from probe byte
+    ///     7 at `idx 30 = 'I'`). But the 3 bytes before it —
+    ///     `concat[0..3] = "AAA"` — exactly match `concat[21..24] =
+    ///     "AAA"`, so `extend_backwards` adds 3 backward bytes.
+    ///     Total `match_len = 6 + 3 = 9`, offset = 21.
+    ///
+    /// Gate behaviour at `lit_len = 3`:
+    ///   - Pre-fix: `tail_off = best.match_len - 3 = 5`. For
+    ///     candidate at `idx 3` the gate reads `concat[3+5..3+5+4]
+    ///     = concat[8..12] = "fZMQ"` and compares to probe
+    ///     `concat[29..33] = "fIJK"`. Mismatch → gate SKIPS. The
+    ///     helper never runs `common_prefix_len` on candidate `3`,
+    ///     never extends backwards, and returns `match_len = 8`
+    ///     (the first candidate's match) — losing the 9-byte
+    ///     backward-extended win.
+    ///   - Post-fix: `tail_off = best.match_len - lit_len - 3 = 2`.
+    ///     The gate reads `concat[3+2..3+2+4] = concat[5..9] =
+    ///     "cdef"` and compares to probe `concat[26..30] = "cdef"`.
+    ///     Match → gate PASSES → full count runs, finds forward 6,
+    ///     extends backwards 3, returns `match_len = 9`.
+    #[test]
+    fn hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension() {
+        let mut t = MatchTable::new(64);
+        t.history = b"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK".to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(t.history.clone());
+        t.insert_positions(0, 24);
+
+        let hc = HcMatcher::new(2, 16, 64);
+
+        // `lit_len = 0`: no backward extension headroom — neither
+        // candidate can grow past its forward match length, so the
+        // best wins at forward-only length 8. Both pre-fix and
+        // post-fix gates produce the same answer here.
+        let result_lit0 = hc.hash_chain_candidate(&t, 24, 0);
+        let len0 = result_lit0.map(|c| c.match_len).unwrap_or(0);
+        assert_eq!(
+            len0, 8,
+            "lit_len=0 must return the forward-only 8-byte match at offset 12, \
+             got {len0}"
+        );
+
+        // `lit_len = 3`: the second candidate (`idx 3`) can extend 3
+        // bytes backwards, giving a total length of 9. Pre-fix gate
+        // would skip it; post-fix gate lets it through.
+        let result_lit3 = hc.hash_chain_candidate(&t, 24, 3);
+        let len3 = result_lit3.map(|c| c.match_len).unwrap_or(0);
+        assert_eq!(
+            len3, 9,
+            "lit_len=3 must return the backward-extended 9-byte match \
+             (forward 6 + backward 3); a value of 8 means the gate over-rejected \
+             the second LIFO candidate and the helper missed the backward-extension \
+             win (pre-fix regression). Got {len3}"
+        );
+
+        // Strict-increase between `lit_len=0` and `lit_len=3` is the
+        // signal the pre-fix gate would NOT have produced. Keep this
+        // assertion explicitly so the test's failure message points
+        // at exactly the regression it guards.
+        assert!(
+            len3 > len0,
+            "speculative gate must allow `lit_len`-dependent strict gains: \
+             lit_len=0 → {len0}, lit_len=3 → {len3}. Equal values means the \
+             gate skipped the backward-extending candidate."
+        );
+    }
+
+    /// Regression test for the non-monotonic-walk fallback. When the
+    /// cyclic `chain_table & chain_mask` mask overwrites a slot, the
+    /// chain walker can surface a candidate with a SMALLER offset than
+    /// ones it has already returned. The speculative gate's
+    /// monotonicity precondition (`new.offset_bits ≥ best.offset_bits`)
+    /// is enforced per-iteration via the `new_offset ≥ best.offset`
+    /// check: when monotonicity breaks the gate falls through to
+    /// `common_prefix_len` so the offset-bits advantage is given a
+    /// chance to win.
+    ///
+    /// Construction: organic LIFO insertion order would never produce
+    /// this layout — when positions are inserted in monotonic order
+    /// the chain links naturally point at strictly older positions
+    /// (the previous `hash_table[hash]`). To force the bug-prone
+    /// scenario this test reaches into `MatchTable` and hand-wires the
+    /// chain so the walker visits `pos 9` first (offset 18) and then
+    /// `pos 18` second (offset 9). The fixture sits four 8-byte
+    /// `"abcdefgh"` chunks at positions `0 / 9 / 18 / 27` (each chunk
+    /// followed by a unique terminator byte that caps cross-chunk
+    /// forward matches at exactly 8); the probe at `abs_pos = 27`
+    /// hashes the same prefix as the earlier chunks, so all chain
+    /// candidates produce an 8-byte forward match and only the
+    /// offset-bits difference can decide the winner.
+    ///
+    /// With the new `new_offset >= best.offset` precondition:
+    ///   * Iter 1: cand_abs 9, offset 18. `best = None` → no gate,
+    ///     full count, `best = (len 8, offset 18)`.
+    ///   * Iter 2: cand_abs 18, offset 9. `new_offset = 9 <
+    ///     best.offset = 18` → gate skipped → full count runs →
+    ///     `better_candidate` picks the smaller-offset winner (equal
+    ///     length, smaller offset_bits → strictly higher gain).
+    ///
+    /// Final `best.offset` must be `9` (the smaller-offset winner).
+    /// Pre-fix code (gate applied unconditionally) would have
+    /// inspected the tail at `tail_off = 8 − 0 − 3 = 5` and the
+    /// 4-byte read at offsets `5..9` covers the chunk-terminator byte
+    /// (different `'A' / 'B' / 'C' / 'D'` per chunk) — gate fails on
+    /// the mismatching terminator and the second candidate gets
+    /// skipped, leaving `best.offset = 18`.
+    #[test]
+    fn hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset() {
+        // Four 8-byte `"abcdefgh"` chunks, each followed by a unique
+        // terminator byte (`'A' / 'B' / 'C' / 'D'`). The terminators
+        // are part of the same 40-byte stream, so each chunk start
+        // sits 9 bytes after the previous one — chunk starts are at
+        // `0`, `9`, `18`, `27` (not `0/8/16/24` as a naive
+        // chunk-width calculation would suggest). The cross-chunk
+        // forward match between any two chunks caps at exactly 8
+        // because the byte right after each chunk is unique.
+        let mut t = MatchTable::new(64);
+        t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec();
+        assert_eq!(t.history.len(), 40);
+        // After each "abcdefgh" the next byte is unique ('A'/'B'/'C'
+        // /'D'), capping cross-chunk forward matches at length 8.
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(t.history.clone());
+
+        // The probe is at abs_pos 27 (start of the fourth
+        // "abcdefgh" chunk). Hand-wire the chain so the walker
+        // visits pos 9 first and pos 18 second.
+        //
+        // Layout: chunks at 0..8, 9..17, 18..26, 27..35. The byte
+        // BEFORE each chunk is the terminator from the previous
+        // chunk's match. Probing at abs_pos 27:
+        //   * candidate 9 → offset 27 − 9 = 18
+        //   * candidate 18 → offset 27 − 18 = 9 (SMALLER — second
+        //     visit, non-monotonic)
+        let abs_pos = 27usize;
+        let concat = t.live_history();
+        let probe_hash = t.hash_position(&concat[abs_pos..]);
+        // `stored = pos + 1` per `MatchTable::stored_abs_position_fast`.
+        // Hand-wire the chain head and the link OUT of pos 9 so the
+        // walk surfaces 9 first, then 18.
+        t.hash_table[probe_hash] = 9 + 1;
+        let chain_mask = (1usize << t.chain_log) - 1;
+        t.chain_table[9 & chain_mask] = 18 + 1;
+        // Terminate the walk after pos 18.
+        t.chain_table[18 & chain_mask] = HC_EMPTY;
+
+        let hc = HcMatcher::new(2, 16, 64);
+        let result = hc.hash_chain_candidate(&t, abs_pos, 0);
+        let cand = result.expect("non-monotonic walk must still produce a match");
+        assert_eq!(
+            cand.match_len, 8,
+            "both chain candidates have an 8-byte forward prefix match — \
+             expected match_len = 8, got {}",
+            cand.match_len
+        );
+        assert_eq!(
+            cand.offset, 9,
+            "non-monotonic fallback must surface the smaller-offset winner: \
+             expected offset = 9 (cand_abs 18), got offset = {}. \
+             A regression in the `new_offset >= best.offset` check would \
+             keep the gate active for the smaller-offset second candidate, \
+             skip its full count, and leave best.offset at 18 (the \
+             larger-offset first-visited candidate).",
+            cand.offset
+        );
     }
 }
