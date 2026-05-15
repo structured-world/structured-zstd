@@ -89,6 +89,22 @@ impl LdmHashTable {
         // be zero — undefined behaviour upstream and a div-by-zero
         // here.
         let effective_bucket_log = bucket_size_log.min(hash_log);
+        // Donor cap `ZSTD_LDM_BUCKETSIZELOG_MAX = 8` (`zstd.h:1300`).
+        // We store the per-bucket round-robin cursor in a `u8`
+        // (mirrors donor `BYTE bucketOffsets[]` in `zstd_ldm.c:202`),
+        // which silently truncates at 256 slots — i.e. above this
+        // cap the cursor would only cycle through the first 256
+        // entries of a larger bucket, dropping new inserts on the
+        // floor. The assertion enforces the donor pre-condition so
+        // callers that bypass `LdmParams::adjust_for` (which already
+        // clamps to `LDM_BUCKETSIZELOG_MAX`) still get a clear
+        // failure instead of silent data loss.
+        assert!(
+            effective_bucket_log <= 8,
+            "effective bucket_size_log {effective_bucket_log} exceeds donor \
+             ZSTD_LDM_BUCKETSIZELOG_MAX (8); a u8 cursor would silently \
+             truncate at 256 slots — widen the cursor or clamp the request"
+        );
         let bucket_count = 1u32 << (hash_log - effective_bucket_log);
         let total_entries = 1usize << hash_log;
 
@@ -307,6 +323,18 @@ mod tests {
         let t = LdmHashTable::new(18, 4);
         assert_eq!(t.bucket_count(), 1usize << (18 - 4));
         assert_eq!(t.bucket_slots(), 1usize << 4);
+    }
+
+    /// `effective_bucket_log > 8` (donor `LDM_BUCKETSIZELOG_MAX`)
+    /// must panic, not silently truncate the `u8` round-robin
+    /// cursor at 256 slots. Donor pre-condition mirrored from
+    /// `zstd_ldm.c:202` where `bucketOffsets` is a `BYTE`.
+    #[test]
+    #[should_panic(expected = "ZSTD_LDM_BUCKETSIZELOG_MAX")]
+    fn new_rejects_bucket_size_log_above_donor_cap() {
+        // hash_log = 12, bucket_size_log = 9 → effective = 9 > 8
+        // → assertion fires.
+        let _ = LdmHashTable::new(12, 9);
     }
 
     /// `bucket_mask` returned by the table must agree with the

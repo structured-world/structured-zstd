@@ -208,16 +208,15 @@ impl LdmProducer {
             return;
         }
 
-        // hBits = hashLog - bucketSizeLog. Donor `zstd_ldm.c:354`.
-        let h_bits = self
-            .params
-            .hash_log
-            .saturating_sub(self.params.bucket_size_log);
-        let hash_id_mask: u32 = if h_bits >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << h_bits).wrapping_sub(1)
-        };
+        // hBits = hashLog - bucketSizeLog (donor `zstd_ldm.c:354`).
+        // Pull the mask from the table rather than re-deriving from
+        // `params.hash_log / params.bucket_size_log`: the table
+        // applies a `min(bucket_size_log, hash_log)` clamp
+        // (`zstd_ldm.c:176`) which the producer-side recomputation
+        // does not, so any caller that constructs the table with a
+        // `bucket_size_log >= hash_log` would see drift between
+        // `hash_id_mask` and the actual bucket count.
+        let hash_id_mask: u32 = self.hash_table.bucket_mask();
 
         // Re-init + reset against the first min_match bytes —
         // donor `zstd_ldm.c:381-383`. The table itself is
