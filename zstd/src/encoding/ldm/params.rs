@@ -66,7 +66,16 @@ impl LdmParams {
     ///
     /// Returns a fully-initialised `LdmParams` with no zero fields.
     pub(crate) fn adjust_for(window_log: u32, strategy: u32) -> Self {
-        debug_assert!(
+        // Runtime `assert!` (not `debug_assert!`) — the body uses
+        // raw `LDM_HASH_RLOG - (strategy / 3)`, which underflows
+        // `u32` for `strategy >= 24` (`7 - 8 = u32::MAX`) and
+        // yields nonsensical `hash_rate_log` in release builds.
+        // Donor enforces the same precondition as a hard
+        // `assert(1 <= strategy && strategy <= 9)` at
+        // `zstd_ldm.c:149` / `zstd_ldm.c:167`; we mirror that
+        // hardness in our `pub(crate)` surface. The check runs
+        // once per frame so the cost is negligible.
+        assert!(
             (1..=9).contains(&strategy),
             "strategy must be a donor 1..=9 ordinal (donor asserts at \
              zstd_ldm.c:149 + zstd_ldm.c:167)"
@@ -156,6 +165,18 @@ mod tests {
     ///   strategy 3 (greedy)   → 6
     ///   strategy 6 (btlazy2)  → 5
     ///   strategy 9 (btultra2) → 4
+    /// `adjust_for` must panic in BOTH debug and release builds
+    /// when handed an out-of-range strategy (donor 1..=9). The
+    /// inner `LDM_HASH_RLOG - (strategy / 3)` would otherwise
+    /// underflow `u32` for `strategy >= 24` and produce
+    /// nonsensical params. Regression for PR #139 round-10
+    /// review (Copilot).
+    #[test]
+    #[should_panic(expected = "strategy must be a donor 1..=9 ordinal")]
+    fn adjust_for_panics_on_out_of_range_strategy() {
+        let _ = LdmParams::adjust_for(27, 24);
+    }
+
     #[test]
     fn adjust_strategy_to_hash_rate_log_matches_donor_table() {
         assert_eq!(LdmParams::adjust_for(27, 1).hash_rate_log, 7);
