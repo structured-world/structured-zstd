@@ -266,10 +266,14 @@ impl LdmHashTable {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `abs_pos < position_base` or if
-    /// `abs_pos - position_base + 1 > u32::MAX`. The producer
-    /// must call `ensure_room_for` before the first insert that
-    /// could exceed the window.
+    /// Panics in **all build modes** if `abs_pos < position_base`
+    /// (enforced by `checked_sub(...).unwrap_or_else(panic!)`) or
+    /// if `abs_pos - position_base + 1 > u32::MAX` (enforced by an
+    /// `assert!`). Both checks are runtime — never `debug_assert!`
+    /// — so a contract violation cannot silently wrap a relative
+    /// offset and corrupt the table in release. The producer must
+    /// call `ensure_room_for` before the first insert that could
+    /// exceed the window.
     pub(crate) fn insert_absolute(&mut self, hash_id: u32, abs_pos: usize, checksum: u32) {
         // Use runtime panics (rather than `debug_assert!`) for both
         // preconditions so a contract violation never silently
