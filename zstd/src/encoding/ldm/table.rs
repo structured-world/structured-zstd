@@ -609,7 +609,14 @@ mod tests {
     /// `insert_absolute` would panic on the `(rel + 1) as u32`
     /// cast. Regression for PR #139 round-14 review (CodeRabbit
     /// Major).
+    ///
+    /// Gated to 64-bit pointer widths: `5 * REBASE_GUARD_BAND`
+    /// (= 5 GiB) overflows `usize` on 32-bit targets, where the
+    /// scenario is unreachable anyway because `usize::MAX` < 4
+    /// GiB caps the addressable stream below the rebase
+    /// threshold.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn ensure_room_for_loops_across_multiple_guard_bands() {
         let mut t = LdmHashTable::new(4, 2);
         // Jump past two guard bands at once. With u32::MAX ≈
