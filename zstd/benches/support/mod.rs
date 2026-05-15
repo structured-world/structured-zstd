@@ -167,11 +167,21 @@ pub(crate) fn supported_levels() -> Vec<LevelConfig> {
             ffi_level: n,
         });
     }
-    // Standard tier: `1..=22`. Strategy mirrors `clevels.h`.
+    // Standard tier: `1..=22`. Strategy mirrors `clevels.h`. Use
+    // `CompressionLevel::Level(n)` directly — NOT
+    // `CompressionLevel::from_level(n)` — so the bench label
+    // `level_<N>_<strategy>` matches the variant exercised by the
+    // encoder. `from_level(11)` collapses to `Best`, and the named
+    // `Best` variant bypasses `donor_pre_split_level`'s
+    // `Level(11..=15) -> Some(0)` arm (the borders pre-splitter
+    // landed in #140), so the numbers would silently diverge from
+    // what a user calling `compress_to_vec(input, Level(11))` sees.
+    // Same divergence applies to 1 (`Fastest`), 3 (`Default`),
+    // 7 (`Better`) on any future preset-only branch.
     for n in 1..=22i32 {
         levels.push(LevelConfig {
             name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
-            rust_level: CompressionLevel::from_level(n),
+            rust_level: CompressionLevel::Level(n),
             ffi_level: n,
         });
     }
