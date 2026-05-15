@@ -386,6 +386,14 @@ jobs:
           STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.level }}
           # run-benchmarks.sh: re-exec this binary instead of `cargo bench`.
           STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+          # The prebuilt bench binary is launched directly (not via cargo),
+          # so `env::var("CARGO_MANIFEST_DIR")` returns None inside it.
+          # Without this override, `load_decode_corpus_scenario()` falls
+          # back to the synthetic 1 MiB corpus and the bench label silently
+          # flips from `decodecorpus-z000033` to `decodecorpus-synthetic-1m`,
+          # making dashboards diverge from a baseline produced via
+          # `cargo bench`. Point the binary at the checkout's real fixture.
+          STRUCTURED_ZSTD_BENCH_CORPUS_PATH: ${{ github.workspace }}/zstd/decodecorpus_files/z000033
         run: bash .github/scripts/run-benchmarks.sh
 
       - name: Rename benchmark outputs for matrix artifact

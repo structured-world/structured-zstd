@@ -367,35 +367,55 @@ fn load_decode_corpus_scenario() -> Scenario {
     const FALLBACK_ID: &str = "decodecorpus-synthetic-1m";
     const FALLBACK_LABEL: &str = "Synthetic decode corpus fallback (1 MiB)";
 
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok();
-    let fixture_path = manifest_dir
-        .as_deref()
-        .map(Path::new)
-        .map(|dir| dir.join("decodecorpus_files/z000033"));
+    // Resolution order:
+    //   1. `STRUCTURED_ZSTD_BENCH_CORPUS_PATH` — explicit absolute path
+    //      to the corpus file. CI sets this so the prebuilt bench
+    //      binary (invoked directly via `STRUCTURED_ZSTD_BENCH_BIN`,
+    //      bypassing cargo) can still locate the fixture even though
+    //      `CARGO_MANIFEST_DIR` is not in its environment.
+    //   2. `CARGO_MANIFEST_DIR/decodecorpus_files/z000033` — local
+    //      `cargo bench` runs, where cargo injects the manifest dir.
+    //   3. Synthetic 1 MiB fallback — packaged sources / hand-run
+    //      binaries with no fixture access.
+    let candidate_paths: Vec<std::path::PathBuf> = {
+        let mut paths = Vec::new();
+        if let Ok(explicit) = env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                paths.push(std::path::PathBuf::from(trimmed));
+            }
+        }
+        if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+            paths.push(Path::new(&manifest_dir).join("decodecorpus_files/z000033"));
+        }
+        paths
+    };
 
-    if let Some(path) = fixture_path {
-        match fs::read(&path) {
+    if candidate_paths.is_empty() {
+        eprintln!(
+            "BENCH_WARN neither STRUCTURED_ZSTD_BENCH_CORPUS_PATH nor \
+             CARGO_MANIFEST_DIR is set; using synthetic decode corpus fallback"
+        );
+    }
+    for path in &candidate_paths {
+        match fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => {
                 return Scenario::new(REAL_ID, REAL_LABEL, bytes, ScenarioClass::Corpus);
             }
             Ok(_) => {
                 eprintln!(
-                    "BENCH_WARN decode corpus fixture is empty at {}, using synthetic fallback",
+                    "BENCH_WARN decode corpus fixture is empty at {}, trying next candidate",
                     path.display()
                 );
             }
             Err(err) => {
                 eprintln!(
-                    "BENCH_WARN failed to read decode corpus fixture at {}: {}. Using synthetic fallback",
+                    "BENCH_WARN failed to read decode corpus fixture at {}: {}. Trying next candidate",
                     path.display(),
                     err
                 );
             }
         }
-    } else {
-        eprintln!(
-            "BENCH_WARN CARGO_MANIFEST_DIR is not set, using synthetic decode corpus fallback"
-        );
     }
 
     // Keep the benchmark matrix runnable from packaged sources where fixture files may be omitted.
