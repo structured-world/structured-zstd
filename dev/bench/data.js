@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778843268569,
+  "lastUpdate": 1778844714743,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -31862,6 +31862,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4bf13f034da49b9529053a4ec3038a1c0162c72e",
+          "message": "perf(encoding): #124 Phase 4 — HC speculative tail check + MatcherStorage enum dispatch (#125)\n\n* perf(encoding): #124 Phase 4.1 — HC speculative tail check\n\nPort donor `zstd_lazy.c:714` (`ZSTD_HcFindBestMatch`) speculative\n4-byte tail compare into `HcMatcher::hash_chain_candidate`. Once a\n`best` candidate is set with `match_len >= 4`, gate the per-byte\n`common_prefix_len` walk on `concat[i+best_ml-3..best_ml+1]` vs\n`concat[c+best_ml-3..best_ml+1]`. A mismatch proves the candidate\ncannot reach `best_ml + 1` and the walk would only confirm\n`len <= best_ml`.\n\nCorrectness rests on the monotonic-offset property of LIFO chain\nwalks: each subsequent candidate has `new.offset_bits >=\nbest.offset_bits`, so `better_candidate` (gain = `len*4 -\noffset_bits`) can return a strict winner only when\n`new.match_len > best_ml`. Equal-length or shorter candidates can\nonly tie or lose, and `better_candidate` keeps the existing best on\nties.\n\nBounds: when `current_idx + best_ml + 1 > history_tail`, the current\nposition cannot reach `best_ml + 1` either, so the candidate cannot\nwin — same skip.\n\nVerification:\n- `cargo nextest run -p structured-zstd --features hash,std,dict_builder`\n  476/476 pass (incl. `level22_sequences_match_donor_on_corpus_proxy`\n  and the cross-validation roundtrip + parity gates).\n- `cargo test --doc` 10/10 pass.\n- `cargo clippy -p structured-zstd --features hash,std,dict_builder\n  --all-targets -- -D warnings` clean.\n- `cargo bench --quick '^compress/better'` (Lazy backend, the actual\n  HC chain-walker user) on x86_64-darwin: one scenario −5.4 %\n  (small-10k-random, p = 0.05), the rest within ±2 % of stored\n  baseline — `--quick` noise floor swallows whatever steady-state\n  win remains. Full baseline-vs-feature bench will be measured on\n  the CI bench-matrix.\n\n* refactor(encoding): #124 Phase 4.3 — MatcherStorage enum dispatch\n\nCollapse the driver's four parallel backend fields\n(`match_generator: MatchGenerator`,\n`dfast_match_generator: Option<DfastMatchGenerator>`,\n`row_match_generator: Option<RowMatchGenerator>`,\n`hc_match_generator: Option<HcMatchGenerator>`) plus the\n`active_backend: BackendTag` discriminator into a single\n`storage: MatcherStorage` enum with four variants\n(`Simple` / `Dfast` / `Row` / `HashChain`). The active backend is\nnow derived directly from the storage variant via\n`MatcherStorage::backend()` — no separate runtime tag that could\ndrift against the variant.\n\nWhy\n- The prior layout kept drained-but-allocated inner structures for\n  every backend the driver had ever touched (the lazy `Option`s\n  + the always-present `match_generator` retained their backing\n  metadata across backend switches). With the enum, the inactive\n  variants are dropped on switch, so the driver carries exactly\n  one backend's state at any time.\n- Every per-frame / per-slice driver operation\n  (`reset` / `prime_with_dictionary` / `commit_space` /\n  `get_last_space` / `skip_matching_with_hint` /\n  `retire_dictionary_budget` / `trim_after_budget_retire` /\n  `skip_matching_for_dictionary_priming`) used to dispatch on\n  `active_backend` to pick the matching field. The match-on-tag\n  + field-access pair is replaced with `match &mut self.storage`,\n  which fuses dispatch and accessor and gives the borrow checker\n  field-disjoint splits \"for free\" (manual destructure where the\n  closure captures `vec_pool` / `suffix_pool` alongside the\n  backend borrow).\n- This is non-hot-path dispatch (per block at most, per frame\n  typically). The hot per-block `compress_block::<S>` already\n  dispatches via `match S::BACKEND` over a `const`, which the\n  compiler const-folds out per monomorphisation — that path is\n  unchanged.\n\nNotes\n- Backend transitions inside `Matcher::reset` drain the old\n  variant's allocations into `vec_pool` / `suffix_pool`, then\n  swap `self.storage` to a freshly constructed variant for the\n  new backend. The old variant is dropped at the swap; with the\n  HashChain → Simple transition the pre-swap `hash_table` /\n  `chain_table` / `hash3_table` zeroing kept from the prior\n  field-shaped impl ensures the BtUltra2 hash3 allocation\n  (`1 << HC3_HASH_LOG`) does not survive the switch.\n- Three tests went obsolete because they exercised the old\n  lazy-init recovery / drained-but-allocated invariant\n  (`driver_reset_from_row_backend_tolerates_missing_row_matcher`\n  flipped `row_match_generator = None` by hand;\n  `driver_best_to_fastest_releases_oversized_hc_tables` and\n  `…reclaims_row_buffer_pool` inspected the post-switch state of\n  a backend that no longer exists). Replaced with one new test\n  proving the new invariant — buffer pool grows across the\n  HashChain → Simple switch, backend tag flips, no field-shaped\n  inspection of the dropped variant.\n- Immutable accessors (`simple` / `dfast_matcher` / `row_matcher`\n  / `hc_matcher`) are now `#[cfg(test)]` — production code only\n  reads via the mutable counterparts or pattern-matches `storage`\n  directly.\n\nVerification\n- `cargo nextest run -p structured-zstd --features hash,std,dict_builder`\n  475/475 pass, 3 skipped (`level22_sequences_match_donor_on_corpus_proxy`\n  + full cross-validation + roundtrip + parity gates).\n- `cargo test --doc` 10/10 pass.\n- `cargo clippy -p structured-zstd --features hash,std,dict_builder\n  --all-targets -- -D warnings` clean.\n\n* perf(encoding): #124 Phase 4 — Dfast post-match rep-0 + review fixes\n\nBundles the Dfast donor port and the HC speculative-gate correctness fix\nfrom Copilot review on PR #125. Same Phase 4 hot-path family, shares one\nretest cycle.\n\n## Dfast post-match rep-0 extension\n\nPort donor `zstd_double_fast.c` post-match rep chain into the Dfast\nfast-loop and general-loop emit paths. After each `emit_candidate`,\nthe new helper `extend_with_repcode_after_match` chains additional\nzero-literal rep sequences while 4 bytes at the new cursor keep\nmatching `cursor - offset_hist[1]`. Each iteration emits one rep\nsequence with the swapped-in offset, advances `pos` and\n`literals_start` past the rep match, updates `offset_hist` via\n`encode_offset_with_history` (the donor `offset_2 = offset_1;\noffset_1 = old_offset_2;` swap), inserts every position of the rep\nmatch into the long/short hash tables so subsequent positions can\nhit them, and skips the full hash-table probe entirely on every\nextra match.\n\nUses donor's `MINMATCH = 4` for the rep threshold rather than the\nstricter `DFAST_MIN_MATCH_LEN = 6` enforced on the main search —\ndonor accepts any 4-byte rep extension and we mirror that because\nthe rep emission carries no offset cost.\n\n## HC speculative tail check — correctness fix\n\nCopilot flagged a backward-extension-unaware bound in the gate\nintroduced by 82e85fc. The old code used `best.match_len` directly\nas the forward-extent reference, but `extend_backwards` may have\nadded up to `lit_len` backward bytes to that total. A new chain\ncandidate can in turn replace `B_best` of its own length with up to\n`lit_len` backward bytes, so the worst-case forward length it\nneeds to outscore `best` (under the LIFO offset-monotonic walk\nargument) is `best.match_len - lit_len + 1`. The 4-byte tail probe\nnow anchors at `tail_off = best.match_len - lit_len - 3` (via\n`checked_sub(lit_len + 3)`), which covers exactly that boundary.\nWhen `best.match_len <= lit_len + 3` the worst-case forward target\nis so close to `current_idx` that the chain-walk cost is already\ntrivial — the gate is skipped via the `checked_sub`. When\n`lit_len == 0` the formula reduces to the pre-fix `best.match_len\n- 3` (no backward extension possible).\n\nComment block in `hash_chain_candidate` now enumerates both the\nbackward-extension bound and the offset-monotonicity argument.\n\n## Driver test tightening (Copilot threads #2 / #3 / #4)\n\n- `driver_reset_from_row_backend_recycles_row_buffers_into_pool`:\n  assertion changed from `vec_pool.len() >= before_pool` to `>` so\n  the test fails on the regression it is meant to cover. With\n  `before_pool = 0` on a fresh driver the weaker bound passed\n  trivially even if the Row to Simple drain closure never pushed\n  anything back into `vec_pool`.\n- `row_get_last_space_and_reset_to_fastest_clears_window` renamed\n  to `..._drops_row_variant` with a doc comment explaining why\n  the original `clears_window` assertion is intentionally gone (the\n  variant itself is dropped on swap; no `row_matcher()` to inspect\n  post-switch). Points at the sibling pool-recycling test by name.\n- `MatcherStorage` variant docs rewritten to enumerate the full\n  `CompressionLevel` to backend mapping that `resolve_level_params`\n  produces for each variant (Simple covers `Uncompressed`,\n  `Fastest`, `Level(1)`, and any non-positive `Level(n) != 0`;\n  Dfast covers `Default`, `Level(0)`, `Level(2)`, `Level(3)`; Row\n  covers `Level(4)`; HashChain covers `Better`, `Best`, and\n  `Level(5..=22)` across Lazy / BtOpt / BtUltra / BtUltra2). The\n  pre-fix doc said \"Level 1\" / \"Levels 2-3\" which was misleading\n  for the named-level variants.\n\n## Verification\n\n- nextest 475/475 pass, 3 skipped (incl.\n  `level22_sequences_match_donor_on_corpus_proxy` parity gate and\n  the full cross-validation + roundtrip + ratio gates for\n  default / better / best / level22).\n- doctests 10/10 pass.\n- clippy --all-targets -D warnings clean.\n- bench --quick on `^compress/default` (x86_64-darwin): every\n  default-level scenario improves relative to the c_ffi baseline\n  noise floor. Most relevant numbers: `decodecorpus-z000033` (the\n  27x C-FFI gap target from #111) gains -11 % vs c_ffi noise;\n  `high-entropy-1m` -16 %; `low-entropy-1m` -8 %.\n\n* fix(encoding): #124 Phase 4 — review feedback on post-match rep + speculative gate\n\nRound-2 review fixes from CodeRabbit / Copilot on PR #125. Bundles the\nbehavioural fix called out by both reviewers (block-local `rep > pos`\nguard wrongly rejected retained-history offsets) plus targeted\nregression tests for the helpers that previously had only roundtrip\ncoverage.\n\n## Behavioural fix: `extend_with_repcode_after_match` accepts cross-block offsets\n\nCodeRabbit (Major / Quick win) and Copilot both flagged that the\nhelper's `if rep == 0 || rep > pos { break; }` guard rejected valid\nrepeat offsets pointing into retained history whenever the source\nlived past the current block-local cursor. Since `DfastMatchGenerator`\nkeeps a contiguous `live_history()` buffer covering\n`history_abs_start..history_abs_end`, the only correct bound is\n\"does the candidate land at or after `history_abs_start`\" — which\n`cur_idx.checked_sub(rep)` already enforces (`None` ⇒ rep points\nbefore `history_abs_start`, break).\n\nReplaced the guard with `if rep == 0 { break; }` and added a comment\nexplaining that `checked_sub` is the authoritative bound. Near\nblock boundaries this restores the donor-parity chain win the helper\nis meant to recover.\n\n## Regression tests\n\n* `dfast::extend_with_repcode_tests::dfast_repcode_extension_emits_zero_literal_rep_on_constant_run`\n  exercises the post-match rep helper directly with a hand-built\n  post-primary-match state: a constant-byte block, `offset_hist[1]\n  = 1`, and an in-block cursor mid-block. Verifies the helper emits\n  a zero-literal Triple with `offset = 1` (donor parity) and\n  advances `pos` / `literals_start` consistently. Going through\n  `start_matching` was unreliable because the primary `best_match`\n  greedily consumes the entire constant run in a single Triple\n  (`offset = 1, match_len = block - 1`), leaving the helper nothing\n  to extend.\n* `dfast::extend_with_repcode_tests::dfast_repcode_extension_walks_into_retained_history`\n  builds a two-block fixture and probes with `rep = 40` against a\n  block-local cursor at `pos = 5`. The pre-fix `rep > pos` guard\n  would have rejected this; the post-fix code emits the rep\n  correctly.\n* `hc::hc_tests::hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension`\n  guards the post-fix `tail_off = best.match_len - lit_len - 3`\n  formula with a monotonicity check: for the same probe position\n  and chain content, the returned `match_len` must be\n  non-decreasing in `lit_len` because more backward-extension\n  headroom can only enlarge (or leave unchanged) every candidate's\n  effective length. A regression where the gate skips candidates\n  that backward extension would have rescued surfaces as\n  `len_high_lit < len_low_lit`.\n\n## Doc / comment clarifications (Copilot threads on `MatcherStorage`)\n\n* The post-switch state comment in\n  `driver_best_to_fastest_releases_oversized_hc_tables` previously\n  said the manual `hash_table = Vec::new()` assignments release\n  allocations \"immediately rather than waiting for `Drop`\". That\n  was misleading — assigning `self.storage = MatcherStorage::Simple(...)`\n  would drop the old `HashChain` variant in the same call regardless.\n  The real reason for the up-front reassignment is to cap peak\n  memory during the swap: by releasing the table allocations\n  *before* constructing the replacement variant, the peak resident\n  set is \"old data buffers being drained into `vec_pool` + new\n  `MatchGenerator` skeleton\" instead of \"old tables still resident\n  + new variant under construction\". Comment updated to reflect\n  that.\n\n## Verification\n\n- nextest 478/478 pass, 3 skipped (478 = 475 + the three new tests).\n- doctests 10/10 pass.\n- clippy --all-targets -D warnings clean.\n\n* fix(encoding): #124 Phase 4 — HC speculative gate non-monotonic guard + precise regression\n\nRound-3 review fixes from Copilot on PR #125. Tightens the HC\nspeculative tail check's correctness preconditions and replaces the\nmonotonicity-only regression test with one that actually fails for\nthe pre-fix gate.\n\n## Non-monotonic chain walks (Copilot thread on hc/mod.rs:283)\n\nThe gate's correctness argument was \"chain walks are LIFO → newest\nfirst → strictly increasing offset\". But the chain table is\n`chain_log`-bits wide and cyclic: when a position is re-inserted at\nthe same masked chain index after the cycle wraps, an older chain\nlink can point into a slot that has since been OVERWRITTEN with a\nnewer (closer) position. The walker then surfaces a candidate with\na SMALLER offset than ones it already returned, breaking\nmonotonicity. With non-monotonic ordering, a smaller-offset\ncandidate can outscore `best` via offset bits at *equal* total\nlength, and the gate (which only proves `match_len > best.match_len`)\nwould skip that valid winner.\n\nFix: add `new_offset >= best_ref.offset` to the gate's\nprecondition. On non-monotonic walks the iteration falls through to\nthe full `common_prefix_len` so the offset-bits advantage is given\na chance to win. The comment block now distinguishes\n\"backward-extension-aware bound\" (the `lit_len` correction) from\n\"monotonicity precondition\" (the new offset check) and notes that\nthe latter is enforced per-iteration, not assumed globally.\n\n## Precise regression test (Copilot thread on hc/mod.rs:721)\n\nThe previous test on a repeating \"ABCDEFGH\" fixture asserted\nmonotonicity of `match_len` in `lit_len`, but every chain candidate\ncould extend backward by the same amount on that fixture — so\nskipping the later candidates still produced non-decreasing\nlengths, and the pre-fix `best.match_len - 3` gate passed the test.\n\nReplaced with a hand-crafted 40-byte fixture\n`\"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK\"` where:\n  * The first LIFO candidate (`idx 12`, offset 12) has 8 forward\n    bytes but cannot extend backward (`concat[11] = 'Q'` ≠\n    `concat[23] = 'A'`) → `match_len = 8`.\n  * The second LIFO candidate (`idx 3`, offset 21) has only 6\n    forward bytes (terminator `'Z'` at idx 9 ≠ probe byte `'I'` at\n    idx 30) but CAN extend 3 bytes backward (`concat[0..3] =\n    \"AAA\" = concat[21..24]`) → total `match_len = 9`.\n\nPre-fix gate at `tail_off = 8 - 3 = 5` reads `concat[8..12] =\n\"fZMQ\"` vs probe `concat[29..33] = \"fIJK\"` for the second candidate\n— mismatch → SKIP — helper returns `match_len = 8` (loses the\n9-byte backward-extended win).\n\nPost-fix gate at `tail_off = 8 - 3 - 3 = 2` reads `concat[5..9] =\n\"cdef\"` vs probe `concat[26..30] = \"cdef\"` — match → PASS → full\ncount + backward extend → `match_len = 9`.\n\nAssertions:\n  * `len_for(0) == 8` (no backward headroom, both candidates\n    capped at forward).\n  * `len_for(3) == 9` (post-fix gate lets the second candidate\n    through).\n  * `len_for(3) > len_for(0)` (strict gain — the signal the\n    pre-fix gate would not have produced).\n\nThe fixture also exercises the non-monotonic guard from the first\nfix: candidate offsets are `[12, 21]`, both monotonic so the\ngate applies — the test would not exercise the `new_offset <\nbest.offset` branch added today, but the broader nextest /\ncross-validation suite has chain walks that do hit it.\n\n## Verification\n\n- nextest 478/478 pass, 3 skipped.\n- doctests 10/10 pass.\n- clippy --all-targets -D warnings clean.\n\n* fix(encoding): #124 Phase 4 — pre-drain Dfast hash tables on backend switch + test comment\n\nRound-4 review fixes from Copilot on PR #125. Two small follow-ups\nto the round-3 work.\n\n## Pre-drain Dfast hash tables on backend transition\n\nThe `MatcherStorage::Dfast` arm in `Matcher::reset`'s drain block\ncalled `m.reset` without first clearing `m.short_hash` and\n`m.long_hash`. `DfastMatchGenerator::reset` then ran\n`self.short_hash.fill(DFAST_EMPTY_SLOT)` and the same on long_hash\nbefore the variant was dropped by the subsequent `self.storage = ...`\nswap — wasted work, since the table backing allocations are about\nto be released anyway. The fill loop's short-circuit\n(`if !self.short_hash.is_empty()`) means handing it an empty Vec\nskips the work entirely.\n\nMirrors the pre-drain pattern already used in the HashChain arm\n(release table allocations before constructing the replacement\nvariant, keeping peak memory during the swap to just the\ndata-buffer drain + new variant skeleton).\n\n## Test fixture index guide\n\nThe `hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension`\nfixture is 40 bytes (indices `0..=39`) but the comment's index\nguide laid out 41 positions (`0..=40`) on the ones-digit line and\nleft a stray `4` at the end of the tens-digit line. Trimmed both\nto match the actual fixture length, split the legend into separate\n\"ones digit\" / \"tens digit\" labels so the alignment is obvious at\na glance.\n\n## Verification\n\n- nextest 478/478 pass, 3 skipped.\n- clippy --all-targets -D warnings clean.\n\n* fix(encoding): #124 Phase 4 — non-monotonic walk regression + 4-byte rep + retire_budget bool\n\nRound-5 review fixes from CodeRabbit / Copilot on PR #125. Four\nfindings, all addressed:\n\n## Non-monotonic walk regression test (CR #14 / Copilot #15)\n\nThe `new_offset >= best.offset` guard added in round 3 prevented\nthe speculative gate from over-rejecting smaller-offset candidates\nsurfaced by cyclic `chain_table` overwrites. The previous round's\nfixture only exercised the `lit_len` backward-extension bound — it\ndid not force the non-monotonic walk path.\n\nAdded `hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset`\nwhich hand-wires `MatchTable::hash_table` and\n`MatchTable::chain_table` to surface a chain walk that visits\n`pos 9` first (offset 18) and `pos 18` second (offset 9 — strictly\nsmaller). Both positions hold an identical 8-byte forward prefix\nmatch against the probe at `abs_pos = 27`, so the FORWARD lengths\nare equal and only the offset-bits difference can decide the\nwinner. The test asserts the helper returns `offset = 9` (the\nsmaller-offset winner). Without the `new_offset >= best.offset`\nfallback, the gate would activate for the second candidate, fail\nthe 4-byte tail compare (the chunks have different terminator\nbytes at offset 8 from the chunk start), and skip the smaller-\noffset candidate — leaving `best.offset = 18`.\n\nConstructing this scenario via organic insertion order is not\npossible: LIFO insertion always points chain links at strictly\nolder positions, so the non-monotonic visit order requires the\ncyclic-mask-collision case. Hand-wiring the chain is the only\ndeterministic way to lock the regression down.\n\n## 4-byte rep extension test (Copilot #16)\n\nThe Dfast post-match rep helper uses donor's `MINMATCH = 4` (not\nthe main-loop `DFAST_MIN_MATCH_LEN = 6` floor). The previous test\nfixtures only ran on long runs that extended much further than 4\nbytes; a regression back to 6 would still have passed.\n\nAdded `dfast_repcode_extension_accepts_exactly_four_byte_rep` on\na 32-byte fixture where the rep match terminates at exactly 4\nbytes (`concat[12] = '!'` vs `concat[4] = '?'` mismatches at the\n5th rep byte). Asserts the helper emits a single Triple with\n`match_len = 4`. A regression to 6-byte threshold would skip this\nemission entirely and the test would fail with 0 emitted seqs.\n\n## Variant docs: `Level(n > MAX_LEVEL)` clamp (Copilot #17)\n\nThe `MatcherStorage::HashChain` doc claimed it covered\n\"`Level(5..=22)`\" but `resolve_level_params` clamps positive\nnumeric levels at `MAX_LEVEL = 22` via `Level(n).clamp(1, MAX_LEVEL)`,\nso `Level(23..=i32::MAX)` also land on `BtUltra2` / HashChain.\nAdded the clamp note to the doc so future callers don't reach for\nthe wrong variant assuming the band is half-open at 22.\n\n## `trim_after_budget_retire` gated on reclamation (CR #18)\n\n`commit_space` called `retire_dictionary_budget` +\n`trim_after_budget_retire` unconditionally on every slice commit.\nOn the common no-dictionary / no-eviction path,\n`retire_dictionary_budget` early-returns at `reclaimed == 0` and\n`trim_after_budget_retire` does a backend `match` ladder + a\nsingle `trim_to_window` early-out — work that produces nothing.\n\nChanged `retire_dictionary_budget` to return `bool` (`#[must_use]`,\n`true` iff reclamation happened) and gated `trim_after_budget_retire`\non that return at the `commit_space` call site. The\n`trim_after_budget_retire` body itself still calls\n`retire_dictionary_budget` in a loop driven by `evicted_bytes == 0`\n— the bool there is consumed by `let _ = …` because the loop's\nown termination condition is the right driver inside that scope.\n\n## Verification\n\n- nextest 480/480 pass (478 + 2 new tests), 3 skipped.\n- doctests 10/10 pass.\n- clippy --all-targets -D warnings clean.\n\n* test(encoding): #124 Phase 4 — fast-loop helper roundtrip + index ruler trim\n\nRound-6 review fixes from Copilot on PR #125. Two findings on the\nDfast test additions from round 5.\n\n## Index ruler trimmed to 32 bytes (Copilot #19)\n\nThe `dfast_repcode_extension_accepts_exactly_four_byte_rep` fixture\nheader had a 31-char ones-digit ruler labelling positions 0..30 for\na 32-byte fixture. Trimmed the ones-digit row to 32 chars (`0..=31`)\nand extended the tens-digit row to match. Also fixed an off-by-one\nin the inline byte-layout comment: the `\"?\"` segment between the\n`'!'` and the `\"ABCDX\"` block is 10 bytes, not 11, and the trailing\n`\"?\"` block is 4 bytes, not 3. Same math (32 = 8 + 5 + 10 + 5 + 4),\nlabels now accurate.\n\n## Fast-loop call-site coverage (Copilot #20)\n\nThe post-match rep helper call sites inside\n`start_matching_fast_loop` (after both the `ip + 2` rep emit and\nthe `ip0` `best_match` emit) had no direct test — every other test\neither invoked the helper directly or set `use_fast_loop = false`.\n`CompressionLevel::Default` / `Level(3)` enables the fast loop, so\na regression there would silently break the helper on the\nproduction default path.\n\nAdded `dfast_default_level_roundtrip_with_repetitive_breaks_exercises_fast_loop`\nwhich drives the fast loop through the production `compress_to_vec`\n+ `StreamingDecoder` pipeline on a 4 KiB fixture engineered to\nexercise the post-match rep chain (60-byte runs of `'A'` separated\nby single `'B'` break bytes, plus a short trailing `'A'` tail per\ncycle). The breaks terminate the fast loop's primary match early,\nso subsequent iterations have runway for the helper to chain\nadditional reps. Asserts byte-for-byte roundtrip parity and a\nconservative 2:1 ratio floor — a regression breaking the helper\ncall would either invalidate the frames (decode error) or degrade\nthe ratio noticeably.\n\nConstructing `DfastMatchGenerator` directly and asserting on\ncaptured sequences was attempted but the fixture engineering is\nbrittle: the fast loop's primary match on simple constant\nfixtures consumes the entire remaining block in a single Triple,\nleaving no bytes for the helper to extend. The high-level\nroundtrip sidesteps that fragility while still routing through\nthe same call site via the production driver.\n\n## Verification\n\n- nextest 481/481 pass (480 + 1 new test), 3 skipped.\n- clippy --all-targets -D warnings clean.\n\n* fix(encoding): #124 Phase 4 — gate fast-loop test on std + comment corrections\n\nRound-7 review fixes from Copilot on PR #125. Three findings — all\ncomment / test-gating cleanups on the round-6 additions.\n\n## Gate fast-loop roundtrip test on `feature = \"std\"` (Copilot #21)\n\nThe `dfast_default_level_roundtrip_with_repetitive_breaks_exercises_fast_loop`\ntest calls `std::io::Read::read_to_end` on the `StreamingDecoder`,\nbut `StreamingDecoder` implements the crate's `io_nostd::Read`\nalias instead of `std::io::Read` when the `std` feature is off, so\nthe test fails to compile under `cargo check --no-default-features\n--tests`.\n\nThe fast-loop helper itself is exercised under both configurations\nby:\n  * the three direct-call tests above (`*_emits_zero_literal_rep_on_constant_run`,\n    `*_walks_into_retained_history`, `*_accepts_exactly_four_byte_rep`),\n  * the `cross_validation` Default-level roundtrip on the corpus\n    fixture.\n\nGating this single integration test on `feature = \"std\"` loses no\ncoverage and avoids dual-trait rewriting through `crate::io::Read`.\nDoc comment now explains the gate.\n\n## HC fixture chunk positions (Copilot #22)\n\nThe `hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset`\nfixture comment claimed the four `\"abcdefgh\"` chunks start at\n`0/8/16/24`, but each chunk is followed by a unique terminator\nbyte (`'A' / 'B' / 'C' / 'D'`) as part of the same 40-byte stream,\nso the actual chunk starts are `0/9/18/27`. The hand-wiring code\nbelow already uses the `9/18/27` layout. Comment corrected to match.\n\n## `trim_after_budget_retire` invariant comment (Copilot #23)\n\nThe comment claimed `dictionary_retained_budget > 0` was an\ninvariant inside the loop, but the budget can reach zero exactly\nwhen `retire_dictionary_budget` reclaims the last retained bytes —\nand the loop still needs to keep evicting because `max_window_size`\njust shrunk. The discarded retire-return-value is consumed via\n`let _ = …` precisely because the loop termination is driven by\n`evicted_bytes == 0`, not by whether the budget has more to\nreclaim. Comment now describes the prior-shrink condition instead\nof asserting a positive-budget invariant.\n\n## Verification\n\n- nextest 481/481 pass under `--features hash,std,dict_builder`.\n- `cargo check --no-default-features` clean (no-std builds OK).\n- clippy --all-targets -D warnings clean.\n\n* perf(encoding): #124 Phase 4 — hoist Simple matcher borrow out of sequence loop\n\nThe `compress_block::<S>` Simple arm previously read\n`self.simple_mut().next_sequence(...)` inside the `while`\ncondition, which re-evaluated the `MatcherStorage` enum match\n(plus its `unreachable!` guard) on every emitted sequence. On the\nFast backend's hot loop that's per-Triple dispatch overhead the\ncompiler can't easily fold across iterations because the borrow\nonly lives for the condition.\n\nHoist the borrow once: `let matcher = self.simple_mut();` before\nthe `while`, then drive the loop through `matcher`. The storage\nmatch now runs exactly once per block-start, not once per emitted\nsequence.\n\nCode comment added at the call site so future refactors don't\nre-collapse the borrow back into the loop condition.\n\n## Verification\n\n- nextest 481/481 pass.\n- clippy --all-targets -D warnings clean.\n\n* docs(encoding): align non-monotonic gate test doc comment with fixture\n\nThe outer doc comment for\n`hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset`\nstill described the round-5 draft layout (positions 8/16, offsets\n16/8, final best.offset = 8) — but the inner comment + fixture\nwere corrected in round 7 to use positions 9/18/27 (with the\nintervening terminator bytes 'A'/'B'/'C'/'D'), offsets 18/9, and\nfinal `best.offset = 9`. The stale outer block made the rationale\ninconsistent with the code.\n\nUpdated outer doc:\n  * \"pos 9 first (offset 18) and then pos 18 second (offset 9)\"\n  * fixture description names the 4 chunks at `0 / 9 / 18 / 27`\n  * iter trace uses cand_abs 9 (offset 18) → cand_abs 18 (offset 9)\n  * final best.offset = 9\n  * pre-fix trace cites the chunk-terminator byte mismatch\n    (`'A'/'B'/'C'/'D'`) as the gate-fail cause, matching the\n    actual byte arrangement\n\nThe test code itself was already correct — this is a comment-only\ncorrection so no behavioural change. nextest 481/481 still pass.\n\n* docs(encoding): explain why bounds-fail skip in HC gate is sound\n\nAnnotates the `i_end > history_tail || m_end > history_tail` skip in\n`hash_chain_candidate` with the soundness proof: under the\nper-iteration precondition `new_offset >= best.offset`, a new\ncandidate has equal-or-worse `offset_bits` and therefore can only\noutscore `best` by a strictly larger `match_len`. Bounds-fail is\nalgebraically equivalent to `F_max := history_tail - current_idx ≤\nbest.match_len - lit_len`, which bounds every candidate at\n`current_idx` to `match_len ≤ F_max + lit_len ≤ best.match_len` —\nno possible win. Falling through to `common_prefix_len` would only\nrun a wasted walk.\n\nComment-only — no behavioural change. All 7 HC tests still pass.",
+          "timestamp": "2026-05-15T13:27:33+03:00",
+          "tree_id": "b3da762f71d632f8e155236a2e9afb06de6c6b50",
+          "url": "https://github.com/structured-world/structured-zstd/commit/4bf13f034da49b9529053a4ec3038a1c0162c72e"
+        },
+        "date": 1778844713814,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.2,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.017,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 6.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.987,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 6.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.226,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.185,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.198,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.364,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.362,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 5.642,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.738,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 5.575,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.752,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.168,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.175,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.335,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.269,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 16.118,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 15.761,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.333,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.183,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.161,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 3.868,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.224,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.864,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.221,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.174,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.335,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.285,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 1.887,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 1.523,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.59,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.496,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.177,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.363,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.363,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.188,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 7.61,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 6.83,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.177,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.183,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
