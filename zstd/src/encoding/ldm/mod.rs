@@ -399,15 +399,26 @@ impl LdmProducer {
                 }
             }
 
-            // Guarantee forward progress even when `hashed == 0`
-            // (gear_feed in practice always advances by at least
-            // one byte over a non-empty chunk, but the saturating
-            // fallback below keeps the outer `while` loop
-            // monotonic against any future regression).
-            // Both operands of `.max(..)` use `saturating_add` so
-            // `ip_abs` near `usize::MAX` saturates rather than
-            // overflowing the inner `ip_abs + 1`.
-            ip_abs = ip_abs.saturating_add(hashed).max(ip_abs.saturating_add(1));
+            // Guarantee forward progress even when `hashed == 0`:
+            // `gear_feed` always advances by at least one byte
+            // over a non-empty chunk, but `hashed.max(1)` keeps
+            // the outer `while` loop monotonic against any
+            // future regression of that invariant.
+            //
+            // Raw `+` is safe — every callsite reaches LDM via
+            // `bt::prepare_ldm_candidates`, whose
+            // `current_abs_start` / `block_end_abs` are derived
+            // from a `MatchTable` that has already passed
+            // `check_stream_abs_headroom`
+            // (`match_table/storage.rs:50`). That frame-level
+            // guard guarantees `history_abs_start + window_size +
+            // STREAM_ABS_HEADROOM ≤ usize::MAX`, a much stronger
+            // bound than this single-byte add needs. Within the
+            // `while ip_abs < ilimit_abs` loop body the
+            // post-update value also stays ≤ `ilimit_abs ≤
+            // history_abs_start + live_history.len()`, so neither
+            // operand can overflow `usize`.
+            ip_abs += hashed.max(1);
         }
 
         // Donor returns `iend - anchor` (the "leftover" tail),
