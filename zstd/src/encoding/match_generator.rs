@@ -674,14 +674,19 @@ impl MatchGeneratorDriver {
             if evicted_bytes == 0 {
                 break;
             }
-            // Inside this loop, `evicted_bytes != 0` means the backend
-            // had bytes to evict because `max_window_size` was shrunk
-            // by a prior `retire_dictionary_budget` call — so
-            // `dictionary_retained_budget > 0` is the invariant the
-            // outer caller upholds, and the return-value of the retire
-            // call is consumed by `let _ = …` rather than gating the
-            // next loop pass on it (the loop's natural termination is
-            // `evicted_bytes == 0`, not `retire returns false`).
+            // The loop's invariant is "the backend's previous
+            // `max_window_size` shrink had downstream bytes left to
+            // evict" — that's what `evicted_bytes != 0` proves at
+            // this point. `dictionary_retained_budget` is NOT
+            // guaranteed to be positive here: the outer
+            // `retire_dictionary_budget` call may have already
+            // drained it to zero by reclaiming the last retained
+            // bytes, while the backend still has bytes above the
+            // freshly-shrunk window cap waiting for this loop to
+            // evict. The return value of the retire call below is
+            // therefore intentionally discarded — the loop's
+            // termination is driven by `evicted_bytes == 0`, not by
+            // whether the budget has more bytes left to reclaim.
             let _ = self.retire_dictionary_budget(evicted_bytes);
         }
     }

@@ -1116,6 +1116,18 @@ mod extend_with_repcode_tests {
     /// Triple, leaving no bytes for the helper to extend. The
     /// high-level roundtrip sidesteps that fragility while still
     /// routing through the same call site via the production driver.
+    ///
+    /// Gated on `feature = "std"`: the `Read::read_to_end` method
+    /// used to drain `StreamingDecoder` resolves to `std::io::Read`
+    /// only when std is enabled. Under no-std `StreamingDecoder`
+    /// implements the crate's `io_nostd::Read` alias instead, and
+    /// the call site has to be rewritten through that trait. The
+    /// fast-loop helper itself is exercised under both
+    /// configurations by the direct-call tests above plus the
+    /// `cross_validation` Default-level roundtrip — gating this one
+    /// integration test on std loses no coverage, only saves the
+    /// dual-trait rewrite.
+    #[cfg(feature = "std")]
     #[test]
     fn dfast_default_level_roundtrip_with_repetitive_breaks_exercises_fast_loop() {
         // ~4 KiB of input: 64 cycles of [60 'A's, 1 'B', 3 'A's].
@@ -1141,6 +1153,9 @@ mod extend_with_repcode_tests {
         let mut decoder = crate::decoding::StreamingDecoder::new(compressed.as_slice())
             .expect("default-level frame must decode");
         let mut decoded = Vec::with_capacity(data.len());
+        // Under `feature = "std"` (the gate above) `StreamingDecoder`
+        // implements `std::io::Read`, so `Read::read_to_end` resolves
+        // through the standard library's blanket implementation.
         std::io::Read::read_to_end(&mut decoder, &mut decoded)
             .expect("fast-loop output must round-trip cleanly");
         assert_eq!(

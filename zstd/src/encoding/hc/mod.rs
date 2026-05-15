@@ -855,9 +855,14 @@ mod hc_tests {
     /// skipped, leaving `best.offset = 16`.
     #[test]
     fn hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset() {
-        // Four 8-byte chunks: `"abcdefgh"` at 0/8/16/24, terminated by
-        // different bytes (`'A'/'B'/'C'/'D'`) right after so the
-        // forward match between any two chunks caps at exactly 8.
+        // Four 8-byte `"abcdefgh"` chunks, each followed by a unique
+        // terminator byte (`'A' / 'B' / 'C' / 'D'`). The terminators
+        // are part of the same 40-byte stream, so each chunk start
+        // sits 9 bytes after the previous one — chunk starts are at
+        // `0`, `9`, `18`, `27` (not `0/8/16/24` as a naive
+        // chunk-width calculation would suggest). The cross-chunk
+        // forward match between any two chunks caps at exactly 8
+        // because the byte right after each chunk is unique.
         let mut t = MatchTable::new(64);
         t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec();
         assert_eq!(t.history.len(), 40);
