@@ -7,8 +7,11 @@
 //!   input is consumed incrementally from `Read`, so input buffering
 //!   stays bounded; however, the compressed output is buffered in
 //!   memory until the frame is complete so the Frame Content Size
-//!   field can be filled in the header — peak memory is ≈
-//!   `output_size`, independent of input length.
+//!   field can be filled in the header — peak memory is
+//!   `O(compressed_size)` (worst-case `O(input_size)` for
+//!   incompressible payloads, plus a small frame overhead). The
+//!   savings vs [`compress_to_vec`] come from not materialising the
+//!   input alongside the output.
 //! * [`compress_to_vec`] — same one-shot path as [`compress`] but
 //!   the input is eagerly drained into an internal `Vec` first
 //!   (`read_to_end`) so the encoder can be handed a `&[u8]` and a
