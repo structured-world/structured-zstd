@@ -102,7 +102,7 @@ pub(crate) fn level_filter_from_env() -> Option<Vec<String>> {
 pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
     let all = supported_levels();
     let Some(keep) = level_filter_from_env() else {
-        return all.to_vec();
+        return all;
     };
     let known: Vec<&'static str> = all.iter().map(|cfg| cfg.name).collect();
     let unknown: Vec<String> = keep
@@ -121,39 +121,71 @@ pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
         .collect()
 }
 
-pub(crate) fn supported_levels() -> [LevelConfig; 6] {
-    [
-        LevelConfig {
-            name: "fastest",
-            rust_level: CompressionLevel::Fastest,
-            ffi_level: 1,
-        },
-        LevelConfig {
-            name: "default",
-            rust_level: CompressionLevel::Default,
-            ffi_level: 3,
-        },
-        LevelConfig {
-            name: "better",
-            rust_level: CompressionLevel::Better,
-            ffi_level: 7,
-        },
-        LevelConfig {
-            name: "level4-row",
-            rust_level: CompressionLevel::Level(4),
-            ffi_level: 4,
-        },
-        LevelConfig {
-            name: "best",
-            rust_level: CompressionLevel::Best,
-            ffi_level: 11,
-        },
-        LevelConfig {
-            name: "level22",
-            rust_level: CompressionLevel::Level(22),
-            ffi_level: 22,
-        },
-    ]
+/// Bench-side mirror of `StrategyTag::for_compression_level`. Returns
+/// the lowercase tag suffix used in bench IDs and CI shard labels so
+/// the dashboard can render `level -7 :: Fast`, `level 3 :: Dfast`,
+/// `level 22 :: BtUltra2`, etc. without re-deriving the strategy from
+/// the numeric level on the consumer side.
+///
+/// Negative levels share the `fast` ultra-fast strategy (donor maps
+/// any `cParams.cLevel <= 1` to `ZSTD_fast`). The 1..=22 split mirrors
+/// `clevels.h` and `StrategyTag::for_level` exactly.
+fn strategy_suffix(level: i32) -> &'static str {
+    match level {
+        ..=0 => "fast",
+        1 => "fast",
+        2 | 3 => "dfast",
+        4 => "greedy",
+        5..=15 => "lazy",
+        16 | 17 => "btopt",
+        18 | 19 => "btultra",
+        _ => "btultra2",
+    }
+}
+
+/// Canonical bench level inventory: `-7..=-1` (ultra-fast) plus
+/// `1..=22` (the donor advertised range). Level 0 is omitted because
+/// the donor treats it as a sentinel for "use default" (= 3) — a
+/// distinct bench entry would just duplicate level 3's numbers.
+///
+/// Each entry's `name` field is the canonical `level_<N>_<strategy>`
+/// label consumed by:
+///   - bench IDs in criterion output (`compress/level_3_dfast/...`)
+///   - the CI matrix `level:` keys in `.github/workflows/ci.yml`
+///   - the `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` env var
+///
+/// Renaming an entry requires synchronising all three call sites. The
+/// `level_filter_from_env()` panic on unknown names is the safety net
+/// that catches the drift in CI before any silent skips.
+pub(crate) fn supported_levels() -> Vec<LevelConfig> {
+    let mut levels = Vec::with_capacity(29);
+    // Ultra-fast tier: `-7..=-1`. Donor strategy = Fast.
+    for n in -7..=-1i32 {
+        levels.push(LevelConfig {
+            name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
+            rust_level: CompressionLevel::Level(n),
+            ffi_level: n,
+        });
+    }
+    // Standard tier: `1..=22`. Strategy mirrors `clevels.h`.
+    for n in 1..=22i32 {
+        levels.push(LevelConfig {
+            name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
+            rust_level: CompressionLevel::from_level(n),
+            ffi_level: n,
+        });
+    }
+    levels
+}
+
+/// Convert a one-shot owned `String` (built by `format!`) into a
+/// `&'static str`. The leak is deliberate and bounded: `supported_levels()`
+/// is called a handful of times per bench process at most, the leaked
+/// data lives for the rest of the run, and the process exits within
+/// minutes. Keeps `LevelConfig::name: &'static str` simple so bench
+/// IDs can stay `&'static`-friendly inside criterion's helpers.
+fn leak_owned(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
 }
 
 impl Scenario {

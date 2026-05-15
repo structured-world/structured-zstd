@@ -319,13 +319,46 @@ jobs:
       fail-fast: false
       matrix:
         bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
+        # Canonical level inventory: `-7..=-1` (ultra-fast, donor
+        # Fast strategy) plus `1..=22` (donor advertised range with
+        # strategies fast/dfast/greedy/lazy/btopt/btultra/btultra2).
+        # Level 0 is intentionally omitted — donor treats it as a
+        # sentinel for "use default" (= 3) so a dedicated shard
+        # would just duplicate level_3_dfast's numbers. 29 entries ×
+        # 3 targets = 87 shards. Names mirror `supported_levels()`
+        # in `zstd/benches/support/mod.rs`; `level_filter_from_env`
+        # panics on drift so a typo here surfaces in the first
+        # affected shard instead of silently skipping the level.
         level:
-          - fastest
-          - default
-          - better
-          - level4-row
-          - best
-          - level22
+          - level_-7_fast
+          - level_-6_fast
+          - level_-5_fast
+          - level_-4_fast
+          - level_-3_fast
+          - level_-2_fast
+          - level_-1_fast
+          - level_1_fast
+          - level_2_dfast
+          - level_3_dfast
+          - level_4_greedy
+          - level_5_lazy
+          - level_6_lazy
+          - level_7_lazy
+          - level_8_lazy
+          - level_9_lazy
+          - level_10_lazy
+          - level_11_lazy
+          - level_12_lazy
+          - level_13_lazy
+          - level_14_lazy
+          - level_15_lazy
+          - level_16_btopt
+          - level_17_btopt
+          - level_18_btultra
+          - level_19_btultra
+          - level_20_btultra2
+          - level_21_btultra2
+          - level_22_btultra2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
