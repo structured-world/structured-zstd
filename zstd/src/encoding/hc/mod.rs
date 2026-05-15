@@ -693,4 +693,75 @@ mod hc_tests {
         let t = table_with_history(b"abc");
         assert!(hc.find_best_match(&t, 0, 1).is_none());
     }
+
+    /// Regression test for the speculative tail check's
+    /// backward-extension bound. The post-fix formula is
+    /// `tail_off = best.match_len − lit_len − 3` (via
+    /// `checked_sub(lit_len + 3)`); the pre-fix gate used
+    /// `best_ml − 3` directly and over-rejected later chain candidates
+    /// when `lit_len > 0` because `extend_backwards` may have added up
+    /// to `lit_len` backward bytes to `best.match_len`.
+    ///
+    /// The test exercises behavioural parity across `lit_len` values:
+    /// for the same probe position and chain content, the helper must
+    /// return a match length that is *non-decreasing* in `lit_len`,
+    /// because more backward-extension headroom can only enlarge (or
+    /// leave unchanged) every candidate's effective length. A
+    /// regression where the gate skips candidates that backward
+    /// extension would have rescued shows up as `len_high_lit <
+    /// len_low_lit`.
+    ///
+    /// Fixture: a repeating "ABCDEFGH" pattern at idx 0, 8, 16, 24
+    /// inside a 40-byte history. Probing at `abs_pos = 24` finds
+    /// chunks 0, 8, 16 as chain candidates (LIFO order 16 → 8 → 0).
+    /// Every candidate is an 8-byte forward match; the gate is what
+    /// decides whether each is *evaluated*. Without the `lit_len`
+    /// correction, the pre-fix gate would drop the later candidates
+    /// after seeing the first match, even when backward extension
+    /// could grow them.
+    #[test]
+    fn hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension() {
+        let mut t = MatchTable::new(64);
+        t.history = b"ABCDEFGHABCDEFGHABCDEFGHABCDEFGHZZZZZZZZ".to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(t.history.clone());
+        t.insert_positions(0, 24);
+
+        let hc = HcMatcher::new(2, 16, 64);
+
+        let len_for = |lit_len: usize| -> usize {
+            hc.hash_chain_candidate(&t, 24, lit_len)
+                .map(|c| c.match_len)
+                .unwrap_or(0)
+        };
+
+        let len0 = len_for(0);
+        let len1 = len_for(1);
+        let len4 = len_for(4);
+
+        assert!(
+            len0 >= 4,
+            "lit_len=0 must still find at least a 4-byte (HC_MIN_MATCH_LEN) \
+             chain match on the repeating fixture, got {len0}"
+        );
+        assert!(
+            len1 >= len0,
+            "monotonicity violation: lit_len=1 returned shorter match than \
+             lit_len=0 ({len1} < {len0}) — speculative gate must not drop \
+             candidates that backward extension could rescue"
+        );
+        assert!(
+            len4 >= len1,
+            "monotonicity violation: lit_len=4 returned shorter match than \
+             lit_len=1 ({len4} < {len1}) — speculative gate's `lit_len` term \
+             must widen, not narrow, the candidate set as headroom grows"
+        );
+    }
 }

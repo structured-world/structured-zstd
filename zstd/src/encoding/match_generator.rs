@@ -5047,15 +5047,19 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     driver.skip_matching_with_hint(None);
 
     // Switch to Fastest — the [`MatcherStorage`] enum swaps to the
-    // `Simple` variant and drops the `HashChain` variant entirely (the
-    // HC reset closure pre-drop pushes any retained data buffers into
-    // `vec_pool`, and the `hash_table` / `chain_table` / `hash3_table`
-    // are emptied by hand before drop so their backing allocations
-    // release immediately rather than waiting for the variant's `Drop`
-    // to run on the way out of the swap). Post-switch the HC variant
-    // no longer exists — there is nothing to inspect by accessor; the
-    // assertion that storage is now `Simple` covers the invariant the
-    // old hash_table/chain_table checks were proxying for.
+    // `Simple` variant and the `HashChain` variant is dropped. The
+    // drain block in `Matcher::reset` reassigns
+    // `m.table.hash_table` / `chain_table` / `hash3_table` to
+    // `Vec::new()` BEFORE constructing the replacement variant so the
+    // table backing allocations are released up front — this caps
+    // peak memory during the swap to "old data buffers being drained
+    // into `vec_pool` + new `MatchGenerator` skeleton" rather than
+    // "old tables still resident + new variant under construction".
+    // The eventual `Drop` on the old variant would release the tables
+    // anyway, but only after the new variant is built, so the early
+    // reassign shifts the peak. Post-switch the HC variant no longer
+    // exists; the assertion that storage is now `Simple` covers the
+    // invariant the old hash_table/chain_table checks were proxying.
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), (1u64 << 17));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);

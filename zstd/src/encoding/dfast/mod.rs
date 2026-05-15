@@ -450,11 +450,21 @@ impl DfastMatchGenerator {
             // on the next sequence is zero — donor's rep probe uses
             // `offset_2` (== `offset_hist[1]` under our encoding).
             let rep = self.offset_hist[1] as usize;
-            if rep == 0 || rep > pos {
+            if rep == 0 {
                 break;
             }
             let abs_pos = current_abs_start + pos;
             let cur_idx = abs_pos - self.history_abs_start;
+            // `checked_sub` is the authoritative bound here: a valid rep
+            // can reach beyond the current block into retained history
+            // (the contiguous `live_history()` buffer covers
+            // `history_abs_start..history_abs_end`), so the only hard
+            // constraint is `cur_idx >= rep` (i.e. the candidate is in
+            // the addressable history range). A previous draft also
+            // gated on `rep > pos`, which over-rejected valid offsets
+            // that point into retained history near block boundaries —
+            // exactly the donor-style chain win this helper is meant to
+            // recover.
             let cand_idx = match cur_idx.checked_sub(rep) {
                 Some(idx) => idx,
                 None => break,
@@ -808,5 +818,198 @@ impl DfastMatchGenerator {
     fn hash_index(&self, value: u64) -> usize {
         let mixed = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
         (mixed >> (64 - self.hash_bits)) as usize
+    }
+}
+
+#[cfg(test)]
+mod extend_with_repcode_tests {
+    //! Targeted regression coverage for `extend_with_repcode_after_match`.
+    //!
+    //! These tests intentionally bypass the higher-level
+    //! `compress_to_vec` roundtrip path used by `cross_validation` so
+    //! that a failure pinpoints the post-match rep helper rather than
+    //! firing somewhere downstream (block writer / huff0 / FSE / decode).
+    //! The capture closure records the exact sequence stream the matcher
+    //! emits, which is what the assertions check.
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    /// Capture every sequence the matcher emits into an owned record,
+    /// so the assertions can match on `lit_len` / `offset` / `match_len`
+    /// shape directly. `Sequence::Triple` carries borrowed literals; we
+    /// take their length and discard the bytes (the test only cares
+    /// about the structural shape, not the literal content).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CapturedSeq {
+        Triple {
+            lit_len: usize,
+            offset: usize,
+            match_len: usize,
+        },
+        Literals {
+            lit_len: usize,
+        },
+    }
+
+    fn record_seq<'a>(out: &'a mut Vec<CapturedSeq>) -> impl FnMut(Sequence<'_>) + 'a {
+        move |seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => out.push(CapturedSeq::Triple {
+                lit_len: literals.len(),
+                offset,
+                match_len,
+            }),
+            Sequence::Literals { literals } => out.push(CapturedSeq::Literals {
+                lit_len: literals.len(),
+            }),
+        }
+    }
+
+    fn build_dfast_with(data: &[u8]) -> DfastMatchGenerator {
+        // Window sized to the block so the matcher does not start
+        // trimming history mid-test.
+        let mut dfast = DfastMatchGenerator::new(data.len().next_power_of_two().max(64));
+        dfast.use_fast_loop = false; // exercise `start_matching_general`
+        dfast.ensure_hash_tables();
+        dfast.add_data(data.to_vec(), |_| {});
+        dfast
+    }
+
+    /// Direct call into [`DfastMatchGenerator::extend_with_repcode_after_match`]
+    /// with a hand-built post-primary-match state. Going through
+    /// `start_matching` is unreliable for this assertion because the
+    /// primary `best_match` greedily consumes a constant run in a
+    /// single `Triple` (offset 1, match_len = block - 1), leaving the
+    /// helper nothing to extend. Instead we set up the state the
+    /// helper expects after a primary emit and verify it chains
+    /// rep-0 sequences for as many bytes as the rep predicate
+    /// matches.
+    #[test]
+    fn dfast_repcode_extension_emits_zero_literal_rep_on_constant_run() {
+        let data: Vec<u8> = vec![b'A'; 64];
+        let mut dfast = build_dfast_with(&data);
+
+        // Post-primary-match state: pretend a previous sequence emitted
+        // with offset = 4 (`offset_hist[0]`). Under the donor swap the
+        // post-match rep probe consults `offset_hist[1]`, here set to
+        // 1 so every subsequent byte (constant 'A') matches its
+        // predecessor.
+        dfast.offset_hist = [4, 1, 8];
+        let current_abs_start = dfast.history_abs_start + dfast.window_size - data.len();
+        let current_len = data.len();
+        // Start the helper mid-block; the leading bytes are the
+        // "literals + match" the (simulated) primary would have
+        // covered. `literals_start == pos` is the post-emit invariant
+        // — `lit_len` for the next sequence is zero.
+        let pos = 10usize;
+        let mut literals_start = pos;
+
+        let mut seqs = Vec::new();
+        let new_pos = {
+            let mut rec = record_seq(&mut seqs);
+            dfast.extend_with_repcode_after_match(
+                current_abs_start,
+                current_len,
+                pos,
+                &mut literals_start,
+                &mut rec,
+            )
+        };
+
+        assert!(
+            new_pos > pos,
+            "helper must advance pos past at least one rep match \
+             (pos={pos}, new_pos={new_pos})"
+        );
+        assert_eq!(
+            literals_start, new_pos,
+            "helper must keep literals_start == new_pos so the caller's main \
+             loop sees zero pending literals after the rep chain"
+        );
+        assert!(!seqs.is_empty(), "helper must emit at least one Triple");
+        for seq in &seqs {
+            match seq {
+                CapturedSeq::Triple {
+                    lit_len,
+                    offset,
+                    match_len: _,
+                } => {
+                    assert_eq!(
+                        *lit_len, 0,
+                        "rep emission must be zero-literal (got {seq:?})"
+                    );
+                    assert_eq!(
+                        *offset, 1,
+                        "rep emission must use the swapped-in offset_hist[1] = 1 \
+                         (got {seq:?})"
+                    );
+                }
+                CapturedSeq::Literals { .. } => {
+                    panic!("rep extension must not emit a Literals tail: {seq:?}");
+                }
+            }
+        }
+    }
+
+    /// Cross-block / retained-history case: probe with `offset > pos`
+    /// (where `pos` is block-local) so the candidate lives in retained
+    /// history from a previously committed block. The
+    /// CodeRabbit-flagged `rep > pos` guard would have rejected
+    /// exactly this path — the current implementation only gates on
+    /// `cur_idx.checked_sub(rep)` so the helper accepts the cross-
+    /// block offset and emits the rep sequence.
+    #[test]
+    fn dfast_repcode_extension_walks_into_retained_history() {
+        let block_a: Vec<u8> = vec![b'C'; 64];
+        let block_b: Vec<u8> = vec![b'C'; 32];
+        let mut dfast = DfastMatchGenerator::new(256);
+        dfast.use_fast_loop = false;
+        dfast.ensure_hash_tables();
+        dfast.add_data(block_a, |_| {});
+        dfast.add_data(block_b.clone(), |_| {});
+
+        // Post-primary-match state targeting cross-block rep: probe
+        // offset = 40 (a candidate inside block A bytes), block-local
+        // cursor = 5 (so `rep > pos` under the rejected guard).
+        dfast.offset_hist = [4, 40, 8];
+        let current_len = block_b.len();
+        let current_abs_start = dfast.history_abs_start + dfast.window_size - current_len;
+        let pos = 5usize;
+        let mut literals_start = pos;
+
+        let mut seqs = Vec::new();
+        let new_pos = {
+            let mut rec = record_seq(&mut seqs);
+            dfast.extend_with_repcode_after_match(
+                current_abs_start,
+                current_len,
+                pos,
+                &mut literals_start,
+                &mut rec,
+            )
+        };
+
+        assert!(
+            new_pos > pos,
+            "rep with offset > block-local pos must still emit a match when the \
+             candidate lives in retained history (pos={pos}, new_pos={new_pos})"
+        );
+        assert_eq!(seqs.len(), 1, "expected one rep emit, got {seqs:?}");
+        match &seqs[0] {
+            CapturedSeq::Triple {
+                lit_len,
+                offset,
+                match_len: _,
+            } => {
+                assert_eq!(*lit_len, 0, "rep emit must be zero-literal");
+                assert_eq!(*offset, 40, "rep emit must use the cross-block offset 40");
+            }
+            other => panic!("expected Triple, got {other:?}"),
+        }
     }
 }
