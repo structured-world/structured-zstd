@@ -2969,9 +2969,28 @@ impl HcMatchGenerator {
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
-        self.backend
-            .bt_mut()
-            .prepare_ldm_candidates(current_abs_start, current_len);
+        // Borrow split: `prepare_ldm_candidates` needs immutable
+        // access to the live history (the post-`history_start`
+        // slice of `self.table.history`) while it mutates the LDM
+        // bucket table owned by `self.backend.bt_mut()`. Both live
+        // in disjoint fields of `Self`, so we capture the slice +
+        // its base before reaching for `bt_mut()`.
+        //
+        // The producer operates in absolute stream coordinates
+        // throughout; `live_history[0]` corresponds to absolute
+        // `history_abs_start` (donor `base + dictLimit`), and the
+        // abs→slice translation happens inside the producer at
+        // each `live_history[..]` access. Passing the full
+        // `history` Vec would index into the dead prefix (the
+        // bytes already retired past `history_start`).
+        let live_history = self.table.live_history();
+        let history_abs_start = self.table.history_abs_start;
+        self.backend.bt_mut().prepare_ldm_candidates(
+            live_history,
+            history_abs_start,
+            current_abs_start,
+            current_len,
+        );
 
         if self.should_run_btultra2_seed_pass::<S>(current_len) {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);

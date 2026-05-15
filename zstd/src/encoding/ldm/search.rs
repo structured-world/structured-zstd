@@ -1,0 +1,599 @@
+//! Bucket lookup + forward / backward extension for the LDM
+//! producer.
+//!
+//! Implements the per-split candidate selection from donor
+//! `ZSTD_ldm_generateSequences_internal` (`zstd_ldm.c:405-466`)
+//! v1.5.7, **prefix-only path**. The two-segment `extDict`
+//! variant (donor `ZSTD_count_2segments` +
+//! `ZSTD_ldm_countBackwardsMatch_2segments`) is deferred — the
+//! current Rust encoder does not surface a separate `extDict`
+//! buffer, so every byte the producer can reach lives in a
+//! single contiguous `history` slice and the prefix-only path
+//! is bit-for-bit equivalent to donor on those inputs.
+//!
+//! Donor parity anchors:
+//! * `ZSTD_count`                        → [`super::super::match_table::helpers::common_prefix_len`]
+//! * `ZSTD_ldm_countBackwardsMatch`      → [`count_backwards_match`]
+//! * Per-bucket best-match selection     → [`find_best_match`]
+
+use super::super::match_table::helpers::common_prefix_len;
+use super::table::LdmHashTable;
+
+/// Result of [`find_best_match`]: a verified LDM candidate.
+///
+/// Holds the *resolved* forward and backward lengths separately
+/// because the caller needs both to derive the emitted raw-seq
+/// `lit_length` (`split - backward - anchor`) and the wire-format
+/// match length (`forward + backward`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LdmMatch {
+    /// **Absolute** byte position of the matching window's start
+    /// in the back reference (donor `bestEntry->offset`). Stored
+    /// as `usize` so streams larger than `u32::MAX` (4 GiB) stay
+    /// representable end-to-end; the table rebases its internal
+    /// `u32` storage transparently via
+    /// [`LdmHashTable::ensure_room_for`].
+    pub(crate) match_pos: usize,
+    /// Bytes that matched forward from `split`.
+    pub(crate) forward_len: usize,
+    /// Bytes that matched backward from `split` (capped by
+    /// `split - anchor` and by `match_pos > lowest_index`).
+    pub(crate) backward_len: usize,
+}
+
+impl LdmMatch {
+    /// Total match length emitted on the wire. Donor
+    /// `mLength = forwardMatchLength + backwardMatchLength`
+    /// (`zstd_ldm.c:477`).
+    pub(crate) const fn total_len(&self) -> usize {
+        self.forward_len + self.backward_len
+    }
+}
+
+/// Donor `ZSTD_ldm_countBackwardsMatch` (`zstd_ldm.c:214-225`):
+/// walk left from `(p_in, p_match)` while bytes still match and
+/// both pointers stay above their respective lower bounds.
+///
+/// Bounds expressed as **slice indices** into `history`: the
+/// caller is expected to translate absolute stream positions to
+/// slice indices via `abs - history_abs_start` before invoking.
+/// `p_in_idx` is the candidate's "split" index, `p_match_idx`
+/// is the back-ref index; `anchor_idx` / `match_base_idx` are
+/// the corresponding lower bounds. The walk stops when either
+/// pointer reaches its bound or the bytes diverge.
+///
+/// Returns the number of matched backward bytes (capped at the
+/// tighter of `min(p_in_idx - anchor_idx, p_match_idx -
+/// match_base_idx)`).
+pub(crate) fn count_backwards_match(
+    history: &[u8],
+    p_in_idx: usize,
+    anchor_idx: usize,
+    p_match_idx: usize,
+    match_base_idx: usize,
+) -> usize {
+    debug_assert!(p_in_idx <= history.len());
+    debug_assert!(p_match_idx <= history.len());
+    debug_assert!(anchor_idx <= p_in_idx);
+    debug_assert!(match_base_idx <= p_match_idx);
+
+    let mut p_in = p_in_idx;
+    let mut p_match = p_match_idx;
+    let mut len = 0usize;
+    while p_in > anchor_idx && p_match > match_base_idx && history[p_in - 1] == history[p_match - 1]
+    {
+        p_in -= 1;
+        p_match -= 1;
+        len += 1;
+    }
+    len
+}
+
+/// Per-call inputs to [`find_best_match`]. Bundled into a struct
+/// so the public function avoids the `clippy::too_many_arguments`
+/// trip-wire while keeping each input clearly named (every field
+/// has a distinct semantic role; merging would obscure the donor
+/// citations).
+///
+/// All positional fields are **absolute stream coordinates** —
+/// stable across window evictions. `live_history` carries the
+/// concrete byte slice corresponding to the absolute range
+/// `[history_abs_start, history_abs_start + live_history.len())`;
+/// the function performs the abs→slice translation internally so
+/// the bucket entries (which `LdmProducer` stores in absolute
+/// coordinates by design) remain valid after a window slide.
+pub(crate) struct FindBestMatchInputs<'a> {
+    /// Live history slice (donor: `base + dictLimit .. iend`).
+    /// `live_history[0]` is the byte at absolute position
+    /// `history_abs_start`.
+    pub(crate) live_history: &'a [u8],
+    /// Absolute stream position of `live_history[0]`. Subtracted
+    /// from every absolute position before indexing into the
+    /// slice.
+    pub(crate) history_abs_start: usize,
+    /// Absolute stream position of the candidate window's start.
+    /// Donor `split` (as an absolute index relative to `base`).
+    pub(crate) split_abs: usize,
+    /// Absolute stream position of the leftmost byte the producer
+    /// is still allowed to emit as literal — the previous emitted
+    /// match's post-match boundary or the block start at frame
+    /// entry. Donor `anchor`.
+    pub(crate) anchor_abs: usize,
+    /// **Inclusive** lower bound: entries with absolute `offset <
+    /// lowest_index_abs` are stale and rejected, entries with
+    /// `offset >= lowest_index_abs` survive. Conceptually the
+    /// "lowest still-live absolute position" — the caller passes
+    /// `history_abs_start` so a candidate at the very left edge
+    /// of the live window (`live_history[0]`, absolute
+    /// `history_abs_start`) remains matchable. Stored as `usize`
+    /// so the comparison stays valid above the `u32` boundary
+    /// (the table itself rebases internally).
+    ///
+    /// Semantic deviation from donor `zstd_ldm.c:431` — donor's
+    /// `cur->offset <= lowestIndex` is an exclusive lower bound
+    /// where `lowestIndex` itself is rejected. We use the inclusive
+    /// form because our internal coordinate space (absolute
+    /// stream position, +1-biased relative offset in the
+    /// rebase-aware table) already differs from donor; flipping
+    /// the comparison removes the need for a
+    /// `history_abs_start.saturating_sub(1)` adjustment at every
+    /// callsite.
+    pub(crate) lowest_index_abs: usize,
+    /// Absolute stream position one past the last byte the
+    /// forward match is allowed to reach. Donor `iend` (the
+    /// caller-supplied `block_end_abs`); the forward count is
+    /// clamped to `iend_abs - split_abs` bytes so a match cannot
+    /// extend past the current block's scan boundary even if
+    /// `live_history` happens to contain matching bytes beyond
+    /// it. Must satisfy `iend_abs >= split_abs` and
+    /// `iend_abs <= history_abs_start + live_history.len()`.
+    pub(crate) iend_abs: usize,
+    /// Donor `params->minMatchLength` — forward matches shorter
+    /// than this floor are filtered out.
+    pub(crate) min_match_length: usize,
+}
+
+/// Walk every slot of the bucket associated with `hash_id`, scoring
+/// each entry by `forward + backward` match length, and return the
+/// best candidate strictly above the donor's
+/// `forward >= min_match_length` floor. Returns `None` when no
+/// bucket entry survives the filter.
+///
+/// Mirrors the per-split inner loop in
+/// `ZSTD_ldm_generateSequences_internal` (`zstd_ldm.c:405-466`)
+/// prefix-only path. The caller must pre-resolve `hash_id` via
+/// [`LdmHashTable::bucket_mask`]. All positions in
+/// [`FindBestMatchInputs`] are absolute stream coordinates; the
+/// returned [`LdmMatch::match_pos`] is also absolute.
+pub(crate) fn find_best_match(
+    table: &LdmHashTable,
+    hash_id: u32,
+    checksum: u32,
+    inputs: FindBestMatchInputs<'_>,
+) -> Option<LdmMatch> {
+    let FindBestMatchInputs {
+        live_history,
+        history_abs_start,
+        split_abs,
+        anchor_abs,
+        lowest_index_abs,
+        iend_abs,
+        min_match_length,
+    } = inputs;
+    debug_assert!(history_abs_start <= split_abs);
+    debug_assert!(split_abs <= history_abs_start + live_history.len());
+    debug_assert!(anchor_abs <= split_abs);
+    debug_assert!(history_abs_start <= anchor_abs);
+    debug_assert!(split_abs <= iend_abs);
+    debug_assert!(iend_abs <= history_abs_start + live_history.len());
+
+    let bucket = table.bucket(hash_id);
+    let mut best: Option<LdmMatch> = None;
+    let history_abs_end = history_abs_start + live_history.len();
+    // Translate split_abs / iend_abs to indices into `live_history`
+    // once; every forward comparison reuses them. `split_idx_end`
+    // caps the forward slice so a match cannot extend past the
+    // current block's scan boundary even if matching bytes happen
+    // to live beyond it — donor `ZSTD_count(split, pMatch, iend)`
+    // is bounded by `iend`.
+    let split_idx = split_abs - history_abs_start;
+    let split_idx_end = iend_abs - history_abs_start;
+
+    for entry in bucket {
+        // Donor `zstd_ldm.c:431`: skip stale or wrong-checksum
+        // entries. `table.resolve` filters the empty-slot
+        // sentinel (`entry.offset == 0`) and translates the
+        // stored relative offset back to an absolute stream
+        // position so the staleness threshold can be compared
+        // directly even past the `u32` rebase boundary.
+        if entry.checksum != checksum {
+            continue;
+        }
+        let Some(match_abs) = table.resolve(entry) else {
+            continue;
+        };
+        // Inclusive lower bound (see `FindBestMatchInputs::
+        // lowest_index_abs` docs). `match_abs >=
+        // lowest_index_abs` survives; everything below the live
+        // window is filtered.
+        if match_abs < lowest_index_abs {
+            continue;
+        }
+        // Out-of-window guard: an entry above `history_abs_end`
+        // (caller misuse or a torn write race in a future
+        // concurrent caller) would index past `live_history`.
+        if match_abs < history_abs_start || match_abs >= history_abs_end {
+            continue;
+        }
+        // Back-reference ordering guard: a back-reference must
+        // point at bytes that already exist (`match_abs <
+        // split_abs`). In normal producer operation every entry
+        // in the bucket was inserted at a position strictly less
+        // than the current `split_abs` (the producer's `insert
+        // _absolute` runs AFTER `find_best_match`, and the outer
+        // loop's `split_abs` increases monotonically), so this
+        // check is structurally redundant. Keeping it explicit
+        // hardens against future direct callers (custom tables
+        // injected via test fixtures, an eventual `extDict`
+        // path) where `match_abs == split_abs` would emit
+        // `offset = 0` (invalid back-ref) and `match_abs >
+        // split_abs` would underflow the unsigned subtraction in
+        // the producer's `offset = split_abs − best.match_pos`.
+        if match_abs >= split_abs {
+            continue;
+        }
+        let match_idx = match_abs - history_abs_start;
+
+        // Forward match: bytes that compare equal starting from
+        // `split` vs `match_pos`. Donor `ZSTD_count(split, pMatch,
+        // iend)` — bounded by `iend`, so we cap the `split` slice
+        // at `split_idx_end`. The match slice is bounded only by
+        // `live_history.len()` because back-references into the
+        // history before the current block are legitimate (donor
+        // `pMatch < iend` is automatically true when the entry's
+        // absolute offset is below `iend_abs`).
+        let forward_len = common_prefix_len(
+            &live_history[split_idx..split_idx_end],
+            &live_history[match_idx..],
+        );
+        if forward_len < min_match_length {
+            continue;
+        }
+
+        // Backward match: walk left as far as both `anchor`-bound
+        // and `low_prefix`-bound (the absolute start of the live
+        // history) permit. Donor `zstd_ldm.c:455-456`.
+        let backward_len = count_backwards_match(
+            live_history,
+            split_idx,
+            anchor_abs - history_abs_start,
+            match_idx,
+            0, // live_history[0] IS the low-prefix pointer in slice coords
+        );
+
+        let candidate = LdmMatch {
+            match_pos: match_abs,
+            forward_len,
+            backward_len,
+        };
+        match best {
+            Some(b) if candidate.total_len() <= b.total_len() => {}
+            _ => best = Some(candidate),
+        }
+    }
+
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::ldm::table::LdmHashTable;
+
+    fn fresh_table() -> LdmHashTable {
+        // 4-bucket × 4-slot table — small enough that we can
+        // hand-place candidates in known slots.
+        LdmHashTable::new(4, 2)
+    }
+
+    /// `count_backwards_match` honours both lower bounds and
+    /// stops on the first mismatch. Fixture: "XXXabc" matches
+    /// "YYYabc" with 3 backward bytes from offset 3 in each.
+    #[test]
+    fn count_backwards_match_walks_until_mismatch_or_bound() {
+        // history = "abc__abc"  positions: 0..3 = "abc",
+        //                                  3..5 = "__",
+        //                                  5..8 = "abc".
+        // Backwards walk from p_in=8 (after "abc") and p_match=3
+        // (after the first "abc") should match the 3 bytes
+        // "abc".
+        let history = b"abc__abc";
+        let len = count_backwards_match(history, 8, 0, 3, 0);
+        assert_eq!(len, 3);
+
+        // Mismatch on the 4th byte back: '_' (history[4]) vs
+        // nothing in the first window — the walk hits the
+        // match_base_abs bound (0) earlier on the match side.
+        let len2 = count_backwards_match(history, 5, 0, 0, 0);
+        // p_match starts at 0 → match_base bound reached
+        // immediately → 0 bytes matched.
+        assert_eq!(len2, 0);
+    }
+
+    /// `anchor_abs` caps the backward walk on the in-stream side.
+    #[test]
+    fn count_backwards_match_respects_anchor_bound() {
+        let history = b"aaaaaaaa";
+        // anchor at position 5 → only 1 byte of leftward room.
+        let len = count_backwards_match(history, 6, 5, 4, 0);
+        assert_eq!(len, 1);
+    }
+
+    /// Bucket lookup returns `None` when every slot mismatches
+    /// the checksum.
+    #[test]
+    fn find_best_match_returns_none_on_checksum_mismatch() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0x1111_1111);
+        let history = b"abcdefghabcdefgh";
+        let m = find_best_match(
+            &table,
+            1,
+            0xDEAD_BEEF,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 8,
+                anchor_abs: 0,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m.is_none(), "wrong checksum must be filtered out");
+    }
+
+    /// Bucket lookup returns `None` when the offset is strictly
+    /// below `lowest_index_abs` (inclusive lower bound — entries
+    /// at exactly `lowest_index_abs` survive, entries below are
+    /// stale).
+    #[test]
+    fn find_best_match_rejects_stale_entries() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0xCAFE);
+        let history = b"abcdefghabcdefgh";
+        // lowest_index_abs = 5 → entry offset 4 is strictly below
+        // → rejected. (At lowest_index_abs = 4 the entry would
+        // exactly meet the floor and survive — that's the edge
+        // case the inclusive bound is designed to preserve.)
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 8,
+                anchor_abs: 0,
+                lowest_index_abs: 5,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m.is_none(), "stale entry must be filtered out");
+    }
+
+    /// `find_best_match` returns the longest combined
+    /// forward+backward match across the bucket. Engineered
+    /// fixture: a 4-byte preamble (so the donor `offset > 0`
+    /// staleness floor is satisfied — entry.offset == 0 is the
+    /// reserved "empty slot" sentinel) followed by two
+    /// repetitions of "abcdefgh". The single candidate at
+    /// offset 4 should produce forward 8 + backward 0 = 8.
+    #[test]
+    fn find_best_match_picks_longest_combined_match() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0xCAFE);
+        let history = b"PPPPabcdefghabcdefgh";
+        // split at position 12, anchor at 12 → no backward room.
+        // The forward count should match 8 bytes ("abcdefgh").
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        )
+        .expect("a valid candidate must be found");
+        assert_eq!(m.match_pos, 4);
+        assert_eq!(m.forward_len, 8);
+        assert_eq!(m.backward_len, 0);
+        assert_eq!(m.total_len(), 8);
+    }
+
+    /// Backward extension picks up the bytes BEFORE `split` when
+    /// `anchor` allows. Fixture: "XYabcdefghXYabcdefgh" — split
+    /// at position 12 ('a'), anchor at 10 ('X') gives 2 bytes of
+    /// backward room ("XY"). Forward 8 + backward 2 = total 10.
+    #[test]
+    fn find_best_match_extends_backwards_into_pre_split_bytes() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 2, 0xCAFE);
+        let history = b"XYabcdefghXYabcdefgh";
+        // split at 12 (start of second "abcdefgh"), anchor at 10
+        // → backward up to 2 bytes ("XY" at positions 10..12 vs
+        // 0..2). Forward count: 8 bytes ("abcdefgh").
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 10,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        )
+        .expect("a valid candidate must be found");
+        assert_eq!(m.match_pos, 2);
+        assert_eq!(m.forward_len, 8);
+        assert_eq!(m.backward_len, 2);
+        assert_eq!(m.total_len(), 10);
+    }
+
+    /// When the bucket holds multiple valid candidates the longer
+    /// combined match wins, regardless of slot order. Preamble
+    /// bytes shift both candidate offsets above the donor `offset
+    /// > 0` floor.
+    #[test]
+    fn find_best_match_prefers_longer_total_across_slots() {
+        let mut table = fresh_table();
+        // Slot 0: offset 4 (short forward match — only 4 bytes).
+        table.insert_absolute(1, 4, 0xCAFE);
+        // Slot 1: offset 8 (8-byte match — extends further forward).
+        table.insert_absolute(1, 8, 0xCAFE);
+        let history = b"PPPPabcdabcdefghabcdefgh";
+        // split at position 16 ('a' of trailing block). Match at
+        // offset 8 ("abcdefgh") gives 8 bytes forward; match at
+        // offset 4 ("abcdabcd...") gives only 4 bytes forward
+        // because the 5th byte ('a' vs 'e') mismatches.
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 16,
+                anchor_abs: 16,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        )
+        .expect("a valid candidate must be found");
+        assert_eq!(m.match_pos, 8, "longer-forward winner must be picked");
+        assert_eq!(m.forward_len, 8);
+    }
+
+    /// `find_best_match` must reject entries at or past
+    /// `split_abs` so the producer's `offset = split_abs −
+    /// match_pos` never underflows / emits a zero back-reference.
+    /// Regression for PR #139 round-9 review.
+    #[test]
+    fn find_best_match_rejects_entries_at_or_past_split() {
+        let mut table = fresh_table();
+        // Inject a stray entry at exactly `split_abs` — would be
+        // structurally impossible from `LdmProducer::generate_into`
+        // (inserts happen after the lookup) but possible from a
+        // direct caller / test fixture / future extDict variant.
+        table.insert_absolute(1, 12, 0xCAFE);
+        let history = b"PPPPabcdefghabcdefgh";
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m.is_none(), "entry at split_abs must be rejected");
+
+        // Same fixture but entry at strictly past split — also
+        // must be rejected.
+        let mut table_after = fresh_table();
+        table_after.insert_absolute(1, 16, 0xCAFE);
+        let m_after = find_best_match(
+            &table_after,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m_after.is_none(), "entry past split_abs must be rejected");
+    }
+
+    /// Forward count must respect `iend_abs` — even when matching
+    /// bytes continue past the block end inside `live_history`,
+    /// `forward_len` is capped at `iend_abs - split_abs`.
+    /// Regression for PR #139 round-7 review.
+    #[test]
+    fn find_best_match_forward_count_is_bounded_by_iend_abs() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0xCAFE);
+        // 4 preamble bytes + two 8-byte "abcdefgh" runs = 20 bytes.
+        // Without iend_abs cap the match at split=12 vs match=4
+        // would return forward_len = 8 ("abcdefgh"). With
+        // iend_abs = 16 (4 bytes past the split) the match must
+        // cap at 4.
+        let history = b"PPPPabcdefghabcdefgh";
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: 16, // cap: only 4 forward bytes allowed
+                min_match_length: 4,
+            },
+        )
+        .expect("a 4-byte forward match still passes the min_match floor");
+        assert_eq!(
+            m.forward_len, 4,
+            "forward count must cap at iend_abs - split_abs"
+        );
+    }
+
+    /// Forward match below `min_match_length` is rejected even
+    /// when the checksum agrees (donor `zstd_ldm.c:444/452`).
+    #[test]
+    fn find_best_match_filters_short_forward_matches() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0xCAFE);
+        let history = b"PPPPabXXXXXXab";
+        // 2-byte forward match from split=12 vs match=4, but
+        // min_match_length = 4 → rejected.
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m.is_none());
+    }
+}

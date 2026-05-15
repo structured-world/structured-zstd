@@ -1,4 +1,42 @@
-//! Structures and utilities used for compressing/encoding data into the Zstd format.
+//! Zstandard encoder — frame compression, streaming, dictionary support.
+//!
+//! Four entry points cover the common use cases:
+//!
+//! * [`compress`] — one-shot helper that builds a self-contained
+//!   Zstandard frame from a `Read` source to a `Write` sink. The
+//!   input is consumed incrementally from `Read`, so input buffering
+//!   stays bounded; however, the compressed output is buffered in
+//!   memory until the frame is complete so the Frame Content Size
+//!   field can be filled in the header — peak memory is
+//!   `O(compressed_size)` (worst-case `O(input_size)` for
+//!   incompressible payloads, plus a small frame overhead). The
+//!   savings vs [`compress_to_vec`] come from not materialising the
+//!   input alongside the output.
+//! * [`compress_to_vec`] — same one-shot path as [`compress`] but
+//!   the input is eagerly drained into an internal `Vec` first
+//!   (`read_to_end`) so the encoder can be handed a `&[u8]` and a
+//!   precise source-size hint. Peak memory is therefore ≈
+//!   `input_size + output_size`; prefer [`compress`] or
+//!   [`StreamingEncoder`] when the input is large or unbounded.
+//! * [`StreamingEncoder`] — implements [`crate::io::Write`], which
+//!   re-exports [`std::io::Write`] under the `std` feature and falls
+//!   back to a `no_std`-friendly trait otherwise. Accepts bytes
+//!   incrementally and flushes compressed output as blocks fill.
+//!   Requires `set_pledged_content_size` before the first write if
+//!   the Frame Content Size field is to be populated.
+//! * [`FrameCompressor`] — lower-level builder that owns the matcher and
+//!   the per-frame configuration; the streaming and one-shot helpers are
+//!   thin wrappers over it. Reach for it when you need to swap in a custom
+//!   [`Matcher`] implementation or share the matcher across frames.
+//!
+//! Compression intensity is selected via [`CompressionLevel`], which
+//! provides both named presets (`Fastest`, `Default`, `Better`, `Best`) and
+//! numeric levels (`from_level(n)`) that mirror C zstd's level numbering
+//! (negative for ultra-fast, `0` = default, `1..=22` for the standard
+//! range).
+//!
+//! All produced frames are valid RFC 8878 Zstandard streams and decode
+//! through both this crate's [`crate::decoding`] module and upstream C zstd.
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
@@ -22,6 +60,20 @@ pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
+// LDM uses `twox_hash::XxHash64` (per-window XXH64 over the
+// `min_match_length` byte slice, donor `zstd_ldm.c:315`). The
+// `twox-hash` dependency is gated behind the `hash` feature so
+// `default-features = false` builds (no_std, embedded) don't pull
+// it in. `BtMatcher::ldm_producer` and the `cfg(feature = "hash")`
+// blocks inside `BtMatcher::prepare_ldm_candidates` /
+// `BtMatcher::reset` carry the same gate; the call site in
+// `match_generator.rs::start_matching_optimal` invokes
+// `prepare_ldm_candidates` unconditionally because the
+// gating is internal to the method body (under
+// `not(feature = "hash")` the method shrinks to the legacy
+// `ldm_sequences.clear()` stub).
+#[cfg(feature = "hash")]
+pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
 pub(crate) mod row;

@@ -20,6 +20,8 @@
 use alloc::vec::Vec;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
+#[cfg(feature = "hash")]
+use super::ldm::LdmProducer;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
 
@@ -65,6 +67,25 @@ pub(crate) struct BtMatcher {
     /// parser. Built per-block during `start_matching_optimal` and
     /// drained as the parser advances.
     pub(crate) ldm_sequences: Vec<HcRawSeq>,
+    /// LDM producer — `None` while LDM is opt-out (current
+    /// default) so the table allocation only happens for callers
+    /// that opt in. The producer is **never auto-constructed**:
+    /// every `CompressionLevel` preset leaves this field as
+    /// `None`, matching upstream `libzstd.so.1` where
+    /// `ZSTD_compress(..., level)` never enables LDM. The
+    /// opt-in surface (Rust parameter API, see #27) builds an
+    /// `LdmProducer` from caller-supplied params and assigns it
+    /// here at frame setup time; `prepare_ldm_candidates` only
+    /// consumes the field, it does not construct it. See
+    /// [`super::ldm::LdmProducer`].
+    ///
+    /// Gated behind the `hash` feature because the producer's
+    /// per-window XXH64 hashing depends on the optional
+    /// `twox-hash` dependency; under `default-features = false`
+    /// the field disappears and the `prepare_ldm_candidates`
+    /// body shrinks to the legacy `ldm_sequences.clear()` stub.
+    #[cfg(feature = "hash")]
+    pub(crate) ldm_producer: Option<LdmProducer>,
 }
 
 impl BtMatcher {
@@ -116,6 +137,8 @@ impl BtMatcher {
             opt_ml_price_generation: Vec::new(),
             opt_ml_price_stamp: 0,
             ldm_sequences: Vec::new(),
+            #[cfg(feature = "hash")]
+            ldm_producer: None,
         }
     }
 
@@ -138,6 +161,10 @@ impl BtMatcher {
         self.opt_ml_price_generation.clear();
         self.opt_ml_price_stamp = 0;
         self.ldm_sequences.clear();
+        #[cfg(feature = "hash")]
+        if let Some(producer) = self.ldm_producer.as_mut() {
+            producer.clear();
+        }
     }
 
     /// Donor parity: `ZSTD_optLdm_skipRawSeqStoreBytes`. Fast-forward the
@@ -305,15 +332,94 @@ impl BtMatcher {
         result
     }
 
-    /// Donor parity: `ZSTD_ldm_blockCompress` would seed external
+    /// Donor parity: `ZSTD_ldm_blockCompress` seeds external
     /// long-distance match candidates here when `enableLdm ==
-    /// ZSTD_ps_enable`. This Rust encoder does not expose the donor's
-    /// LDM producer / runtime switch yet, so every level-22 frame
-    /// starts with an empty `ldm_sequences` buffer — keep the clear
-    /// to defend against carry-over if a producer is added later.
-    pub(crate) fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
+    /// ZSTD_ps_enable`. The default Rust encoder still keeps LDM
+    /// disabled (`ldm_producer = None`); when an external caller
+    /// opts in (#18 Phase 5 wiring — see #27 for the parameter
+    /// surface), the producer is delegated to via
+    /// [`LdmProducer::generate_into`].
+    ///
+    /// While `ldm_producer.is_none()` the behaviour matches the
+    /// pre-Phase-5 stub: a defensive clear of [`Self::ldm_sequences`]
+    /// so cross-frame carry-over is impossible if a producer is
+    /// activated mid-session.
+    ///
+    /// # Coordinate convention (PR #139 review feedback)
+    ///
+    /// The producer operates entirely in **absolute stream
+    /// coordinates** (so its bucket-table entries remain valid
+    /// across window evictions — entries inserted by an earlier
+    /// view of the frame are filtered by the staleness check
+    /// `entry.offset < history_abs_start`, i.e. inclusive lower
+    /// bound: entries at exactly `history_abs_start` survive,
+    /// see `ldm::search::FindBestMatchInputs::lowest_index_abs`).
+    /// The caller is expected to pass:
+    ///
+    /// * `live_history` — the contiguous *live* slice of the
+    ///   per-frame `MatchTable::history` (`&history[history_start..]`).
+    ///   `live_history[0]` corresponds to absolute position
+    ///   `history_abs_start`.
+    /// * `history_abs_start` — absolute stream position of
+    ///   `live_history[0]`.
+    /// * `current_abs_start` / `current_len` — absolute span of
+    ///   the block to scan.
+    ///
+    /// `prepare_ldm_candidates` forwards these absolute
+    /// coordinates straight to [`LdmProducer::generate_into`]; the
+    /// abs→slice translation happens inside the producer only at
+    /// the moment of `live_history[..]` indexing.
+    pub(crate) fn prepare_ldm_candidates(
+        &mut self,
+        live_history: &[u8],
+        history_abs_start: usize,
+        current_abs_start: usize,
+        current_len: usize,
+    ) {
         self.ldm_sequences.clear();
-        let _ = (current_abs_start, current_len);
+        #[cfg(feature = "hash")]
+        if let Some(producer) = self.ldm_producer.as_mut() {
+            debug_assert!(current_abs_start >= history_abs_start);
+            // MatchTable invariant: `live_history.len() ==
+            // window_size`, and `current_abs_start =
+            // history_abs_start + window_size − current_len`
+            // (match_generator.rs around line 1330). The two
+            // sides below must coincide; using `min(...)` would
+            // silently truncate the scanned range and mask an
+            // invariant violation. Raw `+` is safe — the frame-
+            // level `check_stream_abs_headroom`
+            // (`match_table/storage.rs:50`) guarantees
+            // `history_abs_start + window_size +
+            // STREAM_ABS_HEADROOM ≤ usize::MAX`.
+            debug_assert_eq!(
+                current_abs_start + current_len,
+                history_abs_start + live_history.len(),
+                "MatchTable invariant violation: current block range \
+                 `[current_abs_start, +current_len)` must coincide with the \
+                 live-history end (window_size == live_history.len())"
+            );
+            let block_end_abs = current_abs_start + current_len;
+            producer.generate_into(
+                live_history,
+                history_abs_start,
+                current_abs_start,
+                block_end_abs,
+                &mut self.ldm_sequences,
+            );
+        }
+        #[cfg(not(feature = "hash"))]
+        {
+            // Under `default-features = false` (no `hash`),
+            // `LdmProducer` is not compiled — `live_history` /
+            // `history_abs_start` / `current_abs_start` /
+            // `current_len` would otherwise be unused.
+            let _ = (
+                live_history,
+                history_abs_start,
+                current_abs_start,
+                current_len,
+            );
+        }
     }
 
     /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
@@ -622,6 +728,65 @@ mod ldm_helper_tests {
             pos_in_sequence: 0,
             size,
         }
+    }
+
+    /// Regression test for PR #139 Copilot review — threads #1/#2:
+    /// `prepare_ldm_candidates` must translate the absolute
+    /// `current_abs_start` (`history_abs_start + window_size -
+    /// current_len`) into a slice index inside the supplied
+    /// `history` slice. Before the fix, the code passed
+    /// `current_abs_start` directly as `block_start` to
+    /// `LdmProducer::generate_into`, which would index out of
+    /// bounds (or into the wrong byte range) as soon as
+    /// `history_abs_start != 0` after window eviction.
+    ///
+    /// We construct a `BtMatcher` with an active `LdmProducer`
+    /// whose table starts empty, hand it a small `history` slice,
+    /// and call `prepare_ldm_candidates` with absolute coordinates
+    /// shifted by a non-zero `history_abs_start`. The call must
+    /// complete without panic — under the pre-fix code it would
+    /// panic on the `history[block_start..block_end]` slice access
+    /// inside `generate_into`.
+    #[test]
+    #[cfg(feature = "hash")]
+    fn prepare_ldm_candidates_translates_absolute_positions_to_slice_indices() {
+        use crate::encoding::ldm::{LdmProducer, params::LdmParams};
+
+        let mut bt = BtMatcher::new();
+        // Activate the producer with hand-tuned small params —
+        // the donor btultra2 defaults (`with_window_and_strategy(27, 9)`)
+        // would allocate `1 << 23 = 8M` entries × 8 bytes = 64 MiB
+        // for a table this test never actually populates beyond a
+        // handful of entries. Build a 10-bit hash log instead so
+        // the table is ~8 KiB — keeps the suite stable under
+        // parallel nextest on 32-bit / memory-tight CI shards.
+        bt.ldm_producer = Some(LdmProducer::new(LdmParams {
+            window_log: 27,
+            hash_log: 10,
+            hash_rate_log: 4,
+            min_match_length: 32,
+            bucket_size_log: 4,
+        }));
+
+        // 256 bytes of arbitrary content — enough for the gear
+        // hash to make progress against the donor btultra2
+        // `min_match_length = 32`.
+        let history: alloc::vec::Vec<u8> = (0u8..=255).collect();
+
+        // Simulate a frame whose window has already evicted some
+        // bytes: `history_abs_start = 1024`, and the current block
+        // covers absolute `[1024, 1280)` which maps to slice
+        // `[0, 256)` inside `history`.
+        let history_abs_start = 1024usize;
+        let current_abs_start = 1024usize;
+        let current_len = history.len();
+
+        // Pre-fix: would panic with `slice index out of bounds`
+        // on `history[1024..1280]`. Post-fix: translates to
+        // `[0..256]` and runs cleanly.
+        bt.prepare_ldm_candidates(&history, history_abs_start, current_abs_start, current_len);
+        // Cross-block fixture isn't engineered to emit a match —
+        // the assertion is simply that the call succeeded.
     }
 
     #[test]

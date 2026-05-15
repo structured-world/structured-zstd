@@ -1,88 +1,84 @@
 # structured-zstd
 
-Pure Rust zstd implementation — managed fork of [ruzstd](https://github.com/KillingSpark/zstd-rs).
+**Pure-Rust Zstandard codec with a production-grade decoder, dictionary handle reuse, and an actively-improved encoder. Builds with plain `cargo` — no cmake, no system zstd, no FFI. `no_std` ready for embedded.**
 
 [![CI](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/structured-zstd.svg)](https://crates.io/crates/structured-zstd)
 [![docs.rs](https://docs.rs/structured-zstd/badge.svg)](https://docs.rs/structured-zstd)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## Benchmarks Dashboard
+## Quick start
 
-Historical benchmark charts are published to GitHub Pages:
+```toml
+[dependencies]
+structured-zstd = "0.0.20"
+```
 
-- [Performance dashboard](https://structured-world.github.io/structured-zstd/dev/bench/)
-- [Latest relative payload](https://structured-world.github.io/structured-zstd/dev/bench/benchmark-relative.json)
-- [Latest benchmark delta report](https://structured-world.github.io/structured-zstd/dev/bench/benchmark-delta.md)
-- [Latest full benchmark report](https://structured-world.github.io/structured-zstd/dev/bench/benchmark-report.md)
+```rust
+use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 
-Note: the root Pages URL can be empty; benchmark charts live under `/dev/bench/`.
+let compressed = compress_to_vec(&b"hello world"[..], CompressionLevel::from_level(7));
+```
 
-## Managed Fork
+For `no_std` builds disable the default features:
 
-This is a **maintained fork** of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Structured World Foundation](https://sw.foundation). We maintain additional features and hardening for the [CoordiNode](https://github.com/structured-world/coordinode) database engine.
+```toml
+[dependencies]
+structured-zstd = { version = "0.0.20", default-features = false }
+```
 
-**Fork goals:**
-- Dictionary compression improvements (critical for per-label trained dictionaries in LSM-tree)
-- Performance parity with C zstd for decompression (currently 1.4-3.5x slower)
-- Full numeric compression levels (0 = default, 1–22 plus negative ultra-fast, with C zstd-compatible level numbering/API; not exact strategy/ratio parity at every level)
-- No FFI — pure `cargo build`, no cmake/system libraries (ADR-013 compliance)
+## Status
 
-**Upstream relationship:** We periodically sync with upstream but maintain an independent development trajectory focused on CoordiNode requirements.
+### Decoder — production-ready
 
-## What is this
+Complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation, including dictionary-backed streams, raw / RLE / compressed blocks, and the full Zstandard frame format with optional content checksums.
 
-A pure Rust implementation of the Zstandard compression format, as defined in [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.pdf).
+### Encoder — full level range, active parity work
 
-This crate contains a fully operational decompressor and a compressor that is usable but does not yet match the speed, ratio, or configurability of the original C library.
+All standard compression levels are wired and produce valid Zstandard frames decodable by both this crate and upstream C zstd:
 
-## Current Status
+- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈11)
+- **Numeric levels:** `0..=22` and negative ultra-fast levels via `CompressionLevel::from_level(n)` — C zstd-compatible numbering
+- **Streaming encoder** via `std::io::Write`
+- **Dictionary compression** with the same dictionary format C zstd consumes
+- **Frame Content Size** — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before the first write
+- **Content checksums** opt-in
 
-### Decompression
+The encoder is undergoing an architectural rewrite — see [#111](https://github.com/structured-world/structured-zstd/issues/111) for the roadmap.
 
-Complete RFC 8878 implementation. Performance: ~1.4-3.5x slower than C zstd depending on data compressibility.
+### Dictionary training
 
-### Compression
+Behind the `dict_builder` feature flag, the `dictionary` module can:
 
-- [x] Uncompressed blocks
-- [x] Fastest (roughly level 1)
-- [x] Default (roughly level 3)
-- [x] Better (roughly level 7)
-- [x] Best (roughly level 11)
-- [x] Numeric levels `0` (default), `1–22`, and negative ultra-fast levels via `CompressionLevel::from_level(n)` (C zstd-compatible numbering)
-- [x] Checksums
-- [x] Frame Content Size — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before first write
-- [x] Dictionary compression
-- [x] Streaming encoder (`io::Write`)
-
-### Compression Strategy Coverage
-
-Implemented strategy/back-end coverage:
-- Level 1: simple matcher (`Simple`)
-- Levels 2-3: `Dfast`
-- Level 4: row matcher (`Row`)
-- Levels 5-15: hash-chain matcher (`HashChain`) with lazy/lazy2 tuning
-- Levels 16-17: `btopt`-style price parser on top of hash-chain candidates
-- Levels 18-19: `btultra`-style price parser profile
-- Levels 20-22: `btultra2`-style dual-profile pass (choose lower-cost parse)
-
-Still not implemented as dedicated family:
-- `greedy`
-
-### Dictionary Generation
-
-When the `dict_builder` feature is enabled, the `dictionary` module can:
 - build raw dictionaries with COVER (`create_raw_dict_from_source`)
 - build raw dictionaries with FastCOVER (`create_fastcover_raw_dict_from_source`)
-- finalize raw content into full zstd dictionary format (`finalize_raw_dict`)
-- train+finalize in one pure-Rust flow (`create_fastcover_dict_from_source`)
-- propagate I/O failures from dictionary-building APIs via `io::Result` return values
+- finalize raw content into the full zstd dictionary format (`finalize_raw_dict`)
+- train + finalize in one pure-Rust flow (`create_fastcover_dict_from_source`)
 
-## Benchmarking
+<details>
+<summary>Internal: compression strategy backends</summary>
 
-Performance tracking lives in [BENCHMARKS.md](BENCHMARKS.md). The suite compares `structured-zstd` against the C reference across small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora. CI benchmark runs are now published as a multi-target matrix (`x86_64-gnu`, `i686-gnu`, `x86_64-musl`) and expose a relative-first payload (`benchmark-relative.json`) for dashboard filtering by `target/stage/scenario/level/source`.
+| Level range | Backend |
+|-------------|---------|
+| 1           | `Simple` matcher |
+| 2-3         | `Dfast` |
+| 4           | `Row` matcher |
+| 5-15        | `HashChain` with lazy / lazy2 tuning |
+| 16-17       | `btopt`-style price parser on top of hash-chain candidates |
+| 18-19       | `btultra`-style price parser profile |
+| 20-22       | `btultra2`-style dual-profile pass (choose lower-cost parse) |
 
-Benchmark report files are generated by `.github/scripts/run-benchmarks.sh` and are kept as ignored local/CI artifacts rather than tracked files in this repository.
+The `greedy` family is not implemented as a dedicated strategy yet — its target ratios are covered by adjacent levels.
+
+</details>
+
+## Performance
+
+Per-merge benchmarks publish to GitHub Pages: **[structured-world.github.io/structured-zstd/dev/bench](https://structured-world.github.io/structured-zstd/dev/bench/)**.
+
+The CI matrix covers `x86_64-linux-gnu`, `i686-linux-gnu`, and `x86_64-musl`; the dashboard exposes per-target / stage / scenario / level filtering. The encoder architecture rewrite ([#111](https://github.com/structured-world/structured-zstd/issues/111)) is the active surface for compression-side work; the public benchmark report tracks the delta vs upstream C zstd over time.
+
+See [BENCHMARKS.md](https://github.com/structured-world/structured-zstd/blob/main/BENCHMARKS.md) for the methodology — small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora.
 
 ## Usage
 
@@ -124,7 +120,7 @@ let mut result = Vec::new();
 decoder.read_to_end(&mut result).unwrap();
 ```
 
-### Dictionary-backed Decompression API
+### Dictionary-backed decompression
 
 ```rust,no_run
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
@@ -154,7 +150,11 @@ let mut sink = Vec::new();
 stream.read_to_end(&mut sink).unwrap();
 ```
 
-## Support the Project
+## Project relationship
+
+Maintained fork of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by the [Structured World Foundation](https://sw.foundation). We sync periodically with upstream but maintain an independent development trajectory focused on the [CoordiNode](https://github.com/structured-world/coordinode) database engine's per-label dictionary needs.
+
+## Support the project
 
 <div align="center">
 
@@ -166,6 +166,4 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 ## License
 
-Apache License 2.0
-
-Contributions will be published under the same Apache 2.0 license.
+Apache License 2.0. Contributions will be published under the same Apache 2.0 license.

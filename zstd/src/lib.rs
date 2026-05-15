@@ -1,18 +1,28 @@
-//! A pure Rust implementation of the [Zstandard compression format](https://www.rfc-editor.org/rfc/rfc8878.pdf).
+//! Pure-Rust Zstandard codec with a production-grade decoder, dictionary
+//! handle reuse, and an actively-improved encoder.
 //!
-//! ## Decompression
-//! The [decoding] module contains the code for decompression.
-//! Decompression can be achieved by using the [`decoding::StreamingDecoder`]
-//! or the more low-level [`decoding::FrameDecoder`]
+//! The crate ships:
 //!
-//! ## Compression
-//! The [encoding] module contains the code for compression.
-//! Compression can be achieved by using the [`encoding::compress`]/[`encoding::compress_to_vec`]
-//! functions or [`encoding::FrameCompressor`]
+//! * [`decoding`] — [RFC 8878] decoder ([`decoding::StreamingDecoder`],
+//!   [`decoding::FrameDecoder`], dictionary-backed paths via
+//!   [`decoding::DictionaryHandle`]).
+//! * [`encoding`] — frame compressor, streaming encoder, named and numeric
+//!   compression levels ([`encoding::CompressionLevel`]).
+//! * [`dictionary`] (feature `dict_builder`) — COVER / FastCOVER training
+//!   plus raw-to-finalized dictionary helpers.
+//!
+//! No FFI, no cmake, no system zstd. `no_std` builds are supported by
+//! disabling the default `std` feature.
+//!
+//! The packaged README is included below for the docs.rs landing page; the
+//! API anchors above link straight into the per-module documentation.
+//!
+//! [RFC 8878]: https://www.rfc-editor.org/rfc/rfc8878
 // Keep crate docs aligned with the packaged README via the crate-local symlink in `zstd/README.md`.
 #![doc = include_str!("../README.md")]
 #![no_std]
 #![deny(trivial_casts, trivial_numeric_casts, rust_2018_idioms)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "std")]
 extern crate std;
