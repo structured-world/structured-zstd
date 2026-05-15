@@ -329,37 +329,48 @@ impl BtMatcher {
     /// so cross-frame carry-over is impossible if a producer is
     /// activated mid-session.
     ///
-    /// # Coordinate translation (PR #139 review fix)
+    /// # Coordinate convention (PR #139 review feedback)
     ///
-    /// The caller supplies `history` as a slice into the
-    /// per-frame `MatchTable::history` Vec, plus the producer's
-    /// absolute stream position `current_abs_start` and the
-    /// per-block `history_abs_start` from the match table. The
-    /// producer interprets its `block_start` / `block_end`
-    /// arguments as INDICES INTO `history`, so this method
-    /// translates the absolute pair via `abs - history_abs_start`
-    /// before delegating. Without that translation the producer
-    /// would index out of bounds (or worse, silently into the
-    /// wrong byte range) as soon as `history_abs_start != 0` after
-    /// window eviction.
+    /// The producer operates entirely in **absolute stream
+    /// coordinates** (so its bucket-table entries remain valid
+    /// across window evictions — entries inserted by an earlier
+    /// view of the frame are filtered by the staleness check
+    /// `entry.offset <= history_abs_start`). The caller is
+    /// expected to pass:
+    ///
+    /// * `live_history` — the contiguous *live* slice of the
+    ///   per-frame `MatchTable::history` (`&history[history_start..]`).
+    ///   `live_history[0]` corresponds to absolute position
+    ///   `history_abs_start`.
+    /// * `history_abs_start` — absolute stream position of
+    ///   `live_history[0]`.
+    /// * `current_abs_start` / `current_len` — absolute span of
+    ///   the block to scan.
+    ///
+    /// `prepare_ldm_candidates` forwards these absolute
+    /// coordinates straight to [`LdmProducer::generate_into`]; the
+    /// abs→slice translation happens inside the producer only at
+    /// the moment of `live_history[..]` indexing.
     pub(crate) fn prepare_ldm_candidates(
         &mut self,
-        history: &[u8],
+        live_history: &[u8],
         history_abs_start: usize,
         current_abs_start: usize,
         current_len: usize,
     ) {
         self.ldm_sequences.clear();
         if let Some(producer) = self.ldm_producer.as_mut() {
-            // Translate absolute → slice index. The caller is
-            // responsible for ensuring `current_abs_start >=
-            // history_abs_start` (the optimal driver derives both
-            // from the same `MatchTable`, so the invariant holds
-            // structurally).
             debug_assert!(current_abs_start >= history_abs_start);
-            let block_start = current_abs_start - history_abs_start;
-            let block_end = block_start.saturating_add(current_len).min(history.len());
-            producer.generate_into(history, block_start, block_end, &mut self.ldm_sequences);
+            let block_end_abs = current_abs_start
+                .saturating_add(current_len)
+                .min(history_abs_start + live_history.len());
+            producer.generate_into(
+                live_history,
+                history_abs_start,
+                current_abs_start,
+                block_end_abs,
+                &mut self.ldm_sequences,
+            );
         }
     }
 

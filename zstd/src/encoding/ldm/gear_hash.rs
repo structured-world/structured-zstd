@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(GEAR_TAB[0], 0xf5b8f72c5f77775c, "GEAR_TAB[0]");
         // Mid-table anchor (donor row 14 col 0 → index 42).
         assert_eq!(GEAR_TAB[42], 0x869cb54a8749c161, "GEAR_TAB[42]");
-        // Quarter-table anchor (donor row 21 col 2 → index 65).
+        // Three-quarter anchor (donor row 26 col 2 → index 80).
         assert_eq!(GEAR_TAB[80], 0x3bed519cbcb4e1e1, "GEAR_TAB[80]");
         // Last entry: index 255 (donor zstd_ldm_geartab.h:103).
         assert_eq!(GEAR_TAB[255], 0x2b4da14f2613d8f4, "GEAR_TAB[255]");

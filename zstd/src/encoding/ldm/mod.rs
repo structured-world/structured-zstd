@@ -151,16 +151,21 @@ impl LdmProducer {
         self.params
     }
 
-    /// Scan `history[block_start..block_end]` against accumulated
-    /// long-range candidates and append every accepted match into
-    /// `out` as an [`HcRawSeq`].
+    /// Scan the absolute range `[block_start_abs, block_end_abs)`
+    /// inside `live_history` against accumulated long-range
+    /// candidates and append every accepted match into `out` as
+    /// an [`HcRawSeq`].
     ///
-    /// `history` is the full per-frame byte slice — back
-    /// references reach all the way back to byte 0 (the
-    /// prefix-only path described in [`search`]). `block_start`
-    /// / `block_end` mark the bounds of the input chunk this
-    /// call is responsible for; the producer never emits a
-    /// sequence whose `split + forward` reaches past `block_end`.
+    /// `live_history` is the per-frame *live* byte slice — `live_
+    /// history[0]` is the byte at absolute stream position
+    /// `history_abs_start`. Every cross-block invariant
+    /// (`anchor`, `ip`, `entry.offset`) is maintained in
+    /// **absolute stream coordinates** so the bucket table stays
+    /// valid across window evictions: after a slide,
+    /// `history_abs_start` advances and any entry inserted by an
+    /// earlier window is filtered by the `entry.offset <=
+    /// lowest_index_abs` staleness check in
+    /// [`find_best_match`].
     ///
     /// Implements the donor pipeline from
     /// `ZSTD_ldm_generateSequences_internal`
@@ -193,18 +198,20 @@ impl LdmProducer {
     /// in [`search`].
     pub(crate) fn generate_into(
         &mut self,
-        history: &[u8],
-        block_start: usize,
-        block_end: usize,
+        live_history: &[u8],
+        history_abs_start: usize,
+        block_start_abs: usize,
+        block_end_abs: usize,
         out: &mut Vec<HcRawSeq>,
     ) {
-        debug_assert!(block_start <= block_end);
-        debug_assert!(block_end <= history.len());
+        debug_assert!(history_abs_start <= block_start_abs);
+        debug_assert!(block_start_abs <= block_end_abs);
+        debug_assert!(block_end_abs <= history_abs_start + live_history.len());
 
         let min_match = self.params.min_match_length as usize;
         // Donor `zstd_ldm.c:377-378`: nothing to do if the block
         // can't fit a single LDM window.
-        if block_end.saturating_sub(block_start) < min_match {
+        if block_end_abs.saturating_sub(block_start_abs) < min_match {
             return;
         }
 
@@ -218,29 +225,38 @@ impl LdmProducer {
         // `hash_id_mask` and the actual bucket count.
         let hash_id_mask: u32 = self.hash_table.bucket_mask();
 
+        // abs→slice helper. The closure body folds to a single
+        // sub instruction at the call site.
+        let to_idx = |abs: usize| abs - history_abs_start;
+
         // Re-init + reset against the first min_match bytes —
         // donor `zstd_ldm.c:381-383`. The table itself is
         // preserved across blocks; only the rolling hash is
         // wound back.
         self.hash_state = GearHashState::new(min_match, self.params.hash_rate_log);
+        let reset_start_idx = to_idx(block_start_abs);
         gear_hash::reset(
             &mut self.hash_state,
-            &history[block_start..block_start + min_match],
+            &live_history[reset_start_idx..reset_start_idx + min_match],
         );
 
         // Anchor: leftmost byte the producer can still emit as
-        // literal. Donor `BYTE const* anchor = istart;`.
-        let mut anchor = block_start;
+        // literal. Donor `BYTE const* anchor = istart;` — kept in
+        // absolute coordinates so emitted seq positions stay
+        // consistent across blocks within a frame.
+        let mut anchor_abs = block_start_abs;
         // `ip` (current input cursor): we start AFTER the reset
         // window. Donor `ip += minMatchLength;`.
-        let mut ip = block_start + min_match;
+        let mut ip_abs = block_start_abs + min_match;
         // Donor caps the outer walk at `iend - HASH_READ_SIZE`
         // (`zstd_ldm.c:366`). HASH_READ_SIZE = 8 in donor.
         const HASH_READ_SIZE: usize = 8;
-        let ilimit = block_end.saturating_sub(HASH_READ_SIZE);
+        let ilimit_abs = block_end_abs.saturating_sub(HASH_READ_SIZE);
 
-        while ip < ilimit {
-            let chunk = &history[ip..ilimit];
+        while ip_abs < ilimit_abs {
+            let chunk_idx = to_idx(ip_abs);
+            let chunk_end_idx = to_idx(ilimit_abs);
+            let chunk = &live_history[chunk_idx..chunk_end_idx];
             let (hashed, num_splits) =
                 gear_hash::feed(&mut self.hash_state, chunk, &mut self.splits_scratch);
 
@@ -250,30 +266,40 @@ impl LdmProducer {
             // `splits_scratch` and recompute the per-split state
             // in pass two — Rust's optimiser folds the duplicated
             // work). Pass two is the verify + emit + insert loop.
-            let mut split_idx = 0usize;
-            while split_idx < num_splits {
-                let s = self.splits_scratch[split_idx];
-                split_idx += 1;
+            let mut split_n = 0usize;
+            while split_n < num_splits {
+                let s = self.splits_scratch[split_n];
+                split_n += 1;
                 // Donor `zstd_ldm.c:313`:
                 //   if (ip + splits[n] >= istart + minMatchLength)
-                // Since `ip - block_start >= min_match` after the
-                // reset, the window-start subtraction never
-                // underflows. Belt-and-braces defensive guard:
-                if s + ip < block_start + min_match {
+                // Since `ip_abs - block_start_abs >= min_match`
+                // after the reset, the window-start subtraction
+                // never underflows. Belt-and-braces defensive
+                // guard:
+                if s + ip_abs < block_start_abs + min_match {
                     continue;
                 }
-                let split_abs = ip + s - min_match;
-                let window_end = split_abs + min_match;
-                if window_end > block_end {
+                let split_abs = ip_abs + s - min_match;
+                let window_end_abs = split_abs + min_match;
+                if window_end_abs > block_end_abs {
                     continue;
                 }
 
+                let split_idx = to_idx(split_abs);
+                let window_end_idx = to_idx(window_end_abs);
                 let mut hasher = XxHash64::with_seed(LDM_XXH64_SEED);
-                hasher.write(&history[split_abs..window_end]);
+                hasher.write(&live_history[split_idx..window_end_idx]);
                 let xxhash = hasher.finish();
                 let hash_id = (xxhash as u32) & hash_id_mask;
                 let checksum = (xxhash >> 32) as u32;
 
+                // Store the entry's offset in ABSOLUTE coordinates
+                // so it survives window eviction — `find_best_
+                // match` translates to slice indices at lookup
+                // time and the staleness check `offset <=
+                // lowest_index_abs` (where the caller passes the
+                // current `history_abs_start`) filters entries
+                // that fall out of the window.
                 let new_entry = LdmEntry {
                     offset: split_abs as u32,
                     checksum,
@@ -282,24 +308,31 @@ impl LdmProducer {
                 // Donor `zstd_ldm.c:420-426`: if this split would
                 // emit a sequence overlapping the previous one,
                 // just record it and move on.
-                if split_abs < anchor {
+                if split_abs < anchor_abs {
                     self.hash_table.insert(hash_id, new_entry);
                     continue;
                 }
 
                 // Search bucket for the best forward+backward
-                // match. `lowest_index_abs = 0` matches our
-                // prefix-only invariant (every entry with
-                // `offset > 0` is in-window).
+                // match. `lowest_index_abs = history_abs_start`
+                // — entries inserted before the current window
+                // (i.e. by a previous, now-evicted frame view)
+                // are stale and filtered. Within a single frame
+                // `history_abs_start` stays constant so all
+                // entries inserted by this call are kept; the
+                // mechanism becomes load-bearing only when the
+                // caller drives multiple compress_block windows
+                // through the same producer.
                 let best = find_best_match(
                     &self.hash_table,
                     hash_id,
                     checksum,
                     FindBestMatchInputs {
-                        history,
+                        live_history,
+                        history_abs_start,
                         split_abs,
-                        anchor_abs: anchor,
-                        lowest_index_abs: 0,
+                        anchor_abs,
+                        lowest_index_abs: history_abs_start as u32,
                         min_match_length: min_match,
                     },
                 );
@@ -312,8 +345,12 @@ impl LdmProducer {
                 };
 
                 // Match found. Donor `zstd_ldm.c:475-488`.
+                // `best.match_pos` is absolute; `split_abs` is
+                // absolute; their difference is a true
+                // back-reference distance, immune to window
+                // sliding.
                 let offset = (split_abs as u32) - best.match_pos;
-                let lit_length = split_abs - best.backward_len - anchor;
+                let lit_length = split_abs - best.backward_len - anchor_abs;
                 let match_length = best.total_len();
                 out.push(HcRawSeq {
                     lit_length,
@@ -328,31 +365,34 @@ impl LdmProducer {
 
                 // Advance anchor past the matched bytes (donor
                 // `zstd_ldm.c:494`).
-                anchor = split_abs + best.forward_len;
+                anchor_abs = split_abs + best.forward_len;
 
                 // Donor `zstd_ldm.c:496-508`: when the emitted
                 // match extends past the already-hashed window,
                 // skip ahead by re-resetting the rolling hash on
                 // the bytes preceding the new anchor.
-                if anchor > ip + hashed {
-                    let reset_start = anchor.saturating_sub(min_match);
-                    if reset_start + min_match <= block_end {
+                if anchor_abs > ip_abs + hashed {
+                    let reset_start_abs = anchor_abs.saturating_sub(min_match);
+                    if reset_start_abs + min_match <= block_end_abs
+                        && reset_start_abs >= history_abs_start
+                    {
+                        let reset_idx = to_idx(reset_start_abs);
                         self.hash_state = GearHashState::new(min_match, self.params.hash_rate_log);
                         gear_hash::reset(
                             &mut self.hash_state,
-                            &history[reset_start..reset_start + min_match],
+                            &live_history[reset_idx..reset_idx + min_match],
                         );
                         // Continue the outer `while (ip < ilimit)`
                         // loop at `anchor`. Donor: `ip = anchor -
                         // hashed;` so the upcoming `ip += hashed`
                         // lands exactly at `anchor`.
-                        ip = anchor.saturating_sub(hashed);
+                        ip_abs = anchor_abs.saturating_sub(hashed).max(history_abs_start);
                     }
                     break;
                 }
             }
 
-            ip = ip.saturating_add(hashed).max(ip + 1);
+            ip_abs = ip_abs.saturating_add(hashed).max(ip_abs + 1);
         }
 
         // Donor returns `iend - anchor` (the "leftover" tail),
@@ -390,7 +430,7 @@ mod tests {
         let mut out = Vec::new();
         // Feed a non-empty chunk so the rolling hash advances.
         let data = [0xAAu8; 256];
-        producer.generate_into(&data, 0, data.len(), &mut out);
+        producer.generate_into(&data, 0, 0, data.len(), &mut out);
         let advanced = producer.hash_state.rolling;
         assert_ne!(
             advanced,
@@ -451,7 +491,7 @@ mod tests {
         history.extend_from_slice(&payload);
 
         let mut out = Vec::new();
-        producer.generate_into(&history, 0, history.len(), &mut out);
+        producer.generate_into(&history, 0, 0, history.len(), &mut out);
 
         assert!(
             !out.is_empty(),
@@ -481,6 +521,147 @@ mod tests {
         );
     }
 
+    /// Regression test for PR #139 round-2 review (CodeRabbit +
+    /// Copilot, Major): the producer must store **absolute stream
+    /// positions** in its bucket-table entries so that long-range
+    /// matches accumulated by one block remain valid after a
+    /// window eviction shifts `history_abs_start` forward.
+    ///
+    /// Setup: same 4 KiB payload appears twice in the per-frame
+    /// history. We invoke `generate_into` twice:
+    ///   1. First call covers absolute range `[0, payload_end_0)`
+    ///      — the producer's bucket table accumulates entries
+    ///      whose `offset` fields hold absolute positions inside
+    ///      the first payload copy.
+    ///   2. Second call advances `history_abs_start` (simulates
+    ///      window eviction) and covers the absolute range
+    ///      containing the second payload copy. The bucket-table
+    ///      entries from call 1 must remain reachable: their
+    ///      absolute offsets still point at the SAME bytes
+    ///      (now further left in the live slice), and the
+    ///      staleness check `entry.offset <= history_abs_start`
+    ///      keeps them in-window.
+    ///
+    /// If the producer had stored slice-relative indices
+    /// instead, call 2 would either miss the long-range match
+    /// entirely (slice indices from call 1 would point into the
+    /// wrong bytes after the slide) or underflow `offset =
+    /// split_abs − best.match_pos` and emit a corrupt
+    /// back-reference.
+    #[test]
+    fn generate_into_preserves_bucket_entries_across_history_slide() {
+        let mut producer = LdmProducer::with_window_and_strategy(27, 9);
+        let p = producer.params();
+        assert_eq!(p.min_match_length, 32);
+
+        const PAYLOAD: usize = 4096;
+        const GAP_A: usize = 32 * 1024;
+        const GAP_B: usize = 32 * 1024;
+
+        // Deterministic non-trivial payload.
+        let mut prng: u32 = 0xC0FFEEEE;
+        let payload: alloc::vec::Vec<u8> = (0..PAYLOAD)
+            .map(|_| {
+                prng = prng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (prng >> 16) as u8
+            })
+            .collect();
+
+        // Build the full frame in one Vec — represents the
+        // contiguous live history visible to the encoder before
+        // any eviction.
+        let mut frame = alloc::vec::Vec::with_capacity(2 * PAYLOAD + GAP_A + GAP_B);
+        frame.extend_from_slice(&payload);
+        frame.extend((0..GAP_A).map(|i| (i % 251) as u8));
+        frame.extend_from_slice(&payload);
+        frame.extend((0..GAP_B).map(|i| ((i + 17) % 241) as u8));
+
+        // Call 1: cover the first half of the frame —
+        // history_abs_start = 0, walks the first payload copy
+        // and the start of the first gap. The bucket table
+        // populates with absolute offsets inside payload #1.
+        let mut out1 = Vec::new();
+        let split_at = PAYLOAD + GAP_A;
+        producer.generate_into(&frame[..split_at], 0, 0, split_at, &mut out1);
+
+        // Call 2: simulate a window slide. The encoder retired
+        // the leading `eviction` bytes from the live history;
+        // the surviving slice is `frame[eviction..]` and its
+        // byte 0 sits at absolute position `eviction`. The
+        // second payload copy is at absolute position `PAYLOAD
+        // + GAP_A`, which after the slide is at index
+        // `PAYLOAD + GAP_A − eviction` inside the slice.
+        let eviction = PAYLOAD / 2; // arbitrary — payload #1 partially evicted
+        let live = &frame[eviction..];
+        let history_abs_start = eviction;
+        let block_start_abs = PAYLOAD + GAP_A; // start of payload #2
+        let block_end_abs = block_start_abs + PAYLOAD;
+
+        let mut out2 = Vec::new();
+        producer.generate_into(
+            live,
+            history_abs_start,
+            block_start_abs,
+            block_end_abs,
+            &mut out2,
+        );
+
+        // The long-range match must still fire — entries from
+        // call 1 in the surviving tail of payload #1
+        // (`absolute [eviction, PAYLOAD)`) are still in-window
+        // and still point at the right bytes. If the producer
+        // had stored slice-relative offsets, call 2 would
+        // either miss or emit corrupt offsets.
+        assert!(
+            !out2.is_empty(),
+            "cross-slide long-range match must survive a window eviction"
+        );
+        // Every emitted match must (a) clear the min_match
+        // floor, and (b) point at bytes that still live inside
+        // the post-slide history. The latter is the actual
+        // round-2 review-fix invariant: if the producer had
+        // stored slice-relative offsets, entries inserted by
+        // call 1 would now reference the wrong absolute bytes
+        // and `offset = split_abs − stale_match_pos` could
+        // underflow `u32` and emit an offset > live_history
+        // length.
+        let live_len = live.len();
+        for seq in &out2 {
+            assert!(
+                seq.match_length >= p.min_match_length as usize,
+                "every emitted match must reach min_match_length (got {})",
+                seq.match_length
+            );
+            assert!(
+                seq.offset <= live_len,
+                "back-ref offset {} must stay within the live \
+                 history (= {} bytes); offsets larger than this \
+                 are the smoking gun for stale slice-relative \
+                 entries surviving the eviction",
+                seq.offset,
+                live_len
+            );
+        }
+
+        // At least one emitted sequence MUST hit a long-range
+        // back-reference (offset >= GAP_A, i.e. crossing from
+        // payload #2 back into payload #1's surviving tail).
+        // This is the long-range win LDM exists to capture and
+        // the round-2 fix has to preserve.
+        let crossed_gap = out2.iter().any(|s| s.offset >= GAP_A);
+        assert!(
+            crossed_gap,
+            "at least one emitted sequence must hit a back-ref of \
+             >= GAP_A ({GAP_A}) — that's the long-range match \
+             into the surviving tail of payload #1 the bucket \
+             entries from call 1 are supposed to produce; \
+             offsets observed: {:?}",
+            out2.iter()
+                .map(|s| s.offset)
+                .collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
     /// `generate_into` with an empty range is a no-op — emits
     /// nothing and leaves the rolling hash untouched. Guards
     /// against an off-by-one in the bounds check.
@@ -490,7 +671,7 @@ mod tests {
         let mut out = Vec::new();
         let data = [0u8; 128];
         let pre = producer.hash_state.rolling;
-        producer.generate_into(&data, 64, 64, &mut out);
+        producer.generate_into(&data, 0, 64, 64, &mut out);
         assert!(out.is_empty());
         assert_eq!(producer.hash_state.rolling, pre);
     }

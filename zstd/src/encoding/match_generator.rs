@@ -2970,25 +2970,23 @@ impl HcMatchGenerator {
             .backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
         // Borrow split: `prepare_ldm_candidates` needs immutable
-        // access to `self.table.history` while it mutates the LDM
-        // bucket table owned by `self.backend.bt_mut()`. The two
-        // live in disjoint fields of `Self`, so we hand the history
-        // in by reference to keep the borrow checker happy.
+        // access to the live history (the post-`history_start`
+        // slice of `self.table.history`) while it mutates the LDM
+        // bucket table owned by `self.backend.bt_mut()`. Both live
+        // in disjoint fields of `Self`, so we capture the slice +
+        // its base before reaching for `bt_mut()`.
         //
-        // `current_abs_start` is an *absolute* stream position
-        // (`history_abs_start + window_size - current_len`); the
-        // producer expects slice indices into the supplied
-        // `history` Vec. We pass both `history_abs_start` and the
-        // absolute cursor and let `prepare_ldm_candidates` perform
-        // the translation — keeps the abs→slice math in one place
-        // and matches every other matcher backend's coordinate
-        // convention (`idx = abs_pos - history_abs_start`,
-        // `concat = &history[history_start..]` — see
-        // `match_table/storage.rs:317-318`).
-        let history = self.table.history.as_slice();
+        // The producer operates in absolute stream coordinates
+        // throughout; `live_history[0]` corresponds to absolute
+        // `history_abs_start` (donor `base + dictLimit`), and the
+        // abs→slice translation happens inside the producer at
+        // each `live_history[..]` access. Passing the full
+        // `history` Vec would index into the dead prefix (the
+        // bytes already retired past `history_start`).
+        let live_history = self.table.live_history();
         let history_abs_start = self.table.history_abs_start;
         self.backend.bt_mut().prepare_ldm_candidates(
-            history,
+            live_history,
             history_abs_start,
             current_abs_start,
             current_len,
