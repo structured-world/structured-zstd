@@ -292,6 +292,19 @@ impl HcMatcher {
             {
                 let m_end = candidate_idx + tail_off + 4;
                 let i_end = current_idx + tail_off + 4;
+                // Bounds-fail (`i_end > history_tail`) is a SAFE skip — not
+                // a missed optimization. Under the per-iteration
+                // precondition `new_offset >= best.offset`, new candidates
+                // have equal-or-worse `offset_bits`, so to outscore `best`
+                // they need strictly *larger* `match_len`. Bounds fail
+                // ⟺ `current_idx + best.match_len − lit_len + 1 >
+                // history_tail` ⟺ forward bytes at `current_idx`
+                // (`F_max := history_tail − current_idx`) satisfy
+                // `F_max ≤ best.match_len − lit_len`. Any candidate at
+                // `current_idx` has `match_len ≤ F_max + lit_len ≤
+                // best.match_len`, so it cannot strictly outscore. Falling
+                // through to `common_prefix_len` would only run a wasted
+                // walk that can never improve `best`.
                 if i_end > history_tail || m_end > history_tail {
                     continue;
                 }
