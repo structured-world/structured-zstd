@@ -2969,9 +2969,15 @@ impl HcMatchGenerator {
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
+        // Borrow split: `prepare_ldm_candidates` (next-commit body)
+        // needs immutable access to `self.table.history` while it
+        // mutates the LDM bucket table owned by `self.backend.bt_mut()`.
+        // The two live in disjoint fields of `Self`, so we hand the
+        // history in by reference to keep the borrow checker happy.
+        let history = self.table.history.as_slice();
         self.backend
             .bt_mut()
-            .prepare_ldm_candidates(current_abs_start, current_len);
+            .prepare_ldm_candidates(history, current_abs_start, current_len);
 
         if self.should_run_btultra2_seed_pass::<S>(current_len) {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len);

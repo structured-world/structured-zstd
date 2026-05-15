@@ -22,6 +22,7 @@ pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
+pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
 pub(crate) mod row;

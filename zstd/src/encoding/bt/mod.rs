@@ -20,6 +20,7 @@
 use alloc::vec::Vec;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
+use super::ldm::LdmProducer;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
 
@@ -65,6 +66,12 @@ pub(crate) struct BtMatcher {
     /// parser. Built per-block during `start_matching_optimal` and
     /// drained as the parser advances.
     pub(crate) ldm_sequences: Vec<HcRawSeq>,
+    /// LDM producer — populated lazily on the first
+    /// `prepare_ldm_candidates` call for a frame. `None` while LDM
+    /// is opt-out (current default) so the table allocation only
+    /// happens for callers that opt in. See
+    /// [`super::ldm::LdmProducer`].
+    pub(crate) ldm_producer: Option<LdmProducer>,
 }
 
 impl BtMatcher {
@@ -116,6 +123,7 @@ impl BtMatcher {
             opt_ml_price_generation: Vec::new(),
             opt_ml_price_stamp: 0,
             ldm_sequences: Vec::new(),
+            ldm_producer: None,
         }
     }
 
@@ -138,6 +146,9 @@ impl BtMatcher {
         self.opt_ml_price_generation.clear();
         self.opt_ml_price_stamp = 0;
         self.ldm_sequences.clear();
+        if let Some(producer) = self.ldm_producer.as_mut() {
+            producer.clear();
+        }
     }
 
     /// Donor parity: `ZSTD_optLdm_skipRawSeqStoreBytes`. Fast-forward the
@@ -305,15 +316,29 @@ impl BtMatcher {
         result
     }
 
-    /// Donor parity: `ZSTD_ldm_blockCompress` would seed external
+    /// Donor parity: `ZSTD_ldm_blockCompress` seeds external
     /// long-distance match candidates here when `enableLdm ==
-    /// ZSTD_ps_enable`. This Rust encoder does not expose the donor's
-    /// LDM producer / runtime switch yet, so every level-22 frame
-    /// starts with an empty `ldm_sequences` buffer — keep the clear
-    /// to defend against carry-over if a producer is added later.
-    pub(crate) fn prepare_ldm_candidates(&mut self, current_abs_start: usize, current_len: usize) {
+    /// ZSTD_ps_enable`. The default Rust encoder still keeps LDM
+    /// disabled (`ldm_producer = None`); when an external caller
+    /// opts in (#18 Phase 5 wiring — feature flag + threshold land
+    /// after the search/verify commit), the producer is delegated
+    /// to via [`LdmProducer::generate_into`].
+    ///
+    /// While `ldm_producer.is_none()` the behaviour matches the
+    /// pre-Phase-5 stub: a defensive clear of [`Self::ldm_sequences`]
+    /// so cross-frame carry-over is impossible if a producer is
+    /// activated mid-session.
+    pub(crate) fn prepare_ldm_candidates(
+        &mut self,
+        history: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+    ) {
         self.ldm_sequences.clear();
-        let _ = (current_abs_start, current_len);
+        if let Some(producer) = self.ldm_producer.as_mut() {
+            let end = current_abs_start.saturating_add(current_len);
+            producer.generate_into(history, current_abs_start, end, &mut self.ldm_sequences);
+        }
     }
 
     /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
