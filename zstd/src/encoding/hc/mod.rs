@@ -832,27 +832,30 @@ mod hc_tests {
     /// the chain links naturally point at strictly older positions
     /// (the previous `hash_table[hash]`). To force the bug-prone
     /// scenario this test reaches into `MatchTable` and hand-wires the
-    /// chain so the walker visits `pos 8` first (offset 16) and then
-    /// `pos 16` second (offset 8). Both positions hold the same
-    /// 8-byte prefix `"abcdefgh"` (matching the probe at `pos 24`), so
-    /// the FORWARD lengths are equal and only the offset-bits
-    /// difference can decide the winner.
+    /// chain so the walker visits `pos 9` first (offset 18) and then
+    /// `pos 18` second (offset 9). The fixture sits four 8-byte
+    /// `"abcdefgh"` chunks at positions `0 / 9 / 18 / 27` (each chunk
+    /// followed by a unique terminator byte that caps cross-chunk
+    /// forward matches at exactly 8); the probe at `abs_pos = 27`
+    /// hashes the same prefix as the earlier chunks, so all chain
+    /// candidates produce an 8-byte forward match and only the
+    /// offset-bits difference can decide the winner.
     ///
     /// With the new `new_offset >= best.offset` precondition:
-    ///   * Iter 1: cand_abs 8, offset 16. `best = None` → no gate,
-    ///     full count, `best = (len 8, offset 16)`.
-    ///   * Iter 2: cand_abs 16, offset 8. `new_offset = 8 <
-    ///     best.offset = 16` → gate skipped → full count runs →
+    ///   * Iter 1: cand_abs 9, offset 18. `best = None` → no gate,
+    ///     full count, `best = (len 8, offset 18)`.
+    ///   * Iter 2: cand_abs 18, offset 9. `new_offset = 9 <
+    ///     best.offset = 18` → gate skipped → full count runs →
     ///     `better_candidate` picks the smaller-offset winner (equal
     ///     length, smaller offset_bits → strictly higher gain).
     ///
-    /// Final `best.offset` must be `8` (the smaller-offset winner).
+    /// Final `best.offset` must be `9` (the smaller-offset winner).
     /// Pre-fix code (gate applied unconditionally) would have
     /// inspected the tail at `tail_off = 8 − 0 − 3 = 5` and the
-    /// 4-byte read at offsets `5..9` covers byte 8 which is the
-    /// forward-terminator mismatch (different ninth byte between
-    /// chunks) — gate would fail and the second candidate gets
-    /// skipped, leaving `best.offset = 16`.
+    /// 4-byte read at offsets `5..9` covers the chunk-terminator byte
+    /// (different `'A' / 'B' / 'C' / 'D'` per chunk) — gate fails on
+    /// the mismatching terminator and the second candidate gets
+    /// skipped, leaving `best.offset = 18`.
     #[test]
     fn hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset() {
         // Four 8-byte `"abcdefgh"` chunks, each followed by a unique
