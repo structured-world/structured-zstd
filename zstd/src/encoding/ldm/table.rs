@@ -482,7 +482,7 @@ mod tests {
         // allocates the max at runtime either (window_log caps
         // hash_log to 27 or so in practice). Test just the boundary
         // arithmetic — request hash_log = 18 with bucket_size_log =
-        // 4 → 16 buckets × 16384 slots = 262144 entries × 8 bytes
+        // 4 → 16384 buckets × 16 slots = 262144 entries × 8 bytes
         // = ~2 MiB allocation, safe on every CI runner.
         let t = LdmHashTable::new(18, 4);
         assert_eq!(t.bucket_count(), 1usize << (18 - 4));
