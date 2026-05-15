@@ -281,9 +281,14 @@ fn donor_split_block_from_borders(block: &[u8]) -> usize {
     if dist_from_begin.abs_diff(dist_from_end) < min_distance {
         return 64 * 1024;
     }
-    // Middle closer to the start means the transition is early →
-    // emit a 32 KB head; closer to the end means it's late → emit
-    // a 96 KB head and let the 32 KB tail carry the new statistics.
+    // Larger `dist_from_begin` (i.e. `middle` farther from the head
+    // fingerprint, equivalently closer to the tail) means the new
+    // statistics already dominate the centre — the transition
+    // happened EARLY → emit a small 32 KB head and let the 96 KB
+    // tail absorb the rest. Inverse case: `dist_from_end` larger
+    // (middle still resembles the head) means the transition is
+    // LATE → emit a 96 KB head so the trailing 32 KB carries the
+    // new statistics alone.
     if dist_from_begin > dist_from_end {
         32 * 1024
     } else {
@@ -2013,14 +2018,19 @@ mod tests {
 
     /// Heterogeneous input — first half all zeros, second half a
     /// counter sequence — has clearly distinguishable border
-    /// histograms, so the borders heuristic must report one of the
-    /// three donor-quantised split positions (32 KB / 64 KB / 96 KB).
+    /// histograms, so the borders heuristic decides to split.
+    ///
     /// The transition sits at exactly the block midpoint, so the
-    /// middle-segment distance is asymmetric toward the start →
-    /// donor returns 96 KB (`middle` closer to `end` because the
-    /// "end" pattern dominates from byte 64 KB onwards).
+    /// middle 512-byte sample (`block[mid-256..mid+256]`) is half
+    /// zeros + half counter values. That makes it roughly
+    /// equidistant from both border fingerprints — the
+    /// `abs_diff(dist_from_begin, dist_from_end) < min_distance`
+    /// branch fires and the heuristic returns the midpoint (64 KiB)
+    /// per `zstd_preSplit.c:222`. The test asserts the exact value
+    /// rather than just "one of {32K, 64K, 96K}" so a regression
+    /// to a different quantised arm cannot silently slip through.
     #[test]
-    fn donor_split_block_from_borders_returns_quantised_split() {
+    fn donor_split_block_from_borders_returns_midpoint_for_centred_transition() {
         let mut block = vec![0u8; MAX_BLOCK_SIZE as usize];
         for (i, byte) in block
             .iter_mut()
@@ -2030,10 +2040,11 @@ mod tests {
             *byte = (i % 251 + 1) as u8;
         }
         let split = super::donor_split_block_from_borders(&block);
-        assert!(
-            split == 32 * 1024 || split == 64 * 1024 || split == 96 * 1024,
-            "borders heuristic must return one of the donor-quantised \
-             split points (32K/64K/96K), got {split}"
+        assert_eq!(
+            split,
+            64 * 1024,
+            "centred-transition fixture must take the symmetric \
+             midpoint arm (`abs_diff < min_distance`), got {split}"
         );
     }
 
