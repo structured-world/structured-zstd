@@ -102,7 +102,7 @@ pub(crate) fn level_filter_from_env() -> Option<Vec<String>> {
 pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
     let all = supported_levels();
     let Some(keep) = level_filter_from_env() else {
-        return all.to_vec();
+        return all;
     };
     let known: Vec<&'static str> = all.iter().map(|cfg| cfg.name).collect();
     let unknown: Vec<String> = keep
@@ -121,39 +121,108 @@ pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
         .collect()
 }
 
-pub(crate) fn supported_levels() -> [LevelConfig; 6] {
-    [
-        LevelConfig {
-            name: "fastest",
-            rust_level: CompressionLevel::Fastest,
-            ffi_level: 1,
-        },
-        LevelConfig {
-            name: "default",
-            rust_level: CompressionLevel::Default,
-            ffi_level: 3,
-        },
-        LevelConfig {
-            name: "better",
-            rust_level: CompressionLevel::Better,
-            ffi_level: 7,
-        },
-        LevelConfig {
-            name: "level4-row",
-            rust_level: CompressionLevel::Level(4),
-            ffi_level: 4,
-        },
-        LevelConfig {
-            name: "best",
-            rust_level: CompressionLevel::Best,
-            ffi_level: 11,
-        },
-        LevelConfig {
-            name: "level22",
-            rust_level: CompressionLevel::Level(22),
-            ffi_level: 22,
-        },
-    ]
+/// Bench-side mirror of `StrategyTag::for_compression_level`. Returns
+/// the lowercase tag suffix used in bench IDs and CI shard labels so
+/// the dashboard can render `level -7 :: Fast`, `level 3 :: Dfast`,
+/// `level 22 :: BtUltra2`, etc. without re-deriving the strategy from
+/// the numeric level on the consumer side.
+///
+/// Negative levels share the `fast` ultra-fast strategy (donor maps
+/// any `cParams.cLevel <= 1` to `ZSTD_fast`). The 1..=22 split mirrors
+/// `clevels.h` and `StrategyTag::for_level` exactly.
+fn strategy_suffix(level: i32) -> &'static str {
+    match level {
+        // Negative levels uniformly map to the ultra-fast `Fast`
+        // strategy (donor `cParams.strategy = ZSTD_fast` for any
+        // `cLevel <= 1`). Level 0 is intentionally NOT classified
+        // here — donor treats it as a sentinel for "use default"
+        // (= 3, `Dfast`), and `supported_levels()` omits it to keep
+        // bench labels unambiguous. A future caller that does pass
+        // `0` should pre-resolve it to `3` before reaching this
+        // helper rather than have it silently aliased to `fast`.
+        i32::MIN..=-1 => "fast",
+        0 => unreachable!(
+            "strategy_suffix(0) called; level 0 is the donor sentinel for \
+             'use default' (= 3). `supported_levels()` skips it so it never \
+             reaches this helper. Resolve to the canonical numeric level \
+             before calling."
+        ),
+        1 => "fast",
+        2 | 3 => "dfast",
+        4 => "greedy",
+        5..=15 => "lazy",
+        16 | 17 => "btopt",
+        18 | 19 => "btultra",
+        _ => "btultra2",
+    }
+}
+
+/// Canonical bench level inventory: `-7..=-1` (ultra-fast) plus
+/// `1..=22` (the donor advertised range). Level 0 is omitted because
+/// the donor treats it as a sentinel for "use default" (= 3) — a
+/// distinct bench entry would just duplicate level 3's numbers.
+///
+/// Each entry's `name` field is the canonical `level_<N>_<strategy>`
+/// label consumed by:
+///   - bench IDs in criterion output (`compress/level_3_dfast/...`)
+///   - the CI matrix `level:` keys in `.github/workflows/ci.yml`
+///   - the `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` env var
+///
+/// Renaming an entry requires synchronising all three call sites. The
+/// `level_filter_from_env()` panic on unknown names is the safety net
+/// that catches the drift in CI before any silent skips.
+///
+/// The inventory is built once per process via [`LazyLock`] so the
+/// `Box::leak` that backs each `&'static str` `name` happens exactly
+/// 29 times total — the criterion bench loops call this helper many
+/// times per scenario, and a naive per-call rebuild would compound
+/// the leak proportionally.
+pub(crate) fn supported_levels() -> Vec<LevelConfig> {
+    static INVENTORY: std::sync::LazyLock<Vec<LevelConfig>> =
+        std::sync::LazyLock::new(build_supported_levels);
+    INVENTORY.clone()
+}
+
+fn build_supported_levels() -> Vec<LevelConfig> {
+    let mut levels = Vec::with_capacity(29);
+    // Ultra-fast tier: `-7..=-1`. Donor strategy = Fast.
+    for n in -7..=-1i32 {
+        levels.push(LevelConfig {
+            name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
+            rust_level: CompressionLevel::Level(n),
+            ffi_level: n,
+        });
+    }
+    // Standard tier: `1..=22`. Strategy mirrors `clevels.h`. Use
+    // `CompressionLevel::Level(n)` directly — NOT
+    // `CompressionLevel::from_level(n)` — so the bench label
+    // `level_<N>_<strategy>` matches the variant exercised by the
+    // encoder. `from_level(11)` collapses to `Best`, and the named
+    // `Best` variant bypasses `donor_pre_split_level`'s
+    // `Level(11..=15) -> Some(0)` arm (the borders pre-splitter
+    // landed in #140), so the numbers would silently diverge from
+    // what a user calling `compress_to_vec(input, Level(11))` sees.
+    // Same divergence applies to 1 (`Fastest`), 3 (`Default`),
+    // 7 (`Better`) on any future preset-only branch.
+    for n in 1..=22i32 {
+        levels.push(LevelConfig {
+            name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
+            rust_level: CompressionLevel::Level(n),
+            ffi_level: n,
+        });
+    }
+    levels
+}
+
+/// Convert a one-shot owned `String` (built by `format!`) into a
+/// `&'static str`. Called exactly once per level inside
+/// [`build_supported_levels`], whose result is cached in a
+/// `LazyLock` so the total leak is bounded to the 29 strings the
+/// bench inventory needs — no proportional growth even when
+/// `supported_levels()` is called inside criterion's per-scenario
+/// loops.
+fn leak_owned(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
 }
 
 impl Scenario {
@@ -325,35 +394,55 @@ fn load_decode_corpus_scenario() -> Scenario {
     const FALLBACK_ID: &str = "decodecorpus-synthetic-1m";
     const FALLBACK_LABEL: &str = "Synthetic decode corpus fallback (1 MiB)";
 
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").ok();
-    let fixture_path = manifest_dir
-        .as_deref()
-        .map(Path::new)
-        .map(|dir| dir.join("decodecorpus_files/z000033"));
+    // Resolution order:
+    //   1. `STRUCTURED_ZSTD_BENCH_CORPUS_PATH` — explicit absolute path
+    //      to the corpus file. CI sets this so the prebuilt bench
+    //      binary (invoked directly via `STRUCTURED_ZSTD_BENCH_BIN`,
+    //      bypassing cargo) can still locate the fixture even though
+    //      `CARGO_MANIFEST_DIR` is not in its environment.
+    //   2. `CARGO_MANIFEST_DIR/decodecorpus_files/z000033` — local
+    //      `cargo bench` runs, where cargo injects the manifest dir.
+    //   3. Synthetic 1 MiB fallback — packaged sources / hand-run
+    //      binaries with no fixture access.
+    let candidate_paths: Vec<std::path::PathBuf> = {
+        let mut paths = Vec::new();
+        if let Ok(explicit) = env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                paths.push(std::path::PathBuf::from(trimmed));
+            }
+        }
+        if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+            paths.push(Path::new(&manifest_dir).join("decodecorpus_files/z000033"));
+        }
+        paths
+    };
 
-    if let Some(path) = fixture_path {
-        match fs::read(&path) {
+    if candidate_paths.is_empty() {
+        eprintln!(
+            "BENCH_WARN neither STRUCTURED_ZSTD_BENCH_CORPUS_PATH nor \
+             CARGO_MANIFEST_DIR is set; using synthetic decode corpus fallback"
+        );
+    }
+    for path in &candidate_paths {
+        match fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => {
                 return Scenario::new(REAL_ID, REAL_LABEL, bytes, ScenarioClass::Corpus);
             }
             Ok(_) => {
                 eprintln!(
-                    "BENCH_WARN decode corpus fixture is empty at {}, using synthetic fallback",
+                    "BENCH_WARN decode corpus fixture is empty at {}, trying next candidate",
                     path.display()
                 );
             }
             Err(err) => {
                 eprintln!(
-                    "BENCH_WARN failed to read decode corpus fixture at {}: {}. Using synthetic fallback",
+                    "BENCH_WARN failed to read decode corpus fixture at {}: {}. Trying next candidate",
                     path.display(),
                     err
                 );
             }
         }
-    } else {
-        eprintln!(
-            "BENCH_WARN CARGO_MANIFEST_DIR is not set, using synthetic decode corpus fallback"
-        );
     }
 
     // Keep the benchmark matrix runnable from packaged sources where fixture files may be omitted.
