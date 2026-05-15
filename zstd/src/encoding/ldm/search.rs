@@ -225,6 +225,23 @@ pub(crate) fn find_best_match(
         if match_abs < history_abs_start || match_abs >= history_abs_end {
             continue;
         }
+        // Back-reference ordering guard: a back-reference must
+        // point at bytes that already exist (`match_abs <
+        // split_abs`). In normal producer operation every entry
+        // in the bucket was inserted at a position strictly less
+        // than the current `split_abs` (the producer's `insert
+        // _absolute` runs AFTER `find_best_match`, and the outer
+        // loop's `split_abs` increases monotonically), so this
+        // check is structurally redundant. Keeping it explicit
+        // hardens against future direct callers (custom tables
+        // injected via test fixtures, an eventual `extDict`
+        // path) where `match_abs == split_abs` would emit
+        // `offset = 0` (invalid back-ref) and `match_abs >
+        // split_abs` would underflow the unsigned subtraction in
+        // the producer's `offset = split_abs − best.match_pos`.
+        if match_abs >= split_abs {
+            continue;
+        }
         let match_idx = match_abs - history_abs_start;
 
         // Forward match: bytes that compare equal starting from
@@ -467,6 +484,56 @@ mod tests {
         .expect("a valid candidate must be found");
         assert_eq!(m.match_pos, 8, "longer-forward winner must be picked");
         assert_eq!(m.forward_len, 8);
+    }
+
+    /// `find_best_match` must reject entries at or past
+    /// `split_abs` so the producer's `offset = split_abs −
+    /// match_pos` never underflows / emits a zero back-reference.
+    /// Regression for PR #139 round-9 review.
+    #[test]
+    fn find_best_match_rejects_entries_at_or_past_split() {
+        let mut table = fresh_table();
+        // Inject a stray entry at exactly `split_abs` — would be
+        // structurally impossible from `LdmProducer::generate_into`
+        // (inserts happen after the lookup) but possible from a
+        // direct caller / test fixture / future extDict variant.
+        table.insert_absolute(1, 12, 0xCAFE);
+        let history = b"PPPPabcdefghabcdefgh";
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m.is_none(), "entry at split_abs must be rejected");
+
+        // Same fixture but entry at strictly past split — also
+        // must be rejected.
+        let mut table_after = fresh_table();
+        table_after.insert_absolute(1, 16, 0xCAFE);
+        let m_after = find_best_match(
+            &table_after,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: history.len(),
+                min_match_length: 4,
+            },
+        );
+        assert!(m_after.is_none(), "entry past split_abs must be rejected");
     }
 
     /// Forward count must respect `iend_abs` — even when matching

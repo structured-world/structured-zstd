@@ -67,16 +67,23 @@ pub(crate) struct BtMatcher {
     /// parser. Built per-block during `start_matching_optimal` and
     /// drained as the parser advances.
     pub(crate) ldm_sequences: Vec<HcRawSeq>,
-    /// LDM producer — populated lazily on the first
-    /// `prepare_ldm_candidates` call for a frame. `None` while LDM
-    /// is opt-out (current default) so the table allocation only
-    /// happens for callers that opt in. See
-    /// [`super::ldm::LdmProducer`]. Gated behind the `hash`
-    /// feature because the producer's per-window XXH64 hashing
-    /// depends on the optional `twox-hash` dependency; under
-    /// `default-features = false` the field disappears and the
-    /// `prepare_ldm_candidates` body shrinks to the legacy
-    /// `ldm_sequences.clear()` stub.
+    /// LDM producer — `None` while LDM is opt-out (current
+    /// default) so the table allocation only happens for callers
+    /// that opt in. The producer is **never auto-constructed**:
+    /// every `CompressionLevel` preset leaves this field as
+    /// `None`, matching upstream `libzstd.so.1` where
+    /// `ZSTD_compress(..., level)` never enables LDM. The
+    /// opt-in surface (Rust parameter API, see #27) builds an
+    /// `LdmProducer` from caller-supplied params and assigns it
+    /// here at frame setup time; `prepare_ldm_candidates` only
+    /// consumes the field, it does not construct it. See
+    /// [`super::ldm::LdmProducer`].
+    ///
+    /// Gated behind the `hash` feature because the producer's
+    /// per-window XXH64 hashing depends on the optional
+    /// `twox-hash` dependency; under `default-features = false`
+    /// the field disappears and the `prepare_ldm_candidates`
+    /// body shrinks to the legacy `ldm_sequences.clear()` stub.
     #[cfg(feature = "hash")]
     pub(crate) ldm_producer: Option<LdmProducer>,
 }
