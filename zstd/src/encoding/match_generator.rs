@@ -1147,7 +1147,17 @@ impl MatchGeneratorDriver {
     ) {
         use super::strategy::BackendTag;
         match S::BACKEND {
-            BackendTag::Simple => while self.simple_mut().next_sequence(&mut *handle_sequence) {},
+            BackendTag::Simple => {
+                // Hoist the storage match out of the per-sequence loop.
+                // `self.simple_mut()` runs an `enum MatcherStorage` match
+                // arm + an `unreachable!` guard on every call, so emitting
+                // it inside `while self.simple_mut().next_sequence(...)`
+                // (the previous form) re-paid that dispatch on every
+                // sequence the Fast backend produced. Borrow once and
+                // drive the loop through the local handle.
+                let matcher = self.simple_mut();
+                while matcher.next_sequence(&mut *handle_sequence) {}
+            }
             BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
             BackendTag::Row => self.row_matcher_mut().start_matching(handle_sequence),
             BackendTag::HashChain => self
