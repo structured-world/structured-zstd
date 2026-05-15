@@ -162,14 +162,19 @@ impl LdmHashTable {
         }
     }
 
-    /// Reset every bucket to "empty" without reallocating. Donor
-    /// equivalent is the `ZSTD_cwksp` clear of the LDM region at
-    /// frame boundaries. `LdmEntry` is `Copy` so the slice
-    /// `fill` compiles down to a bulk memset — meaningful when
-    /// `hash_log` is large and this runs at every frame boundary.
+    /// Reset every bucket to "empty" without reallocating, and
+    /// rewind the rebase base so a fresh frame can start its
+    /// absolute positions from any value (including 0) without
+    /// tripping the `abs_pos >= position_base` assertion in
+    /// [`Self::insert_absolute`]. Donor equivalent is the
+    /// `ZSTD_cwksp` clear of the LDM region at frame boundaries.
+    /// `LdmEntry` is `Copy` so the slice `fill` compiles down to
+    /// a bulk memset — meaningful when `hash_log` is large and
+    /// this runs at every frame boundary.
     pub(crate) fn clear(&mut self) {
         self.entries.fill(LdmEntry::default());
         self.bucket_offsets.fill(0);
+        self.position_base = 0;
     }
 
     /// Number of buckets (`1 << (hash_log - bucket_size_log)`).
@@ -566,6 +571,28 @@ mod tests {
         // round-trip.
         t.insert_absolute(2, trigger_pos, 0xCAFE);
         assert_eq!(t.resolve(&t.bucket(2)[0]), Some(trigger_pos));
+    }
+
+    /// `clear()` must reset `position_base` to 0 so a subsequent
+    /// frame can insert at any absolute position (including
+    /// values below the previous frame's `position_base`)
+    /// without tripping the `abs_pos >= position_base`
+    /// assertion. Regression for PR #139 round-4 CodeRabbit
+    /// nitpick.
+    #[test]
+    fn clear_resets_position_base() {
+        let mut t = LdmHashTable::new(4, 2);
+        t.insert_absolute(0, 1024, 0xAAAA);
+        t.reduce(1 << 20); // shift base forward
+        assert!(t.position_base() > 0);
+        t.clear();
+        assert_eq!(t.position_base(), 0, "clear must rewind position_base to 0");
+        // Inserting at absolute 0 after clear must succeed —
+        // would panic on the assertion if position_base wasn't
+        // reset.
+        t.insert_absolute(0, 0, 0xCAFE);
+        let entry = t.bucket(0)[0];
+        assert_eq!(t.resolve(&entry), Some(0));
     }
 
     /// `bucket_mask` returned by the table must agree with the
