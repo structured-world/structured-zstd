@@ -289,18 +289,20 @@ impl LdmHashTable {
         );
     }
 
-    /// Ensure that absolute position `abs_pos` (and the next
-    /// `LDM_INSERT_LOOKAHEAD` bytes, conservatively) can be
-    /// stored without `u32` overflow. If the relative position
-    /// is within [`REBASE_GUARD_BAND`] of `u32::MAX`, advance
-    /// `position_base` by `REBASE_GUARD_BAND` and run
-    /// [`Self::reduce`] across all entries.
+    /// Ensure that absolute position `abs_pos` can be stored as a
+    /// `u32` offset relative to [`Self::position_base`] without
+    /// overflow. If the relative position would exceed `u32::MAX
+    /// - REBASE_GUARD_BAND`, advance `position_base` by
+    /// [`REBASE_GUARD_BAND`] and run [`Self::reduce`] across all
+    /// entries. In the common case (`rel <= max_rel`) the call is
+    /// a single compare and returns immediately.
     ///
-    /// Returns the absolute position `abs_pos - shift_applied`
-    /// the caller should treat as "current" after the rebase
-    /// (zero shift in the common case). Donor:
-    /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`), invoked from
-    /// `ZSTD_window_update`.
+    /// The producer calls this before every insert so positions
+    /// past 4 GiB rebase transparently. Caller positions remain
+    /// absolute on both sides of the rebase — `Self::resolve` /
+    /// `Self::insert_absolute` handle the relative-coordinate
+    /// translation internally. Donor: `ZSTD_ldm_reduceTable`
+    /// (`zstd_ldm.c:520`), invoked from `ZSTD_window_update`.
     pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
         if abs_pos < self.position_base {
             // The caller asked about a position BEFORE the
