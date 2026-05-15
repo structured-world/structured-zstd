@@ -211,11 +211,27 @@ impl LdmHashTable {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `hash_id >= bucket_count()`. Release
-    /// builds rely on `bucket_offsets[]` indexing to panic the same
-    /// way (the `entries[]` write past the bucket would corrupt the
-    /// next bucket in release without the assertion).
+    /// Panics in all build modes if `entry.offset == 0` — that
+    /// value is reserved for the empty-slot sentinel and an
+    /// accepted insert would be silently dropped by
+    /// [`Self::resolve`]; callers must produce a +1-biased
+    /// relative offset (use [`Self::insert_absolute`] for the
+    /// common path).
+    ///
+    /// Out-of-range `hash_id` panics in both debug and release
+    /// (Vec bounds-check on `bucket_offsets[hash_id]`); the
+    /// `debug_assert!` exists purely to produce an earlier,
+    /// clearer error than the bare index-out-of-bounds.
     pub(crate) fn insert(&mut self, hash_id: u32, entry: LdmEntry) {
+        // Runtime check (not `debug_assert!`): storing offset 0
+        // would alias the empty-slot sentinel, so a buggy caller
+        // would silently lose candidates rather than fail fast.
+        assert!(
+            entry.offset != 0,
+            "offset 0 is reserved for the empty-slot sentinel; \
+             use `insert_absolute` (which applies the +1 bias) or \
+             store a +1-biased relative offset before calling insert"
+        );
         debug_assert!(
             hash_id <= self.bucket_mask,
             "hash_id {hash_id} out of range (bucket_count = {})",
@@ -394,10 +410,13 @@ mod tests {
     }
 
     /// Round-robin insertion fills the bucket then wraps.
+    /// Uses offsets `1..=6` (not `0..6`) so the test does not
+    /// rely on the sentinel value `0`, which
+    /// [`LdmHashTable::insert`] now rejects with a runtime assert.
     #[test]
     fn insert_round_robin_wraps_through_bucket_slots() {
         let mut t = LdmHashTable::new(4, 2); // 4 buckets × 4 slots
-        for k in 0..6u32 {
+        for k in 1..=6u32 {
             t.insert(
                 1,
                 LdmEntry {
@@ -407,13 +426,32 @@ mod tests {
             );
         }
         let b = t.bucket(1);
-        // After 6 inserts, slots hold: [k=4, k=5, k=2, k=3]
-        // (slot 0 overwritten by k=4, slot 1 by k=5; slots 2,3
-        // hold the pre-wrap inserts k=2,3).
-        assert_eq!(b[0].offset, 4);
-        assert_eq!(b[1].offset, 5);
-        assert_eq!(b[2].offset, 2);
-        assert_eq!(b[3].offset, 3);
+        // After 6 inserts in a 4-slot bucket the round-robin
+        // cursor cycles 0→1→2→3→0→1, so the last write to each
+        // slot is k=5 (slot 0), k=6 (slot 1), k=3 (slot 2),
+        // k=4 (slot 3).
+        assert_eq!(b[0].offset, 5);
+        assert_eq!(b[1].offset, 6);
+        assert_eq!(b[2].offset, 3);
+        assert_eq!(b[3].offset, 4);
+    }
+
+    /// `insert` must reject the empty-slot sentinel `offset == 0`
+    /// — otherwise the entry would survive in the bucket but be
+    /// invisible to [`LdmHashTable::resolve`] (which treats `0`
+    /// as the empty marker), silently dropping candidates.
+    /// Regression for PR #139 round-16 review (CodeRabbit Major).
+    #[test]
+    #[should_panic(expected = "offset 0 is reserved")]
+    fn insert_panics_on_sentinel_offset_zero() {
+        let mut t = LdmHashTable::new(4, 2);
+        t.insert(
+            0,
+            LdmEntry {
+                offset: 0,
+                checksum: 0xDEAD,
+            },
+        );
     }
 
     /// Inserts to one bucket must not bleed into adjacent buckets.
