@@ -132,7 +132,21 @@ pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
 /// `clevels.h` and `StrategyTag::for_level` exactly.
 fn strategy_suffix(level: i32) -> &'static str {
     match level {
-        ..=0 => "fast",
+        // Negative levels uniformly map to the ultra-fast `Fast`
+        // strategy (donor `cParams.strategy = ZSTD_fast` for any
+        // `cLevel <= 1`). Level 0 is intentionally NOT classified
+        // here — donor treats it as a sentinel for "use default"
+        // (= 3, `Dfast`), and `supported_levels()` omits it to keep
+        // bench labels unambiguous. A future caller that does pass
+        // `0` should pre-resolve it to `3` before reaching this
+        // helper rather than have it silently aliased to `fast`.
+        i32::MIN..=-1 => "fast",
+        0 => unreachable!(
+            "strategy_suffix(0) called; level 0 is the donor sentinel for \
+             'use default' (= 3). `supported_levels()` skips it so it never \
+             reaches this helper. Resolve to the canonical numeric level \
+             before calling."
+        ),
         1 => "fast",
         2 | 3 => "dfast",
         4 => "greedy",
@@ -157,7 +171,19 @@ fn strategy_suffix(level: i32) -> &'static str {
 /// Renaming an entry requires synchronising all three call sites. The
 /// `level_filter_from_env()` panic on unknown names is the safety net
 /// that catches the drift in CI before any silent skips.
+///
+/// The inventory is built once per process via [`LazyLock`] so the
+/// `Box::leak` that backs each `&'static str` `name` happens exactly
+/// 29 times total — the criterion bench loops call this helper many
+/// times per scenario, and a naive per-call rebuild would compound
+/// the leak proportionally.
 pub(crate) fn supported_levels() -> Vec<LevelConfig> {
+    static INVENTORY: std::sync::LazyLock<Vec<LevelConfig>> =
+        std::sync::LazyLock::new(build_supported_levels);
+    INVENTORY.clone()
+}
+
+fn build_supported_levels() -> Vec<LevelConfig> {
     let mut levels = Vec::with_capacity(29);
     // Ultra-fast tier: `-7..=-1`. Donor strategy = Fast.
     for n in -7..=-1i32 {
@@ -189,11 +215,12 @@ pub(crate) fn supported_levels() -> Vec<LevelConfig> {
 }
 
 /// Convert a one-shot owned `String` (built by `format!`) into a
-/// `&'static str`. The leak is deliberate and bounded: `supported_levels()`
-/// is called a handful of times per bench process at most, the leaked
-/// data lives for the rest of the run, and the process exits within
-/// minutes. Keeps `LevelConfig::name: &'static str` simple so bench
-/// IDs can stay `&'static`-friendly inside criterion's helpers.
+/// `&'static str`. Called exactly once per level inside
+/// [`build_supported_levels`], whose result is cached in a
+/// `LazyLock` so the total leak is bounded to the 29 strings the
+/// bench inventory needs — no proportional growth even when
+/// `supported_levels()` is called inside criterion's per-scenario
+/// loops.
 fn leak_owned(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
