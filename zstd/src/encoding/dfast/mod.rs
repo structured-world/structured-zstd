@@ -249,6 +249,14 @@ impl DfastMatchGenerator {
                     handle_sequence,
                 );
                 pos = start + candidate.match_len;
+                // Donor's opportunistic rep-0 extension after every emit.
+                pos = self.extend_with_repcode_after_match(
+                    current_abs_start,
+                    current_len,
+                    pos,
+                    &mut literals_start,
+                    handle_sequence,
+                );
                 skip_step = 1;
                 next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
@@ -339,6 +347,13 @@ impl DfastMatchGenerator {
                         handle_sequence,
                     );
                     pos = start + rep.match_len;
+                    pos = self.extend_with_repcode_after_match(
+                        current_abs_start,
+                        current_len,
+                        pos,
+                        &mut literals_start,
+                        handle_sequence,
+                    );
                     skip_step = 1;
                     next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                     miss_run = 0;
@@ -355,6 +370,13 @@ impl DfastMatchGenerator {
                     handle_sequence,
                 );
                 pos = start + candidate.match_len;
+                pos = self.extend_with_repcode_after_match(
+                    current_abs_start,
+                    current_len,
+                    pos,
+                    &mut literals_start,
+                    handle_sequence,
+                );
                 skip_step = 1;
                 next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
@@ -387,6 +409,82 @@ impl DfastMatchGenerator {
 
         self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
         self.emit_trailing_literals(literals_start, handle_sequence);
+    }
+
+    /// Donor `zstd_double_fast.c` post-match rep-0 extension. After the
+    /// primary match has been emitted and `pos` advanced past it, donor
+    /// opportunistically chains additional `rep_2`-coded matches at the
+    /// new cursor as long as 4 bytes at `ip` keep matching the bytes at
+    /// `ip - offset_2` (in donor naming; in Rust offset terms this is
+    /// `offset_hist[1]` once `lit_len == 0` after the just-emitted
+    /// primary). Each iteration:
+    ///
+    ///   * emits one zero-literal sequence with the old `offset_hist[1]`,
+    ///   * swaps `offset_hist[0]` ↔ `offset_hist[1]` via
+    ///     [`encode_offset_with_history`] (the donor `offset_2 = offset_1;
+    ///     offset_1 = old_offset_2;` swap),
+    ///   * skips the hash-table probe entirely on every extra match.
+    ///
+    /// Critically uses donor's `MINMATCH = 4` here rather than the
+    /// stricter `DFAST_MIN_MATCH_LEN = 6` enforced on the main search
+    /// loop. The donor accepts any 4-byte rep extension; we mirror that
+    /// because the rep emission carries no offset cost — even a 4-byte
+    /// rep is a net win over re-running the full hash search. Returns
+    /// the new value of `pos` and updates `literals_start` in place to
+    /// the post-rep-chain anchor.
+    fn extend_with_repcode_after_match(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        mut pos: usize,
+        literals_start: &mut usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) -> usize {
+        const DONOR_REP_MIN_MATCH_LEN: usize = 4;
+        loop {
+            // Need at least DONOR_REP_MIN_MATCH_LEN bytes of room past `pos`.
+            if pos + DONOR_REP_MIN_MATCH_LEN > current_len {
+                break;
+            }
+            // After a primary emit `literals_start == pos`, so `lit_len`
+            // on the next sequence is zero — donor's rep probe uses
+            // `offset_2` (== `offset_hist[1]` under our encoding).
+            let rep = self.offset_hist[1] as usize;
+            if rep == 0 || rep > pos {
+                break;
+            }
+            let abs_pos = current_abs_start + pos;
+            let cur_idx = abs_pos - self.history_abs_start;
+            let cand_idx = match cur_idx.checked_sub(rep) {
+                Some(idx) => idx,
+                None => break,
+            };
+            let concat = &self.history[self.history_start..];
+            if cur_idx + DONOR_REP_MIN_MATCH_LEN > concat.len() {
+                break;
+            }
+            // Cheap 4-byte gate before the SIMD `common_prefix_len`.
+            if concat[cur_idx..cur_idx + 4] != concat[cand_idx..cand_idx + 4] {
+                break;
+            }
+            let match_len = common_prefix_len(&concat[cand_idx..], &concat[cur_idx..]);
+            if match_len < DONOR_REP_MIN_MATCH_LEN {
+                break;
+            }
+            // Insert the rep range into hash tables so future positions
+            // hashing into this area find these candidates.
+            self.insert_positions(abs_pos, abs_pos + match_len);
+            // Emit zero-literal rep sequence.
+            handle_sequence(Sequence::Triple {
+                literals: &[],
+                offset: rep,
+                match_len,
+            });
+            let _ = encode_offset_with_history(rep as u32, 0, &mut self.offset_hist);
+            pos += match_len;
+            *literals_start = pos;
+        }
+        pos
     }
 
     pub(crate) fn seed_remaining_hashable_starts(

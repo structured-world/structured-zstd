@@ -231,30 +231,49 @@ impl HcMatcher {
         // Donor speculative tail check (`zstd_lazy.c:714`,
         // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
         // expensive `common_prefix_len` walk on a 4-byte tail compare
-        // proving the candidate can reach `best_ml + 1`. See the
-        // monotonic-offset argument inside the loop for correctness.
+        // proving the new candidate can possibly reach the *forward*
+        // length required to outscore `best` under
+        // [`Self::better_candidate`] (gain = `len*4 - offset_bits`).
+        //
+        // Correctness — backward-extension–aware bound:
+        //   `best.match_len` is the *total* length stored by
+        //   [`Self::extend_backwards`]: forward bytes from
+        //   `current_idx` plus up to `lit_len` backward bytes
+        //   (`B_best = abs_pos − best.start`, capped by `lit_len`).
+        //   A new candidate can in principle replace `B_best` of its
+        //   own length with up to `lit_len` backward bytes, so the
+        //   worst-case forward length it needs to outscore `best`
+        //   is `best.match_len − lit_len + 1`. The 4-byte tail probe
+        //   at offset `best.match_len − lit_len − 3` covers exactly
+        //   that boundary (the read includes the byte at the
+        //   required-forward-length position itself). A mismatch
+        //   there is a proof the candidate cannot win regardless of
+        //   how much it later extends backwards.
+        //   When `best.match_len ≤ lit_len + 3` the worst-case
+        //   forward target is so close to `current_idx` that the
+        //   `common_prefix_len` cost is already trivial — the gate
+        //   is skipped via the `checked_sub`.
+        //
+        // Walk-order argument (offset monotonicity):
+        //   Chain walks are LIFO (newest first → strictly increasing
+        //   offset). Once `best` is set, every subsequent candidate
+        //   has `new.offset_bits ≥ best.offset_bits`, so
+        //   `better_candidate` can only return a new winner when the
+        //   *total* match length (forward + backward) strictly
+        //   exceeds `best.match_len`. Combined with the worst-case
+        //   backward-extension bound above, the required forward
+        //   length is `best.match_len − lit_len + 1`.
         let history_tail = concat.len();
         for candidate_abs in self.chain_candidates(table, abs_pos) {
             if candidate_abs == usize::MAX {
                 break;
             }
             let candidate_idx = candidate_abs - table.history_abs_start;
-            if let Some(best_ml) = best.map(|b| b.match_len)
-                && best_ml >= 4
+            if let Some(best_ref) = best
+                && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
             {
-                let tail_off = best_ml - 3;
                 let m_end = candidate_idx + tail_off + 4;
                 let i_end = current_idx + tail_off + 4;
-                // Chain walk is LIFO (newest first → strictly
-                // increasing offset). Once `best` is set, every
-                // subsequent candidate has `new.offset_bits >=
-                // best.offset_bits`, so `better_candidate` (gain =
-                // `len*4 - offset_bits`) can only return a new
-                // winner when `new.match_len > best_ml`. The 4-byte
-                // tail compare proves that pre-condition without
-                // running `common_prefix_len`. If either side runs
-                // out of room before `best_ml + 1`, the candidate
-                // cannot exceed `best_ml` either — same skip.
                 if i_end > history_tail || m_end > history_tail {
                     continue;
                 }

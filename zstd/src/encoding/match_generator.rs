@@ -419,17 +419,29 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
 /// of truth and dead variants are dropped when the active backend
 /// changes.
 enum MatcherStorage {
-    /// Level 1 — donor `ZSTD_fast`. Single-table Simple matcher; always
-    /// the initial variant constructed by [`MatchGeneratorDriver::new`].
+    /// Donor `ZSTD_fast` family. Constructed by
+    /// [`MatchGeneratorDriver::new`] as the initial variant and
+    /// re-selected by [`Matcher::reset`] for any [`CompressionLevel`]
+    /// that `resolve_level_params` maps to [`StrategyTag::Fast`]
+    /// (`Uncompressed`, `Fastest`, `Level(1)`, and any non-positive
+    /// `Level(n)` not equal to `0`).
     Simple(MatchGenerator),
-    /// Levels 2-3 — donor `ZSTD_dfast`. Two-table hash chain.
+    /// Donor `ZSTD_dfast` family — two-table hash chain. Selected for
+    /// any level that resolves to [`StrategyTag::Dfast`] in
+    /// `resolve_level_params` (`Default`, `Level(0)`, `Level(2)`,
+    /// `Level(3)`).
     Dfast(DfastMatchGenerator),
-    /// Level 4 — donor `ZSTD_greedy` with row hashing.
+    /// Donor `ZSTD_greedy` family with row hashing. Selected for any
+    /// level that resolves to [`StrategyTag::Greedy`] (currently
+    /// `Level(4)` only).
     Row(RowMatchGenerator),
-    /// Levels 5-22 — donor `ZSTD_lazy2` and the BT-based optimal modes
-    /// (`btopt` / `btultra` / `btultra2`). Holds an [`HcMatchGenerator`]
-    /// whose internal [`HcBackend`] discriminator decides whether BT
-    /// scratch is allocated.
+    /// Donor `ZSTD_lazy2` and the BT-based optimal modes
+    /// (`btopt` / `btultra` / `btultra2`). Selected for any level that
+    /// resolves to [`StrategyTag::Lazy`], [`StrategyTag::BtOpt`],
+    /// [`StrategyTag::BtUltra`], or [`StrategyTag::BtUltra2`]
+    /// (`Better`, `Best`, `Level(5..=22)`). The
+    /// [`HcMatchGenerator`]'s internal [`HcBackend`] discriminator
+    /// decides whether BT scratch is allocated.
     HashChain(HcMatchGenerator),
 }
 
@@ -5381,10 +5393,20 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     );
 }
 
+/// Row → Simple transition drops the Row variant and the
+/// post-switch active backend is exactly Simple. The window-emptied
+/// check from the pre-enum era (`driver.row_matcher().window.is_empty()`)
+/// is intentionally gone — the `Row` variant no longer exists after
+/// the swap, so there is nothing to inspect by accessor; the "window
+/// cleared" invariant is replaced by "variant dropped", and a
+/// subsequent `row_matcher()` call would panic by design. The
+/// pool-recycling side of the same transition is covered by
+/// [`driver_reset_from_row_backend_recycles_row_buffers_into_pool`].
 #[test]
-fn row_get_last_space_and_reset_to_fastest_clears_window() {
+fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(4));
+    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
     let mut space = driver.get_next_space();
     space.clear();
@@ -5421,9 +5443,16 @@ fn driver_reset_from_row_backend_recycles_row_buffers_into_pool() {
     driver.reset(CompressionLevel::Fastest);
 
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
+    // `>` not `>=`: a fresh driver starts with `before_pool == 0`, so the
+    // weaker bound passes even if the Row→Simple transition failed to
+    // drain the committed buffer back into `vec_pool`. Strict growth
+    // proves the drain ran. Single fixture buffer → exactly one Vec
+    // returned to the pool.
     assert!(
-        driver.vec_pool.len() >= before_pool,
-        "row reset should recycle row history buffers"
+        driver.vec_pool.len() > before_pool,
+        "row reset must recycle the committed row history buffer into vec_pool \
+         (before_pool = {before_pool}, after = {})",
+        driver.vec_pool.len()
     );
 }
 
