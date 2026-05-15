@@ -63,7 +63,7 @@ REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_buffer_bytes_estimate=(\d+) ffi_buffer_bytes_estimate=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
@@ -248,8 +248,8 @@ with open(raw_path) as f:
                 label,
                 level,
                 stage,
-                rust_buffer_bytes_estimate,
-                ffi_buffer_bytes_estimate,
+                rust_peak_alloc_bytes,
+                ffi_peak_alloc_bytes,
             ) = mem_match.groups()
             label = unescape_report_label(label)
             memory_rows.append({
@@ -257,8 +257,8 @@ with open(raw_path) as f:
                 "label": label,
                 "level": level,
                 "stage": stage,
-                "rust_buffer_bytes_estimate": int(rust_buffer_bytes_estimate),
-                "ffi_buffer_bytes_estimate": int(ffi_buffer_bytes_estimate),
+                "rust_peak_alloc_bytes": int(rust_peak_alloc_bytes),
+                "ffi_peak_alloc_bytes": int(ffi_peak_alloc_bytes),
             })
             continue
 
@@ -572,6 +572,52 @@ for row in delta_rows:
             }
         )
 
+# Add per-(scenario, level, stage) peak-memory rows so the dashboard
+# can render a third metric alongside compression_ratio +
+# throughput_bytes_per_sec. The memory stage strings from the bench
+# (`compress`, `decompress-rust_stream`, `decompress-c_stream`) get
+# normalised into the same (stage, source) shape the speed/ratio
+# records already use so the dashboard's existing per-series grouping
+# keeps working unchanged.
+for row in memory_rows:
+    rust_bytes = row["rust_peak_alloc_bytes"]
+    ffi_bytes = row["ffi_peak_alloc_bytes"]
+    raw_stage = row["stage"]
+    if raw_stage == "compress":
+        stage = "compress"
+        source = None
+    elif raw_stage.startswith("decompress-"):
+        stage = "decompress"
+        source = raw_stage.removeprefix("decompress-")
+    else:
+        stage = raw_stage
+        source = None
+    # delta_ratio = rust_peak / ffi_peak. Values > 1 mean Rust uses
+    # MORE memory than FFI (worse for us — same direction as
+    # compression_ratio, where >1 means Rust output is larger).
+    delta_ratio = (rust_bytes / ffi_bytes) if ffi_bytes > 0 else None
+    if delta_ratio is None:
+        continue
+    relative_rows.append(
+        {
+            "target": bench_target_id,
+            "stage": stage,
+            "scenario": row["scenario"],
+            "level": row["level"],
+            "source": source,
+            "key": canonical_key(stage, row["scenario"], row["level"], source),
+            "commit_sha": commit_sha,
+            "generated_at": generated_at,
+            "metric": "peak_alloc_bytes",
+            "rust_value": rust_bytes,
+            "ffi_value": ffi_bytes,
+            "delta_ratio": delta_ratio,
+            "delta_percent": (delta_ratio - 1.0) * 100.0,
+            "status_band": "n/a",
+            "interpretation": "delta>1 means Rust allocates more peak memory than FFI",
+        }
+    )
+
 relative_payload = {
     "version": 1,
     "target": {
@@ -612,14 +658,14 @@ lines.extend([
     "",
     "## Buffer Size Estimates (Input + Output)",
     "",
-    "| Scenario | Label | Level | Stage | Rust buffer bytes (estimate) | C buffer bytes (estimate) |",
+    "| Scenario | Label | Level | Stage | Rust peak alloc bytes | C peak alloc bytes |",
     "| --- | --- | --- | --- | ---: | ---: |",
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
     label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_buffer_bytes_estimate"]} | {row["ffi_buffer_bytes_estimate"]} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
     )
 
 lines.extend([

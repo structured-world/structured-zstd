@@ -12,10 +12,118 @@
 mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::io::Write;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Hand-rolled tracking allocator wrapping `System` so the bench can
+/// emit a per-call peak-memory metric alongside throughput / ratio.
+/// Hand-rolled (not a dep) because the wrapper is ~30 lines and stays
+/// dev-only; pulling `peak_alloc` would add a transitive dep on
+/// `parking_lot` for what amounts to two atomics.
+///
+/// Usage:
+///   1. `PeakAllocTracker::reset()` — snapshot current usage as the
+///      peak baseline.
+///   2. Run the work to measure.
+///   3. `PeakAllocTracker::peak_since_reset()` — high-water mark of
+///      live bytes above the snapshot baseline.
+///
+/// Atomics use `Relaxed` ordering: the peak/current pair is observed
+/// from the same thread that runs the work, so cross-thread ordering
+/// guarantees aren't needed. The bench harness runs each measurement
+/// on the calling thread.
+struct TrackingAllocator;
+static ALLOC_CURRENT: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_PEAK: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_BASELINE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded to the system allocator unchanged; the
+        // tracking just observes the size on success.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
+            // `fetch_max` on the new live size keeps the high-water
+            // mark current without an extra load+compare.
+            ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: caller guarantees the pointer/layout pair came from
+        // a matching `alloc` call.
+        unsafe { System.dealloc(ptr, layout) };
+        ALLOC_CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded to the system allocator unchanged; the
+        // tracking just observes the size on success.
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
+            ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the realloc contract is honoured by `System.realloc`;
+        // tracking adjusts the live count by the size delta when the
+        // new allocation succeeds.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            let old = layout.size();
+            if new_size >= old {
+                let diff = new_size - old;
+                let prev = ALLOC_CURRENT.fetch_add(diff, Ordering::Relaxed);
+                ALLOC_PEAK.fetch_max(prev + diff, Ordering::Relaxed);
+            } else {
+                ALLOC_CURRENT.fetch_sub(old - new_size, Ordering::Relaxed);
+            }
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+struct PeakAllocTracker;
+impl PeakAllocTracker {
+    /// Snapshot the current live-bytes count as the baseline against
+    /// which the next [`Self::peak_since_reset`] measurement is taken.
+    /// Also forces the peak counter to the same baseline so a peak
+    /// observed BEFORE this call doesn't leak into the next sample.
+    fn reset() {
+        let current = ALLOC_CURRENT.load(Ordering::Relaxed);
+        ALLOC_BASELINE.store(current, Ordering::Relaxed);
+        ALLOC_PEAK.store(current, Ordering::Relaxed);
+    }
+
+    /// High-water mark of live bytes above the baseline set by
+    /// [`Self::reset`]. Returns `0` when the workload only freed
+    /// memory below the baseline (impossible for a positive-net
+    /// compress/decompress call but guards against signed underflow).
+    fn peak_since_reset() -> usize {
+        let peak = ALLOC_PEAK.load(Ordering::Relaxed);
+        let baseline = ALLOC_BASELINE.load(Ordering::Relaxed);
+        peak.saturating_sub(baseline)
+    }
+}
+
+fn measure_peak_alloc<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    PeakAllocTracker::reset();
+    let result = f();
+    let peak = PeakAllocTracker::peak_since_reset();
+    (result, peak)
+}
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
@@ -69,21 +177,19 @@ fn bench_compress(c: &mut Criterion) {
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
-                let rust_compressed = structured_zstd::encoding::compress_to_vec(
-                    &scenario.bytes[..],
-                    level.rust_level,
-                );
-                let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
+                let (rust_compressed, rust_peak_bytes) = measure_peak_alloc(|| {
+                    structured_zstd::encoding::compress_to_vec(
+                        &scenario.bytes[..],
+                        level.rust_level,
+                    )
+                });
+                let (ffi_compressed, ffi_peak_bytes) = measure_peak_alloc(|| {
+                    ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level)
+                });
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
-                emit_memory_report(
-                    scenario,
-                    level,
-                    "compress",
-                    scenario.len() + rust_compressed.len(),
-                    scenario.len() + ffi_compressed.len(),
-                );
+                emit_memory_report(scenario, level, "compress", rust_peak_bytes, ffi_peak_bytes);
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -151,12 +257,33 @@ fn bench_decompress_source(
     assert_decompress_matches_reference(scenario, compressed, expected_len);
 
     if emit_reports {
+        // Measure peak live bytes for one full decode pass on each
+        // path. Done OUTSIDE the criterion bench loop so the sample
+        // is dominated by decoder internals (FrameDecoder state for
+        // rust, ZSTD_DCtx + window for ffi) rather than criterion's
+        // own per-iteration bookkeeping.
+        let (_, rust_peak_bytes) = measure_peak_alloc(|| {
+            let mut target = vec![0u8; expected_len];
+            let mut decoder = FrameDecoder::new();
+            let written = decoder.decode_all(compressed, &mut target).unwrap();
+            assert_eq!(written, expected_len);
+            target
+        });
+        let (_, ffi_peak_bytes) = measure_peak_alloc(|| {
+            let mut decoder = zstd::bulk::Decompressor::new().unwrap();
+            let mut output = Vec::with_capacity(expected_len);
+            let written = decoder
+                .decompress_to_buffer(compressed, &mut output)
+                .unwrap();
+            assert_eq!(written, expected_len);
+            output
+        });
         emit_memory_report(
             scenario,
             level,
             &format!("decompress-{source}"),
-            compressed.len() + expected_len,
-            compressed.len() + expected_len,
+            rust_peak_bytes,
+            ffi_peak_bytes,
         );
     }
 
@@ -456,18 +583,18 @@ fn emit_memory_report(
     scenario: &Scenario,
     level: LevelConfig,
     stage: &str,
-    rust_buffer_bytes_estimate: usize,
-    ffi_buffer_bytes_estimate: usize,
+    rust_peak_alloc_bytes: usize,
+    ffi_peak_alloc_bytes: usize,
 ) {
     let escaped_label = escape_report_label(&scenario.label);
+    // Field names changed from `*_buffer_bytes_estimate` (static
+    // input+output approximation) to `*_peak_alloc_bytes` (real
+    // high-water mark of live allocator bytes during one
+    // compress/decompress pass). The aggregator regex is updated in
+    // lockstep — see `.github/scripts/run-benchmarks.sh`.
     println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_buffer_bytes_estimate={} ffi_buffer_bytes_estimate={}",
-        scenario.id,
-        escaped_label,
-        level.name,
-        stage,
-        rust_buffer_bytes_estimate,
-        ffi_buffer_bytes_estimate
+        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_alloc_bytes={} ffi_peak_alloc_bytes={}",
+        scenario.id, escaped_label, level.name, stage, rust_peak_alloc_bytes, ffi_peak_alloc_bytes
     );
 }
 
