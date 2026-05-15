@@ -291,8 +291,8 @@ impl LdmHashTable {
 
     /// Ensure that absolute position `abs_pos` can be stored as a
     /// `u32` offset relative to [`Self::position_base`] without
-    /// overflow. If the relative position would exceed `u32::MAX
-    /// - REBASE_GUARD_BAND`, advance `position_base` by
+    /// overflow. When the relative position would exceed
+    /// `u32::MAX − REBASE_GUARD_BAND`, advance `position_base` by
     /// [`REBASE_GUARD_BAND`] and run [`Self::reduce`] across all
     /// entries. In the common case (`rel <= max_rel`) the call is
     /// a single compare and returns immediately.
