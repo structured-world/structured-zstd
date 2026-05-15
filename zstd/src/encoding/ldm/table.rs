@@ -31,27 +31,66 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// One hash-table entry — `(absolute_position, checksum)`.
+/// One hash-table entry — `(offset_relative_to_position_base,
+/// checksum)`.
 ///
-/// Mirrors donor `ldmEntry_t` from `zstd_compress_internal.h`. The
-/// 32-bit `checksum` is the high 32 bits of the per-window XXH64;
-/// the low 32 bits index into the bucket array and so do not need to
-/// be stored separately.
+/// Mirrors donor `ldmEntry_t` from `zstd_compress_internal.h`.
+///
+/// **Offset semantics:** `offset` is **NOT an absolute stream
+/// position**. It is stored relative to the owning
+/// [`LdmHashTable::position_base`] so that streams larger than
+/// `u32::MAX` (4 GiB) can be encoded without truncation: the
+/// table calls [`LdmHashTable::resolve`] to translate
+/// `entry.offset` to an absolute position when the producer or
+/// search path needs it, and periodically rebases via
+/// [`LdmHashTable::reduce`] (donor `ZSTD_ldm_reduceTable`,
+/// `zstd_ldm.c:520`) to keep `position - position_base ≤
+/// u32::MAX`. Same scheme `MatchTable` uses for the BT/HC chain
+/// table.
+///
+/// The 32-bit `checksum` is the high 32 bits of the per-window
+/// XXH64; the low 32 bits index into the bucket array and so do
+/// not need to be stored separately.
+///
+/// `offset == 0` is the reserved **empty-slot sentinel** —
+/// callers must never produce a real relative offset of 0
+/// (every insert path adds 1 to the relative position before
+/// storing).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LdmEntry {
-    /// Absolute byte position of the start of the matched window
-    /// (donor: `entry.offset = (U32)(split - base)`).
+    /// Position relative to [`LdmHashTable::position_base`], with
+    /// a +1 bias so a fresh default-zeroed entry remains
+    /// distinguishable as "empty". A real absolute position
+    /// `P >= position_base` is stored as `(P - position_base + 1)
+    /// as u32`; the [`LdmHashTable::resolve`] helper handles the
+    /// inverse translation.
     pub(crate) offset: u32,
     /// High 32 bits of the XXH64 over the `min_match_length`-byte
-    /// window — donor `entry.checksum`. Used to filter false-positive
-    /// bucket collisions before invoking the byte-level verify.
+    /// window — donor `entry.checksum`. Used to filter
+    /// false-positive bucket collisions before invoking the
+    /// byte-level verify.
     pub(crate) checksum: u32,
 }
+
+/// Margin reserved above the high-water mark before triggering a
+/// rebase. Donor `ZSTD_ldm_reduceTable` is called at a coarser
+/// granularity (per-frame `ZSTD_window_update`); ours kicks in
+/// per-insert via [`LdmHashTable::ensure_room_for`] but uses a
+/// generous safety band so the rebase is amortised across many
+/// inserts.
+const REBASE_GUARD_BAND: u32 = 1u32 << 30;
 
 /// Bucket-based hash table sized from an [`super::params::LdmParams`].
 ///
 /// `entries.len() == 1 << hash_log`; `bucket_offsets.len() ==
 /// bucket_count`. Per-bucket slot count is `1 << effective_bucket_log`.
+///
+/// **Coordinate model:** entries store positions relative to
+/// `position_base` (see [`LdmEntry`] for the `+1` empty-slot
+/// convention). The producer interacts with the table via the
+/// [`LdmHashTable::insert_absolute`] / [`LdmHashTable::resolve`]
+/// helpers so absolute-position support extends past `u32::MAX`
+/// transparently — same pattern as `MatchTable`'s chain rebase.
 pub(crate) struct LdmHashTable {
     entries: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,
@@ -62,6 +101,12 @@ pub(crate) struct LdmHashTable {
     /// hash ids in `[0, bucket_count)`; this mask is exposed so the
     /// producer can clamp without re-deriving it.
     bucket_mask: u32,
+    /// Absolute stream position that corresponds to a stored
+    /// `entry.offset == 1` (offset 0 is the empty-slot sentinel).
+    /// Advanced by [`Self::reduce`] when the producer is about to
+    /// store a position beyond the `u32` window — donor
+    /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`).
+    position_base: usize,
 }
 
 impl LdmHashTable {
@@ -113,16 +158,17 @@ impl LdmHashTable {
             bucket_offsets: vec![0u8; bucket_count as usize],
             effective_bucket_log,
             bucket_mask: bucket_count - 1,
+            position_base: 0,
         }
     }
 
     /// Reset every bucket to "empty" without reallocating. Donor
     /// equivalent is the `ZSTD_cwksp` clear of the LDM region at
-    /// frame boundaries.
+    /// frame boundaries. `LdmEntry` is `Copy` so the slice
+    /// `fill` compiles down to a bulk memset — meaningful when
+    /// `hash_log` is large and this runs at every frame boundary.
     pub(crate) fn clear(&mut self) {
-        for e in &mut self.entries {
-            *e = LdmEntry::default();
-        }
+        self.entries.fill(LdmEntry::default());
         self.bucket_offsets.fill(0);
     }
 
@@ -189,6 +235,101 @@ impl LdmHashTable {
     /// caller from re-deriving `bucket_count - 1`.
     pub(crate) const fn bucket_mask(&self) -> u32 {
         self.bucket_mask
+    }
+
+    /// Absolute stream position that corresponds to the +1
+    /// relative-offset bias — i.e. an entry with `offset == 1`
+    /// refers to absolute byte `position_base`.
+    pub(crate) const fn position_base(&self) -> usize {
+        self.position_base
+    }
+
+    /// Translate an entry's stored `offset` (relative + 1-biased)
+    /// back to an absolute stream position. Returns `None` for
+    /// the empty-slot sentinel (`offset == 0`).
+    pub(crate) fn resolve(&self, entry: &LdmEntry) -> Option<usize> {
+        match entry.offset {
+            0 => None,
+            rel => Some(self.position_base + (rel as usize) - 1),
+        }
+    }
+
+    /// Insert a candidate at absolute position `abs_pos` into the
+    /// bucket for `hash_id`. The caller is responsible for
+    /// invoking [`Self::ensure_room_for`] beforehand so the
+    /// relative-offset arithmetic stays inside `u32`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `abs_pos < position_base` or if
+    /// `abs_pos - position_base + 1 > u32::MAX`. The producer
+    /// must call `ensure_room_for` before the first insert that
+    /// could exceed the window.
+    pub(crate) fn insert_absolute(&mut self, hash_id: u32, abs_pos: usize, checksum: u32) {
+        debug_assert!(abs_pos >= self.position_base);
+        let rel = abs_pos - self.position_base;
+        debug_assert!(
+            rel < u32::MAX as usize,
+            "insert position {abs_pos} (rel {rel}) exceeds u32 window; \
+             producer must call `ensure_room_for` before insert"
+        );
+        // +1 bias so 0 stays reserved for the empty-slot sentinel.
+        let stored = (rel + 1) as u32;
+        self.insert(
+            hash_id,
+            LdmEntry {
+                offset: stored,
+                checksum,
+            },
+        );
+    }
+
+    /// Ensure that absolute position `abs_pos` (and the next
+    /// `LDM_INSERT_LOOKAHEAD` bytes, conservatively) can be
+    /// stored without `u32` overflow. If the relative position
+    /// is within [`REBASE_GUARD_BAND`] of `u32::MAX`, advance
+    /// `position_base` by `REBASE_GUARD_BAND` and run
+    /// [`Self::reduce`] across all entries.
+    ///
+    /// Returns the absolute position `abs_pos - shift_applied`
+    /// the caller should treat as "current" after the rebase
+    /// (zero shift in the common case). Donor:
+    /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`), invoked from
+    /// `ZSTD_window_update`.
+    pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
+        if abs_pos < self.position_base {
+            // The caller asked about a position BEFORE the
+            // current base — that's the producer error case,
+            // not a rebase trigger.
+            return;
+        }
+        let rel = abs_pos - self.position_base;
+        // Leave at least `REBASE_GUARD_BAND` of u32 headroom
+        // above the current insert position so the next batch of
+        // inserts doesn't immediately re-rebase.
+        let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
+        if rel > max_rel {
+            // Shift the base forward by `REBASE_GUARD_BAND` —
+            // matches donor's "subtract the reducer value, clamp
+            // anything below to 0" semantics.
+            self.reduce(REBASE_GUARD_BAND);
+        }
+    }
+
+    /// Donor `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`): subtract
+    /// `reducer` from every entry's relative offset, saturating
+    /// anything below at 0 (which becomes the empty-slot
+    /// sentinel); advance `position_base` by `reducer` so future
+    /// inserts continue from the shifted origin.
+    pub(crate) fn reduce(&mut self, reducer: u32) {
+        for entry in &mut self.entries {
+            if entry.offset <= reducer {
+                entry.offset = 0;
+            } else {
+                entry.offset -= reducer;
+            }
+        }
+        self.position_base = self.position_base.saturating_add(reducer as usize);
     }
 }
 
@@ -335,6 +476,96 @@ mod tests {
         // hash_log = 12, bucket_size_log = 9 → effective = 9 > 8
         // → assertion fires.
         let _ = LdmHashTable::new(12, 9);
+    }
+
+    /// `insert_absolute` + `resolve` round-trip preserves the
+    /// absolute position across the +1 empty-slot bias.
+    #[test]
+    fn insert_absolute_round_trips_through_resolve() {
+        let mut t = LdmHashTable::new(4, 2);
+        t.insert_absolute(1, 42, 0xCAFE);
+        let entry = t.bucket(1)[0];
+        assert_eq!(entry.checksum, 0xCAFE);
+        assert_eq!(
+            t.resolve(&entry),
+            Some(42),
+            "stored relative offset must resolve back to the inserted absolute"
+        );
+    }
+
+    /// `resolve` returns `None` for the empty-slot sentinel
+    /// (`offset == 0`), distinguishing it from any real
+    /// inserted position.
+    #[test]
+    fn resolve_returns_none_for_empty_slot() {
+        let t = LdmHashTable::new(4, 2);
+        let empty = LdmEntry::default();
+        assert_eq!(empty.offset, 0);
+        assert_eq!(t.resolve(&empty), None);
+    }
+
+    /// `reduce` subtracts the reducer from every entry's relative
+    /// offset (saturating at 0 = empty sentinel) and advances
+    /// `position_base` so future `resolve` calls translate back
+    /// to the same absolute positions. Donor
+    /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`).
+    #[test]
+    fn reduce_preserves_resolved_absolute_positions() {
+        let mut t = LdmHashTable::new(4, 2);
+        t.insert_absolute(0, 100, 0xAAAA);
+        t.insert_absolute(1, 200, 0xBBBB);
+        t.insert_absolute(2, 300, 0xCCCC);
+        assert_eq!(t.position_base(), 0);
+
+        // Shift the base forward by 150; positions 100 and 200
+        // should still resolve to 100 and 200 (the relative
+        // offsets shift but absolute stays).
+        t.reduce(150);
+        assert_eq!(t.position_base(), 150);
+        // pos 100 had relative offset 101 → after reduce: max(101−150, 0) = 0 (sentinel)
+        let entry0 = t.bucket(0)[0];
+        assert_eq!(
+            t.resolve(&entry0),
+            None,
+            "pos 100 < new_base 150 must be evicted"
+        );
+        // pos 200 had relative 201 → 201−150 = 51 → resolved 150 + 51 − 1 = 200
+        let entry1 = t.bucket(1)[0];
+        assert_eq!(t.resolve(&entry1), Some(200));
+        // pos 300 had relative 301 → 301−150 = 151 → resolved 150 + 151 − 1 = 300
+        let entry2 = t.bucket(2)[0];
+        assert_eq!(t.resolve(&entry2), Some(300));
+    }
+
+    /// `ensure_room_for` triggers a rebase when the relative
+    /// offset would exceed the guard band, keeping the `u32`
+    /// storage valid for streams past 4 GiB.
+    #[test]
+    fn ensure_room_for_rebases_above_guard_band() {
+        let mut t = LdmHashTable::new(4, 2);
+        // First insert at moderate offset — no rebase needed.
+        t.insert_absolute(0, 1024, 0xAAAA);
+        assert_eq!(t.position_base(), 0);
+
+        // Probe a position that would overflow the guard band:
+        // u32::MAX - REBASE_GUARD_BAND + 1 = the smallest abs
+        // that triggers a rebase.
+        let trigger_pos = (u32::MAX as usize) - (REBASE_GUARD_BAND as usize) + 1;
+        t.ensure_room_for(trigger_pos);
+        assert_eq!(
+            t.position_base(),
+            REBASE_GUARD_BAND as usize,
+            "rebase must advance position_base by REBASE_GUARD_BAND"
+        );
+        // The earlier insert at 1024 had relative offset 1025;
+        // after rebase by 2^30 it's clamped to 0 (empty) since
+        // 1025 < REBASE_GUARD_BAND.
+        assert_eq!(t.resolve(&t.bucket(0)[0]), None);
+
+        // A fresh insert past the rebase boundary must still
+        // round-trip.
+        t.insert_absolute(2, trigger_pos, 0xCAFE);
+        assert_eq!(t.resolve(&t.bucket(2)[0]), Some(trigger_pos));
     }
 
     /// `bucket_mask` returned by the table must agree with the

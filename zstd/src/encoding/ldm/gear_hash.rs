@@ -100,6 +100,15 @@ impl GearHashState {
     /// the module-level docs.
     pub(crate) fn new(min_match_length: usize, hash_rate_log: u32) -> Self {
         let max_bits_in_mask = min_match_length.min(64) as u32;
+        // Defensive clamp to 63: the degenerate-path shift
+        // `1u64 << hash_rate_log` would panic at 64. Every
+        // production caller routes through `LdmParams::adjust_for`
+        // (`hash_rate_log = LDM_HASH_RLOG - strategy/3` → 4..7) or
+        // `window_log - hash_log` (donor-bounded to 0..27), so the
+        // clamp is unreachable today; it guards against future
+        // callers / param-API misuse picking up the function
+        // directly.
+        let hash_rate_log = hash_rate_log.min(63);
         let stop_mask = if hash_rate_log > 0 && hash_rate_log <= max_bits_in_mask {
             ((1u64 << hash_rate_log) - 1) << (max_bits_in_mask - hash_rate_log)
         } else {

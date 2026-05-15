@@ -77,7 +77,7 @@ pub(crate) mod table;
 use gear_hash::{GearHashState, LDM_BATCH_SIZE};
 use params::LdmParams;
 use search::{FindBestMatchInputs, find_best_match};
-use table::{LdmEntry, LdmHashTable};
+use table::LdmHashTable;
 
 /// Donor `XXH64` seed for the per-window LDM hash
 /// (`zstd_ldm.c:315`: `XXH64(split, minMatchLength, 0)`).
@@ -293,23 +293,19 @@ impl LdmProducer {
                 let hash_id = (xxhash as u32) & hash_id_mask;
                 let checksum = (xxhash >> 32) as u32;
 
-                // Store the entry's offset in ABSOLUTE coordinates
-                // so it survives window eviction — `find_best_
-                // match` translates to slice indices at lookup
-                // time and the staleness check `offset <=
-                // lowest_index_abs` (where the caller passes the
-                // current `history_abs_start`) filters entries
-                // that fall out of the window.
-                let new_entry = LdmEntry {
-                    offset: split_abs as u32,
-                    checksum,
-                };
+                // The table stores positions as `u32` offsets
+                // relative to its internal `position_base` (donor
+                // rebase scheme — see `table.rs`); ensure room
+                // before every insert so streams beyond
+                // `u32::MAX` rebase transparently.
+                self.hash_table.ensure_room_for(split_abs);
 
                 // Donor `zstd_ldm.c:420-426`: if this split would
                 // emit a sequence overlapping the previous one,
                 // just record it and move on.
                 if split_abs < anchor_abs {
-                    self.hash_table.insert(hash_id, new_entry);
+                    self.hash_table
+                        .insert_absolute(hash_id, split_abs, checksum);
                     continue;
                 }
 
@@ -332,7 +328,7 @@ impl LdmProducer {
                         history_abs_start,
                         split_abs,
                         anchor_abs,
-                        lowest_index_abs: history_abs_start as u32,
+                        lowest_index_abs: history_abs_start,
                         min_match_length: min_match,
                     },
                 );
@@ -340,28 +336,31 @@ impl LdmProducer {
                 let Some(best) = best else {
                     // Donor `zstd_ldm.c:468-473`: no match → just
                     // insert the new entry and continue.
-                    self.hash_table.insert(hash_id, new_entry);
+                    self.hash_table
+                        .insert_absolute(hash_id, split_abs, checksum);
                     continue;
                 };
 
                 // Match found. Donor `zstd_ldm.c:475-488`.
                 // `best.match_pos` is absolute; `split_abs` is
                 // absolute; their difference is a true
-                // back-reference distance, immune to window
-                // sliding.
-                let offset = (split_abs as u32) - best.match_pos;
+                // back-reference distance immune to window
+                // sliding and to the table's internal `u32`
+                // rebase shifts.
+                let offset = split_abs - best.match_pos;
                 let lit_length = split_abs - best.backward_len - anchor_abs;
                 let match_length = best.total_len();
                 out.push(HcRawSeq {
                     lit_length,
-                    offset: offset as usize,
+                    offset,
                     match_length,
                 });
 
                 // Insert AFTER finding the match so the lookup
                 // doesn't clobber `bestEntry` (donor `zstd_ldm.c:
                 // 490-492`).
-                self.hash_table.insert(hash_id, new_entry);
+                self.hash_table
+                    .insert_absolute(hash_id, split_abs, checksum);
 
                 // Advance anchor past the matched bytes (donor
                 // `zstd_ldm.c:494`).
@@ -405,13 +404,17 @@ impl LdmProducer {
 mod tests {
     use super::*;
 
-    /// `LdmProducer::new` must allocate without panic for a
-    /// representative parameter set (level 22 / btultra2 / window
-    /// 27 — the level the project's ratio gate targets).
+    /// `LdmParams::adjust_for` must derive a representative
+    /// donor-btultra2 parameter set at window_log=27. Checked via
+    /// the parameter struct alone — instantiating the producer
+    /// at these knobs would allocate `1 << 23 = 8M` table entries
+    /// (~64 MiB), which slows nextest under parallelism and risks
+    /// OOM on 32-bit CI shards. The producer-construction smoke
+    /// path is exercised by every other test in this module with
+    /// a smaller hand-tuned `LdmParams`.
     #[test]
     fn producer_constructs_with_donor_default_params() {
-        let producer = LdmProducer::with_window_and_strategy(27, 9);
-        let p = producer.params();
+        let p = LdmParams::adjust_for(27, 9);
         // Donor defaults at btultra2: minMatch halved, hash_rate_log
         // = 4, bucket_size_log clamps to 8. See params::tests for
         // the per-knob derivations.
@@ -421,12 +424,28 @@ mod tests {
         assert_eq!(p.bucket_size_log, 8);
     }
 
+    /// Compact `LdmParams` for unit-test producer construction —
+    /// keeps the table allocation at ~8 KiB instead of the
+    /// donor-btultra2 64 MiB so parallel nextest stays stable.
+    /// `min_match_length = 32` (half of donor floor) matches the
+    /// btultra2 derivation so engineered fixtures still trigger
+    /// long-range matches at 32-byte windows.
+    fn test_params() -> LdmParams {
+        LdmParams {
+            window_log: 27,
+            hash_log: 10,
+            hash_rate_log: 4,
+            min_match_length: 32,
+            bucket_size_log: 4,
+        }
+    }
+
     /// `clear` after `generate_into` rewinds the rolling hash to
     /// the canonical init value — guards the frame-boundary
     /// contract.
     #[test]
     fn clear_resets_rolling_hash_state() {
-        let mut producer = LdmProducer::with_window_and_strategy(27, 3);
+        let mut producer = LdmProducer::new(test_params());
         let mut out = Vec::new();
         // Feed a non-empty chunk so the rolling hash advances.
         let data = [0xAAu8; 256];
@@ -460,7 +479,7 @@ mod tests {
         // 128 KiB+ fixture to comfortably trigger a split inside
         // the payload, which slows the test without adding
         // coverage.
-        let mut producer = LdmProducer::with_window_and_strategy(27, 9);
+        let mut producer = LdmProducer::new(test_params());
         let p = producer.params();
         assert_eq!(p.min_match_length, 32);
 
@@ -550,7 +569,7 @@ mod tests {
     /// back-reference.
     #[test]
     fn generate_into_preserves_bucket_entries_across_history_slide() {
-        let mut producer = LdmProducer::with_window_and_strategy(27, 9);
+        let mut producer = LdmProducer::new(test_params());
         let p = producer.params();
         assert_eq!(p.min_match_length, 32);
 
@@ -667,7 +686,7 @@ mod tests {
     /// against an off-by-one in the bounds check.
     #[test]
     fn generate_into_empty_range_is_noop() {
-        let mut producer = LdmProducer::with_window_and_strategy(27, 3);
+        let mut producer = LdmProducer::new(test_params());
         let mut out = Vec::new();
         let data = [0u8; 128];
         let pre = producer.hash_state.rolling;

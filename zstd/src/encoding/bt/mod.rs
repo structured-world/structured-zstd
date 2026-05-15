@@ -701,13 +701,23 @@ mod ldm_helper_tests {
     /// inside `generate_into`.
     #[test]
     fn prepare_ldm_candidates_translates_absolute_positions_to_slice_indices() {
-        use crate::encoding::ldm::LdmProducer;
+        use crate::encoding::ldm::{LdmProducer, params::LdmParams};
 
         let mut bt = BtMatcher::new();
-        // Activate the producer with a small-but-real parameter
-        // set. The table allocation is bounded by hash_log so this
-        // stays cheap.
-        bt.ldm_producer = Some(LdmProducer::with_window_and_strategy(27, 9));
+        // Activate the producer with hand-tuned small params —
+        // the donor btultra2 defaults (`with_window_and_strategy(27, 9)`)
+        // would allocate `1 << 23 = 8M` entries × 8 bytes = 64 MiB
+        // for a table this test never actually populates beyond a
+        // handful of entries. Build a 10-bit hash log instead so
+        // the table is ~8 KiB — keeps the suite stable under
+        // parallel nextest on 32-bit / memory-tight CI shards.
+        bt.ldm_producer = Some(LdmProducer::new(LdmParams {
+            window_log: 27,
+            hash_log: 10,
+            hash_rate_log: 4,
+            min_match_length: 32,
+            bucket_size_log: 4,
+        }));
 
         // 256 bytes of arbitrary content — enough for the gear
         // hash to make progress against the donor btultra2
