@@ -338,7 +338,7 @@ jobs:
         run: ${{ matrix.bench.runtime_setup }}
 
       - name: Download pre-built bench binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bench-binary-${{ matrix.bench.id }}
           path: bench-binary
@@ -395,7 +395,7 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Download benchmark shard artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: benchmark-shard-*
           path: benchmark-artifacts
@@ -470,7 +470,7 @@ jobs:
       # merge-benchmarks.py's per-target name extraction with
       # `<target>.<level>` keys, so we download just the single
       # combined `benchmark-aggregated` artifact here.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: benchmark-aggregated
           path: benchmark-artifacts
