@@ -816,4 +816,103 @@ mod hc_tests {
              gate skipped the backward-extending candidate."
         );
     }
+
+    /// Regression test for the non-monotonic-walk fallback. When the
+    /// cyclic `chain_table & chain_mask` mask overwrites a slot, the
+    /// chain walker can surface a candidate with a SMALLER offset than
+    /// ones it has already returned. The speculative gate's
+    /// monotonicity precondition (`new.offset_bits ≥ best.offset_bits`)
+    /// is enforced per-iteration via the `new_offset ≥ best.offset`
+    /// check: when monotonicity breaks the gate falls through to
+    /// `common_prefix_len` so the offset-bits advantage is given a
+    /// chance to win.
+    ///
+    /// Construction: organic LIFO insertion order would never produce
+    /// this layout — when positions are inserted in monotonic order
+    /// the chain links naturally point at strictly older positions
+    /// (the previous `hash_table[hash]`). To force the bug-prone
+    /// scenario this test reaches into `MatchTable` and hand-wires the
+    /// chain so the walker visits `pos 8` first (offset 16) and then
+    /// `pos 16` second (offset 8). Both positions hold the same
+    /// 8-byte prefix `"abcdefgh"` (matching the probe at `pos 24`), so
+    /// the FORWARD lengths are equal and only the offset-bits
+    /// difference can decide the winner.
+    ///
+    /// With the new `new_offset >= best.offset` precondition:
+    ///   * Iter 1: cand_abs 8, offset 16. `best = None` → no gate,
+    ///     full count, `best = (len 8, offset 16)`.
+    ///   * Iter 2: cand_abs 16, offset 8. `new_offset = 8 <
+    ///     best.offset = 16` → gate skipped → full count runs →
+    ///     `better_candidate` picks the smaller-offset winner (equal
+    ///     length, smaller offset_bits → strictly higher gain).
+    ///
+    /// Final `best.offset` must be `8` (the smaller-offset winner).
+    /// Pre-fix code (gate applied unconditionally) would have
+    /// inspected the tail at `tail_off = 8 − 0 − 3 = 5` and the
+    /// 4-byte read at offsets `5..9` covers byte 8 which is the
+    /// forward-terminator mismatch (different ninth byte between
+    /// chunks) — gate would fail and the second candidate gets
+    /// skipped, leaving `best.offset = 16`.
+    #[test]
+    fn hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset() {
+        // Four 8-byte chunks: `"abcdefgh"` at 0/8/16/24, terminated by
+        // different bytes (`'A'/'B'/'C'/'D'`) right after so the
+        // forward match between any two chunks caps at exactly 8.
+        let mut t = MatchTable::new(64);
+        t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec();
+        assert_eq!(t.history.len(), 40);
+        // After each "abcdefgh" the next byte is unique ('A'/'B'/'C'
+        // /'D'), capping cross-chunk forward matches at length 8.
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.position_base = 0;
+        t.hash_log = 8;
+        t.chain_log = 8;
+        t.hash3_log = 0;
+        t.ensure_tables();
+        t.window.push_back(t.history.clone());
+
+        // The probe is at abs_pos 27 (start of the fourth
+        // "abcdefgh" chunk). Hand-wire the chain so the walker
+        // visits pos 9 first and pos 18 second.
+        //
+        // Layout: chunks at 0..8, 9..17, 18..26, 27..35. The byte
+        // BEFORE each chunk is the terminator from the previous
+        // chunk's match. Probing at abs_pos 27:
+        //   * candidate 9 → offset 27 − 9 = 18
+        //   * candidate 18 → offset 27 − 18 = 9 (SMALLER — second
+        //     visit, non-monotonic)
+        let abs_pos = 27usize;
+        let concat = t.live_history();
+        let probe_hash = t.hash_position(&concat[abs_pos..]);
+        // `stored = pos + 1` per `MatchTable::stored_abs_position_fast`.
+        // Hand-wire the chain head and the link OUT of pos 9 so the
+        // walk surfaces 9 first, then 18.
+        t.hash_table[probe_hash] = 9 + 1;
+        let chain_mask = (1usize << t.chain_log) - 1;
+        t.chain_table[9 & chain_mask] = 18 + 1;
+        // Terminate the walk after pos 18.
+        t.chain_table[18 & chain_mask] = HC_EMPTY;
+
+        let hc = HcMatcher::new(2, 16, 64);
+        let result = hc.hash_chain_candidate(&t, abs_pos, 0);
+        let cand = result.expect("non-monotonic walk must still produce a match");
+        assert_eq!(
+            cand.match_len, 8,
+            "both chain candidates have an 8-byte forward prefix match — \
+             expected match_len = 8, got {}",
+            cand.match_len
+        );
+        assert_eq!(
+            cand.offset, 9,
+            "non-monotonic fallback must surface the smaller-offset winner: \
+             expected offset = 9 (cand_abs 18), got offset = {}. \
+             A regression in the `new_offset >= best.offset` check would \
+             keep the gate active for the smaller-offset second candidate, \
+             skip its full count, and leave best.offset at 18 (the \
+             larger-offset first-visited candidate).",
+            cand.offset
+        );
+    }
 }

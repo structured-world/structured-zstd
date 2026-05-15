@@ -439,9 +439,13 @@ enum MatcherStorage {
     /// (`btopt` / `btultra` / `btultra2`). Selected for any level that
     /// resolves to [`StrategyTag::Lazy`], [`StrategyTag::BtOpt`],
     /// [`StrategyTag::BtUltra`], or [`StrategyTag::BtUltra2`]
-    /// (`Better`, `Best`, `Level(5..=22)`). The
-    /// [`HcMatchGenerator`]'s internal [`HcBackend`] discriminator
-    /// decides whether BT scratch is allocated.
+    /// (`Better`, `Best`, `Level(5..=22)`, and any `Level(n)` with
+    /// `n > MAX_LEVEL` — `resolve_level_params` clamps positive
+    /// numeric levels at `MAX_LEVEL = 22` via
+    /// `Level(n).clamp(1, MAX_LEVEL)`, so `Level(23..=i32::MAX)` all
+    /// land on `BtUltra2` here). The [`HcMatchGenerator`]'s internal
+    /// [`HcBackend`] discriminator decides whether BT scratch is
+    /// allocated.
     HashChain(HcMatchGenerator),
 }
 
@@ -577,10 +581,19 @@ impl MatchGeneratorDriver {
         }
     }
 
-    fn retire_dictionary_budget(&mut self, evicted_bytes: usize) {
+    /// Shrink the active backend's `max_window_size` by the bytes
+    /// reclaimed from the dictionary-retention budget. Returns `true`
+    /// iff any reclamation happened — the caller uses that as the
+    /// gate for [`Self::trim_after_budget_retire`] (which is a no-op
+    /// otherwise: with `max_window_size` unchanged the backend's
+    /// `trim_to_window` cannot find anything to evict, so calling it
+    /// just runs an extra `match` ladder + a single early-out check
+    /// per slice commit).
+    #[must_use]
+    fn retire_dictionary_budget(&mut self, evicted_bytes: usize) -> bool {
         let reclaimed = evicted_bytes.min(self.dictionary_retained_budget);
         if reclaimed == 0 {
-            return;
+            return false;
         }
         self.dictionary_retained_budget -= reclaimed;
         match self.active_backend() {
@@ -602,6 +615,7 @@ impl MatchGeneratorDriver {
                     matcher.table.max_window_size.saturating_sub(reclaimed);
             }
         }
+        true
     }
 
     fn trim_after_budget_retire(&mut self) {
@@ -660,7 +674,15 @@ impl MatchGeneratorDriver {
             if evicted_bytes == 0 {
                 break;
             }
-            self.retire_dictionary_budget(evicted_bytes);
+            // Inside this loop, `evicted_bytes != 0` means the backend
+            // had bytes to evict because `max_window_size` was shrunk
+            // by a prior `retire_dictionary_budget` call — so
+            // `dictionary_retained_budget > 0` is the invariant the
+            // outer caller upholds, and the return-value of the retire
+            // call is consumed by `let _ = …` rather than gating the
+            // next loop pass on it (the loop's natural termination is
+            // `evicted_bytes == 0`, not `retire returns false`).
+            let _ = self.retire_dictionary_budget(evicted_bytes);
         }
     }
 
@@ -1046,8 +1068,18 @@ impl Matcher for MatchGeneratorDriver {
                 });
             }
         }
-        self.retire_dictionary_budget(evicted_bytes);
-        self.trim_after_budget_retire();
+        // Gate the second backend trim pass on actual budget
+        // reclamation. Without it, every slice commit on the
+        // no-dictionary / no-eviction path (the common case) would
+        // run a backend `match` ladder + `trim_to_window` early-out
+        // for no reason — `trim_after_budget_retire` only does
+        // meaningful work when `retire_dictionary_budget` shrank
+        // `max_window_size` enough to make the backend's
+        // `window_size > max_window_size` invariant trigger
+        // eviction.
+        if self.retire_dictionary_budget(evicted_bytes) {
+            self.trim_after_budget_retire();
+        }
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {

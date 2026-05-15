@@ -1012,4 +1012,83 @@ mod extend_with_repcode_tests {
             other => panic!("expected Triple, got {other:?}"),
         }
     }
+
+    /// The helper accepts 4-byte rep extensions (donor `MINMATCH = 4`),
+    /// not the main-loop `DFAST_MIN_MATCH_LEN = 6` floor. A regression
+    /// back to 6 would still pass the constant-run / cross-block tests
+    /// above (their rep matches extend much further), so this fixture
+    /// is built so the rep matches EXACTLY 4 bytes before terminating:
+    /// the byte at `pos + 4` differs from the byte at `pos + 4 - rep`.
+    ///
+    /// Fixture (32 bytes):
+    ///   `"ABCD????ABCD!??????????ABCDX????"`
+    ///    0123456789012345678901234567890     (ones digit)
+    ///              1111111111222222222233    (tens digit, aligned)
+    ///
+    /// Probe state:
+    ///   * `offset_hist[1] = 8` → rep probe reads `concat[pos - 8..]`.
+    ///   * `pos = 8` → `concat[8..12] = "ABCD"`, `concat[0..4] = "ABCD"`
+    ///     → 4 bytes match.
+    ///   * `concat[12] = '!'` vs `concat[4] = '?'` → 5th byte mismatch,
+    ///     so the rep extension stops at exactly 4 bytes.
+    #[test]
+    fn dfast_repcode_extension_accepts_exactly_four_byte_rep() {
+        // Block: "ABCD????" (8) + "ABCD!" (5) + "???????????" (11) +
+        //        "ABCDX" (5) + "????" (3) = 32 bytes total. The
+        //        important invariants are `concat[0..4] == "ABCD"`,
+        //        `concat[8..12] == "ABCD"`, and `concat[12] = '!'`
+        //        (so byte 12 ≠ byte 4 = '?', stopping the rep at
+        //        length 4). The trailing bytes are irrelevant — we
+        //        only iterate the helper at `pos = 8` and the rep
+        //        chain terminates after one 4-byte emit because the
+        //        next rep probe (post-swap) would need bytes at
+        //        `pos + 4` to match a different offset.
+        let data: Vec<u8> = b"ABCD????ABCD!??????????ABCDX????".to_vec();
+        assert_eq!(data.len(), 32, "fixture invariant: 32 bytes");
+        let mut dfast = DfastMatchGenerator::new(64);
+        dfast.use_fast_loop = false;
+        dfast.ensure_hash_tables();
+        dfast.add_data(data.clone(), |_| {});
+
+        dfast.offset_hist = [12, 8, 4];
+        let current_abs_start = dfast.history_abs_start + dfast.window_size - data.len();
+        let current_len = data.len();
+        let pos = 8usize;
+        let mut literals_start = pos;
+
+        let mut seqs = Vec::new();
+        let new_pos = {
+            let mut rec = record_seq(&mut seqs);
+            dfast.extend_with_repcode_after_match(
+                current_abs_start,
+                current_len,
+                pos,
+                &mut literals_start,
+                &mut rec,
+            )
+        };
+
+        // Helper must emit a single 4-byte rep, then stop because
+        // the 5th byte mismatches.
+        assert_eq!(seqs.len(), 1, "expected one 4-byte rep emit, got {seqs:?}");
+        match &seqs[0] {
+            CapturedSeq::Triple {
+                lit_len,
+                offset,
+                match_len,
+            } => {
+                assert_eq!(*lit_len, 0, "rep emit must be zero-literal");
+                assert_eq!(*offset, 8, "rep emit must use offset 8 (offset_hist[1])");
+                assert_eq!(
+                    *match_len, 4,
+                    "rep emit must be exactly 4 bytes (donor MINMATCH floor). \
+                     A regression back to DFAST_MIN_MATCH_LEN = 6 would skip \
+                     this emission entirely and the test would fail with 0 seqs."
+                );
+            }
+            other => panic!("expected Triple, got {other:?}"),
+        }
+        assert_eq!(new_pos, pos + 4, "pos must advance by exactly 4");
+        assert_eq!(literals_start, new_pos, "literals_start must follow pos");
+    }
 }
