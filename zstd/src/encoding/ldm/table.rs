@@ -476,7 +476,7 @@ mod tests {
     /// we exercise elsewhere.
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn new_accepts_donor_max_hash_log() {
+    fn new_accepts_large_hash_log_smoke() {
         // Use a small bucket_size_log so the entry count is bounded
         // and we don't actually allocate 8 GiB. Donor itself never
         // allocates the max at runtime either (window_log caps

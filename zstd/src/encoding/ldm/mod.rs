@@ -35,7 +35,8 @@
 //!   `ldm_producer: Option<LdmProducer>` field on `BtMatcher` that
 //!   stays `None` by default. The forthcoming parameter-API issue
 //!   (#27) plugs into that field; the C ABI work in #126 / #127
-//!   wires `ZSTD_c_enableLdm` through the same surface.
+//!   wires `ZSTD_c_enableLongDistanceMatching` through the same
+//!   surface.
 //!
 //! Therefore the `level22_sequences_match_donor_on_corpus_proxy`
 //! ratio gate continues to compare two LDM-OFF outputs (ours vs

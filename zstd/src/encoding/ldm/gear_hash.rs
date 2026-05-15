@@ -34,8 +34,11 @@
 //!
 //! # Constants
 //!
-//! * [`LDM_BUCKET_SIZE_LOG`] — donor `#define` (matches
-//!   `ZSTD_LDM_BUCKETSIZELOG_MAX` upper bound, sized identically).
+//! * [`LDM_BUCKET_SIZE_LOG`] — donor `#define` (= 4, the default /
+//!   lower bound used by `LdmParams::adjust_for`'s `BOUNDED`
+//!   clamp; the donor upper bound is the separate
+//!   `ZSTD_LDM_BUCKETSIZELOG_MAX = 8` constant, exposed as
+//!   `params::LDM_BUCKETSIZELOG_MAX`).
 //! * [`LDM_MIN_MATCH_LENGTH`] — donor `#define`.
 //! * [`LDM_HASH_RLOG`] — donor `#define` (default hash-rate log).
 //! * [`LDM_BATCH_SIZE`] — donor `#define` from

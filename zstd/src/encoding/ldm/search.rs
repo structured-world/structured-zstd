@@ -119,12 +119,25 @@ pub(crate) struct FindBestMatchInputs<'a> {
     /// match's post-match boundary or the block start at frame
     /// entry. Donor `anchor`.
     pub(crate) anchor_abs: usize,
-    /// Donor `lowestIndex` — entries with absolute `offset <=
-    /// lowest_index_abs` are stale and rejected. Typically the
-    /// caller passes the current `history_abs_start` so any entry
-    /// inserted into a previous, now-evicted window is filtered.
-    /// Stored as `usize` so the comparison stays valid above the
-    /// `u32` boundary (the table itself rebases internally).
+    /// **Inclusive** lower bound: entries with absolute `offset <
+    /// lowest_index_abs` are stale and rejected, entries with
+    /// `offset >= lowest_index_abs` survive. Conceptually the
+    /// "lowest still-live absolute position" — the caller passes
+    /// `history_abs_start` so a candidate at the very left edge
+    /// of the live window (`live_history[0]`, absolute
+    /// `history_abs_start`) remains matchable. Stored as `usize`
+    /// so the comparison stays valid above the `u32` boundary
+    /// (the table itself rebases internally).
+    ///
+    /// Semantic deviation from donor `zstd_ldm.c:431` — donor's
+    /// `cur->offset <= lowestIndex` is an exclusive lower bound
+    /// where `lowestIndex` itself is rejected. We use the inclusive
+    /// form because our internal coordinate space (absolute
+    /// stream position, +1-biased relative offset in the
+    /// rebase-aware table) already differs from donor; flipping
+    /// the comparison removes the need for a
+    /// `history_abs_start.saturating_sub(1)` adjustment at every
+    /// callsite.
     pub(crate) lowest_index_abs: usize,
     /// Absolute stream position one past the last byte the
     /// forward match is allowed to reach. Donor `iend` (the
@@ -199,7 +212,11 @@ pub(crate) fn find_best_match(
         let Some(match_abs) = table.resolve(entry) else {
             continue;
         };
-        if match_abs <= lowest_index_abs {
+        // Inclusive lower bound (see `FindBestMatchInputs::
+        // lowest_index_abs` docs). `match_abs >=
+        // lowest_index_abs` survives; everything below the live
+        // window is filtered.
+        if match_abs < lowest_index_abs {
             continue;
         }
         // Out-of-window guard: an entry above `history_abs_end`
@@ -319,15 +336,19 @@ mod tests {
         assert!(m.is_none(), "wrong checksum must be filtered out");
     }
 
-    /// Bucket lookup returns `None` when the offset is at or
-    /// below `lowest_index_abs` (donor staleness rejection).
+    /// Bucket lookup returns `None` when the offset is strictly
+    /// below `lowest_index_abs` (inclusive lower bound — entries
+    /// at exactly `lowest_index_abs` survive, entries below are
+    /// stale).
     #[test]
     fn find_best_match_rejects_stale_entries() {
         let mut table = fresh_table();
         table.insert_absolute(1, 4, 0xCAFE);
         let history = b"abcdefghabcdefgh";
-        // lowest_index_abs = 4 → entry offset 4 is NOT strictly
-        // greater → rejected.
+        // lowest_index_abs = 5 → entry offset 4 is strictly below
+        // → rejected. (At lowest_index_abs = 4 the entry would
+        // exactly meet the floor and survive — that's the edge
+        // case the inclusive bound is designed to preserve.)
         let m = find_best_match(
             &table,
             1,
@@ -337,7 +358,7 @@ mod tests {
                 history_abs_start: 0,
                 split_abs: 8,
                 anchor_abs: 0,
-                lowest_index_abs: 4,
+                lowest_index_abs: 5,
                 iend_abs: history.len(),
                 min_match_length: 4,
             },
