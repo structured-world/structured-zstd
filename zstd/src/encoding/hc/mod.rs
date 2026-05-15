@@ -254,22 +254,40 @@ impl HcMatcher {
         //   `common_prefix_len` cost is already trivial — the gate
         //   is skipped via the `checked_sub`.
         //
-        // Walk-order argument (offset monotonicity):
-        //   Chain walks are LIFO (newest first → strictly increasing
-        //   offset). Once `best` is set, every subsequent candidate
-        //   has `new.offset_bits ≥ best.offset_bits`, so
-        //   `better_candidate` can only return a new winner when the
-        //   *total* match length (forward + backward) strictly
-        //   exceeds `best.match_len`. Combined with the worst-case
-        //   backward-extension bound above, the required forward
-        //   length is `best.match_len − lit_len + 1`.
+        // Walk-order argument (offset monotonicity — REQUIRED gate
+        // precondition, enforced per-iteration):
+        //   Chain walks are LIFO in their dense form (newest first →
+        //   strictly increasing offset). But the chain table is
+        //   `chain_log`-bits wide; when a position is re-inserted at
+        //   the same masked chain index after the cycle wraps, an
+        //   older chain link can point into a slot that has since
+        //   been OVERWRITTEN with a newer (closer) position. The
+        //   walker then surfaces a candidate with a SMALLER offset
+        //   than ones it has already returned, breaking monotonicity.
+        //
+        //   The gate's bound (`tail_off = best.match_len − lit_len −
+        //   3` covers exactly the "new forward must reach
+        //   best.match_len − lit_len + 1" requirement) is only sound
+        //   when `new.offset_bits ≥ best.offset_bits`. Otherwise a
+        //   smaller-offset candidate can outscore `best` by gain at
+        //   *equal* total length — and the gate would skip it because
+        //   it only proves `match_len > best.match_len`. The
+        //   `new_offset >= best.offset` per-iteration check below
+        //   enforces the monotonicity precondition; on non-monotonic
+        //   walks we fall through to the full `common_prefix_len` so
+        //   the offset-bits advantage is given a chance to win.
         let history_tail = concat.len();
         for candidate_abs in self.chain_candidates(table, abs_pos) {
             if candidate_abs == usize::MAX {
                 break;
             }
             let candidate_idx = candidate_abs - table.history_abs_start;
+            // `abs_pos > candidate_abs` is invariant for in-range chain
+            // entries (filtered by `chain_candidates`), so the subtraction
+            // never underflows.
+            let new_offset = abs_pos - candidate_abs;
             if let Some(best_ref) = best
+                && new_offset >= best_ref.offset
                 && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
             {
                 let m_end = candidate_idx + tail_off + 4;
@@ -695,34 +713,60 @@ mod hc_tests {
     }
 
     /// Regression test for the speculative tail check's
-    /// backward-extension bound. The post-fix formula is
-    /// `tail_off = best.match_len − lit_len − 3` (via
-    /// `checked_sub(lit_len + 3)`); the pre-fix gate used
-    /// `best_ml − 3` directly and over-rejected later chain candidates
-    /// when `lit_len > 0` because `extend_backwards` may have added up
-    /// to `lit_len` backward bytes to `best.match_len`.
+    /// backward-extension bound. The pre-fix gate used `tail_off =
+    /// best.match_len − 3` and was unaware that `extend_backwards`
+    /// could have added up to `lit_len` backward bytes to
+    /// `best.match_len`. The post-fix formula subtracts `lit_len`
+    /// via `checked_sub(lit_len + 3)`.
     ///
-    /// The test exercises behavioural parity across `lit_len` values:
-    /// for the same probe position and chain content, the helper must
-    /// return a match length that is *non-decreasing* in `lit_len`,
-    /// because more backward-extension headroom can only enlarge (or
-    /// leave unchanged) every candidate's effective length. A
-    /// regression where the gate skips candidates that backward
-    /// extension would have rescued shows up as `len_high_lit <
-    /// len_low_lit`.
+    /// To actually fail for the pre-fix gate (Copilot review on
+    /// `c16ca32b` flagged that an earlier round of this test did
+    /// not), the fixture is constructed so the first LIFO candidate
+    /// cannot extend backward but a later candidate can — only the
+    /// later candidate's *total* match length (`forward +
+    /// backward_extension`) reaches the new best.
     ///
-    /// Fixture: a repeating "ABCDEFGH" pattern at idx 0, 8, 16, 24
-    /// inside a 40-byte history. Probing at `abs_pos = 24` finds
-    /// chunks 0, 8, 16 as chain candidates (LIFO order 16 → 8 → 0).
-    /// Every candidate is an 8-byte forward match; the gate is what
-    /// decides whether each is *evaluated*. Without the `lit_len`
-    /// correction, the pre-fix gate would drop the later candidates
-    /// after seeing the first match, even when backward extension
-    /// could grow them.
+    /// Fixture (40 bytes):
+    ///   `"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK"`
+    ///    01234567890123456789012345678901234567890   (indices)
+    ///             1111111111222222222233333333334
+    ///
+    /// Probing `abs_pos = 24, lit_len = 3`:
+    ///   - The 4-byte hash at `idx 24` ("abcd") collides with the
+    ///     hashes at `idx 3` and `idx 12` (also "abcd"). All other
+    ///     positions in `0..24` hash to other buckets, so the chain
+    ///     walker visits exactly `[12, 3]` in LIFO order.
+    ///   - Candidate at `idx 12`: forward 8 bytes (`"abcdefIJ"`
+    ///     matches the probe `"abcdefIJ"` at `24..32` exactly), but
+    ///     the byte right before — `concat[11] = 'Q'` — does NOT
+    ///     equal `concat[23] = 'A'`, so `extend_backwards` cannot
+    ///     extend even one byte despite `lit_len = 3` of available
+    ///     headroom. Total `match_len = 8`, offset = 12.
+    ///   - Candidate at `idx 3`: forward only 6 bytes (`"abcdef"`
+    ///     matches, byte 7 at `idx 9 = 'Z'` differs from probe byte
+    ///     7 at `idx 30 = 'I'`). But the 3 bytes before it —
+    ///     `concat[0..3] = "AAA"` — exactly match `concat[21..24] =
+    ///     "AAA"`, so `extend_backwards` adds 3 backward bytes.
+    ///     Total `match_len = 6 + 3 = 9`, offset = 21.
+    ///
+    /// Gate behaviour at `lit_len = 3`:
+    ///   - Pre-fix: `tail_off = best.match_len - 3 = 5`. For
+    ///     candidate at `idx 3` the gate reads `concat[3+5..3+5+4]
+    ///     = concat[8..12] = "fZMQ"` and compares to probe
+    ///     `concat[29..33] = "fIJK"`. Mismatch → gate SKIPS. The
+    ///     helper never runs `common_prefix_len` on candidate `3`,
+    ///     never extends backwards, and returns `match_len = 8`
+    ///     (the first candidate's match) — losing the 9-byte
+    ///     backward-extended win.
+    ///   - Post-fix: `tail_off = best.match_len - lit_len - 3 = 2`.
+    ///     The gate reads `concat[3+2..3+2+4] = concat[5..9] =
+    ///     "cdef"` and compares to probe `concat[26..30] = "cdef"`.
+    ///     Match → gate PASSES → full count runs, finds forward 6,
+    ///     extends backwards 3, returns `match_len = 9`.
     #[test]
     fn hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension() {
         let mut t = MatchTable::new(64);
-        t.history = b"ABCDEFGHABCDEFGHABCDEFGHABCDEFGHZZZZZZZZ".to_vec();
+        t.history = b"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK".to_vec();
         t.history_start = 0;
         t.history_abs_start = 0;
         t.window_size = t.history.len();
@@ -736,32 +780,40 @@ mod hc_tests {
 
         let hc = HcMatcher::new(2, 16, 64);
 
-        let len_for = |lit_len: usize| -> usize {
-            hc.hash_chain_candidate(&t, 24, lit_len)
-                .map(|c| c.match_len)
-                .unwrap_or(0)
-        };
-
-        let len0 = len_for(0);
-        let len1 = len_for(1);
-        let len4 = len_for(4);
-
-        assert!(
-            len0 >= 4,
-            "lit_len=0 must still find at least a 4-byte (HC_MIN_MATCH_LEN) \
-             chain match on the repeating fixture, got {len0}"
+        // `lit_len = 0`: no backward extension headroom — neither
+        // candidate can grow past its forward match length, so the
+        // best wins at forward-only length 8. Both pre-fix and
+        // post-fix gates produce the same answer here.
+        let result_lit0 = hc.hash_chain_candidate(&t, 24, 0);
+        let len0 = result_lit0.map(|c| c.match_len).unwrap_or(0);
+        assert_eq!(
+            len0, 8,
+            "lit_len=0 must return the forward-only 8-byte match at offset 12, \
+             got {len0}"
         );
-        assert!(
-            len1 >= len0,
-            "monotonicity violation: lit_len=1 returned shorter match than \
-             lit_len=0 ({len1} < {len0}) — speculative gate must not drop \
-             candidates that backward extension could rescue"
+
+        // `lit_len = 3`: the second candidate (`idx 3`) can extend 3
+        // bytes backwards, giving a total length of 9. Pre-fix gate
+        // would skip it; post-fix gate lets it through.
+        let result_lit3 = hc.hash_chain_candidate(&t, 24, 3);
+        let len3 = result_lit3.map(|c| c.match_len).unwrap_or(0);
+        assert_eq!(
+            len3, 9,
+            "lit_len=3 must return the backward-extended 9-byte match \
+             (forward 6 + backward 3); a value of 8 means the gate over-rejected \
+             the second LIFO candidate and the helper missed the backward-extension \
+             win (pre-fix regression). Got {len3}"
         );
+
+        // Strict-increase between `lit_len=0` and `lit_len=3` is the
+        // signal the pre-fix gate would NOT have produced. Keep this
+        // assertion explicitly so the test's failure message points
+        // at exactly the regression it guards.
         assert!(
-            len4 >= len1,
-            "monotonicity violation: lit_len=4 returned shorter match than \
-             lit_len=1 ({len4} < {len1}) — speculative gate's `lit_len` term \
-             must widen, not narrow, the candidate set as headroom grows"
+            len3 > len0,
+            "speculative gate must allow `lit_len`-dependent strict gains: \
+             lit_len=0 → {len0}, lit_len=3 → {len3}. Equal values means the \
+             gate skipped the backward-extending candidate."
         );
     }
 }
