@@ -326,12 +326,18 @@ impl LdmHashTable {
             // not a rebase trigger.
             return;
         }
-        let rel = abs_pos - self.position_base;
         // Leave at least `REBASE_GUARD_BAND` of u32 headroom
         // above the current insert position so the next batch of
-        // inserts doesn't immediately re-rebase.
+        // inserts doesn't immediately re-rebase. The producer
+        // advances `abs_pos` in small strides today, so the loop
+        // typically runs at most once; the `while` is required by
+        // the doc guarantee — a caller that jumps the position by
+        // more than one guard band (e.g. a future hand-off path
+        // that skips frame regions) would otherwise leave `rel`
+        // above `u32::MAX` after a single shift and panic on the
+        // next insert.
         let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
-        if rel > max_rel {
+        while abs_pos - self.position_base > max_rel {
             // Shift the base forward by `REBASE_GUARD_BAND` —
             // matches donor's "subtract the reducer value, clamp
             // anything below to 0" semantics.
@@ -589,6 +595,40 @@ mod tests {
         // round-trip.
         t.insert_absolute(2, trigger_pos, 0xCAFE);
         assert_eq!(t.resolve(&t.bucket(2)[0]), Some(trigger_pos));
+    }
+
+    /// `ensure_room_for` must loop until `rel <= max_rel` even if
+    /// the caller jumps the position past several guard bands in
+    /// a single call. With the old single-shot `if`, a jump
+    /// larger than `2 * REBASE_GUARD_BAND` left `rel` above
+    /// `u32::MAX - REBASE_GUARD_BAND`, so the next
+    /// `insert_absolute` would panic on the `(rel + 1) as u32`
+    /// cast. Regression for PR #139 round-14 review (CodeRabbit
+    /// Major).
+    #[test]
+    fn ensure_room_for_loops_across_multiple_guard_bands() {
+        let mut t = LdmHashTable::new(4, 2);
+        // Jump past two guard bands at once. With u32::MAX ≈
+        // 4 * REBASE_GUARD_BAND and max_rel = u32::MAX -
+        // REBASE_GUARD_BAND ≈ 3 * REBASE_GUARD_BAND, an abs_pos
+        // of 5 * REBASE_GUARD_BAND yields rel = 5 *
+        // REBASE_GUARD_BAND > max_rel even after one reduce
+        // (rel = 4 * REBASE_GUARD_BAND > 3 * REBASE_GUARD_BAND).
+        // A second reduce brings rel = 3 * REBASE_GUARD_BAND ≤
+        // max_rel and the loop exits.
+        let abs_pos = 5usize * (REBASE_GUARD_BAND as usize);
+        t.ensure_room_for(abs_pos);
+        let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
+        assert!(
+            abs_pos - t.position_base() <= max_rel,
+            "ensure_room_for must rebase until rel ≤ max_rel \
+             (got rel = {}, max_rel = {})",
+            abs_pos - t.position_base(),
+            max_rel
+        );
+        // The subsequent insert must succeed (no u32 overflow).
+        t.insert_absolute(0, abs_pos, 0xFEED);
+        assert_eq!(t.resolve(&t.bucket(0)[0]), Some(abs_pos));
     }
 
     /// `insert_absolute` must panic in BOTH debug and release

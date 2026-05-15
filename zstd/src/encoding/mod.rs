@@ -3,8 +3,9 @@
 //! Three entry points cover the common use cases:
 //!
 //! * [`compress`] / [`compress_to_vec`] — one-shot helpers that build a
-//!   self-contained Zstandard frame from a `Read` source. Compact when the
-//!   whole input is already in memory.
+//!   self-contained Zstandard frame from a `Read` source. They buffer the
+//!   entire input before compressing, so peak memory is ≈ `input + output`;
+//!   use [`StreamingEncoder`] for large or unbounded payloads.
 //! * [`StreamingEncoder`] — implements [`std::io::Write`] (`std` feature),
 //!   accepting bytes incrementally and flushing compressed output as blocks
 //!   fill. Requires `set_pledged_content_size` before the first write if
