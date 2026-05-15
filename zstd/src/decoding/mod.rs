@@ -14,9 +14,17 @@
 //!   dictionary parse cost when the same dictionary is used many times in a
 //!   row.
 //!
-//! Both [`StreamingDecoder`] and [`FrameDecoder`] expose
-//! `_with_dictionary_handle` / `_with_dict_bytes` variants so the dictionary
-//! path can either reuse a parsed handle or pass raw bytes per frame.
+//! Both decoders expose dictionary-aware constructors / methods,
+//! though the exact naming differs:
+//!
+//! * [`StreamingDecoder::new_with_dictionary_handle`] /
+//!   [`StreamingDecoder::new_with_dictionary_bytes`]
+//! * [`FrameDecoder::decode_all_with_dict_handle`] /
+//!   [`FrameDecoder::decode_all_with_dict_bytes`]
+//!
+//! The `_handle` variants reuse a previously parsed
+//! [`DictionaryHandle`]; the `_bytes` variants parse the dictionary
+//! per call (suitable for one-off decodes).
 //!
 //! Errors surface through [`errors::FrameDecoderError`] and the per-decoder
 //! error types in the [`errors`] submodule.

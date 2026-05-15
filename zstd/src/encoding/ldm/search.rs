@@ -126,6 +126,15 @@ pub(crate) struct FindBestMatchInputs<'a> {
     /// Stored as `usize` so the comparison stays valid above the
     /// `u32` boundary (the table itself rebases internally).
     pub(crate) lowest_index_abs: usize,
+    /// Absolute stream position one past the last byte the
+    /// forward match is allowed to reach. Donor `iend` (the
+    /// caller-supplied `block_end_abs`); the forward count is
+    /// clamped to `iend_abs - split_abs` bytes so a match cannot
+    /// extend past the current block's scan boundary even if
+    /// `live_history` happens to contain matching bytes beyond
+    /// it. Must satisfy `iend_abs >= split_abs` and
+    /// `iend_abs <= history_abs_start + live_history.len()`.
+    pub(crate) iend_abs: usize,
     /// Donor `params->minMatchLength` — forward matches shorter
     /// than this floor are filtered out.
     pub(crate) min_match_length: usize,
@@ -155,19 +164,27 @@ pub(crate) fn find_best_match(
         split_abs,
         anchor_abs,
         lowest_index_abs,
+        iend_abs,
         min_match_length,
     } = inputs;
     debug_assert!(history_abs_start <= split_abs);
     debug_assert!(split_abs <= history_abs_start + live_history.len());
     debug_assert!(anchor_abs <= split_abs);
     debug_assert!(history_abs_start <= anchor_abs);
+    debug_assert!(split_abs <= iend_abs);
+    debug_assert!(iend_abs <= history_abs_start + live_history.len());
 
     let bucket = table.bucket(hash_id);
     let mut best: Option<LdmMatch> = None;
     let history_abs_end = history_abs_start + live_history.len();
-    // Translate split_abs to an index into `live_history` once;
-    // every forward comparison reuses it.
+    // Translate split_abs / iend_abs to indices into `live_history`
+    // once; every forward comparison reuses them. `split_idx_end`
+    // caps the forward slice so a match cannot extend past the
+    // current block's scan boundary even if matching bytes happen
+    // to live beyond it — donor `ZSTD_count(split, pMatch, iend)`
+    // is bounded by `iend`.
     let split_idx = split_abs - history_abs_start;
+    let split_idx_end = iend_abs - history_abs_start;
 
     for entry in bucket {
         // Donor `zstd_ldm.c:431`: skip stale or wrong-checksum
@@ -195,8 +212,16 @@ pub(crate) fn find_best_match(
 
         // Forward match: bytes that compare equal starting from
         // `split` vs `match_pos`. Donor `ZSTD_count(split, pMatch,
-        // iend)`.
-        let forward_len = common_prefix_len(&live_history[split_idx..], &live_history[match_idx..]);
+        // iend)` — bounded by `iend`, so we cap the `split` slice
+        // at `split_idx_end`. The match slice is bounded only by
+        // `live_history.len()` because back-references into the
+        // history before the current block are legitimate (donor
+        // `pMatch < iend` is automatically true when the entry's
+        // absolute offset is below `iend_abs`).
+        let forward_len = common_prefix_len(
+            &live_history[split_idx..split_idx_end],
+            &live_history[match_idx..],
+        );
         if forward_len < min_match_length {
             continue;
         }
@@ -287,6 +312,7 @@ mod tests {
                 split_abs: 8,
                 anchor_abs: 0,
                 lowest_index_abs: 0,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         );
@@ -312,6 +338,7 @@ mod tests {
                 split_abs: 8,
                 anchor_abs: 0,
                 lowest_index_abs: 4,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         );
@@ -342,6 +369,7 @@ mod tests {
                 split_abs: 12,
                 anchor_abs: 12,
                 lowest_index_abs: 0,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         )
@@ -374,6 +402,7 @@ mod tests {
                 split_abs: 12,
                 anchor_abs: 10,
                 lowest_index_abs: 0,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         )
@@ -410,12 +439,48 @@ mod tests {
                 split_abs: 16,
                 anchor_abs: 16,
                 lowest_index_abs: 0,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         )
         .expect("a valid candidate must be found");
         assert_eq!(m.match_pos, 8, "longer-forward winner must be picked");
         assert_eq!(m.forward_len, 8);
+    }
+
+    /// Forward count must respect `iend_abs` — even when matching
+    /// bytes continue past the block end inside `live_history`,
+    /// `forward_len` is capped at `iend_abs - split_abs`.
+    /// Regression for PR #139 round-7 review.
+    #[test]
+    fn find_best_match_forward_count_is_bounded_by_iend_abs() {
+        let mut table = fresh_table();
+        table.insert_absolute(1, 4, 0xCAFE);
+        // 4 preamble bytes + two 8-byte "abcdefgh" runs = 20 bytes.
+        // Without iend_abs cap the match at split=12 vs match=4
+        // would return forward_len = 8 ("abcdefgh"). With
+        // iend_abs = 16 (4 bytes past the split) the match must
+        // cap at 4.
+        let history = b"PPPPabcdefghabcdefgh";
+        let m = find_best_match(
+            &table,
+            1,
+            0xCAFE,
+            FindBestMatchInputs {
+                live_history: history,
+                history_abs_start: 0,
+                split_abs: 12,
+                anchor_abs: 12,
+                lowest_index_abs: 0,
+                iend_abs: 16, // cap: only 4 forward bytes allowed
+                min_match_length: 4,
+            },
+        )
+        .expect("a 4-byte forward match still passes the min_match floor");
+        assert_eq!(
+            m.forward_len, 4,
+            "forward count must cap at iend_abs - split_abs"
+        );
     }
 
     /// Forward match below `min_match_length` is rejected even
@@ -437,6 +502,7 @@ mod tests {
                 split_abs: 12,
                 anchor_abs: 12,
                 lowest_index_abs: 0,
+                iend_abs: history.len(),
                 min_match_length: 4,
             },
         );

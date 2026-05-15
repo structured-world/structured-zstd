@@ -329,6 +329,14 @@ impl LdmProducer {
                         split_abs,
                         anchor_abs,
                         lowest_index_abs: history_abs_start,
+                        // Cap the forward search at the current
+                        // block's end — donor `iend`. Without
+                        // this bound a match could extend past
+                        // `block_end_abs` into bytes the
+                        // producer hasn't scanned yet, breaking
+                        // the `anchor <= split + forward <=
+                        // block_end_abs` invariant downstream.
+                        iend_abs: block_end_abs,
                         min_match_length: min_match,
                     },
                 );
@@ -391,7 +399,15 @@ impl LdmProducer {
                 }
             }
 
-            ip_abs = ip_abs.saturating_add(hashed).max(ip_abs + 1);
+            // Guarantee forward progress even when `hashed == 0`
+            // (gear_feed in practice always advances by at least
+            // one byte over a non-empty chunk, but the saturating
+            // fallback below keeps the outer `while` loop
+            // monotonic against any future regression).
+            // Both operands of `.max(..)` use `saturating_add` so
+            // `ip_abs` near `usize::MAX` saturates rather than
+            // overflowing the inner `ip_abs + 1`.
+            ip_abs = ip_abs.saturating_add(hashed).max(ip_abs.saturating_add(1));
         }
 
         // Donor returns `iend - anchor` (the "leftover" tail),

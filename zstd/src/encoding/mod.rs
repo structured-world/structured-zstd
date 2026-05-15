@@ -49,10 +49,14 @@ pub(crate) mod hc;
 // `min_match_length` byte slice, donor `zstd_ldm.c:315`). The
 // `twox-hash` dependency is gated behind the `hash` feature so
 // `default-features = false` builds (no_std, embedded) don't pull
-// it in. The `BtMatcher::ldm_producer` field and every callsite
-// in `match_generator.rs` share the same `cfg(feature = "hash")`
-// gate so the codepath stays consistent across feature
-// combinations.
+// it in. `BtMatcher::ldm_producer` and the `cfg(feature = "hash")`
+// blocks inside `BtMatcher::prepare_ldm_candidates` /
+// `BtMatcher::reset` carry the same gate; the call site in
+// `match_generator.rs::start_matching_optimal` invokes
+// `prepare_ldm_candidates` unconditionally because the
+// gating is internal to the method body (under
+// `not(feature = "hash")` the method shrinks to the legacy
+// `ldm_sequences.clear()` stub).
 #[cfg(feature = "hash")]
 pub(crate) mod ldm;
 pub(crate) mod match_table;
