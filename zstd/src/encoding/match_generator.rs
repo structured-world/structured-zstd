@@ -715,6 +715,20 @@ impl Matcher for MatchGeneratorDriver {
                     });
                 }
                 MatcherStorage::Dfast(m) => {
+                    // Drop the long / short hash table allocations
+                    // before calling `m.reset`. Without this prepass,
+                    // `DfastMatchGenerator::reset` would `fill` both
+                    // tables with `DFAST_EMPTY_SLOT` sentinels — wasted
+                    // work given the next assignment to `self.storage`
+                    // is about to drop `m` entirely. `reset` itself
+                    // short-circuits on `if !self.short_hash.is_empty()`,
+                    // so handing it an empty `Vec` skips the fill loop.
+                    // Mirrors the pre-drain pattern in the HashChain
+                    // arm below (and serves the same peak-memory
+                    // purpose: release the table-allocation footprint
+                    // before constructing the replacement variant).
+                    m.short_hash = Vec::new();
+                    m.long_hash = Vec::new();
                     let vec_pool = &mut self.vec_pool;
                     m.reset(|mut data| {
                         data.resize(data.capacity(), 0);

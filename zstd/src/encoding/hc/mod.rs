@@ -726,10 +726,10 @@ mod hc_tests {
     /// later candidate's *total* match length (`forward +
     /// backward_extension`) reaches the new best.
     ///
-    /// Fixture (40 bytes):
+    /// Fixture (40 bytes, indices `0..=39`):
     ///   `"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK"`
-    ///    01234567890123456789012345678901234567890   (indices)
-    ///             1111111111222222222233333333334
+    ///    0123456789012345678901234567890123456789   (ones digit)
+    ///              1111111111222222222233333333     (tens digit, aligned)
     ///
     /// Probing `abs_pos = 24, lit_len = 3`:
     ///   - The 4-byte hash at `idx 24` ("abcd") collides with the
