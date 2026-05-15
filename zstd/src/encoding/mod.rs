@@ -1,6 +1,6 @@
 //! Zstandard encoder — frame compression, streaming, dictionary support.
 //!
-//! Three entry points cover the common use cases:
+//! Four entry points cover the common use cases:
 //!
 //! * [`compress`] — one-shot helper that builds a self-contained
 //!   Zstandard frame from a `Read` source to a `Write` sink. The
@@ -15,9 +15,11 @@
 //!   precise source-size hint. Peak memory is therefore ≈
 //!   `input_size + output_size`; prefer [`compress`] or
 //!   [`StreamingEncoder`] when the input is large or unbounded.
-//! * [`StreamingEncoder`] — implements [`std::io::Write`] (`std` feature),
-//!   accepting bytes incrementally and flushing compressed output as blocks
-//!   fill. Requires `set_pledged_content_size` before the first write if
+//! * [`StreamingEncoder`] — implements [`crate::io::Write`], which
+//!   re-exports [`std::io::Write`] under the `std` feature and falls
+//!   back to a `no_std`-friendly trait otherwise. Accepts bytes
+//!   incrementally and flushes compressed output as blocks fill.
+//!   Requires `set_pledged_content_size` before the first write if
 //!   the Frame Content Size field is to be populated.
 //! * [`FrameCompressor`] — lower-level builder that owns the matcher and
 //!   the per-frame configuration; the streaming and one-shot helpers are
