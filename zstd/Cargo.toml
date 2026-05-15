@@ -17,12 +17,18 @@ readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
 categories = ["compression"]
 
-# docs.rs builds the crate with all features enabled so feature-gated items
-# (e.g. the `dictionary` module behind `dict_builder`) appear in the published
-# documentation. The `--cfg docsrs` flag activates the `#[cfg_attr(docsrs,
-# doc(cfg(...)))]` annotations that render feature badges on each item.
+# docs.rs builds the crate with the public feature set so feature-gated
+# items (e.g. the `dictionary` module behind `dict_builder`) appear in the
+# published documentation. We list the public features explicitly rather
+# than using `all-features = true` because the manifest also exposes
+# `rustc-dep-of-std` (libstd-build-only — swaps in `rustc-std-workspace-*`
+# crates), `bench_internals` (widens the API surface for benches), and
+# `fuzz_exports` (widens it for fuzz targets); none of these should appear
+# on docs.rs. The `--cfg docsrs` flag activates the
+# `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
+# badges on each item.
 [package.metadata.docs.rs]
-all-features = true
+features = ["std", "hash", "dict_builder"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

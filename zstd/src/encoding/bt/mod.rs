@@ -351,8 +351,10 @@ impl BtMatcher {
     /// coordinates** (so its bucket-table entries remain valid
     /// across window evictions — entries inserted by an earlier
     /// view of the frame are filtered by the staleness check
-    /// `entry.offset <= history_abs_start`). The caller is
-    /// expected to pass:
+    /// `entry.offset < history_abs_start`, i.e. inclusive lower
+    /// bound: entries at exactly `history_abs_start` survive,
+    /// see `ldm::search::FindBestMatchInputs::lowest_index_abs`).
+    /// The caller is expected to pass:
     ///
     /// * `live_history` — the contiguous *live* slice of the
     ///   per-frame `MatchTable::history` (`&history[history_start..]`).

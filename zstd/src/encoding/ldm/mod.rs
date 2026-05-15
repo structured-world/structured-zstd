@@ -164,9 +164,10 @@ impl LdmProducer {
     /// **absolute stream coordinates** so the bucket table stays
     /// valid across window evictions: after a slide,
     /// `history_abs_start` advances and any entry inserted by an
-    /// earlier window is filtered by the `entry.offset <=
-    /// lowest_index_abs` staleness check in
-    /// [`find_best_match`].
+    /// earlier window is filtered by the inclusive lower-bound
+    /// staleness check `entry.offset < lowest_index_abs` in
+    /// [`find_best_match`] (entries at exactly
+    /// `lowest_index_abs == history_abs_start` survive).
     ///
     /// Implements the donor pipeline from
     /// `ZSTD_ldm_generateSequences_internal`
@@ -586,8 +587,10 @@ mod tests {
     ///      entries from call 1 must remain reachable: their
     ///      absolute offsets still point at the SAME bytes
     ///      (now further left in the live slice), and the
-    ///      staleness check `entry.offset <= history_abs_start`
-    ///      keeps them in-window.
+    ///      inclusive lower-bound staleness check
+    ///      `entry.offset < history_abs_start` keeps them
+    ///      in-window (entries at exactly `history_abs_start`
+    ///      survive).
     ///
     /// If the producer had stored slice-relative indices
     /// instead, call 2 would either miss the long-range match
