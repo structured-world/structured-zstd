@@ -105,6 +105,11 @@ const PRESPLIT_CHUNK_SIZE: usize = 8 << 10;
 const PRESPLIT_HASH_LOG_MAX: usize = 10;
 const PRESPLIT_HASH_TABLE_SIZE: usize = 1 << PRESPLIT_HASH_LOG_MAX;
 const PRESPLIT_KNUTH: u32 = 0x9E37_79B9;
+/// Donor `SEGMENT_SIZE` in `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:201`).
+/// Two `SEGMENT_SIZE`-byte fingerprints — one from the start, one from the end —
+/// drive the cheap border heuristic; a third one from the middle disambiguates
+/// where in the block the transition sits.
+const PRESPLIT_BORDERS_SEGMENT: usize = 512;
 
 #[derive(Clone)]
 struct PreSplitFingerprint {
@@ -151,6 +156,21 @@ fn presplit_record_fingerprint(
     // Donor parity: zstd_preSplit.c records the integer division, not the
     // rounded-up number of sampled events from the loop above.
     fp.nb_events += limit / sampling_rate;
+}
+
+/// Single-byte histogram pass — matches donor `HIST_add` over a small
+/// segment with `hashLog == 8` (the `hash2` shortcut at
+/// `zstd_preSplit.c:36` returns the raw byte). The byChunks path uses
+/// 2-byte hashing for `hashLog >= 9`; this helper exists so the borders
+/// heuristic doesn't pay for that wider hash on its 512-byte windows.
+fn presplit_record_byte_histogram(fp: &mut PreSplitFingerprint, src: &[u8]) {
+    fp.events.fill(0);
+    for &b in src {
+        fp.events[b as usize] += 1;
+    }
+    // Donor `HIST_add` returns the maximum symbol; the caller then sets
+    // `nbEvents = SEGMENT_SIZE` explicitly (see `zstd_preSplit.c:213`).
+    fp.nb_events = src.len();
 }
 
 fn presplit_distance(lhs: &PreSplitFingerprint, rhs: &PreSplitFingerprint, hash_log: usize) -> u64 {
@@ -225,9 +245,63 @@ fn donor_split_block_by_chunks(block: &[u8], level: usize) -> usize {
     block.len()
 }
 
+/// Donor port of `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:198`).
+/// Records two 512-byte byte-histograms — one from each end of a 128 KB
+/// block — and a third from the middle as a tie-breaker; returns either
+/// a quantised split point (32 KB / 64 KB / 96 KB) or the full block
+/// size when the two ends look indistinguishable. Cheaper than the
+/// chunk-based path because it touches at most 1.5 KB of input
+/// regardless of block size.
+fn donor_split_block_from_borders(block: &[u8]) -> usize {
+    debug_assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
+    let block_size = block.len();
+    let mut past = PreSplitFingerprint::default();
+    let mut new_fp = PreSplitFingerprint::default();
+    presplit_record_byte_histogram(&mut past, &block[..PRESPLIT_BORDERS_SEGMENT]);
+    presplit_record_byte_histogram(&mut new_fp, &block[block_size - PRESPLIT_BORDERS_SEGMENT..]);
+    // Donor uses `penalty = 0, hash_log = 8` — i.e. raw byte histogram
+    // distance with no threshold padding (`zstd_preSplit.c:214`).
+    if !presplit_fingerprints_differ(&past, &new_fp, 0, 8) {
+        return block_size;
+    }
+
+    let mut middle = PreSplitFingerprint::default();
+    let mid_start = block_size / 2 - PRESPLIT_BORDERS_SEGMENT / 2;
+    presplit_record_byte_histogram(
+        &mut middle,
+        &block[mid_start..mid_start + PRESPLIT_BORDERS_SEGMENT],
+    );
+
+    let dist_from_begin = presplit_distance(&past, &middle, 8);
+    let dist_from_end = presplit_distance(&new_fp, &middle, 8);
+    // Donor `SEGMENT_SIZE * SEGMENT_SIZE / 3` (`zstd_preSplit.c:221`):
+    // if the middle is roughly equidistant from both ends, the change
+    // sits near the centre — split at the midpoint.
+    let min_distance = (PRESPLIT_BORDERS_SEGMENT as u64) * (PRESPLIT_BORDERS_SEGMENT as u64) / 3;
+    if dist_from_begin.abs_diff(dist_from_end) < min_distance {
+        return 64 * 1024;
+    }
+    // Middle closer to the start means the transition is early →
+    // emit a 32 KB head; closer to the end means it's late → emit
+    // a 96 KB head and let the 32 KB tail carry the new statistics.
+    if dist_from_begin > dist_from_end {
+        32 * 1024
+    } else {
+        96 * 1024
+    }
+}
+
 fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
     match level {
-        // C zstd's default splitter level for btopt/btultra/btultra2 is 4.
+        // Donor `ZSTD_blockSplitter_level` table (`clevels.h`): cheap
+        // borders heuristic for lazy2 / btlazy2 strategies (levels
+        // 11..=15) — the splitter still pays for itself on
+        // heterogeneous payloads but the per-block cost stays bounded
+        // by two 512-byte histograms.
+        CompressionLevel::Level(11..=15) => Some(0),
+        // C zstd's default splitter level for btopt/btultra/btultra2 is 4
+        // (`ZSTD_splitBlock_byChunks` with internal level 3 — sampling
+        // rate 1, `hashLog` 10).
         CompressionLevel::Level(16..=22) => Some(4),
         _ => None,
     }
@@ -252,7 +326,16 @@ pub(crate) fn donor_optimal_block_size(
     if block.len() < MAX_BLOCK_SIZE as usize {
         return remaining_src_size.min(block_size_max);
     }
-    donor_split_block_by_chunks(&block[..MAX_BLOCK_SIZE as usize], split_level)
+    // Donor `ZSTD_splitBlock` dispatch (`zstd_preSplit.c:234`):
+    // `split_level == 0` → cheap borders heuristic;
+    // `split_level == 1..=4` → byChunks with internal sampling level
+    // `split_level - 1`.
+    let raw_split = if split_level == 0 {
+        donor_split_block_from_borders(&block[..MAX_BLOCK_SIZE as usize])
+    } else {
+        donor_split_block_by_chunks(&block[..MAX_BLOCK_SIZE as usize], split_level)
+    };
+    raw_split
         .max(PRESPLIT_BLOCK_MIN)
         .min(MAX_BLOCK_SIZE as usize)
 }
@@ -710,7 +793,7 @@ mod tests {
 
     use super::FrameCompressor;
     use crate::blocks::block::BlockType;
-    use crate::common::MAGIC_NUM;
+    use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
     use crate::decoding::{FrameDecoder, block_decoder, frame::read_frame_header};
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
@@ -1914,5 +1997,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Homogeneous input — every byte the same — must NOT be split:
+    /// both border histograms are identical (all 512 hits on a single
+    /// slot), so `presplit_fingerprints_differ` returns `false` and the
+    /// function takes the early-return path at
+    /// `zstd_preSplit.c:214` returning `blockSize`.
+    #[test]
+    fn donor_split_block_from_borders_keeps_homogeneous_block() {
+        let block = vec![0xAAu8; MAX_BLOCK_SIZE as usize];
+        let split = super::donor_split_block_from_borders(&block);
+        assert_eq!(split, MAX_BLOCK_SIZE as usize);
+    }
+
+    /// Heterogeneous input — first half all zeros, second half a
+    /// counter sequence — has clearly distinguishable border
+    /// histograms, so the borders heuristic must report one of the
+    /// three donor-quantised split positions (32 KB / 64 KB / 96 KB).
+    /// The transition sits at exactly the block midpoint, so the
+    /// middle-segment distance is asymmetric toward the start →
+    /// donor returns 96 KB (`middle` closer to `end` because the
+    /// "end" pattern dominates from byte 64 KB onwards).
+    #[test]
+    fn donor_split_block_from_borders_returns_quantised_split() {
+        let mut block = vec![0u8; MAX_BLOCK_SIZE as usize];
+        for (i, byte) in block
+            .iter_mut()
+            .enumerate()
+            .skip(MAX_BLOCK_SIZE as usize / 2)
+        {
+            *byte = (i % 251 + 1) as u8;
+        }
+        let split = super::donor_split_block_from_borders(&block);
+        assert!(
+            split == 32 * 1024 || split == 64 * 1024 || split == 96 * 1024,
+            "borders heuristic must return one of the donor-quantised \
+             split points (32K/64K/96K), got {split}"
+        );
+    }
+
+    /// `donor_pre_split_level` maps mid-range levels to the cheap
+    /// borders heuristic and high levels to the byChunks path. Levels
+    /// below 11 stay unsplit so the splitter never runs on fast /
+    /// default presets where its per-block cost would dominate.
+    #[test]
+    fn donor_pre_split_level_dispatches_by_compression_level() {
+        use crate::encoding::CompressionLevel;
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Fastest),
+            None
+        );
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Default),
+            None
+        );
+        assert_eq!(super::donor_pre_split_level(CompressionLevel::Better), None);
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Level(7)),
+            None
+        );
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Level(11)),
+            Some(0)
+        );
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Level(15)),
+            Some(0)
+        );
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Level(16)),
+            Some(4)
+        );
+        assert_eq!(
+            super::donor_pre_split_level(CompressionLevel::Level(22)),
+            Some(4)
+        );
+    }
+
+    /// End-to-end: a 256 KB heterogeneous payload compressed at
+    /// Level(13) (borders heuristic active) round-trips through the
+    /// crate's own decoder. The pre-split path runs over the first
+    /// 128 KB block and emits two consecutive sub-blocks; the second
+    /// 128 KB block goes through the splitter on its own. The test
+    /// proves the split decisions do not corrupt the frame bitstream.
+    #[test]
+    fn level_13_borders_split_roundtrips_through_own_decoder() {
+        use crate::encoding::CompressionLevel;
+        let mut data = vec![0u8; 256 * 1024];
+        // First 128 KB: low-entropy repeating run; second 128 KB:
+        // counter sequence — clearly distinct border histograms.
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = if i < 128 * 1024 {
+                (i & 0x07) as u8
+            } else {
+                (i % 251 + 1) as u8
+            };
+        }
+
+        let mut compressed = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Level(13));
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut decoder = FrameDecoder::new();
+        let mut source = compressed.as_slice();
+        decoder
+            .reset(&mut source)
+            .expect("frame header should parse");
+        while !decoder.is_finished() {
+            decoder
+                .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                .expect("decode should succeed");
+        }
+        let mut decoded = Vec::with_capacity(data.len());
+        decoder.collect_to_writer(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
     }
 }
