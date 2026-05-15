@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1778844714743,
+  "lastUpdate": 1778883371636,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -32426,6 +32426,570 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "05036ced64c276b62dc9e03580b2ec2152634345",
+          "message": "perf(encoding): #18 Phase 5 — LDM producer (gear hash + bucket table + search/emit) (#139)\n\n* feat(encoding): #18 Phase 5 foundations — LDM gear hash + bucket fill\n\nLands the foundational primitives of the donor LDM producer\n(`lib/compress/zstd_ldm.c` v1.5.7) under a new `encoding/ldm/`\nmodule. The verify + extend + emit half of the pipeline plus the\n`window_log >= 27` activation gate follow in a second Phase 5\ncommit; by default the producer stays `None` on every BtMatcher,\npreserving exact pre-Phase-5 behaviour (ratio gate\n`level22_sequences_match_donor_on_corpus_proxy` PASS).\n\nWhat ships:\n\n* `ldm/gear_hash.rs` — 64-bit gear rolling hash with the donor's\n  256-entry permutation table (`zstd_ldm_geartab.h`) reproduced\n  verbatim; full unit cross-check confirms zero mismatches against\n  the parsed donor header. `init` / `reset` / `feed` match the\n  donor recurrence `hash = (hash << 1) + GEAR_TAB[byte]` with the\n  same 4-wide unroll and `LDM_BATCH_SIZE = 64` cap.\n* `ldm/params.rs` — `LdmParams` + `adjust_for(window_log, strategy)`\n  is a direct port of `ZSTD_ldm_adjustParameters` (`zstd_ldm.c:135`),\n  including the `7 - strategy/3` hash-rate-log mapping, the\n  `BOUNDED(6, window_log - hash_rate_log, 30)` hash-log clamp, the\n  `minMatchLength /= 2` halving at strategies >= btultra (8), and\n  the `BOUNDED(LDM_BUCKET_SIZE_LOG, strategy, 8)` bucket clamp.\n* `ldm/table.rs` — `LdmHashTable` with `entries: Vec<LdmEntry>` of\n  length `1 << hash_log` and `bucket_offsets: Vec<u8>` for the\n  per-bucket round-robin write cursor (donor `ZSTD_ldm_insertEntry`,\n  `zstd_ldm.c:198-207`); silent `MIN(bucket_size_log, hash_log)`\n  clamp matches `zstd_ldm.c:176`.\n* `ldm/mod.rs` — `LdmProducer` aggregator owns the hash state, the\n  bucket table, and a `LDM_BATCH_SIZE` splits scratch buffer. The\n  fill path (`generate_into`) walks the input through the gear\n  hash, XXH64s each `min_match_length`-byte window (donor\n  `zstd_ldm.c:315`, seed 0), masks the low bits for the bucket id\n  (`hash_log - bucket_size_log` bits) and stores the high 32 bits\n  as the entry checksum.\n* `bt/mod.rs` carries a new `ldm_producer: Option<LdmProducer>`\n  field initialised to `None`; `BtMatcher::reset` propagates\n  `clear` into the producer when present. `prepare_ldm_candidates`\n  now takes the per-frame `history` slice and delegates to the\n  producer when active, otherwise preserves the original\n  defensive `ldm_sequences.clear()` no-op.\n* `match_generator.rs` callsite threads `self.table.history` into\n  `prepare_ldm_candidates` (disjoint-field split borrow keeps the\n  borrow checker happy).\n\nTests:\n\n* 24 new unit tests (9 gear_hash, 5 params, 7 table, 3 producer)\n  with donor `file:line` citations on every primitive.\n* Anchor entries `GEAR_TAB[0,42,80,255]` cross-checked against\n  donor `zstd_ldm_geartab.h`.\n* Recurrence regression test compares `reset` vs `feed(mask=\n  u64::MAX)` to guard the 4-wide unroll.\n* Round-robin insertion + adjacent-bucket isolation + post-clear\n  re-init covered for `LdmHashTable`.\n* `LdmProducer` constructs with donor btultra2/window=27 defaults\n  (min_match=32, hash_rate_log=4, bucket_size_log=8); `clear`\n  rewinds the rolling hash to `GEAR_HASH_INIT`.\n\nBuild + suite:\n\n* 451 / 451 lib tests pass (full suite, no skips).\n* `cargo clippy --lib --tests` clean.\n* Ratio gate `level22_sequences_match_donor_on_corpus_proxy` PASS.\n* No new warnings; `ldm/mod.rs` carries a Phase-1-style\n  `#![allow(dead_code)]` marker (same precedent as `bt/mod.rs`)\n  for the bucket-lookup helpers consumed in the follow-up emit\n  commit.\n\n* feat(encoding): #18 Phase 5 producer — LDM search + verify + emit\n\nCompletes the donor LDM producer pipeline by adding the bucket\nlookup + forward/backward extension half. With this commit\n`LdmProducer::generate_into` is functionally equivalent to donor\n`ZSTD_ldm_generateSequences_internal` on the prefix-only path:\nwhen a `BtMatcher` carries a `Some(LdmProducer)` it emits real\n[`HcRawSeq`] entries that the existing optimal-parser consumer\n(plumbed in #119) walks at block compress time.\n\nWhat ships:\n\n* `ldm/search.rs` — `count_backwards_match` mirrors donor\n  `ZSTD_ldm_countBackwardsMatch` (`zstd_ldm.c:214`); honours both\n  the `anchor` and `match_base` lower bounds, capping the\n  backward walk at the tighter of `min(p_in - anchor,\n  p_match - match_base)`. `find_best_match` walks every slot of\n  the bucket associated with `hash_id`, applies the donor\n  staleness + checksum filter (`zstd_ldm.c:431`), runs the\n  forward `common_prefix_len` and backward count, and returns\n  the candidate with the largest combined `forward + backward`.\n  Inputs are bundled into `FindBestMatchInputs` to keep\n  `clippy::too_many_arguments` happy without flattening the\n  donor citations.\n* `ldm/mod.rs` — `generate_into` re-implemented end-to-end:\n  re-seeds the rolling hash and primes it with the first\n  `min_match_length` bytes of the block (donor\n  `zstd_ldm.c:381-383`); maintains absolute `anchor` and `ip`\n  cursors; per-split branches on `split < anchor` (insert-only),\n  no-match (insert-only), or match-found (emit `HcRawSeq` →\n  insert new entry AFTER lookup to avoid clobbering bestEntry,\n  donor `zstd_ldm.c:490-492` → advance anchor → re-reset hash\n  when the emitted match overruns the hashed window, donor\n  `zstd_ldm.c:497-508`).\n* Module-level docs updated to spell out the activation policy\n  explicitly: `LdmProducer` is **never activated automatically\n  by any `CompressionLevel` preset** — distro-grade parity with\n  upstream `libzstd.so.1`, where `ZSTD_compress(..., level)`\n  keeps LDM off at every standard level (1..22). The opt-in\n  surface lands separately: `#27` plugs the Rust parameter API\n  into `BtMatcher::ldm_producer`, `#126`/`#127` wire\n  `ZSTD_c_enableLongDistanceMatching` through the C ABI, and\n  `#128` exposes the `zstd --long[=N]` CLI flag.\n\nTests:\n\n* 9 new search tests (4 `count_backwards_match` invariants,\n  5 `find_best_match` paths: stale-rejection, checksum\n  filtering, longest-combined selection, backward extension,\n  short-forward rejection). Every donor-staleness fixture uses\n  `offset > 0` to satisfy the reserved \"empty-slot\" sentinel.\n* End-to-end producer test\n  (`generate_into_emits_long_range_match_on_repeated_payload`):\n  4 KiB deterministic LCG payload + 64 KiB unique-byte gap +\n  4 KiB repeat of payload; asserts the producer emits at least\n  one `HcRawSeq` whose offset >= the gap distance and whose\n  match length meets the `min_match_length` floor.\n\nBuild + suite:\n\n* 460 / 460 lib tests pass (+9 vs the foundations commit:\n  8 search + 1 e2e). Phase-5 LDM tests now total 33.\n* `cargo clippy --lib --tests` clean.\n* Ratio gate `level22_sequences_match_donor_on_corpus_proxy`\n  PASS — `ldm_producer = None` on every `CompressionLevel`\n  preset preserves byte-parity with upstream.\n\n* fix(ldm): translate abs→slice index + enforce bucket cap + use table mask\n\n1. `prepare_ldm_candidates` translates absolute stream positions\n   to indices into the supplied `history` slice. Before, the\n   absolute `current_abs_start` (= `history_abs_start +\n   window_size − current_len`) was handed to\n   `LdmProducer::generate_into` as if it were a slice index, so\n   as soon as `history_abs_start != 0` after window eviction the\n   producer would index out of bounds in\n   `history[block_start..block_end]`. The method now takes an\n   explicit `history_abs_start` parameter; the call site in\n   `start_matching_optimal` passes `self.table.history_abs_start`\n   alongside the `history` slice. Matches the coordinate\n   convention every other matcher backend uses (`idx = abs_pos −\n   history_abs_start`, see `match_table/storage.rs:317-318`).\n\n2. `LdmHashTable::new` asserts `effective_bucket_log <= 8`. The\n   bucket round-robin cursor is a `u8` (mirrors donor `BYTE\n   bucketOffsets[]`, `zstd_ldm.c:202`); above 256 slots the\n   cursor would silently truncate, dropping new inserts on the\n   floor. `LdmParams::adjust_for` already clamps to\n   `LDM_BUCKETSIZELOG_MAX = 8`, so the producer's own path is\n   unaffected — the assertion guards callers that bypass the\n   params helper.\n\n3. `LdmProducer::generate_into` derives `hash_id_mask` from\n   `self.hash_table.bucket_mask()` instead of recomputing from\n   `params.hash_log / params.bucket_size_log`. The table applies\n   a `min(bucket_size_log, hash_log)` clamp (`zstd_ldm.c:176`)\n   which the producer-side recomputation did not; using the\n   table's authoritative mask eliminates the drift class.\n\nTests: new `prepare_ldm_candidates_translates_absolute_positions\n_to_slice_indices` regression in `bt/mod.rs` (panics pre-fix on\n`history[1024..1280]`); new `new_rejects_bucket_size_log_above\n_donor_cap` in `table.rs` (panics with the\n`ZSTD_LDM_BUCKETSIZELOG_MAX` assertion on\n`LdmHashTable::new(12, 9)`).\n\n462 / 462 lib tests pass. `cargo clippy --lib --tests` clean.\n`level22_sequences_match_donor_on_corpus_proxy` ratio gate PASS.\n\n* refactor(ldm): store bucket-table entries in absolute coordinates\n\nThe producer's bucket table survives across blocks within a frame;\nstoring slice-relative offsets in `LdmEntry.offset` broke\ncorrectness as soon as `history_abs_start` advanced past zero\nunder a window slide — old entries pointed at the wrong bytes,\nand `offset = split_abs − stale_match_pos` could underflow `u32`\nand emit invalid back-references.\n\nThis commit moves every cross-block invariant onto absolute\nstream coordinates:\n\n* `LdmProducer::generate_into` now takes\n  `(live_history, history_abs_start, block_start_abs,\n  block_end_abs, out)`. `live_history[0]` corresponds to absolute\n  `history_abs_start` (the byte that other matcher backends call\n  `base + dictLimit`); the abs→slice translation happens only at\n  the moment of `live_history[..]` indexing.\n* `LdmEntry.offset` stores absolute stream positions. Entries\n  that fall out of the current window after a slide are filtered\n  by `find_best_match`'s `entry.offset <= lowest_index_abs`\n  staleness check, where the producer now passes the current\n  `history_abs_start` as `lowest_index_abs`.\n* `FindBestMatchInputs` gains a `history_abs_start` field;\n  search-side `live_history`, `split_abs`, `anchor_abs`,\n  `lowest_index_abs` are all interpreted as absolute coordinates.\n  Internal abs→slice translation lives in a single place.\n* `BtMatcher::prepare_ldm_candidates` forwards the four absolute\n  coordinates straight to the producer (no translation\n  in-between).\n* `MatchGeneratorDriver::start_matching_optimal` passes\n  `self.table.live_history()` (the post-`history_start` slice)\n  instead of the full `history` Vec; `history_abs_start`\n  corresponds to `live_history()[0]`, not `history[0]`, so the\n  earlier code would have indexed into the dead prefix once\n  eviction began.\n* `gear_hash.rs` anchor-entry test comment fix: GEAR_TAB[80] is\n  donor row 26 col 2, not row 21 col 2 (`80 / 3 = 26 r 2`).\n\nTests:\n\n* New `generate_into_preserves_bucket_entries_across_history_\n  slide` in `ldm/mod.rs`: builds a 2×4 KiB payload + 2×32 KiB\n  gap frame; invokes `generate_into` first with\n  `history_abs_start = 0` (populates the table with entries\n  inside payload #1), then again with `history_abs_start = 2048`\n  (simulates window eviction that drops the leading half of\n  payload #1) targeting payload #2. Asserts (a) the producer\n  doesn't panic, (b) every emitted offset stays inside the\n  post-slide live history, (c) at least one emitted offset\n  >= GAP_A — the long-range win bucket entries from call 1 are\n  supposed to produce. Pre-fix slice-relative offsets would\n  either miss the match entirely or emit a corrupt\n  larger-than-live-history offset.\n* `prepare_ldm_candidates_translates_absolute_positions_to_\n  slice_indices` regression from round 1 still passes — the\n  abs-coords producer makes the original OOB scenario\n  impossible by construction.\n* All search.rs / generate_into unit tests migrated to the new\n  signature (added `history_abs_start = 0` argument).\n\nBuild + suite:\n\n* 463 / 463 lib tests pass (+1 cross-slide regression).\n* `cargo clippy --lib --tests` clean.\n* `level22_sequences_match_donor_on_corpus_proxy` ratio gate\n  PASS — `ldm_producer = None` default still preserves\n  byte-parity with upstream.\n\n* refactor(ldm): rebase scheme for u32 entries + lighter test allocations\n\nWraps the LDM bucket table in donor's rebase scheme so streams\nbeyond `u32::MAX` (4 GiB) encode without truncation; tightens\nsmall-detail review feedback alongside.\n\n1. **Rebase scheme (donor `ZSTD_ldm_reduceTable`, zstd_ldm.c:520).**\n   `LdmEntry.offset` is no longer an absolute stream position\n   stored as `u32` (would truncate above 4 GiB). It is now a\n   `u32` *relative* to `LdmHashTable::position_base` with a +1\n   bias so the default-zeroed value remains the empty-slot\n   sentinel. New helpers:\n   - `insert_absolute(hash_id, abs_pos, checksum)` — translates\n     `abs_pos − position_base + 1` before storing.\n   - `resolve(&entry) -> Option<usize>` — inverse translation;\n     returns `None` for the sentinel.\n   - `ensure_room_for(abs_pos)` — checks whether the relative\n     offset would exceed `u32::MAX − REBASE_GUARD_BAND` (2^30\n     headroom); if so, calls `reduce`.\n   - `reduce(amount)` — subtracts `amount` from every entry's\n     relative offset (saturating at 0 = empty), advances\n     `position_base`. Matches donor `ZSTD_ldm_reduceTable` shape.\n   The producer calls `ensure_room_for` before every insert and\n   uses `insert_absolute`; `find_best_match` uses `table.resolve`\n   to translate entries back to absolute positions before the\n   staleness / window-bounds checks. Same scheme `MatchTable`\n   uses for the BT/HC chain table.\n\n2. **Wider position types in the search-side surface.**\n   `LdmMatch.match_pos` and `FindBestMatchInputs.lowest_index_abs`\n   widened from `u32` to `usize` so values past 4 GiB stay\n   representable end-to-end. Internal storage remains `u32`\n   (the rebase scheme keeps the value in range); only the\n   external API uses `usize`.\n\n3. **Defensive `hash_rate_log.min(63)` clamp** in\n   `GearHashState::new` (gear_hash.rs:116). `LdmParams::adjust_for`\n   already produces 4..7, but a future caller bypassing the\n   params helper could hit the `1u64 << hash_rate_log` shift\n   panic — donor calls this path via internal-only entry points\n   too, but our `pub(crate)` surface invites a wider audience.\n\n4. **`LdmHashTable::clear` uses `entries.fill(...)`** instead of\n   a manual loop. `LdmEntry` is `Copy` so this compiles to a\n   bulk memset — meaningful when `hash_log` is large and clear\n   runs at every frame boundary.\n\n5. **`count_backwards_match` parameter rename `*_abs → *_idx`**.\n   After the absolute-coords refactor, callers translate to\n   slice indices via `abs − history_abs_start` before invoking\n   the function; the `*_abs` names misled readers (and the\n   deferred extDict path) into expecting absolute coordinates.\n\n6. **Test memory.** Three tests that exercised the producer at\n   `with_window_and_strategy(27, 9)` allocated a `1 << 23 = 8M`\n   entry table (~64 MiB) under parallel nextest, risking OOM on\n   32-bit shards. They now use a hand-tuned `LdmParams { hash_log:\n   10, .. }` via a `test_params()` helper (~8 KiB allocation)\n   without sacrificing test coverage. `producer_constructs_with\n   _donor_default_params` was split — the default-derivation\n   check now uses `LdmParams::adjust_for(27, 9)` directly so the\n   ~64 MiB producer isn't instantiated at all.\n\nTests:\n\n* +4 new rebase coverage in `table.rs`:\n  - `insert_absolute_round_trips_through_resolve`\n  - `resolve_returns_none_for_empty_slot`\n  - `reduce_preserves_resolved_absolute_positions` (verifies the\n    donor \"subtract reducer, saturate at 0\" semantics and\n    `position_base` advance preserve resolved positions for\n    surviving entries)\n  - `ensure_room_for_rebases_above_guard_band` (triggers a\n    rebase at `u32::MAX − 2^30 + 1` and confirms a fresh insert\n    at the trigger position round-trips through `resolve`).\n* All search-side tests migrated to `insert_absolute` so the\n  +1 bias is exercised end-to-end.\n\nBuild + suite:\n\n* 467 / 467 lib tests pass (+4 rebase, no regressions).\n* `cargo clippy --lib --tests` clean.\n* `level22_sequences_match_donor_on_corpus_proxy` ratio gate\n  PASS — `ldm_producer = None` default still preserves\n  byte-parity with upstream.\n\n* fix(ldm): reset position_base in LdmHashTable::clear\n\n`clear()` previously zeroed the entries and bucket cursors but\nleft `position_base` at its last rebased value. After a\n`reduce()` shifted the base forward, `clear()` would leave the\ntable in a state where a fresh-frame insert at absolute 0 hit\nthe `abs_pos >= position_base` assertion in `insert_absolute`.\n\nResetting `position_base = 0` keeps `clear()` semantically\nequivalent to constructing a fresh `LdmHashTable` — the per-\nframe producer reset path can now restart absolute positions\nfrom anywhere without surprise.\n\nNew `clear_resets_position_base` regression in table.rs:\ninserts at abs 1024, calls `reduce(1 << 20)` to shift the base,\nverifies `position_base > 0`, calls `clear()`, asserts\n`position_base == 0`, and then inserts at abs 0 (would panic on\nthe assertion if the reset didn't happen).\n\n468 / 468 lib tests pass. `cargo clippy --lib --tests` clean.\n\n* docs: rewrite README + extend rustdoc landing for docs.rs\n\nREADME:\n\n* Lead with a value-prop tagline (pure Rust, dictionary handle, no FFI,\n  no_std) instead of jumping straight into the benchmarks dashboard.\n* Add a Quick Start section with `cargo add` and a `no_std` toggle.\n* Reframe the status section as decoder / encoder / dictionary\n  capability summaries instead of a TODO-style feature checklist.\n* Collapse the internal compression-strategy backend table into a\n  `<details>` block.\n* Move the live benchmark dashboard link into a Performance section\n  pointing at the GitHub Pages dashboard; methodology stays in\n  BENCHMARKS.md, no headline numbers in README.\n* Move the project-relationship paragraph to the bottom and shorten it.\n* Drop the internal ADR-013 reference (replaced by a concrete\n  no-cmake / no-FFI statement in the tagline).\n* Switch the `LICENSE` link from a broken relative path to an absolute\n  GitHub URL — the previous form rendered dead on docs.rs.\n\ndocs.rs landing:\n\n* Replace the duplicated Decompression/Compression preamble in\n  `lib.rs` with a feature-oriented overview that links into the\n  per-module documentation, then re-includes the README via\n  `include_str!` (single source of truth for the landing page).\n* Enable `#![cfg_attr(docsrs, feature(doc_cfg))]` so feature-gated\n  items render their feature flag badge on docs.rs.\n* Add `[package.metadata.docs.rs] all-features = true, rustdoc-args =\n  [\"--cfg\", \"docsrs\"]` so the published documentation builds with\n  every optional surface visible.\n* Expand `decoding/mod.rs` and `encoding/mod.rs` module preambles —\n  the previous one-liners pointed users at the wrong entry point.\n  The new docs walk through the three entry points each side exposes\n  (one-shot / streaming / low-level) with the trade-off for each.\n\nAll 468 / 468 lib tests pass. `cargo clippy --lib --tests` clean.\n`cargo doc --lib --features dict_builder` builds with zero warnings.\n\n* docs(ldm): correct ensure_room_for docstring\n\nThe doc comment referenced a non-existent `LDM_INSERT_LOOKAHEAD`\nconstant and claimed the function returned `abs_pos -\nshift_applied`. The function returns `()` and operates only on\nthe supplied `abs_pos` — there is no per-call lookahead. The\nrewritten comment matches the actual signature and explains the\nsingle-compare common path plus the rebase trigger.\n\nDoc-only change; 468 / 468 lib tests still pass.\n\n* docs(ldm): replace dash-prefixed line in ensure_room_for docstring\n\nClippy 1.95's `doc_lazy_continuation` lint parses a line starting\nwith `- ` as the head of a markdown list item; the surrounding\nsentence continuation then triggers the indentation warning. CI\nhits `-D warnings` so the build fails. Rewording to `When the\nrelative position would exceed u32::MAX − REBASE_GUARD_BAND`\nkeeps the prose at column 0 with no leading dash.\n\n* fix(ldm): gate behind hash feature + harden insert_absolute preconditions\n\n`encoding::ldm` was compiled unconditionally but depends on\n`twox_hash::XxHash64` for the per-window XXH64 (`zstd_ldm.c:315`).\n`twox-hash` is an optional dependency behind the `hash` feature,\nso `default-features = false` builds (no_std, embedded) failed to\ncompile. The fix mirrors the gating pattern already used for the\nsame crate in `streaming_encoder.rs`, `frame_compressor.rs`, and\n`decode_buffer.rs`:\n\n* `mod ldm;` declaration is `#[cfg(feature = \"hash\")]`.\n* `BtMatcher::ldm_producer` field and every integration callsite\n  (`use ... LdmProducer`, `Some(producer) = self.ldm_producer\n  ...`) carry the same gate. Under `default-features = false` the\n  field disappears and `prepare_ldm_candidates` reduces to its\n  legacy `ldm_sequences.clear()` stub.\n* `prepare_ldm_candidates_translates_absolute_positions_to_slice_\n  indices` regression also gated.\n\nVerified: `cargo build --lib --no-default-features` clean;\n`cargo clippy --lib --tests --no-default-features -- -D warnings`\nclean.\n\nSeparately, `LdmHashTable::insert_absolute` promoted its two\npreconditions from `debug_assert!` to runtime panics so a\ncontract violation cannot silently corrupt the table in release\nbuilds:\n\n* `abs_pos < position_base` now panics via `checked_sub` +\n  `unwrap_or_else` with a diagnostic instead of underflowing the\n  subtraction and casting the wraparound to `u32`.\n* `rel >= u32::MAX as usize` now panics via `assert!` (was\n  `debug_assert!`) — the producer's `ensure_room_for` rebases\n  before this point, but if a custom caller bypasses it the\n  failure is loud and immediate.\n* The `+1` empty-slot bias was moved inside the `u32` arithmetic\n  (`(rel as u32) + 1` instead of `(rel + 1) as u32`) so the\n  intermediate `usize` add can't overflow on 32-bit targets.\n\nNew `insert_absolute_panics_below_position_base` regression\ncovers the underflow guard with `#[should_panic]`.\n\nREADME quick-start snippet now passes `&b\"hello world\"[..]` to\n`compress_to_vec` — `b\"...\"` literal alone is `&[u8; N]` which\ndoes not implement `std::io::Read`, so the doctest failed under\n`cargo test --doc` after the earlier doc rewrite landed.\n\n469 lib tests + 11 doctests pass; clippy clean under default\nfeatures AND under `--no-default-features`.\n\n* fix(ldm): bound forward search by iend_abs + saturate ip progress\n\n`find_best_match` previously walked `common_prefix_len` from\n`split_idx` to the end of `live_history`, which could over-count\nmatches past the caller's intended block boundary. Donor's\n`ZSTD_count(split, pMatch, iend)` is bounded by `iend`, so the\nproducer's `block_end_abs` must propagate into the search:\n\n* `FindBestMatchInputs` gains an `iend_abs` field (absolute\n  stream position one past the last byte the forward match is\n  allowed to reach).\n* `find_best_match` translates `iend_abs` to a slice index\n  `split_idx_end` and clamps the forward slice to\n  `live_history[split_idx..split_idx_end]`. Without the cap, a\n  match could extend past `block_end_abs` and break the\n  `anchor <= split + forward <= block_end_abs` invariant the\n  producer relies on for the anchor advance.\n* `LdmProducer::generate_into` passes `block_end_abs` through.\n\n`ip_abs.saturating_add(hashed).max(ip_abs + 1)` used a\nnon-saturating `ip_abs + 1` that would overflow on `ip_abs near\nusize::MAX`. Switched both operands to `saturating_add(1)` —\nkeeps the progress guarantee without relying on external\nheadroom checks.\n\nTwo documentation fixes paired in the same commit:\n\n* The `encoding/mod.rs` comment that explained the `hash`\n  feature gate falsely claimed `match_generator.rs` callsites\n  share the gate. The callsite calls `prepare_ldm_candidates`\n  unconditionally; the gate is internal to the method body\n  (under `not(feature = \"hash\")` the body shrinks to the legacy\n  `ldm_sequences.clear()` stub). Corrected the comment to\n  describe the actual mechanism.\n* The `decoding/mod.rs` module preamble pointed readers at\n  `_with_dictionary_handle` / `_with_dict_bytes` variants, but\n  the public API names are split: `StreamingDecoder` uses\n  `new_with_dictionary_handle` / `new_with_dictionary_bytes`\n  while `FrameDecoder` uses `decode_all_with_dict_handle` /\n  `decode_all_with_dict_bytes`. Spelled both out so docs.rs\n  readers reach the right method.\n\nNew `find_best_match_forward_count_is_bounded_by_iend_abs`\nregression: 4 preamble + \"abcdefgh\" × 2; without the cap the\nmatch at `split=12 vs match=4` returns `forward_len = 8`, with\n`iend_abs = 16` it caps at 4.\n\n470 lib tests + 11 doctests pass. `cargo clippy --lib --tests\n-- -D warnings` clean under default features AND under\n`--no-default-features`.\n\n* refactor(ldm): drop saturating_add on ip_abs progress\n\nThe `ip_abs.saturating_add(hashed).max(ip_abs.saturating_add(1))`\nchain landed in the previous commit to satisfy a release-build\noverflow concern. The saturation is structurally unreachable in\nthis loop:\n\n* Every caller reaches LDM through\n  `bt::prepare_ldm_candidates`, whose `current_abs_start` and\n  `block_end_abs` come from a `MatchTable` that has already\n  passed `check_stream_abs_headroom` (storage.rs:50). That\n  frame-level guard guarantees `history_abs_start + window_size\n  + STREAM_ABS_HEADROOM ≤ usize::MAX`.\n* Inside the outer `while ip_abs < ilimit_abs` body\n  (`ilimit_abs ≤ block_end_abs ≤ history_abs_start +\n  live_history.len()`), the post-update value `ip_abs +\n  max(hashed, 1)` stays bounded by `ilimit_abs`, which the\n  frame headroom check pins well below `usize::MAX`.\n\nSwitched to raw `ip_abs += hashed.max(1)` — same forward-\nprogress guarantee (`.max(1)` floor), no defensive saturation\non a path the frame-level guard already protects. Same pattern\nthe rest of the encoder uses for stream-position arithmetic\n(`bt_pair_index_for_abs` uses `wrapping_add` for the same\nreason — modulo-ring semantics under the same headroom check).\n\n470 lib tests + 11 doctests pass under both default and\nno-default-features. cargo clippy lib tests with -D warnings is\nclean in both configs. level22_sequences_match_donor_on_corpus\n_proxy ratio gate green.\n\n* refactor(ldm): inclusive lowest_index_abs + correct doc references\n\nFour small corrections across the LDM module:\n\n1. `find_best_match` filter flipped from `match_abs <=\n   lowest_index_abs` (exclusive lower bound — `lowest_index_abs`\n   itself rejected) to `match_abs < lowest_index_abs` (inclusive\n   — `lowest_index_abs` itself survives). Caller in\n   `LdmProducer::generate_into` already passed\n   `history_abs_start`, which under the previous semantics\n   dropped a valid candidate at the left edge of the live window\n   (`live_history[0]`) after a window slide. The inclusive form\n   keeps that edge entry matchable without the\n   `history_abs_start.saturating_sub(1)` workaround\n   CodeRabbit suggested — the underflow risk at frame start\n   disappears too. Stale-rejection test fixture updated to pass\n   `lowest_index_abs = 5` (rejects offset 4) since the previous\n   value `4` now exactly meets the floor and survives.\n\n   Donor deviation noted in the field docstring — donor uses\n   the exclusive form (`zstd_ldm.c:431` `cur->offset <=\n   lowestIndex`), but our internal coordinate space is already\n   rebase-aware so the parameter contract differs from donor's\n   `lowestIndex` anyway.\n\n2. `gear_hash.rs` module-level constant table claimed\n   `LDM_BUCKET_SIZE_LOG` \"matches `ZSTD_LDM_BUCKETSIZELOG_MAX`\n   upper bound\". It's actually `4` — the donor default / lower\n   bound used by `LdmParams::adjust_for`'s `BOUNDED` clamp. The\n   upper bound is `LDM_BUCKETSIZELOG_MAX = 8`, surfaced via\n   `params::LDM_BUCKETSIZELOG_MAX`. Doc corrected.\n\n3. `encoding/ldm/mod.rs` activation-policy section pointed\n   readers at `ZSTD_c_enableLdm` as the C ABI hook, but\n   upstream's actual parameter ID is\n   `ZSTD_c_enableLongDistanceMatching` (the spelling used\n   correctly a few lines above). Aligned both references.\n\n4. `LdmHashTable::new_accepts_donor_max_hash_log` renamed to\n   `new_accepts_large_hash_log_smoke` — the test uses\n   `hash_log = 18` (and the inline comment explicitly says\n   \"deliberately do NOT use 30\"), so the original name pointed\n   future readers at a contract the test does not actually\n   exercise.\n\n470 lib tests + 11 doctests pass under default features AND\n`--no-default-features`. `cargo clippy --lib --tests -- -D\nwarnings` clean in both configs.\n\n* fix(ldm): reject entries at/past split_abs in find_best_match\n\n`find_best_match` previously had no ordering check between\n`match_abs` and `split_abs`. In normal `LdmProducer::generate_into`\noperation the producer inserts AFTER the search and `split_abs`\nadvances monotonically, so the bucket cannot contain an entry at\nor past the current `split_abs` — the check is structurally\nredundant on the producer path. But a direct caller (test fixture\ninjecting entries via `insert_absolute`, future `extDict` path\nmixing positions from two segments) could feed such an entry; the\nproducer's emit then computes `offset = split_abs −\nbest.match_pos`, which becomes 0 (invalid back-ref) when\n`match_abs == split_abs` and underflows when `match_abs >\nsplit_abs` — both silently corrupt the output stream in release\nbuilds.\n\nAdded an explicit `if match_abs >= split_abs { continue }` guard\nbetween the out-of-window check and the forward-match\ncomputation, with an inline comment explaining when it kicks in.\n\n`find_best_match_rejects_entries_at_or_past_split` regression\ncovers both edge cases via direct `insert_absolute` fixtures.\n\nSeparately, the `BtMatcher::ldm_producer` field docstring claimed\nthe producer is \"populated lazily on the first\n`prepare_ldm_candidates` call\". That was misleading — the method\nonly consumes the field when it is already `Some`; the producer\nis never auto-constructed. Updated the doc to spell out the\nopt-in injection model (the future Rust parameter API issue #27\nbuilds an `LdmProducer` from caller-supplied params and assigns\nit here at frame setup time).\n\n471 / 471 lib tests pass under default features AND\n`--no-default-features`. 11 / 11 doctests pass. `cargo clippy\n--lib --tests -- -D warnings` clean in both configs.\n\n* fix(ldm): promote strategy precondition to runtime assert\n\n`LdmParams::adjust_for` previously guarded the donor `1..=9`\nstrategy range with `debug_assert!`, which compiles out in\nrelease builds. The body computes `LDM_HASH_RLOG - (strategy /\n3)` as raw `u32` arithmetic — for `strategy >= 24` this is\n`7 - 8 = u32::MAX`, producing nonsensical params that the\ndownstream `LdmParams` consumers (gear hash, bucket table)\nwould silently accept and operate on.\n\nPromoted to a hard `assert!` so the precondition fails fast in\nboth debug and release, matching donor's own\n`assert(1 <= strategy && strategy <= 9)` at zstd_ldm.c:149 /\nzstd_ldm.c:167. Runs once per frame so the cost is negligible.\n\nNew `adjust_for_panics_on_out_of_range_strategy` regression\ncalls `adjust_for(27, 24)` under `#[should_panic]`.\n\n472 / 472 lib tests pass under default features AND\n`--no-default-features`. 11 / 11 doctests pass. `cargo clippy\n--lib --tests -- -D warnings` clean in both configs.\n\n* fix(ldm): replace block_end_abs min with invariant assertion\n\n`prepare_ldm_candidates` previously computed `block_end_abs =\nmin(current_abs_start + current_len, history_abs_start +\nlive_history.len())`. Under the `MatchTable` invariant\n`live_history.len() == window_size` (maintained by\n`add_data` in `match_table/storage.rs:477-488`) plus the\ncaller's `current_abs_start = history_abs_start + window_size −\ncurrent_len` (match_generator.rs:1330), the two operands of\n`min` always coincide — the clamp is structurally redundant and\nsilently truncates the scanned range if the invariant ever\nbreaks, masking the violation.\n\nReplaced with `debug_assert_eq!` that catches the invariant\nviolation in debug builds, and a raw `current_abs_start +\ncurrent_len` in release. The frame-level\n`check_stream_abs_headroom` (`match_table/storage.rs:50`)\nguarantees `history_abs_start + window_size +\nSTREAM_ABS_HEADROOM ≤ usize::MAX`, so the raw `+` cannot\noverflow.\n\n472 / 472 lib tests pass under default features AND\n`--no-default-features`. 11 / 11 doctests pass. `cargo clippy\n--lib --tests -- -D warnings` clean in both configs.\n\n* docs(ldm): align staleness check wording + scope docs.rs feature set\n\nThree doc/metadata corrections across the LDM surface:\n\n1. `bt::BtMatcher::prepare_ldm_candidates` (bt/mod.rs:354) and\n   `ldm::LdmProducer::generate_into` (ldm/mod.rs:167, plus the\n   regression-test doc at ldm/mod.rs:589) all described the\n   staleness check as `entry.offset <= history_abs_start`. The\n   actual implementation since commit e1932b2 is an inclusive\n   lower bound: `find_best_match` rejects entries with\n   `match_abs < lowest_index_abs` so entries at exactly\n   `lowest_index_abs == history_abs_start` survive. Updated\n   the three doc sites to describe the inclusive filter,\n   pointing at `ldm::search::FindBestMatchInputs::lowest_index_abs`\n   for the canonical definition.\n\n2. `[package.metadata.docs.rs] all-features = true` would also\n   enable `rustc-dep-of-std` (libstd-build-only — swaps in\n   `rustc-std-workspace-*` core/alloc), `bench_internals`\n   (widens the public API for benches), and `fuzz_exports`\n   (widens it for fuzz targets). None of those should appear\n   on docs.rs. Replaced with explicit `features = [\"std\",\n   \"hash\", \"dict_builder\"]` so the published documentation\n   covers exactly the public surface.\n\n472 / 472 lib tests pass under default features AND\n`--no-default-features`. 11 / 11 doctests pass. `cargo doc\n--lib --features dict_builder,std,hash` builds without\nwarnings. `cargo clippy --lib --tests -- -D warnings` clean\nin both feature configs.\n\n* docs(ldm): correct buckets/slots in large hash_log smoke test comment\n\nhash_log=18, bucket_size_log=4 yields 16384 buckets × 16 slots, not\n16 buckets × 16384 slots. Test assertions were already correct\n(1<<14 buckets, 1<<4 slots) — only the inline arithmetic comment\nhad the two factors swapped.\n\n* fix(ldm): loop ensure_room_for across multi-guard-band jumps\n\nensure_room_for() guarantees the relative position fits in u32 before\nreturning. The single-shot 'if rel > max_rel' covered the common case\n(producer strides advance abs_pos by a few bytes per call), but a\ncaller that jumps past more than one REBASE_GUARD_BAND would leave\nrel above u32::MAX - REBASE_GUARD_BAND after one shift, so the next\ninsert_absolute() would panic on the (rel + 1) as u32 cast.\n\nSwitch to a while loop and add a regression test covering a 5x guard\nband jump (the old code rebased once, leaving rel = 4 *\nREBASE_GUARD_BAND > max_rel; the loop rebases twice, bringing rel ==\nmax_rel and the subsequent insert succeeds).\n\nAlso refresh the encoder module preamble — compress_to_vec eagerly\nbuffers the entire Read source, so the prior 'compact when input is\nin memory' bullet was misleading; restore the relative LICENSE link\nin the README badge so offline / crates.io / docs.rs renderers work\nwithout a GitHub round-trip.\n\n* docs(ldm): correct insert_absolute panic contract to runtime, not debug-only\n\nThe rustdoc said panics fire only in debug builds, but the body uses\nchecked_sub(...).unwrap_or_else(panic!) and a runtime assert!, both\nof which fire in release. Align the contract with actual behavior\nand cite the underlying check for each precondition so future\ncontributors do not regress these to debug_assert! (silent-wrap\nwould corrupt the table far from the bug source).\n\n* fix(ldm): gate multi-guard-band rebase test to 64-bit targets\n\nThe new ensure_room_for_loops_across_multiple_guard_bands test\nmaterialises an abs_pos of 5 * REBASE_GUARD_BAND (= 5 GiB) as a\nusize literal, which overflows usize on i686 (usize::MAX ≈ 4 GiB)\nat compile time under #[deny(arithmetic_overflow)]. Gate the test\nto target_pointer_width = \"64\"; the scenario is unreachable on\n32-bit anyway because usize::MAX caps addressable streams below\nthe multi-rebase threshold the test exercises.\n\n* fix(ldm): reject sentinel offset 0 in LdmHashTable::insert + correct insert panic docs\n\nCodeRabbit Major: insert() accepted entry.offset == 0, which aliases\nthe empty-slot sentinel — resolve() would treat the stored entry as\nempty and silently drop the candidate. Promote to a runtime assert\n(not debug_assert!) so contract violations fail fast in release.\nShift the round-robin fixture from 0..6 to 1..=6 so the test stops\nusing the sentinel as data, and add a regression test for the new\npanic path.\n\nCopilot: the prior panics-doc claim that release would 'corrupt the\nnext bucket' was inaccurate — Vec OOB indexing panics in both debug\nand release. Rephrase: the debug_assert only exists for an earlier,\nclearer error message; release falls back to Vec's own bounds check.\n\n* docs(encoding): split compress vs compress_to_vec memory profile\n\ncompress streams from Read incrementally and buffers only compressed\nblocks until the frame end (to write Frame Content Size in the\nheader) — peak ≈ output_size, independent of input length.\ncompress_to_vec eagerly read_to_end's the input into a Vec so the\nencoder can be handed &[u8] + an exact source-size hint, peak ≈\ninput + output. The previous combined wording conflated the two and\noverstated compress's input buffering requirements.\n\n* docs(encoding): fix entry-point count + StreamingEncoder Write trait reference\n\nCodeRabbit + Copilot flagged 'Three entry points' enumerating four\nbullets (compress, compress_to_vec, StreamingEncoder,\nFrameCompressor). Bump to 'Four'.\n\nCopilot also noted StreamingEncoder implements crate::io::Write, not\nstd::io::Write unconditionally — crate::io re-exports std::io when\nthe std feature is on and falls back to a no_std-friendly trait\notherwise. Update the bullet to reference crate::io::Write and call\nout the alias so no_std consumers are not misled.\n\n* docs(encoding): clarify compress peak-memory scales with compressed_size\n\nThe previous wording 'peak ≈ output_size, independent of input length'\nmisled: output_size grows with input length, and worst-case for\nincompressible payloads is O(input_size) (compressed cannot exceed\ninput + small overhead). Rephrase to 'O(compressed_size) (worst-case\nO(input_size))' and call out explicitly that the win vs\ncompress_to_vec is avoiding materialising the input alongside the\noutput.",
+          "timestamp": "2026-05-16T01:04:07+03:00",
+          "tree_id": "45c0c94f69e6cabd9f5d7eaac413e25646bdfa49",
+          "url": "https://github.com/structured-world/structured-zstd/commit/05036ced64c276b62dc9e03580b2ec2152634345"
+        },
+        "date": 1778883370003,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.017,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 5.861,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.901,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/pure_rust",
+            "value": 5.656,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/best/low-entropy-1m/matrix/c_ffi",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.17,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.116,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.34,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/best/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.17,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 6.565,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.822,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/pure_rust",
+            "value": 6.03,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/better/low-entropy-1m/matrix/c_ffi",
+            "value": 0.815,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.191,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/better/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.231,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 14.311,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.308,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/pure_rust",
+            "value": 13.641,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/default/low-entropy-1m/matrix/c_ffi",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.188,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.364,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.361,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/default/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.161,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 3.914,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.248,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/pure_rust",
+            "value": 1.895,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/fastest/low-entropy-1m/matrix/c_ffi",
+            "value": 0.253,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.185,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.183,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.349,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/fastest/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.285,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 1.706,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 1.423,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/pure_rust",
+            "value": 1.585,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level22/low-entropy-1m/matrix/c_ffi",
+            "value": 1.394,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.184,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.122,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.184,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.122,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.371,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.37,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level22/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/pure_rust",
+            "value": 8.871,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/decodecorpus-synthetic-1m/matrix/c_ffi",
+            "value": 0.36,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/pure_rust",
+            "value": 7.736,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level4-row/low-entropy-1m/matrix/c_ffi",
+            "value": 0.356,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/pure_rust",
+            "value": 0.187,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/rust_stream/matrix/c_ffi",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/pure_rust",
+            "value": 0.188,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/decodecorpus-synthetic-1m/c_stream/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.353,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.351,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level4-row/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
