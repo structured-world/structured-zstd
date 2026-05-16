@@ -695,13 +695,16 @@ for row in memory_rows:
             "key": canonical_key(stage, row["scenario"], row["level"], source),
             "commit_sha": commit_sha,
             "generated_at": generated_at,
-            # Both sides use the SAME observer (the
-            # `compare_ffi_memory` binary installs a `#[global_allocator]`
-            # tracking wrapper and routes libzstd's `ZSTD_customMem`
-            # callbacks through `std::alloc::alloc`, so a single counter
-            # sums Rust + FFI bytes). Cross-side ratio is meaningful —
-            # `delta_ratio > 1` says Rust allocated more bytes than FFI
-            # for the same workload.
+            # Both sides feed the SAME pair of atomic counters in
+            # `compare_ffi_memory`: Rust-side via the
+            # `#[global_allocator]` tracking wrapper, FFI-side via the
+            # `ZSTD_customMem` callbacks which call `System.alloc` /
+            # `System.dealloc` directly and manually update the same
+            # counters with only the libzstd-requested `size` (bypassing
+            # the wrapper to avoid double-counting the 16-byte size
+            # header those callbacks prepend). Cross-side ratio is
+            # meaningful — `delta_ratio > 1` says Rust allocated more
+            # bytes than FFI for the same workload.
             "metric": "peak_alloc_bytes",
             "rust_value": rust_bytes,
             "ffi_value": ffi_bytes,
@@ -757,10 +760,13 @@ if memory_rows:
         "",
         "## Peak Allocation Bytes",
         "",
-        "Both columns measured by the same observer: the `compare_ffi_memory` "
-        "bench installs a `#[global_allocator]` tracking wrapper and routes "
-        "libzstd's `ZSTD_customMem` callbacks through it, so Rust-side and "
-        "FFI-side bytes share one counter and are directly comparable.",
+        "Both columns share one pair of atomic counters in the "
+        "`compare_ffi_memory` bench: Rust allocations via the "
+        "`#[global_allocator]` tracking wrapper, FFI allocations via "
+        "`ZSTD_customMem` callbacks that call `System.alloc` / "
+        "`System.dealloc` directly and manually update the same "
+        "counters with the libzstd-requested size only. Byte counts "
+        "are directly comparable cross-side.",
         "",
         "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
         "| --- | --- | --- | --- | ---: | ---: |",

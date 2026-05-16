@@ -1,12 +1,23 @@
 //! Memory peak benchmark: structured-zstd (pure Rust) vs zstd (C FFI).
 //!
 //! Strictly separate from the timing/ratio bench (`compare_ffi.rs`).
-//! This binary installs a `#[global_allocator]` tracking wrapper and
-//! routes libzstd's `ZSTD_customMem` callbacks through the same Rust
-//! allocator, so a SINGLE observer counts bytes on both sides of the
-//! comparison. The tracking allocator adds per-allocation overhead
-//! that biases criterion timing — that's the whole reason this lives
-//! in its own binary instead of being a mode flag on the timing bench.
+//! Both sides feed a single pair of atomic counters
+//! (`ALLOC_CURRENT` / `ALLOC_PEAK`), so the reported bytes are
+//! symmetric across Rust and FFI:
+//! - Rust allocations flow through `#[global_allocator] TrackingAllocator`,
+//!   which counts `layout.size()` (the user-requested bytes only).
+//! - FFI allocations flow through the `ZSTD_customMem` callbacks
+//!   (`ffi_alloc`/`ffi_free`) which call `System.alloc` /
+//!   `System.dealloc` directly — bypassing `TrackingAllocator` to
+//!   avoid double-counting the 16-byte size header the callbacks
+//!   themselves prepend — and manually `fetch_add` / `fetch_sub` only
+//!   the libzstd-requested `size` against the same counters. Net
+//!   effect: one observer, two paths in, byte-exact on both sides.
+//!
+//! This bench owns the `#[global_allocator]` because per-allocation
+//! tracking overhead biases criterion timing samples — keeping the
+//! tracking allocator out of `compare_ffi.rs` lets that bench measure
+//! latency on a vanilla system allocator.
 //!
 //! Output: `REPORT_MEM` lines (same format `compare_ffi.rs` used to
 //! emit before being stripped). Aggregator script (`run-benchmarks.sh`)
