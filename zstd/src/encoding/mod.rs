@@ -103,12 +103,17 @@ pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
 ///   + (srcSize < 128 KB ? (128 KB - srcSize) >> 11 : 0)
 /// ```
 ///
-/// Used to pre-size the output `Vec` in [`compress_to_vec`] so the
+/// Consulted by [`compress_slice_to_vec`] for the small-input branch
+/// of its output-`Vec` seed: the seed is
+/// `min(compress_bound(src), OUTPUT_BLOCK_CAP = 128 KiB)`, so for
+/// inputs that fit within one donor block (`≤ ~128 KiB`) the
 /// destination never reallocates inside the measured window. Without
-/// this, `Vec::push` growth doubles in powers of two and pins
+/// the bound, `Vec::push` growth doubles in powers of two and pins
 /// `~2 × final_compressed_size` resident at the last realloc, which
 /// shows up as ~1 MiB of peak-RSS noise on 1 MiB inputs and prevents
-/// FFI-parity on the memory bench.
+/// FFI-parity on the memory bench. For inputs larger than the cap the
+/// `Vec` still grows by amortized doubling — see
+/// [`compress_slice_to_vec`] for the trade-off rationale.
 #[inline]
 pub(crate) const fn compress_bound(src_size: usize) -> usize {
     const SMALL_INPUT_THRESHOLD: usize = 128 * 1024;
@@ -155,9 +160,17 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// Compress a contiguous byte slice into a fresh `Vec<u8>` without
 /// the input-buffering step that [`compress_to_vec`] performs to
 /// adapt a `Read` source. Donor-parity peak-memory shape: the input
-/// is read by reference and the output is pre-sized to
-/// [`compress_bound`] so neither side incurs an intermediate copy or
-/// realloc-doubling spike inside the measured window.
+/// is read by reference, and the output `Vec` is seeded with
+/// `min(compress_bound(src), OUTPUT_BLOCK_CAP = 128 KiB)`.
+///
+/// The seed is intentionally capped at one donor block. For inputs
+/// up to a few KiB this matches `compress_bound(src)` and the `Vec`
+/// never reallocates inside the measured window. For larger inputs
+/// the `Vec` grows via amortized doubling, with peak transient
+/// memory ≈ 2× current compressed size at the last realloc — a
+/// deliberate trade against pinning `compress_bound(src)` upfront,
+/// which on the 100 MiB `large-log-stream` scenario pinned 100.4 MiB
+/// even though the actual compressed output was ≪ 1 MiB.
 ///
 /// ```rust
 /// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};

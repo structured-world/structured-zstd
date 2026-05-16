@@ -678,9 +678,15 @@ impl MatchGeneratorDriver {
                 }
                 super::strategy::BackendTag::Dfast => {
                     // Dfast doesn't retain input Vecs anymore — `history`
-                    // is the only byte store. `trim_to_window` reports
-                    // evicted lengths via a no-op closure here; we still
-                    // need the eviction count for budget retirement.
+                    // is the only byte store, so its `trim_to_window`
+                    // does NOT fire the `reuse_space` closure (no buffer
+                    // to recycle). We derive the eviction count from the
+                    // `window_size` delta before/after the trim; the
+                    // closure passed below is a deliberate no-op to keep
+                    // the cross-backend `trim_to_window` signature
+                    // uniform. Do NOT "simplify" by removing the closure
+                    // arg — `DfastMatchGenerator::trim_to_window` keeps
+                    // it for cross-backend dispatch in this match arm.
                     let dfast = self.dfast_matcher_mut();
                     let pre = dfast.window_size;
                     dfast.trim_to_window(|_| ());

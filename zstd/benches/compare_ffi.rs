@@ -230,7 +230,7 @@ fn bench_compress(c: &mut Criterion) {
 
             group.bench_function("pure_rust", |b| {
                 b.iter(|| {
-                    black_box(structured_zstd::encoding::compress_to_vec(
+                    black_box(structured_zstd::encoding::compress_slice_to_vec(
                         &scenario.bytes[..],
                         level.rust_level,
                     ))

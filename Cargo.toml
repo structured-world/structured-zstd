@@ -2,6 +2,15 @@
 resolver = "3"
 members = ["zstd", "cli"]
 
-[profile.release]
+# Bench profile inherits from release but overrides LTO/codegen-units so
+# the perf measurement reflects full cross-crate inlining. We deliberately
+# scope this to `[profile.bench]` instead of `[profile.release]`: the
+# release profile is shared by the `cli` binary and every downstream
+# consumer of this workspace, and fat LTO + codegen-units = 1 multiplies
+# release build times ~5× and significantly increases peak compile RAM.
+# Bench builds run on CI with the wall clock budget for it; everyday
+# `cargo build --release` (and downstream consumers) should not pay that
+# cost without explicitly opting in.
+[profile.bench]
 lto = "fat"
 codegen-units = 1
