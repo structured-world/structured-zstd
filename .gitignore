@@ -17,4 +17,5 @@ zstd/fuzz/corpus
 /=
 AGENTS.md
 .claude/
+.local/
 **/__pycache__/
