@@ -7129,23 +7129,31 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
 /// insert at the boundary position must `pack_slot` to a valid
 /// non-sentinel value that `unpack_slot` resolves back to the same
 /// absolute position. Mirrors `LdmHashTable::ensure_room_for_*`
-/// from PR #139; gated to 64-bit pointer widths because the
-/// trigger position exceeds `usize::MAX` on i686.
-#[cfg(target_pointer_width = "64")]
+/// from PR #139.
+///
+/// Runs on every target — `trigger_abs = u32::MAX -
+/// DFAST_REBASE_GUARD_BAND + 1 = 0xC0000000`, which fits in `usize`
+/// on i686 (`usize::MAX = u32::MAX`) without overflow, so the
+/// packed-slot boundary path + u32 ↔ usize round-trip is exercised
+/// on every pointer width we ship.
 #[test]
 fn dfast_ensure_room_for_rebases_above_guard_band() {
     let mut dfast = DfastMatchGenerator::new(1 << 22);
     dfast.set_hash_bits(10);
     dfast.ensure_hash_tables();
 
-    // Seed an early insert near the current base. We use direct
-    // `pack_slot` + bucket write so the test stays focused on the
-    // rebase mechanics and doesn't drag in the full
+    // Seed an early insert near the current base in BOTH tables.
+    // `ensure_room_for` / `reduce` is a shared contract for both
+    // `short_hash` and `long_hash`; without seeding both, a
+    // regression that only cleared short_hash would still pass.
+    // Direct `pack_slot` + bucket write keeps the test focused on
+    // the rebase mechanics and avoids dragging in the full
     // `insert_position` flow with its history/window setup.
     let early_abs = 1024usize;
     let early_packed = dfast.pack_slot(early_abs);
     assert_ne!(early_packed, DFAST_EMPTY_SLOT);
     dfast.short_hash[0][0] = early_packed;
+    dfast.long_hash[0][0] = early_packed;
 
     // Pick a trigger position that forces the first rebase. With
     // `position_base = 0`, the smallest `abs_pos` that fails the
@@ -7164,9 +7172,14 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // subtracts `DFAST_REBASE_GUARD_BAND` (= 2^30) from every slot.
     // 1025 <= 2^30 so the slot drops to the empty sentinel —
     // donor parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
+    // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
         dfast.short_hash[0][0], DFAST_EMPTY_SLOT,
-        "pre-rebase entries below the reducer must become empty"
+        "pre-rebase short-hash entries below the reducer must become empty"
+    );
+    assert_eq!(
+        dfast.long_hash[0][0], DFAST_EMPTY_SLOT,
+        "pre-rebase long-hash entries below the reducer must become empty"
     );
 
     // A fresh insert past the rebase boundary must round-trip:
