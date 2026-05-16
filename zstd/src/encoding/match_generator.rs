@@ -7033,6 +7033,14 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
     );
     let long_hash = matcher.hash8(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
+    // Guard against the membership check turning vacuous if a future
+    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
+    // are pre-filled with the sentinel, so `contains(&empty)` would
+    // pass without proving the real position was seeded.
+    assert_ne!(
+        target_slot, DFAST_EMPTY_SLOT,
+        "pack_slot must never return the empty-slot sentinel for a real position"
+    );
     assert!(
         matcher.long_hash[long_hash].contains(&target_slot),
         "dense skip must seed long-hash entry for newly hashable boundary start"
@@ -7060,6 +7068,14 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     );
     let short_hash = matcher.hash4(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
+    // Guard against the membership check turning vacuous if a future
+    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
+    // are pre-filled with the sentinel, so `contains(&empty)` would
+    // pass without proving the real position was seeded.
+    assert_ne!(
+        target_slot, DFAST_EMPTY_SLOT,
+        "pack_slot must never return the empty-slot sentinel for a real position"
+    );
     assert!(
         matcher.short_hash[short_hash].contains(&target_slot),
         "tail seeding must include the last 4-byte-hashable start"
@@ -7086,6 +7102,14 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     );
     let short_hash = matcher.hash4(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
+    // Guard against the membership check turning vacuous if a future
+    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
+    // are pre-filled with the sentinel, so `contains(&empty)` would
+    // pass without proving the real position was seeded.
+    assert_ne!(
+        target_slot, DFAST_EMPTY_SLOT,
+        "pack_slot must never return the empty-slot sentinel for a real position"
+    );
     assert!(
         matcher.short_hash[short_hash].contains(&target_slot),
         "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
