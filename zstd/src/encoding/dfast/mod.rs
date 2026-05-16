@@ -83,10 +83,6 @@ pub(crate) struct DfastMatchGenerator {
     /// frequently than the 8-byte long hash on average, so the
     /// smaller bucket count is the donor-correct sizing.
     pub(crate) short_hash_bits: usize,
-    /// Cached fastpath kernel for `hash_mix_u64`. Resolved once at `new()`
-    /// and reused on every `hash_index` call so we skip the per-call
-    /// `OnceLock` atomic load that `dispatch_hash_mix_u64` would pay.
-    pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     pub(crate) lazy_depth: u8,
@@ -115,7 +111,6 @@ impl DfastMatchGenerator {
             position_base: 0,
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
-            hash_kernel: crate::encoding::fastpath::select_kernel(),
             use_fast_loop: false,
             lazy_depth: 1,
         }
@@ -962,7 +957,7 @@ impl DfastMatchGenerator {
         // the bodies of `short_hash` / `long_hash` writes mutate
         // through `self`, so each iteration would otherwise reload
         // `history.len()`, `history_start`, `position_base`,
-        // `*_hash_bits`, and `hash_kernel`. With ~1 input byte per
+        // `*_hash_bits`. With ~1 input byte per
         // call on the dfast hot path that re-load shape was the
         // dominant cost in the per-position cluster.
         let history_abs_start = self.history_abs_start;
@@ -974,7 +969,8 @@ impl DfastMatchGenerator {
         let long_hash_bits = self.long_hash_bits;
         let short_hash_ptr = self.short_hash.as_mut_ptr();
         let long_hash_ptr = self.long_hash.as_mut_ptr();
-        let kernel = self.hash_kernel;
+        let short_shift = 64 - short_hash_bits;
+        let long_shift = 64 - long_hash_bits;
 
         // Two contiguous regions in the input range:
         // * `[start .. long_safe_end)` — every position has at least 8
@@ -1007,10 +1003,14 @@ impl DfastMatchGenerator {
                 let load_ptr = history_base_ptr.add(history_start_offset + idx);
                 let v8 = (load_ptr as *const u64).read_unaligned();
                 let v4 = v8 & 0xFFFF_FFFF;
-                let mixed_short = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v4);
-                let mixed_long = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v8);
-                let short_idx = (mixed_short >> (64 - short_hash_bits)) as usize;
-                let long_idx = (mixed_long >> (64 - long_hash_bits)) as usize;
+                // Donor parity (`zstd_compress_internal.h:923-924`):
+                // scalar `* prime8bytes` then shift to high bits. Drops
+                // the CRC32d-based kernel dispatch (3-4 instructions) for
+                // a single mul on the per-byte insert path.
+                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                let short_idx = (mixed_short >> short_shift) as usize;
+                let long_idx = (mixed_long >> long_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
                 *long_hash_ptr.add(long_idx) = packed;
             }
@@ -1022,8 +1022,8 @@ impl DfastMatchGenerator {
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start_offset + idx);
                 let v4 = (load_ptr as *const u32).read_unaligned() as u64;
-                let mixed_short = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v4);
-                let short_idx = (mixed_short >> (64 - short_hash_bits)) as usize;
+                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
             }
             pos += 1;
@@ -1142,7 +1142,13 @@ impl DfastMatchGenerator {
     }
 
     fn hash_index_with_bits(&self, value: u64, bits: usize) -> usize {
-        let mixed = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
+        // Donor parity (`zstd_compress_internal.h:923-924`, `ZSTD_hash8`):
+        // a single 64-bit multiply by `prime8bytes` followed by a high-bits
+        // shift. Drops the CRC32d + rotate + mul kernel dispatch the rest
+        // of the crate uses — for dfast the donor's scalar hash is
+        // distribution-equivalent and one instruction shorter on the hot
+        // path.
+        let mixed = value.wrapping_mul(0xCF1BBCDCB7A56463_u64);
         (mixed >> (64 - bits)) as usize
     }
 }
