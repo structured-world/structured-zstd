@@ -420,68 +420,280 @@ impl DfastMatchGenerator {
         current_len: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
+        // Donor outer/inner structure (`zstd_double_fast.c:167-322`):
+        //   * outer `while(1)` runs once per match-found-and-stored;
+        //   * inner `do { ... } while (ip1 <= ilimit)` carries `hl0`,
+        //     `idxl0` between iterations, and precomputes `hl1` so the
+        //     next iter's long hash is reused (one long-hash compute per
+        //     two positions scanned, not per position).
+        // We mirror that here. Per-frame invariants are hoisted before
+        // the outer loop; mutable state (`position_base`, `history_abs_start`)
+        // is re-snapshotted inside the outer loop because `emit_candidate`
+        // → `insert_positions` → `ensure_room_for` can advance the rebase
+        // base mid-frame.
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        let short_shift = 64 - self.short_hash_bits;
+        let long_shift = 64 - self.long_hash_bits;
         let mut pos = 1usize;
         let mut literals_start = 0usize;
-        let mut skip_step = 1usize;
-        let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
-        // Loop invariants (two distinct bounds):
-        //
-        // 1. Block-local arithmetic (`ip0..ip3 = pos + N` for small
-        //    `N`, `pos + skip_step` with `skip_step <=
-        //    DFAST_MAX_SKIP_STEP`): the dynamic bound is `current_len`
-        //    itself — the `while pos + DFAST_MIN_MATCH_LEN <=
-        //    current_len` guard keeps every offset within that bound
-        //    regardless of how the caller sized `max_window_size`.
-        //    In production this also happens to be `≤
-        //    HC_BLOCKSIZE_MAX (128 KiB)` because the frame compressor
-        //    never hands out larger blocks, but the safety argument
-        //    above does not rely on that limit.
-        // 2. Absolute-position arithmetic (`current_abs_start + ip0`,
-        //    `current_abs_start + ip2`, etc.): `current_abs_start` is
-        //    the frame-lifetime cursor and advances with total bytes
-        //    processed, NOT with the retained window size. A long
-        //    streaming encode on i686 can push `current_abs_start +
-        //    ipN` past `usize::MAX` even though memory stays bounded
-        //    by `window_size`. The runtime enforcement lives in
-        //    `DfastMatchGenerator::add_data` via
-        //    `check_stream_abs_headroom`: every ingest fails fast if
-        //    cumulative input would advance the cursor within
-        //    `STREAM_ABS_HEADROOM` of `usize::MAX`, which keeps the
-        //    raw `current_abs_start + ipN` arithmetic below
-        //    `usize::MAX` for every position
-        //    this loop ever observes.
-        while pos + DFAST_MIN_MATCH_LEN <= current_len {
-            let ip0 = pos;
-            let ip1 = ip0 + 1;
-            let ip2 = ip0 + 2;
-            let ip3 = ip0 + 3;
 
-            let abs_ip0 = current_abs_start + ip0;
-            let lit_len_ip0 = ip0 - literals_start;
+        'outer: loop {
+            // Outer-iter precondition: at least MIN_MATCH bytes ahead of pos.
+            if pos + DFAST_MIN_MATCH_LEN > current_len {
+                break 'outer;
+            }
+            let mut step = 1usize;
+            let mut next_step_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
+            let mut ip0 = pos;
+            let mut ip1 = ip0 + step;
+            if ip1 + DFAST_MIN_MATCH_LEN > current_len {
+                break 'outer;
+            }
 
-            // Donor parity (`zstd_double_fast.c:190`): repcode peek is
-            // at `ip + 1`, not `ip + 2`. The ip+2 form (kept from an
-            // earlier 4-slot bucket era) gates the 1-literal-prefix
-            // rep on the next iteration's `best_match` at ip+1, but
-            // that path only fires when no hash match was found at
-            // ip+0 — a strictly weaker condition than donor's
-            // unconditional `ip+1` peek. Folding the peek back to ip+1
-            // matches donor's exact match-shape preference and pulls
-            // in the 1-literal rep coverage we were missing.
-            if ip1 + DFAST_MIN_MATCH_LEN <= current_len {
+            // Re-read every per-frame-mutable cursor here — `emit_candidate`
+            // in the previous outer iteration may have triggered a rebase.
+            let history_abs_start = self.history_abs_start;
+            let position_base = self.position_base;
+            let history_start_offset = self.history_start;
+            let history_base_ptr = self.history.as_ptr();
+            let short_hash_ptr = self.short_hash.as_mut_ptr();
+            let long_hash_ptr = self.long_hash.as_mut_ptr();
+            let concat_len = self.history.len() - history_start_offset;
+
+            // Pre-compute long hash at ip0 ONCE per outer iter.
+            // `concat_idx = (current_abs_start + ip0) - history_abs_start`
+            // is the byte offset within `live_history`. `add_data` keeps
+            // `current_abs_start..current_abs_start + current_len` always
+            // inside live history with at least 8 bytes of headroom beyond
+            // `current_len` for `add_data`'s scratch (the loop guards
+            // `ip{0,1} + MIN <= current_len`, MIN >= 5, plus we read 8
+            // bytes — fine because the underlying buffer pads).
+            let mut hl0_idx;
+            let mut idxl0;
+            // SAFETY: `current_abs_start + ip0 >= history_abs_start` (donor
+            // invariant: ip is in current block, which is in live history).
+            // The 8-byte unaligned load on `concat[concat_idx..]` is safe
+            // because `concat_idx + 8 <= concat_len` is implied by
+            // `ip0 + DFAST_MIN_MATCH_LEN <= current_len` (>= 5) plus the
+            // padding `add_data` reserves past `current_len`.
+            unsafe {
+                let concat_idx = (current_abs_start + ip0) - history_abs_start;
+                let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
+                    .read_unaligned();
+                hl0_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
+                idxl0 = *long_hash_ptr.add(hl0_idx);
+            }
+
+            // The match the inner loop commits to, plus the relative
+            // position (`ip0` or `ip1`) where the match anchors. `None`
+            // means inner loop exited via tail (no more positions to
+            // scan); outer breaks too.
+            let mut committed: Option<(MatchCandidate, usize, usize)> = None;
+            //                                            ^^^^ relative match pos
+            //                                            ^^^^^^^ lit_len at that pos
+
+            'inner: loop {
+                let abs_ip0 = current_abs_start + ip0;
                 let abs_ip1 = current_abs_start + ip1;
+                let lit_len_ip0 = ip0 - literals_start;
                 let lit_len_ip1 = ip1 - literals_start;
+                let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+
+                let concat_idx0 = abs_ip0 - history_abs_start;
+                let concat_idx1 = abs_ip1 - history_abs_start;
+
+                // Load 8 bytes at ip0 for both short (low 4) and long
+                // probe equality checks. We already used `v8_at_ip0` to
+                // compute hl0/idxl0 in the outer init / previous iter's
+                // carry; reload now (cheap unaligned read) so the
+                // `read_unaligned` is from the same offset the
+                // probe-eq below will use.
+                let v8_0 = unsafe {
+                    (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
+                        .read_unaligned()
+                };
+                let v4_0 = v8_0 & 0xFFFF_FFFF;
+                let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+                let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
+
+                // Donor parity (`zstd_double_fast.c:187`): update BOTH
+                // tables at curr BEFORE checking matches. This makes the
+                // current ip immediately visible as a candidate for any
+                // subsequent probe in the same outer iter (e.g. when
+                // step grows and the rep peek at ip+1 of the next inner
+                // iter looks up a slot we just wrote here).
+                unsafe {
+                    *long_hash_ptr.add(hl0_idx) = packed_curr;
+                    *short_hash_ptr.add(hs0_idx) = packed_curr;
+                }
+
+                // Repcode peek at ip+1 (donor `zstd_double_fast.c:190`).
                 if let Some(rep) = self.repcode_candidate(abs_ip1, lit_len_ip1)
                     && rep.start >= current_abs_start + literals_start
                     && rep.start <= abs_ip1
                 {
+                    committed = Some((rep, ip1, lit_len_ip1));
+                    break 'inner;
+                }
+
+                // Precompute hl1 (donor `_search_next_long` carry, line 197).
+                let v8_1 = unsafe {
+                    (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
+                        .read_unaligned()
+                };
+                let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
+
+                // Long match check at ip0 with idxl0. 8-byte equality
+                // gate (`MEM_read64`) — if it passes, candidate is real.
+                if idxl0 != DFAST_EMPTY_SLOT {
+                    let cand_pos = position_base + (idxl0 as usize) - 1;
+                    if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+                        let cand_idx = cand_pos - history_abs_start;
+                        // SAFETY: same buffer/length bounds as v8_0 above.
+                        let cand_v8 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
+                                .read_unaligned()
+                        };
+                        if cand_v8 == v8_0 {
+                            // 8 bytes match; count forward + extend back.
+                            let mut match_len = 8usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                            // SAFETY: both ptrs at the same buffer; offsets
+                            // verified above. `max_fwd` caps the scan to
+                            // the live region.
+                            unsafe {
+                                let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                    lhs, rhs, max_fwd,
+                                );
+                                match_len += ext;
+                            }
+                            let concat = &self.history[history_start_offset..];
+                            let cand = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                cand_pos,
+                                abs_ip0,
+                                match_len,
+                                lit_len_ip0,
+                            );
+                            committed = Some((cand, ip0, lit_len_ip0));
+                            break 'inner;
+                        }
+                    }
+                }
+
+                let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
+
+                // Short match check at ip0 with idxs0 — 4-byte gate
+                // ONLY (donor `zstd_double_fast.c:220`). Forward count
+                // and `_search_next_long` retry happen ONLY on hit.
+                if idxs0 != DFAST_EMPTY_SLOT {
+                    let cand_pos_s = position_base + (idxs0 as usize) - 1;
+                    if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+                        let cand_idx_s = cand_pos_s - history_abs_start;
+                        let cand4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
+                                .read_unaligned()
+                        };
+                        if cand4 == v4_0 as u32 {
+                            // Short hit: count forward from byte 4 onwards.
+                            let mut s_match_len = 4usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                            unsafe {
+                                let lhs =
+                                    history_base_ptr.add(history_start_offset + cand_idx_s + 4);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                    lhs, rhs, max_fwd,
+                                );
+                                s_match_len += ext;
+                            }
+                            let concat = &self.history[history_start_offset..];
+                            let short_cand = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                cand_pos_s,
+                                abs_ip0,
+                                s_match_len,
+                                lit_len_ip0,
+                            );
+
+                            // Donor `_search_next_long` retry (line 260):
+                            // try long match at ip1 with precomputed idxl1.
+                            // If it produces a strictly longer match, use it.
+                            let mut chosen = (short_cand, ip0, lit_len_ip0);
+                            if idxl1 != DFAST_EMPTY_SLOT {
+                                let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
+                                if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
+                                    let cand_idx_l1 = cand_pos_l1 - history_abs_start;
+                                    let cand_v8_l1 = unsafe {
+                                        (history_base_ptr.add(history_start_offset + cand_idx_l1)
+                                            as *const u64)
+                                            .read_unaligned()
+                                    };
+                                    if cand_v8_l1 == v8_1 {
+                                        let mut l1_match_len = 8usize;
+                                        let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
+                                        unsafe {
+                                            let lhs = history_base_ptr
+                                                .add(history_start_offset + cand_idx_l1 + 8);
+                                            let rhs = history_base_ptr
+                                                .add(history_start_offset + concat_idx1 + 8);
+                                            let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                                lhs, rhs, max_fwd_l1,
+                                            );
+                                            l1_match_len += ext;
+                                        }
+                                        if l1_match_len > short_cand.match_len {
+                                            let concat = &self.history[history_start_offset..];
+                                            let long_cand = extend_backwards_shared(
+                                                concat,
+                                                history_abs_start,
+                                                cand_pos_l1,
+                                                abs_ip1,
+                                                l1_match_len,
+                                                lit_len_ip1,
+                                            );
+                                            chosen = (long_cand, ip1, lit_len_ip1);
+                                        }
+                                    }
+                                }
+                            }
+                            committed = Some(chosen);
+                            break 'inner;
+                        }
+                    }
+                }
+
+                // Step bump on distance (donor `zstd_double_fast.c:224-228`).
+                if ip1 >= next_step_pos {
+                    step = (step + 1).min(DFAST_MAX_SKIP_STEP);
+                    next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
+                }
+
+                // Advance: ip0 = ip1; ip1 += step; carry hl1 → hl0 / idxl1 → idxl0.
+                ip0 = ip1;
+                ip1 += step;
+                hl0_idx = hl1_idx;
+                idxl0 = idxl1;
+                if ip1 + DFAST_MIN_MATCH_LEN > current_len {
+                    break 'inner;
+                }
+            }
+
+            match committed {
+                Some((candidate, _match_pos_rel, _lit_len_at_match)) => {
                     let start = self.emit_candidate(
                         current_abs_start,
                         &mut literals_start,
-                        rep,
+                        candidate,
                         handle_sequence,
                     );
-                    pos = start + rep.match_len;
+                    pos = start + candidate.match_len;
                     pos = self.extend_with_repcode_after_match(
                         current_abs_start,
                         current_len,
@@ -489,53 +701,8 @@ impl DfastMatchGenerator {
                         &mut literals_start,
                         handle_sequence,
                     );
-                    skip_step = 1;
-                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    continue;
                 }
-            }
-
-            let best = self.best_match(abs_ip0, lit_len_ip0);
-            if let Some(candidate) = best {
-                let start = self.emit_candidate(
-                    current_abs_start,
-                    &mut literals_start,
-                    candidate,
-                    handle_sequence,
-                );
-                pos = start + candidate.match_len;
-                pos = self.extend_with_repcode_after_match(
-                    current_abs_start,
-                    current_len,
-                    pos,
-                    &mut literals_start,
-                    handle_sequence,
-                );
-                skip_step = 1;
-                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-            } else {
-                // Single-slot donor parity: donor inserts ONLY at the
-                // current ip per iteration of its inner do-while loop
-                // (`zstd_double_fast.c:187`).
-                self.insert_position(abs_ip0);
-                let _ = (ip1, ip2, ip3);
-                // Donor parity (`zstd_double_fast.c:224-228`): step grows
-                // by distance scanned, NOT by consecutive-miss count.
-                // Donor `step++` fires every `kStepIncr` positions traveled,
-                // independent of whether the previous iters were misses or
-                // matches. Our previous gate required
-                // `miss_run >= DFAST_LOCAL_SKIP_TRIGGER` consecutive misses,
-                // which kept step pinned at 1 whenever matches happened —
-                // exactly the case where donor would already be ramping up.
-                // Match-found branches still reset `skip_step` to 1 and
-                // re-anchor `next_skip_growth_pos`, mirroring donor's
-                // per-`while(1)`-iteration `step = 1; nextStep = ip+kStepIncr`
-                // re-initialisation.
-                if pos >= next_skip_growth_pos {
-                    skip_step = (skip_step + 1).min(DFAST_MAX_SKIP_STEP);
-                    next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                }
-                pos += skip_step;
+                None => break 'outer,
             }
         }
 
