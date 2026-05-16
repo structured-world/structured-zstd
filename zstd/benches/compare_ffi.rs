@@ -11,11 +11,21 @@
 
 mod support;
 
+// This bench targets THROUGHPUT and COMPRESSION RATIO only — no memory
+// observation. Memory measurement lives in the separate
+// `compare_ffi_memory` binary (`zstd/benches/compare_ffi_memory.rs`) so
+// criterion's timing loops here run with a vanilla system allocator
+// and no `ZSTD_customMem` hooks. Conflating timing and memory in one
+// run forced asymmetric observers (OS RSS for Rust vs customMem for
+// FFI) which Copilot/CR correctly flagged as non-comparable across
+// sides. The split bench lets a single tracking allocator observe
+// BOTH sides symmetrically while leaving this file untouched on the
+// timing hot path.
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use std::io::Write;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
@@ -26,32 +36,166 @@ use support::{
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
-fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)
-        .expect("failed to create zstd stream encoder");
-    encoder
-        .include_checksum(cfg!(feature = "hash"))
-        .expect("failed to configure zstd checksum flag");
-    encoder
-        .include_contentsize(true)
-        .expect("failed to configure zstd content-size flag");
-    encoder
-        .set_pledged_src_size(Some(input.len() as u64))
-        .expect("failed to configure zstd pledged source size");
-    // Keep framing comparable to the Rust path only for tiny sources. For
-    // larger inputs, keep the level/default C sizing so parity benches compare
-    // similar compression settings.
-    if input.len() <= (1 << 14) {
-        encoder
-            .window_log(14)
-            .expect("failed to configure zstd window_log");
+/// FFI encode helper used by criterion's timing loop. Uses
+/// `ZSTD_compressStream2` into a growing-output `Vec` — same shape as
+/// the pure-Rust `compress_to_vec` so output-buffer growth profiles
+/// match cross-side.
+fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
+    use zstd::zstd_safe::zstd_sys;
+    // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
+    // The CCtx is freed before returning.
+    let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
+    assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
+
+    // SAFETY: every `zstd_sys` call below operates on the CCtx we
+    // just created and freshly-validated parameter values. Errors
+    // are converted to assertion failures so memory measurements
+    // can't silently regress to default settings.
+    unsafe {
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+            level,
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(rc) == 0,
+            "set compressionLevel failed"
+        );
+
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_checksumFlag,
+            if cfg!(feature = "hash") { 1 } else { 0 },
+        );
+        assert!(zstd_sys::ZSTD_isError(rc) == 0, "set checksumFlag failed");
+
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            1,
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(rc) == 0,
+            "set contentSizeFlag failed"
+        );
+
+        // Tiny inputs use a 14-bit window so the FFI frame matches
+        // the pure-Rust frame on small payloads. Without this the
+        // FFI side picks a larger default window than the Rust
+        // encoder emits, biasing the memory comparison.
+        if input.len() <= (1 << 14) {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_windowLog,
+                14,
+            );
+            assert!(zstd_sys::ZSTD_isError(rc) == 0, "set windowLog failed");
+        }
+
+        let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
+        assert!(zstd_sys::ZSTD_isError(rc) == 0, "setPledgedSrcSize failed");
+
+        let recommended_in = zstd_sys::ZSTD_CStreamInSize();
+        let recommended_out = zstd_sys::ZSTD_CStreamOutSize();
+        let mut output: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; recommended_out];
+        let mut in_pos: usize = 0;
+        loop {
+            let chunk_end = (in_pos + recommended_in).min(input.len());
+            let mut zin = zstd_sys::ZSTD_inBuffer {
+                src: input.as_ptr() as *const core::ffi::c_void,
+                size: chunk_end,
+                pos: in_pos,
+            };
+            let mode = if chunk_end == input.len() {
+                zstd_sys::ZSTD_EndDirective::ZSTD_e_end
+            } else {
+                zstd_sys::ZSTD_EndDirective::ZSTD_e_continue
+            };
+            loop {
+                let mut zout = zstd_sys::ZSTD_outBuffer {
+                    dst: chunk.as_mut_ptr() as *mut core::ffi::c_void,
+                    size: chunk.len(),
+                    pos: 0,
+                };
+                let remaining = zstd_sys::ZSTD_compressStream2(cctx, &mut zout, &mut zin, mode);
+                assert!(
+                    zstd_sys::ZSTD_isError(remaining) == 0,
+                    "ZSTD_compressStream2 failed (code = {remaining})"
+                );
+                output.extend_from_slice(&chunk[..zout.pos]);
+                let frame_complete =
+                    matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) && remaining == 0;
+                let chunk_consumed = matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_continue)
+                    && zin.pos == zin.size;
+                if frame_complete || chunk_consumed {
+                    break;
+                }
+            }
+            in_pos = zin.pos;
+            if in_pos == input.len() && matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) {
+                break;
+            }
+        }
+
+        zstd_sys::ZSTD_freeCCtx(cctx);
+        output
     }
-    encoder
-        .write_all(input)
-        .expect("failed to write zstd stream input");
-    encoder
-        .finish()
-        .expect("failed to finalize zstd stream encoding")
+}
+
+/// Reusable FFI DCtx handle. Wraps `ZSTD_createDCtx` + `ZSTD_freeDCtx`
+/// lifecycle so criterion's `b.iter` timing loop can call
+/// `ZSTD_decompressDCtx` repeatedly against the same context —
+/// matching the pure-Rust loop which reuses one `FrameDecoder`.
+/// Creating a fresh DCtx per iteration would dominate the sample at
+/// small payloads (DCtx construction is ~100 KiB of allocation).
+struct FfiDCtxHandle {
+    ptr: *mut zstd::zstd_safe::zstd_sys::ZSTD_DCtx_s,
+}
+
+impl FfiDCtxHandle {
+    fn new() -> Self {
+        use zstd::zstd_safe::zstd_sys;
+        // SAFETY: `ZSTD_createDCtx` returns null on OOM, asserted below.
+        let ptr = unsafe { zstd_sys::ZSTD_createDCtx() };
+        assert!(!ptr.is_null(), "ZSTD_createDCtx returned null");
+        FfiDCtxHandle { ptr }
+    }
+
+    fn decompress_into(&mut self, compressed: &[u8], output: &mut [u8]) -> usize {
+        use zstd::zstd_safe::zstd_sys;
+        // SAFETY: `self.ptr` is a valid DCtx, lifetime tied to `self`.
+        let written = unsafe {
+            zstd_sys::ZSTD_decompressDCtx(
+                self.ptr,
+                output.as_mut_ptr() as *mut core::ffi::c_void,
+                output.len(),
+                compressed.as_ptr() as *const core::ffi::c_void,
+                compressed.len(),
+            )
+        };
+        assert!(
+            unsafe { zstd_sys::ZSTD_isError(written) } == 0,
+            "ZSTD_decompressDCtx failed (code = {written})"
+        );
+        written
+    }
+}
+
+impl Drop for FfiDCtxHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was created by `Self::new` and is freed
+        // exactly once here.
+        unsafe {
+            zstd::zstd_safe::zstd_sys::ZSTD_freeDCtx(self.ptr);
+        }
+    }
+}
+
+/// One-shot decompress helper used by reference-equality checks.
+fn ffi_decompress_into(compressed: &[u8], output: &mut [u8]) -> usize {
+    let mut dctx = FfiDCtxHandle::new();
+    dctx.decompress_into(compressed, output)
 }
 
 fn benchmark_scenarios_cached() -> &'static [Scenario] {
@@ -73,17 +217,10 @@ fn bench_compress(c: &mut Criterion) {
                     &scenario.bytes[..],
                     level.rust_level,
                 );
-                let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
+                let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
-                emit_memory_report(
-                    scenario,
-                    level,
-                    "compress",
-                    scenario.len() + rust_compressed.len(),
-                    scenario.len() + ffi_compressed.len(),
-                );
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -101,7 +238,7 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| black_box(ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level)))
+                b.iter(|| black_box(ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level)))
             });
 
             group.finish();
@@ -115,7 +252,7 @@ fn bench_decompress(c: &mut Criterion) {
         for level in supported_levels_filtered() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
-            let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
+            let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -146,19 +283,9 @@ fn bench_decompress_source(
     source: &'static str,
     compressed: &[u8],
     expected_len: usize,
-    emit_reports: bool,
+    _emit_reports: bool,
 ) {
     assert_decompress_matches_reference(scenario, compressed, expected_len);
-
-    if emit_reports {
-        emit_memory_report(
-            scenario,
-            level,
-            &format!("decompress-{source}"),
-            compressed.len() + expected_len,
-            compressed.len() + expected_len,
-        );
-    }
 
     let benchmark_name = format!(
         "decompress/{}/{}/{}/matrix",
@@ -181,16 +308,17 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
-        let mut decoder = zstd::bulk::Decompressor::new().unwrap();
-        let mut output = Vec::with_capacity(expected_len);
+        // Reuse one DCtx + target buffer across iterations so the
+        // timing sample reflects decode steady-state — matches the
+        // pure-Rust loop above which reuses one `FrameDecoder` and
+        // one `target`. Creating a fresh DCtx per iteration would
+        // dominate sub-millisecond samples.
+        let mut dctx = FfiDCtxHandle::new();
+        let mut target = vec![0u8; expected_len];
         b.iter(|| {
-            output.clear();
-            let written = decoder
-                .decompress_to_buffer(black_box(compressed), &mut output)
-                .unwrap();
-            black_box(output.as_slice());
+            let written = dctx.decompress_into(black_box(compressed), &mut target);
             assert_eq!(written, expected_len);
-            assert_eq!(output.len(), expected_len);
+            black_box(&target[..written]);
         })
     });
 
@@ -210,13 +338,10 @@ fn assert_decompress_matches_reference(
     assert_eq!(rust_written, expected_len);
     assert_eq!(&rust_target[..rust_written], scenario.bytes.as_slice());
 
-    let mut ffi_decoder = zstd::bulk::Decompressor::new().unwrap();
-    let mut ffi_output = Vec::with_capacity(expected_len);
-    let ffi_written = ffi_decoder
-        .decompress_to_buffer(compressed, &mut ffi_output)
-        .unwrap();
+    let mut ffi_target = vec![0u8; expected_len];
+    let ffi_written = ffi_decompress_into(compressed, &mut ffi_target);
     assert_eq!(ffi_written, expected_len);
-    assert_eq!(ffi_output.as_slice(), scenario.bytes.as_slice());
+    assert_eq!(&ffi_target[..ffi_written], scenario.bytes.as_slice());
 }
 
 fn bench_dictionary(c: &mut Criterion) {
@@ -385,12 +510,22 @@ fn configure_group<M: criterion::measurement::Measurement>(
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Corpus | ScenarioClass::Entropy => {
-            group.sample_size(10);
+            // 3 samples (was 10) — at level_22_btultra2 a single encode
+            // pass on `decodecorpus-z000033` (~1 MiB) takes well over
+            // 1s, so criterion would otherwise warn "Unable to complete
+            // 10 samples in 4s, increase target time to 5.2s". Three
+            // samples are enough for the dashboard's regression-band
+            // ±5% sensitivity while keeping per-shard wall time bounded.
+            group.sample_size(3);
             group.measurement_time(Duration::from_secs(4));
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Large | ScenarioClass::Silesia => {
-            group.sample_size(10);
+            // 3 samples (was 10) — Large/Silesia payloads (~16-100 MiB)
+            // dominate per-shard runtime at higher levels. Three
+            // samples + 2s measurement is sufficient for regression
+            // detection on the canonical alert levels.
+            group.sample_size(3);
             group.measurement_time(Duration::from_secs(2));
             group.warm_up_time(Duration::from_millis(500));
             group.sampling_mode(SamplingMode::Flat);
@@ -449,25 +584,6 @@ fn emit_frame_header_report(
         checksum,
         fcs_bytes,
         dict_id_bytes,
-    );
-}
-
-fn emit_memory_report(
-    scenario: &Scenario,
-    level: LevelConfig,
-    stage: &str,
-    rust_buffer_bytes_estimate: usize,
-    ffi_buffer_bytes_estimate: usize,
-) {
-    let escaped_label = escape_report_label(&scenario.label);
-    println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_buffer_bytes_estimate={} ffi_buffer_bytes_estimate={}",
-        scenario.id,
-        escaped_label,
-        level.name,
-        stage,
-        rust_buffer_bytes_estimate,
-        ffi_buffer_bytes_estimate
     );
 }
 

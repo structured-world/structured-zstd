@@ -19,8 +19,8 @@ use super::blocks::encode_offset_with_history;
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
-    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_SEARCH_DEPTH, DFAST_SHORT_HASH_LOOKAHEAD,
-    DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
+    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SEARCH_DEPTH,
+    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
@@ -39,8 +39,27 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
-    pub(crate) short_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
-    pub(crate) long_hash: Vec<[usize; DFAST_SEARCH_DEPTH]>,
+    // Storage: `[u32; DFAST_SEARCH_DEPTH]` per bucket. Each slot holds
+    // a +1-biased relative position (`(abs_pos - position_base + 1) as
+    // u32`); the empty-slot sentinel `DFAST_EMPTY_SLOT = 0` is
+    // therefore never a real value. Trades 4 bytes per slot (vs the
+    // previous `usize`) — at `DFAST_SEARCH_DEPTH = 4` that's 16 bytes
+    // per bucket vs the prior 32 bytes, halving the hash-table
+    // footprint. Combined with the donor-parity `hashLog = 17` ceiling
+    // this brings the two-table memory cost from 64 MiB to ~4 MiB on
+    // 1 MiB inputs — close to donor's 768 KiB for the same level.
+    pub(crate) short_hash: Vec<[u32; DFAST_SEARCH_DEPTH]>,
+    pub(crate) long_hash: Vec<[u32; DFAST_SEARCH_DEPTH]>,
+    /// Absolute position whose `(abs_pos - position_base + 1)` slot
+    /// encoding evaluates to `1`. Advances only via [`Self::reduce`]
+    /// when an insert is about to overflow the u32 window — the
+    /// frame-level `STREAM_ABS_HEADROOM` gate already bounds
+    /// `history_abs_start` against `usize::MAX`, so a rebase trigger
+    /// here only fires on encoder sessions that span more than
+    /// `u32::MAX - DFAST_REBASE_GUARD_BAND ≈ 3 GiB` of input through
+    /// a single matcher instance. Donor parity: `ZSTD_window_reduce`
+    /// (`zstd_compress_internal.h`).
+    pub(crate) position_base: usize,
     pub(crate) hash_bits: usize,
     /// Cached fastpath kernel for `hash_mix_u64`. Resolved once at `new()`
     /// and reused on every `hash_index` call so we skip the per-call
@@ -71,6 +90,7 @@ impl DfastMatchGenerator {
             offset_hist: [1, 4, 8],
             short_hash: Vec::new(),
             long_hash: Vec::new(),
+            position_base: 0,
             hash_bits: DFAST_HASH_BITS,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             use_fast_loop: false,
@@ -87,11 +107,82 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// Encode an absolute position into a u32 slot value
+    /// (`(abs_pos - position_base + 1) as u32`). Caller must have
+    /// invoked [`Self::ensure_room_for`] earlier in the same frame so
+    /// the relative offset is guaranteed to fit in `u32`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `abs_pos < position_base` (producer bug — a position
+    /// before the current rebase base should have been filtered out
+    /// before reaching the table) or if the relative offset exceeds
+    /// `u32::MAX`. Runtime `assert!` rather than `debug_assert!`: a
+    /// silent wrap would store a garbage relative offset and corrupt
+    /// the bucket far from the bug's source.
+    #[inline]
+    pub(crate) fn pack_slot(&self, abs_pos: usize) -> u32 {
+        let rel = abs_pos.checked_sub(self.position_base).unwrap_or_else(|| {
+            panic!(
+                "DfastMatchGenerator::pack_slot: abs_pos {abs_pos} below \
+                 position_base {} — caller must filter pre-rebase positions",
+                self.position_base
+            )
+        });
+        assert!(
+            rel < u32::MAX as usize,
+            "DfastMatchGenerator::pack_slot: rel {rel} >= u32::MAX — \
+             caller must invoke ensure_room_for before insert"
+        );
+        (rel as u32) + 1
+    }
+
+    /// Ensure that an absolute position `abs_pos` fits in the `u32`
+    /// slot encoding when packed. If the relative offset would
+    /// exceed `u32::MAX - DFAST_REBASE_GUARD_BAND`, advance the base
+    /// by `DFAST_REBASE_GUARD_BAND` (in a loop, in case the caller
+    /// jumped past multiple guard bands at once) and shift every
+    /// stored slot down by the same amount. Mirrors
+    /// `LdmHashTable::ensure_room_for` and the donor's
+    /// `ZSTD_window_reduce` semantics.
+    pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
+        if abs_pos < self.position_base {
+            // Pre-base positions can't push us past the u32 ceiling.
+            return;
+        }
+        let max_rel = u32::MAX as usize - DFAST_REBASE_GUARD_BAND as usize;
+        while abs_pos - self.position_base > max_rel {
+            self.reduce(DFAST_REBASE_GUARD_BAND);
+        }
+    }
+
+    /// Subtract `reducer` from every stored slot value. Slots whose
+    /// pre-shift value was `<= reducer` become the empty sentinel.
+    /// Advance `position_base` by the same amount so future inserts
+    /// continue from the rebased origin.
+    fn reduce(&mut self, reducer: u32) {
+        let shift_buckets = |buckets: &mut Vec<[u32; DFAST_SEARCH_DEPTH]>| {
+            for bucket in buckets.iter_mut() {
+                for slot in bucket.iter_mut() {
+                    *slot = if *slot <= reducer {
+                        DFAST_EMPTY_SLOT
+                    } else {
+                        *slot - reducer
+                    };
+                }
+            }
+        };
+        shift_buckets(&mut self.short_hash);
+        shift_buckets(&mut self.long_hash);
+        self.position_base += reducer as usize;
+    }
+
     pub(crate) fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
         self.history_abs_start = 0;
+        self.position_base = 0;
         self.offset_hist = [1, 4, 8];
         if !self.short_hash.is_empty() {
             self.short_hash.fill([DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]);
@@ -634,6 +725,11 @@ impl DfastMatchGenerator {
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
         let history_abs_start = self.history_abs_start;
+        // Hoist the rebase base out of the bucket-walk loop so each
+        // slot-to-absolute conversion is a single add instead of a
+        // `&self` dereference per iteration. The base only changes
+        // via `reduce`, which is called between match-finding calls.
+        let position_base = self.position_base;
         let mut best = None;
 
         // Long-hash probes first (8-byte hash → longer matches more likely).
@@ -643,11 +739,14 @@ impl DfastMatchGenerator {
             // == 1 << hash_bits` (`ensure_hash_tables`).
             debug_assert!(long_hash < self.long_hash.len());
             let bucket = unsafe { self.long_hash.get_unchecked(long_hash) };
-            for &candidate_pos in bucket {
-                if candidate_pos == DFAST_EMPTY_SLOT
-                    || candidate_pos < history_abs_start
-                    || candidate_pos >= abs_pos
-                {
+            for &slot in bucket {
+                // Inline unpack: slot 0 = empty sentinel, otherwise
+                // `slot - 1 + position_base` is the absolute position.
+                if slot == DFAST_EMPTY_SLOT {
+                    continue;
+                }
+                let candidate_pos = position_base + (slot as usize) - 1;
+                if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
                     continue;
                 }
                 let candidate_idx = candidate_pos - history_abs_start;
@@ -667,11 +766,12 @@ impl DfastMatchGenerator {
             let short_hash = self.hash4(&concat[current_idx..]);
             debug_assert!(short_hash < self.short_hash.len());
             let bucket = unsafe { self.short_hash.get_unchecked(short_hash) };
-            for &candidate_pos in bucket {
-                if candidate_pos == DFAST_EMPTY_SLOT
-                    || candidate_pos < history_abs_start
-                    || candidate_pos >= abs_pos
-                {
+            for &slot in bucket {
+                if slot == DFAST_EMPTY_SLOT {
+                    continue;
+                }
+                let candidate_pos = position_base + (slot as usize) - 1;
+                if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
                     continue;
                 }
                 let candidate_idx = candidate_pos - history_abs_start;
@@ -749,6 +849,17 @@ impl DfastMatchGenerator {
     pub(crate) fn insert_position(&mut self, pos: usize) {
         let idx = pos.wrapping_sub(self.history_abs_start);
         let concat_len = self.history.len() - self.history_start;
+        // Pre-rebase guard. The producer that walks `insert_positions*`
+        // can sweep an arbitrary number of positions per block; running
+        // `pack_slot` per-position would call `ensure_room_for` from a
+        // tight inner loop. Hoisting the rebase trigger to the start of
+        // `insert_position` keeps the per-byte hot path branch-free
+        // when the relative window has plenty of headroom (the common
+        // case) while still guaranteeing the slot value below fits in
+        // `u32`. `ensure_room_for` is a single u32 comparison when no
+        // rebase is needed.
+        self.ensure_room_for(pos);
+        let packed = self.pack_slot(pos);
         // SAFETY: `hash_index` masks the mixed hash to `hash_bits` bits and
         // both tables are sized to `1 << hash_bits` in `ensure_hash_tables`,
         // so every index produced here is provably below the table length.
@@ -759,9 +870,9 @@ impl DfastMatchGenerator {
             let short = self.hash4(&concat[idx..]);
             debug_assert!(short < self.short_hash.len());
             let bucket = unsafe { self.short_hash.get_unchecked_mut(short) };
-            if bucket[0] != pos {
+            if bucket[0] != packed {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
-                bucket[0] = pos;
+                bucket[0] = packed;
             }
         }
 
@@ -770,9 +881,9 @@ impl DfastMatchGenerator {
             let long = self.hash8(&concat[idx..]);
             debug_assert!(long < self.long_hash.len());
             let bucket = unsafe { self.long_hash.get_unchecked_mut(long) };
-            if bucket[0] != pos {
+            if bucket[0] != packed {
                 bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
-                bucket[0] = pos;
+                bucket[0] = packed;
             }
         }
     }

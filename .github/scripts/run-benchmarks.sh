@@ -44,6 +44,31 @@ else
   "${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
 fi
 
+# Memory bench (compare_ffi_memory) runs separately when its binary is
+# available — keeps the timing run on a pristine system allocator and
+# scopes the `#[global_allocator]` tracking wrapper to this second
+# invocation only. PR CI doesn't ship the memory binary (PRs care
+# about review-cycle latency, not memory regression), main pushes do.
+# Both runs append `REPORT_*` lines to the same raw file so downstream
+# parsing is uniform.
+if [ -n "${STRUCTURED_ZSTD_BENCH_MEMORY_BIN:-}" ]; then
+  if [ ! -x "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" ]; then
+    echo "STRUCTURED_ZSTD_BENCH_MEMORY_BIN=$STRUCTURED_ZSTD_BENCH_MEMORY_BIN is not executable" >&2
+    exit 2
+  fi
+  echo "Running memory bench: $STRUCTURED_ZSTD_BENCH_MEMORY_BIN" >&2
+  "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" | tee -a "$BENCH_RAW_FILE"
+elif [ -z "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
+  # Local dev path: when no prebuilt binary env was set above, the
+  # cargo invocation already covered compare_ffi. Run the memory bench
+  # the same way so REPORT_MEM lines land in the raw file.
+  MEM_CMD=(cargo bench --bench compare_ffi_memory -p structured-zstd --features dict_builder)
+  if [ -n "$BENCH_TARGET_TRIPLE" ]; then
+    MEM_CMD+=(--target "$BENCH_TARGET_TRIPLE")
+  fi
+  "${MEM_CMD[@]}" | tee -a "$BENCH_RAW_FILE"
+fi
+
 echo "Parsing results..." >&2
 
 BENCH_RAW_FILE="$BENCH_RAW_FILE" \
@@ -63,7 +88,7 @@ REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_buffer_bytes_estimate=(\d+) ffi_buffer_bytes_estimate=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
@@ -125,6 +150,15 @@ REGRESSION_SCENARIOS = {
     "decodecorpus-synthetic-1m",
     "low-entropy-1m",
 }
+# Only the canonical default-level (level_3_dfast) and max-compression
+# (level_22_btultra2) shards drive the github-action-benchmark
+# regression alert. Other levels still land in the dashboard JSON and
+# the markdown report, but they don't fire alerts — too noisy when
+# every commit measures 29 levels × 3 targets and we'd get false
+# positives on the experimental fast/btopt levels that aren't yet
+# tuned. Keep this in sync with the PR shard's `pr-canonical` levels
+# in `.github/workflows/ci.yml`.
+ALERT_LEVELS = {"level_3_dfast", "level_22_btultra2"}
 
 def parse_benchmark_name(name):
     parts = name.split("/")
@@ -248,17 +282,24 @@ with open(raw_path) as f:
                 label,
                 level,
                 stage,
-                rust_buffer_bytes_estimate,
-                ffi_buffer_bytes_estimate,
+                rust_peak_alloc_bytes,
+                ffi_peak_alloc_bytes,
             ) = mem_match.groups()
             label = unescape_report_label(label)
+            # Both sides observed by the same `TrackingAllocator` in
+            # `compare_ffi_memory.rs`: Rust allocs flow through the
+            # `#[global_allocator]` wrapper, libzstd allocs flow through
+            # `ZSTD_customMem` callbacks that share the same atomic
+            # counters. Counts are byte-precise on both sides — values
+            # are directly comparable and the downstream `delta_ratio`
+            # for `peak_alloc_bytes` is meaningful.
             memory_rows.append({
                 "scenario": scenario,
                 "label": label,
                 "level": level,
                 "stage": stage,
-                "rust_buffer_bytes_estimate": int(rust_buffer_bytes_estimate),
-                "ffi_buffer_bytes_estimate": int(ffi_buffer_bytes_estimate),
+                "rust_peak_alloc_bytes": int(rust_peak_alloc_bytes),
+                "ffi_peak_alloc_bytes": int(ffi_peak_alloc_bytes),
             })
             continue
 
@@ -327,7 +368,13 @@ if timing_point_count == 0:
     print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
     sys.exit(1)
 
-regression_levels = {row["level"] for row in ratios}
+# Restrict the alert set to the canonical pair regardless of how
+# many levels this shard processed. Combined with `REGRESSION_STAGES`
+# + `REGRESSION_SCENARIOS` this keeps the github-action-benchmark
+# alert surface scoped to level_3_dfast / level_22_btultra2 — the
+# two levels we ship as the primary public guarantees.
+present_levels = {row["level"] for row in ratios}
+regression_levels = ALERT_LEVELS & present_levels
 benchmark_results = [
     {
         "name": row["name"],
@@ -339,19 +386,50 @@ benchmark_results = [
 ]
 
 if not benchmark_results:
-    print(
-        "WARN: No regression-set benchmark rows matched smoke filter; "
-        "falling back to all parsed timings for benchmark-results.json.",
-        file=sys.stderr,
-    )
-    benchmark_results = [
-        {
-            "name": name,
-            "unit": "ms",
-            "value": round(ms, 3),
-        }
-        for name, ms in timings
-    ]
+    if regression_levels:
+        # Strategy shard *does* contain at least one canonical alert
+        # level but no scenario row landed in REGRESSION_SCENARIOS —
+        # almost certainly a scenario-mapping issue (e.g. a renamed
+        # corpus fixture). Fall back to all timings so the dashboard
+        # still has data while the mapping gets fixed.
+        print(
+            "WARN: No regression-set benchmark rows matched smoke filter; "
+            "falling back to all parsed timings for benchmark-results.json.",
+            file=sys.stderr,
+        )
+        # Filter to canonical levels + regression stages so the
+        # fallback respects the alert contract: only `level_3_dfast`
+        # and `level_22_btultra2` (the ALERT_LEVELS) ever fire
+        # github-action-benchmark regressions. Falling back to
+        # unfiltered `timings` here would reintroduce non-canonical
+        # shard siblings (e.g. level_2_dfast on the `dfast` shard) and
+        # they'd trip alerts they were explicitly excluded from.
+        benchmark_results = [
+            {
+                "name": row["name"],
+                "unit": "ms",
+                "value": round(row["ms_per_iter"], 3),
+            }
+            for row in timing_rows
+            if row["stage"] in REGRESSION_STAGES
+            and row["level"] in regression_levels
+        ]
+    else:
+        # Strategy shard processed only non-canonical levels (e.g.
+        # `fast` / `greedy` / `btopt` groups on a main push). Emit an
+        # empty `benchmark-results.json` so github-action-benchmark
+        # has no rows to compare against the baseline — these levels
+        # land in the dashboard via `benchmark-relative.json` but
+        # never fire regression alerts. Previously the fallback
+        # repopulated every timing here, which silently re-expanded
+        # the alert surface to all 29 levels (CR review of #143).
+        print(
+            "INFO: shard processed no canonical alert levels "
+            f"(present={sorted(present_levels)}, "
+            f"alert_set={sorted(ALERT_LEVELS)}); writing empty "
+            "benchmark-results.json so this shard contributes no alerts.",
+            file=sys.stderr,
+        )
 
 if not ratios:
     print(
@@ -361,8 +439,15 @@ if not ratios:
     sys.exit(1)
 
 if not memory_rows:
-    print("ERROR: No REPORT_MEM lines parsed; memory section would be empty.", file=sys.stderr)
-    sys.exit(1)
+    # No REPORT_MEM lines is expected on PR shards where the memory
+    # bench binary isn't passed (`STRUCTURED_ZSTD_BENCH_MEMORY_BIN`
+    # empty). Memory rows only land on main pushes; on PRs we still
+    # publish the timing/ratio shards and skip the memory section.
+    print(
+        "INFO: No REPORT_MEM lines parsed (memory bench not run on this shard); "
+        "memory section will be omitted.",
+        file=sys.stderr,
+    )
 
 if not dictionary_rows:
     print(
@@ -572,6 +657,64 @@ for row in delta_rows:
             }
         )
 
+# Add per-(scenario, level, stage) peak-memory rows so the dashboard
+# can render a third metric alongside compression_ratio +
+# throughput_bytes_per_sec. The memory stage strings from the bench
+# (`compress`, `decompress-rust_stream`, `decompress-c_stream`) get
+# normalised into the same (stage, source) shape the speed/ratio
+# records already use so the dashboard's existing per-series grouping
+# keeps working unchanged.
+for row in memory_rows:
+    rust_bytes = row["rust_peak_alloc_bytes"]
+    ffi_bytes = row["ffi_peak_alloc_bytes"]
+    raw_stage = row["stage"]
+    if raw_stage == "compress":
+        stage = "compress"
+        source = None
+    elif raw_stage.startswith("decompress-"):
+        stage = "decompress"
+        source = raw_stage.removeprefix("decompress-")
+    else:
+        stage = raw_stage
+        source = None
+    # delta_ratio = rust_peak / ffi_peak. Values > 1 mean Rust uses
+    # MORE memory than FFI (worse for us — same direction as
+    # compression_ratio, where >1 means Rust output is larger).
+    # `ffi_bytes == 0` is a real datapoint (no libzstd allocations
+    # for that scenario): emit the row with `delta_ratio: null` so the
+    # dashboard keeps both side values; only the ratio is undefined.
+    delta_ratio = (rust_bytes / ffi_bytes) if ffi_bytes > 0 else None
+    delta_percent = (delta_ratio - 1.0) * 100.0 if delta_ratio is not None else None
+    relative_rows.append(
+        {
+            "target": bench_target_id,
+            "stage": stage,
+            "scenario": row["scenario"],
+            "level": row["level"],
+            "source": source,
+            "key": canonical_key(stage, row["scenario"], row["level"], source),
+            "commit_sha": commit_sha,
+            "generated_at": generated_at,
+            # Both sides feed the SAME pair of atomic counters in
+            # `compare_ffi_memory`: Rust-side via the
+            # `#[global_allocator]` tracking wrapper, FFI-side via the
+            # `ZSTD_customMem` callbacks which call `System.alloc` /
+            # `System.dealloc` directly and manually update the same
+            # counters with only the libzstd-requested `size` (bypassing
+            # the wrapper to avoid double-counting the 16-byte size
+            # header those callbacks prepend). Cross-side ratio is
+            # meaningful — `delta_ratio > 1` says Rust allocated more
+            # bytes than FFI for the same workload.
+            "metric": "peak_alloc_bytes",
+            "rust_value": rust_bytes,
+            "ffi_value": ffi_bytes,
+            "delta_ratio": delta_ratio,
+            "delta_percent": delta_percent,
+            "status_band": "n/a",
+            "interpretation": "delta>1 means Rust allocates more peak memory than FFI",
+        }
+    )
+
 relative_payload = {
     "version": 1,
     "target": {
@@ -608,19 +751,32 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
         f'| {row["scenario"]} | {label} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
     )
 
-lines.extend([
-    "",
-    "## Buffer Size Estimates (Input + Output)",
-    "",
-    "| Scenario | Label | Level | Stage | Rust buffer bytes (estimate) | C buffer bytes (estimate) |",
-    "| --- | --- | --- | --- | ---: | ---: |",
-])
+# Skip the entire memory section on PR shards (no memory bench ran,
+# `memory_rows` is empty). The INFO log earlier in this script
+# announced the omission — emitting a heading + empty table here would
+# leave a confusing blank section in `benchmark-report.md`.
+if memory_rows:
+    lines.extend([
+        "",
+        "## Peak Allocation Bytes",
+        "",
+        "Both columns share one pair of atomic counters in the "
+        "`compare_ffi_memory` bench: Rust allocations via the "
+        "`#[global_allocator]` tracking wrapper, FFI allocations via "
+        "`ZSTD_customMem` callbacks that call `System.alloc` / "
+        "`System.dealloc` directly and manually update the same "
+        "counters with the libzstd-requested size only. Byte counts "
+        "are directly comparable cross-side.",
+        "",
+        "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
+        "| --- | --- | --- | --- | ---: | ---: |",
+    ])
 
-for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
-    label = markdown_table_escape(row["label"])
-    lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_buffer_bytes_estimate"]} | {row["ffi_buffer_bytes_estimate"]} |'
-    )
+    for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
+        label = markdown_table_escape(row["label"])
+        lines.append(
+            f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
+        )
 
 lines.extend([
     "",

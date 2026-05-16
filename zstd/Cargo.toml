@@ -73,6 +73,11 @@ harness = false
 required-features = ["dict_builder"]
 
 [[bench]]
+name = "compare_ffi_memory"
+harness = false
+required-features = ["dict_builder"]
+
+[[bench]]
 name = "bitstream"
 harness = false
 required-features = ["bench_internals"]

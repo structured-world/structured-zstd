@@ -12,6 +12,9 @@ benchmark-delta.json
 benchmark-delta.md
 benchmark-relative.json
 fuzz/corpus
+zstd/fuzz/corpus
 .idea
 /=
 AGENTS.md
+.claude/
+**/__pycache__/
