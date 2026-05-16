@@ -63,7 +63,7 @@ REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_rss_delta_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
@@ -257,16 +257,22 @@ with open(raw_path) as f:
                 label,
                 level,
                 stage,
-                rust_peak_alloc_bytes,
+                rust_peak_rss_delta_bytes,
                 ffi_peak_alloc_bytes,
             ) = mem_match.groups()
             label = unescape_report_label(label)
+            # Field semantics differ between sides — see emit_memory_report
+            # in zstd/benches/compare_ffi.rs. Rust side is OS RSS delta
+            # (proxy, may underreport on warm allocator arenas); FFI side
+            # is the precise sum of bytes requested from libzstd's
+            # ZSTD_customMem callbacks. Both stored side-by-side so the
+            # dashboard can show each as its own series.
             memory_rows.append({
                 "scenario": scenario,
                 "label": label,
                 "level": level,
                 "stage": stage,
-                "rust_peak_alloc_bytes": int(rust_peak_alloc_bytes),
+                "rust_peak_rss_delta_bytes": int(rust_peak_rss_delta_bytes),
                 "ffi_peak_alloc_bytes": int(ffi_peak_alloc_bytes),
             })
             continue
@@ -617,7 +623,7 @@ for row in delta_rows:
 # records already use so the dashboard's existing per-series grouping
 # keeps working unchanged.
 for row in memory_rows:
-    rust_bytes = row["rust_peak_alloc_bytes"]
+    rust_bytes = row["rust_peak_rss_delta_bytes"]
     ffi_bytes = row["ffi_peak_alloc_bytes"]
     raw_stage = row["stage"]
     if raw_stage == "compress":
@@ -645,6 +651,13 @@ for row in memory_rows:
             "key": canonical_key(stage, row["scenario"], row["level"], source),
             "commit_sha": commit_sha,
             "generated_at": generated_at,
+            # Single grouping key so the dashboard can plot rust vs ffi
+            # side-by-side. Cross-side values are NOT directly comparable:
+            # `rust_value` is OS RSS delta (proxy, underreports on warm
+            # arenas); `ffi_value` is precise libzstd customMem byte
+            # count. The metric label is kept stable for dashboard
+            # continuity — see compare_ffi.rs `emit_memory_report` for
+            # the full asymmetry note.
             "metric": "peak_alloc_bytes",
             "rust_value": rust_bytes,
             "ffi_value": ffi_bytes,
@@ -693,16 +706,22 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
 
 lines.extend([
     "",
-    "## Peak Allocation Bytes",
+    "## Peak Memory Bytes",
     "",
-    "| Scenario | Label | Level | Stage | Rust peak alloc bytes | C peak alloc bytes |",
+    "Rust column is OS resident-set-size delta during one encode/decode call "
+    "(background-sampled). FFI column is precise sum of bytes requested from "
+    "libzstd's `ZSTD_customMem` callbacks. Values are not directly comparable "
+    "cross-side — they are different proxies for memory pressure during the "
+    "operation. See bench source for details.",
+    "",
+    "| Scenario | Label | Level | Stage | Rust peak RSS delta | C peak alloc bytes |",
     "| --- | --- | --- | --- | ---: | ---: |",
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
     label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_rss_delta_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
     )
 
 lines.extend([

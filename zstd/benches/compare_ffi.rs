@@ -538,7 +538,7 @@ fn bench_compress(c: &mut Criterion) {
                     &scenario.bytes[..],
                     level.rust_level,
                 );
-                let rust_peak_bytes = rust_window.finish();
+                let rust_peak_rss_delta_bytes = rust_window.finish();
                 // FFI side: per-CCtx tracker observes every libzstd
                 // malloc/free precisely. Same `ffi_encode_to_vec` the
                 // timing loop below calls — only the customMem opt-in
@@ -550,7 +550,13 @@ fn bench_compress(c: &mut Criterion) {
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
-                emit_memory_report(scenario, level, "compress", rust_peak_bytes, ffi_peak_bytes);
+                emit_memory_report(
+                    scenario,
+                    level,
+                    "compress",
+                    rust_peak_rss_delta_bytes,
+                    ffi_peak_bytes,
+                );
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -642,7 +648,7 @@ fn bench_decompress_source(
             assert_eq!(written, expected_len);
             black_box(target);
         }
-        let rust_peak_bytes = rust_window.finish();
+        let rust_peak_rss_delta_bytes = rust_window.finish();
 
         let mut ffi_tracker = FfiMemTracker::default();
         let mut ffi_target = vec![0u8; expected_len];
@@ -654,7 +660,7 @@ fn bench_decompress_source(
             scenario,
             level,
             &format!("decompress-{source}"),
-            rust_peak_bytes,
+            rust_peak_rss_delta_bytes,
             ffi_peak_bytes,
         );
     }
@@ -953,18 +959,34 @@ fn emit_memory_report(
     scenario: &Scenario,
     level: LevelConfig,
     stage: &str,
-    rust_peak_alloc_bytes: usize,
+    rust_peak_rss_delta_bytes: usize,
     ffi_peak_alloc_bytes: usize,
 ) {
     let escaped_label = escape_report_label(&scenario.label);
-    // Field names changed from `*_buffer_bytes_estimate` (static
-    // input+output approximation) to `*_peak_alloc_bytes` (real
-    // high-water mark of live allocator bytes during one
-    // compress/decompress pass). The aggregator regex is updated in
-    // lockstep — see `.github/scripts/run-benchmarks.sh`.
+    // Asymmetric metric semantics — named honestly:
+    //   - `ffi_peak_alloc_bytes`: precise sum of bytes requested from
+    //     `ZSTD_customMem` callbacks during one CCtx/DCtx lifetime.
+    //     Reflects every libzstd malloc/free.
+    //   - `rust_peak_rss_delta_bytes`: OS resident-set-size growth
+    //     during one encode/decode call (background-sampled via
+    //     `mach_task_basic_info` / `/proc/self/statm`). Approximates
+    //     peak working set, but allocations satisfied from pages
+    //     already faulted in or from the allocator's cached arena do
+    //     not bump RSS — warm scenarios may underreport.
+    // The fields are different proxies for "memory pressure during
+    // this op"; their absolute values are NOT directly comparable
+    // cross-side, though the relative shape over scenarios still
+    // exposes regressions. Dashboard plots them as two series under
+    // the `peak_alloc_bytes` metric group — see
+    // `.github/scripts/run-benchmarks.sh`.
     println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_alloc_bytes={} ffi_peak_alloc_bytes={}",
-        scenario.id, escaped_label, level.name, stage, rust_peak_alloc_bytes, ffi_peak_alloc_bytes
+        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_rss_delta_bytes={} ffi_peak_alloc_bytes={}",
+        scenario.id,
+        escaped_label,
+        level.name,
+        stage,
+        rust_peak_rss_delta_bytes,
+        ffi_peak_alloc_bytes
     );
 }
 
