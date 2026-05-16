@@ -527,13 +527,60 @@ impl DfastMatchGenerator {
                     *short_hash_ptr.add(hs0_idx) = packed_curr;
                 }
 
-                // Repcode peek at ip+1 (donor `zstd_double_fast.c:190`).
-                if let Some(rep) = self.repcode_candidate(abs_ip1, lit_len_ip1)
-                    && rep.start >= current_abs_start + literals_start
-                    && rep.start <= abs_ip1
-                {
-                    committed = Some((rep, ip1, lit_len_ip1));
-                    break 'inner;
+                // Donor parity (`zstd_double_fast.c:190`): inline rep1
+                // peek at ip+1, 4-byte gate. Donor's hot path checks ONLY
+                // `offset_1` here (full 3-rep walk lives in lazy/btopt).
+                // Since the peek is at `ip+1` with `pos >= literals_start`,
+                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the donor's
+                // `offset_1`. The `repcode_candidate_shared` helper we used
+                // before walked all three offsets + did a full SIMD
+                // `common_prefix_len` per probe, paying ~3× the work for
+                // rep2/rep3 hits that the dfast fast path never benefits
+                // from (those wins live in the lazy/btopt strategies).
+                let rep1 = self.offset_hist[0] as usize;
+                if rep1 != 0 && rep1 <= abs_ip1 {
+                    let cand_pos_r = abs_ip1 - rep1;
+                    if cand_pos_r >= history_abs_start
+                        && cand_pos_r >= current_abs_start + literals_start
+                    {
+                        let cand_idx_r = cand_pos_r - history_abs_start;
+                        // 4-byte gate; full forward count only if it passes.
+                        let cand4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
+                                .read_unaligned()
+                        };
+                        let cur4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + concat_idx1) as *const u32)
+                                .read_unaligned()
+                        };
+                        if cand4 == cur4 {
+                            let mut match_len = 4usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx1 + 4);
+                            unsafe {
+                                let lhs =
+                                    history_base_ptr.add(history_start_offset + cand_idx_r + 4);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx1 + 4);
+                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                    lhs, rhs, max_fwd,
+                                );
+                                match_len += ext;
+                            }
+                            if match_len >= DFAST_MIN_MATCH_LEN {
+                                let concat = &self.history[history_start_offset..];
+                                let rep_cand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos_r,
+                                    abs_ip1,
+                                    match_len,
+                                    lit_len_ip1,
+                                );
+                                committed = Some((rep_cand, ip1, lit_len_ip1));
+                                break 'inner;
+                            }
+                        }
+                    }
                 }
 
                 // Precompute hl1 (donor `_search_next_long` carry, line 197).
