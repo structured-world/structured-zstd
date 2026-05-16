@@ -510,12 +510,22 @@ fn configure_group<M: criterion::measurement::Measurement>(
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Corpus | ScenarioClass::Entropy => {
-            group.sample_size(10);
+            // 3 samples (was 10) — at level_22_btultra2 a single encode
+            // pass on `decodecorpus-z000033` (~1 MiB) takes well over
+            // 1s, so criterion would otherwise warn "Unable to complete
+            // 10 samples in 4s, increase target time to 5.2s". Three
+            // samples are enough for the dashboard's regression-band
+            // ±5% sensitivity while keeping per-shard wall time bounded.
+            group.sample_size(3);
             group.measurement_time(Duration::from_secs(4));
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Large | ScenarioClass::Silesia => {
-            group.sample_size(10);
+            // 3 samples (was 10) — Large/Silesia payloads (~16-100 MiB)
+            // dominate per-shard runtime at higher levels. Three
+            // samples + 2s measurement is sufficient for regression
+            // detection on the canonical alert levels.
+            group.sample_size(3);
             group.measurement_time(Duration::from_secs(2));
             group.warm_up_time(Duration::from_millis(500));
             group.sampling_mode(SamplingMode::Flat);
