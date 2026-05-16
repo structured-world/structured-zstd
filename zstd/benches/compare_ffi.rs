@@ -11,212 +11,20 @@
 
 mod support;
 
+// This bench targets THROUGHPUT and COMPRESSION RATIO only — no memory
+// observation. Memory measurement lives in the separate
+// `compare_ffi_memory` binary (`zstd/benches/compare_ffi_memory.rs`) so
+// criterion's timing loops here run with a vanilla system allocator
+// and no `ZSTD_customMem` hooks. Conflating timing and memory in one
+// run forced asymmetric observers (OS RSS for Rust vs customMem for
+// FFI) which Copilot/CR correctly flagged as non-comparable across
+// sides. The split bench lets a single tracking allocator observe
+// BOTH sides symmetrically while leaving this file untouched on the
+// timing hot path.
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-
-/// OS-level resident-set-size sampling. Used by the bench to observe
-/// Rust-side peak memory during one compress/decompress call without
-/// installing a global allocator wrapper.
-///
-/// Earlier revisions installed a `#[global_allocator] TrackingAllocator`
-/// that intercepted every allocation in the bench binary. Even when its
-/// counting was gated by an atomic flag, the per-allocation load+branch
-/// (and the extra 16-byte header) biased criterion's timing loops
-/// relative to the FFI side. RSS sampling moves the observation off the
-/// hot path entirely: the OS updates resident-set size on
-/// `brk`/`mmap`/page fault, and a background poller reads it.
-///
-/// This module is compiled only into the `compare_ffi` bench binary,
-/// never into the published `structured-zstd` crate.
-mod rss {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::thread;
-    use std::time::Duration;
-
-    /// Current resident-set size of this process in bytes. Returns 0
-    /// on unsupported platforms or if the OS query fails (callers
-    /// treat 0 as "no signal" and skip max-updates).
-    pub fn current() -> usize {
-        #[cfg(target_os = "macos")]
-        {
-            current_macos()
-        }
-        #[cfg(target_os = "linux")]
-        {
-            current_linux()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            0
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn current_macos() -> usize {
-        // mach_task_basic_info — same struct top(1) reads for RSIZE.
-        // `resident_size` is in bytes; flavor id 20 and layout are
-        // stable kernel ABI (xnu mach/task_info.h).
-        const MACH_TASK_BASIC_INFO: i32 = 20;
-        #[repr(C)]
-        struct MachTaskBasicInfo {
-            virtual_size: u64,
-            resident_size: u64,
-            resident_size_max: u64,
-            user_time: [u32; 2],
-            system_time: [u32; 2],
-            policy: i32,
-            suspend_count: i32,
-        }
-        unsafe extern "C" {
-            fn mach_task_self() -> u32;
-            fn task_info(target: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
-        }
-        let mut info = MachTaskBasicInfo {
-            virtual_size: 0,
-            resident_size: 0,
-            resident_size_max: 0,
-            user_time: [0; 2],
-            system_time: [0; 2],
-            policy: 0,
-            suspend_count: 0,
-        };
-        // count is in u32 units (struct size / 4).
-        let mut count = (core::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
-        // SAFETY: `mach_task_self` returns the current task port,
-        // `task_info` reads `count * 4` bytes into the buffer we
-        // pass; the struct size matches `count`.
-        let rc = unsafe {
-            task_info(
-                mach_task_self(),
-                MACH_TASK_BASIC_INFO,
-                core::ptr::from_mut(&mut info) as *mut u8,
-                &mut count,
-            )
-        };
-        if rc == 0 {
-            info.resident_size as usize
-        } else {
-            0
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn current_linux() -> usize {
-        // /proc/self/statm: "size resident shared text lib data dt"
-        // resident column is in pages.
-        let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-        let resident_pages: usize = s
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        resident_pages.saturating_mul(page_size())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn page_size() -> usize {
-        use std::sync::OnceLock;
-        static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-        *PAGE_SIZE.get_or_init(|| {
-            unsafe extern "C" {
-                fn sysconf(name: i32) -> i64;
-            }
-            // _SC_PAGESIZE = 30 on Linux. `sysconf` returns -1 on
-            // failure; fall back to 4 KiB (matches every Linux ABI
-            // we care about, including i686-gnu and x86_64-musl).
-            // SAFETY: sysconf is async-signal-safe and has no
-            // pointer arguments; safe to call from any thread.
-            let v = unsafe { sysconf(30) };
-            if v > 0 { v as usize } else { 4096 }
-        })
-    }
-
-    /// Background-sampled peak-RSS observation window. `start` snaps
-    /// baseline and spawns a poller that updates a peak counter every
-    /// `SAMPLE_INTERVAL`; `finish` joins the poller and returns
-    /// `peak.saturating_sub(baseline)`.
-    ///
-    /// Sampling cadence is tight enough for sub-second encode/decode
-    /// operations on >100 KiB inputs (hundreds of samples per call).
-    /// For sub-100 µs operations the sampler may miss intra-call
-    /// peaks — that's acceptable because RSS for such tiny payloads
-    /// is dominated by static process state and the metric isn't
-    /// meaningful at that scale.
-    const SAMPLE_INTERVAL: Duration = Duration::from_micros(250);
-
-    pub struct PeakWindow {
-        peak: Arc<AtomicUsize>,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-        baseline: usize,
-    }
-
-    impl PeakWindow {
-        pub fn start() -> Self {
-            // Spawn the sampler FIRST and take baseline AFTER its first
-            // sample. Snapshotting baseline before `thread::spawn` would
-            // leak the sampler thread's own startup RSS (stack pages
-            // faulted in, TLS init) into every delta — a fixed bias
-            // that's most visible on the small scenarios this bench
-            // reports. With baseline = first post-spawn sample, the
-            // sampler's footprint is absorbed by baseline and the
-            // returned delta reflects only the workload allocation.
-            let peak = Arc::new(AtomicUsize::new(0));
-            let stop = Arc::new(AtomicBool::new(false));
-            let ready = Arc::new(AtomicBool::new(false));
-            let peak_w = peak.clone();
-            let stop_w = stop.clone();
-            let ready_w = ready.clone();
-            let handle = thread::spawn(move || {
-                // First sample — establishes the post-spawn baseline
-                // observed by the main thread below.
-                let cur = current();
-                if cur > 0 {
-                    peak_w.store(cur, Ordering::Relaxed);
-                }
-                ready_w.store(true, Ordering::Relaxed);
-                while !stop_w.load(Ordering::Relaxed) {
-                    let cur = current();
-                    if cur > 0 {
-                        peak_w.fetch_max(cur, Ordering::Relaxed);
-                    }
-                    thread::sleep(SAMPLE_INTERVAL);
-                }
-            });
-            // Block until the sampler has stored its first sample.
-            while !ready.load(Ordering::Relaxed) {
-                thread::yield_now();
-            }
-            let baseline = peak.load(Ordering::Relaxed);
-            PeakWindow {
-                peak,
-                stop,
-                handle: Some(handle),
-                baseline,
-            }
-        }
-
-        /// Stop the poller and return `peak - baseline`. Also takes
-        /// one final on-thread sample so a peak that landed after
-        /// the poller's last loop iteration but before `finish` is
-        /// still observed.
-        pub fn finish(mut self) -> usize {
-            let final_rss = current();
-            if final_rss > 0 {
-                self.peak.fetch_max(final_rss, Ordering::Relaxed);
-            }
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-            let peak = self.peak.load(Ordering::Relaxed);
-            peak.saturating_sub(self.baseline)
-        }
-    }
-}
 
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
@@ -228,149 +36,15 @@ use support::{
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
-/// Per-CCtx FFI memory tracker. Passed as the `opaque` field of
-/// `ZSTD_customMem` so libzstd's malloc/free callbacks update this
-/// struct directly. No global state, no atomic ops — the tracker
-/// lives on the calling stack and is touched only from libzstd's
-/// single-threaded-per-context allocator path.
-///
-/// Used only when memory is being measured. Criterion's timing loops
-/// call the FFI helpers with `mem = None`, which routes libzstd back
-/// to its default `malloc`/`free`, so timing samples pay no
-/// instrumentation overhead.
-///
-/// Bench-only: lives entirely in this file and is never linked into
-/// the published `structured-zstd` crate.
-#[derive(Default)]
-struct FfiMemTracker {
-    current: usize,
-    peak: usize,
-}
-
-impl FfiMemTracker {
-    /// Build a `ZSTD_customMem` whose `opaque` points at `self`.
-    /// Caller must keep `self` alive for the lifetime of the
-    /// CCtx/DCtx (libzstd calls `customFree` during `ZSTD_freeCCtx` /
-    /// `ZSTD_freeDCtx`, which the bench invokes before dropping the
-    /// tracker).
-    fn custom_mem(&mut self) -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
-        zstd::zstd_safe::zstd_sys::ZSTD_customMem {
-            customAlloc: Some(ffi_alloc),
-            customFree: Some(ffi_free),
-            opaque: core::ptr::from_mut(self) as *mut core::ffi::c_void,
-        }
-    }
-}
-
-/// Header bytes prepended to every customMem allocation so the size
-/// can be recovered at free time (libzstd's `customFree(opaque, addr)`
-/// does not pass a size). 16 also covers SSE / NEON alignment for the
-/// user-visible pointer.
-const FFI_HEADER_BYTES: usize = 16;
-const FFI_ALIGN: usize = 16;
-
-/// `ZSTD_customMem` allocate callback. Reserves `size + HEADER` bytes,
-/// stores `size` in the header, updates the per-CCtx tracker, and
-/// returns the post-header pointer.
-///
-/// SAFETY: `opaque` must be the `*mut FfiMemTracker` pointer that
-/// `custom_mem()` produced. libzstd is single-threaded per CCtx, so
-/// the `&mut FfiMemTracker` access here is race-free as long as the
-/// bench doesn't share a tracker across CCtxs concurrently (it
-/// doesn't — each measurement constructs a fresh tracker on its own
-/// thread).
-unsafe extern "C" fn ffi_alloc(
-    opaque: *mut core::ffi::c_void,
-    size: usize,
-) -> *mut core::ffi::c_void {
-    use std::alloc::Layout;
-    let Some(total) = size.checked_add(FFI_HEADER_BYTES) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(layout) = Layout::from_size_align(total, FFI_ALIGN) else {
-        return core::ptr::null_mut();
-    };
-    // SAFETY: layout is valid (validated above).
-    let raw = unsafe { std::alloc::alloc(layout) };
-    if raw.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: first 8 bytes of `raw` are owned by us (HEADER_BYTES is 16).
-    unsafe {
-        core::ptr::write(raw as *mut usize, size);
-    }
-    // SAFETY: opaque came from `FfiMemTracker::custom_mem`; per-CCtx
-    // single-threaded access.
-    //
-    // Plain `+=`/`-=` (no saturating arithmetic): a single-CCtx
-    // measurement bench cannot realistically reach `usize::MAX` bytes
-    // of live libzstd state. If the counter ever did overflow, that's
-    // a real bug (alloc/free imbalance, mis-routed opaque pointer)
-    // and the panic surfaces it instead of silently freezing the
-    // counter at its max.
-    let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
-    tracker.current += size;
-    if tracker.current > tracker.peak {
-        tracker.peak = tracker.current;
-    }
-    // SAFETY: raw + HEADER_BYTES is in-bounds (allocation size is
-    // total = size + HEADER_BYTES) and HEADER_BYTES ≥ FFI_ALIGN
-    // so the returned pointer is FFI_ALIGN-aligned.
-    unsafe { raw.add(FFI_HEADER_BYTES) as *mut core::ffi::c_void }
-}
-
-/// `ZSTD_customMem` free callback. Recovers `size` from the header,
-/// decrements `tracker.current`, and releases the underlying System
-/// allocation.
-unsafe extern "C" fn ffi_free(opaque: *mut core::ffi::c_void, address: *mut core::ffi::c_void) {
-    use std::alloc::Layout;
-    if address.is_null() {
-        return;
-    }
-    // SAFETY: `address` came from `ffi_alloc`, which placed a size
-    // header exactly HEADER_BYTES before the returned pointer.
-    let header_ptr = unsafe { (address as *mut u8).sub(FFI_HEADER_BYTES) };
-    let size = unsafe { core::ptr::read(header_ptr as *const usize) };
-    let layout = Layout::from_size_align(size + FFI_HEADER_BYTES, FFI_ALIGN)
-        .expect("layout round-trips from ffi_alloc");
-    // SAFETY: opaque is the same FfiMemTracker that `ffi_alloc` saw
-    // for this CCtx; single-threaded per-CCtx. Plain `-=` for the same
-    // reason `ffi_alloc` uses plain `+=`: a free without a matching
-    // alloc would be a real bug, and panicking surfaces it.
-    let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
-    tracker.current -= size;
-    // SAFETY: header_ptr + layout matches the pair from `ffi_alloc`.
-    unsafe { std::alloc::dealloc(header_ptr, layout) };
-}
-
-/// Unified FFI encode helper. Used by both criterion's timing loop
-/// (`mem = None`, libzstd uses default malloc — zero instrumentation
-/// overhead, matches what an ordinary FFI consumer pays) and the
-/// per-shard memory-measurement block (`mem = Some(&mut tracker)` so
-/// every libzstd allocation flows through `FfiMemTracker` and produces
-/// a precise peak number).
-///
-/// Both callers exercise the SAME code path — `ZSTD_compressStream2`
-/// into a growing-output `Vec`. Earlier revisions of this bench had a
-/// split (`zstd::stream::Encoder` for timing, raw API for memory),
-/// which let the two metrics describe different operations. The
-/// streaming output Vec also matches what the pure-Rust
-/// `compress_to_vec` does: both sides grow output incrementally rather
-/// than pre-allocating `ZSTD_compressBound`, so the headline
-/// peak-memory numbers stay apples-to-apples.
-fn ffi_encode_to_vec(input: &[u8], level: i32, mem: Option<&mut FfiMemTracker>) -> Vec<u8> {
+/// FFI encode helper used by criterion's timing loop. Uses
+/// `ZSTD_compressStream2` into a growing-output `Vec` — same shape as
+/// the pure-Rust `compress_to_vec` so output-buffer growth profiles
+/// match cross-side.
+fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
-    // SAFETY: `ZSTD_createCCtx{,_advanced}` return null on OOM and
-    // are otherwise safe to call. The CCtx is freed before returning.
-    // When `mem = Some`, the tracker reference outlives the CCtx
-    // because we drop the CCtx (and thus issue the final customFree
-    // calls) before this function returns.
-    let cctx = unsafe {
-        match mem {
-            Some(tracker) => zstd_sys::ZSTD_createCCtx_advanced(tracker.custom_mem()),
-            None => zstd_sys::ZSTD_createCCtx(),
-        }
-    };
+    // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
+    // The CCtx is freed before returning.
+    let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
     assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
 
     // SAFETY: every `zstd_sys` call below operates on the CCtx we
@@ -469,39 +143,28 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, mem: Option<&mut FfiMemTracker>) 
     }
 }
 
-/// Reusable FFI DCtx handle. Wraps `ZSTD_createDCtx{,_advanced}` +
-/// `ZSTD_freeDCtx` lifecycle so criterion's `b.iter` timing loop can
-/// call `ZSTD_decompressDCtx` repeatedly against the same context —
+/// Reusable FFI DCtx handle. Wraps `ZSTD_createDCtx` + `ZSTD_freeDCtx`
+/// lifecycle so criterion's `b.iter` timing loop can call
+/// `ZSTD_decompressDCtx` repeatedly against the same context —
 /// matching the pure-Rust loop which reuses one `FrameDecoder`.
 /// Creating a fresh DCtx per iteration would dominate the sample at
 /// small payloads (DCtx construction is ~100 KiB of allocation).
-///
-/// When `mem = Some`, libzstd routes its window buffer + dictionary
-/// scratch through `FfiMemTracker`. When `mem = None`, default malloc
-/// is used (timing loops want this).
 struct FfiDCtxHandle {
     ptr: *mut zstd::zstd_safe::zstd_sys::ZSTD_DCtx_s,
 }
 
 impl FfiDCtxHandle {
-    fn new(mem: Option<&mut FfiMemTracker>) -> Self {
+    fn new() -> Self {
         use zstd::zstd_safe::zstd_sys;
-        // SAFETY: both constructors are safe FFI calls returning
-        // null on OOM, which we assert against.
-        let ptr = unsafe {
-            match mem {
-                Some(tracker) => zstd_sys::ZSTD_createDCtx_advanced(tracker.custom_mem()),
-                None => zstd_sys::ZSTD_createDCtx(),
-            }
-        };
+        // SAFETY: `ZSTD_createDCtx` returns null on OOM, asserted below.
+        let ptr = unsafe { zstd_sys::ZSTD_createDCtx() };
         assert!(!ptr.is_null(), "ZSTD_createDCtx returned null");
         FfiDCtxHandle { ptr }
     }
 
     fn decompress_into(&mut self, compressed: &[u8], output: &mut [u8]) -> usize {
         use zstd::zstd_safe::zstd_sys;
-        // SAFETY: `self.ptr` is a valid DCtx, lifetime tied to
-        // `self`. `output` and `compressed` are valid slices.
+        // SAFETY: `self.ptr` is a valid DCtx, lifetime tied to `self`.
         let written = unsafe {
             zstd_sys::ZSTD_decompressDCtx(
                 self.ptr,
@@ -522,26 +185,16 @@ impl FfiDCtxHandle {
 impl Drop for FfiDCtxHandle {
     fn drop(&mut self) {
         // SAFETY: `self.ptr` was created by `Self::new` and is freed
-        // exactly once here. After this, any FfiMemTracker borrowed
-        // through `custom_mem` is safe to read on the same thread —
-        // libzstd's final `customFree` calls run synchronously
-        // inside `ZSTD_freeDCtx`.
+        // exactly once here.
         unsafe {
             zstd::zstd_safe::zstd_sys::ZSTD_freeDCtx(self.ptr);
         }
     }
 }
 
-/// Convenience wrapper for one-shot decompression. Used by the
-/// per-shard memory measurement and the reference-equality check;
-/// timing loops use `FfiDCtxHandle` directly to amortise context
-/// construction.
-fn ffi_decompress_into(
-    compressed: &[u8],
-    output: &mut [u8],
-    mem: Option<&mut FfiMemTracker>,
-) -> usize {
-    let mut dctx = FfiDCtxHandle::new(mem);
+/// One-shot decompress helper used by reference-equality checks.
+fn ffi_decompress_into(compressed: &[u8], output: &mut [u8]) -> usize {
+    let mut dctx = FfiDCtxHandle::new();
     dctx.decompress_into(compressed, output)
 }
 
@@ -560,47 +213,14 @@ fn bench_compress(c: &mut Criterion) {
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
-                // Rust side: OS RSS sampling around one encode call.
-                // No global allocator wrapper, so criterion's timing
-                // loops below stay uninstrumented.
-                let rust_window = rss::PeakWindow::start();
                 let rust_compressed = structured_zstd::encoding::compress_to_vec(
                     &scenario.bytes[..],
                     level.rust_level,
                 );
-                let rust_peak_rss_delta_bytes = rust_window.finish();
-                // FFI side: per-CCtx tracker observes every libzstd
-                // malloc/free precisely. Same `ffi_encode_to_vec` the
-                // timing loop below calls — only the customMem opt-in
-                // differs.
-                //
-                // Intentional asymmetry vs the Rust side: `ffi_tracker.peak`
-                // counts ONLY libzstd's customMem requests, NOT the
-                // Rust-owned `output: Vec<u8>` and `chunk: Vec<u8>`
-                // inside `ffi_encode_to_vec`. The Rust path's
-                // `compress_to_vec` allocates its output via the same
-                // system allocator, so on the FFI side we want only
-                // the libzstd-internal hash/chain/workspace memory —
-                // the apples-to-apples comparison for "what does
-                // libzstd cost over the Rust crate". Wrapping the
-                // whole FFI call in an RSS window would conflate the
-                // two and inflate the FFI metric with bookkeeping the
-                // Rust side doesn't pay either. See `emit_memory_report`
-                // for the full asymmetry note.
-                let mut ffi_tracker = FfiMemTracker::default();
-                let ffi_compressed =
-                    ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, Some(&mut ffi_tracker));
-                let ffi_peak_bytes = ffi_tracker.peak;
+                let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
-                emit_memory_report(
-                    scenario,
-                    level,
-                    "compress",
-                    rust_peak_rss_delta_bytes,
-                    ffi_peak_bytes,
-                );
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -618,13 +238,7 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| {
-                    black_box(ffi_encode_to_vec(
-                        &scenario.bytes[..],
-                        level.ffi_level,
-                        None,
-                    ))
-                })
+                b.iter(|| black_box(ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level)))
             });
 
             group.finish();
@@ -638,10 +252,7 @@ fn bench_decompress(c: &mut Criterion) {
         for level in supported_levels_filtered() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
-            // Build the FFI fixture via the unified helper with
-            // `None` so this prep step pays no customMem overhead; the
-            // bytes feed both `c_stream` decode benches below.
-            let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, None);
+            let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -672,54 +283,9 @@ fn bench_decompress_source(
     source: &'static str,
     compressed: &[u8],
     expected_len: usize,
-    emit_reports: bool,
+    _emit_reports: bool,
 ) {
     assert_decompress_matches_reference(scenario, compressed, expected_len);
-
-    if emit_reports {
-        // Measure peak live bytes for one full decode pass on each
-        // path. Done OUTSIDE criterion's bench loop so the sample is
-        // dominated by decoder internals (FrameDecoder state for
-        // rust, ZSTD_DCtx + window for ffi). Rust uses OS RSS
-        // sampling; FFI uses a per-DCtx customMem tracker. Both
-        // observe the SAME decode call the timing loop below runs —
-        // only the memory hook differs.
-        // `rust_window.finish()` MUST run before `target`/`decoder` drop
-        // so the final on-thread RSS sample sees their pages still
-        // resident. With the previous inner-block scope they were
-        // dropped first, the allocator could (and on macOS does) return
-        // memory to the OS before `finish` sampled — undercounting peak.
-        let rust_window = rss::PeakWindow::start();
-        let mut target = vec![0u8; expected_len];
-        let mut decoder = FrameDecoder::new();
-        let written = decoder.decode_all(compressed, &mut target).unwrap();
-        assert_eq!(written, expected_len);
-        let rust_peak_rss_delta_bytes = rust_window.finish();
-        black_box(target);
-
-        // Same intentional asymmetry as the compress path: the FFI
-        // peak counts ONLY libzstd's customMem requests (DCtx workspace
-        // + window buffer), NOT the Rust-owned `ffi_target` output
-        // slice. The Rust decode path allocates its own `target` via
-        // the system allocator and we want both sides to compare
-        // libzstd-internal vs FrameDecoder-internal memory, not output
-        // bookkeeping. Wrapping the FFI decode in an RSS window would
-        // double-count the Rust-side output that's identical between
-        // both paths. See `emit_memory_report` for details.
-        let mut ffi_tracker = FfiMemTracker::default();
-        let mut ffi_target = vec![0u8; expected_len];
-        let written = ffi_decompress_into(compressed, &mut ffi_target, Some(&mut ffi_tracker));
-        assert_eq!(written, expected_len);
-        let ffi_peak_bytes = ffi_tracker.peak;
-
-        emit_memory_report(
-            scenario,
-            level,
-            &format!("decompress-{source}"),
-            rust_peak_rss_delta_bytes,
-            ffi_peak_bytes,
-        );
-    }
 
     let benchmark_name = format!(
         "decompress/{}/{}/{}/matrix",
@@ -747,7 +313,7 @@ fn bench_decompress_source(
         // pure-Rust loop above which reuses one `FrameDecoder` and
         // one `target`. Creating a fresh DCtx per iteration would
         // dominate sub-millisecond samples.
-        let mut dctx = FfiDCtxHandle::new(None);
+        let mut dctx = FfiDCtxHandle::new();
         let mut target = vec![0u8; expected_len];
         b.iter(|| {
             let written = dctx.decompress_into(black_box(compressed), &mut target);
@@ -773,7 +339,7 @@ fn assert_decompress_matches_reference(
     assert_eq!(&rust_target[..rust_written], scenario.bytes.as_slice());
 
     let mut ffi_target = vec![0u8; expected_len];
-    let ffi_written = ffi_decompress_into(compressed, &mut ffi_target, None);
+    let ffi_written = ffi_decompress_into(compressed, &mut ffi_target);
     assert_eq!(ffi_written, expected_len);
     assert_eq!(&ffi_target[..ffi_written], scenario.bytes.as_slice());
 }
@@ -1008,41 +574,6 @@ fn emit_frame_header_report(
         checksum,
         fcs_bytes,
         dict_id_bytes,
-    );
-}
-
-fn emit_memory_report(
-    scenario: &Scenario,
-    level: LevelConfig,
-    stage: &str,
-    rust_peak_rss_delta_bytes: usize,
-    ffi_peak_alloc_bytes: usize,
-) {
-    let escaped_label = escape_report_label(&scenario.label);
-    // Asymmetric metric semantics — named honestly:
-    //   - `ffi_peak_alloc_bytes`: precise sum of bytes requested from
-    //     `ZSTD_customMem` callbacks during one CCtx/DCtx lifetime.
-    //     Reflects every libzstd malloc/free.
-    //   - `rust_peak_rss_delta_bytes`: OS resident-set-size growth
-    //     during one encode/decode call (background-sampled via
-    //     `mach_task_basic_info` / `/proc/self/statm`). Approximates
-    //     peak working set, but allocations satisfied from pages
-    //     already faulted in or from the allocator's cached arena do
-    //     not bump RSS — warm scenarios may underreport.
-    // The fields are different proxies for "memory pressure during
-    // this op"; their absolute values are NOT directly comparable
-    // cross-side, though the relative shape over scenarios still
-    // exposes regressions. Dashboard plots them as two series under
-    // the `peak_alloc_bytes` metric group — see
-    // `.github/scripts/run-benchmarks.sh`.
-    println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_rss_delta_bytes={} ffi_peak_alloc_bytes={}",
-        scenario.id,
-        escaped_label,
-        level.name,
-        stage,
-        rust_peak_rss_delta_bytes,
-        ffi_peak_alloc_bytes
     );
 }
 
