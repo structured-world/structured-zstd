@@ -44,6 +44,31 @@ else
   "${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
 fi
 
+# Memory bench (compare_ffi_memory) runs separately when its binary is
+# available — keeps the timing run on a pristine system allocator and
+# scopes the `#[global_allocator]` tracking wrapper to this second
+# invocation only. PR CI doesn't ship the memory binary (PRs care
+# about review-cycle latency, not memory regression), main pushes do.
+# Both runs append `REPORT_*` lines to the same raw file so downstream
+# parsing is uniform.
+if [ -n "${STRUCTURED_ZSTD_BENCH_MEMORY_BIN:-}" ]; then
+  if [ ! -x "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" ]; then
+    echo "STRUCTURED_ZSTD_BENCH_MEMORY_BIN=$STRUCTURED_ZSTD_BENCH_MEMORY_BIN is not executable" >&2
+    exit 2
+  fi
+  echo "Running memory bench: $STRUCTURED_ZSTD_BENCH_MEMORY_BIN" >&2
+  "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" | tee -a "$BENCH_RAW_FILE"
+elif [ -z "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
+  # Local dev path: when no prebuilt binary env was set above, the
+  # cargo invocation already covered compare_ffi. Run the memory bench
+  # the same way so REPORT_MEM lines land in the raw file.
+  MEM_CMD=(cargo bench --bench compare_ffi_memory -p structured-zstd --features dict_builder)
+  if [ -n "$BENCH_TARGET_TRIPLE" ]; then
+    MEM_CMD+=(--target "$BENCH_TARGET_TRIPLE")
+  fi
+  "${MEM_CMD[@]}" | tee -a "$BENCH_RAW_FILE"
+fi
+
 echo "Parsing results..." >&2
 
 BENCH_RAW_FILE="$BENCH_RAW_FILE" \
@@ -63,7 +88,7 @@ REPORT_RE = re.compile(
     r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_rss_delta_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
@@ -257,7 +282,7 @@ with open(raw_path) as f:
                 label,
                 level,
                 stage,
-                rust_peak_rss_delta_bytes,
+                rust_peak_alloc_bytes,
                 ffi_peak_alloc_bytes,
             ) = mem_match.groups()
             label = unescape_report_label(label)
@@ -272,7 +297,7 @@ with open(raw_path) as f:
                 "label": label,
                 "level": level,
                 "stage": stage,
-                "rust_peak_rss_delta_bytes": int(rust_peak_rss_delta_bytes),
+                "rust_peak_alloc_bytes": int(rust_peak_alloc_bytes),
                 "ffi_peak_alloc_bytes": int(ffi_peak_alloc_bytes),
             })
             continue
@@ -623,7 +648,7 @@ for row in delta_rows:
 # records already use so the dashboard's existing per-series grouping
 # keeps working unchanged.
 for row in memory_rows:
-    rust_bytes = row["rust_peak_rss_delta_bytes"]
+    rust_bytes = row["rust_peak_alloc_bytes"]
     ffi_bytes = row["ffi_peak_alloc_bytes"]
     raw_stage = row["stage"]
     if raw_stage == "compress":
@@ -651,13 +676,13 @@ for row in memory_rows:
             "key": canonical_key(stage, row["scenario"], row["level"], source),
             "commit_sha": commit_sha,
             "generated_at": generated_at,
-            # Single grouping key so the dashboard can plot rust vs ffi
-            # side-by-side. Cross-side values are NOT directly comparable:
-            # `rust_value` is OS RSS delta (proxy, underreports on warm
-            # arenas); `ffi_value` is precise libzstd customMem byte
-            # count. The metric label is kept stable for dashboard
-            # continuity — see compare_ffi.rs `emit_memory_report` for
-            # the full asymmetry note.
+            # Both sides use the SAME observer (the
+            # `compare_ffi_memory` binary installs a `#[global_allocator]`
+            # tracking wrapper and routes libzstd's `ZSTD_customMem`
+            # callbacks through `std::alloc::alloc`, so a single counter
+            # sums Rust + FFI bytes). Cross-side ratio is meaningful —
+            # `delta_ratio > 1` says Rust allocated more bytes than FFI
+            # for the same workload.
             "metric": "peak_alloc_bytes",
             "rust_value": rust_bytes,
             "ffi_value": ffi_bytes,
@@ -706,22 +731,21 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
 
 lines.extend([
     "",
-    "## Peak Memory Bytes",
+    "## Peak Allocation Bytes",
     "",
-    "Rust column is OS resident-set-size delta during one encode/decode call "
-    "(background-sampled). FFI column is precise sum of bytes requested from "
-    "libzstd's `ZSTD_customMem` callbacks. Values are not directly comparable "
-    "cross-side — they are different proxies for memory pressure during the "
-    "operation. See bench source for details.",
+    "Both columns measured by the same observer: the `compare_ffi_memory` "
+    "bench installs a `#[global_allocator]` tracking wrapper and routes "
+    "libzstd's `ZSTD_customMem` callbacks through it, so Rust-side and "
+    "FFI-side bytes share one counter and are directly comparable.",
     "",
-    "| Scenario | Label | Level | Stage | Rust peak RSS delta | C peak alloc bytes |",
+    "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
     "| --- | --- | --- | --- | ---: | ---: |",
 ])
 
 for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
     label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_rss_delta_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
     )
 
 lines.extend([

@@ -34,18 +34,18 @@ jobs:
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
       - name: Clippy (bench_internals)
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals --benches -- -D warnings
-      - name: Gate — compare_ffi must not pull bench_internals
-        # Rationale: `compare_ffi` benches structured-zstd against the
-        # libzstd FFI build. If `bench_internals` widens our crate's
-        # public API surface (visibility changes for `BitReaderReversed`
-        # etc.), Rust-vs-FFI parity is broken — the Rust side ships
-        # compiled differently than what a real downstream consumer
-        # uses. Keep it strictly out of `compare_ffi`'s feature set.
+      - name: Gate — compare_ffi/memory must not pull bench_internals
+        # Rationale: both `compare_ffi` (timing) and `compare_ffi_memory`
+        # (peak alloc) benchmark structured-zstd against libzstd. If
+        # `bench_internals` widens our crate's public API surface
+        # (visibility changes for `BitReaderReversed` etc.), the Rust
+        # side ships compiled differently than what a real downstream
+        # consumer uses — biasing every cross-side comparison. Keep
+        # bench_internals strictly out of both benches' feature sets.
         #
-        # tomllib parsing (Python 3.11+, available on every supported
-        # runner) handles both single-line and multi-line TOML arrays,
-        # so a future `required-features = ["a", "b"]` reformat into a
-        # multi-line array can't sneak `bench_internals` past the gate.
+        # tomllib (Python 3.11+ stdlib) handles both single-line and
+        # multi-line TOML arrays, so a future `required-features` array
+        # reformat can't sneak `bench_internals` past the gate.
         run: |
           python3 - <<'PY'
           import sys, tomllib
@@ -55,25 +55,30 @@ jobs:
               bench.get("name"): bench.get("required-features", [])
               for bench in cargo.get("bench", [])
           }
-          if "bench_internals" in benches.get("compare_ffi", []):
-              print("::error::compare_ffi must NOT require bench_internals — would bias Rust-vs-FFI parity")
+          violators = [
+              name for name in ("compare_ffi", "compare_ffi_memory")
+              if "bench_internals" in benches.get(name, [])
+          ]
+          if violators:
+              for name in violators:
+                  print(f"::error::{name} must NOT require bench_internals — would bias Rust-vs-FFI parity")
               sys.exit(1)
           PY
       - name: Gate — bench instrumentation must not leak into zstd/src/
-        # Rationale: bench-only memory observation (RSS sampler,
-        # FfiMemTracker, customMem hooks) lives in zstd/benches/.
-        # Anything bench-instrumentation-shaped in zstd/src/ would
-        # bloat the published crate. Comments are OK; identifier
-        # references in actual code are not.
+        # Rationale: bench-only memory observation (TrackingAllocator,
+        # customMem hooks) lives in zstd/benches/. Anything
+        # bench-instrumentation-shaped in zstd/src/ would bloat the
+        # published crate. Comments are OK; identifier references in
+        # actual code are not.
         #
         # The second `rg -v` filters out comment-only lines so a doc
         # comment referencing these names (e.g. "see bench's
-        # `FfiMemTracker`") doesn't trip the gate. Matches `path:line:`
-        # followed by leading whitespace and a Rust comment prefix
-        # (`//`, `///`, `//!`, `/*`, ` *`).
+        # `TrackingAllocator`") doesn't trip the gate. Matches
+        # `path:line:` followed by leading whitespace and a Rust
+        # comment prefix (`//`, `///`, `//!`, `/*`, ` *`).
         run: |
           leaked=$(rg -n --no-heading \
-              'TrackingAllocator|FfiMemTracker|PeakWindow|ZSTD_customMem|customMem\(' \
+              'TrackingAllocator|ALLOC_PEAK|ALLOC_CURRENT|TRACKING_ENABLED|ZSTD_customMem|customMem\(' \
               zstd/src/ \
             | rg -v '^[^:]+:[0-9]+:\s*(//|/\*|\*)' || true)
           if [ -n "$leaked" ]; then
@@ -399,26 +404,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: bench-${{ matrix.bench.id }}
-      - name: Build compare_ffi bench binary
+      - name: Build compare_ffi + compare_ffi_memory bench binaries
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           # `--no-run` builds without executing; `--message-format=json`
           # exposes the resolved binary path in the build log so we
-          # can ship just the executable to shards.
-          cargo bench --bench compare_ffi -p structured-zstd --features dict_builder \
+          # can ship just the executable to shards. Building BOTH
+          # bench binaries in one cargo invocation reuses dependency
+          # compilation between them (zstd-sys, criterion, etc.).
+          cargo bench --bench compare_ffi --bench compare_ffi_memory \
+            -p structured-zstd --features dict_builder \
             --target ${{ matrix.bench.target_triple }} --no-run \
             --message-format=json > build.log
-          bin_path=$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)
-          if [ -z "$bin_path" ] || [ ! -x "$bin_path" ]; then
-            echo "ERROR: failed to locate compare_ffi binary in cargo output" >&2
-            cat build.log | jq -r 'select(.executable != null) | "\(.target.name)  \(.executable)"' >&2
-            exit 1
-          fi
           mkdir -p bench-binary
-          cp "$bin_path" bench-binary/compare_ffi
-          chmod +x bench-binary/compare_ffi
-          echo "Bench binary size: $(wc -c < bench-binary/compare_ffi) bytes"
+          for name in compare_ffi compare_ffi_memory; do
+            bin_path=$(jq -r --arg n "$name" 'select(.executable != null and (.target.name == $n)) | .executable' build.log | tail -1)
+            if [ -z "$bin_path" ] || [ ! -x "$bin_path" ]; then
+              echo "ERROR: failed to locate $name binary in cargo output" >&2
+              cat build.log | jq -r 'select(.executable != null) | "\(.target.name)  \(.executable)"' >&2
+              exit 1
+            fi
+            cp "$bin_path" "bench-binary/$name"
+            chmod +x "bench-binary/$name"
+            echo "$name size: $(wc -c < bench-binary/$name) bytes"
+          done
       - name: Upload bench binary
         uses: actions/upload-artifact@v4
         with:
@@ -475,6 +485,13 @@ jobs:
           STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.shard.levels }}
           # run-benchmarks.sh: re-exec this binary instead of `cargo bench`.
           STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+          # Memory bench runs only on main pushes — its TrackingAllocator
+          # measures peak alloc bytes precisely but adds per-allocation
+          # overhead, so we don't want it on every PR review cycle. On
+          # main pushes (`event_name == 'push'`) the second binary is
+          # invoked sequentially by run-benchmarks.sh and its REPORT_MEM
+          # lines feed the dashboard's `peak_alloc_bytes` metric.
+          STRUCTURED_ZSTD_BENCH_MEMORY_BIN: ${{ github.event_name == 'push' && format('{0}/bench-binary/compare_ffi_memory', github.workspace) || '' }}
           # The prebuilt bench binary is launched directly (not via cargo),
           # so `env::var("CARGO_MANIFEST_DIR")` returns None inside it.
           # Without this override, `load_decode_corpus_scenario()` falls
