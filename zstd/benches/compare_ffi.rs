@@ -510,23 +510,26 @@ fn configure_group<M: criterion::measurement::Measurement>(
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Corpus | ScenarioClass::Entropy => {
-            // 3 samples (was 10) — at level_22_btultra2 a single encode
-            // pass on `decodecorpus-z000033` (~1 MiB) takes well over
-            // 1s, so criterion would otherwise warn "Unable to complete
-            // 10 samples in 4s, increase target time to 5.2s". Three
-            // samples are enough for the dashboard's regression-band
-            // ±5% sensitivity while keeping per-shard wall time bounded.
-            group.sample_size(3);
-            group.measurement_time(Duration::from_secs(4));
+            // criterion 0.8 hard-asserts `sample_size >= 10` at runtime,
+            // so dropping below 10 is not an option (commit 73868b0
+            // tried `sample_size(3)` and every bench shard panicked at
+            // `benchmark_group.rs:97: assertion failed: n >= 10`).
+            // Instead, give criterion enough wall-clock budget — the
+            // earlier warning was "increase target time to 5.2s" on the
+            // slowest combo (level_22_btultra2 + 1 MiB decodecorpus).
+            // 8s covers that with headroom while keeping per-shard
+            // total runtime bounded (~11 min worst-case strategy shard).
+            group.sample_size(10);
+            group.measurement_time(Duration::from_secs(8));
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Large | ScenarioClass::Silesia => {
-            // 3 samples (was 10) — Large/Silesia payloads (~16-100 MiB)
-            // dominate per-shard runtime at higher levels. Three
-            // samples + 2s measurement is sufficient for regression
-            // detection on the canonical alert levels.
-            group.sample_size(3);
-            group.measurement_time(Duration::from_secs(2));
+            // Same `sample_size >= 10` floor. Large/Silesia payloads
+            // (~16-100 MiB) take longer per iteration, so bump the
+            // measurement budget further — 10s covers level_22_btultra2
+            // on 16 MiB streams with margin.
+            group.sample_size(10);
+            group.measurement_time(Duration::from_secs(10));
             group.warm_up_time(Duration::from_millis(500));
             group.sampling_mode(SamplingMode::Flat);
         }
