@@ -52,11 +52,20 @@ jobs:
         # FfiMemTracker, customMem hooks) lives in zstd/benches/.
         # Anything bench-instrumentation-shaped in zstd/src/ would
         # bloat the published crate. Comments are OK; identifier
-        # references are not.
+        # references in actual code are not.
+        #
+        # The second `rg -v` filters out comment-only lines so a doc
+        # comment referencing these names (e.g. "see bench's
+        # `FfiMemTracker`") doesn't trip the gate. Matches `path:line:`
+        # followed by leading whitespace and a Rust comment prefix
+        # (`//`, `///`, `//!`, `/*`, ` *`).
         run: |
-          if rg -n --no-heading \
+          leaked=$(rg -n --no-heading \
               'TrackingAllocator|FfiMemTracker|PeakWindow|ZSTD_customMem|customMem\(' \
-              zstd/src/; then
+              zstd/src/ \
+            | rg -v '^[^:]+:[0-9]+:\s*(//|/\*|\*)' || true)
+          if [ -n "$leaked" ]; then
+            echo "$leaked"
             echo "::error::bench-only instrumentation symbols leaked into zstd/src/"
             exit 1
           fi
