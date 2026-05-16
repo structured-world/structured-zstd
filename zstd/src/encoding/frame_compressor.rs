@@ -438,7 +438,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        let source_size_hint_known = self.source_size_hint.is_some();
+        let initial_size_hint = self.source_size_hint;
+        let source_size_hint_known = initial_size_hint.is_some();
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming()
@@ -518,9 +519,23 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             window_size != 0,
             "matcher reported window_size == 0, which is invalid"
         );
-        // Accumulate all compressed blocks; the frame header is written after
-        // all input has been read so that Frame_Content_Size is known.
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
+        // Accumulate all compressed blocks; the frame header is written
+        // after all input has been read so that Frame_Content_Size is
+        // known. The fixed 130 KiB pre-allocation we used before was
+        // wasteful for small payloads (tiny inputs paid the full 130 KiB
+        // peak even when the compressed output fit in a few hundred
+        // bytes). For larger inputs the 130 KiB seed amortises the first
+        // few `Vec::extend` doublings cheaply and the `peak - 130 KiB`
+        // residue is dominated by internal `compress_block_encoded`
+        // buffers anyway, so changing it produces no measurable savings.
+        // Only shrink the seed when the source-size hint explicitly tells
+        // us the payload is small enough that 130 KiB would be pure waste.
+        let initial_all_blocks_cap = match initial_size_hint {
+            Some(h) if h <= 4 * 1024 => 4 * 1024,
+            Some(h) if h <= 64 * 1024 => 16 * 1024,
+            _ => 130 * 1024,
+        };
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap);
         let mut total_uncompressed: u64 = 0;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
