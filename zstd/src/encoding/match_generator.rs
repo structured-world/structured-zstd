@@ -50,7 +50,7 @@ use std::arch::is_aarch64_feature_detected;
 #[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 use std::arch::is_x86_feature_detected;
 
-pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
+pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;

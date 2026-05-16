@@ -570,7 +570,7 @@ impl DfastMatchGenerator {
     ///   * skips the hash-table probe entirely on every extra match.
     ///
     /// Critically uses donor's `MINMATCH = 4` here rather than the
-    /// stricter `DFAST_MIN_MATCH_LEN = 6` enforced on the main search
+    /// `DFAST_MIN_MATCH_LEN = 5` enforced on the main search
     /// loop. The donor accepts any 4-byte rep extension; we mirror that
     /// because the rep emission carries no offset cost — even a 4-byte
     /// rep is a net win over re-running the full hash search. Returns
@@ -1340,8 +1340,8 @@ mod extend_with_repcode_tests {
     }
 
     /// The helper accepts 4-byte rep extensions (donor `MINMATCH = 4`),
-    /// not the main-loop `DFAST_MIN_MATCH_LEN = 6` floor. A regression
-    /// back to 6 would still pass the constant-run / cross-block tests
+    /// not the main-loop `DFAST_MIN_MATCH_LEN = 5` floor. A regression
+    /// back above 4 would still pass the constant-run / cross-block tests
     /// above (their rep matches extend much further), so this fixture
     /// is built so the rep matches EXACTLY 4 bytes before terminating:
     /// the byte at `pos + 4` differs from the byte at `pos + 4 - rep`.
@@ -1408,7 +1408,7 @@ mod extend_with_repcode_tests {
                 assert_eq!(
                     *match_len, 4,
                     "rep emit must be exactly 4 bytes (donor MINMATCH floor). \
-                     A regression back to DFAST_MIN_MATCH_LEN = 6 would skip \
+                     A regression back to DFAST_MIN_MATCH_LEN > 4 would skip \
                      this emission entirely and the test would fail with 0 seqs."
                 );
             }
