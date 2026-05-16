@@ -54,16 +54,21 @@ pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;
-// Donor `clevels.h:31` at level 3 large-input bucket sets `hashLog = 17`
-// (128 K slots × 4 bytes = 512 KiB hash table). We previously held a
-// 20-bit ceiling (1 M slots × 32 bytes per `[usize; 4]` = 32 MiB) which
-// inflated peak memory ~85× over donor at default level — the bench
-// matrix added in PR #143 surfaced 64 MB Rust vs 768 KB donor for the
-// two-table footprint on `decodecorpus-z000033`. Aligning the default
-// to donor's 17 brings hash-table memory in line and improves cache
-// locality of every lookup. `dfast_hash_bits_for_window` still clamps
-// the runtime value to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this
-// const is the upper bound rather than a fixed default.
+// Donor `clevels.h:31` at level 3 large-input bucket sets `hashLog = 17`.
+// Our table layout stores `[u32; DFAST_SEARCH_DEPTH]` (4 u32 slots) per
+// bucket, so a `1 << 17`-bucket table is `128 K × 16 B = 2 MiB per
+// table`, `4 MiB` for the (short, long) pair. We previously held a
+// 20-bit ceiling (1 M buckets × 32 B per `[usize; 4]` = 32 MiB per
+// table, 64 MiB for the pair) which inflated peak memory ~85× over
+// donor at default level — the bench matrix added in PR #143 surfaced
+// 64 MB Rust vs 768 KB donor for the two-table footprint on
+// `decodecorpus-z000033`. Donor stores a single `U32` per slot plus a
+// `chainTable` for older positions, so their pair is still smaller
+// than ours per-level; aligning the bucket count via this constant
+// already eats the dominant factor, the storage-width change ate the
+// rest. `dfast_hash_bits_for_window` still clamps the runtime value
+// to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the upper
+// bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
 pub(crate) const DFAST_SEARCH_DEPTH: usize = 4;
 /// Sentinel value for an empty slot in the `[u32; DFAST_SEARCH_DEPTH]`

@@ -354,19 +354,41 @@ benchmark_results = [
 ]
 
 if not benchmark_results:
-    print(
-        "WARN: No regression-set benchmark rows matched smoke filter; "
-        "falling back to all parsed timings for benchmark-results.json.",
-        file=sys.stderr,
-    )
-    benchmark_results = [
-        {
-            "name": name,
-            "unit": "ms",
-            "value": round(ms, 3),
-        }
-        for name, ms in timings
-    ]
+    if regression_levels:
+        # Strategy shard *does* contain at least one canonical alert
+        # level but no scenario row landed in REGRESSION_SCENARIOS —
+        # almost certainly a scenario-mapping issue (e.g. a renamed
+        # corpus fixture). Fall back to all timings so the dashboard
+        # still has data while the mapping gets fixed.
+        print(
+            "WARN: No regression-set benchmark rows matched smoke filter; "
+            "falling back to all parsed timings for benchmark-results.json.",
+            file=sys.stderr,
+        )
+        benchmark_results = [
+            {
+                "name": name,
+                "unit": "ms",
+                "value": round(ms, 3),
+            }
+            for name, ms in timings
+        ]
+    else:
+        # Strategy shard processed only non-canonical levels (e.g.
+        # `fast` / `greedy` / `btopt` groups on a main push). Emit an
+        # empty `benchmark-results.json` so github-action-benchmark
+        # has no rows to compare against the baseline — these levels
+        # land in the dashboard via `benchmark-relative.json` but
+        # never fire regression alerts. Previously the fallback
+        # repopulated every timing here, which silently re-expanded
+        # the alert surface to all 29 levels (CR review of #143).
+        print(
+            "INFO: shard processed no canonical alert levels "
+            f"(present={sorted(present_levels)}, "
+            f"alert_set={sorted(ALERT_LEVELS)}); writing empty "
+            "benchmark-results.json so this shard contributes no alerts.",
+            file=sys.stderr,
+        )
 
 if not ratios:
     print(

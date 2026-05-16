@@ -15,7 +15,7 @@ use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Hand-rolled tracking allocator wrapping `System` so the bench can
@@ -39,13 +39,22 @@ struct TrackingAllocator;
 static ALLOC_CURRENT: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_PEAK: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BASELINE: AtomicUsize = AtomicUsize::new(0);
+/// Gates the atomic-counter updates inside [`TrackingAllocator`]. By
+/// default `false`, so criterion's timing loops pay zero tracking
+/// overhead on alloc / dealloc / alloc_zeroed / realloc. Flipped to
+/// `true` only inside [`measure_peak_alloc`] (RAII guard) so the
+/// peak-memory sample is collected exclusively for the wrapped
+/// workload. Without this gate the per-alloc atomic add/sub biases
+/// every Rust-side throughput number — CR + Copilot both flagged this
+/// during PR #143 review.
+static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded to the system allocator unchanged; the
         // tracking just observes the size on success.
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
+        if !ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
             let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
             // `fetch_max` on the new live size keeps the high-water
             // mark current without an extra load+compare.
@@ -58,14 +67,22 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         // SAFETY: caller guarantees the pointer/layout pair came from
         // a matching `alloc` call.
         unsafe { System.dealloc(ptr, layout) };
-        ALLOC_CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
+        // Skip the decrement when tracking is disabled. The pair is
+        // self-consistent because each measure_peak_alloc window
+        // observes only allocations whose matching free also happens
+        // inside the same window; allocations created before the
+        // window are not counted on alloc and not subtracted on free,
+        // so the live-bytes counter stays balanced.
+        if TRACKING_ENABLED.load(Ordering::Relaxed) {
+            ALLOC_CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded to the system allocator unchanged; the
         // tracking just observes the size on success.
         let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
+        if !ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
             let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
             ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
         }
@@ -77,7 +94,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         // tracking adjusts the live count by the size delta when the
         // new allocation succeeds.
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
+        if !new_ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
             let old = layout.size();
             if new_size >= old {
                 let diff = new_size - old;
@@ -118,7 +135,20 @@ impl PeakAllocTracker {
 }
 
 fn measure_peak_alloc<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    /// RAII guard so a panic inside `f` (or an early return) still
+    /// flips `TRACKING_ENABLED` back to `false`. Without this a
+    /// panicking workload would leave tracking on for every
+    /// subsequent allocation in the process — including criterion's
+    /// post-panic teardown.
+    struct TrackingGuard;
+    impl Drop for TrackingGuard {
+        fn drop(&mut self) {
+            TRACKING_ENABLED.store(false, Ordering::Relaxed);
+        }
+    }
     PeakAllocTracker::reset();
+    TRACKING_ENABLED.store(true, Ordering::Relaxed);
+    let _guard = TrackingGuard;
     let result = f();
     let peak = PeakAllocTracker::peak_since_reset();
     (result, peak)
@@ -311,20 +341,60 @@ fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
         let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
         assert!(zstd_sys::ZSTD_isError(rc) == 0, "setPledgedSrcSize failed");
 
-        let cap = zstd_sys::ZSTD_compressBound(input.len());
-        let mut output = vec![0u8; cap];
-        let written = zstd_sys::ZSTD_compress2(
-            cctx,
-            output.as_mut_ptr() as *mut core::ffi::c_void,
-            output.len(),
-            input.as_ptr() as *const core::ffi::c_void,
-            input.len(),
-        );
-        assert!(
-            zstd_sys::ZSTD_isError(written) == 0,
-            "ZSTD_compress2 failed (code = {written})"
-        );
-        output.truncate(written);
+        // Stream via `ZSTD_compressStream2` into a growing `Vec` so
+        // the output buffer profile matches the throughput path
+        // (`zstd::stream::Encoder::new(Vec::new(), ...)` + `write_all`
+        // + `finish`), which Copilot flagged: a `ZSTD_compress2`
+        // one-shot pre-allocates `ZSTD_compressBound(input.len())`
+        // and would inflate `ffi_peak_alloc_bytes` over the worst-case
+        // bound even when the actual compressed output is much smaller.
+        // Growing the Vec on each flush keeps the two paths comparing
+        // the same FFI encode shape.
+        let recommended_in = zstd_sys::ZSTD_CStreamInSize();
+        let recommended_out = zstd_sys::ZSTD_CStreamOutSize();
+        let mut output: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; recommended_out];
+        let mut in_pos: usize = 0;
+        loop {
+            let chunk_end = (in_pos + recommended_in).min(input.len());
+            let mut zin = zstd_sys::ZSTD_inBuffer {
+                src: input.as_ptr() as *const core::ffi::c_void,
+                size: chunk_end,
+                pos: in_pos,
+            };
+            let mode = if chunk_end == input.len() {
+                zstd_sys::ZSTD_EndDirective::ZSTD_e_end
+            } else {
+                zstd_sys::ZSTD_EndDirective::ZSTD_e_continue
+            };
+            loop {
+                let mut zout = zstd_sys::ZSTD_outBuffer {
+                    dst: chunk.as_mut_ptr() as *mut core::ffi::c_void,
+                    size: chunk.len(),
+                    pos: 0,
+                };
+                let remaining = zstd_sys::ZSTD_compressStream2(cctx, &mut zout, &mut zin, mode);
+                assert!(
+                    zstd_sys::ZSTD_isError(remaining) == 0,
+                    "ZSTD_compressStream2 failed (code = {remaining})"
+                );
+                output.extend_from_slice(&chunk[..zout.pos]);
+                // `mode == ZSTD_e_end`: keep flushing until libzstd
+                // reports 0 (frame complete). For `ZSTD_e_continue`,
+                // exit once the input chunk is fully consumed.
+                let frame_complete =
+                    matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) && remaining == 0;
+                let chunk_consumed = matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_continue)
+                    && zin.pos == zin.size;
+                if frame_complete || chunk_consumed {
+                    break;
+                }
+            }
+            in_pos = zin.pos;
+            if in_pos == input.len() && matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) {
+                break;
+            }
+        }
 
         zstd_sys::ZSTD_freeCCtx(cctx);
         output
