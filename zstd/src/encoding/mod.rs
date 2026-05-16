@@ -92,6 +92,34 @@ use alloc::vec::Vec;
 
 pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
 
+/// Donor-parity worst-case compressed-size bound for `src_size`
+/// uncompressed bytes, mirroring `ZSTD_COMPRESSBOUND` in
+/// `lib/zstd.h`:
+///
+/// ```text
+/// ZSTD_COMPRESSBOUND(srcSize) =
+///     srcSize
+///   + (srcSize >> 8)
+///   + (srcSize < 128 KB ? (128 KB - srcSize) >> 11 : 0)
+/// ```
+///
+/// Used to pre-size the output `Vec` in [`compress_to_vec`] so the
+/// destination never reallocates inside the measured window. Without
+/// this, `Vec::push` growth doubles in powers of two and pins
+/// `~2 × final_compressed_size` resident at the last realloc, which
+/// shows up as ~1 MiB of peak-RSS noise on 1 MiB inputs and prevents
+/// FFI-parity on the memory bench.
+#[inline]
+pub(crate) const fn compress_bound(src_size: usize) -> usize {
+    const SMALL_INPUT_THRESHOLD: usize = 128 * 1024;
+    let tail = if src_size < SMALL_INPUT_THRESHOLD {
+        (SMALL_INPUT_THRESHOLD - src_size) >> 11
+    } else {
+        0
+    };
+    src_size + (src_size >> 8) + tail
+}
+
 /// Convenience function to compress some source into a target without reusing any resources of the compressor
 /// ```rust
 /// use structured_zstd::encoding::{compress, CompressionLevel};
@@ -121,11 +149,26 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
     let mut source = source;
     let mut input = Vec::new();
     source.read_to_end(&mut input).unwrap();
+    compress_slice_to_vec(input.as_slice(), level)
+}
 
-    let mut vec = Vec::new();
+/// Compress a contiguous byte slice into a fresh `Vec<u8>` without
+/// the input-buffering step that [`compress_to_vec`] performs to
+/// adapt a `Read` source. Donor-parity peak-memory shape: the input
+/// is read by reference and the output is pre-sized to
+/// [`compress_bound`] so neither side incurs an intermediate copy or
+/// realloc-doubling spike inside the measured window.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
+/// let compressed = compress_slice_to_vec(data, CompressionLevel::Fastest);
+/// ```
+pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> {
+    let mut vec = Vec::with_capacity(compress_bound(source.len()));
     let mut frame_enc = FrameCompressor::new(level);
-    frame_enc.set_source_size_hint(input.len() as u64);
-    frame_enc.set_source(input.as_slice());
+    frame_enc.set_source_size_hint(source.len() as u64);
+    frame_enc.set_source(source);
     frame_enc.set_drain(&mut vec);
     frame_enc.compress();
     vec
