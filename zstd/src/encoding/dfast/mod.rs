@@ -467,12 +467,21 @@ impl DfastMatchGenerator {
             let abs_ip0 = current_abs_start + ip0;
             let lit_len_ip0 = ip0 - literals_start;
 
-            if ip2 + DFAST_MIN_MATCH_LEN <= current_len {
-                let abs_ip2 = current_abs_start + ip2;
-                let lit_len_ip2 = ip2 - literals_start;
-                if let Some(rep) = self.repcode_candidate(abs_ip2, lit_len_ip2)
+            // Donor parity (`zstd_double_fast.c:190`): repcode peek is
+            // at `ip + 1`, not `ip + 2`. The ip+2 form (kept from an
+            // earlier 4-slot bucket era) gates the 1-literal-prefix
+            // rep on the next iteration's `best_match` at ip+1, but
+            // that path only fires when no hash match was found at
+            // ip+0 — a strictly weaker condition than donor's
+            // unconditional `ip+1` peek. Folding the peek back to ip+1
+            // matches donor's exact match-shape preference and pulls
+            // in the 1-literal rep coverage we were missing.
+            if ip1 + DFAST_MIN_MATCH_LEN <= current_len {
+                let abs_ip1 = current_abs_start + ip1;
+                let lit_len_ip1 = ip1 - literals_start;
+                if let Some(rep) = self.repcode_candidate(abs_ip1, lit_len_ip1)
                     && rep.start >= current_abs_start + literals_start
-                    && rep.start <= abs_ip2
+                    && rep.start <= abs_ip1
                 {
                     let start = self.emit_candidate(
                         current_abs_start,
