@@ -29,6 +29,16 @@ use super::match_table::helpers::{
 use super::match_table::storage::check_stream_abs_headroom;
 use super::opt::types::MatchCandidate;
 
+/// Donor `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
+/// width any hash / equality check in the dfast hot path reads at once.
+/// Loop guards must stop scanning when fewer than `HASH_READ_SIZE` bytes
+/// remain ahead of the probe cursor, matching donor `ilimit = iend -
+/// HASH_READ_SIZE`. The `DFAST_MIN_MATCH_LEN = 5` floor is the match
+/// acceptance threshold, NOT a safe loop bound — using it as the loop
+/// guard reads up to 3 bytes past the live history end and is UB on a
+/// raw pointer load.
+const HASH_READ_SIZE: usize = 8;
+
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-block length queue. Previously held the raw input
@@ -226,8 +236,20 @@ impl DfastMatchGenerator {
 
     /// Slice of bytes from the most recently appended block. Returns
     /// the trailing `last_block_len` bytes of `history`.
+    ///
+    /// # Panics
+    /// Panics if `window_blocks` is empty (no block has been ingested yet).
+    /// Callers — `skip_matching`, `skip_matching_dense`, `start_matching`,
+    /// `emit_trailing_literals` — all run inside the block-encoding loop
+    /// after at least one `add_data`, so an empty `window_blocks` here
+    /// would be a producer bug and should fail loudly rather than silently
+    /// return an empty slice (which would let the matcher operate on
+    /// zero-length data and mask the upstream invariant violation).
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        let last_len = *self
+            .window_blocks
+            .back()
+            .expect("get_last_space: window_blocks empty — caller invoked before add_data");
         let start = self.history.len() - last_len;
         &self.history[start..]
     }
@@ -253,6 +275,20 @@ impl DfastMatchGenerator {
         reuse_space(data);
     }
 
+    /// Trim retained blocks until the window fits `max_window_size`.
+    ///
+    /// The `_reuse_space` closure parameter is intentionally a no-op for
+    /// `DfastMatchGenerator`: this backend no longer retains per-block
+    /// `Vec<u8>` storage (history is the sole byte buffer; `add_data`
+    /// returns each input Vec to the caller eagerly), so there is no
+    /// buffer to recycle on eviction. The parameter is retained for
+    /// signature uniformity with `MatchGenerator::trim_to_window`,
+    /// `RowMatchGenerator::trim_to_window`, and
+    /// `HcMatchGenerator::trim_to_window`, where it does fire — keeping
+    /// the cross-backend dispatch in `match_generator.rs` uniform avoids
+    /// per-variant trim branches at the call site. The eviction byte
+    /// count callers need is derived from the `window_size` delta
+    /// before/after this call, not from the closure.
     pub(crate) fn trim_to_window(&mut self, mut _reuse_space: impl FnMut(Vec<u8>)) {
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
@@ -346,10 +382,17 @@ impl DfastMatchGenerator {
         //    the dynamic bound is `current_len` itself — the `while
         //    pos + DFAST_MIN_MATCH_LEN <= current_len` guard keeps
         //    every offset within that bound regardless of how the
-        //    caller sized `max_window_size`. In production this also
-        //    happens to be `≤ HC_BLOCKSIZE_MAX (128 KiB)` because the
-        //    frame compressor never hands out larger blocks, but the
-        //    safety argument above does not rely on that limit.
+        //    caller sized `max_window_size`. The general path's
+        //    `best_match` → `hash_candidate` chain uses SAFE slicing
+        //    (`data[..8].try_into()`) which panics on a short slice
+        //    rather than reading uninitialised bytes — UB-free even
+        //    when this guard lets `pos` land within 3 bytes of the
+        //    block tail. The fast loop has stricter `+ HASH_READ_SIZE`
+        //    guards because it does raw-pointer `read_unaligned` for
+        //    speed; see `start_matching_fast_loop`. In production this
+        //    also happens to be `≤ HC_BLOCKSIZE_MAX (128 KiB)` because
+        //    the frame compressor never hands out larger blocks, but
+        //    the safety argument above does not rely on that limit.
         // 2. Absolute-position arithmetic (`current_abs_start + pos`):
         //    `current_abs_start` is the frame-lifetime cursor and
         //    advances with total bytes processed, NOT with the
@@ -438,15 +481,25 @@ impl DfastMatchGenerator {
         let mut literals_start = 0usize;
 
         'outer: loop {
-            // Outer-iter precondition: at least MIN_MATCH bytes ahead of pos.
-            if pos + DFAST_MIN_MATCH_LEN > current_len {
+            // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
+            // ahead of `pos` so the unconditional 8-byte `u64` load below
+            // is in-bounds for the live history buffer. `DFAST_MIN_MATCH_LEN
+            // = 5` is the match acceptance threshold and is NOT a safe
+            // load bound — using it here read up to 3 bytes past
+            // `history.len()` on tiny blocks (CI fuzz `interop` crash,
+            // 7-byte input).
+            if pos + HASH_READ_SIZE > current_len {
                 break 'outer;
             }
             let mut step = 1usize;
             let mut next_step_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
             let mut ip0 = pos;
             let mut ip1 = ip0 + step;
-            if ip1 + DFAST_MIN_MATCH_LEN > current_len {
+            // Same `HASH_READ_SIZE` rationale for `ip1`: the inner loop
+            // pre-loads 8 bytes at `concat_idx1` for the `hl1` precompute
+            // and the `_search_next_long` retry, so `ip1 + 8 <= current_len`
+            // must hold before we enter.
+            if ip1 + HASH_READ_SIZE > current_len {
                 break 'outer;
             }
 
@@ -462,20 +515,17 @@ impl DfastMatchGenerator {
 
             // Pre-compute long hash at ip0 ONCE per outer iter.
             // `concat_idx = (current_abs_start + ip0) - history_abs_start`
-            // is the byte offset within `live_history`. `add_data` keeps
-            // `current_abs_start..current_abs_start + current_len` always
-            // inside live history with at least 8 bytes of headroom beyond
-            // `current_len` for `add_data`'s scratch (the loop guards
-            // `ip{0,1} + MIN <= current_len`, MIN >= 5, plus we read 8
-            // bytes — fine because the underlying buffer pads).
+            // is the byte offset within `live_history`.
             let mut hl0_idx;
             let mut idxl0;
             // SAFETY: `current_abs_start + ip0 >= history_abs_start` (donor
             // invariant: ip is in current block, which is in live history).
             // The 8-byte unaligned load on `concat[concat_idx..]` is safe
-            // because `concat_idx + 8 <= concat_len` is implied by
-            // `ip0 + DFAST_MIN_MATCH_LEN <= current_len` (>= 5) plus the
-            // padding `add_data` reserves past `current_len`.
+            // because the outer loop guards above enforce
+            // `ip0 + HASH_READ_SIZE <= current_len`, and `current_abs_start
+            // + current_len - history_abs_start <= concat_len` (live history
+            // contains the full current block plus any retained earlier
+            // blocks), giving `concat_idx + 8 <= concat_len`.
             unsafe {
                 let concat_idx = (current_abs_start + ip0) - history_abs_start;
                 let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
@@ -727,7 +777,7 @@ impl DfastMatchGenerator {
                 ip1 += step;
                 hl0_idx = hl1_idx;
                 idxl0 = idxl1;
-                if ip1 + DFAST_MIN_MATCH_LEN > current_len {
+                if ip1 + HASH_READ_SIZE > current_len {
                     break 'inner;
                 }
             }
@@ -1120,7 +1170,7 @@ impl DfastMatchGenerator {
         let candidate_idx = candidate_pos - history_abs_start;
         // Cheap mismatch gate before the SIMD walk: if the first byte
         // doesn't match there's no way `common_prefix_len` reaches the
-        // 6-byte minimum.
+        // `DFAST_MIN_MATCH_LEN = 5` byte minimum.
         if concat[candidate_idx] != concat[current_idx] {
             return None;
         }
