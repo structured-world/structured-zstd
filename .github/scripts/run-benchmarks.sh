@@ -656,7 +656,7 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
 
 lines.extend([
     "",
-    "## Buffer Size Estimates (Input + Output)",
+    "## Peak Allocation Bytes",
     "",
     "| Scenario | Label | Level | Stage | Rust peak alloc bytes | C peak alloc bytes |",
     "| --- | --- | --- | --- | ---: | ---: |",

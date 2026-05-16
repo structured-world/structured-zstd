@@ -14,7 +14,6 @@ mod support;
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -134,32 +133,194 @@ use support::{
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
-fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)
-        .expect("failed to create zstd stream encoder");
-    encoder
-        .include_checksum(cfg!(feature = "hash"))
-        .expect("failed to configure zstd checksum flag");
-    encoder
-        .include_contentsize(true)
-        .expect("failed to configure zstd content-size flag");
-    encoder
-        .set_pledged_src_size(Some(input.len() as u64))
-        .expect("failed to configure zstd pledged source size");
-    // Keep framing comparable to the Rust path only for tiny sources. For
-    // larger inputs, keep the level/default C sizing so parity benches compare
-    // similar compression settings.
-    if input.len() <= (1 << 14) {
-        encoder
-            .window_log(14)
-            .expect("failed to configure zstd window_log");
+/// Custom-allocator shim for libzstd. Without this libzstd's
+/// `ZSTD_CCtx` / hash table / chain table / workspace allocations
+/// go straight to libc `malloc` and are invisible to the Rust
+/// `#[global_allocator]` wrapper. CR review of PR #143 flagged
+/// this as the root cause of the misleadingly small
+/// `ffi_peak_alloc_bytes` numbers in the first baseline pass —
+/// the FFI side was reporting only the Rust-owned output `Vec`
+/// without the actual C heap. Wiring `ZSTD_customMem` so its
+/// alloc/free hooks route through `alloc::alloc::alloc` /
+/// `alloc::alloc::dealloc` makes `TrackingAllocator` observe
+/// every libzstd allocation, restoring apples-to-apples
+/// comparison with `rust_peak_alloc_bytes`.
+///
+/// Layout: each block is over-allocated by `HEADER_BYTES` so the
+/// allocation size can be recovered at free time (libzstd's
+/// `customFree(opaque, addr)` does not receive a size). The
+/// header sits at `ptr` and `ptr + HEADER_BYTES` is returned to
+/// libzstd. `align = 16` covers SSE/NEON requirements; libzstd
+/// internally over-aligns via `ZSTD_alignedAlloc` when it needs
+/// tighter alignment, so the customMem allocator only has to
+/// guarantee 16.
+mod ffi_tracking_alloc {
+    use core::ffi::c_void;
+    use core::ptr;
+    use std::alloc::Layout;
+
+    const HEADER_BYTES: usize = 16;
+    const ALIGN: usize = 16;
+
+    /// SAFETY: libzstd contract — `size` is the request, return
+    /// value is either `null_mut` or a freshly allocated block of
+    /// at least `size` bytes whose pointer is `ALIGN`-aligned.
+    pub(super) unsafe extern "C" fn alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
+        let total = match size.checked_add(HEADER_BYTES) {
+            Some(t) => t,
+            None => return ptr::null_mut(),
+        };
+        let layout = match Layout::from_size_align(total, ALIGN) {
+            Ok(l) => l,
+            Err(_) => return ptr::null_mut(),
+        };
+        // SAFETY: `Layout` validated above; `alloc::alloc::alloc`
+        // routes through `#[global_allocator] = TrackingAllocator`,
+        // which forwards to `System` and updates the peak counters.
+        let raw = unsafe { std::alloc::alloc(layout) };
+        if raw.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: the first `HEADER_BYTES` of `raw` are owned by
+        // this allocator and large enough to hold a `usize`.
+        unsafe { ptr::write(raw as *mut usize, size) };
+        unsafe { raw.add(HEADER_BYTES) as *mut c_void }
     }
-    encoder
-        .write_all(input)
-        .expect("failed to write zstd stream input");
-    encoder
-        .finish()
-        .expect("failed to finalize zstd stream encoding")
+
+    /// SAFETY: libzstd contract — `address` is either `null` or
+    /// a pointer previously returned by `alloc` above; the size
+    /// header at `address - HEADER_BYTES` was written by `alloc`.
+    pub(super) unsafe extern "C" fn free(_opaque: *mut c_void, address: *mut c_void) {
+        if address.is_null() {
+            return;
+        }
+        // SAFETY: pointer arithmetic is valid because `address`
+        // came from `alloc` above, which placed the size header
+        // exactly `HEADER_BYTES` before the returned pointer.
+        let header_ptr = unsafe { (address as *mut u8).sub(HEADER_BYTES) };
+        let size = unsafe { ptr::read(header_ptr as *const usize) };
+        let total = size + HEADER_BYTES;
+        let layout = Layout::from_size_align(total, ALIGN).expect("layout must round-trip");
+        // SAFETY: the layout matches the one passed to `alloc`,
+        // so `dealloc` updates the tracker symmetrically and
+        // releases the underlying System allocation.
+        unsafe { std::alloc::dealloc(header_ptr, layout) };
+    }
+}
+
+fn ffi_custom_mem() -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
+    zstd::zstd_safe::zstd_sys::ZSTD_customMem {
+        customAlloc: Some(ffi_tracking_alloc::alloc),
+        customFree: Some(ffi_tracking_alloc::free),
+        opaque: core::ptr::null_mut(),
+    }
+}
+
+fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
+    // Path through raw `zstd_sys` with `ZSTD_createCCtx_advanced`
+    // so the CCtx + every internal libzstd allocation (hash table,
+    // chain table, working buffers, ...) lands in the
+    // `TrackingAllocator` accounting via the customMem hooks.
+    // `zstd::stream::Encoder` uses `ZSTD_createCCtx()` (default
+    // libc malloc), so we cannot reuse it for the
+    // memory-instrumented FFI path.
+    use zstd::zstd_safe::zstd_sys;
+    // SAFETY: customMem hooks are valid for the lifetime of the
+    // resulting CCtx; we always `ZSTD_freeCCtx` it before the
+    // current scope ends so the hooks outlive every libzstd call.
+    let cctx = unsafe { zstd_sys::ZSTD_createCCtx_advanced(ffi_custom_mem()) };
+    assert!(!cctx.is_null(), "ZSTD_createCCtx_advanced returned null");
+
+    unsafe {
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+            level,
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(rc) == 0,
+            "set compressionLevel failed"
+        );
+
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_checksumFlag,
+            if cfg!(feature = "hash") { 1 } else { 0 },
+        );
+        assert!(zstd_sys::ZSTD_isError(rc) == 0, "set checksumFlag failed");
+
+        let rc = zstd_sys::ZSTD_CCtx_setParameter(
+            cctx,
+            zstd_sys::ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            1,
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(rc) == 0,
+            "set contentSizeFlag failed"
+        );
+
+        // Match the previous comparable-framing tweak for tiny
+        // sources so a level-3 / small-payload comparison still
+        // sits on the same window size as before this refactor.
+        if input.len() <= (1 << 14) {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_windowLog,
+                14,
+            );
+            assert!(zstd_sys::ZSTD_isError(rc) == 0, "set windowLog failed");
+        }
+
+        let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
+        assert!(zstd_sys::ZSTD_isError(rc) == 0, "setPledgedSrcSize failed");
+
+        let cap = zstd_sys::ZSTD_compressBound(input.len());
+        let mut output = vec![0u8; cap];
+        let written = zstd_sys::ZSTD_compress2(
+            cctx,
+            output.as_mut_ptr() as *mut core::ffi::c_void,
+            output.len(),
+            input.as_ptr() as *const core::ffi::c_void,
+            input.len(),
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(written) == 0,
+            "ZSTD_compress2 failed (code = {written})"
+        );
+        output.truncate(written);
+
+        zstd_sys::ZSTD_freeCCtx(cctx);
+        output
+    }
+}
+
+fn ffi_decompress_via_custom_mem(compressed: &[u8], expected_len: usize) -> Vec<u8> {
+    // Mirror of `ffi_encode_all_aligned`'s rationale for the
+    // decode side: routes the `ZSTD_DCtx` + its internal buffers
+    // through the customMem hooks so `TrackingAllocator` sees
+    // every libzstd allocation on the FFI decode path.
+    use zstd::zstd_safe::zstd_sys;
+    // SAFETY: customMem hooks remain valid for the lifetime of
+    // the DCtx, which is freed before returning.
+    let dctx = unsafe { zstd_sys::ZSTD_createDCtx_advanced(ffi_custom_mem()) };
+    assert!(!dctx.is_null(), "ZSTD_createDCtx_advanced returned null");
+    unsafe {
+        let mut output = vec![0u8; expected_len];
+        let written = zstd_sys::ZSTD_decompressDCtx(
+            dctx,
+            output.as_mut_ptr() as *mut core::ffi::c_void,
+            output.len(),
+            compressed.as_ptr() as *const core::ffi::c_void,
+            compressed.len(),
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(written) == 0,
+            "ZSTD_decompressDCtx failed (code = {written})"
+        );
+        output.truncate(written);
+        zstd_sys::ZSTD_freeDCtx(dctx);
+        output
+    }
 }
 
 fn benchmark_scenarios_cached() -> &'static [Scenario] {
@@ -270,13 +431,11 @@ fn bench_decompress_source(
             target
         });
         let (_, ffi_peak_bytes) = measure_peak_alloc(|| {
-            let mut decoder = zstd::bulk::Decompressor::new().unwrap();
-            let mut output = Vec::with_capacity(expected_len);
-            let written = decoder
-                .decompress_to_buffer(compressed, &mut output)
-                .unwrap();
-            assert_eq!(written, expected_len);
-            output
+            // `zstd::bulk::Decompressor::new` uses `ZSTD_createDCtx()`
+            // (default malloc, invisible to TrackingAllocator). Use
+            // the customMem-aware path so the C heap is part of the
+            // peak. Same rationale as `ffi_encode_all_aligned`.
+            ffi_decompress_via_custom_mem(compressed, expected_len)
         });
         emit_memory_report(
             scenario,

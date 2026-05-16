@@ -54,11 +54,34 @@ pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;
-// Keep these aligned with the issue's zstd level-3/dfast target unless ratio
-// measurements show we can shrink them without regressing acceptance tests.
-pub(crate) const DFAST_HASH_BITS: usize = 20;
+// Donor `clevels.h:31` at level 3 large-input bucket sets `hashLog = 17`
+// (128 K slots × 4 bytes = 512 KiB hash table). We previously held a
+// 20-bit ceiling (1 M slots × 32 bytes per `[usize; 4]` = 32 MiB) which
+// inflated peak memory ~85× over donor at default level — the bench
+// matrix added in PR #143 surfaced 64 MB Rust vs 768 KB donor for the
+// two-table footprint on `decodecorpus-z000033`. Aligning the default
+// to donor's 17 brings hash-table memory in line and improves cache
+// locality of every lookup. `dfast_hash_bits_for_window` still clamps
+// the runtime value to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this
+// const is the upper bound rather than a fixed default.
+pub(crate) const DFAST_HASH_BITS: usize = 17;
 pub(crate) const DFAST_SEARCH_DEPTH: usize = 4;
-pub(crate) const DFAST_EMPTY_SLOT: usize = usize::MAX;
+/// Sentinel value for an empty slot in the `[u32; DFAST_SEARCH_DEPTH]`
+/// hash buckets. Real positions are stored as `(abs_pos -
+/// position_base + 1) as u32`, so `0` is reserved as the "empty"
+/// marker and a true relative offset of `0` never appears in the
+/// table. Mirrors the LDM table's `LdmEntry.offset == 0` convention
+/// (see `encoding/ldm/table.rs`) so both rebasing structures share
+/// one sentinel scheme.
+pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
+
+/// Guard band reserved above the high-water mark before triggering a
+/// rebase on the Dfast hash tables. When the next insert would push a
+/// relative offset above `u32::MAX - DFAST_REBASE_GUARD_BAND`, the
+/// table calls `reduce(GUARD_BAND)` to shift every slot down and
+/// advance `position_base` so future inserts stay inside the `u32`
+/// window. Same scheme as `encoding/ldm/table.rs`.
+pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
 pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 6;
 pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
 pub(crate) const DFAST_LOCAL_SKIP_TRIGGER: usize = 256;
@@ -7009,8 +7032,9 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
         "fixture must make the boundary start long-hashable"
     );
     let long_hash = matcher.hash8(&live[target_rel..]);
+    let target_slot = matcher.pack_slot(target_abs_pos);
     assert!(
-        matcher.long_hash[long_hash].contains(&target_abs_pos),
+        matcher.long_hash[long_hash].contains(&target_slot),
         "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
@@ -7035,8 +7059,9 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.hash4(&live[target_rel..]);
+    let target_slot = matcher.pack_slot(target_abs_pos);
     assert!(
-        matcher.short_hash[short_hash].contains(&target_abs_pos),
+        matcher.short_hash[short_hash].contains(&target_slot),
         "tail seeding must include the last 4-byte-hashable start"
     );
 }
@@ -7060,8 +7085,9 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.hash4(&live[target_rel..]);
+    let target_slot = matcher.pack_slot(target_abs_pos);
     assert!(
-        matcher.short_hash[short_hash].contains(&target_abs_pos),
+        matcher.short_hash[short_hash].contains(&target_slot),
         "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
     );
 }
