@@ -31,7 +31,14 @@ use super::opt::types::MatchCandidate;
 
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
-    pub(crate) window: VecDeque<Vec<u8>>,
+    /// Per-block length queue. Previously held the raw input
+    /// `VecDeque<Vec<u8>>` for each appended block — that duplicated
+    /// every byte in `history`, doubling the input footprint relative
+    /// to donor on the hot path. Now stores only the lengths so the
+    /// matcher can still pop blocks block-by-block on eviction
+    /// (advancing `history_start` by each pop) while the actual byte
+    /// storage lives once, in `history`.
+    pub(crate) window_blocks: VecDeque<usize>,
     pub(crate) window_size: usize,
     // We keep a contiguous searchable history to avoid rebuilding and reseeding
     // the matcher state from disjoint block buffers on every block.
@@ -97,7 +104,7 @@ impl DfastMatchGenerator {
     pub(crate) fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
-            window: VecDeque::new(),
+            window_blocks: VecDeque::new(),
             window_size: 0,
             history: Vec::new(),
             history_start: 0,
@@ -203,7 +210,7 @@ impl DfastMatchGenerator {
         self.position_base += reducer as usize;
     }
 
-    pub(crate) fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn reset(&mut self, mut _reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
@@ -214,45 +221,55 @@ impl DfastMatchGenerator {
             self.short_hash.fill(DFAST_EMPTY_SLOT);
             self.long_hash.fill(DFAST_EMPTY_SLOT);
         }
-        for mut data in self.window.drain(..) {
-            data.resize(data.capacity(), 0);
-            reuse_space(data);
-        }
+        // No Vec<u8> blocks to recycle anymore — `add_data` returns
+        // each input Vec to the caller eagerly. Keep the
+        // `reuse_space` closure parameter so the cross-matcher API
+        // shape stays uniform across HC / Row / Dfast (callers pass
+        // the same pool helper to every reset/add_data path).
+        self.window_blocks.clear();
     }
 
+    /// Slice of bytes from the most recently appended block. Returns
+    /// the trailing `last_block_len` bytes of `history`.
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        self.window.back().unwrap().as_slice()
+        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        let start = self.history.len() - last_len;
+        &self.history[start..]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.window_blocks.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         self.compact_history();
         self.history.extend_from_slice(&data);
         self.window_size += data.len();
-        self.window.push_back(data);
+        self.window_blocks.push_back(data.len());
+        // Eager Vec recycle: the only purpose of holding the input Vec
+        // was to return it to the caller's pool on eviction. Now that
+        // `history` owns the bytes, hand the Vec back immediately so
+        // the pool grows on first add instead of waiting for window
+        // overflow.
+        reuse_space(data);
     }
 
-    pub(crate) fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn trim_to_window(&mut self, mut _reuse_space: impl FnMut(Vec<u8>)) {
         while self.window_size > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.window_blocks.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
     }
 
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_hash_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let tail_start = current_abs_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
@@ -286,7 +303,7 @@ impl DfastMatchGenerator {
 
     pub(crate) fn skip_matching_dense(&mut self) {
         self.ensure_hash_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = current_abs_start
@@ -301,7 +318,7 @@ impl DfastMatchGenerator {
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_hash_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
         if current_len == 0 {
             return;
         }
@@ -657,7 +674,7 @@ impl DfastMatchGenerator {
             current_abs_start + *literals_start,
             candidate.start + candidate.match_len,
         );
-        let current = self.window.back().unwrap().as_slice();
+        let current = self.get_last_space();
         let start = candidate.start - current_abs_start;
         let literals = &current[*literals_start..start];
         handle_sequence(Sequence::Triple {
@@ -679,8 +696,9 @@ impl DfastMatchGenerator {
         literals_start: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        if literals_start < self.window.back().unwrap().len() {
-            let current = self.window.back().unwrap().as_slice();
+        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        if literals_start < last_len {
+            let current = self.get_last_space();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });

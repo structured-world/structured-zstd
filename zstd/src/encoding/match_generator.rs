@@ -677,15 +677,14 @@ impl MatchGeneratorDriver {
                     });
                 }
                 super::strategy::BackendTag::Dfast => {
-                    let mut retired = Vec::new();
-                    self.dfast_matcher_mut().trim_to_window(|data| {
-                        evicted_bytes += data.len();
-                        retired.push(data);
-                    });
-                    for mut data in retired {
-                        data.resize(data.capacity(), 0);
-                        self.vec_pool.push(data);
-                    }
+                    // Dfast doesn't retain input Vecs anymore — `history`
+                    // is the only byte store. `trim_to_window` reports
+                    // evicted lengths via a no-op closure here; we still
+                    // need the eviction count for budget retirement.
+                    let dfast = self.dfast_matcher_mut();
+                    let pre = dfast.window_size;
+                    dfast.trim_to_window(|_| ());
+                    evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
                     let mut retired = Vec::new();
@@ -884,11 +883,11 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     DFAST_HASH_BITS
                 });
-                let vec_pool = &mut self.vec_pool;
-                dfast.reset(|mut data| {
-                    data.resize(data.capacity(), 0);
-                    vec_pool.push(data);
-                });
+                // Dfast no longer retains input Vecs (history is the
+                // sole byte store; add_data returns the Vec eagerly).
+                // `reset` callback is unused but kept for API uniformity
+                // across backend `reset` signatures.
+                dfast.reset(|_| ());
             }
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
@@ -6886,7 +6885,15 @@ fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
 }
 
 #[test]
-fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
+fn dfast_trim_to_window_evicts_oldest_block_by_length() {
+    // After the history-only storage refactor (#111 Phase 7c step 3),
+    // Dfast no longer retains input `Vec<u8>`s — the `history`
+    // contiguous buffer is the sole byte store, and `add_data`
+    // returns the input Vec to the caller's pool eagerly. So
+    // `trim_to_window` doesn't have anything to hand back to the
+    // closure (no Vec exists to give). The eviction is observable
+    // instead through `window_size` shrinking by the per-block
+    // length recorded in `window_blocks`.
     let mut matcher = DfastMatchGenerator::new(16);
 
     let mut first = Vec::with_capacity(64);
@@ -6897,18 +6904,26 @@ fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
     second.extend_from_slice(b"ijklmnop");
     matcher.add_data(second, |_| {});
 
+    assert_eq!(matcher.window_size, 16);
+    assert_eq!(matcher.window_blocks.len(), 2);
+
     matcher.max_window_size = 8;
 
-    let mut observed_evicted_len = None;
-    matcher.trim_to_window(|data| {
-        observed_evicted_len = Some(data.len());
+    let mut callback_fired = 0u32;
+    matcher.trim_to_window(|_| {
+        callback_fired += 1;
     });
 
     assert_eq!(
-        observed_evicted_len,
-        Some(8),
-        "trim callback must report evicted byte length, not backing capacity"
+        callback_fired, 0,
+        "callback must not fire under history-only storage"
     );
+    assert_eq!(
+        matcher.window_size, 8,
+        "exactly one 8-byte block must remain"
+    );
+    assert_eq!(matcher.window_blocks.len(), 1);
+    assert_eq!(matcher.history_abs_start, 8);
 }
 
 #[test]
@@ -7087,7 +7102,7 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     matcher.add_data(block, |_| {});
     matcher.ensure_hash_tables();
 
-    let current_len = matcher.window.back().unwrap().len();
+    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     let seed_start = current_len - DFAST_MIN_MATCH_LEN;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
@@ -7118,7 +7133,7 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     matcher.add_data(block, |_| {});
     matcher.ensure_hash_tables();
 
-    let current_len = matcher.window.back().unwrap().len();
+    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
 
