@@ -280,8 +280,15 @@ unsafe extern "C" fn ffi_alloc(
     }
     // SAFETY: opaque came from `FfiMemTracker::custom_mem`; per-CCtx
     // single-threaded access.
+    //
+    // Plain `+=`/`-=` (no saturating arithmetic): a single-CCtx
+    // measurement bench cannot realistically reach `usize::MAX` bytes
+    // of live libzstd state. If the counter ever did overflow, that's
+    // a real bug (alloc/free imbalance, mis-routed opaque pointer)
+    // and the panic surfaces it instead of silently freezing the
+    // counter at its max.
     let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
-    tracker.current = tracker.current.saturating_add(size);
+    tracker.current += size;
     if tracker.current > tracker.peak {
         tracker.peak = tracker.current;
     }
@@ -306,9 +313,11 @@ unsafe extern "C" fn ffi_free(opaque: *mut core::ffi::c_void, address: *mut core
     let layout = Layout::from_size_align(size + FFI_HEADER_BYTES, FFI_ALIGN)
         .expect("layout round-trips from ffi_alloc");
     // SAFETY: opaque is the same FfiMemTracker that `ffi_alloc` saw
-    // for this CCtx; single-threaded per-CCtx.
+    // for this CCtx; single-threaded per-CCtx. Plain `-=` for the same
+    // reason `ffi_alloc` uses plain `+=`: a free without a matching
+    // alloc would be a real bug, and panicking surfaces it.
     let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
-    tracker.current = tracker.current.saturating_sub(size);
+    tracker.current -= size;
     // SAFETY: header_ptr + layout matches the pair from `ffi_alloc`.
     unsafe { std::alloc::dealloc(header_ptr, layout) };
 }
@@ -543,6 +552,20 @@ fn bench_compress(c: &mut Criterion) {
                 // malloc/free precisely. Same `ffi_encode_to_vec` the
                 // timing loop below calls — only the customMem opt-in
                 // differs.
+                //
+                // Intentional asymmetry vs the Rust side: `ffi_tracker.peak`
+                // counts ONLY libzstd's customMem requests, NOT the
+                // Rust-owned `output: Vec<u8>` and `chunk: Vec<u8>`
+                // inside `ffi_encode_to_vec`. The Rust path's
+                // `compress_to_vec` allocates its output via the same
+                // system allocator, so on the FFI side we want only
+                // the libzstd-internal hash/chain/workspace memory —
+                // the apples-to-apples comparison for "what does
+                // libzstd cost over the Rust crate". Wrapping the
+                // whole FFI call in an RSS window would conflate the
+                // two and inflate the FFI metric with bookkeeping the
+                // Rust side doesn't pay either. See `emit_memory_report`
+                // for the full asymmetry note.
                 let mut ffi_tracker = FfiMemTracker::default();
                 let ffi_compressed =
                     ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, Some(&mut ffi_tracker));
@@ -640,16 +663,28 @@ fn bench_decompress_source(
         // sampling; FFI uses a per-DCtx customMem tracker. Both
         // observe the SAME decode call the timing loop below runs —
         // only the memory hook differs.
+        // `rust_window.finish()` MUST run before `target`/`decoder` drop
+        // so the final on-thread RSS sample sees their pages still
+        // resident. With the previous inner-block scope they were
+        // dropped first, the allocator could (and on macOS does) return
+        // memory to the OS before `finish` sampled — undercounting peak.
         let rust_window = rss::PeakWindow::start();
-        {
-            let mut target = vec![0u8; expected_len];
-            let mut decoder = FrameDecoder::new();
-            let written = decoder.decode_all(compressed, &mut target).unwrap();
-            assert_eq!(written, expected_len);
-            black_box(target);
-        }
+        let mut target = vec![0u8; expected_len];
+        let mut decoder = FrameDecoder::new();
+        let written = decoder.decode_all(compressed, &mut target).unwrap();
+        assert_eq!(written, expected_len);
         let rust_peak_rss_delta_bytes = rust_window.finish();
+        black_box(target);
 
+        // Same intentional asymmetry as the compress path: the FFI
+        // peak counts ONLY libzstd's customMem requests (DCtx workspace
+        // + window buffer), NOT the Rust-owned `ffi_target` output
+        // slice. The Rust decode path allocates its own `target` via
+        // the system allocator and we want both sides to compare
+        // libzstd-internal vs FrameDecoder-internal memory, not output
+        // bookkeeping. Wrapping the FFI decode in an RSS window would
+        // double-count the Rust-side output that's identical between
+        // both paths. See `emit_memory_report` for details.
         let mut ffi_tracker = FfiMemTracker::default();
         let mut ffi_target = vec![0u8; expected_len];
         let written = ffi_decompress_into(compressed, &mut ffi_target, Some(&mut ffi_tracker));
