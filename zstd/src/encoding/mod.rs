@@ -165,7 +165,21 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// let compressed = compress_slice_to_vec(data, CompressionLevel::Fastest);
 /// ```
 pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> {
-    let mut vec = Vec::with_capacity(compress_bound(source.len()));
+    // Initial capacity sized to a single output block, matching donor
+    // `ZSTD_CStreamOutSize()` (≈ `ZSTD_BLOCKSIZE_MAX` + headroom). For
+    // small inputs `compress_bound(src)` is smaller than this block —
+    // use the tighter bound to avoid over-allocation. For larger inputs
+    // the `Vec` grows via amortized doubling, with peak ≈ 2×current
+    // compressed size at the last realloc (donor streaming shape: the
+    // caller buffer is one block, not `ZSTD_compressBound(srcSize)`).
+    // Pre-allocating `compress_bound(src)` here would charge worst-case
+    // expansion against peak even on highly compressible inputs — on
+    // the 100 MiB `large-log-stream` scenario that single allocation
+    // dominated the encoder's measured footprint (`compress_bound` ≈
+    // 100.4 MiB pinned, actual compressed output ≪ 1 MiB).
+    const OUTPUT_BLOCK_CAP: usize = 128 * 1024;
+    let cap = compress_bound(source.len()).min(OUTPUT_BLOCK_CAP);
+    let mut vec = Vec::with_capacity(cap);
     let mut frame_enc = FrameCompressor::new(level);
     frame_enc.set_source_size_hint(source.len() as u64);
     frame_enc.set_source(source);
