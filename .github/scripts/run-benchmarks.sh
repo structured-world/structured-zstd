@@ -737,24 +737,29 @@ for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
         f'| {row["scenario"]} | {label} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
     )
 
-lines.extend([
-    "",
-    "## Peak Allocation Bytes",
-    "",
-    "Both columns measured by the same observer: the `compare_ffi_memory` "
-    "bench installs a `#[global_allocator]` tracking wrapper and routes "
-    "libzstd's `ZSTD_customMem` callbacks through it, so Rust-side and "
-    "FFI-side bytes share one counter and are directly comparable.",
-    "",
-    "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
-    "| --- | --- | --- | --- | ---: | ---: |",
-])
+# Skip the entire memory section on PR shards (no memory bench ran,
+# `memory_rows` is empty). The INFO log earlier in this script
+# announced the omission — emitting a heading + empty table here would
+# leave a confusing blank section in `benchmark-report.md`.
+if memory_rows:
+    lines.extend([
+        "",
+        "## Peak Allocation Bytes",
+        "",
+        "Both columns measured by the same observer: the `compare_ffi_memory` "
+        "bench installs a `#[global_allocator]` tracking wrapper and routes "
+        "libzstd's `ZSTD_customMem` callbacks through it, so Rust-side and "
+        "FFI-side bytes share one counter and are directly comparable.",
+        "",
+        "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
+        "| --- | --- | --- | --- | ---: | ---: |",
+    ])
 
-for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
-    label = markdown_table_escape(row["label"])
-    lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
-    )
+    for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
+        label = markdown_table_escape(row["label"])
+        lines.append(
+            f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
+        )
 
 lines.extend([
     "",
