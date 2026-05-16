@@ -41,12 +41,24 @@ jobs:
         # etc.), Rust-vs-FFI parity is broken — the Rust side ships
         # compiled differently than what a real downstream consumer
         # uses. Keep it strictly out of `compare_ffi`'s feature set.
+        #
+        # tomllib parsing (Python 3.11+, available on every supported
+        # runner) handles both single-line and multi-line TOML arrays,
+        # so a future `required-features = ["a", "b"]` reformat into a
+        # multi-line array can't sneak `bench_internals` past the gate.
         run: |
-          if awk '/^\[\[bench\]\]$/{b=""} /^name = /{n=$3} /^required-features =/{print n,$0}' zstd/Cargo.toml \
-              | grep -E 'compare_ffi.*bench_internals' >/dev/null; then
-            echo "::error::compare_ffi must NOT require bench_internals — would bias Rust-vs-FFI parity"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import sys, tomllib
+          with open("zstd/Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)
+          benches = {
+              bench.get("name"): bench.get("required-features", [])
+              for bench in cargo.get("bench", [])
+          }
+          if "bench_internals" in benches.get("compare_ffi", []):
+              print("::error::compare_ffi must NOT require bench_internals — would bias Rust-vs-FFI parity")
+              sys.exit(1)
+          PY
       - name: Gate — bench instrumentation must not leak into zstd/src/
         # Rationale: bench-only memory observation (RSS sampler,
         # FfiMemTracker, customMem hooks) lives in zstd/benches/.
