@@ -296,6 +296,14 @@ impl DfastMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
+        // `history_start` advanced past the evicted bytes, but they are
+        // still resident in the `Vec<u8>` until something compacts the
+        // prefix away. `add_data` would eventually call `compact_history`,
+        // but a caller that explicitly trims (e.g., to shed memory before
+        // a long idle period) wouldn't see the expected RSS drop until the
+        // next ingest. Compact eagerly so the released window is actually
+        // reclaimed.
+        self.compact_history();
     }
 
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
@@ -474,6 +482,19 @@ impl DfastMatchGenerator {
         // is re-snapshotted inside the outer loop because `emit_candidate`
         // → `insert_positions` → `ensure_room_for` can advance the rebase
         // base mid-frame.
+        //
+        // Rebase BEFORE any inner-loop slot pack. The hot loop computes
+        // `packed_curr = (abs_ip0 - position_base) as u32 + 1` and writes
+        // it straight into the hash tables, bypassing `insert_position`
+        // (which is where `ensure_room_for` normally fires). On a long
+        // stream of all-miss / non-hashable blocks the matcher can advance
+        // `current_abs_start` arbitrarily far without any per-byte insert,
+        // so `position_base` may be stale by `> u32::MAX`. The first
+        // fast-loop block after that would silently truncate `packed_curr`
+        // and poison both hash tables. The guard band in `ensure_room_for`
+        // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
+        // worth of positions, so a single call at function entry suffices.
+        self.ensure_room_for(current_abs_start + current_len - 1);
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
         let short_shift = 64 - self.short_hash_bits;
         let long_shift = 64 - self.long_hash_bits;

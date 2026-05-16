@@ -4859,8 +4859,12 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let hinted_short = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
-    // At the floor `MIN_HINTED_WINDOW_LOG`, set_hash_bits clamps short
-    // to MIN_WINDOW_LOG so both tables can equal the floor.
+    // At the hinted floor `MIN_HINTED_WINDOW_LOG`, the long table
+    // matches the hinted size; the short table sits one
+    // `DFAST_SHORT_HASH_BITS_DELTA` step below it, clamped at its own
+    // `MIN_WINDOW_LOG` floor. The one-bit split between the two tables
+    // is preserved — the short table is NOT pulled up to equal the
+    // long table at this floor.
     assert_eq!(hinted_long, 1 << MIN_HINTED_WINDOW_LOG);
     assert!(
         hinted_long < full_long && hinted_short < full_short,
