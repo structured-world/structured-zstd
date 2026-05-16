@@ -156,12 +156,28 @@ mod rss {
 
     impl PeakWindow {
         pub fn start() -> Self {
-            let baseline = current();
-            let peak = Arc::new(AtomicUsize::new(baseline));
+            // Spawn the sampler FIRST and take baseline AFTER its first
+            // sample. Snapshotting baseline before `thread::spawn` would
+            // leak the sampler thread's own startup RSS (stack pages
+            // faulted in, TLS init) into every delta — a fixed bias
+            // that's most visible on the small scenarios this bench
+            // reports. With baseline = first post-spawn sample, the
+            // sampler's footprint is absorbed by baseline and the
+            // returned delta reflects only the workload allocation.
+            let peak = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
+            let ready = Arc::new(AtomicBool::new(false));
             let peak_w = peak.clone();
             let stop_w = stop.clone();
+            let ready_w = ready.clone();
             let handle = thread::spawn(move || {
+                // First sample — establishes the post-spawn baseline
+                // observed by the main thread below.
+                let cur = current();
+                if cur > 0 {
+                    peak_w.store(cur, Ordering::Relaxed);
+                }
+                ready_w.store(true, Ordering::Relaxed);
                 while !stop_w.load(Ordering::Relaxed) {
                     let cur = current();
                     if cur > 0 {
@@ -170,6 +186,11 @@ mod rss {
                     thread::sleep(SAMPLE_INTERVAL);
                 }
             });
+            // Block until the sampler has stored its first sample.
+            while !ready.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            let baseline = peak.load(Ordering::Relaxed);
             PeakWindow {
                 peak,
                 stop,
