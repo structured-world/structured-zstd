@@ -38,13 +38,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use structured_zstd::decoding::FrameDecoder;
 use support::{LevelConfig, Scenario, benchmark_scenarios, supported_levels_filtered};
 
-/// Process-wide byte tracker. Counts EVERY allocation in this binary
-/// once `TRACKING_ENABLED` flips true — Rust-side `Vec`/`Box`/encoder
-/// internals via the `#[global_allocator]` route, FFI-side libzstd
-/// requests via the `ZSTD_customMem` callbacks (which themselves call
-/// `std::alloc::alloc`, going through this same wrapper). Both sides
-/// share the counter, so the reported peak is by construction
-/// symmetric — no cross-observer ambiguity.
+/// Process-wide byte tracker. Two allocation paths feed the SAME
+/// pair of atomic counters (`ALLOC_CURRENT` / `ALLOC_PEAK`) once
+/// `TRACKING_ENABLED` flips true:
+///
+/// - Rust-side `Vec`/`Box`/encoder internals route through this
+///   `TrackingAllocator` as `#[global_allocator]`. The `alloc` impl
+///   below counts `layout.size()` (the user-requested bytes only;
+///   the 16-byte tracking header is not counted).
+/// - FFI-side libzstd requests enter via the `ZSTD_customMem`
+///   callbacks (`ffi_alloc` / `ffi_free`). Those callbacks DELIBERATELY
+///   bypass this wrapper — they call `System.alloc` / `System.dealloc`
+///   directly and `fetch_add` / `fetch_sub` only the libzstd-requested
+///   `size` into the same counters. The bypass avoids double-counting
+///   the 16-byte size header the callbacks themselves prepend on top
+///   of libzstd's allocation.
+///
+/// Both paths land on identical accounting (user-requested bytes,
+/// nothing more), so cross-side comparison of `peak` is honest.
 struct TrackingAllocator;
 
 static ALLOC_CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -126,6 +137,48 @@ unsafe impl GlobalAlloc for TrackingAllocator {
             .expect("layout round-trips on dealloc");
         // SAFETY: `(raw, augmented)` matches the pair from `alloc` above.
         unsafe { System.dealloc(raw, augmented) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Override so `Vec` growth (the most common realloc shape in
+        // the bench's measured path) does not temporarily hold both
+        // old and new buffers live. The default `GlobalAlloc::realloc`
+        // does alloc+copy+dealloc, inflating `ALLOC_PEAK` by the
+        // full old-buffer size during the copy window — that's a
+        // measurement artefact, not real allocator behaviour, since
+        // `System.realloc` typically resizes in-place. Route through
+        // `System.realloc` and update counters by the size delta.
+        let header = tracker_header(layout);
+        // SAFETY: `ptr` came from `alloc`, header sits `header` bytes earlier.
+        let raw = unsafe { ptr.sub(header) };
+        let counted = unsafe { *raw } == FLAG_COUNTED;
+        let Some(new_total) = new_size.checked_add(header) else {
+            return core::ptr::null_mut();
+        };
+        let old_augmented = Layout::from_size_align(layout.size() + header, header)
+            .expect("layout round-trips on realloc");
+        // SAFETY: `(raw, old_augmented)` matches the `alloc` pair and
+        // alignment is preserved — `System.realloc` requires this.
+        let new_raw = unsafe { System.realloc(raw, old_augmented, new_total) };
+        if new_raw.is_null() {
+            return core::ptr::null_mut();
+        }
+        // `System.realloc` preserves bytes up to `min(old, new)`. The
+        // flag byte sits at offset 0, well within that prefix, so it
+        // survives unmodified — no need to rewrite it.
+        if counted {
+            if new_size >= layout.size() {
+                let delta = new_size - layout.size();
+                let prev = ALLOC_CURRENT.fetch_add(delta, Ordering::Relaxed);
+                ALLOC_PEAK.fetch_max(prev + delta, Ordering::Relaxed);
+            } else {
+                let delta = layout.size() - new_size;
+                ALLOC_CURRENT.fetch_sub(delta, Ordering::Relaxed);
+            }
+        }
+        // SAFETY: `new_raw + header` is aligned to `layout.align()` —
+        // header is a multiple of align (header = max(align, 16)).
+        unsafe { new_raw.add(header) }
     }
 }
 
@@ -328,6 +381,16 @@ fn ffi_decode(compressed: &[u8], expected_len: usize) -> Vec<u8> {
             compressed.len(),
         );
         assert!(zstd_sys::ZSTD_isError(written) == 0);
+        // Match the Rust decode side, which asserts exact length —
+        // a partial decode (incomplete frame, mid-stream truncation)
+        // would leave the customMem peak counter accurate but the
+        // metric meaningless against an incomplete result. Better to
+        // crash the bench than emit a misleading `ffi_peak_alloc_bytes`
+        // for a workload that didn't actually finish.
+        assert_eq!(
+            written, expected_len,
+            "ffi_decode wrote {written} bytes, expected {expected_len}",
+        );
         output.truncate(written);
         zstd_sys::ZSTD_freeDCtx(dctx);
         output
