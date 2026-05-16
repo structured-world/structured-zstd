@@ -39,73 +39,123 @@ struct TrackingAllocator;
 static ALLOC_CURRENT: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_PEAK: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BASELINE: AtomicUsize = AtomicUsize::new(0);
-/// Gates the atomic-counter updates inside [`TrackingAllocator`]. By
-/// default `false`, so criterion's timing loops pay zero tracking
-/// overhead on alloc / dealloc / alloc_zeroed / realloc. Flipped to
-/// `true` only inside [`measure_peak_alloc`] (RAII guard) so the
-/// peak-memory sample is collected exclusively for the wrapped
-/// workload. Without this gate the per-alloc atomic add/sub biases
-/// every Rust-side throughput number — CR + Copilot both flagged this
-/// during PR #143 review.
+/// Gates whether new allocations are *counted* in [`ALLOC_CURRENT`] /
+/// [`ALLOC_PEAK`]. By default `false`, so criterion's timing loops
+/// pay zero tracking overhead. Flipped to `true` only inside
+/// [`measure_peak_alloc`] (RAII guard) so the peak-memory sample is
+/// scoped to one wrapped workload.
+///
+/// Decoupling: the gate controls **what new allocations record**, NOT
+/// what `dealloc` subtracts. Per-allocation "was counted" metadata
+/// (encoded in [`TrackingAllocator`]'s header prefix below) drives
+/// the dealloc decrement, so a `Vec` allocated inside a measurement
+/// window and dropped outside still subtracts cleanly and
+/// `ALLOC_CURRENT` stays balanced across the whole process. Without
+/// that decoupling the counter would drift upward every sample
+/// (CR + Copilot both flagged this on PR #143; on i686 the 32-bit
+/// counter could wrap and corrupt later peak measurements).
 static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Minimum header width. Each allocation reserves
+/// `max(layout.align(), HEADER_MIN)` bytes before the user pointer
+/// to store one byte of "was this allocation counted?" metadata
+/// plus padding to the requested alignment. 16 bytes covers SSE /
+/// NEON alignment requirements without further fixup for the common
+/// `align <= 16` case (essentially every `Box` / `Vec<T>` we'll see
+/// in the bench process).
+const TRACKER_HEADER_MIN: usize = 16;
+
+/// Flag byte values stored at the start of each TrackingAllocator
+/// header. Encoded as `u8` so a single-byte read at the header offset
+/// recovers the counted bit on `dealloc` without atomic ops.
+const TRACKER_FLAG_UNCOUNTED: u8 = 0;
+const TRACKER_FLAG_COUNTED: u8 = 1;
+
+#[inline]
+fn tracker_header_size(layout: Layout) -> usize {
+    layout.align().max(TRACKER_HEADER_MIN)
+}
+
+#[inline]
+fn tracker_augmented_layout(layout: Layout) -> Option<Layout> {
+    let header = tracker_header_size(layout);
+    let total = layout.size().checked_add(header)?;
+    // Augmented allocation must satisfy the user's alignment AND fit
+    // a `TRACKER_HEADER_MIN`-byte header in front. `align.max(HEADER_MIN)`
+    // is a power of two (both inputs are powers of two from a valid
+    // `Layout`), so `Layout::from_size_align` accepts it.
+    Layout::from_size_align(total, layout.align().max(TRACKER_HEADER_MIN)).ok()
+}
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded to the system allocator unchanged; the
-        // tracking just observes the size on success.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
+        let Some(augmented) = tracker_augmented_layout(layout) else {
+            return core::ptr::null_mut();
+        };
+        let header = tracker_header_size(layout);
+        // SAFETY: `augmented` is a valid `Layout` (size + header,
+        // alignment ≥ header) so `System.alloc` either returns null
+        // or a pointer to at least `augmented.size()` bytes.
+        let raw = unsafe { System.alloc(augmented) };
+        if raw.is_null() {
+            return raw;
+        }
+        let counted = TRACKING_ENABLED.load(Ordering::Relaxed);
+        // SAFETY: `raw` is non-null and points to at least `header`
+        // bytes (header bytes are dedicated to the size flag + pad).
+        unsafe {
+            *raw = if counted {
+                TRACKER_FLAG_COUNTED
+            } else {
+                TRACKER_FLAG_UNCOUNTED
+            };
+        }
+        if counted {
             let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
             // `fetch_max` on the new live size keeps the high-water
             // mark current without an extra load+compare.
             ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
         }
-        ptr
+        // SAFETY: header bytes were just initialised; the user
+        // pointer (raw + header) is aligned to `layout.align()`
+        // because `header = max(align, HEADER_MIN)` is a multiple of
+        // `align`, and `raw` is aligned to `augmented.align()` =
+        // `max(align, HEADER_MIN) >= align`.
+        unsafe { raw.add(header) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: caller guarantees the pointer/layout pair came from
-        // a matching `alloc` call.
-        unsafe { System.dealloc(ptr, layout) };
-        // Skip the decrement when tracking is disabled. The pair is
-        // self-consistent because each measure_peak_alloc window
-        // observes only allocations whose matching free also happens
-        // inside the same window; allocations created before the
-        // window are not counted on alloc and not subtracted on free,
-        // so the live-bytes counter stays balanced.
-        if TRACKING_ENABLED.load(Ordering::Relaxed) {
+        let header = tracker_header_size(layout);
+        // SAFETY: `ptr` came from `alloc` above, which placed the
+        // flag byte exactly `header` bytes before this pointer.
+        let raw = unsafe { ptr.sub(header) };
+        let counted = unsafe { *raw } == TRACKER_FLAG_COUNTED;
+        // Always subtract for counted allocations regardless of the
+        // current TRACKING_ENABLED state. Without this the Vec
+        // returned from `measure_peak_alloc`'s closure would have its
+        // alloc counted (TRACKING_ENABLED=true at alloc time) but its
+        // dealloc skipped (TRACKING_ENABLED=false at drop time), and
+        // ALLOC_CURRENT would drift upward across every sample —
+        // eventually wrapping the 32-bit counter on i686.
+        if counted {
             ALLOC_CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
         }
+        let augmented = Layout::from_size_align(
+            layout.size() + header,
+            layout.align().max(TRACKER_HEADER_MIN),
+        )
+        .expect("alloc layout must round-trip on dealloc");
+        // SAFETY: `raw` + `augmented` match the pair passed to
+        // `System.alloc` by our `alloc` above.
+        unsafe { System.dealloc(raw, augmented) };
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded to the system allocator unchanged; the
-        // tracking just observes the size on success.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
-            let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
-            ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the realloc contract is honoured by `System.realloc`;
-        // tracking adjusts the live count by the size delta when the
-        // new allocation succeeds.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
-            let old = layout.size();
-            if new_size >= old {
-                let diff = new_size - old;
-                let prev = ALLOC_CURRENT.fetch_add(diff, Ordering::Relaxed);
-                ALLOC_PEAK.fetch_max(prev + diff, Ordering::Relaxed);
-            } else {
-                ALLOC_CURRENT.fetch_sub(old - new_size, Ordering::Relaxed);
-            }
-        }
-        new_ptr
-    }
+    // `alloc_zeroed` / `realloc` use the default `GlobalAlloc` impls
+    // (which call back into our `alloc` / `dealloc`), so they pick up
+    // the header-prefix accounting for free. The default `realloc`
+    // does `alloc + copy + dealloc` rather than passing through to
+    // `System.realloc`, which is the correct path under header
+    // accounting — `System.realloc` would invalidate our header.
 }
 
 #[global_allocator]
