@@ -677,19 +677,13 @@ impl MatchGeneratorDriver {
                     });
                 }
                 super::strategy::BackendTag::Dfast => {
-                    // Dfast doesn't retain input Vecs anymore — `history`
-                    // is the only byte store, so its `trim_to_window`
-                    // does NOT fire the `reuse_space` closure (no buffer
-                    // to recycle). We derive the eviction count from the
-                    // `window_size` delta before/after the trim; the
-                    // closure passed below is a deliberate no-op to keep
-                    // the cross-backend `trim_to_window` signature
-                    // uniform. Do NOT "simplify" by removing the closure
-                    // arg — `DfastMatchGenerator::trim_to_window` keeps
-                    // it for cross-backend dispatch in this match arm.
+                    // Dfast doesn't retain input Vecs — `history` is the
+                    // only byte store, so its `trim_to_window` has no
+                    // pool callback to invoke. Eviction byte count is
+                    // derived from the `window_size` delta before/after.
                     let dfast = self.dfast_matcher_mut();
                     let pre = dfast.window_size;
-                    dfast.trim_to_window(|_| ());
+                    dfast.trim_to_window();
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
@@ -800,11 +794,7 @@ impl Matcher for MatchGeneratorDriver {
                     // before constructing the replacement variant).
                     m.short_hash = Vec::new();
                     m.long_hash = Vec::new();
-                    let vec_pool = &mut self.vec_pool;
-                    m.reset(|mut data| {
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
+                    m.reset();
                 }
                 MatcherStorage::Row(m) => {
                     m.row_heads = Vec::new();
@@ -889,11 +879,10 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     DFAST_HASH_BITS
                 });
-                // Dfast no longer retains input Vecs (history is the
-                // sole byte store; add_data returns the Vec eagerly).
-                // `reset` callback is unused but kept for API uniformity
-                // across backend `reset` signatures.
-                dfast.reset(|_| ());
+                // Dfast holds no per-block input Vecs (history owns the
+                // bytes and `add_data` returns each Vec eagerly), so
+                // `reset` takes no `reuse_space` callback.
+                dfast.reset();
             }
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
@@ -3842,6 +3831,62 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 }
 
+/// Regression for the `DFAST_MIN_MATCH_LEN: 6 -> 5` drop. The fixture
+/// is built so the longest available match is EXACTLY 5 bytes — a
+/// matcher that still effectively requires a 6-byte floor would emit
+/// only literals here and the assertion would catch the silent
+/// 5-byte miss.
+///
+/// Layout (32 B): `"ABCDE????????????????????????ABCDE???"` — the
+/// trailing `"ABCDE"` repeats the 5-byte prefix at offset 28 and the
+/// 6th byte differs (`'?'` vs `'?'`... actually they are the same;
+/// fixture pinned below to make the mismatch explicit). A 5-byte
+/// match must be emitted; a 6-byte+ match must NOT.
+#[test]
+fn dfast_accepts_exact_five_byte_match() {
+    // Layout the input so that:
+    //   bytes 0..5   = "ABCDE"        (the match source)
+    //   bytes 5..28  = 23 filler bytes that do NOT start with 'A'
+    //   bytes 28..33 = "ABCDE"        (the 5-byte match site)
+    //   byte  33     = 'F'            (differs from byte 5 = '!')
+    // The longest available copy at position 28 is exactly 5 bytes:
+    // the byte at position 33 ('F') differs from the byte at position 5
+    // ('!'), so the forward extension stops at length 5.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"ABCDE"); // 0..5
+    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
+    data.extend_from_slice(b"ABCDE"); // 28..33
+    data.push(b'F'); // 33: forces forward extension to stop at length 5
+    assert_eq!(data.len(), 34);
+
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    matcher.add_data(data.clone(), |_| {});
+
+    let mut saw_five_byte_match = false;
+    let mut saw_longer_match = false;
+    matcher.start_matching(|seq| {
+        if let Sequence::Triple {
+            offset, match_len, ..
+        } = seq
+        {
+            if offset == 28 && match_len == 5 {
+                saw_five_byte_match = true;
+            } else if offset == 28 && match_len > 5 {
+                saw_longer_match = true;
+            }
+        }
+    });
+
+    assert!(
+        saw_five_byte_match,
+        "dfast must accept the exact-5-byte match — a 6-byte floor would skip it"
+    );
+    assert!(
+        !saw_longer_match,
+        "fixture pinned to length 5 — byte 33 ('F') must terminate the extension"
+    );
+}
+
 #[test]
 fn driver_switches_backends_and_initializes_dfast_via_reset() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
@@ -4866,6 +4911,16 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     // is preserved — the short table is NOT pulled up to equal the
     // long table at this floor.
     assert_eq!(hinted_long, 1 << MIN_HINTED_WINDOW_LOG);
+    let expected_hinted_short_bits = (MIN_HINTED_WINDOW_LOG as usize)
+        .saturating_sub(DFAST_SHORT_HASH_BITS_DELTA)
+        .max(MIN_WINDOW_LOG as usize);
+    assert_eq!(
+        hinted_short,
+        1 << expected_hinted_short_bits,
+        "short table must sit one DFAST_SHORT_HASH_BITS_DELTA below the long table \
+         (clamped at MIN_WINDOW_LOG) — a regression that pulls it up to the long-table \
+         floor would still satisfy the `< full_short` bound below and slip through"
+    );
     assert!(
         hinted_long < full_long && hinted_short < full_short,
         "tiny source hint should reduce both dfast tables"
@@ -6919,15 +6974,8 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 
     matcher.max_window_size = 8;
 
-    let mut callback_fired = 0u32;
-    matcher.trim_to_window(|_| {
-        callback_fired += 1;
-    });
+    matcher.trim_to_window();
 
-    assert_eq!(
-        callback_fired, 0,
-        "callback must not fire under history-only storage"
-    );
     assert_eq!(
         matcher.window_size, 8,
         "exactly one 8-byte block must remain"

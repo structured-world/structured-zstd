@@ -46,15 +46,25 @@ fn test_all_artifacts() {
 #[test]
 fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     extern crate std;
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
     use crate::encoding::{CompressionLevel, compress_to_vec};
 
     let data: &[u8] = &[0x04, 0x60, 0x2e, 0x20, 0x20, 0x0a, 0x20];
     // Level Default == 3 == dfast. Pre-fix this panicked / produced a
     // garbage frame on Linux fuzz (ASan caught the UB).
     let compressed = compress_to_vec(data, CompressionLevel::Default);
-    // Roundtrip through the donor decoder (matches the fuzz target's
-    // assertion shape — `decode_zstd` in `zstd/fuzz/fuzz_targets/interop.rs`).
-    let mut decoded = alloc::vec::Vec::new();
-    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
+
+    // Roundtrip through the in-tree decoder — matches the convention
+    // used by `test_all_artifacts` above and avoids coupling this
+    // regression to the donor `zstd` crate. The OOB load shows up as
+    // a panic / decode error before this point under ASan; if we get
+    // here with a parseable frame the bytes must match the input.
+    let mut frame_dec = FrameDecoder::new();
+    let mut cursor = compressed.as_slice();
+    frame_dec.reset(&mut cursor).unwrap();
+    frame_dec
+        .decode_blocks(&mut cursor, BlockDecodingStrategy::All)
+        .unwrap();
+    let decoded = frame_dec.collect().unwrap_or_default();
     assert_eq!(decoded.as_slice(), data);
 }

@@ -215,7 +215,7 @@ impl DfastMatchGenerator {
         self.position_base += reducer as usize;
     }
 
-    pub(crate) fn reset(&mut self, mut _reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn reset(&mut self) {
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
@@ -226,11 +226,13 @@ impl DfastMatchGenerator {
             self.short_hash.fill(DFAST_EMPTY_SLOT);
             self.long_hash.fill(DFAST_EMPTY_SLOT);
         }
-        // No Vec<u8> blocks to recycle anymore — `add_data` returns
-        // each input Vec to the caller eagerly. Keep the
-        // `reuse_space` closure parameter so the cross-matcher API
-        // shape stays uniform across HC / Row / Dfast (callers pass
-        // the same pool helper to every reset/add_data path).
+        // No Vec<u8> blocks to recycle: `add_data` returns each input
+        // Vec to the caller eagerly via its own `reuse_space`, and the
+        // history Vec is owned solely by the matcher. There is nothing
+        // for an outer pool helper to do at reset time, so the dfast
+        // signature does not take one (HC / Row do because they hold
+        // per-block input Vecs internally; the dispatcher in
+        // `match_generator.rs` resolves the per-backend shape).
         self.window_blocks.clear();
     }
 
@@ -238,13 +240,23 @@ impl DfastMatchGenerator {
     /// the trailing `last_block_len` bytes of `history`.
     ///
     /// # Panics
-    /// Panics if `window_blocks` is empty (no block has been ingested yet).
-    /// Callers — `skip_matching`, `skip_matching_dense`, `start_matching`,
-    /// `emit_trailing_literals` — all run inside the block-encoding loop
-    /// after at least one `add_data`, so an empty `window_blocks` here
-    /// would be a producer bug and should fail loudly rather than silently
-    /// return an empty slice (which would let the matcher operate on
-    /// zero-length data and mask the upstream invariant violation).
+    /// Panics if `window_blocks` is empty (no block has been ingested
+    /// yet). Every in-tree caller follows the SAME gate convention:
+    /// they read `window_blocks.back().copied().unwrap_or(0)` first
+    /// and bail out (early return / no-op) when the length is 0 BEFORE
+    /// calling this helper. Concretely the gated entry points are:
+    ///
+    ///   * `skip_matching` (line ~313) — `if current_len == 0 { return; }`
+    ///   * `skip_matching_dense` (line ~347) — same gate
+    ///   * `start_matching` (line ~362) — same gate
+    ///   * `emit_trailing_literals` (line ~1004) — `if literals_start
+    ///     < last_len { … }` short-circuits on `last_len == 0`
+    ///
+    /// So when this `expect` fires it indicates a NEW caller has
+    /// skipped the gate, not a producer bug at runtime. The panic
+    /// then surfaces the missing gate loudly instead of silently
+    /// returning an empty slice and letting the matcher operate on
+    /// zero-length data downstream.
     pub(crate) fn get_last_space(&self) -> &[u8] {
         let last_len = *self
             .window_blocks
@@ -277,32 +289,31 @@ impl DfastMatchGenerator {
 
     /// Trim retained blocks until the window fits `max_window_size`.
     ///
-    /// The `_reuse_space` closure parameter is intentionally a no-op for
-    /// `DfastMatchGenerator`: this backend no longer retains per-block
-    /// `Vec<u8>` storage (history is the sole byte buffer; `add_data`
-    /// returns each input Vec to the caller eagerly), so there is no
-    /// buffer to recycle on eviction. The parameter is retained for
-    /// signature uniformity with `MatchGenerator::trim_to_window`,
+    /// Unlike `MatchGenerator::trim_to_window`,
     /// `RowMatchGenerator::trim_to_window`, and
-    /// `HcMatchGenerator::trim_to_window`, where it does fire — keeping
-    /// the cross-backend dispatch in `match_generator.rs` uniform avoids
-    /// per-variant trim branches at the call site. The eviction byte
-    /// count callers need is derived from the `window_size` delta
-    /// before/after this call, not from the closure.
-    pub(crate) fn trim_to_window(&mut self, mut _reuse_space: impl FnMut(Vec<u8>)) {
+    /// `HcMatchGenerator::trim_to_window`, this backend does NOT take a
+    /// `reuse_space` callback because it doesn't retain per-block
+    /// `Vec<u8>` storage to recycle (history is the sole byte buffer
+    /// and `add_data` returns each input Vec eagerly). The dispatcher
+    /// in `match_generator.rs` knows the variant and threads the right
+    /// signature; callers needing the eviction byte count derive it
+    /// from the `window_size` delta before/after this call.
+    ///
+    /// On a normal block-loop iteration `add_data` runs immediately
+    /// after this trim and would compact too — the extra `compact_history`
+    /// here is a no-op in that case (`history_start` is already 0 or
+    /// the next ingest immediately re-compacts). The reason to compact
+    /// eagerly is the explicit-trim-before-idle path: a caller that
+    /// trims to shed memory before a long quiescent period would not
+    /// see the expected RSS drop until the next ingest, which may
+    /// never happen.
+    pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // `history_start` advanced past the evicted bytes, but they are
-        // still resident in the `Vec<u8>` until something compacts the
-        // prefix away. `add_data` would eventually call `compact_history`,
-        // but a caller that explicitly trims (e.g., to shed memory before
-        // a long idle period) wouldn't see the expected RSS drop until the
-        // next ingest. Compact eagerly so the released window is actually
-        // reclaimed.
         self.compact_history();
     }
 
@@ -555,13 +566,18 @@ impl DfastMatchGenerator {
                 idxl0 = *long_hash_ptr.add(hl0_idx);
             }
 
-            // The match the inner loop commits to, plus the relative
-            // position (`ip0` or `ip1`) where the match anchors. `None`
-            // means inner loop exited via tail (no more positions to
-            // scan); outer breaks too.
-            let mut committed: Option<(MatchCandidate, usize, usize)> = None;
-            //                                            ^^^^ relative match pos
-            //                                            ^^^^^^^ lit_len at that pos
+            // The match the inner loop commits to, or `None` if the
+            // inner loop exited via tail (no more positions to scan).
+            // Outer match arm uses `candidate.start` to recover the
+            // anchor, so we don't carry the relative match cursor here.
+            let mut committed: Option<MatchCandidate> = None;
+            // First un-scanned position when inner exits via tail. On
+            // a miss-only block we'd otherwise re-seed from `pos`
+            // (still at outer-entry), densely re-inserting positions
+            // the fast loop already wrote — throwing away the
+            // skip-step win on incompressible data. Updated on the
+            // inner-advance break.
+            let mut tail_seed_anchor = pos;
 
             'inner: loop {
                 let abs_ip0 = current_abs_start + ip0;
@@ -588,11 +604,17 @@ impl DfastMatchGenerator {
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
                 // Donor parity (`zstd_double_fast.c:187`): update BOTH
-                // tables at curr BEFORE checking matches. This makes the
-                // current ip immediately visible as a candidate for any
-                // subsequent probe in the same outer iter (e.g. when
-                // step grows and the rep peek at ip+1 of the next inner
-                // iter looks up a slot we just wrote here).
+                // tables at curr BEFORE checking matches. The benefit is
+                // for hash-table consumers, NOT the rep peek (rep at ip+1
+                // reads `offset_hist[0]`, never the hash tables). The
+                // donor rationale is the long-hash retry path: the next
+                // inner iter's `idxl1` lookup (`hashLong[hl1_idx]`) can
+                // collide with this iter's `hl0_idx`, and writing curr
+                // first means a self-collision still resolves to a real
+                // match instead of the previous occupant. The short
+                // probe of the same iter and the `_search_next_long`
+                // retry at ip+1 are the other consumers that see the
+                // fresh write.
                 unsafe {
                     *long_hash_ptr.add(hl0_idx) = packed_curr;
                     *short_hash_ptr.add(hs0_idx) = packed_curr;
@@ -647,7 +669,7 @@ impl DfastMatchGenerator {
                                     match_len,
                                     lit_len_ip1,
                                 );
-                                committed = Some((rep_cand, ip1, lit_len_ip1));
+                                committed = Some(rep_cand);
                                 break 'inner;
                             }
                         }
@@ -697,7 +719,7 @@ impl DfastMatchGenerator {
                                 match_len,
                                 lit_len_ip0,
                             );
-                            committed = Some((cand, ip0, lit_len_ip0));
+                            committed = Some(cand);
                             break 'inner;
                         }
                     }
@@ -743,7 +765,7 @@ impl DfastMatchGenerator {
                             // Donor `_search_next_long` retry (line 260):
                             // try long match at ip1 with precomputed idxl1.
                             // If it produces a strictly longer match, use it.
-                            let mut chosen = (short_cand, ip0, lit_len_ip0);
+                            let mut chosen = short_cand;
                             if idxl1 != DFAST_EMPTY_SLOT {
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
@@ -768,7 +790,7 @@ impl DfastMatchGenerator {
                                         }
                                         if l1_match_len > short_cand.match_len {
                                             let concat = &self.history[history_start_offset..];
-                                            let long_cand = extend_backwards_shared(
+                                            chosen = extend_backwards_shared(
                                                 concat,
                                                 history_abs_start,
                                                 cand_pos_l1,
@@ -776,7 +798,6 @@ impl DfastMatchGenerator {
                                                 l1_match_len,
                                                 lit_len_ip1,
                                             );
-                                            chosen = (long_cand, ip1, lit_len_ip1);
                                         }
                                     }
                                 }
@@ -799,12 +820,17 @@ impl DfastMatchGenerator {
                 hl0_idx = hl1_idx;
                 idxl0 = idxl1;
                 if ip1 + HASH_READ_SIZE > current_len {
+                    // First position the fast loop did NOT pack into the
+                    // hash tables. `seed_remaining_hashable_starts` will
+                    // pick up from here instead of restarting at the
+                    // outer-entry `pos`.
+                    tail_seed_anchor = ip0;
                     break 'inner;
                 }
             }
 
             match committed {
-                Some((candidate, _match_pos_rel, _lit_len_at_match)) => {
+                Some(candidate) => {
                     let start = self.emit_candidate(
                         current_abs_start,
                         &mut literals_start,
@@ -820,7 +846,14 @@ impl DfastMatchGenerator {
                         handle_sequence,
                     );
                 }
-                None => break 'outer,
+                None => {
+                    // Inner loop ran out of safe scan room without
+                    // committing. Hand the tail seeder the first
+                    // un-scanned position so it does not redundantly
+                    // re-pack everything the fast loop already wrote.
+                    pos = tail_seed_anchor;
+                    break 'outer;
+                }
             }
         }
 
@@ -907,6 +940,14 @@ impl DfastMatchGenerator {
             // donor parity it would just overwrite every bucket along
             // the match span and discard whichever positions the
             // producer was about to re-probe.
+            //
+            // At the floor `match_len == DONOR_REP_MIN_MATCH_LEN (= 4)`
+            // the three targets collapse to two distinct positions
+            // (`curr+2`, `ip-1` map to the same offset, `ip-2 == curr+2`).
+            // Single-slot overwrite is idempotent so the duplicate
+            // write is correctness-neutral; it's one wasted store on
+            // the shortest rep extension and not worth a branch to
+            // dedup. For `match_len >= 5` all three are distinct.
             let post_match_end = abs_pos + match_len;
             let insert_targets = [
                 abs_pos + 2,                      // curr + 2

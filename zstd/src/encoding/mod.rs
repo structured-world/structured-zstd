@@ -163,19 +163,30 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// is read by reference, and the output `Vec` is seeded with
 /// `min(compress_bound(src), OUTPUT_BLOCK_CAP = 128 KiB)`.
 ///
-/// The seed is intentionally capped at one donor block. For inputs
-/// up to a few KiB this matches `compress_bound(src)` and the `Vec`
-/// never reallocates inside the measured window. For larger inputs
-/// the `Vec` grows via amortized doubling, with peak transient
-/// memory ≈ 2× current compressed size at the last realloc — a
-/// deliberate trade against pinning `compress_bound(src)` upfront,
-/// which on the 100 MiB `large-log-stream` scenario pinned 100.4 MiB
-/// even though the actual compressed output was ≪ 1 MiB.
+/// The seed is intentionally capped at one donor block
+/// (`OUTPUT_BLOCK_CAP = 128 KiB`). Three regimes:
+///
+/// * Inputs up to ~127 KiB where `compress_bound(src) <
+///   OUTPUT_BLOCK_CAP` — the `min` picks the tighter bound and the
+///   `Vec` never reallocates inside the measured window (cheap, no
+///   doubling spikes, no over-allocation).
+/// * Inputs around 128 KiB where `compress_bound(src) >=
+///   OUTPUT_BLOCK_CAP` — the `min` clamps to the cap, so the "no
+///   reallocation" property holds only as long as the actual
+///   compressed output also fits within `OUTPUT_BLOCK_CAP`. For
+///   high-entropy inputs near the cap boundary the `Vec` may grow
+///   by one doubling step before the next block lands.
+/// * Larger inputs — the `Vec` grows via amortized doubling, with
+///   peak transient memory ≈ 2× current compressed size at the last
+///   realloc. Deliberate trade-off against pinning
+///   `compress_bound(src)` upfront, which on the 100 MiB
+///   `large-log-stream` scenario pinned 100.4 MiB even though the
+///   actual compressed output was ≪ 1 MiB.
 ///
 /// ```rust
 /// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
-/// let compressed = compress_slice_to_vec(data, CompressionLevel::Fastest);
+/// let compressed = compress_slice_to_vec(data, CompressionLevel::Default);
 /// ```
 pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> {
     // Initial capacity sized to a single output block, matching donor
