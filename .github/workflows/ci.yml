@@ -218,8 +218,21 @@ jobs:
     outputs:
       targets: ${{ steps.set.outputs.targets }}
       ids_csv: ${{ steps.set.outputs.ids_csv }}
+      shards: ${{ steps.set.outputs.shards }}
+      shards_csv: ${{ steps.set.outputs.shards_csv }}
     steps:
       - id: set
+        env:
+          # Drives the shard plan below. On a `pull_request` we run
+          # only the two canonical levels (`level_3_dfast` = donor
+          # default, `level_22_btultra2` = max compression) bundled
+          # into a single shard per target — three shards total, cheap
+          # PR feedback. On a `push: main` (post-merge), one shard
+          # per strategy group runs (fast / dfast / greedy / lazy /
+          # btopt / btultra / btultra2 — seven groups × three targets
+          # = 21 shards), so the published gh-pages snapshot keeps
+          # full coverage for the dashboard + tagged baselines.
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           cat > targets.json <<'EOF'
           [
@@ -251,6 +264,68 @@ jobs:
           echo "targets=$targets_compact" >> "$GITHUB_OUTPUT"
           echo "ids_csv=$ids_csv" >> "$GITHUB_OUTPUT"
           echo "Bench targets: $ids_csv"
+
+          # Shard plan: each entry runs a comma-separated set of
+          # levels through one bench binary invocation via the
+          # `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` env var. `id` drives
+          # the artifact name (`benchmark-shard-<target>-<id>`) and
+          # the per-file suffix in the markdown / JSON outputs.
+          #
+          # PR event = single shard covering the two canonical levels
+          # so reviewers see ratio + speed + memory deltas on the
+          # default-level path (level_3_dfast) and the max-compression
+          # path (level_22_btultra2) within minutes. Strategy groups
+          # mirror `clevels.h` + `StrategyTag::for_level` so an
+          # entire strategy's levels share a runner — keeps per-job
+          # build overhead amortised across the levels of that family.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            cat > shards.json <<'EOF'
+          [
+            {
+              "id": "pr-canonical",
+              "levels": "level_3_dfast,level_22_btultra2"
+            }
+          ]
+          EOF
+          else
+            cat > shards.json <<'EOF'
+          [
+            {
+              "id": "fast",
+              "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast,level_-2_fast,level_-1_fast,level_1_fast"
+            },
+            {
+              "id": "dfast",
+              "levels": "level_2_dfast,level_3_dfast"
+            },
+            {
+              "id": "greedy",
+              "levels": "level_4_greedy"
+            },
+            {
+              "id": "lazy",
+              "levels": "level_5_lazy,level_6_lazy,level_7_lazy,level_8_lazy,level_9_lazy,level_10_lazy,level_11_lazy,level_12_lazy,level_13_lazy,level_14_lazy,level_15_lazy"
+            },
+            {
+              "id": "btopt",
+              "levels": "level_16_btopt,level_17_btopt"
+            },
+            {
+              "id": "btultra",
+              "levels": "level_18_btultra,level_19_btultra"
+            },
+            {
+              "id": "btultra2",
+              "levels": "level_20_btultra2,level_21_btultra2,level_22_btultra2"
+            }
+          ]
+          EOF
+          fi
+          shards_compact=$(jq -c . shards.json)
+          shards_csv=$(jq -r '[.[].id] | join(",")' shards.json)
+          echo "shards=$shards_compact" >> "$GITHUB_OUTPUT"
+          echo "shards_csv=$shards_csv" >> "$GITHUB_OUTPUT"
+          echo "Bench shards ($EVENT_NAME): $shards_csv"
 
   bench-build:
     # Build the criterion `compare_ffi` binary once per target. Every
@@ -306,7 +381,7 @@ jobs:
           retention-days: 7
 
   benchmark:
-    name: Bench ${{ matrix.bench.id }} / ${{ matrix.level }}
+    name: Bench ${{ matrix.bench.id }} / ${{ matrix.shard.id }}
     needs: [bench-build, bench-matrix]
     timeout-minutes: ${{ matrix.bench.timeout_minutes }}
     strategy:
@@ -319,46 +394,13 @@ jobs:
       fail-fast: false
       matrix:
         bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
-        # Canonical level inventory: `-7..=-1` (ultra-fast, donor
-        # Fast strategy) plus `1..=22` (donor advertised range with
-        # strategies fast/dfast/greedy/lazy/btopt/btultra/btultra2).
-        # Level 0 is intentionally omitted — donor treats it as a
-        # sentinel for "use default" (= 3) so a dedicated shard
-        # would just duplicate level_3_dfast's numbers. 29 entries ×
-        # 3 targets = 87 shards. Names mirror `supported_levels()`
-        # in `zstd/benches/support/mod.rs`; `level_filter_from_env`
-        # panics on drift so a typo here surfaces in the first
-        # affected shard instead of silently skipping the level.
-        level:
-          - level_-7_fast
-          - level_-6_fast
-          - level_-5_fast
-          - level_-4_fast
-          - level_-3_fast
-          - level_-2_fast
-          - level_-1_fast
-          - level_1_fast
-          - level_2_dfast
-          - level_3_dfast
-          - level_4_greedy
-          - level_5_lazy
-          - level_6_lazy
-          - level_7_lazy
-          - level_8_lazy
-          - level_9_lazy
-          - level_10_lazy
-          - level_11_lazy
-          - level_12_lazy
-          - level_13_lazy
-          - level_14_lazy
-          - level_15_lazy
-          - level_16_btopt
-          - level_17_btopt
-          - level_18_btultra
-          - level_19_btultra
-          - level_20_btultra2
-          - level_21_btultra2
-          - level_22_btultra2
+        # Shard plan is resolved in `bench-matrix.outputs.shards`.
+        # Each shard owns one strategy-grouped level bundle (PR runs
+        # a single `pr-canonical` shard with level_3 + level_22; main
+        # runs seven strategy groups). `shard.levels` is a CSV that
+        # we forward into `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` so the
+        # bench binary iterates the requested levels in one process.
+        shard: ${{ fromJSON(needs.bench-matrix.outputs.shards) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -378,12 +420,12 @@ jobs:
       - name: Mark bench binary executable
         run: chmod +x bench-binary/compare_ffi
 
-      - name: Run benchmarks (filtered to single level)
+      - name: Run benchmarks (filtered to shard's levels)
         env:
           STRUCTURED_ZSTD_BENCH_TARGET: ${{ matrix.bench.id }}
           STRUCTURED_ZSTD_BENCH_TRIPLE: ${{ matrix.bench.target_triple }}
           STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event_name == 'pull_request' && github.event.pull_request.updated_at || github.event.head_commit.timestamp || github.event.repository.updated_at }}
-          STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.level }}
+          STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: ${{ matrix.shard.levels }}
           # run-benchmarks.sh: re-exec this binary instead of `cargo bench`.
           STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
           # The prebuilt bench binary is launched directly (not via cargo),
@@ -398,22 +440,22 @@ jobs:
 
       - name: Rename benchmark outputs for matrix artifact
         run: |
-          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
-          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
-          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
-          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
-          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
+          mv benchmark-results.json benchmark-results.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
+          mv benchmark-report.md benchmark-report.${{ matrix.bench.id }}.${{ matrix.shard.id }}.md
+          mv benchmark-delta.json benchmark-delta.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
+          mv benchmark-delta.md benchmark-delta.${{ matrix.bench.id }}.${{ matrix.shard.id }}.md
+          mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
 
       - name: Upload benchmark shard artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-shard-${{ matrix.bench.id }}-${{ matrix.level }}
+          name: benchmark-shard-${{ matrix.bench.id }}-${{ matrix.shard.id }}
           path: |
-            benchmark-results.${{ matrix.bench.id }}.${{ matrix.level }}.json
-            benchmark-report.${{ matrix.bench.id }}.${{ matrix.level }}.md
-            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.json
-            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.level }}.md
-            benchmark-relative.${{ matrix.bench.id }}.${{ matrix.level }}.json
+            benchmark-results.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
+            benchmark-report.${{ matrix.bench.id }}.${{ matrix.shard.id }}.md
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
+            benchmark-delta.${{ matrix.bench.id }}.${{ matrix.shard.id }}.md
+            benchmark-relative.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
           if-no-files-found: error
           # Intermediate inputs to `benchmark-aggregate`; match the
           # 7-day retention used for `bench-binary-*`.

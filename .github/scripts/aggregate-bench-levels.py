@@ -94,10 +94,13 @@ def merge_relative_json(target):
 
 
 def merge_markdown(target, kind):
-    """Concatenate shard reports with a short level header above each
-    shard's body. The merge-benchmarks.py cross-target step will
-    consume these — it already strips the leading `# Title` line, so
-    we keep that convention."""
+    """Concatenate shard reports with a short strategy-group header
+    above each shard's body. Each shard now bundles every level of a
+    strategy family (`fast` / `dfast` / `greedy` / `lazy` / `btopt` /
+    `btultra` / `btultra2`) or, on PR runs, the canonical pair
+    (`pr-canonical` = level_3 + level_22). The merge-benchmarks.py
+    cross-target step consumes these — it already strips the leading
+    `# Title` line, so we keep that convention."""
     shards = files_for(target, kind, "md")
     if not shards:
         print(f"WARN[{target}]: no benchmark-{kind}.*.md shards found", file=sys.stderr)
@@ -107,11 +110,13 @@ def merge_markdown(target, kind):
     )
     lines = [f"# {title} ({target})", ""]
     for shard in shards:
-        # Extract level from filename suffix: benchmark-<kind>.<target>.<level>.md
+        # Extract shard id from filename suffix:
+        # `benchmark-<kind>.<target>.<shard_id>.md`. The shard id is
+        # a strategy family on main pushes (`fast`, `dfast`, ...) or
+        # `pr-canonical` on pull-request shards.
         stem = shard.name
-        # strip prefix `benchmark-<kind>.<target>.` and trailing `.md`
         prefix = f"benchmark-{kind}.{target}."
-        level = stem[len(prefix):-len(".md")]
+        shard_id = stem[len(prefix):-len(".md")]
         body = shard.read_text().strip()
         # Drop the shard's `# ...` line so we don't get nested H1s.
         body_lines = body.splitlines()
@@ -119,7 +124,7 @@ def merge_markdown(target, kind):
             body_lines = body_lines[1:]
             if body_lines and not body_lines[0].strip():
                 body_lines = body_lines[1:]
-        lines.append(f"## Level: {level}")
+        lines.append(f"## Strategy group: {shard_id}")
         lines.append("")
         lines.extend(body_lines)
         lines.append("")

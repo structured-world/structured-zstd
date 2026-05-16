@@ -125,6 +125,15 @@ REGRESSION_SCENARIOS = {
     "decodecorpus-synthetic-1m",
     "low-entropy-1m",
 }
+# Only the canonical default-level (level_3_dfast) and max-compression
+# (level_22_btultra2) shards drive the github-action-benchmark
+# regression alert. Other levels still land in the dashboard JSON and
+# the markdown report, but they don't fire alerts — too noisy when
+# every commit measures 29 levels × 3 targets and we'd get false
+# positives on the experimental fast/btopt levels that aren't yet
+# tuned. Keep this in sync with the PR shard's `pr-canonical` levels
+# in `.github/workflows/ci.yml`.
+ALERT_LEVELS = {"level_3_dfast", "level_22_btultra2"}
 
 def parse_benchmark_name(name):
     parts = name.split("/")
@@ -327,7 +336,13 @@ if timing_point_count == 0:
     print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
     sys.exit(1)
 
-regression_levels = {row["level"] for row in ratios}
+# Restrict the alert set to the canonical pair regardless of how
+# many levels this shard processed. Combined with `REGRESSION_STAGES`
+# + `REGRESSION_SCENARIOS` this keeps the github-action-benchmark
+# alert surface scoped to level_3_dfast / level_22_btultra2 — the
+# two levels we ship as the primary public guarantees.
+present_levels = {row["level"] for row in ratios}
+regression_levels = ALERT_LEVELS & present_levels
 benchmark_results = [
     {
         "name": row["name"],
