@@ -16,7 +16,7 @@ use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
+use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
     DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
@@ -420,13 +420,10 @@ impl DfastMatchGenerator {
         current_len: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        let block_is_strict_incompressible = self
-            .block_looks_incompressible_strict(current_abs_start, current_abs_start + current_len);
         let mut pos = 1usize;
         let mut literals_start = 0usize;
         let mut skip_step = 1usize;
         let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
-        let mut miss_run = 0usize;
         // Loop invariants (two distinct bounds):
         //
         // 1. Block-local arithmetic (`ip0..ip3 = pos + N` for small
@@ -494,7 +491,6 @@ impl DfastMatchGenerator {
                     );
                     skip_step = 1;
                     next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    miss_run = 0;
                     continue;
                 }
             }
@@ -517,32 +513,29 @@ impl DfastMatchGenerator {
                 );
                 skip_step = 1;
                 next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                miss_run = 0;
             } else {
                 // Single-slot donor parity: donor inserts ONLY at the
                 // current ip per iteration of its inner do-while loop
-                // (`zstd_double_fast.c:187`). The earlier
-                // ip0/ip1/ip2/ip3 fan-out only made sense with the
-                // 4-slot bucket — under single-slot storage four inserts
-                // per miss just overwrite the same buckets and discard
-                // previously-stored positions before the producer can
-                // walk past them, which costs ~30% compression ratio
-                // on dfast-level fixtures.
+                // (`zstd_double_fast.c:187`).
                 self.insert_position(abs_ip0);
                 let _ = (ip1, ip2, ip3);
-                miss_run += 1;
-                if block_is_strict_incompressible || miss_run >= DFAST_LOCAL_SKIP_TRIGGER {
-                    let skip_cap = DFAST_MAX_SKIP_STEP;
-                    if pos >= next_skip_growth_pos {
-                        skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    }
-                    pos += skip_step;
-                } else {
-                    skip_step = 1;
-                    next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    pos += 1;
+                // Donor parity (`zstd_double_fast.c:224-228`): step grows
+                // by distance scanned, NOT by consecutive-miss count.
+                // Donor `step++` fires every `kStepIncr` positions traveled,
+                // independent of whether the previous iters were misses or
+                // matches. Our previous gate required
+                // `miss_run >= DFAST_LOCAL_SKIP_TRIGGER` consecutive misses,
+                // which kept step pinned at 1 whenever matches happened —
+                // exactly the case where donor would already be ramping up.
+                // Match-found branches still reset `skip_step` to 1 and
+                // re-anchor `next_skip_growth_pos`, mirroring donor's
+                // per-`while(1)`-iteration `step = 1; nextStep = ip+kStepIncr`
+                // re-initialisation.
+                if pos >= next_skip_growth_pos {
+                    skip_step = (skip_step + 1).min(DFAST_MAX_SKIP_STEP);
+                    next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 }
+                pos += skip_step;
             }
         }
 
@@ -1131,20 +1124,6 @@ impl DfastMatchGenerator {
         }
         let block = &live[start_idx..end_idx];
         block_looks_incompressible(block)
-    }
-
-    fn block_looks_incompressible_strict(&self, start: usize, end: usize) -> bool {
-        let live = self.live_history();
-        if start >= end || start < self.history_abs_start {
-            return false;
-        }
-        let start_idx = start - self.history_abs_start;
-        let end_idx = end - self.history_abs_start;
-        if end_idx > live.len() {
-            return false;
-        }
-        let block = &live[start_idx..end_idx];
-        block_looks_incompressible_strict(block)
     }
 
     #[inline(always)]
