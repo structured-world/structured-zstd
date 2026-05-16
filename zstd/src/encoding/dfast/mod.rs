@@ -19,9 +19,8 @@ use super::blocks::encode_offset_with_history;
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
-    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SEARCH_DEPTH,
-    DFAST_SHORT_HASH_BITS_DELTA, DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL,
-    DFAST_TARGET_LEN, MIN_WINDOW_LOG,
+    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
+    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
@@ -40,17 +39,20 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
-    // Storage: `[u32; DFAST_SEARCH_DEPTH]` per bucket. Each slot holds
-    // a +1-biased relative position (`(abs_pos - position_base + 1) as
-    // u32`); the empty-slot sentinel `DFAST_EMPTY_SLOT = 0` is
-    // therefore never a real value. Trades 4 bytes per slot (vs the
-    // previous `usize`) — at `DFAST_SEARCH_DEPTH = 4` that's 16 bytes
-    // per bucket vs the prior 32 bytes, halving the hash-table
-    // footprint. Combined with the donor-parity `hashLog = 17` ceiling
-    // this brings the two-table memory cost from 64 MiB to ~4 MiB on
-    // 1 MiB inputs — close to donor's 768 KiB for the same level.
-    pub(crate) short_hash: Vec<[u32; DFAST_SEARCH_DEPTH]>,
-    pub(crate) long_hash: Vec<[u32; DFAST_SEARCH_DEPTH]>,
+    // Storage: single `u32` per bucket — donor-parity overwrite-on-
+    // collision. Each slot holds a +1-biased relative position
+    // (`(abs_pos - position_base + 1) as u32`); `DFAST_EMPTY_SLOT = 0`
+    // is therefore never a real value. The two tables are sized
+    // independently: `long_hash` (8-byte hash) uses `long_hash_bits`
+    // (donor `hashTable`); `short_hash` (4-byte hash) uses
+    // `short_hash_bits` = `long - 1` (donor `chainTable` for dfast).
+    // Donor parity at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`. The
+    // ratio loss from single-slot is compensated by donor's
+    // `_search_next_long` retry — after a short-hash hit, the search
+    // probes long_hash at `ip + 1` and picks the longer of the two
+    // (see `find_best_match` for the retry logic).
+    pub(crate) short_hash: Vec<u32>,
+    pub(crate) long_hash: Vec<u32>,
     /// Absolute position whose `(abs_pos - position_base + 1)` slot
     /// encoding evaluates to `1`. Advances only via [`Self::reduce`]
     /// when an insert is about to overflow the u32 window — the
@@ -187,19 +189,17 @@ impl DfastMatchGenerator {
     /// Advance `position_base` by the same amount so future inserts
     /// continue from the rebased origin.
     fn reduce(&mut self, reducer: u32) {
-        let shift_buckets = |buckets: &mut Vec<[u32; DFAST_SEARCH_DEPTH]>| {
-            for bucket in buckets.iter_mut() {
-                for slot in bucket.iter_mut() {
-                    *slot = if *slot <= reducer {
-                        DFAST_EMPTY_SLOT
-                    } else {
-                        *slot - reducer
-                    };
-                }
+        let shift_slots = |slots: &mut [u32]| {
+            for slot in slots.iter_mut() {
+                *slot = if *slot <= reducer {
+                    DFAST_EMPTY_SLOT
+                } else {
+                    *slot - reducer
+                };
             }
         };
-        shift_buckets(&mut self.short_hash);
-        shift_buckets(&mut self.long_hash);
+        shift_slots(&mut self.short_hash);
+        shift_slots(&mut self.long_hash);
         self.position_base += reducer as usize;
     }
 
@@ -211,8 +211,8 @@ impl DfastMatchGenerator {
         self.position_base = 0;
         self.offset_hist = [1, 4, 8];
         if !self.short_hash.is_empty() {
-            self.short_hash.fill([DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]);
-            self.long_hash.fill([DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]);
+            self.short_hash.fill(DFAST_EMPTY_SLOT);
+            self.long_hash.fill(DFAST_EMPTY_SLOT);
         }
         for mut data in self.window.drain(..) {
             data.resize(data.capacity(), 0);
@@ -498,16 +498,17 @@ impl DfastMatchGenerator {
                 next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 miss_run = 0;
             } else {
+                // Single-slot donor parity: donor inserts ONLY at the
+                // current ip per iteration of its inner do-while loop
+                // (`zstd_double_fast.c:187`). The earlier
+                // ip0/ip1/ip2/ip3 fan-out only made sense with the
+                // 4-slot bucket — under single-slot storage four inserts
+                // per miss just overwrite the same buckets and discard
+                // previously-stored positions before the producer can
+                // walk past them, which costs ~30% compression ratio
+                // on dfast-level fixtures.
                 self.insert_position(abs_ip0);
-                if ip1 + 4 <= current_len {
-                    self.insert_position(current_abs_start + ip1);
-                }
-                if ip2 + 4 <= current_len {
-                    self.insert_position(current_abs_start + ip2);
-                }
-                if ip3 + 4 <= current_len {
-                    self.insert_position(current_abs_start + ip3);
-                }
+                let _ = (ip1, ip2, ip3);
                 miss_run += 1;
                 if block_is_strict_incompressible || miss_run >= DFAST_LOCAL_SKIP_TRIGGER {
                     let skip_cap = DFAST_MAX_SKIP_STEP;
@@ -598,9 +599,26 @@ impl DfastMatchGenerator {
             if match_len < DONOR_REP_MIN_MATCH_LEN {
                 break;
             }
-            // Insert the rep range into hash tables so future positions
-            // hashing into this area find these candidates.
-            self.insert_positions(abs_pos, abs_pos + match_len);
+            // Sparse complementary insertion (donor parity,
+            // `zstd_double_fast.c:300-304`): donor inserts ONLY at
+            // `curr+2`, `ip-2`, `ip-1` after a match — three specific
+            // positions, not the whole match range. The previous
+            // `insert_positions(abs_pos, abs_pos + match_len)` made
+            // sense only under the 4-slot bucket; with single-slot
+            // donor parity it would just overwrite every bucket along
+            // the match span and discard whichever positions the
+            // producer was about to re-probe.
+            let post_match_end = abs_pos + match_len;
+            let insert_targets = [
+                abs_pos + 2,                      // curr + 2
+                post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
+                post_match_end.saturating_sub(1), // ip - 1
+            ];
+            for &target in &insert_targets {
+                if target > abs_pos && target < post_match_end {
+                    self.insert_position(target);
+                }
+            }
             // Emit zero-literal rep sequence.
             handle_sequence(Sequence::Triple {
                 literals: &[],
@@ -676,10 +694,10 @@ impl DfastMatchGenerator {
         let long_len = 1usize << self.long_hash_bits;
         let short_len = 1usize << self.short_hash_bits;
         if self.long_hash.len() != long_len {
-            self.long_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; long_len];
+            self.long_hash = alloc::vec![DFAST_EMPTY_SLOT; long_len];
         }
         if self.short_hash.len() != short_len {
-            self.short_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; short_len];
+            self.short_hash = alloc::vec![DFAST_EMPTY_SLOT; short_len];
         }
     }
 
@@ -761,61 +779,124 @@ impl DfastMatchGenerator {
         let position_base = self.position_base;
         let mut best = None;
 
-        // Long-hash probes first (8-byte hash → longer matches more likely).
-        if current_idx + 8 <= concat.len() {
-            let long_hash = self.hash8(&concat[current_idx..]);
-            // SAFETY: `hash_index` masks to `hash_bits` and `long_hash.len()
-            // == 1 << hash_bits` (`ensure_hash_tables`).
+        // Long-hash probe first (8-byte hash → longer matches more
+        // likely). Single-slot per bucket — donor parity, no chain
+        // walking. The retry policy below mirrors donor
+        // `_search_next_long`: if the long-hash misses but the
+        // short-hash hits, peek the long-hash at `abs_pos + 1` and
+        // pick the longer of the two matches.
+        let long_hit = if current_idx + 8 <= concat.len() {
+            let long_hash = self.long_hash_index(&concat[current_idx..]);
+            // SAFETY: `long_hash_index` masks to `long_hash_bits` and
+            // `long_hash.len() == 1 << long_hash_bits` (`ensure_hash_tables`).
             debug_assert!(long_hash < self.long_hash.len());
-            let bucket = unsafe { self.long_hash.get_unchecked(long_hash) };
-            for &slot in bucket {
-                // Inline unpack: slot 0 = empty sentinel, otherwise
-                // `slot - 1 + position_base` is the absolute position.
-                if slot == DFAST_EMPTY_SLOT {
-                    continue;
-                }
-                let candidate_pos = position_base + (slot as usize) - 1;
-                if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
-                    continue;
-                }
-                let candidate_idx = candidate_pos - history_abs_start;
-                let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-                if match_len >= DFAST_MIN_MATCH_LEN {
-                    let candidate =
-                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                    best = best_len_offset_candidate(best, Some(candidate));
-                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                        return best;
-                    }
-                }
+            let slot = unsafe { *self.long_hash.get_unchecked(long_hash) };
+            self.probe_slot_match(
+                slot,
+                position_base,
+                history_abs_start,
+                abs_pos,
+                current_idx,
+                concat,
+                lit_len,
+            )
+        } else {
+            None
+        };
+        if let Some(cand) = long_hit {
+            best = best_len_offset_candidate(best, Some(cand));
+            if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                return best;
             }
         }
 
         if current_idx + 4 <= concat.len() {
-            let short_hash = self.hash4(&concat[current_idx..]);
+            let short_hash = self.short_hash_index(&concat[current_idx..]);
             debug_assert!(short_hash < self.short_hash.len());
-            let bucket = unsafe { self.short_hash.get_unchecked(short_hash) };
-            for &slot in bucket {
-                if slot == DFAST_EMPTY_SLOT {
-                    continue;
+            let slot = unsafe { *self.short_hash.get_unchecked(short_hash) };
+            if let Some(short_cand) = self.probe_slot_match(
+                slot,
+                position_base,
+                history_abs_start,
+                abs_pos,
+                current_idx,
+                concat,
+                lit_len,
+            ) {
+                best = best_len_offset_candidate(best, Some(short_cand));
+                if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
+                    return best;
                 }
-                let candidate_pos = position_base + (slot as usize) - 1;
-                if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
-                    continue;
-                }
-                let candidate_idx = candidate_pos - history_abs_start;
-                let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-                if match_len >= DFAST_MIN_MATCH_LEN {
-                    let candidate =
-                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                    best = best_len_offset_candidate(best, Some(candidate));
-                    if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                        return best;
+                // Donor `_search_next_long` retry: short hit landed but
+                // a long hit at `abs_pos + 1` could be even longer. The
+                // donor inner loop precomputes `hashLong[hl1]` for
+                // exactly this case (line 213 in `zstd_double_fast.c`);
+                // we lift it inline here so the single-slot table
+                // retains the compression-quality donor gets from its
+                // overlapping probe pattern.
+                let next_idx = current_idx + 1;
+                if best.is_none_or(|b| b.match_len < DFAST_TARGET_LEN)
+                    && next_idx + 8 <= concat.len()
+                {
+                    let next_long_hash = self.long_hash_index(&concat[next_idx..]);
+                    debug_assert!(next_long_hash < self.long_hash.len());
+                    let next_slot = unsafe { *self.long_hash.get_unchecked(next_long_hash) };
+                    if let Some(retry) = self.probe_slot_match(
+                        next_slot,
+                        position_base,
+                        history_abs_start,
+                        abs_pos + 1,
+                        next_idx,
+                        concat,
+                        lit_len.saturating_add(1),
+                    ) && retry.match_len > short_cand.match_len
+                    {
+                        best = best_len_offset_candidate(best, Some(retry));
                     }
                 }
             }
         }
         best
+    }
+
+    /// Resolve a single packed-slot value against the live history and
+    /// return a backward-extended `MatchCandidate` if the bucket holds
+    /// a valid in-range position whose forward extension reaches at
+    /// least `DFAST_MIN_MATCH_LEN` bytes. Shared between the long-hash
+    /// primary probe, the short-hash primary probe, and the
+    /// `_search_next_long` retry — keeps the bounds-checking logic in
+    /// one place so the three call sites can't drift.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn probe_slot_match(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        if slot == DFAST_EMPTY_SLOT {
+            return None;
+        }
+        let candidate_pos = position_base + (slot as usize) - 1;
+        if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
+            return None;
+        }
+        let candidate_idx = candidate_pos - history_abs_start;
+        // Cheap mismatch gate before the SIMD walk: if the first byte
+        // doesn't match there's no way `common_prefix_len` reaches the
+        // 6-byte minimum.
+        if concat[candidate_idx] != concat[current_idx] {
+            return None;
+        }
+        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        if match_len < DFAST_MIN_MATCH_LEN {
+            return None;
+        }
+        Some(self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len))
     }
 
     fn extend_backwards(
@@ -889,40 +970,39 @@ impl DfastMatchGenerator {
         // rebase is needed.
         self.ensure_room_for(pos);
         let packed = self.pack_slot(pos);
-        // SAFETY: `hash_index` masks the mixed hash to `hash_bits` bits and
-        // both tables are sized to `1 << hash_bits` in `ensure_hash_tables`,
-        // so every index produced here is provably below the table length.
-        // Eliding the bounds check on this per-byte hot path saves ~4
-        // instructions and one branch per call.
+        // SAFETY: the `*_hash_index` helpers mask the mixed hash to
+        // `long_hash_bits` / `short_hash_bits`, and `ensure_hash_tables`
+        // sizes the two tables to `1 << long_hash_bits` /
+        // `1 << short_hash_bits` respectively, so every produced index
+        // is provably below the table length. Eliding the bounds check
+        // on this per-byte hot path saves ~4 instructions per call.
+        //
+        // Single-slot overwrite (donor parity): the previous 4-slot
+        // bucket shift (`copy_within(..)`) is gone — donor
+        // `ZSTD_compressBlock_doubleFast_*` writes a single `U32` per
+        // hash position and relies on the dense `_search_next_long`
+        // retry in `find_best_match` to preserve compression ratio.
         if idx + 4 <= concat_len {
             let concat = &self.history[self.history_start..];
-            let short = self.hash4(&concat[idx..]);
+            let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_hash.len());
-            let bucket = unsafe { self.short_hash.get_unchecked_mut(short) };
-            if bucket[0] != packed {
-                bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
-                bucket[0] = packed;
-            }
+            unsafe { *self.short_hash.get_unchecked_mut(short) = packed };
         }
 
         if idx + 8 <= concat_len {
             let concat = &self.history[self.history_start..];
-            let long = self.hash8(&concat[idx..]);
+            let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_hash.len());
-            let bucket = unsafe { self.long_hash.get_unchecked_mut(long) };
-            if bucket[0] != packed {
-                bucket.copy_within(0..DFAST_SEARCH_DEPTH - 1, 1);
-                bucket[0] = packed;
-            }
+            unsafe { *self.long_hash.get_unchecked_mut(long) = packed };
         }
     }
 
-    pub(crate) fn hash4(&self, data: &[u8]) -> usize {
+    pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
         self.hash_index_with_bits(value, self.short_hash_bits)
     }
 
-    pub(crate) fn hash8(&self, data: &[u8]) -> usize {
+    pub(crate) fn long_hash_index(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
         self.hash_index_with_bits(value, self.long_hash_bits)
     }

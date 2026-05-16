@@ -54,36 +54,40 @@ pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;
-// Donor `clevels.h:31` at level 3 large-input bucket sets `hashLog = 17`.
-// Our table layout stores `[u32; DFAST_SEARCH_DEPTH]` (4 u32 slots) per
-// bucket, so a `1 << 17`-bucket table is `128 K × 16 B = 2 MiB per
-// table`, `4 MiB` for the (short, long) pair. We previously held a
-// 20-bit ceiling (1 M buckets × 32 B per `[usize; 4]` = 32 MiB per
-// table, 64 MiB for the pair) which inflated peak memory ~85× over
-// donor at default level — the bench matrix added in PR #143 surfaced
-// 64 MB Rust vs 768 KB donor for the two-table footprint on
-// `decodecorpus-z000033`. Donor stores a single `U32` per slot plus a
-// `chainTable` for older positions, so their pair is still smaller
-// than ours per-level; aligning the bucket count via this constant
-// already eats the dominant factor, the storage-width change ate the
-// rest. `dfast_hash_bits_for_window` still clamps the runtime value
-// to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the upper
-// bound rather than a fixed default.
+// Donor `clevels.h:31` at level 3 large-input bucket sets
+// `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
+// short-hash table — donor names this `chainTable` even though for
+// dfast it's used as a plain single-slot hash). Each table holds one
+// `U32` per slot; the donor overwrites on collision and recovers
+// compression quality via the inline `_search_next_long` retry
+// (after a short-hash hit, probes `hashLong[hl1]` at `ip + 1` and
+// keeps the longer match).
+//
+// We mirror that storage layout: single `u32` per bucket (no
+// `[u32; N]` array), `long_hash` sized `1 << DFAST_HASH_BITS` and
+// `short_hash` one bit smaller via `DFAST_SHORT_HASH_BITS_DELTA`.
+// Two-table footprint at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`,
+// exact donor parity. The `_search_next_long` retry lives in
+// `DfastMatchGenerator::find_best_match`. Earlier revisions kept a
+// 4-slot bucket per hash position; that paid 4× the donor memory
+// without measurable ratio gain once the retry was in place.
+//
+// `dfast_hash_bits_for_window` still clamps the runtime long-hash
+// value to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the
+// upper bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
-/// Short-hash table sits one bit smaller than the long-hash table —
-/// matches donor `clevels.h` `chainLog = hashLog - 1` for dfast
-/// levels (level 2: `chainLog=15, hashLog=16`; level 3:
-/// `chainLog=16, hashLog=17`). Halves the short-hash footprint
-/// without losing measurable ratio (collisions on the 4-byte short
-/// hash overwrite less frequently than the 8-byte long hash anyway).
+/// Difference between `long_hash_bits` and `short_hash_bits` —
+/// donor `hashLog - chainLog` is 1 at every dfast level (`clevels.h`
+/// level 2: 16-15=1; level 3: 17-16=1). The short hash is one bit
+/// smaller than the long hash so the per-bucket footprint matches
+/// donor sizing exactly.
 pub(crate) const DFAST_SHORT_HASH_BITS_DELTA: usize = 1;
-pub(crate) const DFAST_SEARCH_DEPTH: usize = 4;
-/// Sentinel value for an empty slot in the `[u32; DFAST_SEARCH_DEPTH]`
-/// hash buckets. Real positions are stored as `(abs_pos -
-/// position_base + 1) as u32`, so `0` is reserved as the "empty"
-/// marker and a true relative offset of `0` never appears in the
-/// table. Mirrors the LDM table's `LdmEntry.offset == 0` convention
-/// (see `encoding/ldm/table.rs`) so both rebasing structures share
+/// Sentinel value for an empty slot in the dfast hash tables. Real
+/// positions are stored as `(abs_pos - position_base + 1) as u32`, so
+/// `0` is reserved as the "empty" marker and a true relative offset
+/// of `0` never appears in the table. Mirrors the LDM table's
+/// `LdmEntry.offset == 0` convention (see `encoding/ldm/table.rs`)
+/// so both rebasing structures share
 /// one sentinel scheme.
 pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 
@@ -7062,18 +7066,16 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
         target_rel + 8 <= live.len(),
         "fixture must make the boundary start long-hashable"
     );
-    let long_hash = matcher.hash8(&live[target_rel..]);
+    let long_hash = matcher.long_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
+    // Single-slot tables (donor parity): the bucket holds at most one
+    // u32; the assertion below is a direct equality (no `.contains`).
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.long_hash[long_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.long_hash[long_hash], target_slot,
         "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
@@ -7097,18 +7099,14 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
         target_rel + 4 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
-    let short_hash = matcher.hash4(&live[target_rel..]);
+    let short_hash = matcher.short_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.short_hash[short_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.short_hash[short_hash], target_slot,
         "tail seeding must include the last 4-byte-hashable start"
     );
 }
@@ -7131,18 +7129,14 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
         target_rel + 4 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
-    let short_hash = matcher.hash4(&live[target_rel..]);
+    let short_hash = matcher.short_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.short_hash[short_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.short_hash[short_hash], target_slot,
         "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
     );
 }
@@ -7178,8 +7172,8 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     let early_abs = 1024usize;
     let early_packed = dfast.pack_slot(early_abs);
     assert_ne!(early_packed, DFAST_EMPTY_SLOT);
-    dfast.short_hash[0][0] = early_packed;
-    dfast.long_hash[0][0] = early_packed;
+    dfast.short_hash[0] = early_packed;
+    dfast.long_hash[0] = early_packed;
 
     // Pick a trigger position that forces the first rebase. With
     // `position_base = 0`, the smallest `abs_pos` that fails the
@@ -7200,11 +7194,11 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // donor parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
     // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
-        dfast.short_hash[0][0], DFAST_EMPTY_SLOT,
+        dfast.short_hash[0], DFAST_EMPTY_SLOT,
         "pre-rebase short-hash entries below the reducer must become empty"
     );
     assert_eq!(
-        dfast.long_hash[0][0], DFAST_EMPTY_SLOT,
+        dfast.long_hash[0], DFAST_EMPTY_SLOT,
         "pre-rebase long-hash entries below the reducer must become empty"
     );
 
