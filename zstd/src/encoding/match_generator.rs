@@ -70,6 +70,13 @@ pub(crate) const DFAST_TARGET_LEN: usize = 48;
 // to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the upper
 // bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
+/// Short-hash table sits one bit smaller than the long-hash table —
+/// matches donor `clevels.h` `chainLog = hashLog - 1` for dfast
+/// levels (level 2: `chainLog=15, hashLog=16`; level 3:
+/// `chainLog=16, hashLog=17`). Halves the short-hash footprint
+/// without losing measurable ratio (collisions on the 4-byte short
+/// hash overwrite less frequently than the 8-byte long hash anyway).
+pub(crate) const DFAST_SHORT_HASH_BITS_DELTA: usize = 1;
 pub(crate) const DFAST_SEARCH_DEPTH: usize = 4;
 /// Sentinel value for an empty slot in the `[u32; DFAST_SEARCH_DEPTH]`
 /// hash buckets. Real positions are stored as `(abs_pos -
@@ -4822,8 +4829,15 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let full_tables = driver.dfast_matcher().short_hash.len();
-    assert_eq!(full_tables, 1 << DFAST_HASH_BITS);
+    // Donor-parity split sizes: long-hash = DFAST_HASH_BITS,
+    // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
+    let full_long = driver.dfast_matcher().long_hash.len();
+    let full_short = driver.dfast_matcher().short_hash.len();
+    assert_eq!(full_long, 1 << DFAST_HASH_BITS);
+    assert_eq!(
+        full_short,
+        1 << (DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA)
+    );
 
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(2));
@@ -4832,13 +4846,16 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_tables = driver.dfast_matcher().short_hash.len();
+    let hinted_long = driver.dfast_matcher().long_hash.len();
+    let hinted_short = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
-    assert_eq!(hinted_tables, 1 << MIN_HINTED_WINDOW_LOG);
+    // At the floor `MIN_HINTED_WINDOW_LOG`, set_hash_bits clamps short
+    // to MIN_WINDOW_LOG so both tables can equal the floor.
+    assert_eq!(hinted_long, 1 << MIN_HINTED_WINDOW_LOG);
     assert!(
-        hinted_tables < full_tables,
-        "tiny source hint should reduce dfast table footprint"
+        hinted_long < full_long && hinted_short < full_short,
+        "tiny source hint should reduce both dfast tables"
     );
 }
 
@@ -5069,11 +5086,20 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    let table_len = driver.dfast_matcher().short_hash.len();
+    // Donor-parity split: long-hash at DFAST_HASH_BITS, short-hash one
+    // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching donor
+    // `chainLog = hashLog - 1` for dfast levels).
+    let long_len = driver.dfast_matcher().long_hash.len();
+    let short_len = driver.dfast_matcher().short_hash.len();
     assert_eq!(
-        table_len,
+        long_len,
         1 << DFAST_HASH_BITS,
-        "unhinted Level(2) should keep default dfast table size"
+        "unhinted Level(2) should keep default long-hash table size"
+    );
+    assert_eq!(
+        short_len,
+        1 << (DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA),
+        "unhinted Level(2) short-hash should be one bit smaller than long-hash"
     );
 }
 

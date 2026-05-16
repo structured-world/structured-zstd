@@ -20,7 +20,8 @@ use super::incompressible::{block_looks_incompressible, block_looks_incompressib
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
     DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SEARCH_DEPTH,
-    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
+    DFAST_SHORT_HASH_BITS_DELTA, DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL,
+    DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
@@ -60,7 +61,19 @@ pub(crate) struct DfastMatchGenerator {
     /// a single matcher instance. Donor parity: `ZSTD_window_reduce`
     /// (`zstd_compress_internal.h`).
     pub(crate) position_base: usize,
-    pub(crate) hash_bits: usize,
+    /// Long-hash table bit-width — `long_hash.len() == 1 <<
+    /// long_hash_bits`. Donor parity with `cParams.hashLog` (17 for
+    /// Level 3 large input, 16 for Level 2; see `clevels.h`).
+    pub(crate) long_hash_bits: usize,
+    /// Short-hash table bit-width — `short_hash.len() == 1 <<
+    /// short_hash_bits`. Default is `long_hash_bits -
+    /// DFAST_SHORT_HASH_BITS_DELTA`, donor parity with
+    /// `cParams.chainLog` for dfast levels (one bit smaller than the
+    /// long hash). Halves the short-table footprint without losing
+    /// measurable ratio — the 4-byte short hash overwrites less
+    /// frequently than the 8-byte long hash on average, so the
+    /// smaller bucket count is the donor-correct sizing.
+    pub(crate) short_hash_bits: usize,
     /// Cached fastpath kernel for `hash_mix_u64`. Resolved once at `new()`
     /// and reused on every `hash_index` call so we skip the per-call
     /// `OnceLock` atomic load that `dispatch_hash_mix_u64` would pay.
@@ -91,19 +104,32 @@ impl DfastMatchGenerator {
             short_hash: Vec::new(),
             long_hash: Vec::new(),
             position_base: 0,
-            hash_bits: DFAST_HASH_BITS,
+            long_hash_bits: DFAST_HASH_BITS,
+            short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             use_fast_loop: false,
             lazy_depth: 1,
         }
     }
 
+    /// Set both hash table sizes. `bits` is the long-hash bit count
+    /// (donor `cParams.hashLog`); the short hash is derived as
+    /// `bits - DFAST_SHORT_HASH_BITS_DELTA`, donor-correct for dfast
+    /// levels. Both clamps stay above `MIN_WINDOW_LOG` so very small
+    /// windows don't underflow.
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        let clamped = bits.clamp(MIN_WINDOW_LOG as usize, DFAST_HASH_BITS);
-        if self.hash_bits != clamped {
-            self.hash_bits = clamped;
-            self.short_hash = Vec::new();
+        let min_bits = MIN_WINDOW_LOG as usize;
+        let long_clamped = bits.clamp(min_bits, DFAST_HASH_BITS);
+        let short_clamped = long_clamped
+            .saturating_sub(DFAST_SHORT_HASH_BITS_DELTA)
+            .max(min_bits);
+        if self.long_hash_bits != long_clamped {
+            self.long_hash_bits = long_clamped;
             self.long_hash = Vec::new();
+        }
+        if self.short_hash_bits != short_clamped {
+            self.short_hash_bits = short_clamped;
+            self.short_hash = Vec::new();
         }
     }
 
@@ -644,13 +670,16 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn ensure_hash_tables(&mut self) {
-        let table_len = 1usize << self.hash_bits;
-        if self.short_hash.len() != table_len {
-            // This is intentionally lazy so Fastest/Uncompressed never pay the
-            // ~dfast-level memory cost. The current size tracks the issue's
-            // zstd level-3 style parameters rather than a generic low-memory preset.
-            self.short_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; table_len];
-            self.long_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; table_len];
+        // Independent sizing per donor `clevels.h`: long-hash =
+        // `hashLog`, short-hash = `chainLog`. Lazy allocation so
+        // Fastest/Uncompressed never pay the dfast-level memory cost.
+        let long_len = 1usize << self.long_hash_bits;
+        let short_len = 1usize << self.short_hash_bits;
+        if self.long_hash.len() != long_len {
+            self.long_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; long_len];
+        }
+        if self.short_hash.len() != short_len {
+            self.short_hash = alloc::vec![[DFAST_EMPTY_SLOT; DFAST_SEARCH_DEPTH]; short_len];
         }
     }
 
@@ -890,12 +919,12 @@ impl DfastMatchGenerator {
 
     pub(crate) fn hash4(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
-        self.hash_index(value)
+        self.hash_index_with_bits(value, self.short_hash_bits)
     }
 
     pub(crate) fn hash8(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
-        self.hash_index(value)
+        self.hash_index_with_bits(value, self.long_hash_bits)
     }
 
     fn block_looks_incompressible(&self, start: usize, end: usize) -> bool {
@@ -926,9 +955,9 @@ impl DfastMatchGenerator {
         block_looks_incompressible_strict(block)
     }
 
-    fn hash_index(&self, value: u64) -> usize {
+    fn hash_index_with_bits(&self, value: u64, bits: usize) -> usize {
         let mixed = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
-        (mixed >> (64 - self.hash_bits)) as usize
+        (mixed >> (64 - bits)) as usize
     }
 }
 
