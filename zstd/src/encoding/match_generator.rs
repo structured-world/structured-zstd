@@ -7116,6 +7116,66 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     );
 }
 
+/// `ensure_room_for` must trigger `reduce()` when the requested
+/// absolute position would push a relative offset past
+/// `u32::MAX - DFAST_REBASE_GUARD_BAND`. After the rebase, the
+/// pre-existing entry at a much-smaller absolute position falls
+/// below `reducer` and gets cleared to `DFAST_EMPTY_SLOT`; a fresh
+/// insert at the boundary position must `pack_slot` to a valid
+/// non-sentinel value that `unpack_slot` resolves back to the same
+/// absolute position. Mirrors `LdmHashTable::ensure_room_for_*`
+/// from PR #139; gated to 64-bit pointer widths because the
+/// trigger position exceeds `usize::MAX` on i686.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn dfast_ensure_room_for_rebases_above_guard_band() {
+    let mut dfast = DfastMatchGenerator::new(1 << 22);
+    dfast.set_hash_bits(10);
+    dfast.ensure_hash_tables();
+
+    // Seed an early insert near the current base. We use direct
+    // `pack_slot` + bucket write so the test stays focused on the
+    // rebase mechanics and doesn't drag in the full
+    // `insert_position` flow with its history/window setup.
+    let early_abs = 1024usize;
+    let early_packed = dfast.pack_slot(early_abs);
+    assert_ne!(early_packed, DFAST_EMPTY_SLOT);
+    dfast.short_hash[0][0] = early_packed;
+
+    // Pick a trigger position that forces the first rebase. With
+    // `position_base = 0`, the smallest `abs_pos` that fails the
+    // `rel <= max_rel` test is `u32::MAX - DFAST_REBASE_GUARD_BAND
+    // + 1`. After one `reduce(DFAST_REBASE_GUARD_BAND)` the base
+    // advances by `DFAST_REBASE_GUARD_BAND`.
+    let trigger_abs = (u32::MAX as usize) - (DFAST_REBASE_GUARD_BAND as usize) + 1;
+    assert_eq!(dfast.position_base, 0);
+    dfast.ensure_room_for(trigger_abs);
+    assert_eq!(
+        dfast.position_base, DFAST_REBASE_GUARD_BAND as usize,
+        "rebase must advance position_base by DFAST_REBASE_GUARD_BAND"
+    );
+
+    // The early entry at abs=1024 had packed slot 1025; the rebase
+    // subtracts `DFAST_REBASE_GUARD_BAND` (= 2^30) from every slot.
+    // 1025 <= 2^30 so the slot drops to the empty sentinel —
+    // donor parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
+    assert_eq!(
+        dfast.short_hash[0][0], DFAST_EMPTY_SLOT,
+        "pre-rebase entries below the reducer must become empty"
+    );
+
+    // A fresh insert past the rebase boundary must round-trip:
+    // pack to a non-sentinel value, then unpack back to the same
+    // absolute position via `position_base + slot - 1`.
+    let post_packed = dfast.pack_slot(trigger_abs);
+    assert_ne!(post_packed, DFAST_EMPTY_SLOT);
+    let unpacked = dfast.position_base + (post_packed as usize) - 1;
+    assert_eq!(
+        unpacked, trigger_abs,
+        "post-rebase pack/unpack must round-trip the absolute position"
+    );
+}
+
 #[test]
 fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blocks() {
     let mut matcher = DfastMatchGenerator::new(1 << 22);

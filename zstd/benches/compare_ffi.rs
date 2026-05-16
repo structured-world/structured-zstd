@@ -216,14 +216,51 @@ fn ffi_custom_mem() -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
     }
 }
 
+/// Uninstrumented FFI encode path. Mirrors what an ordinary
+/// downstream `zstd::stream::Encoder` user pays — no customMem
+/// header bookkeeping, no atomic tracker updates. **This is the
+/// path criterion's `c_ffi` timing benchmark uses**, so the
+/// reported FFI throughput reflects what a real caller observes.
+/// Peak-memory measurement goes through
+/// [`ffi_encode_via_custom_mem`] separately so the timing
+/// benchmark isn't biased by tracking overhead.
 fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
-    // Path through raw `zstd_sys` with `ZSTD_createCCtx_advanced`
-    // so the CCtx + every internal libzstd allocation (hash table,
-    // chain table, working buffers, ...) lands in the
-    // `TrackingAllocator` accounting via the customMem hooks.
-    // `zstd::stream::Encoder` uses `ZSTD_createCCtx()` (default
-    // libc malloc), so we cannot reuse it for the
-    // memory-instrumented FFI path.
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)
+        .expect("failed to create zstd stream encoder");
+    encoder
+        .include_checksum(cfg!(feature = "hash"))
+        .expect("failed to configure zstd checksum flag");
+    encoder
+        .include_contentsize(true)
+        .expect("failed to configure zstd content-size flag");
+    encoder
+        .set_pledged_src_size(Some(input.len() as u64))
+        .expect("failed to configure zstd pledged source size");
+    if input.len() <= (1 << 14) {
+        encoder
+            .window_log(14)
+            .expect("failed to configure zstd window_log");
+    }
+    use std::io::Write;
+    encoder
+        .write_all(input)
+        .expect("failed to write zstd stream input");
+    encoder
+        .finish()
+        .expect("failed to finalize zstd stream encoding")
+}
+
+/// CustomMem-instrumented FFI encode path. Identical compression
+/// settings to [`ffi_encode_all_aligned`] (level / checksum /
+/// content-size / tiny-source windowLog tweak) but routed through
+/// raw `zstd_sys` so `ZSTD_createCCtx_advanced(customMem)` can
+/// hook the libzstd C heap into the `TrackingAllocator`.
+///
+/// Per-call overhead (header bookkeeping + atomic counter updates
+/// for every malloc/free libzstd makes) skews latency, so this
+/// helper is called ONLY inside the per-shard `measure_peak_alloc`
+/// block — never inside criterion's `b.iter(|| ...)` timing loop.
+fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: customMem hooks are valid for the lifetime of the
     // resulting CCtx; we always `ZSTD_freeCCtx` it before the
@@ -345,7 +382,12 @@ fn bench_compress(c: &mut Criterion) {
                     )
                 });
                 let (ffi_compressed, ffi_peak_bytes) = measure_peak_alloc(|| {
-                    ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level)
+                    // CustomMem-instrumented variant. Used here so
+                    // libzstd's C heap is observed by the tracker.
+                    // The criterion `c_ffi` timing path below uses
+                    // the uninstrumented `ffi_encode_all_aligned`
+                    // so latency reflects what a real caller pays.
+                    ffi_encode_via_custom_mem(&scenario.bytes[..], level.ffi_level)
                 });
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
