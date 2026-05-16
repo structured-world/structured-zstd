@@ -397,13 +397,22 @@ if not benchmark_results:
             "falling back to all parsed timings for benchmark-results.json.",
             file=sys.stderr,
         )
+        # Filter to canonical levels + regression stages so the
+        # fallback respects the alert contract: only `level_3_dfast`
+        # and `level_22_btultra2` (the ALERT_LEVELS) ever fire
+        # github-action-benchmark regressions. Falling back to
+        # unfiltered `timings` here would reintroduce non-canonical
+        # shard siblings (e.g. level_2_dfast on the `dfast` shard) and
+        # they'd trip alerts they were explicitly excluded from.
         benchmark_results = [
             {
-                "name": name,
+                "name": row["name"],
                 "unit": "ms",
-                "value": round(ms, 3),
+                "value": round(row["ms_per_iter"], 3),
             }
-            for name, ms in timings
+            for row in timing_rows
+            if row["stage"] in REGRESSION_STAGES
+            and row["level"] in regression_levels
         ]
     else:
         # Strategy shard processed only non-canonical levels (e.g.
@@ -671,9 +680,11 @@ for row in memory_rows:
     # delta_ratio = rust_peak / ffi_peak. Values > 1 mean Rust uses
     # MORE memory than FFI (worse for us — same direction as
     # compression_ratio, where >1 means Rust output is larger).
+    # `ffi_bytes == 0` is a real datapoint (no libzstd allocations
+    # for that scenario): emit the row with `delta_ratio: null` so the
+    # dashboard keeps both side values; only the ratio is undefined.
     delta_ratio = (rust_bytes / ffi_bytes) if ffi_bytes > 0 else None
-    if delta_ratio is None:
-        continue
+    delta_percent = (delta_ratio - 1.0) * 100.0 if delta_ratio is not None else None
     relative_rows.append(
         {
             "target": bench_target_id,
@@ -695,7 +706,7 @@ for row in memory_rows:
             "rust_value": rust_bytes,
             "ffi_value": ffi_bytes,
             "delta_ratio": delta_ratio,
-            "delta_percent": (delta_ratio - 1.0) * 100.0,
+            "delta_percent": delta_percent,
             "status_band": "n/a",
             "interpretation": "delta>1 means Rust allocates more peak memory than FFI",
         }
