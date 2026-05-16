@@ -743,6 +743,7 @@ impl DfastMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    #[inline(always)]
     pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         let hash = self.hash_candidate(abs_pos, lit_len);
@@ -769,6 +770,7 @@ impl DfastMatchGenerator {
         )
     }
 
+    #[inline(always)]
     pub(crate) fn repcode_candidate(
         &self,
         abs_pos: usize,
@@ -784,6 +786,7 @@ impl DfastMatchGenerator {
         )
     }
 
+    #[inline(always)]
     pub(crate) fn hash_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         // Hoist all the per-loop invariants out of the combinator chains.
         // `short_candidates`/`long_candidates` each re-fetch `live_history`
@@ -888,7 +891,7 @@ impl DfastMatchGenerator {
     /// primary probe, the short-hash primary probe, and the
     /// `_search_next_long` retry — keeps the bounds-checking logic in
     /// one place so the three call sites can't drift.
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn probe_slot_match(
         &self,
@@ -921,6 +924,7 @@ impl DfastMatchGenerator {
         Some(self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len))
     }
 
+    #[inline(always)]
     fn extend_backwards(
         &self,
         candidate_pos: usize,
@@ -1103,11 +1107,13 @@ impl DfastMatchGenerator {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
         let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
         self.hash_index_with_bits(value, self.short_hash_bits)
     }
 
+    #[inline(always)]
     pub(crate) fn long_hash_index(&self, data: &[u8]) -> usize {
         let value = u64::from_le_bytes(data[..8].try_into().unwrap());
         self.hash_index_with_bits(value, self.long_hash_bits)
@@ -1141,6 +1147,7 @@ impl DfastMatchGenerator {
         block_looks_incompressible_strict(block)
     }
 
+    #[inline(always)]
     fn hash_index_with_bits(&self, value: u64, bits: usize) -> usize {
         // Donor parity (`zstd_compress_internal.h:923-924`, `ZSTD_hash8`):
         // a single 64-bit multiply by `prime8bytes` followed by a high-bits
