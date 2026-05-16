@@ -12,197 +12,191 @@
 mod support;
 
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Hand-rolled tracking allocator wrapping `System` so the bench can
-/// emit a per-call peak-memory metric alongside throughput / ratio.
-/// Hand-rolled (not a dep) because the wrapper is ~30 lines and stays
-/// dev-only; pulling `peak_alloc` would add a transitive dep on
-/// `parking_lot` for what amounts to two atomics.
+/// OS-level resident-set-size sampling. Used by the bench to observe
+/// Rust-side peak memory during one compress/decompress call without
+/// installing a global allocator wrapper.
 ///
-/// Usage:
-///   1. `PeakAllocTracker::reset()` — snapshot current usage as the
-///      peak baseline.
-///   2. Run the work to measure.
-///   3. `PeakAllocTracker::peak_since_reset()` — high-water mark of
-///      live bytes above the snapshot baseline.
+/// Earlier revisions installed a `#[global_allocator] TrackingAllocator`
+/// that intercepted every allocation in the bench binary. Even when its
+/// counting was gated by an atomic flag, the per-allocation load+branch
+/// (and the extra 16-byte header) biased criterion's timing loops
+/// relative to the FFI side. RSS sampling moves the observation off the
+/// hot path entirely: the OS updates resident-set size on
+/// `brk`/`mmap`/page fault, and a background poller reads it.
 ///
-/// Atomics use `Relaxed` ordering: the peak/current pair is observed
-/// from the same thread that runs the work, so cross-thread ordering
-/// guarantees aren't needed. The bench harness runs each measurement
-/// on the calling thread.
-struct TrackingAllocator;
-static ALLOC_CURRENT: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_PEAK: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_BASELINE: AtomicUsize = AtomicUsize::new(0);
-/// Gates whether new allocations are *counted* in [`ALLOC_CURRENT`] /
-/// [`ALLOC_PEAK`]. By default `false`, so criterion's timing loops
-/// pay zero tracking overhead. Flipped to `true` only inside
-/// [`measure_peak_alloc`] (RAII guard) so the peak-memory sample is
-/// scoped to one wrapped workload.
-///
-/// Decoupling: the gate controls **what new allocations record**, NOT
-/// what `dealloc` subtracts. Per-allocation "was counted" metadata
-/// (encoded in [`TrackingAllocator`]'s header prefix below) drives
-/// the dealloc decrement, so a `Vec` allocated inside a measurement
-/// window and dropped outside still subtracts cleanly and
-/// `ALLOC_CURRENT` stays balanced across the whole process. Without
-/// that decoupling the counter would drift upward every sample
-/// (CR + Copilot both flagged this on PR #143; on i686 the 32-bit
-/// counter could wrap and corrupt later peak measurements).
-static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+/// This module is compiled only into the `compare_ffi` bench binary,
+/// never into the published `structured-zstd` crate.
+mod rss {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-/// Minimum header width. Each allocation reserves
-/// `max(layout.align(), HEADER_MIN)` bytes before the user pointer
-/// to store one byte of "was this allocation counted?" metadata
-/// plus padding to the requested alignment. 16 bytes covers SSE /
-/// NEON alignment requirements without further fixup for the common
-/// `align <= 16` case (essentially every `Box` / `Vec<T>` we'll see
-/// in the bench process).
-const TRACKER_HEADER_MIN: usize = 16;
+    /// Current resident-set size of this process in bytes. Returns 0
+    /// on unsupported platforms or if the OS query fails (callers
+    /// treat 0 as "no signal" and skip max-updates).
+    pub fn current() -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            current_macos()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            current_linux()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            0
+        }
+    }
 
-/// Flag byte values stored at the start of each TrackingAllocator
-/// header. Encoded as `u8` so a single-byte read at the header offset
-/// recovers the counted bit on `dealloc` without atomic ops.
-const TRACKER_FLAG_UNCOUNTED: u8 = 0;
-const TRACKER_FLAG_COUNTED: u8 = 1;
-
-#[inline]
-fn tracker_header_size(layout: Layout) -> usize {
-    layout.align().max(TRACKER_HEADER_MIN)
-}
-
-#[inline]
-fn tracker_augmented_layout(layout: Layout) -> Option<Layout> {
-    let header = tracker_header_size(layout);
-    let total = layout.size().checked_add(header)?;
-    // Augmented allocation must satisfy the user's alignment AND fit
-    // a `TRACKER_HEADER_MIN`-byte header in front. `align.max(HEADER_MIN)`
-    // is a power of two (both inputs are powers of two from a valid
-    // `Layout`), so `Layout::from_size_align` accepts it.
-    Layout::from_size_align(total, layout.align().max(TRACKER_HEADER_MIN)).ok()
-}
-
-unsafe impl GlobalAlloc for TrackingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let Some(augmented) = tracker_augmented_layout(layout) else {
-            return core::ptr::null_mut();
+    #[cfg(target_os = "macos")]
+    fn current_macos() -> usize {
+        // mach_task_basic_info — same struct top(1) reads for RSIZE.
+        // `resident_size` is in bytes; flavor id 20 and layout are
+        // stable kernel ABI (xnu mach/task_info.h).
+        const MACH_TASK_BASIC_INFO: i32 = 20;
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        unsafe extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(target: u32, flavor: i32, info: *mut u8, count: *mut u32) -> i32;
+        }
+        let mut info = MachTaskBasicInfo {
+            virtual_size: 0,
+            resident_size: 0,
+            resident_size_max: 0,
+            user_time: [0; 2],
+            system_time: [0; 2],
+            policy: 0,
+            suspend_count: 0,
         };
-        let header = tracker_header_size(layout);
-        // SAFETY: `augmented` is a valid `Layout` (size + header,
-        // alignment ≥ header) so `System.alloc` either returns null
-        // or a pointer to at least `augmented.size()` bytes.
-        let raw = unsafe { System.alloc(augmented) };
-        if raw.is_null() {
-            return raw;
+        // count is in u32 units (struct size / 4).
+        let mut count = (core::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
+        // SAFETY: `mach_task_self` returns the current task port,
+        // `task_info` reads `count * 4` bytes into the buffer we
+        // pass; the struct size matches `count`.
+        let rc = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                core::ptr::from_mut(&mut info) as *mut u8,
+                &mut count,
+            )
+        };
+        if rc == 0 {
+            info.resident_size as usize
+        } else {
+            0
         }
-        let counted = TRACKING_ENABLED.load(Ordering::Relaxed);
-        // SAFETY: `raw` is non-null and points to at least `header`
-        // bytes (header bytes are dedicated to the size flag + pad).
-        unsafe {
-            *raw = if counted {
-                TRACKER_FLAG_COUNTED
-            } else {
-                TRACKER_FLAG_UNCOUNTED
-            };
-        }
-        if counted {
-            let prev = ALLOC_CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
-            // `fetch_max` on the new live size keeps the high-water
-            // mark current without an extra load+compare.
-            ALLOC_PEAK.fetch_max(prev + layout.size(), Ordering::Relaxed);
-        }
-        // SAFETY: header bytes were just initialised; the user
-        // pointer (raw + header) is aligned to `layout.align()`
-        // because `header = max(align, HEADER_MIN)` is a multiple of
-        // `align`, and `raw` is aligned to `augmented.align()` =
-        // `max(align, HEADER_MIN) >= align`.
-        unsafe { raw.add(header) }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let header = tracker_header_size(layout);
-        // SAFETY: `ptr` came from `alloc` above, which placed the
-        // flag byte exactly `header` bytes before this pointer.
-        let raw = unsafe { ptr.sub(header) };
-        let counted = unsafe { *raw } == TRACKER_FLAG_COUNTED;
-        // Always subtract for counted allocations regardless of the
-        // current TRACKING_ENABLED state. Without this the Vec
-        // returned from `measure_peak_alloc`'s closure would have its
-        // alloc counted (TRACKING_ENABLED=true at alloc time) but its
-        // dealloc skipped (TRACKING_ENABLED=false at drop time), and
-        // ALLOC_CURRENT would drift upward across every sample —
-        // eventually wrapping the 32-bit counter on i686.
-        if counted {
-            ALLOC_CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        let augmented = Layout::from_size_align(
-            layout.size() + header,
-            layout.align().max(TRACKER_HEADER_MIN),
-        )
-        .expect("alloc layout must round-trip on dealloc");
-        // SAFETY: `raw` + `augmented` match the pair passed to
-        // `System.alloc` by our `alloc` above.
-        unsafe { System.dealloc(raw, augmented) };
+    #[cfg(target_os = "linux")]
+    fn current_linux() -> usize {
+        // /proc/self/statm: "size resident shared text lib data dt"
+        // resident column is in pages.
+        let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let resident_pages: usize = s
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        resident_pages.saturating_mul(page_size())
     }
 
-    // `alloc_zeroed` / `realloc` use the default `GlobalAlloc` impls
-    // (which call back into our `alloc` / `dealloc`), so they pick up
-    // the header-prefix accounting for free. The default `realloc`
-    // does `alloc + copy + dealloc` rather than passing through to
-    // `System.realloc`, which is the correct path under header
-    // accounting — `System.realloc` would invalidate our header.
+    #[cfg(target_os = "linux")]
+    fn page_size() -> usize {
+        use std::sync::OnceLock;
+        static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            unsafe extern "C" {
+                fn sysconf(name: i32) -> i64;
+            }
+            // _SC_PAGESIZE = 30 on Linux. `sysconf` returns -1 on
+            // failure; fall back to 4 KiB (matches every Linux ABI
+            // we care about, including i686-gnu and x86_64-musl).
+            // SAFETY: sysconf is async-signal-safe and has no
+            // pointer arguments; safe to call from any thread.
+            let v = unsafe { sysconf(30) };
+            if v > 0 { v as usize } else { 4096 }
+        })
+    }
+
+    /// Background-sampled peak-RSS observation window. `start` snaps
+    /// baseline and spawns a poller that updates a peak counter every
+    /// `SAMPLE_INTERVAL`; `finish` joins the poller and returns
+    /// `peak.saturating_sub(baseline)`.
+    ///
+    /// Sampling cadence is tight enough for sub-second encode/decode
+    /// operations on >100 KiB inputs (hundreds of samples per call).
+    /// For sub-100 µs operations the sampler may miss intra-call
+    /// peaks — that's acceptable because RSS for such tiny payloads
+    /// is dominated by static process state and the metric isn't
+    /// meaningful at that scale.
+    const SAMPLE_INTERVAL: Duration = Duration::from_micros(250);
+
+    pub struct PeakWindow {
+        peak: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+        baseline: usize,
+    }
+
+    impl PeakWindow {
+        pub fn start() -> Self {
+            let baseline = current();
+            let peak = Arc::new(AtomicUsize::new(baseline));
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak_w = peak.clone();
+            let stop_w = stop.clone();
+            let handle = thread::spawn(move || {
+                while !stop_w.load(Ordering::Relaxed) {
+                    let cur = current();
+                    if cur > 0 {
+                        peak_w.fetch_max(cur, Ordering::Relaxed);
+                    }
+                    thread::sleep(SAMPLE_INTERVAL);
+                }
+            });
+            PeakWindow {
+                peak,
+                stop,
+                handle: Some(handle),
+                baseline,
+            }
+        }
+
+        /// Stop the poller and return `peak - baseline`. Also takes
+        /// one final on-thread sample so a peak that landed after
+        /// the poller's last loop iteration but before `finish` is
+        /// still observed.
+        pub fn finish(mut self) -> usize {
+            let final_rss = current();
+            if final_rss > 0 {
+                self.peak.fetch_max(final_rss, Ordering::Relaxed);
+            }
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            let peak = self.peak.load(Ordering::Relaxed);
+            peak.saturating_sub(self.baseline)
+        }
+    }
 }
 
-#[global_allocator]
-static GLOBAL: TrackingAllocator = TrackingAllocator;
-
-struct PeakAllocTracker;
-impl PeakAllocTracker {
-    /// Snapshot the current live-bytes count as the baseline against
-    /// which the next [`Self::peak_since_reset`] measurement is taken.
-    /// Also forces the peak counter to the same baseline so a peak
-    /// observed BEFORE this call doesn't leak into the next sample.
-    fn reset() {
-        let current = ALLOC_CURRENT.load(Ordering::Relaxed);
-        ALLOC_BASELINE.store(current, Ordering::Relaxed);
-        ALLOC_PEAK.store(current, Ordering::Relaxed);
-    }
-
-    /// High-water mark of live bytes above the baseline set by
-    /// [`Self::reset`]. Returns `0` when the workload only freed
-    /// memory below the baseline (impossible for a positive-net
-    /// compress/decompress call but guards against signed underflow).
-    fn peak_since_reset() -> usize {
-        let peak = ALLOC_PEAK.load(Ordering::Relaxed);
-        let baseline = ALLOC_BASELINE.load(Ordering::Relaxed);
-        peak.saturating_sub(baseline)
-    }
-}
-
-fn measure_peak_alloc<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    /// RAII guard so a panic inside `f` (or an early return) still
-    /// flips `TRACKING_ENABLED` back to `false`. Without this a
-    /// panicking workload would leave tracking on for every
-    /// subsequent allocation in the process — including criterion's
-    /// post-panic teardown.
-    struct TrackingGuard;
-    impl Drop for TrackingGuard {
-        fn drop(&mut self) {
-            TRACKING_ENABLED.store(false, Ordering::Relaxed);
-        }
-    }
-    PeakAllocTracker::reset();
-    TRACKING_ENABLED.store(true, Ordering::Relaxed);
-    let _guard = TrackingGuard;
-    let result = f();
-    let peak = PeakAllocTracker::peak_since_reset();
-    (result, peak)
-}
 use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
@@ -213,141 +207,146 @@ use support::{
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
-/// Custom-allocator shim for libzstd. Without this libzstd's
-/// `ZSTD_CCtx` / hash table / chain table / workspace allocations
-/// go straight to libc `malloc` and are invisible to the Rust
-/// `#[global_allocator]` wrapper. CR review of PR #143 flagged
-/// this as the root cause of the misleadingly small
-/// `ffi_peak_alloc_bytes` numbers in the first baseline pass —
-/// the FFI side was reporting only the Rust-owned output `Vec`
-/// without the actual C heap. Wiring `ZSTD_customMem` so its
-/// alloc/free hooks route through `alloc::alloc::alloc` /
-/// `alloc::alloc::dealloc` makes `TrackingAllocator` observe
-/// every libzstd allocation, restoring apples-to-apples
-/// comparison with `rust_peak_alloc_bytes`.
+/// Per-CCtx FFI memory tracker. Passed as the `opaque` field of
+/// `ZSTD_customMem` so libzstd's malloc/free callbacks update this
+/// struct directly. No global state, no atomic ops — the tracker
+/// lives on the calling stack and is touched only from libzstd's
+/// single-threaded-per-context allocator path.
 ///
-/// Layout: each block is over-allocated by `HEADER_BYTES` so the
-/// allocation size can be recovered at free time (libzstd's
-/// `customFree(opaque, addr)` does not receive a size). The
-/// header sits at `ptr` and `ptr + HEADER_BYTES` is returned to
-/// libzstd. `align = 16` covers SSE/NEON requirements; libzstd
-/// internally over-aligns via `ZSTD_alignedAlloc` when it needs
-/// tighter alignment, so the customMem allocator only has to
-/// guarantee 16.
-mod ffi_tracking_alloc {
-    use core::ffi::c_void;
-    use core::ptr;
+/// Used only when memory is being measured. Criterion's timing loops
+/// call the FFI helpers with `mem = None`, which routes libzstd back
+/// to its default `malloc`/`free`, so timing samples pay no
+/// instrumentation overhead.
+///
+/// Bench-only: lives entirely in this file and is never linked into
+/// the published `structured-zstd` crate.
+#[derive(Default)]
+struct FfiMemTracker {
+    current: usize,
+    peak: usize,
+}
+
+impl FfiMemTracker {
+    /// Build a `ZSTD_customMem` whose `opaque` points at `self`.
+    /// Caller must keep `self` alive for the lifetime of the
+    /// CCtx/DCtx (libzstd calls `customFree` during `ZSTD_freeCCtx` /
+    /// `ZSTD_freeDCtx`, which the bench invokes before dropping the
+    /// tracker).
+    fn custom_mem(&mut self) -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
+        zstd::zstd_safe::zstd_sys::ZSTD_customMem {
+            customAlloc: Some(ffi_alloc),
+            customFree: Some(ffi_free),
+            opaque: core::ptr::from_mut(self) as *mut core::ffi::c_void,
+        }
+    }
+}
+
+/// Header bytes prepended to every customMem allocation so the size
+/// can be recovered at free time (libzstd's `customFree(opaque, addr)`
+/// does not pass a size). 16 also covers SSE / NEON alignment for the
+/// user-visible pointer.
+const FFI_HEADER_BYTES: usize = 16;
+const FFI_ALIGN: usize = 16;
+
+/// `ZSTD_customMem` allocate callback. Reserves `size + HEADER` bytes,
+/// stores `size` in the header, updates the per-CCtx tracker, and
+/// returns the post-header pointer.
+///
+/// SAFETY: `opaque` must be the `*mut FfiMemTracker` pointer that
+/// `custom_mem()` produced. libzstd is single-threaded per CCtx, so
+/// the `&mut FfiMemTracker` access here is race-free as long as the
+/// bench doesn't share a tracker across CCtxs concurrently (it
+/// doesn't — each measurement constructs a fresh tracker on its own
+/// thread).
+unsafe extern "C" fn ffi_alloc(
+    opaque: *mut core::ffi::c_void,
+    size: usize,
+) -> *mut core::ffi::c_void {
     use std::alloc::Layout;
-
-    const HEADER_BYTES: usize = 16;
-    const ALIGN: usize = 16;
-
-    /// SAFETY: libzstd contract — `size` is the request, return
-    /// value is either `null_mut` or a freshly allocated block of
-    /// at least `size` bytes whose pointer is `ALIGN`-aligned.
-    pub(super) unsafe extern "C" fn alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
-        let total = match size.checked_add(HEADER_BYTES) {
-            Some(t) => t,
-            None => return ptr::null_mut(),
-        };
-        let layout = match Layout::from_size_align(total, ALIGN) {
-            Ok(l) => l,
-            Err(_) => return ptr::null_mut(),
-        };
-        // SAFETY: `Layout` validated above; `alloc::alloc::alloc`
-        // routes through `#[global_allocator] = TrackingAllocator`,
-        // which forwards to `System` and updates the peak counters.
-        let raw = unsafe { std::alloc::alloc(layout) };
-        if raw.is_null() {
-            return ptr::null_mut();
-        }
-        // SAFETY: the first `HEADER_BYTES` of `raw` are owned by
-        // this allocator and large enough to hold a `usize`.
-        unsafe { ptr::write(raw as *mut usize, size) };
-        unsafe { raw.add(HEADER_BYTES) as *mut c_void }
+    let Some(total) = size.checked_add(FFI_HEADER_BYTES) else {
+        return core::ptr::null_mut();
+    };
+    let Ok(layout) = Layout::from_size_align(total, FFI_ALIGN) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: layout is valid (validated above).
+    let raw = unsafe { std::alloc::alloc(layout) };
+    if raw.is_null() {
+        return core::ptr::null_mut();
     }
-
-    /// SAFETY: libzstd contract — `address` is either `null` or
-    /// a pointer previously returned by `alloc` above; the size
-    /// header at `address - HEADER_BYTES` was written by `alloc`.
-    pub(super) unsafe extern "C" fn free(_opaque: *mut c_void, address: *mut c_void) {
-        if address.is_null() {
-            return;
-        }
-        // SAFETY: pointer arithmetic is valid because `address`
-        // came from `alloc` above, which placed the size header
-        // exactly `HEADER_BYTES` before the returned pointer.
-        let header_ptr = unsafe { (address as *mut u8).sub(HEADER_BYTES) };
-        let size = unsafe { ptr::read(header_ptr as *const usize) };
-        let total = size + HEADER_BYTES;
-        let layout = Layout::from_size_align(total, ALIGN).expect("layout must round-trip");
-        // SAFETY: the layout matches the one passed to `alloc`,
-        // so `dealloc` updates the tracker symmetrically and
-        // releases the underlying System allocation.
-        unsafe { std::alloc::dealloc(header_ptr, layout) };
+    // SAFETY: first 8 bytes of `raw` are owned by us (HEADER_BYTES is 16).
+    unsafe {
+        core::ptr::write(raw as *mut usize, size);
     }
+    // SAFETY: opaque came from `FfiMemTracker::custom_mem`; per-CCtx
+    // single-threaded access.
+    let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
+    tracker.current = tracker.current.saturating_add(size);
+    if tracker.current > tracker.peak {
+        tracker.peak = tracker.current;
+    }
+    // SAFETY: raw + HEADER_BYTES is in-bounds (allocation size is
+    // total = size + HEADER_BYTES) and HEADER_BYTES ≥ FFI_ALIGN
+    // so the returned pointer is FFI_ALIGN-aligned.
+    unsafe { raw.add(FFI_HEADER_BYTES) as *mut core::ffi::c_void }
 }
 
-fn ffi_custom_mem() -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
-    zstd::zstd_safe::zstd_sys::ZSTD_customMem {
-        customAlloc: Some(ffi_tracking_alloc::alloc),
-        customFree: Some(ffi_tracking_alloc::free),
-        opaque: core::ptr::null_mut(),
+/// `ZSTD_customMem` free callback. Recovers `size` from the header,
+/// decrements `tracker.current`, and releases the underlying System
+/// allocation.
+unsafe extern "C" fn ffi_free(opaque: *mut core::ffi::c_void, address: *mut core::ffi::c_void) {
+    use std::alloc::Layout;
+    if address.is_null() {
+        return;
     }
+    // SAFETY: `address` came from `ffi_alloc`, which placed a size
+    // header exactly HEADER_BYTES before the returned pointer.
+    let header_ptr = unsafe { (address as *mut u8).sub(FFI_HEADER_BYTES) };
+    let size = unsafe { core::ptr::read(header_ptr as *const usize) };
+    let layout = Layout::from_size_align(size + FFI_HEADER_BYTES, FFI_ALIGN)
+        .expect("layout round-trips from ffi_alloc");
+    // SAFETY: opaque is the same FfiMemTracker that `ffi_alloc` saw
+    // for this CCtx; single-threaded per-CCtx.
+    let tracker = unsafe { &mut *(opaque as *mut FfiMemTracker) };
+    tracker.current = tracker.current.saturating_sub(size);
+    // SAFETY: header_ptr + layout matches the pair from `ffi_alloc`.
+    unsafe { std::alloc::dealloc(header_ptr, layout) };
 }
 
-/// Uninstrumented FFI encode path. Mirrors what an ordinary
-/// downstream `zstd::stream::Encoder` user pays — no customMem
-/// header bookkeeping, no atomic tracker updates. **This is the
-/// path criterion's `c_ffi` timing benchmark uses**, so the
-/// reported FFI throughput reflects what a real caller observes.
-/// Peak-memory measurement goes through
-/// [`ffi_encode_via_custom_mem`] separately so the timing
-/// benchmark isn't biased by tracking overhead.
-fn ffi_encode_all_aligned(input: &[u8], level: i32) -> Vec<u8> {
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), level)
-        .expect("failed to create zstd stream encoder");
-    encoder
-        .include_checksum(cfg!(feature = "hash"))
-        .expect("failed to configure zstd checksum flag");
-    encoder
-        .include_contentsize(true)
-        .expect("failed to configure zstd content-size flag");
-    encoder
-        .set_pledged_src_size(Some(input.len() as u64))
-        .expect("failed to configure zstd pledged source size");
-    if input.len() <= (1 << 14) {
-        encoder
-            .window_log(14)
-            .expect("failed to configure zstd window_log");
-    }
-    use std::io::Write;
-    encoder
-        .write_all(input)
-        .expect("failed to write zstd stream input");
-    encoder
-        .finish()
-        .expect("failed to finalize zstd stream encoding")
-}
-
-/// CustomMem-instrumented FFI encode path. Identical compression
-/// settings to [`ffi_encode_all_aligned`] (level / checksum /
-/// content-size / tiny-source windowLog tweak) but routed through
-/// raw `zstd_sys` so `ZSTD_createCCtx_advanced(customMem)` can
-/// hook the libzstd C heap into the `TrackingAllocator`.
+/// Unified FFI encode helper. Used by both criterion's timing loop
+/// (`mem = None`, libzstd uses default malloc — zero instrumentation
+/// overhead, matches what an ordinary FFI consumer pays) and the
+/// per-shard memory-measurement block (`mem = Some(&mut tracker)` so
+/// every libzstd allocation flows through `FfiMemTracker` and produces
+/// a precise peak number).
 ///
-/// Per-call overhead (header bookkeeping + atomic counter updates
-/// for every malloc/free libzstd makes) skews latency, so this
-/// helper is called ONLY inside the per-shard `measure_peak_alloc`
-/// block — never inside criterion's `b.iter(|| ...)` timing loop.
-fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
+/// Both callers exercise the SAME code path — `ZSTD_compressStream2`
+/// into a growing-output `Vec`. Earlier revisions of this bench had a
+/// split (`zstd::stream::Encoder` for timing, raw API for memory),
+/// which let the two metrics describe different operations. The
+/// streaming output Vec also matches what the pure-Rust
+/// `compress_to_vec` does: both sides grow output incrementally rather
+/// than pre-allocating `ZSTD_compressBound`, so the headline
+/// peak-memory numbers stay apples-to-apples.
+fn ffi_encode_to_vec(input: &[u8], level: i32, mem: Option<&mut FfiMemTracker>) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
-    // SAFETY: customMem hooks are valid for the lifetime of the
-    // resulting CCtx; we always `ZSTD_freeCCtx` it before the
-    // current scope ends so the hooks outlive every libzstd call.
-    let cctx = unsafe { zstd_sys::ZSTD_createCCtx_advanced(ffi_custom_mem()) };
-    assert!(!cctx.is_null(), "ZSTD_createCCtx_advanced returned null");
+    // SAFETY: `ZSTD_createCCtx{,_advanced}` return null on OOM and
+    // are otherwise safe to call. The CCtx is freed before returning.
+    // When `mem = Some`, the tracker reference outlives the CCtx
+    // because we drop the CCtx (and thus issue the final customFree
+    // calls) before this function returns.
+    let cctx = unsafe {
+        match mem {
+            Some(tracker) => zstd_sys::ZSTD_createCCtx_advanced(tracker.custom_mem()),
+            None => zstd_sys::ZSTD_createCCtx(),
+        }
+    };
+    assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
 
+    // SAFETY: every `zstd_sys` call below operates on the CCtx we
+    // just created and freshly-validated parameter values. Errors
+    // are converted to assertion failures so memory measurements
+    // can't silently regress to default settings.
     unsafe {
         let rc = zstd_sys::ZSTD_CCtx_setParameter(
             cctx,
@@ -376,9 +375,10 @@ fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
             "set contentSizeFlag failed"
         );
 
-        // Match the previous comparable-framing tweak for tiny
-        // sources so a level-3 / small-payload comparison still
-        // sits on the same window size as before this refactor.
+        // Tiny inputs use a 14-bit window so the FFI frame matches
+        // the pure-Rust frame on small payloads. Without this the
+        // FFI side picks a larger default window than the Rust
+        // encoder emits, biasing the memory comparison.
         if input.len() <= (1 << 14) {
             let rc = zstd_sys::ZSTD_CCtx_setParameter(
                 cctx,
@@ -391,15 +391,6 @@ fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
         let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
         assert!(zstd_sys::ZSTD_isError(rc) == 0, "setPledgedSrcSize failed");
 
-        // Stream via `ZSTD_compressStream2` into a growing `Vec` so
-        // the output buffer profile matches the throughput path
-        // (`zstd::stream::Encoder::new(Vec::new(), ...)` + `write_all`
-        // + `finish`), which Copilot flagged: a `ZSTD_compress2`
-        // one-shot pre-allocates `ZSTD_compressBound(input.len())`
-        // and would inflate `ffi_peak_alloc_bytes` over the worst-case
-        // bound even when the actual compressed output is much smaller.
-        // Growing the Vec on each flush keeps the two paths comparing
-        // the same FFI encode shape.
         let recommended_in = zstd_sys::ZSTD_CStreamInSize();
         let recommended_out = zstd_sys::ZSTD_CStreamOutSize();
         let mut output: Vec<u8> = Vec::new();
@@ -429,9 +420,6 @@ fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
                     "ZSTD_compressStream2 failed (code = {remaining})"
                 );
                 output.extend_from_slice(&chunk[..zout.pos]);
-                // `mode == ZSTD_e_end`: keep flushing until libzstd
-                // reports 0 (frame complete). For `ZSTD_e_continue`,
-                // exit once the input chunk is fully consumed.
                 let frame_complete =
                     matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) && remaining == 0;
                 let chunk_consumed = matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_continue)
@@ -451,33 +439,80 @@ fn ffi_encode_via_custom_mem(input: &[u8], level: i32) -> Vec<u8> {
     }
 }
 
-fn ffi_decompress_via_custom_mem(compressed: &[u8], expected_len: usize) -> Vec<u8> {
-    // Mirror of `ffi_encode_all_aligned`'s rationale for the
-    // decode side: routes the `ZSTD_DCtx` + its internal buffers
-    // through the customMem hooks so `TrackingAllocator` sees
-    // every libzstd allocation on the FFI decode path.
-    use zstd::zstd_safe::zstd_sys;
-    // SAFETY: customMem hooks remain valid for the lifetime of
-    // the DCtx, which is freed before returning.
-    let dctx = unsafe { zstd_sys::ZSTD_createDCtx_advanced(ffi_custom_mem()) };
-    assert!(!dctx.is_null(), "ZSTD_createDCtx_advanced returned null");
-    unsafe {
-        let mut output = vec![0u8; expected_len];
-        let written = zstd_sys::ZSTD_decompressDCtx(
-            dctx,
-            output.as_mut_ptr() as *mut core::ffi::c_void,
-            output.len(),
-            compressed.as_ptr() as *const core::ffi::c_void,
-            compressed.len(),
-        );
+/// Reusable FFI DCtx handle. Wraps `ZSTD_createDCtx{,_advanced}` +
+/// `ZSTD_freeDCtx` lifecycle so criterion's `b.iter` timing loop can
+/// call `ZSTD_decompressDCtx` repeatedly against the same context —
+/// matching the pure-Rust loop which reuses one `FrameDecoder`.
+/// Creating a fresh DCtx per iteration would dominate the sample at
+/// small payloads (DCtx construction is ~100 KiB of allocation).
+///
+/// When `mem = Some`, libzstd routes its window buffer + dictionary
+/// scratch through `FfiMemTracker`. When `mem = None`, default malloc
+/// is used (timing loops want this).
+struct FfiDCtxHandle {
+    ptr: *mut zstd::zstd_safe::zstd_sys::ZSTD_DCtx_s,
+}
+
+impl FfiDCtxHandle {
+    fn new(mem: Option<&mut FfiMemTracker>) -> Self {
+        use zstd::zstd_safe::zstd_sys;
+        // SAFETY: both constructors are safe FFI calls returning
+        // null on OOM, which we assert against.
+        let ptr = unsafe {
+            match mem {
+                Some(tracker) => zstd_sys::ZSTD_createDCtx_advanced(tracker.custom_mem()),
+                None => zstd_sys::ZSTD_createDCtx(),
+            }
+        };
+        assert!(!ptr.is_null(), "ZSTD_createDCtx returned null");
+        FfiDCtxHandle { ptr }
+    }
+
+    fn decompress_into(&mut self, compressed: &[u8], output: &mut [u8]) -> usize {
+        use zstd::zstd_safe::zstd_sys;
+        // SAFETY: `self.ptr` is a valid DCtx, lifetime tied to
+        // `self`. `output` and `compressed` are valid slices.
+        let written = unsafe {
+            zstd_sys::ZSTD_decompressDCtx(
+                self.ptr,
+                output.as_mut_ptr() as *mut core::ffi::c_void,
+                output.len(),
+                compressed.as_ptr() as *const core::ffi::c_void,
+                compressed.len(),
+            )
+        };
         assert!(
-            zstd_sys::ZSTD_isError(written) == 0,
+            unsafe { zstd_sys::ZSTD_isError(written) } == 0,
             "ZSTD_decompressDCtx failed (code = {written})"
         );
-        output.truncate(written);
-        zstd_sys::ZSTD_freeDCtx(dctx);
-        output
+        written
     }
+}
+
+impl Drop for FfiDCtxHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was created by `Self::new` and is freed
+        // exactly once here. After this, any FfiMemTracker borrowed
+        // through `custom_mem` is safe to read on the same thread —
+        // libzstd's final `customFree` calls run synchronously
+        // inside `ZSTD_freeDCtx`.
+        unsafe {
+            zstd::zstd_safe::zstd_sys::ZSTD_freeDCtx(self.ptr);
+        }
+    }
+}
+
+/// Convenience wrapper for one-shot decompression. Used by the
+/// per-shard memory measurement and the reference-equality check;
+/// timing loops use `FfiDCtxHandle` directly to amortise context
+/// construction.
+fn ffi_decompress_into(
+    compressed: &[u8],
+    output: &mut [u8],
+    mem: Option<&mut FfiMemTracker>,
+) -> usize {
+    let mut dctx = FfiDCtxHandle::new(mem);
+    dctx.decompress_into(compressed, output)
 }
 
 fn benchmark_scenarios_cached() -> &'static [Scenario] {
@@ -495,20 +530,23 @@ fn bench_compress(c: &mut Criterion) {
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
-                let (rust_compressed, rust_peak_bytes) = measure_peak_alloc(|| {
-                    structured_zstd::encoding::compress_to_vec(
-                        &scenario.bytes[..],
-                        level.rust_level,
-                    )
-                });
-                let (ffi_compressed, ffi_peak_bytes) = measure_peak_alloc(|| {
-                    // CustomMem-instrumented variant. Used here so
-                    // libzstd's C heap is observed by the tracker.
-                    // The criterion `c_ffi` timing path below uses
-                    // the uninstrumented `ffi_encode_all_aligned`
-                    // so latency reflects what a real caller pays.
-                    ffi_encode_via_custom_mem(&scenario.bytes[..], level.ffi_level)
-                });
+                // Rust side: OS RSS sampling around one encode call.
+                // No global allocator wrapper, so criterion's timing
+                // loops below stay uninstrumented.
+                let rust_window = rss::PeakWindow::start();
+                let rust_compressed = structured_zstd::encoding::compress_to_vec(
+                    &scenario.bytes[..],
+                    level.rust_level,
+                );
+                let rust_peak_bytes = rust_window.finish();
+                // FFI side: per-CCtx tracker observes every libzstd
+                // malloc/free precisely. Same `ffi_encode_to_vec` the
+                // timing loop below calls — only the customMem opt-in
+                // differs.
+                let mut ffi_tracker = FfiMemTracker::default();
+                let ffi_compressed =
+                    ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, Some(&mut ffi_tracker));
+                let ffi_peak_bytes = ffi_tracker.peak;
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
@@ -530,7 +568,13 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| black_box(ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level)))
+                b.iter(|| {
+                    black_box(ffi_encode_to_vec(
+                        &scenario.bytes[..],
+                        level.ffi_level,
+                        None,
+                    ))
+                })
             });
 
             group.finish();
@@ -544,7 +588,10 @@ fn bench_decompress(c: &mut Criterion) {
         for level in supported_levels_filtered() {
             let rust_compressed =
                 structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
-            let ffi_compressed = ffi_encode_all_aligned(&scenario.bytes[..], level.ffi_level);
+            // Build the FFI fixture via the unified helper with
+            // `None` so this prep step pays no customMem overhead; the
+            // bytes feed both `c_stream` decode benches below.
+            let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, None);
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -581,24 +628,28 @@ fn bench_decompress_source(
 
     if emit_reports {
         // Measure peak live bytes for one full decode pass on each
-        // path. Done OUTSIDE the criterion bench loop so the sample
-        // is dominated by decoder internals (FrameDecoder state for
-        // rust, ZSTD_DCtx + window for ffi) rather than criterion's
-        // own per-iteration bookkeeping.
-        let (_, rust_peak_bytes) = measure_peak_alloc(|| {
+        // path. Done OUTSIDE criterion's bench loop so the sample is
+        // dominated by decoder internals (FrameDecoder state for
+        // rust, ZSTD_DCtx + window for ffi). Rust uses OS RSS
+        // sampling; FFI uses a per-DCtx customMem tracker. Both
+        // observe the SAME decode call the timing loop below runs —
+        // only the memory hook differs.
+        let rust_window = rss::PeakWindow::start();
+        {
             let mut target = vec![0u8; expected_len];
             let mut decoder = FrameDecoder::new();
             let written = decoder.decode_all(compressed, &mut target).unwrap();
             assert_eq!(written, expected_len);
-            target
-        });
-        let (_, ffi_peak_bytes) = measure_peak_alloc(|| {
-            // `zstd::bulk::Decompressor::new` uses `ZSTD_createDCtx()`
-            // (default malloc, invisible to TrackingAllocator). Use
-            // the customMem-aware path so the C heap is part of the
-            // peak. Same rationale as `ffi_encode_all_aligned`.
-            ffi_decompress_via_custom_mem(compressed, expected_len)
-        });
+            black_box(target);
+        }
+        let rust_peak_bytes = rust_window.finish();
+
+        let mut ffi_tracker = FfiMemTracker::default();
+        let mut ffi_target = vec![0u8; expected_len];
+        let written = ffi_decompress_into(compressed, &mut ffi_target, Some(&mut ffi_tracker));
+        assert_eq!(written, expected_len);
+        let ffi_peak_bytes = ffi_tracker.peak;
+
         emit_memory_report(
             scenario,
             level,
@@ -629,16 +680,17 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
-        let mut decoder = zstd::bulk::Decompressor::new().unwrap();
-        let mut output = Vec::with_capacity(expected_len);
+        // Reuse one DCtx + target buffer across iterations so the
+        // timing sample reflects decode steady-state — matches the
+        // pure-Rust loop above which reuses one `FrameDecoder` and
+        // one `target`. Creating a fresh DCtx per iteration would
+        // dominate sub-millisecond samples.
+        let mut dctx = FfiDCtxHandle::new(None);
+        let mut target = vec![0u8; expected_len];
         b.iter(|| {
-            output.clear();
-            let written = decoder
-                .decompress_to_buffer(black_box(compressed), &mut output)
-                .unwrap();
-            black_box(output.as_slice());
+            let written = dctx.decompress_into(black_box(compressed), &mut target);
             assert_eq!(written, expected_len);
-            assert_eq!(output.len(), expected_len);
+            black_box(&target[..written]);
         })
     });
 
@@ -658,13 +710,10 @@ fn assert_decompress_matches_reference(
     assert_eq!(rust_written, expected_len);
     assert_eq!(&rust_target[..rust_written], scenario.bytes.as_slice());
 
-    let mut ffi_decoder = zstd::bulk::Decompressor::new().unwrap();
-    let mut ffi_output = Vec::with_capacity(expected_len);
-    let ffi_written = ffi_decoder
-        .decompress_to_buffer(compressed, &mut ffi_output)
-        .unwrap();
+    let mut ffi_target = vec![0u8; expected_len];
+    let ffi_written = ffi_decompress_into(compressed, &mut ffi_target, None);
     assert_eq!(ffi_written, expected_len);
-    assert_eq!(ffi_output.as_slice(), scenario.bytes.as_slice());
+    assert_eq!(&ffi_target[..ffi_written], scenario.bytes.as_slice());
 }
 
 fn bench_dictionary(c: &mut Criterion) {

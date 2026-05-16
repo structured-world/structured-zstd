@@ -34,6 +34,32 @@ jobs:
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
       - name: Clippy (bench_internals)
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals --benches -- -D warnings
+      - name: Gate — compare_ffi must not pull bench_internals
+        # Rationale: `compare_ffi` benches structured-zstd against the
+        # libzstd FFI build. If `bench_internals` widens our crate's
+        # public API surface (visibility changes for `BitReaderReversed`
+        # etc.), Rust-vs-FFI parity is broken — the Rust side ships
+        # compiled differently than what a real downstream consumer
+        # uses. Keep it strictly out of `compare_ffi`'s feature set.
+        run: |
+          if awk '/^\[\[bench\]\]$/{b=""} /^name = /{n=$3} /^required-features =/{print n,$0}' zstd/Cargo.toml \
+              | grep -E 'compare_ffi.*bench_internals' >/dev/null; then
+            echo "::error::compare_ffi must NOT require bench_internals — would bias Rust-vs-FFI parity"
+            exit 1
+          fi
+      - name: Gate — bench instrumentation must not leak into zstd/src/
+        # Rationale: bench-only memory observation (RSS sampler,
+        # FfiMemTracker, customMem hooks) lives in zstd/benches/.
+        # Anything bench-instrumentation-shaped in zstd/src/ would
+        # bloat the published crate. Comments are OK; identifier
+        # references are not.
+        run: |
+          if rg -n --no-heading \
+              'TrackingAllocator|FfiMemTracker|PeakWindow|ZSTD_customMem|customMem\(' \
+              zstd/src/; then
+            echo "::error::bench-only instrumentation symbols leaked into zstd/src/"
+            exit 1
+          fi
 
   test:
     needs: lint
