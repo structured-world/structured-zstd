@@ -937,8 +937,87 @@ impl DfastMatchGenerator {
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         let start = start.max(self.history_abs_start);
         let end = end.min(self.history_abs_end());
-        for pos in start..end {
-            self.insert_position(pos);
+        if start >= end {
+            return;
+        }
+        // Hoist the rebase trigger out of the inner loop: a single
+        // `ensure_room_for(end - 1)` covers every `pack_slot` in the
+        // range. The per-position `ensure_room_for` call inside
+        // `insert_position` would re-check on every byte and the
+        // compiler cannot prove the call is idempotent through
+        // `&mut self`.
+        self.ensure_room_for(end - 1);
+
+        // Snapshot every per-call invariant. `&mut self` blocks the
+        // optimiser from hoisting these loads across the inner loop —
+        // the bodies of `short_hash` / `long_hash` writes mutate
+        // through `self`, so each iteration would otherwise reload
+        // `history.len()`, `history_start`, `position_base`,
+        // `*_hash_bits`, and `hash_kernel`. With ~1 input byte per
+        // call on the dfast hot path that re-load shape was the
+        // dominant cost in the per-position cluster.
+        let history_abs_start = self.history_abs_start;
+        let position_base = self.position_base;
+        let history_start = self.history_start;
+        let concat_len = self.history.len() - history_start;
+        let history_base_ptr = self.history.as_ptr();
+        let short_hash_bits = self.short_hash_bits;
+        let long_hash_bits = self.long_hash_bits;
+        let short_hash_ptr = self.short_hash.as_mut_ptr();
+        let long_hash_ptr = self.long_hash.as_mut_ptr();
+        let kernel = self.hash_kernel;
+
+        // Two contiguous regions in the input range:
+        // * `[start .. long_safe_end)` — every position has at least 8
+        //   bytes of lookahead, so both short and long hashes get
+        //   inserted from a single 8-byte unaligned load.
+        // * `[long_safe_end .. short_safe_end)` — only 4..7 bytes
+        //   remain, so only the short hash gets inserted (4-byte
+        //   load).
+        // Past `short_safe_end` neither hash has enough lookahead and
+        // donor parity is "no insert" — skip entirely.
+        let abs_concat_end = history_abs_start + concat_len;
+        let long_safe_end = abs_concat_end.saturating_sub(7).min(end);
+        let short_safe_end = abs_concat_end.saturating_sub(3).min(end);
+
+        // SAFETY: `history_base_ptr.add(history_start + idx)` is
+        // in-bounds for `idx + 8 <= concat_len`, which the two
+        // `*_safe_end` cutoffs enforce. `short_hash_ptr.add(k)` /
+        // `long_hash_ptr.add(k)` are in-bounds because
+        // `ensure_hash_tables` sizes the two tables to `1 <<
+        // *_hash_bits` and `k = mixed >> (64 - bits)` has at most
+        // `bits` bits set. `position_base` and `history_abs_start`
+        // are constant across the loop after the single `ensure_room_for`
+        // call above. `packed` fits in `u32` by that same gate.
+        let history_start_offset = history_start;
+        let mut pos = start;
+        while pos < long_safe_end {
+            unsafe {
+                let idx = pos - history_abs_start;
+                let packed = ((pos - position_base) as u32) + 1;
+                let load_ptr = history_base_ptr.add(history_start_offset + idx);
+                let v8 = (load_ptr as *const u64).read_unaligned();
+                let v4 = v8 & 0xFFFF_FFFF;
+                let mixed_short = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v4);
+                let mixed_long = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v8);
+                let short_idx = (mixed_short >> (64 - short_hash_bits)) as usize;
+                let long_idx = (mixed_long >> (64 - long_hash_bits)) as usize;
+                *short_hash_ptr.add(short_idx) = packed;
+                *long_hash_ptr.add(long_idx) = packed;
+            }
+            pos += 1;
+        }
+        while pos < short_safe_end {
+            unsafe {
+                let idx = pos - history_abs_start;
+                let packed = ((pos - position_base) as u32) + 1;
+                let load_ptr = history_base_ptr.add(history_start_offset + idx);
+                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let mixed_short = crate::encoding::fastpath::hash_mix_u64_with_kernel(kernel, v4);
+                let short_idx = (mixed_short >> (64 - short_hash_bits)) as usize;
+                *short_hash_ptr.add(short_idx) = packed;
+            }
+            pos += 1;
         }
     }
 
