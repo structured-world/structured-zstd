@@ -286,12 +286,13 @@ with open(raw_path) as f:
                 ffi_peak_alloc_bytes,
             ) = mem_match.groups()
             label = unescape_report_label(label)
-            # Field semantics differ between sides — see emit_memory_report
-            # in zstd/benches/compare_ffi.rs. Rust side is OS RSS delta
-            # (proxy, may underreport on warm allocator arenas); FFI side
-            # is the precise sum of bytes requested from libzstd's
-            # ZSTD_customMem callbacks. Both stored side-by-side so the
-            # dashboard can show each as its own series.
+            # Both sides observed by the same `TrackingAllocator` in
+            # `compare_ffi_memory.rs`: Rust allocs flow through the
+            # `#[global_allocator]` wrapper, libzstd allocs flow through
+            # `ZSTD_customMem` callbacks that share the same atomic
+            # counters. Counts are byte-precise on both sides — values
+            # are directly comparable and the downstream `delta_ratio`
+            # for `peak_alloc_bytes` is meaningful.
             memory_rows.append({
                 "scenario": scenario,
                 "label": label,
@@ -429,8 +430,15 @@ if not ratios:
     sys.exit(1)
 
 if not memory_rows:
-    print("ERROR: No REPORT_MEM lines parsed; memory section would be empty.", file=sys.stderr)
-    sys.exit(1)
+    # No REPORT_MEM lines is expected on PR shards where the memory
+    # bench binary isn't passed (`STRUCTURED_ZSTD_BENCH_MEMORY_BIN`
+    # empty). Memory rows only land on main pushes; on PRs we still
+    # publish the timing/ratio shards and skip the memory section.
+    print(
+        "INFO: No REPORT_MEM lines parsed (memory bench not run on this shard); "
+        "memory section will be omitted.",
+        file=sys.stderr,
+    )
 
 if not dictionary_rows:
     print(

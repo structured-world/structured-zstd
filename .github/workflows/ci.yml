@@ -474,8 +474,16 @@ jobs:
         with:
           name: bench-binary-${{ matrix.bench.id }}
           path: bench-binary
-      - name: Mark bench binary executable
-        run: chmod +x bench-binary/compare_ffi
+      - name: Mark bench binaries executable
+        # `actions/download-artifact` strips the executable bit
+        # (downloaded files land as mode 0644). Both binaries shipped
+        # in the artifact need +x — the memory binary's `-x` check in
+        # run-benchmarks.sh would otherwise reject it on main pushes.
+        run: |
+          chmod +x bench-binary/compare_ffi
+          if [ -f bench-binary/compare_ffi_memory ]; then
+            chmod +x bench-binary/compare_ffi_memory
+          fi
 
       - name: Run benchmarks (filtered to shard's levels)
         env:

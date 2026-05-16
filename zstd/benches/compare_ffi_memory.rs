@@ -55,9 +55,22 @@ const FLAG_UNCOUNTED: u8 = 0;
 const FLAG_COUNTED: u8 = 1;
 
 #[inline]
+fn tracker_header(layout: Layout) -> usize {
+    // alloc()/dealloc() use `header = align.max(HEADER_BYTES)` as the
+    // offset between the System.alloc pointer and the user pointer.
+    // The augmented allocation MUST reserve the same `header` bytes
+    // up front — using a fixed `HEADER_BYTES` here when align > 16
+    // (e.g. SIMD types with align = 32) would leave the user pointer
+    // pointing past the end of the System.alloc-owned block, causing
+    // out-of-bounds writes during init and a layout mismatch on free.
+    layout.align().max(HEADER_BYTES)
+}
+
+#[inline]
 fn augmented_layout(layout: Layout) -> Option<Layout> {
-    let total = layout.size().checked_add(HEADER_BYTES)?;
-    Layout::from_size_align(total, layout.align().max(HEADER_BYTES)).ok()
+    let header = tracker_header(layout);
+    let total = layout.size().checked_add(header)?;
+    Layout::from_size_align(total, header).ok()
 }
 
 unsafe impl GlobalAlloc for TrackingAllocator {
@@ -65,7 +78,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         let Some(augmented) = augmented_layout(layout) else {
             return core::ptr::null_mut();
         };
-        let header = layout.align().max(HEADER_BYTES);
+        let header = tracker_header(layout);
         // SAFETY: `augmented` is a valid Layout (size+header, alignment ≥ header).
         let raw = unsafe { System.alloc(augmented) };
         if raw.is_null() {
@@ -90,7 +103,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let header = layout.align().max(HEADER_BYTES);
+        let header = tracker_header(layout);
         // SAFETY: `ptr` came from our `alloc`, header sits exactly `header`
         // bytes earlier.
         let raw = unsafe { ptr.sub(header) };
@@ -128,9 +141,18 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (result, peak.saturating_sub(baseline))
 }
 
-/// `ZSTD_customMem` allocate callback. Routes through `std::alloc::alloc`
-/// so libzstd's heap is observed by `TrackingAllocator` exactly like
-/// Rust-side allocations.
+/// `ZSTD_customMem` allocate callback. Bypasses `TrackingAllocator`
+/// (calls `System.alloc` directly) and manually increments
+/// `ALLOC_CURRENT` / `ALLOC_PEAK` by the libzstd-requested `size` only.
+///
+/// Routing through `std::alloc::alloc` would double-count: libzstd
+/// requests `size`, but we have to over-allocate by `FFI_HEADER` to
+/// stash the size for the size-less `customFree`. If both the header
+/// AND the user bytes flowed through `TrackingAllocator`, the FFI
+/// metric would include an extra 16 bytes per libzstd allocation —
+/// biasing the new Rust/FFI memory ratio Copilot flagged in #143. The
+/// Rust side counts only `layout.size()` (the original request), so
+/// the FFI side must too.
 unsafe extern "C" fn ffi_alloc(
     _opaque: *mut core::ffi::c_void,
     size: usize,
@@ -143,17 +165,27 @@ unsafe extern "C" fn ffi_alloc(
     let Ok(layout) = Layout::from_size_align(total, FFI_ALIGN) else {
         return core::ptr::null_mut();
     };
-    // SAFETY: layout validated above; std::alloc::alloc routes through
-    // `#[global_allocator] = TrackingAllocator`.
-    let raw = unsafe { std::alloc::alloc(layout) };
+    // SAFETY: layout validated above; `System.alloc` is a bare system
+    // allocator call without TrackingAllocator's header bookkeeping.
+    let raw = unsafe { System.alloc(layout) };
     if raw.is_null() {
         return core::ptr::null_mut();
     }
-    // Store the libzstd-requested size in the first 8 bytes of our
-    // 16-byte header so `ffi_free` can recover it (libzstd's free
-    // callback receives only a pointer).
+    // Store the libzstd-requested size at the start of our 16-byte
+    // header so `ffi_free` can recover it (libzstd's free callback
+    // receives only a pointer).
     unsafe {
         core::ptr::write(raw as *mut usize, size);
+    }
+    // Count just the libzstd-requested `size`, NOT `total`. Both
+    // measurement windows are bounded by `measure_peak()` and every
+    // CCtx/DCtx is freed before the window closes, so a missed
+    // `dealloc` decrement is structurally impossible — no flag header
+    // needed (unlike TrackingAllocator, where Rust Vecs can outlive
+    // a measurement window).
+    if TRACKING_ENABLED.load(Ordering::Relaxed) {
+        let prev = ALLOC_CURRENT.fetch_add(size, Ordering::Relaxed);
+        ALLOC_PEAK.fetch_max(prev + size, Ordering::Relaxed);
     }
     unsafe { raw.add(FFI_HEADER) as *mut core::ffi::c_void }
 }
@@ -170,8 +202,12 @@ unsafe extern "C" fn ffi_free(_opaque: *mut core::ffi::c_void, address: *mut cor
     let size = unsafe { core::ptr::read(header_ptr as *const usize) };
     let layout = Layout::from_size_align(size + FFI_HEADER, FFI_ALIGN)
         .expect("layout round-trips from ffi_alloc");
-    // SAFETY: `(header_ptr, layout)` matches the pair from `ffi_alloc`.
-    unsafe { std::alloc::dealloc(header_ptr, layout) };
+    if TRACKING_ENABLED.load(Ordering::Relaxed) {
+        ALLOC_CURRENT.fetch_sub(size, Ordering::Relaxed);
+    }
+    // SAFETY: `(header_ptr, layout)` matches the pair from
+    // `System.alloc` in `ffi_alloc`.
+    unsafe { System.dealloc(header_ptr, layout) };
 }
 
 fn ffi_custom_mem() -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
