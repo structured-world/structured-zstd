@@ -707,29 +707,42 @@ const OF_DIST: &[i32] = &[
 // the actual compression work is ~1-5 µs, so the predefined-table
 // build dominates the per-frame cost for tiny inputs.
 //
-// Cache each predefined table once per process via a dedicated
-// `AtomicPtr<FSETable>` and hand callers a clone. The per-distribution
-// cache slot is encoded by the static identity of the cache itself
-// (each helper has its own `static`), NOT by pointer comparison on
-// the distribution slice — `LL_DIST` / `ML_DIST` / `OF_DIST` are
-// `const`, and `core::ptr::eq` on the materialized slice pointer of
-// a `const` is only stable as long as rustc keeps lowering it to a
-// single anonymous static. A future rustc change that duplicates the
-// const at each use site would silently sink every call through the
-// "unknown slice" branch and bypass the cache forever. Owning the
-// `static AtomicPtr` per-helper means the cache slot is selected at
-// compile time without consulting the slice pointer at all.
+// Cache each predefined table once per process and hand callers a
+// `&'static FSETable`. The per-distribution cache slot is encoded by
+// the static identity of the cache itself (each helper has its own
+// `static`), NOT by pointer comparison on the distribution slice —
+// `LL_DIST` / `ML_DIST` / `OF_DIST` are `const`, and `core::ptr::eq`
+// on the materialized slice pointer of a `const` is only stable as
+// long as rustc keeps lowering it to a single anonymous static. A
+// future rustc change that duplicates the const at each use site
+// would silently sink every call through a "unknown slice" branch
+// and bypass the cache forever. Per-helper `static`s avoid that
+// failure mode entirely — the cache slot is selected at compile time
+// without consulting the slice pointer at all.
 //
-// `AtomicPtr<FSETable>` lock-free init works in both `std` and
-// `no_std` builds — only `alloc` is required (always available in
-// this crate via `extern crate alloc`), which keeps the cache on a
-// single code path instead of a `cfg(feature = "std")` branch with
-// an eager rebuild fallback. Memory ordering: `Acquire` on the load
-// so the consumer sees a fully-published `FSETable`; `AcqRel` on the
-// compare-exchange so the publishing side both reads any concurrent
-// winner (`Acquire`) and publishes its store (`Release`). The first
-// writer leaks `Box<FSETable>` intentionally — the cache lives for
-// the entire program lifetime, exactly like a `LazyLock`.
+// Two implementations:
+//
+//   * Targets with atomic pointer support (`target_has_atomic = "ptr"`)
+//     — `AtomicPtr<FSETable>` lock-free init via `compare_exchange`.
+//     Works in both `std` and `no_std` builds; only `alloc` is needed
+//     (always available in this crate via `extern crate alloc`).
+//     Memory ordering: `Acquire` on the load so the consumer sees a
+//     fully-published `FSETable`; `AcqRel` on the compare-exchange
+//     so the publishing side both reads any concurrent winner
+//     (`Acquire`) and publishes its store (`Release`). The first
+//     writer leaks `Box<FSETable>` intentionally — the cache lives
+//     for the entire program lifetime, exactly like a `LazyLock`.
+//
+//   * No-atomic targets (`not(target_has_atomic = "ptr")`, e.g.
+//     `thumbv6m-none-eabi`, AVR) — `static mut` raw pointer with
+//     single-threaded access. Targets that lack atomic pointer
+//     support are by definition single-threaded embedded
+//     environments (otherwise their interrupt model couldn't share
+//     state without atomics either), so a non-atomic mutable static
+//     is sound. The crate already uses this same split for
+//     `decoding::dictionary::DictionaryHandle` (`Arc` vs `Rc`); the
+//     FSE cache mirrors that pattern. Same `Box::leak` lifetime.
+#[cfg(target_has_atomic = "ptr")]
 fn get_or_init_cached_table(
     cache: &core::sync::atomic::AtomicPtr<FSETable>,
     probs: &[i32],
@@ -784,20 +797,76 @@ fn get_or_init_cached_table(
     }
 }
 
+/// SAFETY (caller): `cache` must point at a per-helper `static mut`
+/// raw pointer, accessed serially. Targets without atomic pointer
+/// support are by construction single-threaded (their runtime model
+/// has no concurrent access primitive), so serial access is the only
+/// access shape that exists. The function is `unsafe` to make every
+/// call site flag the precondition at the use site.
+#[cfg(not(target_has_atomic = "ptr"))]
+unsafe fn get_or_init_cached_table_noatomic(
+    cache: *mut *mut FSETable,
+    probs: &[i32],
+    acc_log: u8,
+) -> &'static FSETable {
+    // SAFETY: caller guarantees `cache` is a valid `static mut` slot
+    // accessed under the single-threaded no-atomic invariant. First
+    // call writes the leaked `Box::into_raw` pointer; subsequent
+    // calls return the cached reference. The `Box::leak` shape
+    // matches the atomic path, so consumers see the same `'static`
+    // lifetime semantics on both targets.
+    unsafe {
+        let slot = &mut *cache;
+        if !slot.is_null() {
+            return &**slot;
+        }
+        let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
+        *slot = alloc::boxed::Box::into_raw(built);
+        &**slot
+    }
+}
+
 pub(crate) fn default_ml_table() -> &'static FSETable {
-    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
-        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-    get_or_init_cached_table(&CACHE, ML_DIST, 6)
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, ML_DIST, 6)
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        static mut CACHE: *mut FSETable = core::ptr::null_mut();
+        // SAFETY: no-atomic target invariant (single-threaded).
+        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, ML_DIST, 6) }
+    }
 }
 
 pub(crate) fn default_ll_table() -> &'static FSETable {
-    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
-        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-    get_or_init_cached_table(&CACHE, LL_DIST, 6)
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, LL_DIST, 6)
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        static mut CACHE: *mut FSETable = core::ptr::null_mut();
+        // SAFETY: no-atomic target invariant (single-threaded).
+        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, LL_DIST, 6) }
+    }
 }
 
 pub(crate) fn default_of_table() -> &'static FSETable {
-    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
-        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-    get_or_init_cached_table(&CACHE, OF_DIST, 5)
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, OF_DIST, 5)
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        static mut CACHE: *mut FSETable = core::ptr::null_mut();
+        // SAFETY: no-atomic target invariant (single-threaded).
+        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, OF_DIST, 5) }
+    }
 }

@@ -1440,8 +1440,15 @@ impl DfastMatchGenerator {
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
         // with `unwrap_or(0)`). `emit_candidate` runs only after a
         // successful match was found in the active block, so
-        // `last_len > 0` is a structural precondition.
+        // `last_len > 0` is a structural precondition — the
+        // `debug_assert!` makes that precondition fail at the source
+        // in tests rather than silently produce an empty slice and
+        // panic on the literals subslice below.
         let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        debug_assert!(
+            last_len > 0,
+            "emit_candidate precondition: active block must be non-empty"
+        );
         let current = &self.history[self.history.len() - last_len..];
         let start = candidate.start - current_abs_start;
         let literals = &current[*literals_start..start];
