@@ -4173,6 +4173,7 @@ fn sufficient_match_len_is_capped_by_opt_num() {
 }
 
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
@@ -4187,7 +4188,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(Some(&huff), Some(ll), Some(ml), Some(of));
+    hc.seed_dictionary_entropy(Some(&huff), Some(&*ll), Some(&*ml), Some(&*of));
 
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
@@ -4221,6 +4222,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
 }
 
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn dictionary_fse_seed_applies_without_huffman_seed() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
@@ -4232,7 +4234,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
+    hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
@@ -4264,6 +4266,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
 }
 
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
@@ -4275,7 +4278,7 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
+    hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abc",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
@@ -4325,6 +4328,7 @@ fn lit_length_price_blocksize_max_costs_one_extra_bit() {
 }
 
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
@@ -4335,7 +4339,7 @@ fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
+    hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "dictionary-seeded first block should skip btultra2 warmup pass"
@@ -4472,6 +4476,7 @@ fn update_stats_skips_literal_frequencies_when_uncompressed() {
 }
 
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     let mut stats = HcOptState::new();
     stats.set_literals_compressed_for_tests(false);
@@ -4481,7 +4486,7 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    stats.seed_dictionary_entropy(Some(&huff), Some(ll), Some(ml), Some(of));
+    stats.seed_dictionary_entropy(Some(&huff), Some(&*ll), Some(&*ml), Some(&*of));
     stats.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
