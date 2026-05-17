@@ -734,23 +734,32 @@ fn get_or_init_cached_table(
     cache: &core::sync::atomic::AtomicPtr<FSETable>,
     probs: &[i32],
     acc_log: u8,
-) -> FSETable {
+) -> &'static FSETable {
     use core::sync::atomic::Ordering;
 
     let cur = cache.load(Ordering::Acquire);
     if !cur.is_null() {
         // SAFETY: a non-null entry in this cache was published by a
         // previous winner of the `compare_exchange` below, which
-        // leaked the `Box<FSETable>`. The pointed-to allocation is
-        // therefore valid for `'static` and immutable for the rest of
-        // the program — sharing `&*cur` across threads is sound, and
-        // `clone()` does its own allocation rather than touching the
-        // shared data.
-        return unsafe { (*cur).clone() };
+        // leaked the `Box<FSETable>` (the cache never frees, mirroring
+        // a `LazyLock` lifetime). The pointed-to allocation is
+        // therefore valid for `'static` and immutable for the rest
+        // of the program, so handing out a `&'static FSETable` to
+        // multiple threads is sound.
+        return unsafe { &*cur };
     }
 
     let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
     let raw = alloc::boxed::Box::into_raw(built);
+    // `AcqRel` on success rather than the minimal `Release`: the
+    // success path doesn't actually need Acquire (no prior loads to
+    // synchronise with at the publication point), but matching the
+    // failure Acquire ordering keeps the success and failure
+    // branches symmetric on rustc's atomic surface — both arms then
+    // see the same memory-fence shape for whatever follows. The
+    // marginal cost is one extra fence instruction on x86/aarch64;
+    // this path runs at most three times per process so it never
+    // shows up in a flamegraph.
     match cache.compare_exchange(
         core::ptr::null_mut(),
         raw,
@@ -760,7 +769,7 @@ fn get_or_init_cached_table(
         Ok(_) => {
             // We installed the singleton. SAFETY: `raw` is the
             // pointer we just published; no other thread can free it.
-            unsafe { (*raw).clone() }
+            unsafe { &*raw }
         }
         Err(existing) => {
             // Another thread beat us to the publish — reclaim our
@@ -770,24 +779,24 @@ fn get_or_init_cached_table(
             // published by the winning thread and is leaked for
             // `'static`, mirroring the `cur` path.
             drop(unsafe { alloc::boxed::Box::from_raw(raw) });
-            unsafe { (*existing).clone() }
+            unsafe { &*existing }
         }
     }
 }
 
-pub(crate) fn default_ml_table() -> FSETable {
+pub(crate) fn default_ml_table() -> &'static FSETable {
     static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
     get_or_init_cached_table(&CACHE, ML_DIST, 6)
 }
 
-pub(crate) fn default_ll_table() -> FSETable {
+pub(crate) fn default_ll_table() -> &'static FSETable {
     static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
     get_or_init_cached_table(&CACHE, LL_DIST, 6)
 }
 
-pub(crate) fn default_of_table() -> FSETable {
+pub(crate) fn default_of_table() -> &'static FSETable {
     static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
         core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
     get_or_init_cached_table(&CACHE, OF_DIST, 5)

@@ -95,9 +95,9 @@ fn table_header_bits_exact() {
     };
 
     // Predefined tables
-    check(&default_ll_table());
-    check(&default_ml_table());
-    check(&default_of_table());
+    check(default_ll_table());
+    check(default_ml_table());
+    check(default_of_table());
 
     // Tables built from synthetic data
     let data: alloc::vec::Vec<u8> = (0u8..32).cycle().take(1000).collect();

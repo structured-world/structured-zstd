@@ -249,33 +249,23 @@ impl DfastMatchGenerator {
     }
 
     /// Slice of bytes from the most recently appended block. Returns
-    /// the trailing `last_block_len` bytes of `history`.
+    /// the trailing `last_block_len` bytes of `history`, or an empty
+    /// slice if no block has been ingested yet.
     ///
-    /// This is the public trait-dispatch entry point used by the
-    /// streaming encoder / block compressor / per-level helpers via
-    /// the `Matcher::get_last_space` trait. Internal callers inside
-    /// this file deliberately use the inline pattern
-    /// `let last_len = self.window_blocks.back().copied().unwrap_or(0);
-    /// let current = &self.history[self.history.len() - last_len..];`
-    /// so they share the same gate shape as the `current_len == 0`
-    /// early returns in `skip_matching` / `start_matching`.
-    ///
-    /// # Panics
-    /// Panics if `window_blocks` is empty (no block has been ingested
-    /// yet). All trait-level callers reach this only on the
-    /// `frame_compressor` post-`add_data` path, where at least one
-    /// block has been appended. The panic is a contract-violation
-    /// surface for a NEW external caller invoking before `add_data`,
-    /// not a runtime data path: it fails loudly rather than silently
-    /// returning an empty slice and letting downstream operate on
-    /// zero-length data.
+    /// Mirrors the inline gate pattern used by `skip_matching` /
+    /// `skip_matching_dense` / `start_matching` / `emit_candidate` /
+    /// `emit_trailing_literals`: read
+    /// `window_blocks.back().copied().unwrap_or(0)` and slice the
+    /// trailing `last_len` bytes (which is empty when `last_len == 0`).
+    /// All current external callers — streaming encoder, block
+    /// compressor, per-level helpers — invoke this only after at
+    /// least one `add_data`, but returning an empty slice on the
+    /// empty case keeps the trait surface aligned with the internal
+    /// usage and avoids a panic-vs-gate divergence that would
+    /// surprise a future refactor consolidating the call sites.
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        let last_len = *self
-            .window_blocks
-            .back()
-            .expect("get_last_space: window_blocks empty — caller invoked before add_data");
-        let start = self.history.len() - last_len;
-        &self.history[start..]
+        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        &self.history[self.history.len() - last_len..]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -1153,7 +1143,7 @@ impl DfastMatchGenerator {
     /// `emit_candidate` which inserts via `insert_positions` over the
     /// emitted range, exactly like the inner loop's hit path.
     fn probe_tail_ip0_only(
-        &mut self,
+        &self,
         current_abs_start: usize,
         current_len: usize,
         ip0: usize,
@@ -1173,12 +1163,6 @@ impl DfastMatchGenerator {
         let history_base_ptr = self.history.as_ptr();
 
         let concat_idx0 = abs_ip0 - history_abs_start;
-        // `position_base` participates in the bounds check below
-        // (`cand_pos = position_base + idx - 1` for both probes); the
-        // explicit `packed_curr` computation that the inner loop uses
-        // for table writes is not needed here since `probe_tail_ip0_only`
-        // is now read-only on the hash tables.
-        let _ = position_base;
 
         // SAFETY: `concat_idx0 + 8 <= concat_len` follows from the
         // caller's `ip0 + HASH_READ_SIZE <= current_len` precondition

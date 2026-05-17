@@ -76,11 +76,20 @@ impl PreviousFseTable {
 }
 
 pub(crate) struct FseTables {
-    pub(crate) ll_default: FSETable,
+    /// The three predefined LL/ML/OF tables are functions of
+    /// compile-time-constant distributions; the cached helpers in
+    /// `fse_encoder` build them once per process and hand back
+    /// `&'static FSETable`. Storing the reference here (rather than
+    /// an owned `FSETable`) collapses `FrameCompressor::new` to a
+    /// 3-pointer copy on the cache-hot path — clone takes ~4 µs on
+    /// x86_64, the bare pointer copy is sub-nanosecond — and removes
+    /// the same per-clone cost from `clone_fse_tables` on the
+    /// block-split estimator path.
+    pub(crate) ll_default: &'static FSETable,
     pub(crate) ll_previous: Option<PreviousFseTable>,
-    pub(crate) ml_default: FSETable,
+    pub(crate) ml_default: &'static FSETable,
     pub(crate) ml_previous: Option<PreviousFseTable>,
-    pub(crate) of_default: FSETable,
+    pub(crate) of_default: &'static FSETable,
     pub(crate) of_previous: Option<PreviousFseTable>,
 }
 

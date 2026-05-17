@@ -174,6 +174,15 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// peak RSS on this entry point will see a different curve than
 /// pre-revision; bench shape, not steady-state, is what changed.
 ///
+/// **This is NOT a streaming API.** The source is fully buffered
+/// into a `Vec<u8>` before any compression work begins, so peak input
+/// memory is bounded by `source.len()` (not "constant regardless of
+/// payload size" as a stream-shaped encoder would offer). The RSS
+/// notes below apply to the materialization-then-compress shape; if
+/// the source is large enough that holding it in memory is not
+/// acceptable, use [`StreamingEncoder`] which consumes chunks
+/// incrementally without the up-front Vec build.
+///
 /// The other side of the peak shape is the input buffering: this
 /// helper drives `read_to_end` to materialize the full source into a
 /// `Vec<u8>` before forwarding the slice to [`compress_slice_to_vec`].
