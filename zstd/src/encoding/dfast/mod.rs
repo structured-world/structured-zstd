@@ -268,6 +268,16 @@ impl DfastMatchGenerator {
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        // Run the headroom check first so the safety invariant
+        // (`history_abs_start + window_size + len + STREAM_ABS_HEADROOM
+        // <= usize::MAX`) is enforced at the function boundary, not
+        // hidden behind the empty-chunk short-circuit below. With
+        // `data.len() == 0` the check is a cheap no-op on the cumulative
+        // state today, but keeping the call here means the invariant
+        // doesn't depend on "empty data implies nothing changes"
+        // reasoning if a future change ever attaches side effects to
+        // the empty path.
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         // Empty chunks have nothing to record: pushing a `0` into
         // `window_blocks` would let a streaming caller that flushes
         // empty chunks grow the deque without bound (`window_size`
@@ -278,7 +288,6 @@ impl DfastMatchGenerator {
             reuse_space(data);
             return;
         }
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -309,14 +318,22 @@ impl DfastMatchGenerator {
     /// signature; callers needing the eviction byte count derive it
     /// from the `window_size` delta before/after this call.
     ///
-    /// On a normal block-loop iteration `add_data` runs immediately
-    /// after this trim and would compact too — the extra `compact_history`
-    /// here is a no-op in that case (`history_start` is already 0 or
-    /// the next ingest immediately re-compacts). The reason to compact
-    /// eagerly is the explicit-trim-before-idle path: a caller that
-    /// trims to shed memory before a long quiescent period would not
-    /// see the expected RSS drop until the next ingest, which may
-    /// never happen.
+    /// The explicit-trim-before-idle path is the reason this helper
+    /// exists: a caller that trims to shed memory before a long
+    /// quiescent period must see the resident size drop immediately,
+    /// not "eventually, on the next ingest".
+    ///
+    /// `compact_history` is NOT the right tool for that — it uses
+    /// `Vec::drain(..history_start)`, which moves elements down in
+    /// the existing allocation and leaves capacity untouched (per
+    /// `Vec` docs, only `shrink_to_fit` releases capacity). So even
+    /// when compact ran, the original buffer stayed alive. Instead,
+    /// rebuild `history` via `split_off`: it allocates a fresh
+    /// buffer sized to the retained suffix, and the assignment
+    /// drops the original (full-capacity) buffer. On a normal block
+    /// loop `add_data` will compact again the next iter — the cost
+    /// is one extra realloc on the trim boundary in exchange for
+    /// actually shedding the prefix to the system allocator.
     pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
@@ -324,7 +341,14 @@ impl DfastMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        self.compact_history();
+        if self.history_start != 0 {
+            // `split_off` returns the suffix in a fresh allocation;
+            // the original Vec (still owning [..history_start]) is
+            // dropped on the assignment below, releasing the dead
+            // prefix back to the allocator.
+            self.history = self.history.split_off(self.history_start);
+            self.history_start = 0;
+        }
     }
 
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
@@ -528,7 +552,15 @@ impl DfastMatchGenerator {
         // and poison both hash tables. The guard band in `ensure_room_for`
         // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
         // worth of positions, so a single call at function entry suffices.
-        self.ensure_room_for(current_abs_start + current_len - 1);
+        //
+        // `current_len > 0` is a precondition of this helper: the only
+        // caller (`start_matching`) bails out at `current_len == 0`
+        // before reaching here. The explicit guard below makes the
+        // precondition self-documenting and protects the `- 1` from
+        // wrapping if a future caller forgets to gate.
+        if current_len > 0 {
+            self.ensure_room_for(current_abs_start + current_len - 1);
+        }
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
         let short_shift = 64 - self.short_hash_bits;
         let long_shift = 64 - self.long_hash_bits;

@@ -173,7 +173,7 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// ```rust
 /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
-/// let compressed = compress_to_vec(data, CompressionLevel::Default);
+/// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
 /// ```
 pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
     let mut source = source;
@@ -211,7 +211,7 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// ```rust
 /// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
-/// let compressed = compress_slice_to_vec(data, CompressionLevel::Default);
+/// let compressed = compress_slice_to_vec(data, CompressionLevel::Fastest);
 /// ```
 pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> {
     // Initial capacity sized to a single output block, matching donor
