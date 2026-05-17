@@ -178,13 +178,15 @@ fn parse_levels_env() -> Vec<i32> {
             .filter_map(|s| s.trim().parse::<i32>().ok())
             .collect()
     };
-    let (supported, dropped): (Vec<i32>, Vec<i32>) =
-        parsed.into_iter().partition(|&l| l <= MAX_SUPPORTED_LEVEL);
+    let (supported, dropped): (Vec<i32>, Vec<i32>) = parsed
+        .into_iter()
+        .partition(|&l| (1..=MAX_SUPPORTED_LEVEL).contains(&l));
     if !dropped.is_empty() {
         eprintln!(
-            "warn: dropping post-split levels {dropped:?} (Level(>={}) rejected by \
-             sequence_capture matcher post-split guard)",
-            MAX_SUPPORTED_LEVEL + 1,
+            "warn: dropping unsupported levels {dropped:?} (supported numeric levels \
+             are 1..={MAX_SUPPORTED_LEVEL}; 0/negatives unsupported by sequence_capture, \
+             >={post_split} rejected by post-split guard)",
+            post_split = MAX_SUPPORTED_LEVEL + 1,
         );
     }
     if supported.is_empty() {
