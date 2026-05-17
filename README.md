@@ -27,6 +27,8 @@ For `no_std` builds disable the default features:
 structured-zstd = { version = "0.0.21", default-features = false }
 ```
 
+Release notes for every version live in [`zstd/CHANGELOG.md`](zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
+
 ## Status
 
 ### Decoder — production-ready

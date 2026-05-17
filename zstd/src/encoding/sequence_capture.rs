@@ -518,10 +518,11 @@ mod tests {
     /// at least one `Triple` sequence — every position past the first
     /// 16 bytes finds a long match 16 bytes back. Constant-run input
     /// (`AAAA…`) is covered separately by
-    /// `constant_run_routes_through_matcher_path` because it tests a
-    /// different invariant (the matcher path stays alignment-correct
-    /// even when no `Triple` is emitted). On the rotating pattern
-    /// here we want at least one captured triple, which a clean
+    /// `rejects_constant_run_with_rle_on_wire_block` because the
+    /// raw/RLE detector rejects that shape at the public-API
+    /// boundary (different contract from the per-position match
+    /// capture this test pins). On the rotating pattern here we
+    /// want at least one captured triple, which a clean
     /// matcher always produces.
     #[test]
     fn captures_at_least_one_triple_on_repeating_pattern() {
