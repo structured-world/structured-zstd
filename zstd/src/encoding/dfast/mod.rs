@@ -39,6 +39,18 @@ use super::opt::types::MatchCandidate;
 /// raw pointer load.
 const HASH_READ_SIZE: usize = 8;
 
+/// Rep-extension minimum match length. The upstream zstd 1.5.7
+/// reference (`zstd_double_fast.c:191`, rep1 emit
+/// `ZSTD_count(ip+1+4, ip+1+4-offset_1, iend) + 4`) accepts 4-byte
+/// rep hits even though hash-search matches require 5 bytes
+/// (`DFAST_MIN_MATCH_LEN`) — rep coding has no on-wire offset cost,
+/// so a 4-byte rep is a net win over re-running the hash probe. Both
+/// the fast-loop inline rep1 peek and the post-match
+/// `extend_with_repcode_after_match` chain must gate on this floor;
+/// using the hash-search floor on either site silently drops 4-byte
+/// rep emissions that upstream produces.
+const DFAST_REP_MIN_MATCH_LEN: usize = 4;
+
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-block length queue. Previously held the raw input
@@ -284,6 +296,14 @@ impl DfastMatchGenerator {
         // stays unchanged so `trim_to_window` never has cause to
         // evict the zero-length entries). Hand the Vec straight back
         // to the pool and short-circuit.
+        //
+        // Side effect: this short-circuits BEFORE the eviction `while`
+        // loop below. If a caller shrinks `max_window_size` and then
+        // calls `add_data(vec![])` hoping to trigger trim, the trim
+        // won't fire here. Use `trim_to_window` directly for that
+        // case — it's the dedicated path for shedding retained bytes
+        // and now actually frees the prefix (via `split_off`) instead
+        // of leaving it pinned in the `history` allocation.
         if data.is_empty() {
             reuse_space(data);
             return;
@@ -354,6 +374,15 @@ impl DfastMatchGenerator {
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_hash_tables();
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            // `add_data` short-circuits on empty input and does NOT push
+            // a zero-length entry onto `window_blocks`. A caller that
+            // invokes skip-matching after a streaming flush of an empty
+            // chunk would otherwise re-seed the previous block's
+            // retained tail on every empty write. Mirror the gate that
+            // `start_matching` already uses.
+            return;
+        }
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let tail_start = current_abs_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
@@ -388,6 +417,14 @@ impl DfastMatchGenerator {
     pub(crate) fn skip_matching_dense(&mut self) {
         self.ensure_hash_tables();
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            // Same gate as `skip_matching` and `start_matching`: empty
+            // chunks fed through `add_data` no longer push a block
+            // entry, so a streaming caller that flushes empty chunks
+            // would otherwise re-seed the retained tail on every
+            // empty write.
+            return;
+        }
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = current_abs_start
@@ -575,6 +612,16 @@ impl DfastMatchGenerator {
             // load bound — using it here read up to 3 bytes past
             // `history.len()` on tiny blocks (CI fuzz `interop` crash,
             // 7-byte input).
+            // NOTE: when this guard fires on the very first outer-iter
+            // (tiny block, `current_len < 9`), we `break 'outer` BEFORE
+            // `tail_seed_anchor` is even declared. The post-loop
+            // `seed_remaining_hashable_starts(.., pos)` then runs with
+            // `pos` at its initial value (1 on first frame, or the
+            // post-match cursor from a previous outer iter); that's the
+            // correct tail seed for tiny blocks — `seed_pos = pos.min(
+            // current_len).min(boundary_tail_start)` plus the
+            // `seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= current_len`
+            // guard inside the seeder keeps every insert in-bounds.
             if pos + HASH_READ_SIZE > current_len {
                 break 'outer;
             }
@@ -585,7 +632,8 @@ impl DfastMatchGenerator {
             // Same `HASH_READ_SIZE` rationale for `ip1`: the inner loop
             // pre-loads 8 bytes at `concat_idx1` for the `hl1` precompute
             // and the `_search_next_long` retry, so `ip1 + 8 <= current_len`
-            // must hold before we enter.
+            // must hold before we enter. Same tiny-block tail-seed
+            // reasoning as the `pos` guard above applies here.
             if ip1 + HASH_READ_SIZE > current_len {
                 break 'outer;
             }
@@ -605,16 +653,28 @@ impl DfastMatchGenerator {
             // is the byte offset within `live_history`.
             let mut hl0_idx;
             let mut idxl0;
-            // SAFETY: `current_abs_start + ip0 >= history_abs_start` (donor
-            // invariant: ip is in current block, which is in live history).
-            // The 8-byte unaligned load on `concat[concat_idx..]` is safe
-            // because the outer loop guards above enforce
-            // `ip0 + HASH_READ_SIZE <= current_len`, and `current_abs_start
-            // + current_len - history_abs_start <= concat_len` (live history
-            // contains the full current block plus any retained earlier
-            // blocks), giving `concat_idx + 8 <= concat_len`.
+            // SAFETY: `current_abs_start + ip0 >= history_abs_start`
+            // (`ip` is inside the current block, which is part of live
+            // history). The 8-byte unaligned load on
+            // `concat[concat_idx..]` is safe because the outer loop
+            // guards above enforce `ip0 + HASH_READ_SIZE <= current_len`,
+            // and `current_abs_start + current_len - history_abs_start
+            // <= concat_len` (live history contains the full current
+            // block plus any retained earlier blocks), giving
+            // `concat_idx + 8 <= concat_len`. The `debug_assert!` below
+            // makes that invariant explicit so a future refactor that
+            // touches eviction / `compact_history` / `trim_to_window`
+            // semantics catches a violation in tests instead of leaking
+            // through to ASan UB.
             unsafe {
                 let concat_idx = (current_abs_start + ip0) - history_abs_start;
+                debug_assert!(
+                    concat_idx + HASH_READ_SIZE <= concat_len,
+                    "fast-loop 8-byte load OOB: concat_idx={} HASH_READ_SIZE={} concat_len={}",
+                    concat_idx,
+                    HASH_READ_SIZE,
+                    concat_len,
+                );
                 let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
                     .read_unaligned();
                 hl0_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
@@ -625,13 +685,23 @@ impl DfastMatchGenerator {
             // inner loop exited via tail (no more positions to scan).
             // Outer match arm uses `candidate.start` to recover the
             // anchor, so we don't carry the relative match cursor here.
+            //
+            // `tail_seed_anchor` is paired with `committed = None`: it's
+            // the first un-scanned position when inner exits via tail
+            // break, and is ONLY read in the `None` arm of the post-
+            // inner-loop `match`. On a miss-only block we'd otherwise
+            // re-seed from `pos` (still at outer-entry), densely
+            // re-inserting positions the fast loop already wrote —
+            // throwing away the skip-step win on incompressible data.
+            // The implicit pairing (assigned at the inner-advance break,
+            // read in the `None` arm) is fragile to future edits — if a
+            // new `break 'inner` path is added without an explicit
+            // `committed = Some(...)`, this anchor stays at its initial
+            // `pos` value and the tail seeder will re-pack from the
+            // outer entry. Worth promoting to an explicit
+            // `enum InnerExit { Committed(MatchCandidate), Tail(usize) }`
+            // if the inner loop grows another exit shape.
             let mut committed: Option<MatchCandidate> = None;
-            // First un-scanned position when inner exits via tail. On
-            // a miss-only block we'd otherwise re-seed from `pos`
-            // (still at outer-entry), densely re-inserting positions
-            // the fast loop already wrote — throwing away the
-            // skip-step win on incompressible data. Updated on the
-            // inner-advance break.
             let mut tail_seed_anchor = pos;
 
             'inner: loop {
@@ -714,7 +784,17 @@ impl DfastMatchGenerator {
                                 );
                                 match_len += ext;
                             }
-                            if match_len >= DFAST_MIN_MATCH_LEN {
+                            // Rep extensions use the 4-byte
+                            // `DFAST_REP_MIN_MATCH_LEN` floor, NOT the
+                            // hash-search `DFAST_MIN_MATCH_LEN = 5`. Rep
+                            // coding has no on-wire offset cost, so the
+                            // upstream reference accepts 4-byte rep
+                            // hits; gating at 5 here would silently drop
+                            // every 4-byte rep1 the upstream encoder
+                            // produces, and leave the post-match
+                            // `extend_with_repcode_after_match` chain
+                            // (which uses 4) inconsistent with the peek.
+                            if match_len >= DFAST_REP_MIN_MATCH_LEN {
                                 let concat = &self.history[history_start_offset..];
                                 let rep_cand = extend_backwards_shared(
                                     concat,
@@ -945,10 +1025,9 @@ impl DfastMatchGenerator {
         literals_start: &mut usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
-        const DONOR_REP_MIN_MATCH_LEN: usize = 4;
         loop {
-            // Need at least DONOR_REP_MIN_MATCH_LEN bytes of room past `pos`.
-            if pos + DONOR_REP_MIN_MATCH_LEN > current_len {
+            // Need at least DFAST_REP_MIN_MATCH_LEN bytes of room past `pos`.
+            if pos + DFAST_REP_MIN_MATCH_LEN > current_len {
                 break;
             }
             // After a primary emit `literals_start == pos`, so `lit_len`
@@ -975,7 +1054,7 @@ impl DfastMatchGenerator {
                 None => break,
             };
             let concat = &self.history[self.history_start..];
-            if cur_idx + DONOR_REP_MIN_MATCH_LEN > concat.len() {
+            if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
             // Cheap 4-byte gate before the SIMD `common_prefix_len`.
@@ -983,7 +1062,7 @@ impl DfastMatchGenerator {
                 break;
             }
             let match_len = common_prefix_len(&concat[cand_idx..], &concat[cur_idx..]);
-            if match_len < DONOR_REP_MIN_MATCH_LEN {
+            if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
             // Sparse complementary insertion (donor parity,
@@ -996,7 +1075,7 @@ impl DfastMatchGenerator {
             // the match span and discard whichever positions the
             // producer was about to re-probe.
             //
-            // At the floor `match_len == DONOR_REP_MIN_MATCH_LEN (= 4)`
+            // At the floor `match_len == DFAST_REP_MIN_MATCH_LEN (= 4)`
             // the three targets collapse to two distinct positions.
             // With `post_match_end = abs_pos + 4` the three offsets
             // resolve to:
@@ -1204,6 +1283,7 @@ impl DfastMatchGenerator {
                 current_idx,
                 concat,
                 lit_len,
+                8, // long-hash equality gate
             )
         } else {
             None
@@ -1227,6 +1307,7 @@ impl DfastMatchGenerator {
                 current_idx,
                 concat,
                 lit_len,
+                4, // short-hash equality gate
             ) {
                 best = best_len_offset_candidate(best, Some(short_cand));
                 if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
@@ -1254,6 +1335,7 @@ impl DfastMatchGenerator {
                         next_idx,
                         concat,
                         lit_len.saturating_add(1),
+                        8, // long-hash equality gate, `_search_next_long` retry
                     ) && retry.match_len > short_cand.match_len
                     {
                         best = best_len_offset_candidate(best, Some(retry));
@@ -1282,6 +1364,7 @@ impl DfastMatchGenerator {
         current_idx: usize,
         concat: &[u8],
         lit_len: usize,
+        gate_len: usize,
     ) -> Option<MatchCandidate> {
         if slot == DFAST_EMPTY_SLOT {
             return None;
@@ -1291,10 +1374,22 @@ impl DfastMatchGenerator {
             return None;
         }
         let candidate_idx = candidate_pos - history_abs_start;
-        // Cheap mismatch gate before the SIMD walk: if the first byte
-        // doesn't match there's no way `common_prefix_len` reaches the
-        // `DFAST_MIN_MATCH_LEN = 5` byte minimum.
-        if concat[candidate_idx] != concat[current_idx] {
+        // Probe-width equality gate before the SIMD walk. The long-hash
+        // callers pass `gate_len = 8` (matches an `MEM_read64`-style
+        // probe in the upstream reference); the short-hash caller
+        // passes `gate_len = 4` (`MEM_read32`-style). A 1-byte
+        // precheck would accept hash collisions whose actual common
+        // prefix runs from 1 byte up to less than the probe width,
+        // paying the full `common_prefix_len` walk for them on every
+        // iteration. The wider gate rejects those collisions early
+        // and matches what the upstream `_search_next_long` path does
+        // after a hit.
+        if candidate_idx + gate_len > concat.len() || current_idx + gate_len > concat.len() {
+            return None;
+        }
+        if concat[candidate_idx..candidate_idx + gate_len]
+            != concat[current_idx..current_idx + gate_len]
+        {
             return None;
         }
         let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);

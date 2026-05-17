@@ -92,14 +92,18 @@ use alloc::vec::Vec;
 
 pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
 
-/// Donor-parity worst-case compressed-size bound for `src_size`
-/// uncompressed bytes. The canonical definition lives in donor
-/// `lib/zstd.h` (zstd 1.5.7) as the `ZSTD_COMPRESSBOUND(srcSize)`
-/// macro; the formula below mirrors the active branch of that macro
-/// for the size range we hit in practice. If the macro changes in a
-/// future donor revision, treat the donor header as authoritative
-/// and re-derive this function — do NOT trust the inline copy
-/// without cross-checking.
+/// Worst-case compressed-size bound for `src_size` uncompressed
+/// bytes. Mirrors the upstream `ZSTD_COMPRESSBOUND(srcSize)` macro
+/// from `lib/zstd.h` (zstd 1.5.7) — the C *macro*, NOT the public
+/// `ZSTD_compressBound()` function. The function adds frame/block-
+/// header headroom in some code paths; the macro is a tighter
+/// expression suitable for sizing an internal output Vec, which is
+/// the only call site here. Callers that need a hard upper bound on
+/// the wire-format compressed size should NOT reuse this — use the
+/// `zstd-sys` function call directly. If the macro changes in a
+/// future upstream revision, treat the upstream header as
+/// authoritative and re-derive this function — do not trust the
+/// inline copy without cross-checking.
 ///
 /// Inline approximation (this revision):
 ///
@@ -169,6 +173,20 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// a 128 KiB floor rather than 0. Downstream consumers that measure
 /// peak RSS on this entry point will see a different curve than
 /// pre-revision; bench shape, not steady-state, is what changed.
+///
+/// The other side of the peak shape is the input buffering: this
+/// helper drives `read_to_end` to materialize the full source into a
+/// `Vec<u8>` before forwarding the slice to [`compress_slice_to_vec`].
+/// For a `Read` whose size is unknown ahead of time, `read_to_end`
+/// grows that input `Vec` via power-of-two doubling — peak input
+/// allocation can be up to 2× the final source length transiently.
+/// At the moment that input buffer crosses ~128 KiB the output Vec
+/// seed kicks in concurrently, so the helper's true RSS peak is
+/// roughly `input.capacity() + 128 KiB` (or
+/// `input.capacity() + compress_bound(input.len())` for sub-128-KiB
+/// inputs). [`StreamingEncoder`] avoids the input materialization
+/// step entirely and is the right entry point when the source is
+/// large or unbounded.
 ///
 /// ```rust
 /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
