@@ -273,28 +273,31 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
          recorded. Use a compressible level (Fastest / Level(N) / \
          Default / Better) for sequence-stream audits.",
     );
-    // Levels that route through the donor block-splitter
+    // Numeric levels that route through the donor block-splitter
     // (`donor_split_block_by_chunks` / `_fromBorders`) can emit
     // multiple physical on-wire blocks per single `start_matching`
     // call. `CapturingMatcher::current_block` increments once per
     // matcher invocation, so on those levels the recorded
     // `block_tail_lengths` would NOT be "one entry per emitted
     // on-wire block" and alignment against FFI delimiters would
-    // shift by the split-block count. Reject pre-split levels with
-    // a diagnostic until per-physical-block bookkeeping is wired
-    // through — current scope is the Lane A `7-compress-default`
-    // audit at `Level(3)` (PR #149 review #22).
-    let post_split = matches!(level, CompressionLevel::Best)
-        || matches!(level, CompressionLevel::Level(11..=22));
+    // shift by the split-block count.
+    //
+    // `donor_pre_split_level` (frame_compressor.rs) matches the
+    // EXACT enum variants — `Level(11..=15)` and `Level(16..=22)`
+    // — so `Best` falls through to `None` and is NOT a pre-split
+    // path despite its docstring saying "roughly equivalent to
+    // Zstd level 11". Reject only the numeric range that actually
+    // pre-splits (PR #149 review #24).
+    let post_split = matches!(level, CompressionLevel::Level(11..=22));
     assert!(
         !post_split,
         "compress_and_collect_sequences does not support pre-split \
-         levels (Best / Level(11..=22)): the donor block-splitter \
-         emits multiple physical blocks per matcher call, which the \
+         levels (Level(11..=22)): the donor block-splitter emits \
+         multiple physical blocks per matcher call, which the \
          current per-matcher-call block counter cannot track. The \
-         tool is validated for Fastest / Default / Better / \
-         Level(1..=10); higher levels need per-physical-block hooks \
-         that don't exist yet.",
+         tool is validated for Fastest / Default / Better / Best / \
+         Level(1..=10); higher numeric levels need per-physical-block \
+         hooks that don't exist yet.",
     );
     // Mirror `FrameCompressor::new()` matcher construction. The
     // `reset()` call inside `compress()` re-derives the real per-level
@@ -648,12 +651,39 @@ mod tests {
         );
     }
 
-    /// Same guard, named-preset variant. `Best` corresponds to
-    /// `Level(11)` per the public docstring, so both must reject.
+    /// `Best` is documented as "roughly equivalent to Level 11" but
+    /// `donor_pre_split_level` matches the EXACT enum variants
+    /// (`Level(11..=15)` / `Level(16..=22)`) — the `Best` arm
+    /// falls through to `None`, so the named preset does NOT
+    /// trigger the donor block-splitter. The guard above
+    /// intentionally allows `Best` through; this test pins the
+    /// matcher path stays alignment-correct for it. Without it, a
+    /// future tightening of the guard to also reject `Best` would
+    /// silently break a valid capture path.
     #[test]
-    #[should_panic(expected = "does not support pre-split levels")]
-    fn rejects_best_preset() {
-        let _ =
-            compress_and_collect_sequences(b"hello there general kenobi", CompressionLevel::Best);
+    fn captures_through_best_preset() {
+        // 32 KiB of a 32-byte rotating pattern: compressible enough
+        // for Best (lazy2 / btlazy2 strategy) to produce a non-empty
+        // sequence stream, small enough to keep the test fast.
+        let pattern: [u8; 32] = {
+            let mut p = [0u8; 32];
+            for (i, b) in p.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(11).wrapping_add(3);
+            }
+            p
+        };
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(32 * 1024).collect();
+        let captured = compress_and_collect_sequences(&data, CompressionLevel::Best);
+        let cumulative: u64 = captured
+            .sequences
+            .iter()
+            .map(|s| s.ll as u64 + s.ml as u64)
+            .sum::<u64>()
+            + captured
+                .block_tail_lengths
+                .iter()
+                .map(|t| *t as u64)
+                .sum::<u64>();
+        assert_eq!(cumulative, data.len() as u64);
     }
 }
