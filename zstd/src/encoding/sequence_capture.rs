@@ -223,7 +223,39 @@ impl Matcher for CapturingMatcher {
 /// events were initially dropped from the recorder and the resulting
 /// alignment loss showed up as spurious `RustOnly` / `FfiOnly` noise
 /// on multi-block fixtures.
+///
+/// # Known limitation: raw-fallback blocks
+///
+/// The capture records what the matcher PRODUCED, not what the
+/// encoder eventually WROTE on-wire. `compress_block_encoded` may
+/// fall back to a raw block when `compressed.len() >= MAX_BLOCK_SIZE`
+/// (compression made the block bigger than the source). In that
+/// case the matcher's triples are recorded in the capture but the
+/// on-wire frame contains no sequences for that block, so the
+/// comparator will report spurious `RustOnly` rows. The wrapper
+/// has no way to observe the raw-fallback decision from inside the
+/// `Matcher` trait — fixing this would require hooking the encoder
+/// downstream of the matcher pass, which is out of scope for this
+/// bench-only tool. Triage the recorded stream with this caveat in
+/// mind: a Rust block where every triple appears as `RustOnly` and
+/// FFI has the matching offsets nowhere likely means raw fallback,
+/// not a real algorithmic divergence (PR #149 review #21).
 pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> SequenceCapture {
+    // Empty input bypasses the matcher entirely: `FrameCompressor`
+    // emits a zero-length raw block without calling any `Matcher`
+    // method. The reconstruction invariant `Σ(ll+ml)+Σ(tails) ==
+    // input.len()` would trivially pass (`0 == 0`) but
+    // `block_tail_lengths.len()` would be 0 — violating the
+    // public "one entry per emitted block" contract. Reject
+    // explicitly so callers using `tail_lengths.len()` as a block
+    // count get a clear diagnostic (PR #149 review #20).
+    assert!(
+        !input.is_empty(),
+        "compress_and_collect_sequences requires non-empty input: \
+         the frame compressor emits a zero-length raw block for \
+         empty input without invoking the matcher, so no block \
+         metadata is recorded.",
+    );
     // `CompressionLevel::Uncompressed` short-circuits the encoder
     // before any `Matcher` method runs — the frame compressor emits
     // raw blocks straight from input without consulting
@@ -239,7 +271,30 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
          CompressionLevel::Uncompressed: raw-block emission bypasses \
          the matcher entirely, so no sequences or block tails are \
          recorded. Use a compressible level (Fastest / Level(N) / \
-         Default / Better / Best) for sequence-stream audits.",
+         Default / Better) for sequence-stream audits.",
+    );
+    // Levels that route through the donor block-splitter
+    // (`donor_split_block_by_chunks` / `_fromBorders`) can emit
+    // multiple physical on-wire blocks per single `start_matching`
+    // call. `CapturingMatcher::current_block` increments once per
+    // matcher invocation, so on those levels the recorded
+    // `block_tail_lengths` would NOT be "one entry per emitted
+    // on-wire block" and alignment against FFI delimiters would
+    // shift by the split-block count. Reject pre-split levels with
+    // a diagnostic until per-physical-block bookkeeping is wired
+    // through — current scope is the Lane A `7-compress-default`
+    // audit at `Level(3)` (PR #149 review #22).
+    let post_split = matches!(level, CompressionLevel::Best)
+        || matches!(level, CompressionLevel::Level(11..=22));
+    assert!(
+        !post_split,
+        "compress_and_collect_sequences does not support pre-split \
+         levels (Best / Level(11..=22)): the donor block-splitter \
+         emits multiple physical blocks per matcher call, which the \
+         current per-matcher-call block counter cannot track. The \
+         tool is validated for Fastest / Default / Better / \
+         Level(1..=10); higher levels need per-physical-block hooks \
+         that don't exist yet.",
     );
     // Mirror `FrameCompressor::new()` matcher construction. The
     // `reset()` call inside `compress()` re-derives the real per-level
