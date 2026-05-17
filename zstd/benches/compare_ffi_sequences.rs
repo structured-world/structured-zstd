@@ -330,22 +330,34 @@ fn align_and_diff(
         // block whose final triple was already consumed but whose
         // tail bytes haven't been counted yet. This keeps the
         // cumulative position aligned with on-wire byte consumption.
-        if let Some(r) = rust_iter.peek() {
-            advance_tail_for_completed_blocks(
-                &mut rust_pos,
-                &mut rust_block_idx,
-                r.block_idx,
-                rust_tails,
-            );
-        }
-        if let Some(f) = ffi_iter.peek() {
-            advance_tail_for_completed_blocks(
-                &mut ffi_pos,
-                &mut ffi_block_idx,
-                f.block_idx,
-                ffi_tails,
-            );
-        }
+        // Flush pending tails for every block whose final triple was
+        // already consumed. When `peek()` is `None`, advance to
+        // `tails.len()` so the FINAL block's tail (always present for
+        // any non-trivial input) AND any literal-only / RLE-routed
+        // blocks past the iterator's end are counted. Without the
+        // `unwrap_or(tails.len())` branch the final block's tail
+        // would silently never be added to the cumulative cursor
+        // (PR #149 review round 2 #5).
+        let rust_next_block = rust_iter
+            .peek()
+            .map(|r| r.block_idx)
+            .unwrap_or(rust_tails.len() as u32);
+        advance_tail_for_completed_blocks(
+            &mut rust_pos,
+            &mut rust_block_idx,
+            rust_next_block,
+            rust_tails,
+        );
+        let ffi_next_block = ffi_iter
+            .peek()
+            .map(|f| f.block_idx)
+            .unwrap_or(ffi_tails.len() as u32);
+        advance_tail_for_completed_blocks(
+            &mut ffi_pos,
+            &mut ffi_block_idx,
+            ffi_next_block,
+            ffi_tails,
+        );
         match (rust_iter.peek(), ffi_iter.peek()) {
             (None, None) => break,
             (Some(r), None) => {
@@ -363,7 +375,16 @@ fn align_and_diff(
             (Some(r), Some(f)) => {
                 let r_next_pos = rust_pos + r.ll as u64 + r.ml as u64;
                 let f_next_pos = ffi_pos + f.ll as u64 + f.ml as u64;
-                if r_next_pos == f_next_pos {
+                // Compare field-by-field ONLY when both streams are at
+                // the same current byte position. Gating on
+                // `r_next_pos == f_next_pos` would collapse an
+                // "extra sequence on one side + catch-up on the other"
+                // case into a single misleading `Differ` row whenever
+                // the summed (ll + ml) deltas happen to balance — the
+                // two triples were emitted at different input
+                // positions and aren't actually comparable
+                // (PR #149 review round 2 #6).
+                if rust_pos == ffi_pos {
                     let r = **r;
                     let f = **f;
                     if r.ll == f.ll && r.of == f.of && r.ml == f.ml {
@@ -375,7 +396,7 @@ fn align_and_diff(
                     ffi_pos = f_next_pos;
                     rust_iter.next();
                     ffi_iter.next();
-                } else if r_next_pos < f_next_pos {
+                } else if rust_pos < ffi_pos {
                     let r = **r;
                     rust_pos = r_next_pos;
                     out.push(DiffRow::RustOnly(r));

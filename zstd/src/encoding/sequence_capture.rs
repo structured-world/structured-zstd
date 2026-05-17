@@ -252,6 +252,31 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
     let block_tail_lengths = Rc::try_unwrap(block_tail_lengths)
         .expect("CapturingMatcher dropped with compressor; tail-length vec is single-owner")
         .into_inner();
+    // Fail-fast invariant check: the encoder has a few paths that
+    // emit blocks WITHOUT routing through any `Matcher` method on
+    // `CapturingMatcher` — most notably RLE blocks for fully-constant
+    // runs (`AAAAA…`), which the frame compressor recognises before
+    // ever calling the matcher. On such inputs the captured stream
+    // misses entire blocks, so callers walking the cumulative
+    // position counter (e.g. `compare_ffi_sequences::align_and_diff`)
+    // would silently shift every subsequent row. Panic with a
+    // diagnostic instead of returning a quietly-wrong
+    // `SequenceCapture` (PR #149 review round 2 #7).
+    let reconstructed: u64 = sequences
+        .iter()
+        .map(|s| s.ll as u64 + s.ml as u64)
+        .sum::<u64>()
+        + block_tail_lengths.iter().map(|t| *t as u64).sum::<u64>();
+    assert_eq!(
+        reconstructed,
+        input.len() as u64,
+        "sequence_capture: matcher-bypassing block path (RLE block? raw-frame fast-path?) \
+         left the captured stream short: Σ(ll+ml)+Σ(tails)={reconstructed}, input.len()={}. \
+         The current wrapper only sees blocks routed through `Matcher` methods on \
+         `CapturingMatcher`. Use a non-RLE-friendly fixture or extend capture to \
+         cover the bypassing path before relying on cumulative-position alignment.",
+        input.len(),
+    );
     SequenceCapture {
         sequences,
         block_tail_lengths,
@@ -372,5 +397,39 @@ mod tests {
             data.len() as u64,
             "Σ(ll+ml) over triples + Σ(block_tail_lengths) must reconstruct input length",
         );
+    }
+
+    /// Constant runs (`[b'A'; N]`) currently route through the
+    /// matcher's `skip_matching` path (or emit a single long match),
+    /// NOT through an RLE-bypass that skips `CapturingMatcher`
+    /// entirely. Verify the invariant still holds on this shape so
+    /// `compare_ffi_sequences` can include constant-run fixtures
+    /// without tripping the fail-fast assert in
+    /// `compress_and_collect_sequences`. If a future encoder change
+    /// introduces a true RLE-bypass path on this input the assert
+    /// will fire — at which point the wrapper needs extending to
+    /// plumb synthetic block metadata out of the bypassing path
+    /// (PR #149 review round 2 #7).
+    #[test]
+    fn constant_run_routes_through_matcher_path() {
+        let data: Vec<u8> = alloc::vec![b'A'; 16 * 1024];
+        // Calling this is the assertion: the fail-fast invariant
+        // check inside `compress_and_collect_sequences` panics with
+        // "matcher-bypassing block path" if either `sequences` or
+        // `block_tail_lengths` undercount the input bytes. Reaching
+        // here without panic proves the matcher path covers
+        // constant runs.
+        let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
+        let cumulative: u64 = captured
+            .sequences
+            .iter()
+            .map(|s| s.ll as u64 + s.ml as u64)
+            .sum::<u64>()
+            + captured
+                .block_tail_lengths
+                .iter()
+                .map(|t| *t as u64)
+                .sum::<u64>();
+        assert_eq!(cumulative, data.len() as u64);
     }
 }
