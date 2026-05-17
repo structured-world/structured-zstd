@@ -421,7 +421,10 @@ fn main() {
         for level in supported_levels_filtered() {
             // Compress
             let (rust_compressed, rust_peak) = measure_peak(|| {
-                structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level)
+                structured_zstd::encoding::compress_slice_to_vec(
+                    &scenario.bytes[..],
+                    level.rust_level,
+                )
             });
             let (ffi_compressed, ffi_peak) =
                 measure_peak(|| ffi_encode(&scenario.bytes[..], level.ffi_level));

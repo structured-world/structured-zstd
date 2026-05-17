@@ -699,14 +699,267 @@ const OF_DIST: &[i32] = &[
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
-pub(crate) fn default_ml_table() -> FSETable {
-    build_table_from_probabilities(ML_DIST, 6)
+// The three predefined LL/ML/OF distribution tables are pure functions
+// of compile-time constants (`LL_DIST`, `ML_DIST`, `OF_DIST` and fixed
+// `acc_log` values). Each `build_table_from_probabilities` call costs
+// ~12 µs on a modern x86_64 — multiplied by three, that's ~38 µs of
+// pure setup paid on every `FrameCompressor::new`. On a 1 KiB frame
+// the actual compression work is ~1-5 µs, so the predefined-table
+// build dominates the per-frame cost for tiny inputs.
+//
+// Cache each predefined table once per process and hand callers a
+// `&'static FSETable`. The per-distribution cache slot is encoded by
+// the static identity of the cache itself (each helper has its own
+// `static`), NOT by pointer comparison on the distribution slice —
+// `LL_DIST` / `ML_DIST` / `OF_DIST` are `const`, and `core::ptr::eq`
+// on the materialized slice pointer of a `const` is only stable as
+// long as rustc keeps lowering it to a single anonymous static. A
+// future rustc change that duplicates the const at each use site
+// would silently sink every call through a "unknown slice" branch
+// and bypass the cache forever. Per-helper `static`s avoid that
+// failure mode entirely — the cache slot is selected at compile time
+// without consulting the slice pointer at all.
+//
+// Two implementations:
+//
+//   * Targets with atomic pointer support (`target_has_atomic = "ptr"`)
+//     — `AtomicPtr<FSETable>` lock-free init via `compare_exchange`.
+//     Works in both `std` and `no_std` builds; only `alloc` is needed
+//     (always available in this crate via `extern crate alloc`).
+//     Memory ordering: `Acquire` on the load so the consumer sees a
+//     fully-published `FSETable`; `AcqRel` on the compare-exchange
+//     so the publishing side both reads any concurrent winner
+//     (`Acquire`) and publishes its store (`Release`). The first
+//     writer leaks `Box<FSETable>` intentionally — the cache lives
+//     for the entire program lifetime, exactly like a `LazyLock`.
+//
+//   * No-atomic targets (`not(target_has_atomic = "ptr")`, e.g.
+//     `thumbv6m-none-eabi`, AVR, MSP430) — two sub-paths driven by
+//     the `critical-section` feature:
+//
+//     - With `critical-section` enabled (the recommended choice for
+//       any embedded build that wires up a CS impl from
+//       `cortex-m-rt` / `riscv-rt` / `embassy-executor` / `esp-hal`
+//       / similar): cached `static mut *mut FSETable` slot
+//       protected by `critical_section::with`. First call enters
+//       the CS, double-checks the slot, builds and publishes the
+//       leaked `Box::into_raw` pointer, exits the CS. Subsequent
+//       calls return the cached pointer. The CS is held for the
+//       duration of one `build_table_from_probabilities` (~12 µs)
+//       on the cold path — interrupts disabled for that window,
+//       acceptable for a one-time per-table init.
+//
+//     - Without `critical-section`: no cache. The helpers return
+//       a freshly-built `Box<FSETable>` per call (per-frame cost
+//       same as the pre-cache status quo); the table is dropped
+//       with the owning `FrameCompressor`, so memory does not
+//       grow with the number of `FrameCompressor::new` calls.
+//       Lack of pointer-width atomics is **not** a guarantee of
+//       non-concurrency (interrupt / preemption reentrancy on
+//       bare-metal targets), and a shared `static mut` slot
+//       without any synchronization would be a data race (UB).
+//       The owned-Box return is the same shape as the pre-PR
+//       behaviour — no leak, no UB risk, no cache speedup. Users
+//       who want the cache on no-atomic targets should enable
+//       the `critical-section` feature, which routes through the
+//       CS-protected `&'static` slot above.
+//
+// To paper over the per-target return-type difference the
+// `FseDefaultTable` type alias resolves to `&'static FSETable` on
+// any target/feature combination that has a cache (atomic, or
+// no-atomic + `critical-section`) and to `alloc::boxed::Box<FSETable>`
+// on the cache-less path. Both types `Deref` to `FSETable` so
+// downstream consumers in `encoding/blocks/compressed.rs` and
+// `encoding/frame_compressor.rs` borrow through `&` uniformly.
+#[cfg(target_has_atomic = "ptr")]
+fn get_or_init_cached_table(
+    cache: &core::sync::atomic::AtomicPtr<FSETable>,
+    probs: &[i32],
+    acc_log: u8,
+) -> &'static FSETable {
+    use core::sync::atomic::Ordering;
+
+    let cur = cache.load(Ordering::Acquire);
+    if !cur.is_null() {
+        // SAFETY: a non-null entry in this cache was published by a
+        // previous winner of the `compare_exchange` below, which
+        // leaked the `Box<FSETable>` (the cache never frees, mirroring
+        // a `LazyLock` lifetime). The pointed-to allocation is
+        // therefore valid for `'static` and immutable for the rest
+        // of the program, so handing out a `&'static FSETable` to
+        // multiple threads is sound.
+        return unsafe { &*cur };
+    }
+
+    let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
+    let raw = alloc::boxed::Box::into_raw(built);
+    // `AcqRel` on success rather than the minimal `Release`: the
+    // success path doesn't actually need Acquire (no prior loads to
+    // synchronise with at the publication point), but matching the
+    // failure Acquire ordering keeps the success and failure
+    // branches symmetric on rustc's atomic surface — both arms then
+    // see the same memory-fence shape for whatever follows. The
+    // marginal cost is one extra fence instruction on x86/aarch64;
+    // this path runs at most three times per process so it never
+    // shows up in a flamegraph.
+    match cache.compare_exchange(
+        core::ptr::null_mut(),
+        raw,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // We installed the singleton. SAFETY: `raw` is the
+            // pointer we just published; no other thread can free it.
+            unsafe { &*raw }
+        }
+        Err(existing) => {
+            // Another thread beat us to the publish — reclaim our
+            // throwaway allocation and use the winner. SAFETY: we own
+            // `raw` here (compare_exchange did NOT store it), so
+            // reconstituting the `Box` is sound. `existing` was
+            // published by the winning thread and is leaked for
+            // `'static`, mirroring the `cur` path.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
+            unsafe { &*existing }
+        }
+    }
 }
 
-pub(crate) fn default_ll_table() -> FSETable {
-    build_table_from_probabilities(LL_DIST, 6)
+/// No-atomic + no `critical-section` feature fallback: build a
+/// fresh `FSETable` and return it as an owned `Box<FSETable>`. No
+/// caching — see the module-level header comment for the rationale
+/// (interrupt / preemption reentrancy on bare-metal targets makes
+/// a shared `static mut` cache without atomic synchronization a
+/// data race surface). The owned-Box return shape is paired with
+/// the `FseDefaultTable` type alias so the per-frame caller stores
+/// the table in `FseTables` and drops it when the compressor
+/// drops — no `Box::leak`, no unbounded growth across multiple
+/// `FrameCompressor::new` calls.
+#[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+fn build_owned_table(probs: &[i32], acc_log: u8) -> alloc::boxed::Box<FSETable> {
+    alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log))
 }
 
-pub(crate) fn default_of_table() -> FSETable {
-    build_table_from_probabilities(OF_DIST, 5)
+/// No-atomic + `critical-section` feature: cached `static mut` slot
+/// protected by `critical_section::with`. CS impl supplied by the
+/// downstream embedded runtime (`cortex-m-rt`, `riscv-rt`, etc.).
+///
+/// SAFETY: the slot is only read / written inside the CS, so the
+/// "no concurrent first-call initialization" invariant is enforced
+/// by interrupt-disable rather than by an atomic primitive. The
+/// `Box::leak` lifetime and `&'static FSETable` return shape match
+/// the atomic-target path so the public `default_*_table()`
+/// surface is identical across all target families.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+fn get_or_init_cached_table_cs(
+    cache: &core::cell::UnsafeCell<*mut FSETable>,
+    probs: &[i32],
+    acc_log: u8,
+) -> &'static FSETable {
+    critical_section::with(|_cs| {
+        // SAFETY: the `critical_section::with` token witnesses that
+        // interrupts are disabled for the duration of this closure,
+        // so the slot is accessed serially even on multi-IRQ
+        // bare-metal runtimes. The `UnsafeCell::get()` raw pointer
+        // is dereferenced only inside this CS-protected scope.
+        let slot = unsafe { &mut *cache.get() };
+        if !slot.is_null() {
+            // SAFETY: previously published by a CS-protected write
+            // below, `Box::leak`'d → valid for `'static`.
+            return unsafe { &**slot };
+        }
+        let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
+        *slot = alloc::boxed::Box::into_raw(built);
+        // SAFETY: just assigned a leaked pointer.
+        unsafe { &**slot }
+    })
+}
+
+/// `UnsafeCell<*mut FSETable>` wrapper that is `Sync` because
+/// access is gated by `critical_section::with`. Required because
+/// `UnsafeCell` is not `Sync` by default and `static` items must
+/// be.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+#[repr(transparent)]
+struct CsCachedTablePtr(core::cell::UnsafeCell<*mut FSETable>);
+
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+impl CsCachedTablePtr {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(core::ptr::null_mut()))
+    }
+}
+
+// SAFETY: access to the inner `*mut FSETable` is gated by
+// `critical_section::with` in `get_or_init_cached_table_cs`, so
+// the slot is accessed serially even on multi-IRQ bare-metal
+// runtimes. The CS impl supplied by the downstream runtime
+// guarantees mutual exclusion for the duration of the closure.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+unsafe impl Sync for CsCachedTablePtr {}
+
+/// Per-helper return type. `&'static FSETable` on targets/features
+/// that own a process-wide cache (zero-cost subsequent calls);
+/// `Box<FSETable>` on the cache-less no-atomic path (one allocation
+/// per call, dropped with the owning `FrameCompressor` — no leak).
+/// Both `Deref` to `FSETable`, so downstream consumers borrow
+/// through `&` without caring which arm fired.
+#[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
+pub(crate) type FseDefaultTable = &'static FSETable;
+#[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+pub(crate) type FseDefaultTable = alloc::boxed::Box<FSETable>;
+
+pub(crate) fn default_ml_table() -> FseDefaultTable {
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, ML_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+    {
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, ML_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_owned_table(ML_DIST, 6)
+    }
+}
+
+pub(crate) fn default_ll_table() -> FseDefaultTable {
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, LL_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+    {
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, LL_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_owned_table(LL_DIST, 6)
+    }
+}
+
+pub(crate) fn default_of_table() -> FseDefaultTable {
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+        get_or_init_cached_table(&CACHE, OF_DIST, 5)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+    {
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, OF_DIST, 5)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_owned_table(OF_DIST, 5)
+    }
 }

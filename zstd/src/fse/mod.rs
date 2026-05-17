@@ -74,6 +74,7 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
 
 /// Verify `table_header_bits()` matches the actual byte count written by `write_table()`.
 #[test]
+#[allow(clippy::borrow_deref_ref)]
 fn table_header_bits_exact() {
     use crate::bit_io::BitWriter;
     use fse_encoder::{
@@ -94,10 +95,12 @@ fn table_header_bits_exact() {
         );
     };
 
-    // Predefined tables
-    check(&default_ll_table());
-    check(&default_ml_table());
-    check(&default_of_table());
+    // Predefined tables. Borrow via `&*` so the call compiles on
+    // both `FseDefaultTable` shapes — `&'static FSETable` (atomic /
+    // `critical-section`) and `Box<FSETable>` (no-atomic-no-CS).
+    check(&*default_ll_table());
+    check(&*default_ml_table());
+    check(&*default_of_table());
 
     // Tables built from synthetic data
     let data: alloc::vec::Vec<u8> = (0u8..32).cycle().take(1000).collect();
