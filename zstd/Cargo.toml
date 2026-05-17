@@ -35,6 +35,16 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Locked behind the `hash` feature flag
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"], optional = true }
 fastrand = {version = "2.3.0", optional = true }
+# Optional sync primitive for the FSE default-table cache on no-atomic
+# targets (Cortex-M0/M0+, AVR, MSP430 — anywhere `target_has_atomic =
+# "ptr"` is false). When this feature is enabled the cache uses a
+# critical-section-protected `static mut` slot; when disabled the
+# no-atomic build rebuilds the table per call and leaks the result.
+# On targets with atomic pointer support (every modern desktop /
+# server / mobile / Cortex-M3+ / RISC-V-A target) the dep is dead
+# code and never instantiated — those targets use the lock-free
+# `AtomicPtr` path unconditionally.
+critical-section = { version = "1.2", optional = true }
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
@@ -51,6 +61,10 @@ zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
 default = ["hash", "std"]
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
+# Opt-in cache for FSE default tables on no-atomic targets. See
+# `fse_encoder::default_*_table` for the implementation split. On
+# targets with atomic pointer support this feature is a no-op.
+critical-section = ["dep:critical-section"]
 bench_internals = []
 fuzz_exports = []
 std = []

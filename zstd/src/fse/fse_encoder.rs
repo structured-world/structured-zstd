@@ -734,14 +734,33 @@ const OF_DIST: &[i32] = &[
 //     for the entire program lifetime, exactly like a `LazyLock`.
 //
 //   * No-atomic targets (`not(target_has_atomic = "ptr")`, e.g.
-//     `thumbv6m-none-eabi`, AVR) — `static mut` raw pointer with
-//     single-threaded access. Targets that lack atomic pointer
-//     support are by definition single-threaded embedded
-//     environments (otherwise their interrupt model couldn't share
-//     state without atomics either), so a non-atomic mutable static
-//     is sound. The crate already uses this same split for
-//     `decoding::dictionary::DictionaryHandle` (`Arc` vs `Rc`); the
-//     FSE cache mirrors that pattern. Same `Box::leak` lifetime.
+//     `thumbv6m-none-eabi`, AVR, MSP430) — two sub-paths driven by
+//     the `critical-section` feature:
+//
+//     - With `critical-section` enabled (the recommended choice for
+//       any embedded build that wires up a CS impl from
+//       `cortex-m-rt` / `riscv-rt` / `embassy-executor` / `esp-hal`
+//       / similar): cached `static mut *mut FSETable` slot
+//       protected by `critical_section::with`. First call enters
+//       the CS, double-checks the slot, builds and publishes the
+//       leaked `Box::into_raw` pointer, exits the CS. Subsequent
+//       calls return the cached pointer. The CS is held for the
+//       duration of one `build_table_from_probabilities` (~12 µs)
+//       on the cold path — interrupts disabled for that window,
+//       acceptable for a one-time per-table init.
+//
+//     - Without `critical-section`: rebuild + `Box::leak` per
+//       call. Lack of pointer-width atomics is **not** a guarantee
+//       of non-concurrency (interrupt / preemption reentrancy on
+//       bare-metal targets), and a shared `static mut` slot
+//       without any synchronization would be a data race (UB).
+//       Skipping the cache entirely sidesteps the synchronization
+//       question; the trade-off is that repeat callers leak
+//       ~few-KiB per `FrameCompressor::new` × 3 (LL/ML/OF).
+//       Embedded encoders typically live for the entire process
+//       so the accumulated leak is bounded in practice. Users who
+//       want the cache should enable the `critical-section`
+//       feature.
 #[cfg(target_has_atomic = "ptr")]
 fn get_or_init_cached_table(
     cache: &core::sync::atomic::AtomicPtr<FSETable>,
@@ -797,34 +816,77 @@ fn get_or_init_cached_table(
     }
 }
 
-/// SAFETY (caller): `cache` must point at a per-helper `static mut`
-/// raw pointer, accessed serially. Targets without atomic pointer
-/// support are by construction single-threaded (their runtime model
-/// has no concurrent access primitive), so serial access is the only
-/// access shape that exists. The function is `unsafe` to make every
-/// call site flag the precondition at the use site.
-#[cfg(not(target_has_atomic = "ptr"))]
-unsafe fn get_or_init_cached_table_noatomic(
-    cache: *mut *mut FSETable,
+/// No-atomic + no `critical-section` feature fallback: build a
+/// fresh `FSETable` and `Box::leak` it for the `'static` lifetime.
+/// No caching — see the module-level header comment for the
+/// rationale (interrupt / preemption reentrancy on bare-metal
+/// targets makes a shared `static mut` cache without atomic
+/// synchronization a data race surface, so we trade off ~few-KiB
+/// per call against the UB risk; users who want the cache should
+/// enable the crate's `critical-section` feature).
+#[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+fn build_and_leak_table(probs: &[i32], acc_log: u8) -> &'static FSETable {
+    let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
+    alloc::boxed::Box::leak(built)
+}
+
+/// No-atomic + `critical-section` feature: cached `static mut` slot
+/// protected by `critical_section::with`. CS impl supplied by the
+/// downstream embedded runtime (`cortex-m-rt`, `riscv-rt`, etc.).
+///
+/// SAFETY: the slot is only read / written inside the CS, so the
+/// "no concurrent first-call initialization" invariant is enforced
+/// by interrupt-disable rather than by an atomic primitive. The
+/// `Box::leak` lifetime and `&'static FSETable` return shape match
+/// the atomic-target path so the public `default_*_table()`
+/// surface is identical across all target families.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+fn get_or_init_cached_table_cs(
+    cache: &core::cell::UnsafeCell<*mut FSETable>,
     probs: &[i32],
     acc_log: u8,
 ) -> &'static FSETable {
-    // SAFETY: caller guarantees `cache` is a valid `static mut` slot
-    // accessed under the single-threaded no-atomic invariant. First
-    // call writes the leaked `Box::into_raw` pointer; subsequent
-    // calls return the cached reference. The `Box::leak` shape
-    // matches the atomic path, so consumers see the same `'static`
-    // lifetime semantics on both targets.
-    unsafe {
-        let slot = &mut *cache;
+    critical_section::with(|_cs| {
+        // SAFETY: the `critical_section::with` token witnesses that
+        // interrupts are disabled for the duration of this closure,
+        // so the slot is accessed serially even on multi-IRQ
+        // bare-metal runtimes. The `UnsafeCell::get()` raw pointer
+        // is dereferenced only inside this CS-protected scope.
+        let slot = unsafe { &mut *cache.get() };
         if !slot.is_null() {
-            return &**slot;
+            // SAFETY: previously published by a CS-protected write
+            // below, `Box::leak`'d → valid for `'static`.
+            return unsafe { &**slot };
         }
         let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
         *slot = alloc::boxed::Box::into_raw(built);
-        &**slot
+        // SAFETY: just assigned a leaked pointer.
+        unsafe { &**slot }
+    })
+}
+
+/// `UnsafeCell<*mut FSETable>` wrapper that is `Sync` because
+/// access is gated by `critical_section::with`. Required because
+/// `UnsafeCell` is not `Sync` by default and `static` items must
+/// be.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+#[repr(transparent)]
+struct CsCachedTablePtr(core::cell::UnsafeCell<*mut FSETable>);
+
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+impl CsCachedTablePtr {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(core::ptr::null_mut()))
     }
 }
+
+// SAFETY: access to the inner `*mut FSETable` is gated by
+// `critical_section::with` in `get_or_init_cached_table_cs`, so
+// the slot is accessed serially even on multi-IRQ bare-metal
+// runtimes. The CS impl supplied by the downstream runtime
+// guarantees mutual exclusion for the duration of the closure.
+#[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
+unsafe impl Sync for CsCachedTablePtr {}
 
 pub(crate) fn default_ml_table() -> &'static FSETable {
     #[cfg(target_has_atomic = "ptr")]
@@ -833,11 +895,14 @@ pub(crate) fn default_ml_table() -> &'static FSETable {
             core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
         get_or_init_cached_table(&CACHE, ML_DIST, 6)
     }
-    #[cfg(not(target_has_atomic = "ptr"))]
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
     {
-        static mut CACHE: *mut FSETable = core::ptr::null_mut();
-        // SAFETY: no-atomic target invariant (single-threaded).
-        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, ML_DIST, 6) }
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, ML_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_and_leak_table(ML_DIST, 6)
     }
 }
 
@@ -848,11 +913,14 @@ pub(crate) fn default_ll_table() -> &'static FSETable {
             core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
         get_or_init_cached_table(&CACHE, LL_DIST, 6)
     }
-    #[cfg(not(target_has_atomic = "ptr"))]
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
     {
-        static mut CACHE: *mut FSETable = core::ptr::null_mut();
-        // SAFETY: no-atomic target invariant (single-threaded).
-        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, LL_DIST, 6) }
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, LL_DIST, 6)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_and_leak_table(LL_DIST, 6)
     }
 }
 
@@ -863,10 +931,13 @@ pub(crate) fn default_of_table() -> &'static FSETable {
             core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
         get_or_init_cached_table(&CACHE, OF_DIST, 5)
     }
-    #[cfg(not(target_has_atomic = "ptr"))]
+    #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
     {
-        static mut CACHE: *mut FSETable = core::ptr::null_mut();
-        // SAFETY: no-atomic target invariant (single-threaded).
-        unsafe { get_or_init_cached_table_noatomic(&raw mut CACHE, OF_DIST, 5) }
+        static CACHE: CsCachedTablePtr = CsCachedTablePtr::new();
+        get_or_init_cached_table_cs(&CACHE.0, OF_DIST, 5)
+    }
+    #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
+    {
+        build_and_leak_table(OF_DIST, 5)
     }
 }
