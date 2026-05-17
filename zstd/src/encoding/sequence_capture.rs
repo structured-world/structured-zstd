@@ -144,7 +144,14 @@ impl Matcher for CapturingMatcher {
         // boundary) the default `0` is correct.
         let mut block_tail_ll: u32 = 0;
         self.inner.start_matching(|seq| {
-            match seq {
+            // Match by reference so `seq` stays owned for the
+            // forward to `handle_sequence`. Today every field of
+            // `Sequence` is `Copy` (`&[u8]`, `usize`), so a by-value
+            // match would also leave `seq` usable through implicit
+            // copy semantics, but binding by-ref is robust if any
+            // future field on `Sequence` turns non-Copy
+            // (PR #149 review #29).
+            match &seq {
                 Sequence::Triple {
                     literals,
                     offset,
@@ -154,8 +161,8 @@ impl Matcher for CapturingMatcher {
                         block_idx,
                         seq_in_block,
                         ll: literals.len() as u32,
-                        of: offset as u32,
-                        ml: match_len as u32,
+                        of: *offset as u32,
+                        ml: *match_len as u32,
                     });
                     seq_in_block = seq_in_block.saturating_add(1);
                 }
@@ -224,22 +231,18 @@ impl Matcher for CapturingMatcher {
 /// alignment loss showed up as spurious `RustOnly` / `FfiOnly` noise
 /// on multi-block fixtures.
 ///
-/// # Known limitation: raw-fallback blocks
+/// # Raw-fallback detection
 ///
-/// The capture records what the matcher PRODUCED, not what the
-/// encoder eventually WROTE on-wire. `compress_block_encoded` may
-/// fall back to a raw block when `compressed.len() >= MAX_BLOCK_SIZE`
-/// (compression made the block bigger than the source). In that
-/// case the matcher's triples are recorded in the capture but the
-/// on-wire frame contains no sequences for that block, so the
-/// comparator will report spurious `RustOnly` rows. The wrapper
-/// has no way to observe the raw-fallback decision from inside the
-/// `Matcher` trait — fixing this would require hooking the encoder
-/// downstream of the matcher pass, which is out of scope for this
-/// bench-only tool. Triage the recorded stream with this caveat in
-/// mind: a Rust block where every triple appears as `RustOnly` and
-/// FFI has the matching offsets nowhere likely means raw fallback,
-/// not a real algorithmic divergence (PR #149 review #21).
+/// The matcher hook records triples eagerly; the encoder may later
+/// discard a compressed attempt and emit a Raw_Block when
+/// `compressed.len() >= MAX_BLOCK_SIZE`. The capture would then
+/// contain phantom triples whose on-wire form has no sequences. To
+/// prevent silently misaligned output, this function parses the
+/// emitted frame's block headers (RFC 8878 §3.1.1.2.2) via
+/// [`detect_raw_or_rle_blocks_in_frame`] and panics with a clear
+/// diagnostic if any Raw_Block or RLE_Block is present. Callers
+/// see a hard failure instead of a misleading capture
+/// (PR #149 review #25).
 pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> SequenceCapture {
     // Empty input bypasses the matcher entirely: `FrameCompressor`
     // emits a zero-length raw block without calling any `Matcher`
@@ -286,17 +289,22 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
     // EXACT enum variants — `Level(11..=15)` and `Level(16..=22)`
     // — so `Best` falls through to `None` and is NOT a pre-split
     // path despite its docstring saying "roughly equivalent to
-    // Zstd level 11". Reject only the numeric range that actually
-    // pre-splits (PR #149 review #24).
-    let post_split = matches!(level, CompressionLevel::Level(11..=22));
+    // Zstd level 11". Reject all numeric levels ≥ 11 because
+    // `Level(n > 22)` clamps to Level 22 matcher parameters per
+    // `resolve_level_params` (match_generator.rs:412-415), so
+    // `Level(23)` etc. would silently slip past a `Level(11..=22)`
+    // check and hit the same multi-physical-block path as
+    // `Level(22)` (PR #149 review #24 + #27).
+    let post_split = matches!(level, CompressionLevel::Level(n) if n >= 11);
     assert!(
         !post_split,
         "compress_and_collect_sequences does not support pre-split \
-         levels (Level(11..=22)): the donor block-splitter emits \
-         multiple physical blocks per matcher call, which the \
+         levels (Level(n) where n >= 11): the donor block-splitter \
+         emits multiple physical blocks per matcher call, which the \
          current per-matcher-call block counter cannot track. The \
          tool is validated for Fastest / Default / Better / Best / \
-         Level(1..=10); higher numeric levels need per-physical-block \
+         Level(1..=10); higher numeric levels (including levels above \
+         22 which clamp to Level 22 params) need per-physical-block \
          hooks that don't exist yet.",
     );
     // Mirror `FrameCompressor::new()` matcher construction. The
@@ -365,10 +373,133 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
          cover the bypassing path before relying on cumulative-position alignment.",
         input.len(),
     );
+    // Detect raw-fallback / RLE on-wire blocks. The matcher records
+    // triples eagerly, but `compress_block_encoded` may discard the
+    // compressed block and emit a Raw_Block when
+    // `compressed.len() >= MAX_BLOCK_SIZE` (compression made things
+    // bigger). The matcher-side capture would then contain phantom
+    // triples for a block whose on-wire form has no sequences,
+    // turning the comparator's signal into spurious `RustOnly` rows.
+    // Parse the emitted frame's block headers and panic if any Raw
+    // or RLE block is present so the broken precondition surfaces
+    // immediately instead of being misread as a real divergence
+    // (PR #149 review #25).
+    let raw_or_rle = detect_raw_or_rle_blocks_in_frame(&output).expect(
+        "sequence_capture: failed to parse emitted frame header — refusing to \
+         return a possibly-misaligned capture without raw-block detection",
+    );
+    assert!(
+        raw_or_rle.is_empty(),
+        "compress_and_collect_sequences: emitted frame contains {} raw/RLE block(s) at \
+         on-wire indices {:?}. The matcher recorded triples for those blocks but the \
+         on-wire form has no sequences for them — alignment against FFI delimiters \
+         would silently shift. Use a more compressible fixture (or a smaller block \
+         size) that keeps every block on the compressed path.",
+        raw_or_rle.len(),
+        raw_or_rle,
+    );
     SequenceCapture {
         sequences,
         block_tail_lengths,
     }
+}
+
+/// Walk the emitted Zstandard frame and return the on-wire indices
+/// of any Raw_Block or RLE_Block entries (RFC 8878 §3.1.1.2.2). The
+/// capture's matcher hook cannot observe the encoder's late
+/// raw-fallback decision; this parser gives us a way to fail-fast
+/// when that decision happens. Returns `Err` on malformed frames so
+/// the caller can panic with a clearer diagnostic than a silent
+/// short read.
+fn detect_raw_or_rle_blocks_in_frame(frame: &[u8]) -> Result<Vec<usize>, &'static str> {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    if frame.len() < 6 || frame[..4] != ZSTD_MAGIC {
+        return Err("frame missing zstd magic");
+    }
+    let mut cursor = 4_usize;
+    let fhd = frame[cursor];
+    cursor += 1;
+    let dict_id_flag = fhd & 0b11;
+    let content_checksum_flag = (fhd >> 2) & 1;
+    let single_segment_flag = (fhd >> 5) & 1;
+    let fcs_flag = (fhd >> 6) & 0b11;
+    // Window_Descriptor byte present only when single_segment_flag = 0.
+    if single_segment_flag == 0 {
+        cursor = cursor.checked_add(1).ok_or("cursor overflow")?;
+    }
+    let dict_id_size = match dict_id_flag {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => unreachable!(),
+    };
+    cursor = cursor.checked_add(dict_id_size).ok_or("cursor overflow")?;
+    // Frame_Content_Size: 0/1/2/4/8 bytes per
+    // (single_segment_flag, fcs_flag) combination per RFC 8878.
+    let fcs_size = match (single_segment_flag, fcs_flag) {
+        (1, 0) => 1,
+        (_, 0) => 0,
+        (_, 1) => 2,
+        (_, 2) => 4,
+        (_, 3) => 8,
+        _ => unreachable!(),
+    };
+    cursor = cursor.checked_add(fcs_size).ok_or("cursor overflow")?;
+    if cursor > frame.len() {
+        return Err("truncated frame header");
+    }
+
+    // Iterate blocks until last_block bit is set. Each block has a
+    // 3-byte little-endian header: bit 0 = last, bits 1-2 =
+    // block_type (0=Raw, 1=RLE, 2=Compressed, 3=Reserved), bits 3-23
+    // = block_size (Block_Content size for Raw/Compressed,
+    // Regenerated_Size for RLE).
+    let mut raw_or_rle = Vec::new();
+    let mut block_idx: usize = 0;
+    loop {
+        if cursor.checked_add(3).ok_or("cursor overflow")? > frame.len() {
+            return Err("truncated block header");
+        }
+        let header = u32::from(frame[cursor])
+            | (u32::from(frame[cursor + 1]) << 8)
+            | (u32::from(frame[cursor + 2]) << 16);
+        cursor += 3;
+        let last_block = (header & 1) != 0;
+        let block_type = (header >> 1) & 0b11;
+        let block_size = (header >> 3) as usize;
+        match block_type {
+            0 => {
+                // Raw_Block: Block_Content is `block_size` literal bytes.
+                raw_or_rle.push(block_idx);
+                cursor = cursor.checked_add(block_size).ok_or("cursor overflow")?;
+            }
+            1 => {
+                // RLE_Block: 1-byte content, regenerated to `block_size` bytes.
+                raw_or_rle.push(block_idx);
+                cursor = cursor.checked_add(1).ok_or("cursor overflow")?;
+            }
+            2 => {
+                // Compressed_Block: Block_Content is `block_size` bytes.
+                cursor = cursor.checked_add(block_size).ok_or("cursor overflow")?;
+            }
+            3 => return Err("reserved block_type in frame"),
+            _ => unreachable!(),
+        }
+        block_idx += 1;
+        if cursor > frame.len() {
+            return Err("block content extends past frame end");
+        }
+        if last_block {
+            break;
+        }
+    }
+    // Optional 4-byte content checksum (validated separately by the
+    // decoder; not consumed here beyond bounds-checking).
+    if content_checksum_flag == 1 && cursor.checked_add(4).is_none_or(|end| end > frame.len()) {
+        return Err("truncated content checksum");
+    }
+    Ok(raw_or_rle)
 }
 
 #[cfg(test)]
@@ -379,10 +510,13 @@ mod tests {
 
     /// On a 16 KiB repeating 16-byte pattern, the encoder must emit
     /// at least one `Triple` sequence — every position past the first
-    /// 16 bytes finds a long match 16 bytes back. Constant runs
-    /// (`AAAA…`) intentionally avoided: they route to RLE block
-    /// emission which bypasses the matcher entirely and would
-    /// silently fail this test for the wrong reason.
+    /// 16 bytes finds a long match 16 bytes back. Constant-run input
+    /// (`AAAA…`) is covered separately by
+    /// `constant_run_routes_through_matcher_path` because it tests a
+    /// different invariant (the matcher path stays alignment-correct
+    /// even when no `Triple` is emitted). On the rotating pattern
+    /// here we want at least one captured triple, which a clean
+    /// matcher always produces.
     #[test]
     fn captures_at_least_one_triple_on_repeating_pattern() {
         let pattern: [u8; 16] = *b"PATTERN_1234_END";
@@ -433,15 +567,16 @@ mod tests {
         );
     }
 
-    /// Random / incompressible input should emit at most a sparse
-    /// trickle of triples (the dfast hash can luck into a 5-byte
-    /// collision on any 1 KiB stream), well below "every position
-    /// is a match". This bounds-the-rate test guards against a
-    /// wrapper bug that fabricates phantom sequences or carries
-    /// state across calls — a clean wrapper produces few or zero
-    /// triples here, but ZERO is not the strict contract.
+    /// Random / incompressible input causes the encoder to emit a
+    /// Raw_Block on-wire (`compressed.len() >= MAX_BLOCK_SIZE`), so
+    /// the post-compress raw-block detector must panic. Before the
+    /// detector existed, this test verified the wrapper bounded
+    /// phantom-triple production; now the API-level guarantee is
+    /// stronger — the function refuses to return a misaligned
+    /// capture for such inputs (PR #149 review #25).
     #[test]
-    fn captures_bounded_triples_on_incompressible_input() {
+    #[should_panic(expected = "raw/RLE block")]
+    fn rejects_incompressible_input_with_raw_on_wire_block() {
         // Deterministic non-repeating bytes via a simple LCG.
         let mut state: u32 = 0x1234_5678;
         let data: Vec<u8> = (0..1024)
@@ -450,79 +585,24 @@ mod tests {
                 (state >> 16) as u8
             })
             .collect();
-        let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
-        let seqs = &captured.sequences;
-        // Some matches may still surface on a 1 KiB LCG stream (the
-        // dfast hash can luck into a 5-byte collision), but the count
-        // must stay well below "every position is a match" — otherwise
-        // the wrapper is recording phantom sequences.
-        assert!(
-            seqs.len() < data.len() / 16,
-            "incompressible input emitted suspiciously many sequences: {} (limit: {})",
-            seqs.len(),
-            data.len() / 16,
-        );
-        // Each block (matcher call) must contribute exactly one
-        // tail-length entry — even when no triples were emitted.
-        // Block count is `last.block_idx + 1` if any triples, or
-        // we expect at least one block was processed since the
-        // input is 1 KiB > 0.
-        assert!(
-            !captured.block_tail_lengths.is_empty(),
-            "no block tail lengths recorded for non-empty input",
-        );
-        // Cumulative position must still equal `data.len()`. For an
-        // incompressible block where the encoder routes through
-        // `start_matching` (rare with `set_source_size_hint`, but
-        // possible), the trailing-literal tail will cover most of the
-        // block; with `skip_matching` routing, the tail equals the
-        // entire committed space. Either way, `Σ (ll + ml) + tails`
-        // must reconstruct the input length exactly.
-        let cumulative: u64 = seqs.iter().map(|s| s.ll as u64 + s.ml as u64).sum::<u64>()
-            + captured
-                .block_tail_lengths
-                .iter()
-                .map(|t| *t as u64)
-                .sum::<u64>();
-        assert_eq!(
-            cumulative,
-            data.len() as u64,
-            "Σ(ll+ml) over triples + Σ(block_tail_lengths) must reconstruct input length",
-        );
+        // Calling the function is the test: the raw-block detector
+        // inside `compress_and_collect_sequences` must panic before
+        // returning, so any code after this point is unreachable.
+        let _ = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
     }
 
-    /// Constant runs (`[b'A'; N]`) currently route through the
-    /// matcher's `skip_matching` path (or emit a single long match),
-    /// NOT through an RLE-bypass that skips `CapturingMatcher`
-    /// entirely. Verify the invariant still holds on this shape so
-    /// `compare_ffi_sequences` can include constant-run fixtures
-    /// without tripping the fail-fast assert in
-    /// `compress_and_collect_sequences`. If a future encoder change
-    /// introduces a true RLE-bypass path on this input the assert
-    /// will fire — at which point the wrapper needs extending to
-    /// plumb synthetic block metadata out of the bypassing path
-    /// (PR #149 review round 2 #7).
+    /// Constant runs (`[b'A'; N]`) cause the encoder to emit an
+    /// RLE_Block on-wire (matcher may still produce a long
+    /// rep-coded triple, but the block payload is encoded as
+    /// `(byte, regenerated_size)`, not as sequences). The raw-block
+    /// detector treats RLE the same as Raw — both have no on-wire
+    /// sequences for the comparator to diff — and must panic to
+    /// prevent silently misaligned output (PR #149 review #25).
     #[test]
-    fn constant_run_routes_through_matcher_path() {
+    #[should_panic(expected = "raw/RLE block")]
+    fn rejects_constant_run_with_rle_on_wire_block() {
         let data: Vec<u8> = alloc::vec![b'A'; 16 * 1024];
-        // Calling this is the assertion: the fail-fast invariant
-        // check inside `compress_and_collect_sequences` panics with
-        // "matcher-bypassing block path" if either `sequences` or
-        // `block_tail_lengths` undercount the input bytes. Reaching
-        // here without panic proves the matcher path covers
-        // constant runs.
-        let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
-        let cumulative: u64 = captured
-            .sequences
-            .iter()
-            .map(|s| s.ll as u64 + s.ml as u64)
-            .sum::<u64>()
-            + captured
-                .block_tail_lengths
-                .iter()
-                .map(|t| *t as u64)
-                .sum::<u64>();
-        assert_eq!(cumulative, data.len() as u64);
+        let _ = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
     }
 
     /// Multi-block input (≥ 256 KiB, two 128 KiB frame blocks) is
@@ -544,24 +624,21 @@ mod tests {
     /// (PR #149 review #19).
     #[test]
     fn captures_multi_block_tails_and_indices() {
-        // Repeating 64-byte pattern: compressible enough to emit
-        // sequences (not RLE) and long enough that every position
-        // past the first 64 bytes finds a match, exercising the
-        // matcher rather than a fast skip path.
-        let pattern: [u8; 64] = {
-            let mut p = [0u8; 64];
-            for (i, b) in p.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            p
-        };
-        let data: Vec<u8> = pattern.iter().copied().cycle().take(256 * 1024).collect();
+        // Repeating 16-byte pattern at 200 KiB (≈ 1.5 × 128 KiB
+        // frame block) — guaranteed to span ≥2 blocks while
+        // compressing densely enough to stay on the Compressed_Block
+        // path, avoiding the raw/RLE detector at the end of
+        // `compress_and_collect_sequences`. Larger / less repetitive
+        // fixtures risk a trailing Raw_Block when the final chunk is
+        // small enough that compression doesn't pay for itself.
+        let pattern: [u8; 16] = *b"PATTERN_1234_END";
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(200 * 1024).collect();
         let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
 
         // Multi-block invariant: at least 2 blocks recorded.
         assert!(
             captured.block_tail_lengths.len() >= 2,
-            "expected ≥2 block tail entries for 256 KiB input, got {}: {:?}",
+            "expected ≥2 block tail entries for 200 KiB input, got {}: {:?}",
             captured.block_tail_lengths.len(),
             captured.block_tail_lengths,
         );
@@ -638,10 +715,15 @@ mod tests {
         );
     }
 
-    /// Pin the pre-split-level reject path. `Level(11..=22)` and
-    /// `Best` route through the donor block-splitter, which emits
-    /// multiple physical on-wire blocks per matcher call — the
-    /// per-matcher-call counter cannot track that shape.
+    /// Pin the pre-split-level reject path. Numeric `Level(n)` with
+    /// `n >= 11` routes through the donor block-splitter (or clamps
+    /// to Level 22's params, which post-splits the same way), which
+    /// emits multiple physical on-wire blocks per matcher call — the
+    /// per-matcher-call counter cannot track that shape. The named
+    /// `Best` preset is allowed because `donor_pre_split_level`
+    /// matches on EXACT enum variants and falls through to `None`
+    /// for `Best` — see `captures_through_best_preset` for the
+    /// matching positive test.
     #[test]
     #[should_panic(expected = "does not support pre-split levels")]
     fn rejects_pre_split_numeric_level() {
