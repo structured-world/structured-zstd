@@ -276,34 +276,40 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
          recorded. Use a compressible level (Fastest / Level(N) / \
          Default / Better) for sequence-stream audits.",
     );
-    // Numeric levels that route through the donor block-splitter
-    // (`donor_split_block_by_chunks` / `_fromBorders`) can emit
-    // multiple physical on-wire blocks per single `start_matching`
-    // call. `CapturingMatcher::current_block` increments once per
-    // matcher invocation, so on those levels the recorded
-    // `block_tail_lengths` would NOT be "one entry per emitted
-    // on-wire block" and alignment against FFI delimiters would
-    // shift by the split-block count.
+    // Only the POST-split path breaks the per-matcher-call block
+    // counter. Two distinct splitter mechanisms exist in
+    // `frame_compressor.rs`:
     //
-    // `donor_pre_split_level` (frame_compressor.rs) matches the
-    // EXACT enum variants — `Level(11..=15)` and `Level(16..=22)`
-    // — so `Best` falls through to `None` and is NOT a pre-split
-    // path despite its docstring saying "roughly equivalent to
-    // Zstd level 11". Reject all numeric levels ≥ 11 because
-    // `Level(n > 22)` clamps to Level 22 matcher parameters per
-    // `resolve_level_params` (match_generator.rs:412-415), so
-    // `Level(23)` etc. would silently slip past a `Level(11..=22)`
-    // check and hit the same multi-physical-block path as
-    // `Level(22)` (PR #149 review #24 + #27).
-    let post_split = matches!(level, CompressionLevel::Level(n) if n >= 11);
+    // * Pre-split (`Level(11..=15)` borders + `donor_optimal_block_size`,
+    //   borders-only): the splitter chooses a shrunken `block_len`
+    //   BEFORE the matcher runs; the suffix is parked in
+    //   `pending_input` and the next compress-loop iteration calls
+    //   the matcher again on the suffix. Each matcher call still
+    //   maps to exactly ONE physical on-wire block, so
+    //   `CapturingMatcher::current_block` tracks correctly.
+    //
+    // * Post-split (`Level(16..=22)` + window >= 1<<17, dispatched
+    //   from `levels/fastest.rs::compress_block_encoded` via
+    //   `compress_block_with_post_split`): a SINGLE matcher call's
+    //   output is split into multiple physical blocks by
+    //   `blocks::compress_block_with_post_split`. One matcher call
+    //   → N blocks → `current_block` only increments once,
+    //   `block_tail_lengths.len()` is short by `N - 1`.
+    //
+    // Reject `Level(n >= 16)` only. Covers `Level(16..=22)` and
+    // clamped `Level(>22)` (match_generator.rs:412-415 lands on
+    // Level 22 params for n > 22). `Level(11..=15)` is allowed
+    // because pre-split produces a separate matcher call per
+    // physical block (PR #149 review #24 + #27 + #30).
+    let post_split = matches!(level, CompressionLevel::Level(n) if n >= 16);
     assert!(
         !post_split,
-        "compress_and_collect_sequences does not support pre-split \
-         levels (Level(n) where n >= 11): the donor block-splitter \
+        "compress_and_collect_sequences does not support post-split \
+         levels (Level(n) where n >= 16): `compress_block_with_post_split` \
          emits multiple physical blocks per matcher call, which the \
          current per-matcher-call block counter cannot track. The \
          tool is validated for Fastest / Default / Better / Best / \
-         Level(1..=10); higher numeric levels (including levels above \
+         Level(1..=15); higher numeric levels (including levels above \
          22 which clamp to Level 22 params) need per-physical-block \
          hooks that don't exist yet.",
     );
@@ -715,21 +721,21 @@ mod tests {
         );
     }
 
-    /// Pin the pre-split-level reject path. Numeric `Level(n)` with
-    /// `n >= 11` routes through the donor block-splitter (or clamps
-    /// to Level 22's params, which post-splits the same way), which
-    /// emits multiple physical on-wire blocks per matcher call — the
-    /// per-matcher-call counter cannot track that shape. The named
-    /// `Best` preset is allowed because `donor_pre_split_level`
-    /// matches on EXACT enum variants and falls through to `None`
-    /// for `Best` — see `captures_through_best_preset` for the
-    /// matching positive test.
+    /// Pin the post-split-level reject path. `Level(16..=22)` (and
+    /// any `Level(n > 22)` that clamps to Level 22 params) goes
+    /// through `compress_block_with_post_split` which emits multiple
+    /// physical on-wire blocks per single matcher call — the
+    /// per-matcher-call counter cannot track that shape.
+    /// `Level(11..=15)` is intentionally NOT rejected: those levels
+    /// pre-split via `donor_optimal_block_size` (borders), so each
+    /// shrunken block is processed by its own matcher call and the
+    /// counter stays correct.
     #[test]
-    #[should_panic(expected = "does not support pre-split levels")]
-    fn rejects_pre_split_numeric_level() {
+    #[should_panic(expected = "does not support post-split levels")]
+    fn rejects_post_split_numeric_level() {
         let _ = compress_and_collect_sequences(
             b"hello there general kenobi",
-            CompressionLevel::Level(11),
+            CompressionLevel::Level(16),
         );
     }
 
@@ -756,6 +762,34 @@ mod tests {
         };
         let data: Vec<u8> = pattern.iter().copied().cycle().take(32 * 1024).collect();
         let captured = compress_and_collect_sequences(&data, CompressionLevel::Best);
+        let cumulative: u64 = captured
+            .sequences
+            .iter()
+            .map(|s| s.ll as u64 + s.ml as u64)
+            .sum::<u64>()
+            + captured
+                .block_tail_lengths
+                .iter()
+                .map(|t| *t as u64)
+                .sum::<u64>();
+        assert_eq!(cumulative, data.len() as u64);
+    }
+
+    /// Positive coverage for the pre-split numeric range
+    /// (`Level(11..=15)`). The borders splitter parks the tail in
+    /// `pending_input` BEFORE the matcher runs, so each shrunken
+    /// portion gets its own matcher call and the counter stays
+    /// accurate. Without this test, a future tightening of the
+    /// guard to reject `Level(11..=15)` would regress a valid
+    /// capture path.
+    #[test]
+    fn captures_through_pre_split_level_15() {
+        // 32 KiB of a 16-byte rotating pattern: compressible enough
+        // for lazy2 (Level 11..=15 strategy) to produce a non-empty
+        // sequence stream without tripping the raw/RLE detector.
+        let pattern: [u8; 16] = *b"PATTERN_1234_END";
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(32 * 1024).collect();
+        let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(15));
         let cumulative: u64 = captured
             .sequences
             .iter()
