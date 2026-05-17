@@ -699,14 +699,94 @@ const OF_DIST: &[i32] = &[
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
+// The three predefined LL/ML/OF distribution tables are pure functions
+// of compile-time constants (`LL_DIST`, `ML_DIST`, `OF_DIST` and fixed
+// `acc_log` values). Each `build_table_from_probabilities` call costs
+// ~12 µs on a modern x86_64 — multiplied by three, that's ~38 µs of
+// pure setup paid on every `FrameCompressor::new`. On a 1 KiB frame
+// the actual compression work is ~1-5 µs, so the predefined-table
+// build dominates the per-frame cost for tiny inputs.
+//
+// Cache each predefined table once per process and hand callers a
+// clone; the clone is shallow per-symbol `Vec` copies of mostly-empty
+// `SymbolStates`, dominated by the small `states: Vec<State>` payload
+// rather than per-symbol fixed overhead.
+//
+// `AtomicPtr<FSETable>` lock-free init works in both `std` and
+// `no_std` builds — only `alloc` is required (always available in
+// this crate via `extern crate alloc`), which keeps the cache on a
+// single code path instead of a `cfg(feature = "std")` branch with
+// an eager rebuild fallback. Memory ordering: `Acquire` on the load
+// so the consumer sees a fully-published `FSETable`; `AcqRel` on the
+// compare-exchange so the publishing side both reads any concurrent
+// winner (`Acquire`) and publishes its store (`Release`). The first
+// writer leaks `Box<FSETable>` intentionally — the cache lives for
+// the entire program lifetime, exactly like a `LazyLock`.
+fn cached_default_table(probs: &'static [i32], acc_log: u8) -> FSETable {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    static LL_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
+    static ML_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
+    static OF_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
+
+    let cache: &AtomicPtr<FSETable> = if core::ptr::eq(probs.as_ptr(), LL_DIST.as_ptr()) {
+        &LL_PTR
+    } else if core::ptr::eq(probs.as_ptr(), ML_DIST.as_ptr()) {
+        &ML_PTR
+    } else if core::ptr::eq(probs.as_ptr(), OF_DIST.as_ptr()) {
+        &OF_PTR
+    } else {
+        // Unknown distribution — caller is passing a non-predefined
+        // slice. Skip the cache and build directly.
+        return build_table_from_probabilities(probs, acc_log);
+    };
+
+    let cur = cache.load(Ordering::Acquire);
+    if !cur.is_null() {
+        // SAFETY: a non-null entry in this cache was published by a
+        // previous winner of the `compare_exchange` below, which
+        // leaked the `Box<FSETable>`. The pointed-to allocation is
+        // therefore valid for `'static` and immutable for the rest of
+        // the program — sharing `&*cur` across threads is sound, and
+        // `clone()` does its own allocation rather than touching the
+        // shared data.
+        return unsafe { (*cur).clone() };
+    }
+
+    let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
+    let raw = alloc::boxed::Box::into_raw(built);
+    match cache.compare_exchange(
+        core::ptr::null_mut(),
+        raw,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // We installed the singleton. SAFETY: `raw` is the
+            // pointer we just published; no other thread can free it.
+            unsafe { (*raw).clone() }
+        }
+        Err(existing) => {
+            // Another thread beat us to the publish — reclaim our
+            // throwaway allocation and use the winner.
+            // SAFETY: we own `raw` here (compare_exchange did NOT
+            // store it), so reconstituting the Box is sound.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
+            // SAFETY: same as the `cur` path — `existing` was
+            // published by the winning thread and is leaked for
+            // `'static`.
+            unsafe { (*existing).clone() }
+        }
+    }
+}
+
 pub(crate) fn default_ml_table() -> FSETable {
-    build_table_from_probabilities(ML_DIST, 6)
+    cached_default_table(ML_DIST, 6)
 }
 
 pub(crate) fn default_ll_table() -> FSETable {
-    build_table_from_probabilities(LL_DIST, 6)
+    cached_default_table(LL_DIST, 6)
 }
 
 pub(crate) fn default_of_table() -> FSETable {
-    build_table_from_probabilities(OF_DIST, 5)
+    cached_default_table(OF_DIST, 5)
 }
