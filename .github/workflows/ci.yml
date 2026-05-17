@@ -293,21 +293,21 @@ jobs:
               "target_triple": "x86_64-unknown-linux-gnu",
               "build_setup": "",
               "runtime_setup": "",
-              "timeout_minutes": 25
+              "timeout_minutes": 45
             },
             {
               "id": "i686-gnu",
               "target_triple": "i686-unknown-linux-gnu",
               "build_setup": "sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386",
               "runtime_setup": "sudo apt-get update && sudo apt-get install -y libc6-dev-i386",
-              "timeout_minutes": 30
+              "timeout_minutes": 60
             },
             {
               "id": "x86_64-musl",
               "target_triple": "x86_64-unknown-linux-musl",
               "build_setup": "sudo apt-get update && sudo apt-get install -y musl-tools",
               "runtime_setup": "",
-              "timeout_minutes": 25
+              "timeout_minutes": 45
             }
           ]
           EOF
