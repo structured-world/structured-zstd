@@ -7006,44 +7006,98 @@ fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
 /// `dictionary_retained_budget` observable: starting budget 100, after
 /// the third commit (4 bytes actually evicted) the budget must read 96,
 /// not 95.
-/// Direct verification of the `pre + space_len - post` formula the
-/// `commit_space` Dfast branch now uses, against the divergent case
-/// the buggy `data.len()` accounting would have inflated.
+/// Driver-path regression for the `commit_space` Dfast eviction accounting
+/// bug. Exercises `MatchGeneratorDriver::commit_space` directly (not just
+/// `DfastMatchGenerator::add_data`) so the assertion catches a future
+/// regression that swaps the Dfast branch in `commit_space` back to
+/// `evicted_bytes += data.len()` — the older draft of this regression
+/// hand-recomputed the formula on the matcher and would pass either way.
+///
+/// Fixture: `max_window_size = 10`, commit sequence `[4, 4, 5]`. The
+/// divergent case where the popped block (4 bytes) and the new input
+/// (5 bytes) have different sizes:
+///
+///   * after commit `"abcd"` (4 B): window_blocks=[4], ws=4
+///   * after commit `"efgh"` (4 B): window_blocks=[4,4], ws=8
+///   * commit `"ijklm"` (5 B): 8+5>10 → pop front [4] (evict=4),
+///     push 5 → window_blocks=[4,5], ws=9
+///
+/// `commit_space` then calls `retire_dictionary_budget(evicted)`. With
+/// the fix `evicted=4`; with the bug it would be `evicted=5`. The
+/// downstream `trim_after_budget_retire` cascade (which fires whenever
+/// `retire_dictionary_budget` returns true) drives the budget further
+/// down by trimming the now-oversize window; the final
+/// `dictionary_retained_budget` differs between the two paths because
+/// the cascade starting state differs (max_window_size after first
+/// retire is `10 - evicted`).
+///
+/// Tracing the fix path end-to-end with starting budget = 100:
+///   1st commit: evicted=0, no retire.
+///   2nd commit: evicted=0, no retire.
+///   3rd commit: evicted=4. retire(4) → budget=96, max_window=6.
+///     trim_after_budget_retire:
+///       iter1: ws=9 > max=6, pop [4] → ws=5, evicted=4.
+///              retire(4) → budget=92, max_window=2.
+///       iter2: ws=5 > max=2, pop [5] → ws=0, evicted=5.
+///              retire(5) → budget=87, max_window=0.
+///       iter3: ws=0, no trim, retire(0) → false, exit.
+///   Final budget = 87. Final max_window_size = 0.
+///
+/// In the buggy path the 3rd commit would compute `evicted=5`, retire
+/// would reclaim 5 instead of 4, shrinking max_window_size to 5
+/// instead of 6 — and then the cascade arithmetic produces a
+/// different final budget (and on the 2nd commit the cascade would
+/// already have shrunk max_window_size to 0, causing the 3rd commit
+/// to panic on `data.len() <= max_window_size`). Either way the
+/// regression surfaces as a test failure.
 #[test]
 fn dfast_commit_space_eviction_uses_window_size_delta() {
-    let mut matcher = DfastMatchGenerator::new(10);
-    matcher.max_window_size = 10;
+    use crate::encoding::CompressionLevel;
 
-    // First commit: 4-byte block, window empty → window_size 0 → 4,
-    // no eviction.
-    let v1 = b"abcd".to_vec();
-    let pre = matcher.window_size;
-    let space_len = v1.len();
-    matcher.add_data(v1, |_| {});
-    let evicted = pre + space_len - matcher.window_size;
-    assert_eq!(evicted, 0, "first commit: no eviction expected");
+    let mut driver = MatchGeneratorDriver::new(10, 1);
+    driver.reset(CompressionLevel::Level(2));
+    assert!(matches!(driver.storage, MatcherStorage::Dfast(_)));
 
-    // Second commit: 4-byte block, window 4 → 8, no eviction.
-    let v2 = b"efgh".to_vec();
-    let pre = matcher.window_size;
-    let space_len = v2.len();
-    matcher.add_data(v2, |_| {});
-    let evicted = pre + space_len - matcher.window_size;
-    assert_eq!(evicted, 0, "second commit: no eviction expected");
+    // Override the level-derived window with a tiny one so the
+    // 4 + 4 + 5 = 13 commit sequence below actually crosses the
+    // boundary. A 16 KiB+ default window would never evict on this
+    // little data and the bug would stay invisible.
+    driver.dfast_matcher_mut().max_window_size = 10;
+    driver.dictionary_retained_budget = 100;
 
-    // Third commit (5 bytes): 8 + 5 > 10 → pop the front
-    // 4-byte block, push 5. Actual eviction is 4 bytes; the input
-    // size is 5; the buggy `data.len()` accounting would have
-    // counted 5. The formula must yield 4.
-    let v3 = b"ijklm".to_vec();
-    let pre = matcher.window_size;
-    let space_len = v3.len();
-    matcher.add_data(v3, |_| {});
-    let evicted = pre + space_len - matcher.window_size;
+    let mut space1 = Vec::with_capacity(64);
+    space1.extend_from_slice(b"abcd");
+    driver.commit_space(space1);
     assert_eq!(
-        evicted, 4,
-        "third commit: only the popped 4-byte block was evicted; \
-         the 5-byte input is what's being INGESTED, not what's evicted"
+        driver.dictionary_retained_budget, 100,
+        "1st commit fills window 0 → 4, no eviction, no retire"
+    );
+
+    let mut space2 = Vec::with_capacity(64);
+    space2.extend_from_slice(b"efgh");
+    driver.commit_space(space2);
+    assert_eq!(
+        driver.dictionary_retained_budget, 100,
+        "2nd commit fills window 4 → 8, no eviction, no retire"
+    );
+
+    let mut space3 = Vec::with_capacity(64);
+    space3.extend_from_slice(b"ijklm");
+    driver.commit_space(space3);
+    assert_eq!(
+        driver.dictionary_retained_budget, 87,
+        "3rd commit + trim_after_budget_retire cascade. With the fix \
+         (evicted=4 from window_size delta) the cascade reclaims 100 \
+         → 96 → 92 → 87. With the bug (evicted=5 from data.len()) the \
+         3rd commit would panic on `data.len() <= max_window_size` \
+         after the 2nd commit's cascade had already shrunk \
+         max_window_size to 0."
+    );
+    assert_eq!(
+        driver.dfast_matcher_mut().max_window_size,
+        0,
+        "cascade drains max_window_size to 0 once budget reclaim \
+         exceeds the initial window size"
     );
 }
 

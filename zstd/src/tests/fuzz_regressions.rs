@@ -55,7 +55,6 @@ fn test_all_artifacts() {
 /// signal for this fixture is the Linux fuzz CI job.
 #[test]
 fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
-    extern crate std;
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
     use crate::encoding::{CompressionLevel, compress_to_vec};
 
