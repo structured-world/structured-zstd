@@ -1473,13 +1473,12 @@ impl DfastMatchGenerator {
         // `bits` bits set. `position_base` and `history_abs_start`
         // are constant across the loop after the single `ensure_room_for`
         // call above. `packed` fits in `u32` by that same gate.
-        let history_start_offset = history_start;
         let mut pos = start;
         while pos < long_safe_end {
             unsafe {
                 let idx = pos - history_abs_start;
                 let packed = ((pos - position_base) as u32) + 1;
-                let load_ptr = history_base_ptr.add(history_start_offset + idx);
+                let load_ptr = history_base_ptr.add(history_start + idx);
                 let v8 = (load_ptr as *const u64).read_unaligned();
                 let v4 = v8 & 0xFFFF_FFFF;
                 // Donor parity (`zstd_compress_internal.h:923-924`):
@@ -1499,7 +1498,7 @@ impl DfastMatchGenerator {
             unsafe {
                 let idx = pos - history_abs_start;
                 let packed = ((pos - position_base) as u32) + 1;
-                let load_ptr = history_base_ptr.add(history_start_offset + idx);
+                let load_ptr = history_base_ptr.add(history_start + idx);
                 let v4 = (load_ptr as *const u32).read_unaligned() as u64;
                 let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;

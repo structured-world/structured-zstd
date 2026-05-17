@@ -43,6 +43,16 @@ fn test_all_artifacts() {
 /// `BGAuICAKIA==` → bytes `04 60 2e 20 20 0a 20`. CI fuzz run that
 /// produced this artifact:
 /// https://github.com/structured-world/structured-zstd/actions/runs/25974756307
+///
+/// SIGNAL CAVEAT: a plain `cargo nextest run` of this test may pass
+/// against the pre-fix code because the OOB `*const u64::read_unaligned`
+/// usually lands inside the live `Vec`'s spare capacity — the bytes are
+/// well-defined for the allocator even though the read is UB. The
+/// regression reliably fires only under a sanitizer that tracks valid
+/// length (CI fuzz job runs ASan; `cargo +nightly miri test` also
+/// catches it). Treat a green `cargo test` here as a smoke check, not
+/// proof that the fast-loop guards are correct; the authoritative
+/// signal for this fixture is the Linux fuzz CI job.
 #[test]
 fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     extern crate std;
