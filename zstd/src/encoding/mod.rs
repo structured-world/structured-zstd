@@ -122,7 +122,13 @@ pub(crate) const fn compress_bound(src_size: usize) -> usize {
     } else {
         0
     };
-    src_size + (src_size >> 8) + tail
+    // `saturating_add` guards against the corner case where `src_size`
+    // is close to `usize::MAX`. The current sole caller
+    // (`compress_slice_to_vec`) clamps the result with `.min(OUTPUT_BLOCK_CAP)`
+    // so an overflow there would still produce a sensible cap, but
+    // future `pub(crate)` callers may use the raw bound — keep the
+    // arithmetic itself overflow-safe.
+    src_size.saturating_add(src_size >> 8).saturating_add(tail)
 }
 
 /// Convenience function to compress some source into a target without reusing any resources of the compressor

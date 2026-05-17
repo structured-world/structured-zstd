@@ -268,6 +268,16 @@ impl DfastMatchGenerator {
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
+        // Empty chunks have nothing to record: pushing a `0` into
+        // `window_blocks` would let a streaming caller that flushes
+        // empty chunks grow the deque without bound (`window_size`
+        // stays unchanged so `trim_to_window` never has cause to
+        // evict the zero-length entries). Hand the Vec straight back
+        // to the pool and short-circuit.
+        if data.is_empty() {
+            reuse_space(data);
+            return;
+        }
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();

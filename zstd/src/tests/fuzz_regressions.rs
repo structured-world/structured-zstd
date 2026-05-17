@@ -50,9 +50,14 @@ fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     use crate::encoding::{CompressionLevel, compress_to_vec};
 
     let data: &[u8] = &[0x04, 0x60, 0x2e, 0x20, 0x20, 0x0a, 0x20];
-    // Level Default == 3 == dfast. Pre-fix this panicked / produced a
+    // Pin to `Level(3)` rather than `Default` so this regression keeps
+    // covering the dfast fast loop specifically — the original UB
+    // surfaced through level 3 dfast, and pinning here means a future
+    // retune of the `Default` alias cannot accidentally route this
+    // test off the dfast path and let the regression pass without
+    // exercising the fixed code. Pre-fix this panicked / produced a
     // garbage frame on Linux fuzz (ASan caught the UB).
-    let compressed = compress_to_vec(data, CompressionLevel::Default);
+    let compressed = compress_to_vec(data, CompressionLevel::Level(3));
 
     // Roundtrip through the in-tree decoder — matches the convention
     // used by `test_all_artifacts` above and avoids coupling this

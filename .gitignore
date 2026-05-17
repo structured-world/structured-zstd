@@ -17,7 +17,13 @@ zstd/fuzz/corpus
 # during `cargo fuzz run` sessions. Tracked regressions are whitelisted
 # explicitly below so they ride along with their `tests/fuzz_regressions.rs`
 # counterpart and stay reproducible from a clean checkout.
-zstd/fuzz/artifacts/
+#
+# NB: use the `**` pattern (NOT trailing-slash) on the parent. With
+# `zstd/fuzz/artifacts/` git excludes the directory itself, which
+# blocks any subsequent negation from re-including nested files.
+# `zstd/fuzz/artifacts/**` matches children only, leaving the parent
+# directory traversable.
+zstd/fuzz/artifacts/**
 !zstd/fuzz/artifacts/decode/
 !zstd/fuzz/artifacts/decode/crash-*
 !zstd/fuzz/artifacts/fse/
