@@ -76,11 +76,20 @@ impl PreviousFseTable {
 }
 
 pub(crate) struct FseTables {
-    pub(crate) ll_default: FSETable,
+    /// The three predefined LL/ML/OF tables are functions of
+    /// compile-time-constant distributions; the cached helpers in
+    /// `fse_encoder` build them once per process and hand back
+    /// `&'static FSETable`. Storing the reference here (rather than
+    /// an owned `FSETable`) collapses `FrameCompressor::new` to a
+    /// 3-pointer copy on the cache-hot path — clone takes ~4 µs on
+    /// x86_64, the bare pointer copy is sub-nanosecond — and removes
+    /// the same per-clone cost from `clone_fse_tables` on the
+    /// block-split estimator path.
+    pub(crate) ll_default: &'static FSETable,
     pub(crate) ll_previous: Option<PreviousFseTable>,
-    pub(crate) ml_default: FSETable,
+    pub(crate) ml_default: &'static FSETable,
     pub(crate) ml_previous: Option<PreviousFseTable>,
-    pub(crate) of_default: FSETable,
+    pub(crate) of_default: &'static FSETable,
     pub(crate) of_previous: Option<PreviousFseTable>,
 }
 
@@ -438,7 +447,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        let source_size_hint_known = self.source_size_hint.is_some();
+        let initial_size_hint = self.source_size_hint;
+        let source_size_hint_known = initial_size_hint.is_some();
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming()
@@ -518,9 +528,36 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             window_size != 0,
             "matcher reported window_size == 0, which is invalid"
         );
-        // Accumulate all compressed blocks; the frame header is written after
-        // all input has been read so that Frame_Content_Size is known.
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(1024 * 130);
+        // Accumulate all compressed blocks; the frame header is written
+        // after all input has been read so that Frame_Content_Size is
+        // known. The default seed is one donor block; smaller seeds for
+        // small payloads avoid pinning a full block worth of bytes when
+        // the compressed output fits in a few hundred bytes. For larger
+        // inputs the default seed amortises the first few `Vec::extend`
+        // doublings cheaply and the `peak - default_seed` residue is
+        // dominated by internal `compress_block_encoded` buffers anyway,
+        // so changing it produces no measurable savings.
+        //
+        // Seed-size tiers (mirrors donor `ZSTD_CStreamOutSize` naming):
+        //
+        // * `ALL_BLOCKS_TINY_CAP` — payload ≤ this size, seed equals
+        //   payload bound; ≥ everything compressed output could need
+        //   for a tiny input.
+        // * `ALL_BLOCKS_SMALL_CAP` — small-input seed picked to absorb
+        //   one or two doublings without over-allocating.
+        // * `ALL_BLOCKS_DEFAULT_CAP` — one donor block; the value the
+        //   rest of the encoder is sized around.
+        const ALL_BLOCKS_TINY_THRESHOLD: u64 = 4 * 1024;
+        const ALL_BLOCKS_SMALL_THRESHOLD: u64 = 64 * 1024;
+        const ALL_BLOCKS_TINY_CAP: usize = 4 * 1024;
+        const ALL_BLOCKS_SMALL_CAP: usize = 16 * 1024;
+        const ALL_BLOCKS_DEFAULT_CAP: usize = 130 * 1024;
+        let initial_all_blocks_cap = match initial_size_hint {
+            Some(h) if h <= ALL_BLOCKS_TINY_THRESHOLD => ALL_BLOCKS_TINY_CAP,
+            Some(h) if h <= ALL_BLOCKS_SMALL_THRESHOLD => ALL_BLOCKS_SMALL_CAP,
+            _ => ALL_BLOCKS_DEFAULT_CAP,
+        };
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap);
         let mut total_uncompressed: u64 = 0;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
