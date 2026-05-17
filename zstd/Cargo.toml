@@ -28,7 +28,7 @@ categories = ["compression"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "dict_builder"]
+features = ["std", "hash", "dict_builder", "mt"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -47,6 +47,11 @@ fastrand = {version = "2.3.0", optional = true }
 # is dead code and never instantiated — those targets use the lock-
 # free `AtomicPtr` path unconditionally.
 critical-section = { version = "1.2", optional = true }
+# Worker pool for the `mt` feature's `compress_to_vec_mt` multi-frame
+# parallel encoder. Optional so no_std builds and std-only consumers
+# that don't need MT compression pay nothing for it. Pinned to the
+# 1.x line — rayon API is stable, semver-safe to track minor bumps.
+rayon = { version = "1", optional = true }
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
@@ -70,6 +75,13 @@ critical-section = ["dep:critical-section"]
 bench_internals = []
 fuzz_exports = []
 std = []
+# Rust-side rayon-based multi-frame parallel encoder
+# (`encoding::compress_to_vec_mt`). Requires `std` for
+# `available_parallelism()` and rayon's worker threads. Output is a
+# valid zstd multi-frame archive (RFC 8878 §3.1) — see the module
+# doc for the trade-offs vs upstream `zstdmt` (no overlapLog /
+# rsyncable / jobSize, ≤ 5% ratio degradation on typical corpora).
+mt = ["std", "dep:rayon"]
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.

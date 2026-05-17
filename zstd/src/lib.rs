@@ -8,6 +8,10 @@
 //!   [`decoding::DictionaryHandle`]).
 //! * [`encoding`] — frame compressor, streaming encoder, named and numeric
 //!   compression levels ([`encoding::CompressionLevel`]).
+//! * [`encoding::parallel`] (feature `mt`) — `rayon`-backed multi-frame
+//!   parallel compression via `encoding::compress_to_vec_mt`. Output is a
+//!   valid zstd multi-frame archive (RFC 8878 §3.1); not byte-parity with
+//!   upstream `zstdmt` — see the module docs for the trade-off.
 //! * [`dictionary`] (feature `dict_builder`) — COVER / FastCOVER training
 //!   plus raw-to-finalized dictionary helpers.
 //!

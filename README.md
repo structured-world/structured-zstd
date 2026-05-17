@@ -43,6 +43,7 @@ All standard compression levels are wired and produce valid Zstandard frames dec
 - **Dictionary compression** with the same dictionary format C zstd consumes
 - **Frame Content Size** — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before the first write
 - **Content checksums** opt-in
+- **Multi-threaded compression** (`mt` feature) — `compress_to_vec_mt(input, level, num_threads)` fan-outs the input across a `rayon` worker pool and emits a valid zstd multi-frame archive; ≤ 5% ratio degradation vs single-threaded on typical workloads. Not byte-parity with upstream `zstdmt` (no `overlapLog` / `rsyncable`), and that gap is intentional — see the [`encoding::parallel`](https://docs.rs/structured-zstd/latest/structured_zstd/encoding/parallel/index.html) module docs.
 
 The encoder is undergoing an architectural rewrite — see [#111](https://github.com/structured-world/structured-zstd/issues/111) for the roadmap.
 
