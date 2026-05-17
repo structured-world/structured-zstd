@@ -104,9 +104,10 @@ impl Matcher for CapturingMatcher {
     }
 
     fn skip_matching(&mut self) {
-        // Raw / uncompressed block: every byte of the committed space
-        // is "trailing literals" from the alignment perspective —
-        // there are no triples, just bytes flowing straight through.
+        // No-triple block path (raw / RLE / hint-driven fast paths
+        // routed through the matcher trait): every byte of the
+        // committed space is "trailing literals" from the alignment
+        // perspective — no triples, just bytes flowing through.
         // Read `get_last_space().len()` BEFORE forwarding so we don't
         // race the inner state machine, which may consume the buffer.
         let tail_ll = self.inner.get_last_space().len() as u32;
@@ -116,9 +117,12 @@ impl Matcher for CapturingMatcher {
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
-        // Same accounting as `skip_matching` — hint variant routes
-        // through a different matcher path but still emits a raw
-        // block, so trailing literal length == committed space.
+        // Same accounting as `skip_matching`. The hint variant is
+        // taken on both the incompressible/raw-block path AND the
+        // RLE fast-path for constant runs that the block-emit layer
+        // catches; in either case no triples are produced and the
+        // entire committed space is trailing literals from the
+        // alignment perspective.
         let tail_ll = self.inner.get_last_space().len() as u32;
         self.inner.skip_matching_with_hint(incompressible_hint);
         self.block_tail_lengths.borrow_mut().push(tail_ll);
@@ -220,6 +224,23 @@ impl Matcher for CapturingMatcher {
 /// alignment loss showed up as spurious `RustOnly` / `FfiOnly` noise
 /// on multi-block fixtures.
 pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> SequenceCapture {
+    // `CompressionLevel::Uncompressed` short-circuits the encoder
+    // before any `Matcher` method runs — the frame compressor emits
+    // raw blocks straight from input without consulting
+    // `CapturingMatcher`. The recorder would stay empty and the
+    // post-compress invariant assert would panic with a misleading
+    // "matcher-bypassing block path" message even though the input
+    // is perfectly valid. Reject the variant explicitly with a
+    // diagnostic that points at the actual constraint
+    // (PR #149 review round 4 #12).
+    assert!(
+        !matches!(level, CompressionLevel::Uncompressed),
+        "compress_and_collect_sequences does not support \
+         CompressionLevel::Uncompressed: raw-block emission bypasses \
+         the matcher entirely, so no sequences or block tails are \
+         recorded. Use a compressible level (Fastest / Level(N) / \
+         Default / Better / Best) for sequence-stream audits.",
+    );
     // Mirror `FrameCompressor::new()` matcher construction. The
     // `reset()` call inside `compress()` re-derives the real per-level
     // window/strategy from `level`, so the seed values here only need
@@ -259,11 +280,14 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
         .expect("CapturingMatcher dropped with compressor; tail-length vec is single-owner")
         .into_inner();
     // Fail-fast invariant check: the encoder has a few paths that
-    // emit blocks WITHOUT routing through any `Matcher` method on
-    // `CapturingMatcher` — most notably RLE blocks for fully-constant
-    // runs (`AAAAA…`), which the frame compressor recognises before
-    // ever calling the matcher. On such inputs the captured stream
-    // misses entire blocks, so callers walking the cumulative
+    // could emit blocks WITHOUT routing through any `Matcher` method
+    // on `CapturingMatcher` (e.g. an `Uncompressed`-level shortcut
+    // that emits raw blocks directly from `compress()`, or a future
+    // bypass introduced by an internal refactor). Today RLE-shaped
+    // constant runs in practice still reach the matcher via
+    // `skip_matching_with_hint`, but the assert guards against any
+    // future divergence. On such inputs the captured stream would
+    // miss entire blocks, so callers walking the cumulative
     // position counter (e.g. `compare_ffi_sequences::align_and_diff`)
     // would silently shift every subsequent row. Panic with a
     // diagnostic instead of returning a quietly-wrong
@@ -351,11 +375,15 @@ mod tests {
         );
     }
 
-    /// Random / incompressible input should NOT emit any matches —
-    /// recorder stays empty, confirming the wrapper doesn't fabricate
-    /// or carry over state across calls.
+    /// Random / incompressible input should emit at most a sparse
+    /// trickle of triples (the dfast hash can luck into a 5-byte
+    /// collision on any 1 KiB stream), well below "every position
+    /// is a match". This bounds-the-rate test guards against a
+    /// wrapper bug that fabricates phantom sequences or carries
+    /// state across calls — a clean wrapper produces few or zero
+    /// triples here, but ZERO is not the strict contract.
     #[test]
-    fn captures_no_triples_on_incompressible_input() {
+    fn captures_bounded_triples_on_incompressible_input() {
         // Deterministic non-repeating bytes via a simple LCG.
         let mut state: u32 = 0x1234_5678;
         let data: Vec<u8> = (0..1024)

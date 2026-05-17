@@ -331,10 +331,15 @@ fn advance_tail_for_completed_blocks(
 ///
 /// At each step we advance whichever side has the smaller cumulative
 /// position, classifying as `RustOnly` / `FfiOnly`. Equal positions
-/// are compared field-by-field and emit `Equal` or `Differ`. After
-/// both iterators are exhausted, any remaining trailing-literal tails
-/// (final block on either side) are folded into the cumulative
-/// counters for the equality assertion the bench prints in summary.
+/// are compared field-by-field and emit `Equal` or `Differ`. The
+/// cumulative counters are internal state — they drive the
+/// per-iteration "which side is behind" decision and the final
+/// `Some(_, None)` / `(None, Some(_))` drain logic, but are NOT
+/// returned and the caller's printed summary does not assert
+/// equality against them. The fail-fast invariants live on the
+/// capture/FFI sides (`compress_and_collect_sequences` +
+/// `ffi_generate_sequences`); reaching this function with
+/// undercounted tails would be caught upstream.
 fn align_and_diff(
     rust: &[CapturedRawSequence],
     rust_tails: &[u32],
