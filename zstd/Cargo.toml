@@ -94,6 +94,11 @@ harness = false
 required-features = ["dict_builder"]
 
 [[bench]]
+name = "compare_ffi_sequences"
+harness = false
+required-features = ["dict_builder", "bench_internals"]
+
+[[bench]]
 name = "bitstream"
 harness = false
 required-features = ["bench_internals"]
