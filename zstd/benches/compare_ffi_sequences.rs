@@ -47,13 +47,13 @@
 //! used because timing is irrelevant here; this is a diagnostic
 //! one-shot, not a regression bench.
 
-// `support` is shared with `compare_ffi.rs` / `compare_ffi_memory.rs`.
-// This bench doesn't use any of its helpers but the module is still
-// pulled in by Cargo because `bench` targets share `benches/`. The
-// `#[allow(dead_code)]` suppresses warnings about unused items in
-// `support`.
-#[allow(dead_code)]
-mod support;
+// The `support/` module shared with `compare_ffi.rs` /
+// `compare_ffi_memory.rs` is intentionally NOT declared here — this
+// bench doesn't use any of its helpers, and declaring the module
+// would compile the entire shared bench harness and couple this
+// diagnostic tool to unrelated changes (PR #149 review #18). Cargo
+// does not auto-include sibling modules in `benches/`, so leaving
+// the declaration out is the correct way to opt out.
 
 use std::fs;
 use std::path::Path;
@@ -185,7 +185,7 @@ fn build_low_entropy_log(byte_budget: usize) -> Vec<u8> {
         let hex = format!("{:08x}", counter);
         out.extend_from_slice(hex.as_bytes());
         out.extend_from_slice(suffix);
-        let elapsed = format!("{}", counter % 1000);
+        let elapsed = (counter % 1000).to_string();
         out.extend_from_slice(elapsed.as_bytes());
         out.push(b'\n');
         counter = counter.wrapping_add(1);
@@ -481,7 +481,17 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
         );
         n
     };
-    // SAFETY: libzstd populated the first `nb_seqs` entries.
+    // Defensive guard: `set_len(nb_seqs)` past the allocated capacity
+    // would expose uninitialized memory if libzstd ever returned more
+    // sequences than `ZSTD_sequenceBound` reserved space for. The
+    // bound is documented as inclusive but the check is one assert
+    // (PR #149 review #16).
+    assert!(
+        nb_seqs <= bound,
+        "ZSTD_generateSequences returned more sequences ({nb_seqs}) than ZSTD_sequenceBound reserved ({bound})",
+    );
+    // SAFETY: libzstd populated the first `nb_seqs` entries, and the
+    // assert above guarantees `nb_seqs <= capacity`.
     unsafe { buf.set_len(nb_seqs) };
     // SAFETY: cctx is non-null and was created by us.
     unsafe { zstd_sys::ZSTD_freeCCtx(cctx) };

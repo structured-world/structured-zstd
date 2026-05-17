@@ -466,4 +466,94 @@ mod tests {
                 .sum::<u64>();
         assert_eq!(cumulative, data.len() as u64);
     }
+
+    /// Multi-block input (≥ 256 KiB, two 128 KiB frame blocks) is
+    /// the only shape that exercises per-block tail accounting
+    /// across a block boundary. Single-block tests pass even if a
+    /// regression records only the first/last block tail or
+    /// mis-increments `current_block` across the 128 KiB boundary.
+    ///
+    /// This test pins:
+    ///   - `Σ(ll+ml) + Σ tails == input.len()` across multiple blocks,
+    ///   - `block_tail_lengths.len() >= 2` (at least two blocks),
+    ///   - every recorded triple's `block_idx` falls inside the
+    ///     emitted-block range (no off-by-one on the counter),
+    ///   - block indices observed in triples are contiguous from 0
+    ///     (no gaps, no missed `current_block` increments).
+    ///
+    /// 256 KiB chosen so the encoder produces exactly 2 blocks under
+    /// the default 128 KiB chunk size, keeping the assertion crisp
+    /// (PR #149 review #19).
+    #[test]
+    fn captures_multi_block_tails_and_indices() {
+        // Repeating 64-byte pattern: compressible enough to emit
+        // sequences (not RLE) and long enough that every position
+        // past the first 64 bytes finds a match, exercising the
+        // matcher rather than a fast skip path.
+        let pattern: [u8; 64] = {
+            let mut p = [0u8; 64];
+            for (i, b) in p.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            p
+        };
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(256 * 1024).collect();
+        let captured = compress_and_collect_sequences(&data, CompressionLevel::Level(3));
+
+        // Multi-block invariant: at least 2 blocks recorded.
+        assert!(
+            captured.block_tail_lengths.len() >= 2,
+            "expected ≥2 block tail entries for 256 KiB input, got {}: {:?}",
+            captured.block_tail_lengths.len(),
+            captured.block_tail_lengths,
+        );
+
+        // Cumulative reconstruction across all blocks.
+        let cumulative: u64 = captured
+            .sequences
+            .iter()
+            .map(|s| s.ll as u64 + s.ml as u64)
+            .sum::<u64>()
+            + captured
+                .block_tail_lengths
+                .iter()
+                .map(|t| *t as u64)
+                .sum::<u64>();
+        assert_eq!(
+            cumulative,
+            data.len() as u64,
+            "multi-block Σ(ll+ml)+Σ(tails) mismatch: got {}, want {} \
+             (blocks={}, triples={})",
+            cumulative,
+            data.len(),
+            captured.block_tail_lengths.len(),
+            captured.sequences.len(),
+        );
+
+        // Every triple's block_idx must be in [0, num_blocks).
+        let num_blocks = captured.block_tail_lengths.len() as u32;
+        for s in &captured.sequences {
+            assert!(
+                s.block_idx < num_blocks,
+                "triple block_idx={} out of range (num_blocks={})",
+                s.block_idx,
+                num_blocks,
+            );
+        }
+
+        // Block indices observed in triples must be contiguous
+        // starting at 0 (no skipped `current_block` increments).
+        let mut max_seen: i64 = -1;
+        for s in &captured.sequences {
+            let idx = s.block_idx as i64;
+            assert!(
+                idx <= max_seen + 1,
+                "non-monotonic / gapped block_idx in triple stream: \
+                 max_seen={max_seen}, observed={idx}",
+            );
+            if idx > max_seen {
+                max_seen = idx;
+            }
+        }
+    }
 }
