@@ -63,15 +63,33 @@ use structured_zstd::encoding::sequence_capture::{
     CapturedRawSequence, compress_and_collect_sequences,
 };
 
-/// Compression level under audit. Level 3 / Dfast is the
-/// user-visible `Default` preset and the focus of the Lane A
-/// `7-compress-default` sub-phase that this tool gates.
-const TARGET_LEVEL: i32 = 3;
+/// Default level set when `STRUCTURED_ZSTD_BENCH_LEVEL` is unset.
+/// Single Level(3) (Dfast, the user-visible `Default` preset and
+/// the focus of the Lane A `7-compress-default` sub-phase) keeps
+/// the no-arg path fast for the common per-strategy audit.
+///
+/// Override via `STRUCTURED_ZSTD_BENCH_LEVEL`:
+///
+/// * `STRUCTURED_ZSTD_BENCH_LEVEL=1` — single level
+/// * `STRUCTURED_ZSTD_BENCH_LEVEL=1-15` — inclusive range sweep
+/// * `STRUCTURED_ZSTD_BENCH_LEVEL=1,3,7,11,15` — explicit list
+/// * `STRUCTURED_ZSTD_BENCH_LEVEL=all` — every supported numeric
+///   level (`1..=15`); `Level(>=16)` is rejected by the post-split
+///   guard in `sequence_capture`.
+const DEFAULT_LEVELS: &[i32] = &[3];
 
-/// Cap on diverging-row output per fixture. Beyond this, only the
-/// summary counts are printed — first-N is sufficient for triage,
-/// the full diff is recoverable by re-running with the cap raised.
-const MAX_DIVERGENCE_ROWS: usize = 30;
+/// Highest numeric level the matcher capture supports. `Level(>=16)`
+/// is rejected by `sequence_capture` because
+/// `compress_block_with_post_split` emits multiple physical blocks
+/// per matcher call, which the per-matcher-call block counter
+/// cannot track. Bump this when per-physical-block hooks land.
+const MAX_SUPPORTED_LEVEL: i32 = 15;
+
+/// Cap on diverging-row output per fixture in single-level mode.
+/// Override at runtime via `STRUCTURED_ZSTD_BENCH_MAX_ROWS`. In
+/// sweep mode (multiple levels) defaults to 0 — per-level summary
+/// lines only — so the output stays scannable across all levels.
+const DEFAULT_MAX_DIVERGENCE_ROWS: usize = 30;
 
 /// One sequence captured from the donor (`ZSTD_generateSequences`).
 /// Block delimiters (`of=0 ml=0`) are filtered out before construction.
@@ -97,15 +115,117 @@ enum DiffRow {
 }
 
 fn main() {
+    let levels = parse_levels_env();
+    let single = levels.len() == 1;
+    let default_rows = if single {
+        DEFAULT_MAX_DIVERGENCE_ROWS
+    } else {
+        0
+    };
+    let max_rows = std::env::var("STRUCTURED_ZSTD_BENCH_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default_rows);
     let fixtures = collect_fixtures();
     println!(
-        "=== compare_ffi_sequences (level={}, Rust vs C FFI) ===",
-        TARGET_LEVEL
+        "=== compare_ffi_sequences (levels={}, Rust vs C FFI) ===",
+        fmt_levels(&levels),
     );
     println!();
-    for (name, bytes) in fixtures {
-        run_one(&name, &bytes);
+    for (name, bytes) in &fixtures {
+        println!("=== fixture: {name} ===");
+        for &level in &levels {
+            run_one(name, bytes, level, max_rows);
+        }
         println!();
+    }
+}
+
+/// Parse `STRUCTURED_ZSTD_BENCH_LEVEL` env var into a level list.
+///
+/// Forms accepted: single (`3`), range (`1-15`), comma list
+/// (`1,3,7,11,15`), keyword `all` (= `1..=MAX_SUPPORTED_LEVEL`).
+/// Empty / unset / unparseable → [`DEFAULT_LEVELS`]. Levels above
+/// `MAX_SUPPORTED_LEVEL` (post-split territory) are silently
+/// filtered out with a stderr warning so a careless `all` does not
+/// blow up on the sequence_capture guard.
+fn parse_levels_env() -> Vec<i32> {
+    let raw = match std::env::var("STRUCTURED_ZSTD_BENCH_LEVEL") {
+        Ok(v) => v,
+        Err(_) => return DEFAULT_LEVELS.to_vec(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_LEVELS.to_vec();
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return (1..=MAX_SUPPORTED_LEVEL).collect();
+    }
+    let parsed: Vec<i32> = if let Some((lo, hi)) = trimmed.split_once('-') {
+        match (lo.trim().parse::<i32>(), hi.trim().parse::<i32>()) {
+            (Ok(a), Ok(b)) if a <= b => (a..=b).collect(),
+            _ => {
+                eprintln!(
+                    "warn: STRUCTURED_ZSTD_BENCH_LEVEL={trimmed:?} is not a valid range; \
+                     falling back to default levels {DEFAULT_LEVELS:?}",
+                );
+                return DEFAULT_LEVELS.to_vec();
+            }
+        }
+    } else {
+        trimmed
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i32>().ok())
+            .collect()
+    };
+    let (supported, dropped): (Vec<i32>, Vec<i32>) =
+        parsed.into_iter().partition(|&l| l <= MAX_SUPPORTED_LEVEL);
+    if !dropped.is_empty() {
+        eprintln!(
+            "warn: dropping post-split levels {dropped:?} (Level(>={}) rejected by \
+             sequence_capture matcher post-split guard)",
+            MAX_SUPPORTED_LEVEL + 1,
+        );
+    }
+    if supported.is_empty() {
+        eprintln!(
+            "warn: STRUCTURED_ZSTD_BENCH_LEVEL={trimmed:?} yielded no supported levels; \
+             falling back to default {DEFAULT_LEVELS:?}",
+        );
+        return DEFAULT_LEVELS.to_vec();
+    }
+    supported
+}
+
+fn fmt_levels(levels: &[i32]) -> String {
+    if levels.len() <= 4 {
+        levels
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        let first = levels.first().copied().unwrap_or(0);
+        let last = levels.last().copied().unwrap_or(0);
+        let contiguous = levels.len() == (last - first + 1) as usize
+            && levels
+                .iter()
+                .enumerate()
+                .all(|(i, &l)| l == first + i as i32);
+        if contiguous {
+            format!("{first}-{last}")
+        } else {
+            format!(
+                "{} ({} levels)",
+                levels
+                    .iter()
+                    .take(3)
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                levels.len(),
+            )
+        }
     }
 }
 
@@ -194,23 +314,11 @@ fn build_low_entropy_log(byte_budget: usize) -> Vec<u8> {
     out
 }
 
-fn run_one(name: &str, input: &[u8]) {
-    let rust_capture = compress_and_collect_sequences(input, CompressionLevel::Level(TARGET_LEVEL));
-    let (ffi_seqs, ffi_tail_lengths) = ffi_generate_sequences(input, TARGET_LEVEL);
+fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize) {
+    let rust_capture = compress_and_collect_sequences(input, CompressionLevel::Level(level));
+    let (ffi_seqs, ffi_tail_lengths) = ffi_generate_sequences(input, level);
     let rust_seqs = &rust_capture.sequences;
     let rust_tail_lengths = &rust_capture.block_tail_lengths;
-
-    println!("--- fixture: {name} ---");
-    println!(
-        "  rust sequences: {} (across {} block(s))",
-        rust_seqs.len(),
-        rust_tail_lengths.len(),
-    );
-    println!(
-        "  ffi  sequences: {} (across {} block(s))",
-        ffi_seqs.len(),
-        ffi_tail_lengths.len(),
-    );
 
     let rows = align_and_diff(rust_seqs, rust_tail_lengths, &ffi_seqs, &ffi_tail_lengths);
     let mut equal = 0usize;
@@ -226,20 +334,37 @@ fn run_one(name: &str, input: &[u8]) {
         }
     }
     let total = rows.len().max(1);
+    // Wording note: `Differ/RustOnly/FfiOnly` are RAW classifications,
+    // not value judgments. Divergence from the donor is not a bug —
+    // structured-zstd is allowed (and expected) to make different
+    // and sometimes better choices. The tool surfaces "where do we
+    // pick a different path"; whether each path is a win or
+    // regression is a human-applied call after looking at the
+    // emitted bytes.
     println!(
-        "  alignment: equal={equal} ({:.1}%) differ={differ} rust_only={rust_only} ffi_only={ffi_only}",
-        equal as f64 * 100.0 / total as f64,
+        "  level={level:>2}  rust_seqs={rs:>6} ({rb} blk)  ffi_seqs={fs:>6} ({fb} blk)  \
+         match={equal:>6} ({pct:.1}%)  diverge={dv:>6}  rust_only={rust_only:>5}  \
+         ffi_only={ffi_only}",
+        rs = rust_seqs.len(),
+        rb = rust_tail_lengths.len(),
+        fs = ffi_seqs.len(),
+        fb = ffi_tail_lengths.len(),
+        dv = differ,
+        pct = equal as f64 * 100.0 / total as f64,
     );
 
+    if max_rows == 0 {
+        return;
+    }
     let mut printed = 0usize;
     let mut header_printed = false;
     for (idx, r) in rows.iter().enumerate() {
         if matches!(r, DiffRow::Equal) {
             continue;
         }
-        if printed >= MAX_DIVERGENCE_ROWS {
+        if printed >= max_rows {
             println!(
-                "  ... (omitted {} more diverging rows; raise MAX_DIVERGENCE_ROWS to see them)",
+                "    ... (omitted {} more diverging rows; raise STRUCTURED_ZSTD_BENCH_MAX_ROWS to see them)",
                 differ + rust_only + ffi_only - printed,
             );
             break;
@@ -455,7 +580,20 @@ fn align_and_diff(
 /// count after every block boundary on multi-block inputs (PR #149
 /// review #1-#3).
 fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
-    use zstd::zstd_safe::zstd_sys;
+    use zstd::zstd_safe::{self, zstd_sys};
+    // Mirror of `assert_zstd_ok` in `encoding/match_generator.rs` —
+    // surfaces libzstd's symbolic error name in the panic message
+    // instead of a raw numeric return code, so a triage glance at
+    // the bench log says e.g. "Parameter unsupported" rather than
+    // "rc=18446744073709551614".
+    fn assert_zstd_ok(code: usize, context: &str) {
+        assert_eq!(
+            unsafe { zstd_sys::ZSTD_isError(code) },
+            0,
+            "{context} failed: {}",
+            zstd_safe::get_error_name(code)
+        );
+    }
     // SAFETY: standard libzstd handle creation; null on OOM.
     let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
     assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
@@ -467,7 +605,7 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
             zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
             level,
         );
-        assert!(zstd_sys::ZSTD_isError(rc) == 0, "setParameter level failed");
+        assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)");
         let n = zstd_sys::ZSTD_generateSequences(
             cctx,
             buf.as_mut_ptr(),
@@ -475,10 +613,7 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
             input.as_ptr() as *const core::ffi::c_void,
             input.len(),
         );
-        assert!(
-            zstd_sys::ZSTD_isError(n) == 0,
-            "ZSTD_generateSequences failed: rc={n}"
-        );
+        assert_zstd_ok(n, "ZSTD_generateSequences");
         n
     };
     // Defensive guard: `set_len(nb_seqs)` past the allocated capacity

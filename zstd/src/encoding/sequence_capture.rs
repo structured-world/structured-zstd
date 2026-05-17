@@ -574,9 +574,13 @@ mod tests {
         );
     }
 
-    /// Random / incompressible input causes the encoder to emit a
-    /// Raw_Block on-wire (`compressed.len() >= MAX_BLOCK_SIZE`), so
-    /// the post-compress raw-block detector must panic. Before the
+    /// Random / incompressible input is steered to a Raw_Block by the
+    /// encoder's raw fast-path classifier (`should_use_raw_for_block`
+    /// in `frame_compressor`), not by the late
+    /// `compressed.len() >= MAX_BLOCK_SIZE` fallback — 1 KiB of LCG
+    /// noise is well under one frame block, so the wire format
+    /// commits to `Raw_Block` before any sequence emission, and the
+    /// post-compress raw/RLE detector must panic. Before the
     /// detector existed, this test verified the wrapper bounded
     /// phantom-triple production; now the API-level guarantee is
     /// stronger — the function refuses to return a misaligned
@@ -626,9 +630,10 @@ mod tests {
     ///   - block indices observed in triples are contiguous from 0
     ///     (no gaps, no missed `current_block` increments).
     ///
-    /// 256 KiB chosen so the encoder produces exactly 2 blocks under
-    /// the default 128 KiB chunk size, keeping the assertion crisp
-    /// (PR #149 review #19).
+    /// 200 KiB (≈ 1.5 × 128 KiB) chosen to guarantee ≥ 2 frame blocks
+    /// while staying small enough that the final partial block still
+    /// compresses (no trailing Raw_Block from a sub-threshold tail),
+    /// keeping the multi-block assertion crisp (PR #149 review #19).
     #[test]
     fn captures_multi_block_tails_and_indices() {
         // Repeating 16-byte pattern at 200 KiB (≈ 1.5 × 128 KiB
