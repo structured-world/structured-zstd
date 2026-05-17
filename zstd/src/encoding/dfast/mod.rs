@@ -646,9 +646,38 @@ impl DfastMatchGenerator {
             // Same `HASH_READ_SIZE` rationale for `ip1`: the inner loop
             // pre-loads 8 bytes at `concat_idx1` for the `hl1` precompute
             // and the `_search_next_long` retry, so `ip1 + 8 <= current_len`
-            // must hold before we enter. Same tiny-block tail-seed
-            // reasoning as the `pos` guard above applies here.
+            // must hold before we enter. If `ip0` is still hashable but
+            // `ip1` is not (boundary case `pos == current_len - 8`), we
+            // still want to probe `ip0` — skipping it would leave the
+            // last hashable position to `seed_remaining_hashable_starts`,
+            // which inserts but does NOT search, and that drops real
+            // matches in the tail window vs the upstream reference
+            // (whose single-cursor loop probes every position p with
+            // `p + HASH_READ_SIZE <= iend`). Handle the boundary inline
+            // before exiting: a single-cursor probe at `ip0` (rep peek
+            // and `_search_next_long` retry both depend on `ip1` so
+            // they're skipped — donor accepts that exact tradeoff at
+            // the iend boundary).
             if ip1 + HASH_READ_SIZE > current_len {
+                if let Some(committed) =
+                    self.probe_tail_ip0_only(current_abs_start, current_len, ip0, literals_start)
+                {
+                    let start = self.emit_candidate(
+                        current_abs_start,
+                        &mut literals_start,
+                        committed,
+                        handle_sequence,
+                    );
+                    pos = start + committed.match_len;
+                    pos = self.extend_with_repcode_after_match(
+                        current_abs_start,
+                        current_len,
+                        pos,
+                        &mut literals_start,
+                        handle_sequence,
+                    );
+                    continue 'outer;
+                }
                 break 'outer;
             }
 
@@ -911,10 +940,25 @@ impl DfastMatchGenerator {
                                 lit_len_ip0,
                             );
 
+                            // Enforce the hash-search floor BEFORE
+                            // committing this short hit. The 4-byte
+                            // equality gate plus forward-count extension
+                            // can produce `short_cand.match_len < 5`
+                            // (the literal 4-byte hit, no extension).
+                            // `probe_slot_match` rejects below-floor
+                            // long-hash hits at the same gate; the
+                            // short-hash path must do the same so the
+                            // fast loop never emits a sub-floor non-rep
+                            // match. The retry below can still upgrade
+                            // to a long hit (which has its own 8-byte
+                            // floor, comfortably above `DFAST_MIN_MATCH_LEN`).
+                            let short_hit_valid = short_cand.match_len >= DFAST_MIN_MATCH_LEN;
+
                             // Donor `_search_next_long` retry (line 260):
                             // try long match at ip1 with precomputed idxl1.
                             // If it produces a strictly longer match, use it.
                             let mut chosen = short_cand;
+                            let mut retry_upgraded = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
@@ -947,11 +991,33 @@ impl DfastMatchGenerator {
                                                 l1_match_len,
                                                 lit_len_ip1,
                                             );
+                                            // Long-hash hits start at 8
+                                            // bytes (`MEM_read64` gate
+                                            // above), well above
+                                            // `DFAST_MIN_MATCH_LEN = 5`,
+                                            // so the retry upgrade is
+                                            // always valid even when
+                                            // the raw short hit was
+                                            // below the floor.
+                                            retry_upgraded = true;
                                         }
                                     }
                                 }
                             }
-                            break 'inner InnerExit::Committed(chosen);
+                            if short_hit_valid || retry_upgraded {
+                                break 'inner InnerExit::Committed(chosen);
+                            }
+                            // Below-floor short hit with no retry
+                            // upgrade — fall through to the step bump
+                            // and keep scanning. Discarding here is
+                            // correctness-relevant: emitting a 4-byte
+                            // non-rep match would mint an offset on
+                            // wire that costs more than the 4-byte
+                            // payload buys (offsets at level 2/3 dfast
+                            // are 13–17 bits depending on offset class
+                            // and prior offset_hist state — strictly
+                            // worse than emitting the 4 bytes as
+                            // literals).
                         }
                     }
                 }
@@ -1006,6 +1072,149 @@ impl DfastMatchGenerator {
 
         self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
         self.emit_trailing_literals(literals_start, handle_sequence);
+    }
+
+    /// Single-cursor probe at the last hashable position in the
+    /// current block. Called from `start_matching_fast_loop` only when
+    /// the outer iteration sees `ip0` still hashable but `ip1` past
+    /// the end — the upstream reference's single-cursor loop probes
+    /// every position with `p + HASH_READ_SIZE <= iend`, and skipping
+    /// `ip0` here would leave a real match unsearched.
+    ///
+    /// Mirror the inner loop's long+short probe and the table update
+    /// at `ip0`, but skip the rep1 peek (reads at `ip1`) and the
+    /// `_search_next_long` retry (reads at `ip1`) — both depend on a
+    /// hashable `ip1`. Upstream accepts this exact tradeoff at the
+    /// `iend` boundary: the rep peek and retry only ever fire when a
+    /// second hashable position exists.
+    ///
+    /// Returns `Some(MatchCandidate)` if a long or short hit at `ip0`
+    /// meets the `DFAST_MIN_MATCH_LEN` floor, `None` otherwise (caller
+    /// then breaks the outer loop). On a hit, the hash tables are NOT
+    /// updated by this helper — the caller routes through
+    /// `emit_candidate` which inserts via `insert_positions` over the
+    /// emitted range, exactly like the inner loop's hit path.
+    fn probe_tail_ip0_only(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        ip0: usize,
+        literals_start: usize,
+    ) -> Option<MatchCandidate> {
+        debug_assert!(ip0 + HASH_READ_SIZE <= current_len);
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        let short_shift = 64 - self.short_hash_bits;
+        let long_shift = 64 - self.long_hash_bits;
+
+        let abs_ip0 = current_abs_start + ip0;
+        let lit_len_ip0 = ip0 - literals_start;
+        let history_abs_start = self.history_abs_start;
+        let position_base = self.position_base;
+        let history_start_offset = self.history_start;
+        let concat_len = self.history.len() - history_start_offset;
+        let history_base_ptr = self.history.as_ptr();
+
+        let concat_idx0 = abs_ip0 - history_abs_start;
+        let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+
+        // SAFETY: `concat_idx0 + 8 <= concat_len` follows from the
+        // caller's `ip0 + HASH_READ_SIZE <= current_len` precondition
+        // (the live history contains the full current block).
+        let v8_0 = unsafe {
+            (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
+                .read_unaligned()
+        };
+        let v4_0 = v8_0 & 0xFFFF_FFFF;
+        let hl0_idx = (v8_0.wrapping_mul(PRIME) >> long_shift) as usize;
+        let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+
+        // Pre-fetch the candidate indices BEFORE writing `packed_curr`,
+        // to mirror the inner loop (probe lookup precedes table
+        // update). `ensure_room_for` already ran for the whole block at
+        // the top of `start_matching_fast_loop`, so the raw pointers
+        // into `short_hash` / `long_hash` are still valid here.
+        let short_hash_ptr = self.short_hash.as_mut_ptr();
+        let long_hash_ptr = self.long_hash.as_mut_ptr();
+        let idxl0 = unsafe { *long_hash_ptr.add(hl0_idx) };
+        let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
+        unsafe {
+            *long_hash_ptr.add(hl0_idx) = packed_curr;
+            *short_hash_ptr.add(hs0_idx) = packed_curr;
+        }
+
+        // Long-hash probe first (upstream priority: an 8-byte hit
+        // beats a 4-byte hit even before extension).
+        if idxl0 != DFAST_EMPTY_SLOT {
+            let cand_pos = position_base + (idxl0 as usize) - 1;
+            if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+                let cand_idx = cand_pos - history_abs_start;
+                let cand_v8 = unsafe {
+                    (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
+                        .read_unaligned()
+                };
+                if cand_v8 == v8_0 {
+                    let mut match_len = 8usize;
+                    let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                    unsafe {
+                        let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
+                        let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                        let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                            lhs, rhs, max_fwd,
+                        );
+                        match_len += ext;
+                    }
+                    let concat = &self.history[history_start_offset..];
+                    return Some(extend_backwards_shared(
+                        concat,
+                        history_abs_start,
+                        cand_pos,
+                        abs_ip0,
+                        match_len,
+                        lit_len_ip0,
+                    ));
+                }
+            }
+        }
+
+        // Short-hash probe (4-byte gate, forward extension, same
+        // floor-enforcement as the inner loop's short path — see
+        // comment there).
+        if idxs0 != DFAST_EMPTY_SLOT {
+            let cand_pos_s = position_base + (idxs0 as usize) - 1;
+            if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+                let cand_idx_s = cand_pos_s - history_abs_start;
+                let cand4 = unsafe {
+                    (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
+                        .read_unaligned()
+                };
+                if cand4 == v4_0 as u32 {
+                    let mut s_match_len = 4usize;
+                    let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                    unsafe {
+                        let lhs = history_base_ptr.add(history_start_offset + cand_idx_s + 4);
+                        let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                        let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                            lhs, rhs, max_fwd,
+                        );
+                        s_match_len += ext;
+                    }
+                    let concat = &self.history[history_start_offset..];
+                    let short_cand = extend_backwards_shared(
+                        concat,
+                        history_abs_start,
+                        cand_pos_s,
+                        abs_ip0,
+                        s_match_len,
+                        lit_len_ip0,
+                    );
+                    if short_cand.match_len >= DFAST_MIN_MATCH_LEN {
+                        return Some(short_cand);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Donor `zstd_double_fast.c` post-match rep-0 extension. After the

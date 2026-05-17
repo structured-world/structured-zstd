@@ -6982,8 +6982,17 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 
     matcher.max_window_size = 8;
 
-    matcher.trim_to_window(|_| {});
+    let mut callback_invoked = false;
+    matcher.trim_to_window(|_| {
+        callback_invoked = true;
+    });
 
+    assert!(
+        !callback_invoked,
+        "Dfast trim_to_window must never invoke the reuse_space callback — the \
+         history-only storage has no per-block Vec to recycle; eviction is \
+         observable only via the window_size delta"
+    );
     assert_eq!(
         matcher.window_size, 8,
         "exactly one 8-byte block must remain"
