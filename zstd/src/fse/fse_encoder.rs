@@ -707,10 +707,18 @@ const OF_DIST: &[i32] = &[
 // the actual compression work is ~1-5 µs, so the predefined-table
 // build dominates the per-frame cost for tiny inputs.
 //
-// Cache each predefined table once per process and hand callers a
-// clone; the clone is shallow per-symbol `Vec` copies of mostly-empty
-// `SymbolStates`, dominated by the small `states: Vec<State>` payload
-// rather than per-symbol fixed overhead.
+// Cache each predefined table once per process via a dedicated
+// `AtomicPtr<FSETable>` and hand callers a clone. The per-distribution
+// cache slot is encoded by the static identity of the cache itself
+// (each helper has its own `static`), NOT by pointer comparison on
+// the distribution slice — `LL_DIST` / `ML_DIST` / `OF_DIST` are
+// `const`, and `core::ptr::eq` on the materialized slice pointer of
+// a `const` is only stable as long as rustc keeps lowering it to a
+// single anonymous static. A future rustc change that duplicates the
+// const at each use site would silently sink every call through the
+// "unknown slice" branch and bypass the cache forever. Owning the
+// `static AtomicPtr` per-helper means the cache slot is selected at
+// compile time without consulting the slice pointer at all.
 //
 // `AtomicPtr<FSETable>` lock-free init works in both `std` and
 // `no_std` builds — only `alloc` is required (always available in
@@ -722,23 +730,12 @@ const OF_DIST: &[i32] = &[
 // winner (`Acquire`) and publishes its store (`Release`). The first
 // writer leaks `Box<FSETable>` intentionally — the cache lives for
 // the entire program lifetime, exactly like a `LazyLock`.
-fn cached_default_table(probs: &'static [i32], acc_log: u8) -> FSETable {
-    use core::sync::atomic::{AtomicPtr, Ordering};
-    static LL_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
-    static ML_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
-    static OF_PTR: AtomicPtr<FSETable> = AtomicPtr::new(core::ptr::null_mut());
-
-    let cache: &AtomicPtr<FSETable> = if core::ptr::eq(probs.as_ptr(), LL_DIST.as_ptr()) {
-        &LL_PTR
-    } else if core::ptr::eq(probs.as_ptr(), ML_DIST.as_ptr()) {
-        &ML_PTR
-    } else if core::ptr::eq(probs.as_ptr(), OF_DIST.as_ptr()) {
-        &OF_PTR
-    } else {
-        // Unknown distribution — caller is passing a non-predefined
-        // slice. Skip the cache and build directly.
-        return build_table_from_probabilities(probs, acc_log);
-    };
+fn get_or_init_cached_table(
+    cache: &core::sync::atomic::AtomicPtr<FSETable>,
+    probs: &[i32],
+    acc_log: u8,
+) -> FSETable {
+    use core::sync::atomic::Ordering;
 
     let cur = cache.load(Ordering::Acquire);
     if !cur.is_null() {
@@ -767,26 +764,31 @@ fn cached_default_table(probs: &'static [i32], acc_log: u8) -> FSETable {
         }
         Err(existing) => {
             // Another thread beat us to the publish — reclaim our
-            // throwaway allocation and use the winner.
-            // SAFETY: we own `raw` here (compare_exchange did NOT
-            // store it), so reconstituting the Box is sound.
-            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
-            // SAFETY: same as the `cur` path — `existing` was
+            // throwaway allocation and use the winner. SAFETY: we own
+            // `raw` here (compare_exchange did NOT store it), so
+            // reconstituting the `Box` is sound. `existing` was
             // published by the winning thread and is leaked for
-            // `'static`.
+            // `'static`, mirroring the `cur` path.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
             unsafe { (*existing).clone() }
         }
     }
 }
 
 pub(crate) fn default_ml_table() -> FSETable {
-    cached_default_table(ML_DIST, 6)
+    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    get_or_init_cached_table(&CACHE, ML_DIST, 6)
 }
 
 pub(crate) fn default_ll_table() -> FSETable {
-    cached_default_table(LL_DIST, 6)
+    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    get_or_init_cached_table(&CACHE, LL_DIST, 6)
 }
 
 pub(crate) fn default_of_table() -> FSETable {
-    cached_default_table(OF_DIST, 5)
+    static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+    get_or_init_cached_table(&CACHE, OF_DIST, 5)
 }

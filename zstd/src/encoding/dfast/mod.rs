@@ -304,6 +304,22 @@ impl DfastMatchGenerator {
         // case — it's the dedicated path for shedding retained bytes
         // and now actually frees the prefix (via `split_off`) instead
         // of leaving it pinned in the `history` allocation.
+        //
+        // In-tree caller audit (`grep -rn '\.commit_space(' src/encoding/`):
+        // every production path that reaches the driver's
+        // `commit_space` → `add_data` chain originates in
+        // `levels/fastest.rs`'s block emitter, which produces
+        // non-empty blocks gated by `should_emit_raw_fast_path` /
+        // RLE-detect on the source bytes — none of them pass
+        // `Vec::new()`. The streaming encoder's block-sourcing loop
+        // also filters empty reads before forwarding to the matcher.
+        // Tests are the only callers that exercise the empty path
+        // explicitly, and the regression covers eviction-driven trim
+        // semantics through `trim_to_window` directly. So this
+        // behaviour change is observable only by a hypothetical
+        // future caller that relies on `add_data(empty)` as a
+        // side-effecting trim trigger — and we deliberately want
+        // such a caller to use `trim_to_window` instead.
         if data.is_empty() {
             reuse_space(data);
             return;
@@ -354,20 +370,22 @@ impl DfastMatchGenerator {
     /// loop `add_data` will compact again the next iter — the cost
     /// is one extra realloc on the trim boundary in exchange for
     /// actually shedding the prefix to the system allocator.
-    /// Trim retained history down to `max_window_size`.
     ///
-    /// Signature mirrors `HashChainTable::trim_to_window` /
-    /// `RowMatcher::trim_to_window` so the [`Matcher`] backends share
-    /// a uniform `trim_to_window(impl FnMut(Vec<u8>))` shape — the
-    /// dispatcher in `match_generator.rs` can therefore call every
-    /// backend through the same surface even though Dfast has no
-    /// per-block `Vec<u8>` to recycle. The closure is invoked zero
-    /// times here: Dfast stores its raw bytes in the single contiguous
-    /// `history` buffer, releases the dead prefix via `split_off`
-    /// (which drops the old full-capacity buffer to the system
-    /// allocator), and surfaces eviction byte count to the dispatcher
-    /// via the `window_size` delta rather than the callback.
-    pub(crate) fn trim_to_window(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
+    /// Unlike `HashChainTable::trim_to_window` /
+    /// `RowMatcher::trim_to_window` this signature deliberately takes
+    /// no `reuse_space` callback — Dfast stores its raw bytes in the
+    /// single contiguous `history` buffer (no per-block `Vec<u8>` to
+    /// recycle), releases the dead prefix via `split_off`, and
+    /// surfaces eviction byte count to the dispatcher via the
+    /// `window_size` delta rather than a callback. A uniform-signature
+    /// trim helper would force every call site to monomorphize an
+    /// `impl FnMut(Vec<u8>)` that is documented to never fire, paying
+    /// codegen + inlining cost on the cold path for zero behaviour
+    /// difference; the dispatcher in `match_generator.rs` already
+    /// branches per backend (matchers diverge on `reset` and a few
+    /// other lifecycle calls) so adding one more per-backend arm is
+    /// free.
+    pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -602,6 +620,46 @@ impl DfastMatchGenerator {
         // and poison both hash tables. The guard band in `ensure_room_for`
         // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
         // worth of positions, so a single call at function entry suffices.
+        //
+        // Raw-pointer aliasing invariant. The inner loop caches
+        // `short_hash_ptr = self.short_hash.as_mut_ptr()` and
+        // `long_hash_ptr = self.long_hash.as_mut_ptr()` (and a
+        // `history_base_ptr` for the byte-buffer reads), then over
+        // the rest of the function does:
+        //
+        //   * raw writes / reads via `*short_hash_ptr.add(...) =
+        //     packed_curr`, `*long_hash_ptr.add(...) = packed_curr`,
+        //     and `*long_hash_ptr.add(hl1_idx)`;
+        //   * `&self`-shared reads of `self.offset_hist[0]` for the
+        //     rep1 peek;
+        //   * `&self`-shared slice reads of `self.history` (`let
+        //     concat = &self.history[history_start_offset..]`) for
+        //     `extend_backwards_shared` invocations.
+        //
+        // This is sound under both Stacked Borrows and Tree Borrows
+        // because the three fields touched (`short_hash`, `long_hash`,
+        // `history`, `offset_hist`) are physically disjoint
+        // allocations — `Vec<u32>`/`Vec<u8>` each own their own heap
+        // buffer, and `offset_hist` is an inline `[u32; 3]` inside
+        // the struct. A raw pointer derived from one field's Vec data
+        // has provenance over that field only, so the subsequent
+        // `&self` reads of sibling fields don't reborrow through the
+        // raw pointer's provenance tree.
+        //
+        // CRITICAL: this invariant must be preserved by any future
+        // refactor that adds method calls inside the loop body. A
+        // call that takes `&mut self` (e.g.,
+        // `self.ensure_hash_tables()`, `self.insert_position(...)`)
+        // would reborrow the tables and invalidate the cached raw
+        // pointers — every such call must happen OUTSIDE the
+        // `'outer: loop` (as `ensure_room_for` does, hoisted to the
+        // function preamble above) or be followed by a fresh
+        // `as_mut_ptr()` reload of both `short_hash_ptr` /
+        // `long_hash_ptr`. The outer-loop body already re-snapshots
+        // `history_base_ptr` per iteration for exactly this reason
+        // (`emit_candidate` → `insert_positions` may grow `history`
+        // and trigger a realloc), so the same re-snapshot discipline
+        // applies to the hash-table pointers.
         //
         // `current_len > 0` is a precondition of this helper: every
         // caller (`start_matching`, `skip_matching`, `skip_matching_dense`)
@@ -1115,7 +1173,12 @@ impl DfastMatchGenerator {
         let history_base_ptr = self.history.as_ptr();
 
         let concat_idx0 = abs_ip0 - history_abs_start;
-        let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+        // `position_base` participates in the bounds check below
+        // (`cand_pos = position_base + idx - 1` for both probes); the
+        // explicit `packed_curr` computation that the inner loop uses
+        // for table writes is not needed here since `probe_tail_ip0_only`
+        // is now read-only on the hash tables.
+        let _ = position_base;
 
         // SAFETY: `concat_idx0 + 8 <= concat_len` follows from the
         // caller's `ip0 + HASH_READ_SIZE <= current_len` precondition
@@ -1128,19 +1191,31 @@ impl DfastMatchGenerator {
         let hl0_idx = (v8_0.wrapping_mul(PRIME) >> long_shift) as usize;
         let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
 
-        // Pre-fetch the candidate indices BEFORE writing `packed_curr`,
-        // to mirror the inner loop (probe lookup precedes table
-        // update). `ensure_room_for` already ran for the whole block at
-        // the top of `start_matching_fast_loop`, so the raw pointers
-        // into `short_hash` / `long_hash` are still valid here.
-        let short_hash_ptr = self.short_hash.as_mut_ptr();
-        let long_hash_ptr = self.long_hash.as_mut_ptr();
-        let idxl0 = unsafe { *long_hash_ptr.add(hl0_idx) };
-        let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
-        unsafe {
-            *long_hash_ptr.add(hl0_idx) = packed_curr;
-            *short_hash_ptr.add(hs0_idx) = packed_curr;
-        }
+        // Read-only on the hash tables here — unlike the inner loop's
+        // "update-before-check" pattern, the writes at `hl0_idx` /
+        // `hs0_idx` would be dead in this helper:
+        //
+        //   * On a hit, the caller routes through `emit_candidate`
+        //     which insert-positions the entire emitted range, then
+        //     either advances `pos` past `current_len - HASH_READ_SIZE`
+        //     and the outer guard breaks (so a future iter never
+        //     re-uses these slots), or `continue 'outer` re-enters
+        //     with `pos = start + match_len ≥ current_len - 3`, which
+        //     fails the outer-entry `pos + HASH_READ_SIZE > current_len`
+        //     guard immediately. Either way, no second probe sees the
+        //     write.
+        //   * On no hit, the caller `break 'outer`s directly. Same
+        //     conclusion.
+        //   * `seed_remaining_hashable_starts` inserts `ip0` itself
+        //     during the post-loop tail seed pass, so even the "fresh
+        //     entry for next block" rationale doesn't justify writing
+        //     here — the seeder does that.
+        //
+        // Skipping the writes also removes a small amount of cache
+        // dirtying on the tail boundary and keeps `probe_tail_ip0_only`
+        // strictly cheaper than a full inner-loop iter.
+        let idxl0 = unsafe { *self.long_hash.as_ptr().add(hl0_idx) };
+        let idxs0 = unsafe { *self.short_hash.as_ptr().add(hs0_idx) };
 
         // Long-hash probe first (upstream priority: an 8-byte hit
         // beats a 4-byte hit even before extension).

@@ -679,14 +679,16 @@ impl MatchGeneratorDriver {
                 }
                 super::strategy::BackendTag::Dfast => {
                     // Dfast doesn't retain input Vecs — `history` is the
-                    // only byte store. The `trim_to_window` callback
-                    // shape is preserved for symmetry with HC/Row, but
-                    // the closure here is never invoked: eviction byte
+                    // only byte store, so there is no per-block buffer
+                    // to push back through a callback. Eviction byte
                     // count is derived from the `window_size` delta
-                    // before/after instead.
+                    // before/after; the Dfast variant of
+                    // `trim_to_window` takes no closure, sidestepping
+                    // an unused-`impl FnMut` monomorphization that
+                    // would otherwise contractually never fire.
                     let dfast = self.dfast_matcher_mut();
                     let pre = dfast.window_size;
-                    dfast.trim_to_window(|_| {});
+                    dfast.trim_to_window();
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
@@ -6982,17 +6984,15 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 
     matcher.max_window_size = 8;
 
-    let mut callback_invoked = false;
-    matcher.trim_to_window(|_| {
-        callback_invoked = true;
-    });
+    matcher.trim_to_window();
 
-    assert!(
-        !callback_invoked,
-        "Dfast trim_to_window must never invoke the reuse_space callback — the \
-         history-only storage has no per-block Vec to recycle; eviction is \
-         observable only via the window_size delta"
-    );
+    // No callback signature to assert on: the Dfast variant of
+    // `trim_to_window` takes none. That signature shape (vs HC/Row
+    // which accept `impl FnMut(Vec<u8>)`) is the property locking in
+    // the contract — there is no closure to invoke or skip, so no
+    // future change can "start invoking the callback" without a
+    // compile-time signature break that the dispatcher and this test
+    // would force the author to address.
     assert_eq!(
         matcher.window_size, 8,
         "exactly one 8-byte block must remain"

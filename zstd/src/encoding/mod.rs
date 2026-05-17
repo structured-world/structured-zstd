@@ -234,6 +234,20 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 ///   `large-log-stream` scenario pinned 100.4 MiB even though the
 ///   actual compressed output was ≪ 1 MiB.
 ///
+/// # Panics
+///
+/// Panics on encoder error (matches the failure surface of
+/// [`compress_to_vec`], which this function backs). The internal
+/// [`FrameCompressor::compress`] call propagates `io::Error` from the
+/// output [`Vec`] writer; under the in-tree default writer that
+/// channel is infallible and any error becomes a `panic`. Out-of-
+/// memory during `Vec::with_capacity` or the encoder's per-block
+/// scratch allocations is handled by the global allocator's abort
+/// policy. Migrating to a fallible variant requires plumbing
+/// `Result` through `FrameCompressor::compress` — out of scope for
+/// the slice/Vec entry points which mirror the donor `ZSTD_compress`
+/// shape (no error return on the bulk path).
+///
 /// ```rust
 /// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
