@@ -117,25 +117,48 @@ fn main() {
 fn collect_fixtures() -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
 
-    let corpus_path = Path::new("decodecorpus_files/z000033");
-    let workspace_corpus_path = Path::new("zstd/decodecorpus_files/z000033");
-    let corpus = if corpus_path.exists() {
-        Some(corpus_path)
-    } else if workspace_corpus_path.exists() {
-        Some(workspace_corpus_path)
-    } else {
-        None
-    };
-    if let Some(p) = corpus {
-        match fs::read(p) {
-            Ok(bytes) => out.push((format!("z000033 ({} bytes)", bytes.len()), bytes)),
-            Err(e) => eprintln!("warn: skipping {} — {}", p.display(), e),
+    // Mirror the corpus resolution order used by
+    // `zstd/benches/support/mod.rs::load_decode_corpus_scenario` so
+    // this bench finds the canonical `decodecorpus-z000033` fixture
+    // under the same conditions as `compare_ffi.rs` /
+    // `compare_ffi_memory.rs`:
+    //   1. `STRUCTURED_ZSTD_BENCH_CORPUS_PATH` — explicit path. CI
+    //      sets this when invoking the prebuilt bench binary
+    //      directly (no `CARGO_MANIFEST_DIR` in that environment).
+    //   2. `CARGO_MANIFEST_DIR/decodecorpus_files/z000033` —
+    //      cargo-driven `cargo bench` runs.
+    //   3. Repo-relative fallback for hand-run binaries from the
+    //      crate dir or workspace root.
+    // Without (1) and (2), the canonical fixture would silently
+    // skip on CI runs that bypass cargo, undermining the audit
+    // (PR #149 review round 3 #11).
+    let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            candidate_paths.push(std::path::PathBuf::from(trimmed));
         }
-    } else {
+    }
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        candidate_paths.push(Path::new(&manifest_dir).join("decodecorpus_files/z000033"));
+    }
+    candidate_paths.push(std::path::PathBuf::from("decodecorpus_files/z000033"));
+    candidate_paths.push(std::path::PathBuf::from("zstd/decodecorpus_files/z000033"));
+
+    let mut found = false;
+    for p in &candidate_paths {
+        if let Ok(bytes) = fs::read(p)
+            && !bytes.is_empty()
+        {
+            out.push((format!("z000033 ({} bytes)", bytes.len()), bytes));
+            found = true;
+            break;
+        }
+    }
+    if !found {
         eprintln!(
-            "warn: decodecorpus z000033 fixture not found at {} or {} — skipping",
-            corpus_path.display(),
-            workspace_corpus_path.display()
+            "warn: decodecorpus z000033 not found via STRUCTURED_ZSTD_BENCH_CORPUS_PATH, \
+             CARGO_MANIFEST_DIR, or repo-relative paths — skipping",
         );
     }
 
@@ -482,5 +505,23 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
         });
         seq_in_block = seq_in_block.saturating_add(1);
     }
+    // Mirror the Rust-side fail-fast invariant in
+    // `compress_and_collect_sequences`: if `ZSTD_generateSequences`
+    // omits a block delimiter or our filter misses one, `tails` ends
+    // up short and `align_and_diff` would walk a stale cursor and
+    // emit misleading rows. Panic with a clear FFI-specific message
+    // so the broken precondition surfaces immediately instead of
+    // being masked as a "real" divergence (PR #149 review round 3 #8).
+    let reconstructed: u64 = out.iter().map(|s| s.ll as u64 + s.ml as u64).sum::<u64>()
+        + tails.iter().map(|t| *t as u64).sum::<u64>();
+    assert_eq!(
+        reconstructed,
+        input.len() as u64,
+        "ffi_generate_sequences: stream undercounted input bytes — \
+         Σ(ll+ml)+Σ(tails)={reconstructed}, input.len()={}. \
+         Likely cause: a `ZSTD_generateSequences` block delimiter \
+         was omitted or filtered incorrectly.",
+        input.len(),
+    );
     (out, tails)
 }

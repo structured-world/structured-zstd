@@ -65,9 +65,15 @@ pub struct CapturedRawSequence {
 pub struct SequenceCapture {
     /// Triple sequences, one per `Sequence::Triple` event in input order.
     pub sequences: Vec<CapturedRawSequence>,
-    /// Trailing-literal length per block, indexed by block_idx. Always
-    /// `len == sequences.last().map(|s| s.block_idx + 1).unwrap_or(0)`
-    /// — every block the matcher saw contributes exactly one entry.
+    /// Trailing-literal length per emitted block, indexed by block_idx.
+    /// Contains one entry per block the matcher saw, INCLUDING blocks
+    /// that emitted zero `Sequence::Triple` events (e.g. fully-literal
+    /// blocks routed through `start_matching` with only a terminal
+    /// `Sequence::Literals` event, or raw blocks routed through
+    /// `skip_matching` / `skip_matching_with_hint`). The vec length is
+    /// therefore the total number of blocks processed, which may
+    /// exceed `sequences.last().map(|s| s.block_idx + 1).unwrap_or(0)`
+    /// whenever any trailing block emitted no triples.
     pub block_tail_lengths: Vec<u32>,
 }
 
