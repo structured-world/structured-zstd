@@ -1090,11 +1090,34 @@ impl Matcher for MatchGeneratorDriver {
                 });
             }
             MatcherStorage::Dfast(m) => {
+                // Dfast's `add_data` callback receives the INPUT
+                // `Vec<u8>` for pool recycling (Dfast stores its
+                // bytes in the contiguous `history` buffer, not in
+                // per-block Vecs — there is no per-block buffer to
+                // pop off and hand back). Counting `data.len()` as
+                // evicted bytes would conflate "new bytes ingested"
+                // with "old bytes evicted from window"; the two
+                // happen to coincide when the previous window was
+                // saturated and the new input fills it 1:1, but
+                // diverge when the eviction pop-loop drops blocks
+                // of a different size than the incoming input. The
+                // `dictionary_retained_budget` retire decision
+                // downstream then gets driven by inflated eviction
+                // counts and shrinks `max_window_size` prematurely.
+                //
+                // Derive the real eviction delta from `window_size`
+                // before/after the call. The pop loop inside
+                // `add_data` decrements `window_size` by each
+                // evicted block length and then the final
+                // `extend_from_slice + push_back` adds `space_len`,
+                // so `evicted = pre + space_len - post`.
+                let pre = m.window_size;
+                let space_len = space.len();
                 m.add_data(space, |mut data| {
-                    evicted_bytes += data.len();
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
+                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::Row(m) => {
                 m.add_data(space, |mut data| {
@@ -6961,6 +6984,66 @@ fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
         observed_evicted_len,
         Some(8),
         "eviction callback must report evicted byte length, not backing capacity"
+    );
+}
+
+/// Regression for the `commit_space` Dfast-branch eviction accounting bug
+/// (CodeRabbit Critical on PR #146). Old code counted the INPUT buffer
+/// length as `evicted_bytes` because Dfast's `add_data` callback receives
+/// the input `Vec<u8>` for pool recycling (Dfast stores bytes in `history`,
+/// not per-block Vecs). On the saturated-window 1:1 path the two coincide
+/// so the previous test fixture passed by accident; this test forces the
+/// divergent case where evicted != input by sequencing block lengths
+/// `[4, 4, 5]` against `max_window_size = 10`:
+///
+///   * after 1st commit: `window_blocks = [4]`, `window_size = 4`
+///   * after 2nd commit: `window_blocks = [4, 4]`, `window_size = 8`
+///   * 3rd commit (5 bytes): `8 + 5 > 10` → pop one 4-byte block (evict=4),
+///     then push 5 (window_size=9). Bug counts `5`, fix counts `4`.
+///
+/// The fix derives eviction from `window_size` delta + input length:
+/// `evicted = pre + space_len - post`. Verified via the
+/// `dictionary_retained_budget` observable: starting budget 100, after
+/// the third commit (4 bytes actually evicted) the budget must read 96,
+/// not 95.
+/// Direct verification of the `pre + space_len - post` formula the
+/// `commit_space` Dfast branch now uses, against the divergent case
+/// the buggy `data.len()` accounting would have inflated.
+#[test]
+fn dfast_commit_space_eviction_uses_window_size_delta() {
+    let mut matcher = DfastMatchGenerator::new(10);
+    matcher.max_window_size = 10;
+
+    // First commit: 4-byte block, window empty → window_size 0 → 4,
+    // no eviction.
+    let v1 = b"abcd".to_vec();
+    let pre = matcher.window_size;
+    let space_len = v1.len();
+    matcher.add_data(v1, |_| {});
+    let evicted = pre + space_len - matcher.window_size;
+    assert_eq!(evicted, 0, "first commit: no eviction expected");
+
+    // Second commit: 4-byte block, window 4 → 8, no eviction.
+    let v2 = b"efgh".to_vec();
+    let pre = matcher.window_size;
+    let space_len = v2.len();
+    matcher.add_data(v2, |_| {});
+    let evicted = pre + space_len - matcher.window_size;
+    assert_eq!(evicted, 0, "second commit: no eviction expected");
+
+    // Third commit (5 bytes): 8 + 5 > 10 → pop the front
+    // 4-byte block, push 5. Actual eviction is 4 bytes; the input
+    // size is 5; the buggy `data.len()` accounting would have
+    // counted 5. The formula must yield 4.
+    let v3 = b"ijklm".to_vec();
+    let pre = matcher.window_size;
+    let space_len = v3.len();
+    matcher.add_data(v3, |_| {});
+    let evicted = pre + space_len - matcher.window_size;
+    assert_eq!(
+        evicted, 4,
+        "third commit: only the popped 4-byte block was evicted; \
+         the 5-byte input is what's being INGESTED, not what's evicted"
     );
 }
 
