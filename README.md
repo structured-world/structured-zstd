@@ -9,9 +9,8 @@
 
 ## Quick start
 
-```toml
-[dependencies]
-structured-zstd = "0.0.21"
+```bash
+cargo add structured-zstd
 ```
 
 ```rust
@@ -22,10 +21,11 @@ let compressed = compress_to_vec(&b"hello world"[..], CompressionLevel::from_lev
 
 For `no_std` builds disable the default features:
 
-```toml
-[dependencies]
-structured-zstd = { version = "0.0.21", default-features = false }
+```bash
+cargo add structured-zstd --no-default-features
 ```
+
+Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com/structured-world/structured-zstd/blob/main/zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
 
 ## Status
 

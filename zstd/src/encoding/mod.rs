@@ -82,6 +82,8 @@ pub(crate) mod strategy;
 
 mod frame_compressor;
 mod levels;
+#[cfg(feature = "bench_internals")]
+pub mod sequence_capture;
 mod streaming_encoder;
 pub use frame_compressor::FrameCompressor;
 pub use match_generator::MatchGeneratorDriver;
