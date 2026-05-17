@@ -75,6 +75,7 @@ pub mod io_nostd;
 #[cfg(not(feature = "std"))]
 pub use io_nostd as io;
 
+#[cfg(test)]
 mod tests;
 
 /// Re-exports of internal types used by benchmarks.
