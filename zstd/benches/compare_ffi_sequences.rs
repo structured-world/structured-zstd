@@ -343,9 +343,16 @@ fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize) {
     // pick a different path"; whether each path is a win or
     // regression is a human-applied call after looking at the
     // emitted bytes.
+    // `differ` is the `DiffRow::Differ` bucket only — both sides emit
+    // a triple at the same cumulative position but with different
+    // `(ll, of, ml)`. `rust_only` / `ffi_only` are separate buckets
+    // (one side emits a triple where the other doesn't). They are
+    // all forms of divergence; the label uses the enum name so a
+    // reader can map each column back to the `DiffRow` variant
+    // instead of conflating `Differ` with the total.
     println!(
         "  level={level:>2}  rust_seqs={rs:>6} ({rb} blk)  ffi_seqs={fs:>6} ({fb} blk)  \
-         match={equal:>6} ({pct:.1}%)  diverge={dv:>6}  rust_only={rust_only:>5}  \
+         match={equal:>6} ({pct:.1}%)  differ={dv:>6}  rust_only={rust_only:>5}  \
          ffi_only={ffi_only}",
         rs = rust_seqs.len(),
         rb = rust_tail_lengths.len(),
@@ -608,6 +615,22 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
             level,
         );
         assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)");
+        // Mirror the small-input windowLog=14 override used by
+        // `compare_ffi.rs` so the donor parser sees the same window
+        // the Rust encoder applies when the source size is hinted
+        // down to a 16 KiB frame. Without this, tiny fixtures
+        // (e.g. the 16 KiB synthetic log) get parsed against a
+        // larger default window on the FFI side and produce
+        // sequence-stream divergences that are pure window-mismatch
+        // artifacts, not real strategy differences.
+        if input.len() <= (1 << 14) {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_windowLog,
+                14,
+            );
+            assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_windowLog=14)");
+        }
         let n = zstd_sys::ZSTD_generateSequences(
             cctx,
             buf.as_mut_ptr(),
