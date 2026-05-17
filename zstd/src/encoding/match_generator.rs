@@ -50,33 +50,45 @@ use std::arch::is_aarch64_feature_detected;
 #[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 use std::arch::is_x86_feature_detected;
 
-pub(crate) const DFAST_MIN_MATCH_LEN: usize = 6;
+pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;
-// Donor `clevels.h:31` at level 3 large-input bucket sets `hashLog = 17`.
-// Our table layout stores `[u32; DFAST_SEARCH_DEPTH]` (4 u32 slots) per
-// bucket, so a `1 << 17`-bucket table is `128 K × 16 B = 2 MiB per
-// table`, `4 MiB` for the (short, long) pair. We previously held a
-// 20-bit ceiling (1 M buckets × 32 B per `[usize; 4]` = 32 MiB per
-// table, 64 MiB for the pair) which inflated peak memory ~85× over
-// donor at default level — the bench matrix added in PR #143 surfaced
-// 64 MB Rust vs 768 KB donor for the two-table footprint on
-// `decodecorpus-z000033`. Donor stores a single `U32` per slot plus a
-// `chainTable` for older positions, so their pair is still smaller
-// than ours per-level; aligning the bucket count via this constant
-// already eats the dominant factor, the storage-width change ate the
-// rest. `dfast_hash_bits_for_window` still clamps the runtime value
-// to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the upper
-// bound rather than a fixed default.
+// Donor `clevels.h:31` at level 3 large-input bucket sets
+// `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
+// short-hash table — donor names this `chainTable` even though for
+// dfast it's used as a plain single-slot hash). Each table holds one
+// `U32` per slot; the donor overwrites on collision and recovers
+// compression quality via the inline `_search_next_long` retry
+// (after a short-hash hit, probes `hashLong[hl1]` at `ip + 1` and
+// keeps the longer match).
+//
+// We mirror that storage layout: single `u32` per bucket (no
+// `[u32; N]` array), `long_hash` sized `1 << DFAST_HASH_BITS` and
+// `short_hash` one bit smaller via `DFAST_SHORT_HASH_BITS_DELTA`.
+// Two-table footprint at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`,
+// exact upstream parity. The `_search_next_long` retry lives in
+// `DfastMatchGenerator::hash_candidate` (called via
+// `best_match`). Earlier revisions kept a
+// 4-slot bucket per hash position; that paid 4× the donor memory
+// without measurable ratio gain once the retry was in place.
+//
+// `dfast_hash_bits_for_window` still clamps the runtime long-hash
+// value to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the
+// upper bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
-pub(crate) const DFAST_SEARCH_DEPTH: usize = 4;
-/// Sentinel value for an empty slot in the `[u32; DFAST_SEARCH_DEPTH]`
-/// hash buckets. Real positions are stored as `(abs_pos -
-/// position_base + 1) as u32`, so `0` is reserved as the "empty"
-/// marker and a true relative offset of `0` never appears in the
-/// table. Mirrors the LDM table's `LdmEntry.offset == 0` convention
-/// (see `encoding/ldm/table.rs`) so both rebasing structures share
+/// Difference between `long_hash_bits` and `short_hash_bits` —
+/// donor `hashLog - chainLog` is 1 at every dfast level (`clevels.h`
+/// level 2: 16-15=1; level 3: 17-16=1). The short hash is one bit
+/// smaller than the long hash so the per-bucket footprint matches
+/// donor sizing exactly.
+pub(crate) const DFAST_SHORT_HASH_BITS_DELTA: usize = 1;
+/// Sentinel value for an empty slot in the dfast hash tables. Real
+/// positions are stored as `(abs_pos - position_base + 1) as u32`, so
+/// `0` is reserved as the "empty" marker and a true relative offset
+/// of `0` never appears in the table. Mirrors the LDM table's
+/// `LdmEntry.offset == 0` convention (see `encoding/ldm/table.rs`)
+/// so both rebasing structures share
 /// one sentinel scheme.
 pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 
@@ -666,15 +678,18 @@ impl MatchGeneratorDriver {
                     });
                 }
                 super::strategy::BackendTag::Dfast => {
-                    let mut retired = Vec::new();
-                    self.dfast_matcher_mut().trim_to_window(|data| {
-                        evicted_bytes += data.len();
-                        retired.push(data);
-                    });
-                    for mut data in retired {
-                        data.resize(data.capacity(), 0);
-                        self.vec_pool.push(data);
-                    }
+                    // Dfast doesn't retain input Vecs — `history` is the
+                    // only byte store, so there is no per-block buffer
+                    // to push back through a callback. Eviction byte
+                    // count is derived from the `window_size` delta
+                    // before/after; the Dfast variant of
+                    // `trim_to_window` takes no closure, sidestepping
+                    // an unused-`impl FnMut` monomorphization that
+                    // would otherwise contractually never fire.
+                    let dfast = self.dfast_matcher_mut();
+                    let pre = dfast.window_size;
+                    dfast.trim_to_window();
+                    evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
                     let mut retired = Vec::new();
@@ -784,11 +799,7 @@ impl Matcher for MatchGeneratorDriver {
                     // before constructing the replacement variant).
                     m.short_hash = Vec::new();
                     m.long_hash = Vec::new();
-                    let vec_pool = &mut self.vec_pool;
-                    m.reset(|mut data| {
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
+                    m.reset();
                 }
                 MatcherStorage::Row(m) => {
                     m.row_heads = Vec::new();
@@ -873,11 +884,10 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     DFAST_HASH_BITS
                 });
-                let vec_pool = &mut self.vec_pool;
-                dfast.reset(|mut data| {
-                    data.resize(data.capacity(), 0);
-                    vec_pool.push(data);
-                });
+                // Dfast holds no per-block input Vecs (history owns the
+                // bytes and `add_data` returns each Vec eagerly), so
+                // `reset` takes no `reuse_space` callback.
+                dfast.reset();
             }
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
@@ -3826,6 +3836,67 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 }
 
+/// Regression for the `DFAST_MIN_MATCH_LEN: 6 -> 5` drop. The fixture
+/// is built so the longest available match is EXACTLY 5 bytes — a
+/// matcher that still effectively requires a 6-byte floor would emit
+/// only literals here and the assertion would catch the silent
+/// 5-byte miss.
+///
+/// Fixture layout (34 B):
+///   bytes 0..5    `"ABCDE"`  — match source
+///   bytes 5..28   `'!'` × 23 — filler that does NOT start with 'A'
+///   bytes 28..33  `"ABCDE"`  — match site (repeats the prefix)
+///   byte  33      `'F'`      — terminator: differs from byte 5 (`'!'`),
+///                              so the forward extension at the match
+///                              site stops at exactly length 5.
+///
+/// A 5-byte match at offset 28 must be emitted; a 6-byte+ match at the
+/// same offset must NOT.
+#[test]
+fn dfast_accepts_exact_five_byte_match() {
+    // Layout the input so that:
+    //   bytes 0..5   = "ABCDE"        (the match source)
+    //   bytes 5..28  = 23 filler bytes that do NOT start with 'A'
+    //   bytes 28..33 = "ABCDE"        (the 5-byte match site)
+    //   byte  33     = 'F'            (differs from byte 5 = '!')
+    // The longest available copy at position 28 is exactly 5 bytes:
+    // the byte at position 33 ('F') differs from the byte at position 5
+    // ('!'), so the forward extension stops at length 5.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"ABCDE"); // 0..5
+    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
+    data.extend_from_slice(b"ABCDE"); // 28..33
+    data.push(b'F'); // 33: forces forward extension to stop at length 5
+    assert_eq!(data.len(), 34);
+
+    let mut matcher = DfastMatchGenerator::new(1 << 22);
+    matcher.add_data(data.clone(), |_| {});
+
+    let mut saw_five_byte_match = false;
+    let mut saw_longer_match = false;
+    matcher.start_matching(|seq| {
+        if let Sequence::Triple {
+            offset, match_len, ..
+        } = seq
+        {
+            if offset == 28 && match_len == 5 {
+                saw_five_byte_match = true;
+            } else if offset == 28 && match_len > 5 {
+                saw_longer_match = true;
+            }
+        }
+    });
+
+    assert!(
+        saw_five_byte_match,
+        "dfast must accept the exact-5-byte match — a 6-byte floor would skip it"
+    );
+    assert!(
+        !saw_longer_match,
+        "fixture pinned to length 5 — byte 33 ('F') must terminate the extension"
+    );
+}
+
 #[test]
 fn driver_switches_backends_and_initializes_dfast_via_reset() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
@@ -4116,7 +4187,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
+    hc.seed_dictionary_entropy(Some(&huff), Some(ll), Some(ml), Some(of));
 
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
@@ -4161,7 +4232,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
@@ -4204,7 +4275,7 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abc",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
@@ -4264,7 +4335,7 @@ fn btultra2_seed_pass_disabled_when_dictionary_entropy_seed_present() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    hc.seed_dictionary_entropy(None, Some(&ll), Some(&ml), Some(&of));
+    hc.seed_dictionary_entropy(None, Some(ll), Some(ml), Some(of));
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "dictionary-seeded first block should skip btultra2 warmup pass"
@@ -4410,7 +4481,7 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     let ll = crate::fse::fse_encoder::default_ll_table();
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
-    stats.seed_dictionary_entropy(Some(&huff), Some(&ll), Some(&ml), Some(&of));
+    stats.seed_dictionary_entropy(Some(&huff), Some(ll), Some(ml), Some(of));
     stats.rescale_freqs(
         b"abcd",
         HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>(),
@@ -4822,8 +4893,15 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let full_tables = driver.dfast_matcher().short_hash.len();
-    assert_eq!(full_tables, 1 << DFAST_HASH_BITS);
+    // Donor-parity split sizes: long-hash = DFAST_HASH_BITS,
+    // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
+    let full_long = driver.dfast_matcher().long_hash.len();
+    let full_short = driver.dfast_matcher().short_hash.len();
+    assert_eq!(full_long, 1 << DFAST_HASH_BITS);
+    assert_eq!(
+        full_short,
+        1 << (DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA)
+    );
 
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(2));
@@ -4832,13 +4910,30 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_tables = driver.dfast_matcher().short_hash.len();
+    let hinted_long = driver.dfast_matcher().long_hash.len();
+    let hinted_short = driver.dfast_matcher().short_hash.len();
 
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
-    assert_eq!(hinted_tables, 1 << MIN_HINTED_WINDOW_LOG);
+    // At the hinted floor `MIN_HINTED_WINDOW_LOG`, the long table
+    // matches the hinted size; the short table sits one
+    // `DFAST_SHORT_HASH_BITS_DELTA` step below it, clamped at its own
+    // `MIN_WINDOW_LOG` floor. The one-bit split between the two tables
+    // is preserved — the short table is NOT pulled up to equal the
+    // long table at this floor.
+    assert_eq!(hinted_long, 1 << MIN_HINTED_WINDOW_LOG);
+    let expected_hinted_short_bits = (MIN_HINTED_WINDOW_LOG as usize)
+        .saturating_sub(DFAST_SHORT_HASH_BITS_DELTA)
+        .max(MIN_WINDOW_LOG as usize);
+    assert_eq!(
+        hinted_short,
+        1 << expected_hinted_short_bits,
+        "short table must sit one DFAST_SHORT_HASH_BITS_DELTA below the long table \
+         (clamped at MIN_WINDOW_LOG) — a regression that pulls it up to the long-table \
+         floor would still satisfy the `< full_short` bound below and slip through"
+    );
     assert!(
-        hinted_tables < full_tables,
-        "tiny source hint should reduce dfast table footprint"
+        hinted_long < full_long && hinted_short < full_short,
+        "tiny source hint should reduce both dfast tables"
     );
 }
 
@@ -5069,11 +5164,20 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    let table_len = driver.dfast_matcher().short_hash.len();
+    // Donor-parity split: long-hash at DFAST_HASH_BITS, short-hash one
+    // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching donor
+    // `chainLog = hashLog - 1` for dfast levels).
+    let long_len = driver.dfast_matcher().long_hash.len();
+    let short_len = driver.dfast_matcher().short_hash.len();
     assert_eq!(
-        table_len,
+        long_len,
         1 << DFAST_HASH_BITS,
-        "unhinted Level(2) should keep default dfast table size"
+        "unhinted Level(2) should keep default long-hash table size"
+    );
+    assert_eq!(
+        short_len,
+        1 << (DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA),
+        "unhinted Level(2) short-hash should be one bit smaller than long-hash"
     );
 }
 
@@ -6856,7 +6960,15 @@ fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
 }
 
 #[test]
-fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
+fn dfast_trim_to_window_evicts_oldest_block_by_length() {
+    // After the history-only storage refactor (#111 Phase 7c step 3),
+    // Dfast no longer retains input `Vec<u8>`s — the `history`
+    // contiguous buffer is the sole byte store, and `add_data`
+    // returns the input Vec to the caller's pool eagerly. So
+    // `trim_to_window` doesn't have anything to hand back to the
+    // closure (no Vec exists to give). The eviction is observable
+    // instead through `window_size` shrinking by the per-block
+    // length recorded in `window_blocks`.
     let mut matcher = DfastMatchGenerator::new(16);
 
     let mut first = Vec::with_capacity(64);
@@ -6867,18 +6979,26 @@ fn dfast_trim_to_window_callback_reports_evicted_len_not_capacity() {
     second.extend_from_slice(b"ijklmnop");
     matcher.add_data(second, |_| {});
 
+    assert_eq!(matcher.window_size, 16);
+    assert_eq!(matcher.window_blocks.len(), 2);
+
     matcher.max_window_size = 8;
 
-    let mut observed_evicted_len = None;
-    matcher.trim_to_window(|data| {
-        observed_evicted_len = Some(data.len());
-    });
+    matcher.trim_to_window();
 
+    // No callback signature to assert on: the Dfast variant of
+    // `trim_to_window` takes none. That signature shape (vs HC/Row
+    // which accept `impl FnMut(Vec<u8>)`) is the property locking in
+    // the contract — there is no closure to invoke or skip, so no
+    // future change can "start invoking the callback" without a
+    // compile-time signature break that the dispatcher and this test
+    // would force the author to address.
     assert_eq!(
-        observed_evicted_len,
-        Some(8),
-        "trim callback must report evicted byte length, not backing capacity"
+        matcher.window_size, 8,
+        "exactly one 8-byte block must remain"
     );
+    assert_eq!(matcher.window_blocks.len(), 1);
+    assert_eq!(matcher.history_abs_start, 8);
 }
 
 #[test]
@@ -7036,18 +7156,16 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
         target_rel + 8 <= live.len(),
         "fixture must make the boundary start long-hashable"
     );
-    let long_hash = matcher.hash8(&live[target_rel..]);
+    let long_hash = matcher.long_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
+    // Single-slot tables (donor parity): the bucket holds at most one
+    // u32; the assertion below is a direct equality (no `.contains`).
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.long_hash[long_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.long_hash[long_hash], target_slot,
         "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
@@ -7059,7 +7177,7 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     matcher.add_data(block, |_| {});
     matcher.ensure_hash_tables();
 
-    let current_len = matcher.window.back().unwrap().len();
+    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     let seed_start = current_len - DFAST_MIN_MATCH_LEN;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
@@ -7071,18 +7189,14 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
         target_rel + 4 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
-    let short_hash = matcher.hash4(&live[target_rel..]);
+    let short_hash = matcher.short_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.short_hash[short_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.short_hash[short_hash], target_slot,
         "tail seeding must include the last 4-byte-hashable start"
     );
 }
@@ -7094,7 +7208,7 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     matcher.add_data(block, |_| {});
     matcher.ensure_hash_tables();
 
-    let current_len = matcher.window.back().unwrap().len();
+    let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
 
@@ -7105,18 +7219,14 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
         target_rel + 4 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
-    let short_hash = matcher.hash4(&live[target_rel..]);
+    let short_hash = matcher.short_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Guard against the membership check turning vacuous if a future
-    // `pack_slot` regression returned `DFAST_EMPTY_SLOT`: empty buckets
-    // are pre-filled with the sentinel, so `contains(&empty)` would
-    // pass without proving the real position was seeded.
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
-    assert!(
-        matcher.short_hash[short_hash].contains(&target_slot),
+    assert_eq!(
+        matcher.short_hash[short_hash], target_slot,
         "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
     );
 }
@@ -7152,8 +7262,8 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     let early_abs = 1024usize;
     let early_packed = dfast.pack_slot(early_abs);
     assert_ne!(early_packed, DFAST_EMPTY_SLOT);
-    dfast.short_hash[0][0] = early_packed;
-    dfast.long_hash[0][0] = early_packed;
+    dfast.short_hash[0] = early_packed;
+    dfast.long_hash[0] = early_packed;
 
     // Pick a trigger position that forces the first rebase. With
     // `position_base = 0`, the smallest `abs_pos` that fails the
@@ -7174,11 +7284,11 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // donor parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
     // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
-        dfast.short_hash[0][0], DFAST_EMPTY_SLOT,
+        dfast.short_hash[0], DFAST_EMPTY_SLOT,
         "pre-rebase short-hash entries below the reducer must become empty"
     );
     assert_eq!(
-        dfast.long_hash[0][0], DFAST_EMPTY_SLOT,
+        dfast.long_hash[0], DFAST_EMPTY_SLOT,
         "pre-rebase long-hash entries below the reducer must become empty"
     );
 
