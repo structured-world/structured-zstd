@@ -611,4 +611,49 @@ mod tests {
             }
         }
     }
+
+    /// Pin the empty-input guard. Without this assert the
+    /// reconstruction invariant trivially passes (`0 == 0`) but
+    /// `block_tail_lengths` stays empty, breaking the public
+    /// per-emitted-block contract.
+    #[test]
+    #[should_panic(expected = "requires non-empty input")]
+    fn rejects_empty_input() {
+        let _ = compress_and_collect_sequences(&[], CompressionLevel::Level(3));
+    }
+
+    /// Pin the `CompressionLevel::Uncompressed` reject path. That
+    /// variant routes through the encoder's raw-block fast-path
+    /// without invoking the matcher, leaving the recorder empty and
+    /// the post-compress invariant misleading.
+    #[test]
+    #[should_panic(expected = "CompressionLevel::Uncompressed")]
+    fn rejects_uncompressed_level() {
+        let _ = compress_and_collect_sequences(
+            b"hello there general kenobi",
+            CompressionLevel::Uncompressed,
+        );
+    }
+
+    /// Pin the pre-split-level reject path. `Level(11..=22)` and
+    /// `Best` route through the donor block-splitter, which emits
+    /// multiple physical on-wire blocks per matcher call — the
+    /// per-matcher-call counter cannot track that shape.
+    #[test]
+    #[should_panic(expected = "does not support pre-split levels")]
+    fn rejects_pre_split_numeric_level() {
+        let _ = compress_and_collect_sequences(
+            b"hello there general kenobi",
+            CompressionLevel::Level(11),
+        );
+    }
+
+    /// Same guard, named-preset variant. `Best` corresponds to
+    /// `Level(11)` per the public docstring, so both must reject.
+    #[test]
+    #[should_panic(expected = "does not support pre-split levels")]
+    fn rejects_best_preset() {
+        let _ =
+            compress_and_collect_sequences(b"hello there general kenobi", CompressionLevel::Best);
+    }
 }
