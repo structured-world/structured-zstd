@@ -577,21 +577,26 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Store benchmark results (x86_64-gnu only)
-        if: steps.bot-token.outputs.token != ''
+      # Save baseline (main push only). Intentionally NO `fail-on-alert`
+      # and NO `comment-on-alert` here — regression alerts are handled
+      # exclusively by the `benchmark-regression-check` job below, which
+      # runs only on regular developer PRs. Mixing the alert/fail path
+      # with the save path here would re-create the stuck-baseline
+      # cascade from #158: a regression on main push would fail the step
+      # before `save-data-file` ran, freezing the baseline indefinitely.
+      - name: Save benchmark baseline (main push only)
+        if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "structured-zstd vs C FFI (x86_64-gnu)"
           tool: customSmallerIsBetter
           output-file-path: benchmark-results.x86_64-gnu.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          comment-on-alert: true
-          alert-comment-cc-users: "@polaz"
+          auto-push: true
+          save-data-file: true
+          comment-on-alert: false
+          fail-on-alert: false
           alert-threshold: "130%"
-          fail-threshold: "160%"
-          fail-on-alert: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
   benchmark-pages:
@@ -650,3 +655,60 @@ jobs:
           git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json dev/bench/benchmark-summary.md dev/bench/benchmark-delta-summary.md
           git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages
+
+  # Regression alert gate — runs ONLY on regular developer PRs from
+  # this repo. Intentionally NOT on:
+  #   * push events (main is the immutable historical record; the
+  #     dev/bench dashboard surfaces regressions visually, no need to
+  #     fail CI red and freeze the publish chain)
+  #   * release-plz PRs (version-bump only, no source changes → perf
+  #     deltas are noise)
+  #   * fork PRs (no access to gh-pages baseline anyway, would just
+  #     emit a confusing comparison-failed line)
+  #
+  # Decoupled from `benchmark-aggregate` / `benchmark-pages` so that a
+  # red alert here does NOT block publish or baseline save (see #158
+  # for the stuck-baseline cascade this avoids).
+  benchmark-regression-check:
+    name: Bench regression alert (developer PR only)
+    needs: benchmark-aggregate
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'release-plz[bot]' &&
+      !startsWith(github.head_ref, 'release-plz-')
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The aggregated artifact carries `benchmark-results.<target>.json`
+      # at its root; download into workspace root so the action's
+      # `output-file-path` resolves without extra path plumbing.
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark-aggregated
+
+      - name: Compare against baseline + alert (no save, no push)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "structured-zstd vs C FFI (x86_64-gnu)"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.x86_64-gnu.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only comparison: no baseline write, no gh-pages push.
+          # The save path lives in `benchmark-aggregate` and runs on
+          # main push only.
+          auto-push: false
+          save-data-file: false
+          # Surface regressions to the PR author + reviewer. Comment is
+          # posted on the head commit so it shows in the PR conversation.
+          comment-on-alert: true
+          alert-comment-cc-users: "@polaz"
+          alert-threshold: "130%"
+          fail-threshold: "160%"
+          # Red CI on >60% regression so a reviewer can't merge by
+          # accident without acknowledging the delta. Failing here does
+          # NOT block publish / baseline save (separate job).
+          fail-on-alert: true
+          benchmark-data-dir-path: dev/bench
