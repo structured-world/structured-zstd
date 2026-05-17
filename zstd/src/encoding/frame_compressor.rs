@@ -77,19 +77,21 @@ impl PreviousFseTable {
 
 pub(crate) struct FseTables {
     /// The three predefined LL/ML/OF tables are functions of
-    /// compile-time-constant distributions; the cached helpers in
-    /// `fse_encoder` build them once per process and hand back
-    /// `&'static FSETable`. Storing the reference here (rather than
-    /// an owned `FSETable`) collapses `FrameCompressor::new` to a
-    /// 3-pointer copy on the cache-hot path — clone takes ~4 µs on
-    /// x86_64, the bare pointer copy is sub-nanosecond — and removes
-    /// the same per-clone cost from `clone_fse_tables` on the
-    /// block-split estimator path.
-    pub(crate) ll_default: &'static FSETable,
+    /// compile-time-constant distributions. The
+    /// [`fse_encoder::FseDefaultTable`] type alias resolves to
+    /// `&'static FSETable` when a process-wide cache is available
+    /// (atomic-pointer targets, or no-atomic targets with the
+    /// `critical-section` feature) and to `Box<FSETable>` on the
+    /// cache-less no-atomic path (one per-frame allocation, dropped
+    /// with the compressor — no `Box::leak`, no unbounded growth).
+    /// Both arms `Deref` to `FSETable`, so consumers in
+    /// `encoding/blocks/compressed.rs` borrow through `&` uniformly
+    /// without seeing the per-target divergence.
+    pub(crate) ll_default: crate::fse::fse_encoder::FseDefaultTable,
     pub(crate) ll_previous: Option<PreviousFseTable>,
-    pub(crate) ml_default: &'static FSETable,
+    pub(crate) ml_default: crate::fse::fse_encoder::FseDefaultTable,
     pub(crate) ml_previous: Option<PreviousFseTable>,
-    pub(crate) of_default: &'static FSETable,
+    pub(crate) of_default: crate::fse::fse_encoder::FseDefaultTable,
     pub(crate) of_previous: Option<PreviousFseTable>,
 }
 
@@ -103,6 +105,32 @@ impl FseTables {
             of_default: default_of_table(),
             of_previous: None,
         }
+    }
+
+    /// Borrow the LL default table as `&FSETable`. Abstracts the cfg
+    /// split in [`crate::fse::fse_encoder::FseDefaultTable`] —
+    /// `&'static FSETable` (atomic / `critical-section`) auto-derefs
+    /// directly; `Box<FSETable>` (cache-less no-atomic) derefs
+    /// through `Box`. Both arms yield `&FSETable` uniformly so
+    /// downstream consumers can stay cfg-agnostic.
+    #[inline]
+    #[allow(clippy::borrow_deref_ref)]
+    pub(crate) fn ll_default_ref(&self) -> &FSETable {
+        &*self.ll_default
+    }
+
+    /// Borrow the ML default table as `&FSETable`. See [`Self::ll_default_ref`].
+    #[inline]
+    #[allow(clippy::borrow_deref_ref)]
+    pub(crate) fn ml_default_ref(&self) -> &FSETable {
+        &*self.ml_default
+    }
+
+    /// Borrow the OF default table as `&FSETable`. See [`Self::ll_default_ref`].
+    #[inline]
+    #[allow(clippy::borrow_deref_ref)]
+    pub(crate) fn of_default_ref(&self) -> &FSETable {
+        &*self.of_default
     }
 }
 

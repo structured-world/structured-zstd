@@ -749,18 +749,28 @@ const OF_DIST: &[i32] = &[
 //       on the cold path — interrupts disabled for that window,
 //       acceptable for a one-time per-table init.
 //
-//     - Without `critical-section`: rebuild + `Box::leak` per
-//       call. Lack of pointer-width atomics is **not** a guarantee
-//       of non-concurrency (interrupt / preemption reentrancy on
+//     - Without `critical-section`: no cache. The helpers return
+//       a freshly-built `Box<FSETable>` per call (per-frame cost
+//       same as the pre-cache status quo); the table is dropped
+//       with the owning `FrameCompressor`, so memory does not
+//       grow with the number of `FrameCompressor::new` calls.
+//       Lack of pointer-width atomics is **not** a guarantee of
+//       non-concurrency (interrupt / preemption reentrancy on
 //       bare-metal targets), and a shared `static mut` slot
 //       without any synchronization would be a data race (UB).
-//       Skipping the cache entirely sidesteps the synchronization
-//       question; the trade-off is that repeat callers leak
-//       ~few-KiB per `FrameCompressor::new` × 3 (LL/ML/OF).
-//       Embedded encoders typically live for the entire process
-//       so the accumulated leak is bounded in practice. Users who
-//       want the cache should enable the `critical-section`
-//       feature.
+//       The owned-Box return is the same shape as the pre-PR
+//       behaviour — no leak, no UB risk, no cache speedup. Users
+//       who want the cache on no-atomic targets should enable
+//       the `critical-section` feature, which routes through the
+//       CS-protected `&'static` slot above.
+//
+// To paper over the per-target return-type difference the
+// `FseDefaultTable` type alias resolves to `&'static FSETable` on
+// any target/feature combination that has a cache (atomic, or
+// no-atomic + `critical-section`) and to `alloc::boxed::Box<FSETable>`
+// on the cache-less path. Both types `Deref` to `FSETable` so
+// downstream consumers in `encoding/blocks/compressed.rs` and
+// `encoding/frame_compressor.rs` borrow through `&` uniformly.
 #[cfg(target_has_atomic = "ptr")]
 fn get_or_init_cached_table(
     cache: &core::sync::atomic::AtomicPtr<FSETable>,
@@ -817,17 +827,18 @@ fn get_or_init_cached_table(
 }
 
 /// No-atomic + no `critical-section` feature fallback: build a
-/// fresh `FSETable` and `Box::leak` it for the `'static` lifetime.
-/// No caching — see the module-level header comment for the
-/// rationale (interrupt / preemption reentrancy on bare-metal
-/// targets makes a shared `static mut` cache without atomic
-/// synchronization a data race surface, so we trade off ~few-KiB
-/// per call against the UB risk; users who want the cache should
-/// enable the crate's `critical-section` feature).
+/// fresh `FSETable` and return it as an owned `Box<FSETable>`. No
+/// caching — see the module-level header comment for the rationale
+/// (interrupt / preemption reentrancy on bare-metal targets makes
+/// a shared `static mut` cache without atomic synchronization a
+/// data race surface). The owned-Box return shape is paired with
+/// the `FseDefaultTable` type alias so the per-frame caller stores
+/// the table in `FseTables` and drops it when the compressor
+/// drops — no `Box::leak`, no unbounded growth across multiple
+/// `FrameCompressor::new` calls.
 #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
-fn build_and_leak_table(probs: &[i32], acc_log: u8) -> &'static FSETable {
-    let built = alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log));
-    alloc::boxed::Box::leak(built)
+fn build_owned_table(probs: &[i32], acc_log: u8) -> alloc::boxed::Box<FSETable> {
+    alloc::boxed::Box::new(build_table_from_probabilities(probs, acc_log))
 }
 
 /// No-atomic + `critical-section` feature: cached `static mut` slot
@@ -888,7 +899,18 @@ impl CsCachedTablePtr {
 #[cfg(all(not(target_has_atomic = "ptr"), feature = "critical-section"))]
 unsafe impl Sync for CsCachedTablePtr {}
 
-pub(crate) fn default_ml_table() -> &'static FSETable {
+/// Per-helper return type. `&'static FSETable` on targets/features
+/// that own a process-wide cache (zero-cost subsequent calls);
+/// `Box<FSETable>` on the cache-less no-atomic path (one allocation
+/// per call, dropped with the owning `FrameCompressor` — no leak).
+/// Both `Deref` to `FSETable`, so downstream consumers borrow
+/// through `&` without caring which arm fired.
+#[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
+pub(crate) type FseDefaultTable = &'static FSETable;
+#[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+pub(crate) type FseDefaultTable = alloc::boxed::Box<FSETable>;
+
+pub(crate) fn default_ml_table() -> FseDefaultTable {
     #[cfg(target_has_atomic = "ptr")]
     {
         static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
@@ -902,11 +924,11 @@ pub(crate) fn default_ml_table() -> &'static FSETable {
     }
     #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
     {
-        build_and_leak_table(ML_DIST, 6)
+        build_owned_table(ML_DIST, 6)
     }
 }
 
-pub(crate) fn default_ll_table() -> &'static FSETable {
+pub(crate) fn default_ll_table() -> FseDefaultTable {
     #[cfg(target_has_atomic = "ptr")]
     {
         static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
@@ -920,11 +942,11 @@ pub(crate) fn default_ll_table() -> &'static FSETable {
     }
     #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
     {
-        build_and_leak_table(LL_DIST, 6)
+        build_owned_table(LL_DIST, 6)
     }
 }
 
-pub(crate) fn default_of_table() -> &'static FSETable {
+pub(crate) fn default_of_table() -> FseDefaultTable {
     #[cfg(target_has_atomic = "ptr")]
     {
         static CACHE: core::sync::atomic::AtomicPtr<FSETable> =
@@ -938,6 +960,6 @@ pub(crate) fn default_of_table() -> &'static FSETable {
     }
     #[cfg(all(not(target_has_atomic = "ptr"), not(feature = "critical-section")))]
     {
-        build_and_leak_table(OF_DIST, 5)
+        build_owned_table(OF_DIST, 5)
     }
 }

@@ -330,19 +330,19 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
         // Choose the tables
         let ll_mode = choose_table(
             state.fse_tables.ll_previous.as_ref(),
-            state.fse_tables.ll_default,
+            state.fse_tables.ll_default_ref(),
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
         );
         let ml_mode = choose_table(
             state.fse_tables.ml_previous.as_ref(),
-            state.fse_tables.ml_default,
+            state.fse_tables.ml_default_ref(),
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
         );
         let of_mode = choose_table(
             state.fse_tables.of_previous.as_ref(),
-            state.fse_tables.of_default,
+            state.fse_tables.of_default_ref(),
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
         );
@@ -540,26 +540,29 @@ fn estimate_sequences_section_bytes(
     // internally, identical decision path.
     let ll_mode = choose_table(
         fse_tables.ll_previous.as_ref(),
-        fse_tables.ll_default,
+        fse_tables.ll_default_ref(),
         sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
     );
     let ml_mode = choose_table(
         fse_tables.ml_previous.as_ref(),
-        fse_tables.ml_default,
+        fse_tables.ml_default_ref(),
         sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
     );
     let of_mode = choose_table(
         fse_tables.of_previous.as_ref(),
-        fse_tables.of_default,
+        fse_tables.of_default_ref(),
         sequences.iter().map(|seq| encode_offset(seq.of).0),
         8,
     );
 
-    let ll_bits_chosen = fse_section_bits_for_mode(&ll_mode, ll_counts, fse_tables.ll_default);
-    let ml_bits_chosen = fse_section_bits_for_mode(&ml_mode, ml_counts, fse_tables.ml_default);
-    let of_bits_chosen = fse_section_bits_for_mode(&of_mode, of_counts, fse_tables.of_default);
+    let ll_bits_chosen =
+        fse_section_bits_for_mode(&ll_mode, ll_counts, fse_tables.ll_default_ref());
+    let ml_bits_chosen =
+        fse_section_bits_for_mode(&ml_mode, ml_counts, fse_tables.ml_default_ref());
+    let of_bits_chosen =
+        fse_section_bits_for_mode(&of_mode, of_counts, fse_tables.of_default_ref());
 
     let ll_table_desc_bytes = mode_table_description_bytes(&ll_mode);
     let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
@@ -822,15 +825,37 @@ fn encode_raw_sequences_into(
 }
 
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
-    // `*_default` fields are `&'static FSETable` (pointer-sized
-    // copies, cache-backed); only the `*_previous` per-frame tables
-    // need a deep clone.
+    // The `*_default` fields are cfg-typed via the
+    // [`crate::fse::fse_encoder::FseDefaultTable`] alias —
+    // `&'static FSETable` on atomic / `critical-section` targets
+    // (Copy, zero-cost clone via field-access) and
+    // `Box<FSETable>` on the cache-less no-atomic path (needs
+    // `Clone::clone` for a deep copy). Method resolution of
+    // `.clone()` on `&'static FSETable` resolves via auto-deref to
+    // `FSETable::clone` (returns owned `FSETable`) which is the
+    // WRONG return type for the atomic arm — the cfg-split below
+    // picks the correct expression explicitly per target/feature.
+    //
+    // The block-split estimator path that calls this helper does
+    // not run on the per-frame hot path (it fires only when block
+    // pre-splitting decides to estimate sub-block costs, levels
+    // 11+), so the no-atomic deep-clone cost is amortised in the
+    // broader estimator overhead.
     FseTables {
+        #[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
         ll_default: fse_tables.ll_default,
+        #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+        ll_default: fse_tables.ll_default.clone(),
         ll_previous: fse_tables.ll_previous.clone(),
+        #[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
         ml_default: fse_tables.ml_default,
+        #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+        ml_default: fse_tables.ml_default.clone(),
         ml_previous: fse_tables.ml_previous.clone(),
+        #[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
         of_default: fse_tables.of_default,
+        #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+        of_default: fse_tables.of_default.clone(),
         of_previous: fse_tables.of_previous.clone(),
     }
 }
@@ -1255,9 +1280,9 @@ fn encode_sequences(
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
     let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
     let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-    let ll_table = mode_table(ll_mode, defaults.ll_default);
-    let ml_table = mode_table(ml_mode, defaults.ml_default);
-    let of_table = mode_table(of_mode, defaults.of_default);
+    let ll_table = mode_table(ll_mode, defaults.ll_default_ref());
+    let ml_table = mode_table(ml_mode, defaults.ml_default_ref());
+    let of_table = mode_table(of_mode, defaults.of_default_ref());
     let mut ll_state = ll_table.map(|table| table.start_state(ll_code));
     let mut ml_state = ml_table.map(|table| table.start_state(ml_code));
     let mut of_state = of_table.map(|table| table.start_state(of_code));
@@ -1710,34 +1735,34 @@ mod tests {
         );
 
         assert!(tables_match(
-            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default).unwrap(),
-            fse_tables.ll_default
+            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default_ref()).unwrap(),
+            fse_tables.ll_default_ref()
         ));
         assert!(tables_match(
-            previous_table(fse_tables.ml_previous.as_ref(), fse_tables.ml_default).unwrap(),
-            fse_tables.ml_default
+            previous_table(fse_tables.ml_previous.as_ref(), fse_tables.ml_default_ref()).unwrap(),
+            fse_tables.ml_default_ref()
         ));
         assert!(tables_match(
-            previous_table(fse_tables.of_previous.as_ref(), fse_tables.of_default).unwrap(),
-            fse_tables.of_default
+            previous_table(fse_tables.of_previous.as_ref(), fse_tables.of_default_ref()).unwrap(),
+            fse_tables.of_default_ref()
         ));
 
         let sample_codes = [0u8, 1u8];
         let ll_repeat = choose_table(
             fse_tables.ll_previous.as_ref(),
-            fse_tables.ll_default,
+            fse_tables.ll_default_ref(),
             sample_codes.iter().copied(),
             9,
         );
         let ml_repeat = choose_table(
             fse_tables.ml_previous.as_ref(),
-            fse_tables.ml_default,
+            fse_tables.ml_default_ref(),
             sample_codes.iter().copied(),
             9,
         );
         let of_repeat = choose_table(
             fse_tables.of_previous.as_ref(),
-            fse_tables.of_default,
+            fse_tables.of_default_ref(),
             sample_codes.iter().copied(),
             8,
         );
@@ -1754,7 +1779,7 @@ mod tests {
         fse_tables.ll_previous = Some(PreviousFseTable::Custom(Box::new(custom)));
 
         let before = core::ptr::from_ref(
-            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default).unwrap(),
+            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default_ref()).unwrap(),
         );
 
         remember_last_used_tables(
@@ -1765,7 +1790,7 @@ mod tests {
         );
 
         let after = core::ptr::from_ref(
-            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default).unwrap(),
+            previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default_ref()).unwrap(),
         );
 
         assert_eq!(before, after);
@@ -1780,7 +1805,7 @@ mod tests {
         let fse_tables = FseTables::new();
         let mode = choose_table(
             None,
-            fse_tables.ll_default,
+            fse_tables.ll_default_ref(),
             core::iter::repeat_n(0u8, 32),
             9,
         );
