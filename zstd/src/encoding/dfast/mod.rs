@@ -79,7 +79,7 @@ pub(crate) struct DfastMatchGenerator {
     // ratio loss from single-slot is compensated by donor's
     // `_search_next_long` retry — after a short-hash hit, the search
     // probes long_hash at `ip + 1` and picks the longer of the two
-    // (see `find_best_match` for the retry logic).
+    // (see `hash_candidate`, invoked via `best_match`, for the retry).
     pub(crate) short_hash: Vec<u32>,
     pub(crate) long_hash: Vec<u32>,
     /// Absolute position whose `(abs_pos - position_base + 1)` slot
@@ -251,24 +251,24 @@ impl DfastMatchGenerator {
     /// Slice of bytes from the most recently appended block. Returns
     /// the trailing `last_block_len` bytes of `history`.
     ///
+    /// This is the public trait-dispatch entry point used by the
+    /// streaming encoder / block compressor / per-level helpers via
+    /// the `Matcher::get_last_space` trait. Internal callers inside
+    /// this file deliberately use the inline pattern
+    /// `let last_len = self.window_blocks.back().copied().unwrap_or(0);
+    /// let current = &self.history[self.history.len() - last_len..];`
+    /// so they share the same gate shape as the `current_len == 0`
+    /// early returns in `skip_matching` / `start_matching`.
+    ///
     /// # Panics
     /// Panics if `window_blocks` is empty (no block has been ingested
-    /// yet). Every in-tree caller follows the SAME gate convention:
-    /// they read `window_blocks.back().copied().unwrap_or(0)` first
-    /// and bail out (early return / no-op) when the length is 0 BEFORE
-    /// calling this helper. Concretely the gated entry points are:
-    ///
-    ///   * `skip_matching` (line ~313) — `if current_len == 0 { return; }`
-    ///   * `skip_matching_dense` (line ~347) — same gate
-    ///   * `start_matching` (line ~362) — same gate
-    ///   * `emit_trailing_literals` (line ~1004) — `if literals_start
-    ///     < last_len { … }` short-circuits on `last_len == 0`
-    ///
-    /// So when this `expect` fires it indicates a NEW caller has
-    /// skipped the gate, not a producer bug at runtime. The panic
-    /// then surfaces the missing gate loudly instead of silently
-    /// returning an empty slice and letting the matcher operate on
-    /// zero-length data downstream.
+    /// yet). All trait-level callers reach this only on the
+    /// `frame_compressor` post-`add_data` path, where at least one
+    /// block has been appended. The panic is a contract-violation
+    /// surface for a NEW external caller invoking before `add_data`,
+    /// not a runtime data path: it fails loudly rather than silently
+    /// returning an empty slice and letting downstream operate on
+    /// zero-length data.
     pub(crate) fn get_last_space(&self) -> &[u8] {
         let last_len = *self
             .window_blocks
@@ -354,7 +354,20 @@ impl DfastMatchGenerator {
     /// loop `add_data` will compact again the next iter — the cost
     /// is one extra realloc on the trim boundary in exchange for
     /// actually shedding the prefix to the system allocator.
-    pub(crate) fn trim_to_window(&mut self) {
+    /// Trim retained history down to `max_window_size`.
+    ///
+    /// Signature mirrors `HashChainTable::trim_to_window` /
+    /// `RowMatcher::trim_to_window` so the [`Matcher`] backends share
+    /// a uniform `trim_to_window(impl FnMut(Vec<u8>))` shape — the
+    /// dispatcher in `match_generator.rs` can therefore call every
+    /// backend through the same surface even though Dfast has no
+    /// per-block `Vec<u8>` to recycle. The closure is invoked zero
+    /// times here: Dfast stores its raw bytes in the single contiguous
+    /// `history` buffer, releases the dead prefix via `split_off`
+    /// (which drops the old full-capacity buffer to the system
+    /// allocator), and surfaces eviction byte count to the dispatcher
+    /// via the `window_size` delta rather than the callback.
+    pub(crate) fn trim_to_window(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -590,14 +603,15 @@ impl DfastMatchGenerator {
         // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
         // worth of positions, so a single call at function entry suffices.
         //
-        // `current_len > 0` is a precondition of this helper: the only
-        // caller (`start_matching`) bails out at `current_len == 0`
-        // before reaching here. The explicit guard below makes the
-        // precondition self-documenting and protects the `- 1` from
-        // wrapping if a future caller forgets to gate.
-        if current_len > 0 {
-            self.ensure_room_for(current_abs_start + current_len - 1);
-        }
+        // `current_len > 0` is a precondition of this helper: every
+        // caller (`start_matching`, `skip_matching`, `skip_matching_dense`)
+        // returns early at `current_len == 0`. Encode it as a hard
+        // assert so a future caller that forgets the gate fails loudly
+        // in debug rather than wrap-underflowing the `- 1` below; the
+        // rebase is unconditional in release builds since the
+        // precondition holds.
+        debug_assert!(current_len > 0, "fast_loop precondition: current_len > 0");
+        self.ensure_room_for(current_abs_start + current_len - 1);
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
         let short_shift = 64 - self.short_hash_bits;
         let long_shift = 64 - self.long_hash_bits;
@@ -681,30 +695,32 @@ impl DfastMatchGenerator {
                 idxl0 = *long_hash_ptr.add(hl0_idx);
             }
 
-            // The match the inner loop commits to, or `None` if the
-            // inner loop exited via tail (no more positions to scan).
-            // Outer match arm uses `candidate.start` to recover the
-            // anchor, so we don't carry the relative match cursor here.
+            // Inner-loop exit shape. Every `break 'inner` produces a
+            // value of this type, so the type system enforces the
+            // previously implicit pairing between "did we commit a
+            // match?" and "where does the tail seeder pick up?":
             //
-            // `tail_seed_anchor` is paired with `committed = None`: it's
-            // the first un-scanned position when inner exits via tail
-            // break, and is ONLY read in the `None` arm of the post-
-            // inner-loop `match`. On a miss-only block we'd otherwise
-            // re-seed from `pos` (still at outer-entry), densely
-            // re-inserting positions the fast loop already wrote —
-            // throwing away the skip-step win on incompressible data.
-            // The implicit pairing (assigned at the inner-advance break,
-            // read in the `None` arm) is fragile to future edits — if a
-            // new `break 'inner` path is added without an explicit
-            // `committed = Some(...)`, this anchor stays at its initial
-            // `pos` value and the tail seeder will re-pack from the
-            // outer entry. Worth promoting to an explicit
-            // `enum InnerExit { Committed(MatchCandidate), Tail(usize) }`
-            // if the inner loop grows another exit shape.
-            let mut committed: Option<MatchCandidate> = None;
-            let mut tail_seed_anchor = pos;
+            //   * `Committed(c)` — rep1 / long / short(+next_long retry)
+            //     paths chose `c`; outer arm runs emit + rep-extension.
+            //   * `Tail(seed)` — inner ran out of safe scan room at
+            //     `seed = ip0` (first un-scanned position); outer arm
+            //     hands `seed` to `seed_remaining_hashable_starts` so
+            //     the tail seeder does not redundantly re-pack
+            //     positions the fast loop already wrote (which is what
+            //     restarting from outer-entry `pos` would do on a
+            //     miss-only block — throwing away the skip-step win on
+            //     incompressible data).
+            //
+            // Adding a new `break 'inner` variant now forces the
+            // author to pick a `InnerExit::…` variant explicitly; the
+            // previous `Option<MatchCandidate>` + sibling `usize`
+            // pairing relied on a comment-block to flag the coupling.
+            enum InnerExit {
+                Committed(MatchCandidate),
+                Tail(usize),
+            }
 
-            'inner: loop {
+            let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = current_abs_start + ip0;
                 let abs_ip1 = current_abs_start + ip1;
                 let lit_len_ip0 = ip0 - literals_start;
@@ -804,8 +820,7 @@ impl DfastMatchGenerator {
                                     match_len,
                                     lit_len_ip1,
                                 );
-                                committed = Some(rep_cand);
-                                break 'inner;
+                                break 'inner InnerExit::Committed(rep_cand);
                             }
                         }
                     }
@@ -854,8 +869,7 @@ impl DfastMatchGenerator {
                                 match_len,
                                 lit_len_ip0,
                             );
-                            committed = Some(cand);
-                            break 'inner;
+                            break 'inner InnerExit::Committed(cand);
                         }
                     }
                 }
@@ -937,8 +951,7 @@ impl DfastMatchGenerator {
                                     }
                                 }
                             }
-                            committed = Some(chosen);
-                            break 'inner;
+                            break 'inner InnerExit::Committed(chosen);
                         }
                     }
                 }
@@ -957,15 +970,14 @@ impl DfastMatchGenerator {
                 if ip1 + HASH_READ_SIZE > current_len {
                     // First position the fast loop did NOT pack into the
                     // hash tables. `seed_remaining_hashable_starts` will
-                    // pick up from here instead of restarting at the
+                    // pick up from `ip0` instead of restarting at the
                     // outer-entry `pos`.
-                    tail_seed_anchor = ip0;
-                    break 'inner;
+                    break 'inner InnerExit::Tail(ip0);
                 }
-            }
+            };
 
-            match committed {
-                Some(candidate) => {
+            match inner_exit {
+                InnerExit::Committed(candidate) => {
                     let start = self.emit_candidate(
                         current_abs_start,
                         &mut literals_start,
@@ -981,12 +993,12 @@ impl DfastMatchGenerator {
                         handle_sequence,
                     );
                 }
-                None => {
+                InnerExit::Tail(seed) => {
                     // Inner loop ran out of safe scan room without
                     // committing. Hand the tail seeder the first
                     // un-scanned position so it does not redundantly
                     // re-pack everything the fast loop already wrote.
-                    pos = tail_seed_anchor;
+                    pos = seed;
                     break 'outer;
                 }
             }
@@ -1065,8 +1077,8 @@ impl DfastMatchGenerator {
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
-            // Sparse complementary insertion (donor parity,
-            // `zstd_double_fast.c:300-304`): donor inserts ONLY at
+            // Sparse complementary insertion (upstream parity,
+            // `zstd_double_fast.c:300-304`): upstream inserts ONLY at
             // `curr+2`, `ip-2`, `ip-1` after a match — three specific
             // positions, not the whole match range. The previous
             // `insert_positions(abs_pos, abs_pos + match_len)` made
@@ -1088,6 +1100,24 @@ impl DfastMatchGenerator {
             // the shortest rep extension and not worth a branch to
             // dedup. For `match_len >= 5` all three offsets are
             // distinct.
+            //
+            // Why `abs_pos` itself is NOT in the insert set, despite
+            // not being written by the fast loop's pre-check insert
+            // (the previous range form `insert_positions(abs_pos,
+            // post_match_end)` did include it): upstream
+            // `ZSTD_compressBlock_doubleFast_*` likewise does not
+            // insert at the rep-extension start. After a rep match,
+            // upstream just advances `ip` and reruns the outer fast
+            // loop, which writes the new `curr` (the post-rep cursor)
+            // — never the rep's own start. The three offsets above
+            // are upstream's primary-match-emit insertion pattern,
+            // mirrored here to preserve hit rate on the chains that
+            // follow a rep extension. The hash-state delta vs the
+            // prior range-insert behavior is intentional and tracked
+            // by the sequence-stream comparator harness (the
+            // per-sequence diff vs FFI mentioned in the PR body's
+            // deferred section); the audit signed off on the current
+            // sparse set as the closest faithful mirror of upstream.
             let post_match_end = abs_pos + match_len;
             let insert_targets = [
                 abs_pos + 2,                      // curr + 2
@@ -1137,7 +1167,14 @@ impl DfastMatchGenerator {
             current_abs_start + *literals_start,
             candidate.start + candidate.match_len,
         );
-        let current = self.get_last_space();
+        // Inline the trailing-block slice rather than calling
+        // `get_last_space()` so this matches the gate pattern used by
+        // `skip_matching` / `start_matching` (read `window_blocks.back()`
+        // with `unwrap_or(0)`). `emit_candidate` runs only after a
+        // successful match was found in the active block, so
+        // `last_len > 0` is a structural precondition.
+        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        let current = &self.history[self.history.len() - last_len..];
         let start = candidate.start - current_abs_start;
         let literals = &current[*literals_start..start];
         handle_sequence(Sequence::Triple {
@@ -1161,7 +1198,11 @@ impl DfastMatchGenerator {
     ) {
         let last_len = self.window_blocks.back().copied().unwrap_or(0);
         if literals_start < last_len {
-            let current = self.get_last_space();
+            // Inline rather than calling `get_last_space()` so the gate
+            // pattern matches `skip_matching` / `start_matching` /
+            // `emit_candidate`. `last_len > 0` is already established by
+            // the `literals_start < last_len` check above.
+            let current = &self.history[self.history.len() - last_len..];
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -1561,11 +1602,12 @@ impl DfastMatchGenerator {
         // is provably below the table length. Eliding the bounds check
         // on this per-byte hot path saves ~4 instructions per call.
         //
-        // Single-slot overwrite (donor parity): the previous 4-slot
-        // bucket shift (`copy_within(..)`) is gone — donor
+        // Single-slot overwrite (upstream parity): the previous 4-slot
+        // bucket shift (`copy_within(..)`) is gone — upstream
         // `ZSTD_compressBlock_doubleFast_*` writes a single `U32` per
         // hash position and relies on the dense `_search_next_long`
-        // retry in `find_best_match` to preserve compression ratio.
+        // retry in `hash_candidate` (via `best_match`) to preserve
+        // compression ratio.
         if idx + 4 <= concat_len {
             let concat = &self.history[self.history_start..];
             let short = self.short_hash_index(&concat[idx..]);

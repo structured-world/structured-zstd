@@ -67,8 +67,9 @@ pub(crate) const DFAST_TARGET_LEN: usize = 48;
 // `[u32; N]` array), `long_hash` sized `1 << DFAST_HASH_BITS` and
 // `short_hash` one bit smaller via `DFAST_SHORT_HASH_BITS_DELTA`.
 // Two-table footprint at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`,
-// exact donor parity. The `_search_next_long` retry lives in
-// `DfastMatchGenerator::find_best_match`. Earlier revisions kept a
+// exact upstream parity. The `_search_next_long` retry lives in
+// `DfastMatchGenerator::hash_candidate` (called via
+// `best_match`). Earlier revisions kept a
 // 4-slot bucket per hash position; that paid 4× the donor memory
 // without measurable ratio gain once the retry was in place.
 //
@@ -678,12 +679,14 @@ impl MatchGeneratorDriver {
                 }
                 super::strategy::BackendTag::Dfast => {
                     // Dfast doesn't retain input Vecs — `history` is the
-                    // only byte store, so its `trim_to_window` has no
-                    // pool callback to invoke. Eviction byte count is
-                    // derived from the `window_size` delta before/after.
+                    // only byte store. The `trim_to_window` callback
+                    // shape is preserved for symmetry with HC/Row, but
+                    // the closure here is never invoked: eviction byte
+                    // count is derived from the `window_size` delta
+                    // before/after instead.
                     let dfast = self.dfast_matcher_mut();
                     let pre = dfast.window_size;
-                    dfast.trim_to_window();
+                    dfast.trim_to_window(|_| {});
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
@@ -6979,7 +6982,7 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 
     matcher.max_window_size = 8;
 
-    matcher.trim_to_window();
+    matcher.trim_to_window(|_| {});
 
     assert_eq!(
         matcher.window_size, 8,

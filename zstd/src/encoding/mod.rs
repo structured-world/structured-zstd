@@ -181,12 +181,20 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// grows that input `Vec` via power-of-two doubling — peak input
 /// allocation can be up to 2× the final source length transiently.
 /// At the moment that input buffer crosses ~128 KiB the output Vec
-/// seed kicks in concurrently, so the helper's true RSS peak is
-/// roughly `input.capacity() + 128 KiB` (or
-/// `input.capacity() + compress_bound(input.len())` for sub-128-KiB
-/// inputs). [`StreamingEncoder`] avoids the input materialization
-/// step entirely and is the right entry point when the source is
-/// large or unbounded.
+/// seed kicks in concurrently. The total live working set on this
+/// entry point is approximately
+/// `input.capacity() + output_vec_seed + internal_accumulators`,
+/// where `output_vec_seed` is `min(compress_bound(input.len()), 128
+/// KiB)` and `internal_accumulators` covers
+/// `FrameCompressor::all_blocks` (pre-reserved at frame start, up to
+/// ~130 KiB at default block cap) plus per-block scratch (hash tables,
+/// literal/sequence staging). Round the helper's RSS peak to
+/// `input.capacity() + output_vec_seed + ~130 KiB internal +
+/// per-block scratch` rather than the bare `input.capacity() + 128
+/// KiB` figure quoted in earlier revisions, which only accounted for
+/// the output seed. [`StreamingEncoder`] avoids the input
+/// materialization step entirely and is the right entry point when
+/// the source is large or unbounded.
 ///
 /// ```rust
 /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
