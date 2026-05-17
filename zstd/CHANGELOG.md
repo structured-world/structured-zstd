@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21](https://github.com/structured-world/structured-zstd/compare/v0.0.20...v0.0.21) - 2026-05-17
+
+### Added
+
+- *(encoding)* #23 add donor _fromBorders pre-split heuristic + broaden level coverage ([#140](https://github.com/structured-world/structured-zstd/pull/140))
+
+### Fixed
+
+- *(release)* untrack fuzz crash artifacts already gitignored ([#148](https://github.com/structured-world/structured-zstd/pull/148))
+- *(bench)* restore sample_size=10, raise measurement_time to clear criterion floor ([#144](https://github.com/structured-world/structured-zstd/pull/144))
+
+### Performance
+
+- *(7pre)* enablement — donor outer/inner dfast Level 3 + cross-level FSE cache ([#146](https://github.com/structured-world/structured-zstd/pull/146))
+- *(encoding)* #18 Phase 5 — LDM producer (gear hash + bucket table + search/emit) ([#139](https://github.com/structured-world/structured-zstd/pull/139))
+- *(encoding)* #124 Phase 4 — HC speculative tail check + MatcherStorage enum dispatch ([#125](https://github.com/structured-world/structured-zstd/pull/125))
+- *(encoding)* #111 Phase 3 — const-generic Strategy dispatch ([#123](https://github.com/structured-world/structured-zstd/pull/123))
+- *(encoding)* #111 Phase 2 — saturating_* cleanup on hot path ([#121](https://github.com/structured-world/structured-zstd/pull/121))
+
+### Refactored
+
+- *(encoding)* #111 Phase 1e — migrate methods off HcMatchGenerator (Stages A–D) ([#119](https://github.com/structured-world/structured-zstd/pull/119))
+- *(encoding)* #111 Phase 1d — split HcMatchGenerator into MatchTable / HcMatcher / BtMatcher ([#118](https://github.com/structured-world/structured-zstd/pull/118))
+- *(encoding)* #111 Phase 1c — extract Simple matcher into simple/ ([#117](https://github.com/structured-world/structured-zstd/pull/117))
+- *(encoding)* #111 Phase 1b — extract shared match-finder helpers ([#116](https://github.com/structured-world/structured-zstd/pull/116))
+- *(encoding)* #111 Phase 1 — structural split of match_generator monolith ([#113](https://github.com/structured-world/structured-zstd/pull/113))
+
+### Testing
+
+- *(fuzz)* make test_all_artifacts skip when corpus dir is absent ([#151](https://github.com/structured-world/structured-zstd/pull/151))
+
+### Bench
+
+- add real peak-alloc metric for full encode/decode/memory baseline ([#143](https://github.com/structured-world/structured-zstd/pull/143))
+
 ## [0.0.20](https://github.com/structured-world/structured-zstd/compare/v0.0.19...v0.0.20) - 2026-05-12
 
 ### Performance
