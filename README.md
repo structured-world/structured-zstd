@@ -11,7 +11,7 @@
 
 ```toml
 [dependencies]
-structured-zstd = "0.0.20"
+structured-zstd = "0.0.21"
 ```
 
 ```rust
@@ -24,7 +24,7 @@ For `no_std` builds disable the default features:
 
 ```toml
 [dependencies]
-structured-zstd = { version = "0.0.20", default-features = false }
+structured-zstd = { version = "0.0.21", default-features = false }
 ```
 
 ## Status
