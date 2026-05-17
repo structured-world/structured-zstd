@@ -13,25 +13,12 @@ benchmark-delta.md
 benchmark-relative.json
 fuzz/corpus
 zstd/fuzz/corpus
-# Ignore fresh fuzz crash artifacts by default — they pile up locally
-# during `cargo fuzz run` sessions. Tracked regressions are whitelisted
-# explicitly below so they ride along with their `tests/fuzz_regressions.rs`
-# counterpart and stay reproducible from a clean checkout.
-#
-# NB: use the `**` pattern (NOT trailing-slash) on the parent. With
-# `zstd/fuzz/artifacts/` git excludes the directory itself, which
-# blocks any subsequent negation from re-including nested files.
-# `zstd/fuzz/artifacts/**` matches children only, leaving the parent
-# directory traversable.
+# Fresh fuzz crashes from local `cargo fuzz run` sessions are CI/local
+# scratch — they live in the runner. Pre-existing tracked artifacts
+# under `decode/`, `fse/`, `huff0/` keep working because git tracks
+# them by index regardless of this pattern; new untracked crashes
+# stop polluting `git status`.
 zstd/fuzz/artifacts/**
-!zstd/fuzz/artifacts/decode/
-!zstd/fuzz/artifacts/decode/crash-*
-!zstd/fuzz/artifacts/fse/
-!zstd/fuzz/artifacts/fse/crash-*
-!zstd/fuzz/artifacts/huff0/
-!zstd/fuzz/artifacts/huff0/crash-*
-!zstd/fuzz/artifacts/interop/
-!zstd/fuzz/artifacts/interop/crash-*
 .idea
 /=
 AGENTS.md

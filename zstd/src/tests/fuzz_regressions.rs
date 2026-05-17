@@ -49,7 +49,14 @@ fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
     use crate::encoding::{CompressionLevel, compress_to_vec};
 
+    // Bytes inline; the original libFuzzer artifact file was
+    // content-hashed (`crash-01be...0dc7`) so any future fuzz run
+    // that re-discovers the same root cause via a different input
+    // would land in a different filename anyway — the literal is
+    // the canonical regression vector, not the artifact path.
+    // Base64 `BGAuICAKIA==`.
     let data: &[u8] = &[0x04, 0x60, 0x2e, 0x20, 0x20, 0x0a, 0x20];
+
     // Pin to `Level(3)` rather than `Default` so this regression keeps
     // covering the dfast fast loop specifically — the original UB
     // surfaced through level 3 dfast, and pinning here means a future
@@ -70,6 +77,10 @@ fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     frame_dec
         .decode_blocks(&mut cursor, BlockDecodingStrategy::All)
         .unwrap();
-    let decoded = frame_dec.collect().unwrap_or_default();
+    // `expect` over `unwrap_or_default`: a real decoder failure must
+    // surface as a "decoder returned None" panic, not as an empty
+    // `decoded` that then fails `assert_eq!` with a misleading
+    // "left: [] right: [04 60 ...]" diff that hides the real cause.
+    let decoded = frame_dec.collect().expect("decoder returned no payload");
     assert_eq!(decoded.as_slice(), data);
 }

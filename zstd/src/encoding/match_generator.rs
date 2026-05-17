@@ -3837,11 +3837,16 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
 /// only literals here and the assertion would catch the silent
 /// 5-byte miss.
 ///
-/// Layout (32 B): `"ABCDE????????????????????????ABCDE???"` — the
-/// trailing `"ABCDE"` repeats the 5-byte prefix at offset 28 and the
-/// 6th byte differs (`'?'` vs `'?'`... actually they are the same;
-/// fixture pinned below to make the mismatch explicit). A 5-byte
-/// match must be emitted; a 6-byte+ match must NOT.
+/// Fixture layout (34 B):
+///   bytes 0..5    `"ABCDE"`  — match source
+///   bytes 5..28   `'!'` × 23 — filler that does NOT start with 'A'
+///   bytes 28..33  `"ABCDE"`  — match site (repeats the prefix)
+///   byte  33      `'F'`      — terminator: differs from byte 5 (`'!'`),
+///                              so the forward extension at the match
+///                              site stops at exactly length 5.
+///
+/// A 5-byte match at offset 28 must be emitted; a 6-byte+ match at the
+/// same offset must NOT.
 #[test]
 fn dfast_accepts_exact_five_byte_match() {
     // Layout the input so that:

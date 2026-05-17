@@ -492,6 +492,19 @@ impl DfastMatchGenerator {
         current_len: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
+        // Behaviour change vs the pre-refactor `start_matching_general`:
+        // this fast loop deliberately drops the strict-incompressible
+        // early-skip path (the `block_looks_incompressible_strict` short
+        // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
+        // The step ramp is now driven purely by distance traveled
+        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, donor parity except
+        // donor uses 256 — see "Donor-deviation audit" in the PR body),
+        // so blocks the strict gate used to bail out of early now scan
+        // through the standard ramp. `block_looks_incompressible_strict`
+        // is still used by `levels/fastest.rs` for the Fastest preset
+        // and by `incompressible.rs` unit tests, so the helper itself
+        // stays.
+        //
         // Donor outer/inner structure (`zstd_double_fast.c:167-322`):
         //   * outer `while(1)` runs once per match-found-and-stored;
         //   * inner `do { ... } while (ip1 <= ilimit)` carries `hl0`,
@@ -952,12 +965,18 @@ impl DfastMatchGenerator {
             // producer was about to re-probe.
             //
             // At the floor `match_len == DONOR_REP_MIN_MATCH_LEN (= 4)`
-            // the three targets collapse to two distinct positions
-            // (`curr+2`, `ip-1` map to the same offset, `ip-2 == curr+2`).
-            // Single-slot overwrite is idempotent so the duplicate
-            // write is correctness-neutral; it's one wasted store on
+            // the three targets collapse to two distinct positions.
+            // With `post_match_end = abs_pos + 4` the three offsets
+            // resolve to:
+            //   `curr + 2` = abs_pos + 2
+            //   `ip - 2`   = abs_pos + 4 - 2 = abs_pos + 2  ← same as curr+2
+            //   `ip - 1`   = abs_pos + 4 - 1 = abs_pos + 3  ← distinct
+            // So `curr+2` and `ip-2` write the same slot twice;
+            // single-slot overwrite is idempotent, so the duplicate
+            // write is correctness-neutral. It's one wasted store on
             // the shortest rep extension and not worth a branch to
-            // dedup. For `match_len >= 5` all three are distinct.
+            // dedup. For `match_len >= 5` all three offsets are
+            // distinct.
             let post_match_end = abs_pos + match_len;
             let insert_targets = [
                 abs_pos + 2,                      // curr + 2

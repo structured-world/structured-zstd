@@ -93,14 +93,20 @@ use alloc::vec::Vec;
 pub(crate) const BETTER_WINDOW_LOG: u8 = 23;
 
 /// Donor-parity worst-case compressed-size bound for `src_size`
-/// uncompressed bytes, mirroring `ZSTD_COMPRESSBOUND` in
-/// `lib/zstd.h`:
+/// uncompressed bytes. The canonical definition lives in donor
+/// `lib/zstd.h` (zstd 1.5.7) as the `ZSTD_COMPRESSBOUND(srcSize)`
+/// macro; the formula below mirrors the active branch of that macro
+/// for the size range we hit in practice. If the macro changes in a
+/// future donor revision, treat the donor header as authoritative
+/// and re-derive this function — do NOT trust the inline copy
+/// without cross-checking.
+///
+/// Inline approximation (this revision):
 ///
 /// ```text
-/// ZSTD_COMPRESSBOUND(srcSize) =
-///     srcSize
+/// srcSize
 ///   + (srcSize >> 8)
-///   + (srcSize < 128 KB ? (128 KB - srcSize) >> 11 : 0)
+///   + (srcSize < 128 KiB ? ((128 KiB - srcSize) >> 11) : 0)
 /// ```
 ///
 /// Consulted by [`compress_slice_to_vec`] for the small-input branch
@@ -151,10 +157,23 @@ pub fn compress<R: Read, W: Write>(source: R, target: W, level: CompressionLevel
 /// can provide a source-size hint to the one-shot encoder path. Peak memory can
 /// therefore be roughly `input_size + output_size`. For very large payloads or
 /// tighter memory budgets, prefer streaming APIs such as [`StreamingEncoder`].
+///
+/// **Peak-memory shape change in this revision.** The implementation
+/// delegates to [`compress_slice_to_vec`], which seeds the output
+/// `Vec` with `min(compress_bound(input.len()), OUTPUT_BLOCK_CAP =
+/// 128 KiB)` instead of the previous `Vec::new()` (zero-capacity +
+/// power-of-two growth). For inputs in the few-KiB to ~128 KiB range
+/// this is a strict improvement (no doubling spikes inside the
+/// measured window). For inputs significantly larger than 128 KiB the
+/// allocation curve still grows by amortized doubling but starts from
+/// a 128 KiB floor rather than 0. Downstream consumers that measure
+/// peak RSS on this entry point will see a different curve than
+/// pre-revision; bench shape, not steady-state, is what changed.
+///
 /// ```rust
 /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
 /// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
-/// let compressed = compress_to_vec(data, CompressionLevel::Fastest);
+/// let compressed = compress_to_vec(data, CompressionLevel::Default);
 /// ```
 pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
     let mut source = source;
