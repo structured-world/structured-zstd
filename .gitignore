@@ -13,8 +13,15 @@ benchmark-delta.md
 benchmark-relative.json
 fuzz/corpus
 zstd/fuzz/corpus
+# Fresh fuzz crashes from local `cargo fuzz run` sessions are CI/local
+# scratch — they live in the runner. Pre-existing tracked artifacts
+# under `decode/`, `fse/`, `huff0/` keep working because git tracks
+# them by index regardless of this pattern; new untracked crashes
+# stop polluting `git status`.
+zstd/fuzz/artifacts/**
 .idea
 /=
 AGENTS.md
 .claude/
+.local/
 **/__pycache__/

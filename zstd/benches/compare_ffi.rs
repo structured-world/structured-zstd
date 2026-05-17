@@ -213,7 +213,7 @@ fn bench_compress(c: &mut Criterion) {
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
-                let rust_compressed = structured_zstd::encoding::compress_to_vec(
+                let rust_compressed = structured_zstd::encoding::compress_slice_to_vec(
                     &scenario.bytes[..],
                     level.rust_level,
                 );
@@ -230,7 +230,7 @@ fn bench_compress(c: &mut Criterion) {
 
             group.bench_function("pure_rust", |b| {
                 b.iter(|| {
-                    black_box(structured_zstd::encoding::compress_to_vec(
+                    black_box(structured_zstd::encoding::compress_slice_to_vec(
                         &scenario.bytes[..],
                         level.rust_level,
                     ))
@@ -250,8 +250,10 @@ fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
-            let rust_compressed =
-                structured_zstd::encoding::compress_to_vec(&scenario.bytes[..], level.rust_level);
+            let rust_compressed = structured_zstd::encoding::compress_slice_to_vec(
+                &scenario.bytes[..],
+                level.rust_level,
+            );
             let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
             let expected_len = scenario.len();
             bench_decompress_source(
