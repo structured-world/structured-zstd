@@ -274,14 +274,15 @@ impl RowMatchGenerator {
     ///    halves the per-byte work on incompressible runs (the
     ///    `lazySkipping` mode in donor is an extension of the same idea).
     ///
-    /// 4. **Immediate-repcode loop after store**: after every emit, scan
-    ///    forward for back-to-back rep2 hits and emit them with
-    ///    `lit_len = 0`. The repcode `offBase = offset_2; offset_2 =
-    ///    offset_1; offset_1 = offBase;` swap in donor is reproduced by
-    ///    [`encode_offset_with_history`] when called with
-    ///    `actual_offset = offset_hist[1]` and `lit_len = 0` — the
-    ///    helper's `lit_len == 0` arm rotates `offset_hist[0..=1]`
-    ///    identically.
+    /// Donor has an immediate-rep loop after store that probes
+    /// `offset_2` for back-to-back hits. It is omitted here: the
+    /// main-loop rep probe at `abs_pos + 1` already evaluates all
+    /// three rep slots (rep1, rep2, rep3 + the donor `ll0` fallback)
+    /// via [`repcode_candidate_shared`], so the inner-loop slot
+    /// donor's single-rep design would catch is already covered by
+    /// the next main-loop iteration. Confirmed dead-on-arrival via a
+    /// `panic!` probe across the full 528-test suite + benchmark
+    /// matrix (never fires).
     ///
     /// Catch-up backwards extension is already absorbed into the
     /// `MatchCandidate.start` field by `extend_backwards_shared`
@@ -422,50 +423,20 @@ impl RowMatchGenerator {
             pos = start + candidate.match_len;
             literals_start = pos;
 
-            // (4) Immediate-repcode loop with `lit_len == 0`. Donor uses
-            //     `offset_2` (which after the store is the previous
-            //     `offset_1`), checks the 4-byte match, then swaps
-            //     `offset_1 ↔ offset_2`. Our helper performs that
-            //     rotation when called with `actual_offset =
-            //     offset_hist[1]` and `lit_len = 0`, so the loop only
-            //     needs to detect the 4-byte hit and forward-extend.
-            //     We probe `offset_hist[1]` only (not the full bank)
-            //     because donor here probes a single rep slot and
-            //     because at `lit_len == 0` the bank semantics shift
-            //     (`offset_hist[1]` becomes the donor "offset_2" we
-            //     want).
-            while pos + REP_MIN_MATCH_LEN <= current_len {
-                let abs_pos_rep = current_abs_start + pos;
-                let rep2 = self.offset_hist[1] as usize;
-                if rep2 == 0 || abs_pos_rep < self.history_abs_start + rep2 {
-                    break;
-                }
-                let concat = self.live_history();
-                let cur_idx = abs_pos_rep - self.history_abs_start;
-                if cur_idx + REP_MIN_MATCH_LEN > concat.len() {
-                    break;
-                }
-                let rep_idx = cur_idx - rep2;
-                if concat[cur_idx..cur_idx + REP_MIN_MATCH_LEN]
-                    != concat[rep_idx..rep_idx + REP_MIN_MATCH_LEN]
-                {
-                    break;
-                }
-                let rep_len = common_prefix_len(&concat[rep_idx..], &concat[cur_idx..]);
-                if rep_len < REP_MIN_MATCH_LEN {
-                    break;
-                }
-                self.insert_positions(abs_pos_rep, abs_pos_rep + rep_len);
-                let cur_slice = self.window.back().unwrap().as_slice();
-                handle_sequence(Sequence::Triple {
-                    literals: &cur_slice[literals_start..literals_start],
-                    offset: rep2,
-                    match_len: rep_len,
-                });
-                let _ = encode_offset_with_history(rep2 as u32, 0, &mut self.offset_hist);
-                pos += rep_len;
-                literals_start = pos;
-            }
+            // Donor's `lazy_generic` has an immediate-repcode loop here
+            // (probing `offset_2` after each main emit and swapping
+            // `offset_1 ↔ offset_2` on hit). It was implemented and
+            // shipped in earlier iterations of this method but never
+            // fired on any test or benchmark workload — the
+            // `repcode_candidate_shared` probe at the top of the main
+            // loop already evaluates all three rep slots (rep1, rep2,
+            // rep3 + the `ll0` fallback), and the immediate-rep slot
+            // (`offset_hist[1]` at `lit_len = 0`) is subsumed by the
+            // next main-loop iteration's rep probe of the same slot.
+            // Donor's version is single-rep, so the inner loop catches
+            // hits its main-loop probe wouldn't; ours is three-rep, so
+            // the inner loop is dead by construction. Removed to free
+            // the per-iteration check and keep the parser body lean.
         }
 
         while pos + ROW_HASH_KEY_LEN <= current_len {

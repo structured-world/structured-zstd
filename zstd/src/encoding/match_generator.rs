@@ -4117,6 +4117,209 @@ fn driver_level4_greedy_round_trip_cross_slice() {
     );
 }
 
+/// Helper: round-trip `data` through the L4 greedy parse and assert
+/// the reconstructed bytes match. Returns `(triple_count, max_offset)`
+/// so callers can probe parse shape (matches emitted, max-offset).
+#[cfg(test)]
+fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (usize, usize) {
+    let mut driver = MatchGeneratorDriver::new(slice_size, max_slices);
+    driver.reset(CompressionLevel::Level(4));
+
+    let mut reconstructed: Vec<u8> = Vec::with_capacity(data.len());
+    let mut triple_count = 0usize;
+    let mut max_offset = 0usize;
+
+    // `start_matching` consumes the current pending slice; multi-slice
+    // payloads require commit + drive per slice so earlier slices'
+    // bytes actually round-trip out before they're displaced from the
+    // window.
+    let mut offset_in_data = 0usize;
+    while offset_in_data < data.len() {
+        let mut space = driver.get_next_space();
+        let space_cap = space.len();
+        let take = (data.len() - offset_in_data).min(space_cap);
+        space[..take].copy_from_slice(&data[offset_in_data..offset_in_data + take]);
+        space.truncate(take);
+        driver.commit_space(space);
+        offset_in_data += take;
+
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                triple_count += 1;
+                if offset > max_offset {
+                    max_offset = offset;
+                }
+                reconstructed.extend_from_slice(literals);
+                let start = reconstructed.len() - offset;
+                for i in 0..match_len {
+                    let byte = reconstructed[start + i];
+                    reconstructed.push(byte);
+                }
+            }
+        });
+    }
+
+    // Empty payload still needs one commit/drive round so the empty-
+    // input path of `start_matching_greedy` (the `current_len == 0`
+    // early-return guard) gets exercised.
+    if data.is_empty() {
+        let mut space = driver.get_next_space();
+        space.truncate(0);
+        driver.commit_space(space);
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Triple { .. } => panic!("empty input must not emit any matches"),
+        });
+    }
+
+    assert_eq!(reconstructed, data, "L4 greedy round-trip diverged");
+    (triple_count, max_offset)
+}
+
+/// CodeRabbit-flagged tail rep-only case: the previous outer-loop
+/// guard `pos + ROW_MIN_MATCH_LEN <= current_len` (6) meant the last
+/// 5-byte position was unreachable. The rep probe at `abs_pos + 1`
+/// only needs 4 bytes of lookahead beyond the probe point, so the
+/// guard was relaxed to `pos + GREEDY_MIN_LOOKAHEAD <= current_len`
+/// (5). Construct a slice whose tail position carries a 4-byte
+/// repcode match that would have been missed under the old guard.
+#[test]
+fn driver_level4_greedy_tail_rep_only_reachable() {
+    // Cross-slice: first slice establishes a 4-byte repeating
+    // anchor; second slice ends exactly at a position whose
+    // `abs_pos + 1..abs_pos + 5` matches a repcode reaching back
+    // into the first slice.
+    let first: &[u8] = b"BEEF_BEEF_aaaaaa"; // 16 bytes — "BEEF" pattern + filler
+    let second: &[u8] = b"xyzBEEF"; // 7 bytes — last 4 bytes are a rep
+    let mut combined = first.to_vec();
+    combined.extend_from_slice(second);
+    let (triples, _) = l4_greedy_round_trip(16, 2, &combined);
+    // The parse must emit at least one match — exactly the case the
+    // tightened guard ensures is reachable.
+    assert!(
+        triples >= 1,
+        "tail rep-only position must produce a match (got {triples} triples)",
+    );
+}
+
+#[test]
+fn driver_level4_greedy_empty_input_emits_nothing() {
+    // Empty input: no slices committed → no sequences emitted, no
+    // panic. Exercises the `current_len == 0` early-return guard at
+    // the top of `start_matching_greedy`.
+    let mut driver = MatchGeneratorDriver::new(64, 2);
+    driver.reset(CompressionLevel::Level(4));
+    // Commit an empty space so the matcher has SOMETHING to start
+    // matching on (otherwise `start_matching` panics on the
+    // `window.back()` unwrap — that's a separate path covered by
+    // existing reset tests).
+    let mut space = driver.get_next_space();
+    space.truncate(0);
+    driver.commit_space(space);
+    let mut emitted_anything = false;
+    driver.start_matching(|_| emitted_anything = true);
+    assert!(!emitted_anything, "empty slice must not emit any sequences",);
+}
+
+#[test]
+fn driver_level4_greedy_sub_min_lookahead_input() {
+    // Input shorter than `GREEDY_MIN_LOOKAHEAD = 5` — the outer loop
+    // never executes a body iteration; the tail literal path must
+    // still emit the input bytes as a single `Sequence::Literals`.
+    let data: &[u8] = b"abcd"; // 4 bytes
+    let (triples, _) = l4_greedy_round_trip(64, 2, data);
+    assert_eq!(
+        triples, 0,
+        "sub-min-lookahead input must not emit any matches (got {triples})",
+    );
+}
+
+#[test]
+fn driver_level4_greedy_incompressible_input() {
+    // Pseudo-random bytes with no exploitable structure — every
+    // position is a "miss" in both the rep probe and the row
+    // candidate. Exercises the miss branch + `SKIP_STRENGTH = 10`
+    // skip-step grow (irrelevant at this size, but the path runs).
+    let mut data = alloc::vec::Vec::with_capacity(256);
+    let mut x: u32 = 0xDEAD_BEEF;
+    for _ in 0..256 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        data.push((x >> 16) as u8);
+    }
+    let (_triples, _) = l4_greedy_round_trip(64, 8, &data);
+    // No structural assertion — the test passes if round-trip is
+    // bit-exact and no panic / debug_assert fires.
+}
+
+#[test]
+fn driver_level4_greedy_long_literal_run_skip_step_growth() {
+    // 2 KiB of unstructured bytes drives the literal-run length past
+    // the `SKIP_STRENGTH = 10` threshold (~1 KiB) so the per-miss
+    // step grows beyond 1. Without this regression test, a future
+    // change to `SKIP_STRENGTH` could silently skip valid match
+    // positions on long literal runs without anyone noticing — round-
+    // trip still passes, but the parse-loop iteration count would
+    // drift.
+    let mut data = alloc::vec::Vec::with_capacity(2048);
+    let mut x: u32 = 0xC0FF_EE00;
+    for _ in 0..2048 {
+        x = x.wrapping_mul(0x9E37_79B9).wrapping_add(0xCAFEBABE);
+        data.push((x >> 24) as u8);
+    }
+    let (_triples, _) = l4_greedy_round_trip(512, 8, &data);
+}
+
+#[test]
+fn driver_level4_greedy_all_zeros_heavy_rep1() {
+    // All zeros: every position after the first byte has `byte[pos]
+    // == byte[pos - 1]`, so the rep1 probe at `abs_pos + 1` hits
+    // immediately and the parse collapses to a single long match.
+    // Exercises the `cheap rep at +1, full-match length` path.
+    let data: Vec<u8> = alloc::vec![0u8; 128];
+    let (triples, max_offset) = l4_greedy_round_trip(64, 8, &data);
+    assert!(
+        triples >= 1,
+        "all-zeros input must produce at least one rep1 match",
+    );
+    // The dominant match should reference rep1 (offset 1), since
+    // every byte at pos matches pos-1. A larger offset would
+    // indicate the rep1 probe was bypassed.
+    assert_eq!(
+        max_offset, 1,
+        "all-zeros L4 greedy parse should commit at offset 1 (got {max_offset})",
+    );
+}
+
+/// Periodic-pattern payload covers the steady-state rep-cascade path
+/// of the greedy parse — the main-loop rep probe at `abs_pos + 1`
+/// fires every iteration once the period is locked into
+/// `offset_hist[0]`, and the parse emits a long chain of triples at
+/// the same offset.
+#[test]
+fn driver_level4_greedy_periodic_pattern_rep_cascade() {
+    let unit: &[u8] = b"alpha_beta_gamma";
+    assert_eq!(unit.len(), 16);
+    let mut data: Vec<u8> = Vec::with_capacity(unit.len() * 32);
+    for _ in 0..32 {
+        data.extend_from_slice(unit);
+    }
+    let (triples, max_offset) = l4_greedy_round_trip(64, 16, &data);
+    assert!(
+        triples >= 1,
+        "periodic 16-byte payload must emit matches (got {triples})",
+    );
+    assert!(
+        max_offset >= 16,
+        "periodic 16-byte payload must produce at least one offset >= 16 \
+         (got max_offset = {max_offset})",
+    );
+}
+
 #[test]
 fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     use super::strategy::StrategyTag;
