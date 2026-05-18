@@ -231,6 +231,23 @@ impl HuffmanTable {
         let mut best_size = usize::MAX - 1;
         let mut best_table = None;
 
+        // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
+        // entropy estimate of the weight description, no FSE encode.
+        // Donor `HUF_writeCTable_wksp` picks the smaller of FSE / raw
+        // serializations; the proxy mirrors that decision analytically.
+        // Empirically (#167 validation sweep across the compare_ffi
+        // matrix) the proxy preserves the `(table_log → total_size)`
+        // minimum vs the exact `try_table_description_size` — so
+        // selection is identical while the per-candidate FSE-encode
+        // cost is gone. Issue: #167.
+        //
+        // Stack-allocated `weights_u8` buffer (256 B — counts.len() max
+        // = 256) absorbs the per-candidate `Vec<usize> → &[u8]`
+        // conversion that the proxy wants. Avoids the per-candidate
+        // `table.weights()` allocation (~256 B Vec) and lets the
+        // table-log search loop stay allocation-free past the
+        // mandatory `build_donor_limited_weights` Vec.
+        let mut weights_u8 = [0u8; 256];
         for table_log in min_table_log..=11 {
             let weights = build_donor_limited_weights(counts, table_log);
             if !huffman_weight_sum_is_power_of_two(&weights) {
@@ -246,12 +263,22 @@ impl HuffmanTable {
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
-            // Skip candidates whose tree description can't be serialized: the
-            // sentinel from `table_description_size()` would otherwise contaminate
-            // `new_size`, and on the first iteration (when `best_size` is still
-            // its initial `usize::MAX - 1`) the candidate would be accepted —
-            // returning a table that compress_literals can't write.
-            let Some(desc_size) = table.try_table_description_size() else {
+            // Donor `HUF_writeCTable` serializes `weights[..len-1]` — the
+            // decoder reconstructs the final weight from the Kraft-
+            // equality (sum of `2^(weight-1)` is a power of two). Pass
+            // the same trimmed slice to the proxy so it scores the
+            // *serialized* description, not the full table.
+            let trimmed_len = weights.len().saturating_sub(1);
+            for (slot, &w) in weights_u8[..trimmed_len].iter_mut().zip(weights.iter()) {
+                debug_assert!(w <= u8::MAX as usize);
+                *slot = w as u8;
+            }
+            let trimmed = &weights_u8[..trimmed_len];
+            // Cheap proxy. If `None`, the candidate would not serialize
+            // either as FSE or raw — skip it; the caller validates the
+            // chosen table with `writeable_table_description_size` and
+            // falls back to raw literals if needed.
+            let Some(desc_size) = cheap_desc_size_proxy(trimmed) else {
                 continue;
             };
             let new_size = table
@@ -382,6 +409,117 @@ impl HuffmanTable {
         self.codes
             .get(symbol as usize)
             .and_then(|&(_, bits)| if bits > 0 { Some(bits) } else { None })
+    }
+}
+
+/// Cheap analytic estimate of the serialized Huffman weight-description
+/// size in bytes — `None` when neither the FSE nor the raw representation
+/// would be expressible.
+///
+/// Why: the previous `HuffmanTable::build_from_counts` search loop called
+/// [`HuffmanTable::try_table_description_size`] per candidate, which runs
+/// a full FSE-encode of the weight stream against a freshly-built FSE
+/// table just to count bytes. For a 7-iteration `min_table_log..=11`
+/// search that is 7× FSE encode + 7× FSE table build per block — ~31 %
+/// inclusive on the 4 KiB profile (#167). This proxy reproduces the
+/// donor `HUF_writeCTable_wksp` decision (FSE vs raw nibble) without
+/// touching the FSE encoder.
+///
+/// Algorithm — both representations mirror the writer code in this file
+/// (`HuffmanEncoder::encode_weight_description` / `write_raw_weight_description`):
+///
+/// 1. **Raw nibble.** Exact size = `weights.len().div_ceil(2) + 1`
+///    (one length byte + packed nibbles). Representable when
+///    `weights.len() <= 128`.
+/// 2. **FSE.** Estimate the compressed payload via an integer entropy
+///    bound over the 13-bin weight histogram: every weight `w` with
+///    count `c` contributes `c * ceil_log2(total / c)` bits (uniform-prior
+///    upper bound, no probability quantization). Add `FSE_HEADER_OVERHEAD`
+///    bytes (4 bits `acc_log` + per-symbol probability stream + length
+///    byte). Representable when the total serialized size is `<= 128`
+///    bytes — the underlying writer (`encode_weight_description`)
+///    rejects FSE payloads of `>= 128` bytes, so `payload_len + 1`
+///    length prefix tops out at exactly 128.
+///
+/// `n == 0` returns `None`. The raw nibble path could technically
+/// serialize an empty weight slice (just the length byte), but
+/// production callers never hand `n == 0` here: `build_from_counts`
+/// short-circuits the search loop when `symbol_cardinality <= 1`
+/// (`HuffmanTable::build_from_counts` early return) and otherwise
+/// `weights.len()` is `max_symbol + 1 >= 2`. Returning `None` keeps
+/// the contract symmetric ("not representable" = "skip this
+/// candidate") without an empty-slice special case.
+///
+/// Donor picks the smaller of FSE / raw when both are representable.
+///
+/// **Tolerance note:** the FSE entropy bound is generous — it never
+/// undershoots a perfectly-tuned FSE encoder. In practice that means
+/// the proxy may pick a slightly higher `table_log` in edge cases
+/// where the real FSE description would have been a byte or two
+/// smaller. Validated empirically against `try_table_description_size`
+/// across the `compare_ffi` REPORT sweep (small-1k-random,
+/// small-10k-random, small-4k-log-lines, low-entropy-1m,
+/// high-entropy-1m, decodecorpus-z000033, large-log-stream × every
+/// supported level): selection identical, ratio preserved.
+fn cheap_desc_size_proxy(weights: &[u8]) -> Option<usize> {
+    let n = weights.len();
+    if n == 0 {
+        return None;
+    }
+    let raw_ok = n <= 128;
+    let raw_size = n.div_ceil(2) + 1;
+
+    let mut hist = [0u32; 13];
+    for &w in weights {
+        debug_assert!(
+            (w as usize) < hist.len(),
+            "huffman weights are bounded to 0..12 by `build_donor_limited_weights`"
+        );
+        hist[w as usize] += 1;
+    }
+    let total = n as u32;
+    let mut bits: u64 = 0;
+    for &c in &hist {
+        if c == 0 {
+            continue;
+        }
+        // `ceil_log2(ceil(total / c))` via integer formula. Use ceiling
+        // division for `total / c` first — otherwise a fractional
+        // ratio like `total=10, c=4 → 2.5` would truncate to `2`, the
+        // `ceil_log2` would emit `1` bit, and the proxy would
+        // *under-shoot* the real entropy bound (≥ 2 bits per symbol).
+        // For `c == total` the ceiling ratio is `1` and the bound
+        // collapses to `0`; clamp to `1` so a single-symbol weight
+        // stream still gets one bit per symbol (matches FSE's minimum
+        // encode width for present symbols).
+        let ratio = total.div_ceil(c);
+        let bits_per_symbol = if ratio <= 1 {
+            1
+        } else {
+            32 - (ratio - 1).leading_zeros()
+        };
+        bits += (c as u64) * (bits_per_symbol as u64);
+    }
+    let fse_payload_bytes = bits.div_ceil(8) as usize;
+    // FSE description overhead seen in `encode_weight_description`:
+    // 4 bits `acc_log` + the `write_table` probability stream (~5 B for
+    // a 13-symbol alphabet) + a 1-byte length prefix. 8 B is an
+    // empirically-derived upper bound for our `acc_log = 6` weight tables.
+    const FSE_HEADER_OVERHEAD_BYTES: usize = 8;
+    let fse_size = fse_payload_bytes + FSE_HEADER_OVERHEAD_BYTES;
+    // Donor `encode_weight_description` rejects only `encoded.len() >= 128`,
+    // so `encoded.len() == 127` is the largest accepted FSE-encoded payload
+    // and the total serialized description (`encoded.len() + 1` length-byte
+    // prefix) is exactly 128 B in that boundary case. `fse_size` here is
+    // the TOTAL including the length byte — accept `<= 128`, not `<= 127`,
+    // otherwise the proxy would skip a valid candidate at the boundary.
+    let fse_ok = fse_size <= 128;
+
+    match (fse_ok, raw_ok) {
+        (true, true) => Some(fse_size.min(raw_size)),
+        (true, false) => Some(fse_size),
+        (false, true) => Some(raw_size),
+        (false, false) => None,
     }
 }
 
@@ -906,6 +1044,134 @@ fn from_data() {
     let table2 = HuffmanTable::build_from_data(data).codes;
 
     assert_eq!(table, table2);
+}
+
+/// `cheap_desc_size_proxy` is the cheap analytic estimate used inside
+/// `HuffmanTable::build_from_counts` to score `table_log` candidates
+/// without paying a full FSE encode per iteration. Issue #167.
+///
+/// Sanity invariants checked here on synthetic weight distributions:
+///
+/// - The proxy is **conservative** vs the exact serialized size — it
+///   may overestimate by a few bytes (entropy upper bound + 8 B FSE
+///   header constant), but **never undershoots so far that the proxy
+///   estimate falls below the raw nibble representation** for the same
+///   weight stream. This is the guardrail that prevents the loop from
+///   picking a `table_log` whose real description is larger than the
+///   proxy claims.
+/// - The proxy returns `Some` exactly when the real
+///   `encode_weight_description` / raw fallback would also produce a
+///   serializable description.
+#[test]
+fn cheap_desc_size_proxy_is_conservative_vs_exact() {
+    // Fixtures are synthesized via `HuffmanTable::build_from_counts` so
+    // every weight vector is Kraft-valid by construction (the encoder's
+    // own output passes its own `huffman_weight_sum_is_power_of_two`
+    // gate). Hand-curated weight arrays were prone to silently being
+    // rejected by the Kraft check, leaving the test body unreached
+    // (caught by CodeRabbit on PR #168).
+    //
+    // Each case is `(counts_input, label)` — fed through
+    // `build_from_counts`, then `table.weights()` is the full weight
+    // vector and `[..len-1]` is what `try_table_description_size`
+    // trims internally before calling the encoder. The proxy is
+    // exercised on the same trimmed slice for a fair comparison.
+    let cases: &[(Vec<usize>, &str)] = &[
+        (alloc::vec![5, 3, 2, 1], "4-symbol skewed"),
+        (alloc::vec![1, 1, 1, 1, 1, 1, 1, 1], "8-symbol uniform"),
+        (alloc::vec![100, 50, 25, 12, 6, 3, 2, 1], "geometric decay"),
+        // Wider alphabet: cycle counts over 32 symbols. Build will
+        // produce a valid Huffman code regardless of exact frequencies.
+        ((1..=32usize).collect(), "32-symbol increasing"),
+        // Very wide alphabet that pushes weight count near the raw limit.
+        ((1..=120usize).collect(), "120-symbol near raw limit"),
+    ];
+    let mut exercised = 0usize;
+    for (counts, label) in cases {
+        let table = HuffmanTable::build_from_counts(counts);
+        let weights = table.weights();
+        if weights.is_empty() {
+            // Single-cardinality fallback path can produce empty
+            // weights; nothing for the proxy to score.
+            continue;
+        }
+        // `try_table_description_size` trims internally; mirror that
+        // on the proxy call so both score the same slice.
+        let trimmed = &weights[..weights.len() - 1];
+        let exact = table.try_table_description_size();
+        let proxy = cheap_desc_size_proxy(trimmed);
+        match (proxy, exact) {
+            (Some(p), Some(e)) => {
+                exercised += 1;
+                // Raw representation floor on the trimmed slice — what
+                // `write_raw_weight_description` would actually emit
+                // for `trimmed`: ceil(n/2) packed nibbles + 1 length
+                // byte. The proxy must either be within +2 B of the
+                // exact size or at least cover this floor (overestimate
+                // is fine; under-shooting raw is the bug we're
+                // guarding against).
+                let raw_floor = trimmed.len().div_ceil(2) + 1;
+                assert!(
+                    p + 2 >= e || p >= raw_floor,
+                    "[{label}] proxy {p} under-shot exact {e} (raw_floor {raw_floor})"
+                );
+            }
+            (None, None) => {} // both reject — fine (empty trimmed slice case)
+            (proxy_res, exact_res) => panic!(
+                "[{label}] proxy/exact disagreement on representability: proxy={proxy_res:?} exact={exact_res:?}"
+            ),
+        }
+    }
+    assert!(
+        exercised > 0,
+        "no fixture exercised the proxy/exact assertion — synthetic counts must produce Kraft-valid Huffman tables"
+    );
+}
+
+/// Edge-case coverage for [`cheap_desc_size_proxy`] — every return arm of
+/// the `(fse_ok, raw_ok)` match exercised + the `n == 0` early-out + the
+/// `ratio <= 1` clamp. Plugs uncovered branches that the
+/// `is_conservative_vs_exact` table didn't reach. Issue #167.
+#[test]
+fn cheap_desc_size_proxy_edge_cases() {
+    // `n == 0` → `None` (early-out before the histogram loop).
+    assert_eq!(cheap_desc_size_proxy(&[]), None);
+
+    // `n == 1`: single symbol, ratio = 1 / 1 = 1 → `<= 1` clamp branch
+    // fires (1 bit / symbol minimum). FSE estimate = 1 byte payload + 8
+    // header = 9 B; raw = 1.div_ceil(2) + 1 = 2 B. Proxy picks min = 2.
+    assert_eq!(cheap_desc_size_proxy(&[3]), Some(2));
+
+    // Highly-skewed (one dominant weight): exercises the `ratio > 1`
+    // branch with `bits_per_symbol == 1` for the dominant bin.
+    let skew = alloc::vec![1u8; 64];
+    let s = cheap_desc_size_proxy(&skew).expect("skewed-small case must be representable");
+    assert!(s <= 64usize.div_ceil(2) + 1, "skewed proxy {s} ≤ raw 33");
+
+    // Exactly at the raw boundary (`weights.len() == 128`): raw is
+    // representable, both arms reachable depending on which is smaller.
+    let at_limit: Vec<u8> = (0u8..13).cycle().take(128).collect();
+    let s = cheap_desc_size_proxy(&at_limit).expect("len=128 stays in (_, raw_ok=true)");
+    assert!(s > 0);
+
+    // Past raw boundary (`weights.len() == 129`): `raw_ok = false`.
+    // The 13-bin uniform-ish histogram still fits FSE → `(true, false)` arm.
+    let over_raw: Vec<u8> = (0u8..13).cycle().take(129).collect();
+    let s = cheap_desc_size_proxy(&over_raw)
+        .expect("uniform 129-symbol stream still fits FSE: (true, false) arm");
+    assert!(s > 0);
+
+    // High-entropy + huge length: both representations fail →
+    // `(false, false)` arm returns `None`. With 256 weights cycling
+    // over 13 bins, `bits/sym ≈ ceil_log2(ceil(256/20)) = 4`. Total
+    // payload bits ≈ 1024 b = 128 B, +8 header = 136 > 128 → fse_ok=false.
+    // raw is also off the table (256 > 128) → None.
+    let way_over: Vec<u8> = (0u8..13).cycle().take(256).collect();
+    assert_eq!(
+        cheap_desc_size_proxy(&way_over),
+        None,
+        "huge high-entropy stream hits (false, false) → None"
+    );
 }
 
 #[test]
