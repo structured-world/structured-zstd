@@ -455,11 +455,16 @@ fn cheap_desc_size_proxy(weights: &[u8]) -> Option<usize> {
         if c == 0 {
             continue;
         }
-        // `ceil_log2(total / c)` via integer formula. For c == total the
-        // ratio is 1 and the bound collapses to 0; clamp to 1 so a
-        // single-symbol weight stream still gets one bit per symbol
-        // (matches FSE's minimum encode width for present symbols).
-        let ratio = total / c;
+        // `ceil_log2(ceil(total / c))` via integer formula. Use ceiling
+        // division for `total / c` first — otherwise a fractional
+        // ratio like `total=10, c=4 → 2.5` would truncate to `2`, the
+        // `ceil_log2` would emit `1` bit, and the proxy would
+        // *under-shoot* the real entropy bound (≥ 2 bits per symbol).
+        // For `c == total` the ceiling ratio is `1` and the bound
+        // collapses to `0`; clamp to `1` so a single-symbol weight
+        // stream still gets one bit per symbol (matches FSE's minimum
+        // encode width for present symbols).
+        let ratio = total.div_ceil(c);
         let bits_per_symbol = if ratio <= 1 {
             1
         } else {
@@ -1067,6 +1072,52 @@ fn cheap_desc_size_proxy_is_conservative_vs_exact() {
             ),
         }
     }
+}
+
+/// Edge-case coverage for [`cheap_desc_size_proxy`] — every return arm of
+/// the `(fse_ok, raw_ok)` match exercised + the `n == 0` early-out + the
+/// `ratio <= 1` clamp. Plugs uncovered branches that the
+/// `is_conservative_vs_exact` table didn't reach. Issue #167.
+#[test]
+fn cheap_desc_size_proxy_edge_cases() {
+    // `n == 0` → `None` (early-out before the histogram loop).
+    assert_eq!(cheap_desc_size_proxy(&[]), None);
+
+    // `n == 1`: single symbol, ratio = 1 / 1 = 1 → `<= 1` clamp branch
+    // fires (1 bit / symbol minimum). FSE estimate = 1 byte payload + 8
+    // header = 9 B; raw = 1.div_ceil(2) + 1 = 2 B. Proxy picks min = 2.
+    assert_eq!(cheap_desc_size_proxy(&[3]), Some(2));
+
+    // Highly-skewed (one dominant weight): exercises the `ratio > 1`
+    // branch with `bits_per_symbol == 1` for the dominant bin.
+    let skew = alloc::vec![1u8; 64];
+    let s = cheap_desc_size_proxy(&skew).expect("skewed-small case must be representable");
+    assert!(s <= 64usize.div_ceil(2) + 1, "skewed proxy {s} ≤ raw 33");
+
+    // Exactly at the raw boundary (`weights.len() == 128`): raw is
+    // representable, both arms reachable depending on which is smaller.
+    let at_limit: Vec<u8> = (0u8..13).cycle().take(128).collect();
+    let s = cheap_desc_size_proxy(&at_limit).expect("len=128 stays in (_, raw_ok=true)");
+    assert!(s > 0);
+
+    // Past raw boundary (`weights.len() == 129`): `raw_ok = false`.
+    // The 13-bin uniform-ish histogram still fits FSE → `(true, false)` arm.
+    let over_raw: Vec<u8> = (0u8..13).cycle().take(129).collect();
+    let s = cheap_desc_size_proxy(&over_raw)
+        .expect("uniform 129-symbol stream still fits FSE: (true, false) arm");
+    assert!(s > 0);
+
+    // High-entropy + huge length: both representations fail →
+    // `(false, false)` arm returns `None`. With 256 weights cycling
+    // over 13 bins, `bits/sym ≈ ceil_log2(ceil(256/20)) = 4`. Total
+    // payload bits ≈ 1024 B = 128 B, +8 header = 136 > 127 → fse_ok=false.
+    // raw is also off the table (256 > 128) → None.
+    let way_over: Vec<u8> = (0u8..13).cycle().take(256).collect();
+    assert_eq!(
+        cheap_desc_size_proxy(&way_over),
+        None,
+        "huge high-entropy stream hits (false, false) → None"
+    );
 }
 
 #[test]
