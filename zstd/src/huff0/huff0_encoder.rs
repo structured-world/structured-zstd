@@ -116,9 +116,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                 self.writer.append_bytes(fse_description);
                 return;
             }
-            let weights = self.weights();
-            let weights = &weights[..weights.len() - 1]; // don't encode last weight
-            Self::write_raw_weight_description(self.writer, weights);
+            self.write_raw_table_description();
             return;
         }
 
@@ -131,8 +129,14 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             self.writer.write_bits(fse_description.len() as u8, 8);
             self.writer.append_bytes(fse_description);
         } else {
-            Self::write_raw_weight_description(self.writer, weights);
+            self.write_raw_table_description();
         }
+    }
+
+    fn write_raw_table_description(&mut self) {
+        let weights = self.weights();
+        let weights = &weights[..weights.len() - 1]; // don't encode last weight
+        Self::write_raw_weight_description(self.writer, weights);
     }
 
     /// Encodes Huffman weights using FSE when that representation is valid and beneficial.
@@ -1325,10 +1329,10 @@ fn write_table_raw_path_initializes_none_cache() {
         writer.flush();
     }
     assert_eq!(encoded, expected);
-    assert_eq!(
-        table.cached_encoded_weight_description.get().map(Option::is_none),
-        Some(true)
-    );
+    assert!(matches!(
+        table.cached_encoded_weight_description.get(),
+        Some(None)
+    ));
 }
 
 #[test]
