@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779070914377,
+  "lastUpdate": 1779094415975,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -38666,6 +38666,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "85b7e1fdfb11d90c5fddfa27a1b68bab727382ab",
+          "message": "perf(fse): donor FSE_buildCTable_wksp parity — drop per-symbol Vec<State> (#166)\n\n* perf(fse): donor FSE_buildCTable_wksp parity — drop per-symbol Vec<State>\n\n#110. Replace O(num_symbols × table_size) builder loop + BTreeSet\ndedup with donor `FSE_buildCTable_wksp` (cumul + tableSymbol spread +\nsorted-by-symbol sweep). Production no longer materializes any\nper-state Vec; `nextStateTable` (`state_table_flat`) + `symbolTT`\nare everything the hot path needs. `start_state` and `max_num_bits`\nare precomputed once per symbol via donor 16.16 arithmetic and held\nin plain arrays — no per-symbol scan on read.\n\nTest parity check `fse::check_tables` rewritten to enumerate\n`next_state` over every (symbol, input_state) pair (was iterating\nthe per-symbol Vec). Same invariant, no live storage required.\n\nSpeed (small-4k-log-lines L2_dfast pure_rust): 83.7 µs → 47.4 µs\n(−43%, +77% throughput). z000033 L3 unchanged (entropy build was\nnot the bottleneck there). Ratio preserved across the matrix.\n\n501/501 lib tests, clippy clean.\n\n* test(fse): tighten decoder/encoder parity check; clarify Phase 3 doc comment\n\n- `fse::check_tables`: assert every `(symbol, input_state)` transition\n  lands on a decoder slot OWNED by that symbol (was silently skipping\n  cross-symbol transitions, which would mask a routing bug).\n- `build_table_from_probabilities` Phase 3 doc: rewrite to describe\n  the raw-slot Rust convention without misclaiming the code stores\n  `table_size + u` (donor representation); cross-reference\n  `FSETable::next_state` arithmetic that depends on the raw-slot form.\n\n* fix(fse): widen cumul prefix-sum to u32 for acc_log=16 round-trip\n\n`fse_decoder::FSETable::to_encoder_table` can round-trip through\n`build_table_from_probabilities` with `accuracy_log` up to\n`ENTRY_MAX_ACCURACY_LOG = 16`, where the prefix sum reaches\n`table_size = 65 536` — one past `u16::MAX`. The Phase-1 `cumul`\narray (and the Phase-3 `cursor` snapshot) must be `u32` so the\ncumulative count is representable for every valid `acc_log`. Slot\nindices written into `state_table_flat` stay in `0..table_size-1`\n(≤ `u16::MAX`) and remain `u16`.\n\n* fix(fse): debug_assert non-negative start_state index before usize cast\n\nDonor `FSE_initCState2` arithmetic guarantees `state_table_index ≥ 0`\nby construction, but the `isize → usize` cast at the indexing site\nwould silently wrap on regression. Add a `debug_assert!` so a future\narithmetic bug surfaces in dev builds instead of an out-of-bounds\npanic or wrong slot read.",
+          "timestamp": "2026-05-18T11:06:34+03:00",
+          "tree_id": "a7c9b483f209fcd41a02a40bcf49205150760916",
+          "url": "https://github.com/structured-world/structured-zstd/commit/85b7e1fdfb11d90c5fddfa27a1b68bab727382ab"
+        },
+        "date": 1779094414488,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.116,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.067,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 259.001,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 159.8,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.153,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.158,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.639,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.957,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.568,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.04,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.417,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.494,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.354,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.379,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.547,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.05,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.199,
             "unit": "ms"
           }
         ]
