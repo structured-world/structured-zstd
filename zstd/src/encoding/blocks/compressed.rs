@@ -952,21 +952,41 @@ impl SplitEstimator<'_> {
         }
         let entry = self.block_entry.clone();
         let (full, full_raw_fallback, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
-        // G3 — donor `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
-        // bails out to a single raw block when `estBlockSize > srcSize`,
-        // skipping the per-sub-block split work entirely. Our equivalent
-        // signal is `raw_fallback == true` on the whole-block probe: the
-        // estimator already decided the whole range will be emitted raw
-        // by the real encoder. Returning with `partitions` left empty
-        // lets `compress_block_with_post_split`'s outer loop emit the
-        // block as a single partition — `emit_single_sequence_block`
-        // then takes the expansion-fallback path and writes a raw block,
-        // matching donor while avoiding the bisect's recursive
-        // `estimate_subblock_size` walks that would have produced the
-        // same all-raw result anyway. Cheap insertion: the `full`
-        // probe ran whether or not bisect proceeds, so this adds zero
-        // estimator work on the bail-out path and saves all subsequent
-        // bisect probes on incompressible blocks.
+        // G3 — whole-block bail-out before partition split. Donor
+        // `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
+        // bails when `estBlockSize > srcSize` (strict). Our trigger is
+        // the `raw_fallback` flag from `estimate_subblock_size`, which
+        // fires on the **stricter** `emitted_payload >= source_len -
+        // min_gain` condition (where `min_gain = (source_len >> 8) + 2`,
+        // ≈0.4% margin — see line 917 of this file). So we bail in a
+        // narrow band `[source_len - min_gain, source_len + 3]` where
+        // donor would still recurse and *might* find a compressible
+        // split.
+        //
+        // Why this is safe ratio-wise:
+        // - The bail-out routes to `compress_block_with_post_split`'s
+        //   single-partition path → `emit_single_sequence_block` →
+        //   which has the SAME `min_gain` expansion fallback at line
+        //   779-780. So whatever block we bail on would have been
+        //   raw-fallbacked by the real emit anyway, by the same
+        //   threshold.
+        // - For a missed split-win to matter, both sub-blocks would
+        //   need to compress strictly (no raw-fallback in either
+        //   half), AND `cost(first) + cost(second) < source_len + 3`.
+        //   The wider donor band gives at most `min_gain` bytes of
+        //   theoretical recoverable ratio per block.
+        // - Empirically validated: `compare_ffi --list` REPORT lines
+        //   show **zero rust_bytes delta** vs main on every
+        //   (scenario, level) cell across the full bench matrix.
+        //
+        // Returning with `partitions` left empty lets the outer loop
+        // emit the block as a single partition, avoiding the bisect's
+        // recursive `estimate_subblock_size` walks. Cheap: the `full`
+        // probe ran whether or not bisect proceeds, so zero estimator
+        // work added on the bail-out path; significant work saved on
+        // long-input incompressible-ish blocks at high levels (where
+        // optimal parser produces > MIN_SEQUENCES_BLOCK_SPLITTING
+        // sequences).
         if full_raw_fallback {
             return;
         }
@@ -991,7 +1011,9 @@ impl SplitEstimator<'_> {
         {
             // Leaf: this range will be emitted as a single partition, so the
             // exit state is the post-state of that single-partition probe.
-            return self.estimate_subblock_size(start_idx, end_idx, &entry).2;
+            let (_cost, _raw_fallback, post) =
+                self.estimate_subblock_size(start_idx, end_idx, &entry);
+            return post;
         }
         let mid_idx = (start_idx + end_idx) / 2;
         let (first, _, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
@@ -1015,7 +1037,8 @@ impl SplitEstimator<'_> {
                 .derive_block_splits_with_full(mid_idx, end_idx, second, left_post, partitions);
         }
         // No split here — this range will be emitted as one partition.
-        self.estimate_subblock_size(start_idx, end_idx, &entry).2
+        let (_cost, _raw_fallback, post) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        post
     }
 }
 
