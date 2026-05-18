@@ -436,8 +436,19 @@ impl HuffmanTable {
 ///    count `c` contributes `c * ceil_log2(total / c)` bits (uniform-prior
 ///    upper bound, no probability quantization). Add `FSE_HEADER_OVERHEAD`
 ///    bytes (4 bits `acc_log` + per-symbol probability stream + length
-///    byte). Representable when the result is < 128 bytes (length-byte
-///    limit in `encode_weight_description`).
+///    byte). Representable when the total serialized size is `<= 128`
+///    bytes — the underlying writer (`encode_weight_description`)
+///    rejects FSE payloads of `>= 128` bytes, so `payload_len + 1`
+///    length prefix tops out at exactly 128.
+///
+/// `n == 0` returns `None`. The raw nibble path could technically
+/// serialize an empty weight slice (just the length byte), but
+/// production callers never hand `n == 0` here: `build_from_counts`
+/// short-circuits the search loop when `symbol_cardinality <= 1`
+/// (`HuffmanTable::build_from_counts` early return) and otherwise
+/// `weights.len()` is `max_symbol + 1 >= 2`. Returning `None` keeps
+/// the contract symmetric ("not representable" = "skip this
+/// candidate") without an empty-slice special case.
 ///
 /// Donor picks the smaller of FSE / raw when both are representable.
 ///
@@ -1053,53 +1064,68 @@ fn from_data() {
 ///   serializable description.
 #[test]
 fn cheap_desc_size_proxy_is_conservative_vs_exact() {
-    // Each case: (weights, label). All weights ∈ 0..=12. Each `weights`
-    // is a FULL weight vector (one entry per symbol, including the
-    // sentinel last entry); the test trims to `[..len-1]` before
-    // calling the proxy so it sees the same serialized slice that
-    // `try_table_description_size` (which trims internally) does on
-    // the exact path.
-    let cases: &[(Vec<u8>, &str)] = &[
-        (alloc::vec![1, 2, 3, 4, 5], "small uniform"),
-        (alloc::vec![1; 13], "all-ones 13"),
-        (alloc::vec![6; 50], "skewed dominant"),
-        (
-            (0..13u8).cycle().take(120).collect(),
-            "cycle near raw limit",
-        ),
-        ((0..13u8).cycle().take(127).collect(), "cycle at raw limit"),
+    // Fixtures are synthesized via `HuffmanTable::build_from_counts` so
+    // every weight vector is Kraft-valid by construction (the encoder's
+    // own output passes its own `huffman_weight_sum_is_power_of_two`
+    // gate). Hand-curated weight arrays were prone to silently being
+    // rejected by the Kraft check, leaving the test body unreached
+    // (caught by CodeRabbit on PR #168).
+    //
+    // Each case is `(counts_input, label)` — fed through
+    // `build_from_counts`, then `table.weights()` is the full weight
+    // vector and `[..len-1]` is what `try_table_description_size`
+    // trims internally before calling the encoder. The proxy is
+    // exercised on the same trimmed slice for a fair comparison.
+    let cases: &[(Vec<usize>, &str)] = &[
+        (alloc::vec![5, 3, 2, 1], "4-symbol skewed"),
+        (alloc::vec![1, 1, 1, 1, 1, 1, 1, 1], "8-symbol uniform"),
+        (alloc::vec![100, 50, 25, 12, 6, 3, 2, 1], "geometric decay"),
+        // Wider alphabet: cycle counts over 32 symbols. Build will
+        // produce a valid Huffman code regardless of exact frequencies.
+        ((1..=32usize).collect(), "32-symbol increasing"),
+        // Very wide alphabet that pushes weight count near the raw limit.
+        ((1..=120usize).collect(), "120-symbol near raw limit"),
     ];
-    for (weights, label) in cases {
-        let weights_usize: alloc::vec::Vec<usize> = weights.iter().map(|&w| w as usize).collect();
-        if !huffman_weight_sum_is_power_of_two(&weights_usize) {
-            // Skip cases the encoder would reject upstream.
+    let mut exercised = 0usize;
+    for (counts, label) in cases {
+        let table = HuffmanTable::build_from_counts(counts);
+        let weights = table.weights();
+        if weights.is_empty() {
+            // Single-cardinality fallback path can produce empty
+            // weights; nothing for the proxy to score.
             continue;
         }
-        let table = HuffmanTable::build_from_weights(&weights_usize);
-        let exact = table.try_table_description_size();
-        // Match what `try_table_description_size` actually scores — it
-        // trims the last weight before invoking the encoder. Pass the
-        // same trimmed slice to the proxy.
+        // `try_table_description_size` trims internally; mirror that
+        // on the proxy call so both score the same slice.
         let trimmed = &weights[..weights.len() - 1];
+        let exact = table.try_table_description_size();
         let proxy = cheap_desc_size_proxy(trimmed);
         match (proxy, exact) {
             (Some(p), Some(e)) => {
-                // Proxy is allowed to overestimate; flag a hard
-                // underestimate vs raw (the natural floor — if the
-                // exact path picks raw nibble, the proxy must not be
-                // below `n.div_ceil(2) + 1 - 1`).
-                let raw_floor = weights.len().div_ceil(2);
+                exercised += 1;
+                // Raw representation floor on the trimmed slice — what
+                // `write_raw_weight_description` would actually emit
+                // for `trimmed`: ceil(n/2) packed nibbles + 1 length
+                // byte. The proxy must either be within +2 B of the
+                // exact size or at least cover this floor (overestimate
+                // is fine; under-shooting raw is the bug we're
+                // guarding against).
+                let raw_floor = trimmed.len().div_ceil(2) + 1;
                 assert!(
                     p + 2 >= e || p >= raw_floor,
                     "[{label}] proxy {p} under-shot exact {e} (raw_floor {raw_floor})"
                 );
             }
-            (None, None) => {} // both reject — fine
+            (None, None) => {} // both reject — fine (empty trimmed slice case)
             (proxy_res, exact_res) => panic!(
                 "[{label}] proxy/exact disagreement on representability: proxy={proxy_res:?} exact={exact_res:?}"
             ),
         }
     }
+    assert!(
+        exercised > 0,
+        "no fixture exercised the proxy/exact assertion — synthetic counts must produce Kraft-valid Huffman tables"
+    );
 }
 
 /// Edge-case coverage for [`cheap_desc_size_proxy`] — every return arm of
@@ -1138,7 +1164,7 @@ fn cheap_desc_size_proxy_edge_cases() {
     // High-entropy + huge length: both representations fail →
     // `(false, false)` arm returns `None`. With 256 weights cycling
     // over 13 bins, `bits/sym ≈ ceil_log2(ceil(256/20)) = 4`. Total
-    // payload bits ≈ 1024 B = 128 B, +8 header = 136 > 127 → fse_ok=false.
+    // payload bits ≈ 1024 b = 128 B, +8 header = 136 > 128 → fse_ok=false.
     // raw is also off the table (256 > 128) → None.
     let way_over: Vec<u8> = (0u8..13).cycle().take(256).collect();
     assert_eq!(
