@@ -110,12 +110,27 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     fn write_table(&mut self) {
-        if let Some(fse_description) = self.table.cached_encoded_weight_description() {
+        if let Some(cached) = self.table.cached_encoded_weight_description.get() {
+            if let Some(fse_description) = cached.as_deref() {
+                self.writer.write_bits(fse_description.len() as u8, 8);
+                self.writer.append_bytes(fse_description);
+                return;
+            }
+            let weights = self.weights();
+            let weights = &weights[..weights.len() - 1]; // don't encode last weight
+            Self::write_raw_weight_description(self.writer, weights);
+            return;
+        }
+
+        let weights = self.weights();
+        let weights = &weights[..weights.len() - 1]; // don't encode last weight
+        if let Some(fse_description) = self
+            .table
+            .cached_encoded_weight_description_with_weights(weights)
+        {
             self.writer.write_bits(fse_description.len() as u8, 8);
             self.writer.append_bytes(fse_description);
         } else {
-            let weights = self.weights();
-            let weights = &weights[..weights.len() - 1]; // don't encode last weight
             Self::write_raw_weight_description(self.writer, weights);
         }
     }
@@ -341,12 +356,17 @@ impl HuffmanTable {
     }
 
     fn cached_encoded_weight_description(&self) -> Option<&[u8]> {
+        if let Some(cached) = self.cached_encoded_weight_description.get() {
+            return cached.as_deref();
+        }
+        let weights = self.weights();
+        let weights = &weights[..weights.len() - 1];
+        self.cached_encoded_weight_description_with_weights(weights)
+    }
+
+    fn cached_encoded_weight_description_with_weights(&self, weights: &[u8]) -> Option<&[u8]> {
         self.cached_encoded_weight_description
-            .get_or_init(|| {
-                let weights = self.weights();
-                let weights = &weights[..weights.len() - 1];
-                HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
-            })
+            .get_or_init(|| HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights))
             .as_deref()
     }
 
@@ -1274,6 +1294,41 @@ fn cached_encoded_weight_description_is_reused_for_write_table() {
     }
     assert_eq!(encoded[0] as usize, cached.len());
     assert_eq!(&encoded[1..], cached.as_slice());
+}
+
+#[test]
+fn write_table_raw_path_initializes_none_cache() {
+    let table = HuffmanTable::build_from_weights(&[1, 1]);
+    assert!(table.cached_encoded_weight_description.get().is_none());
+
+    let mut expected = Vec::new();
+    let weights = {
+        let mut out = Vec::new();
+        let mut writer = BitWriter::from(&mut out);
+        let encoder = HuffmanEncoder::new(&table, &mut writer);
+        encoder.weights()
+    };
+    {
+        let mut writer = BitWriter::from(&mut expected);
+        HuffmanEncoder::<Vec<u8>>::write_raw_weight_description(
+            &mut writer,
+            &weights[..weights.len() - 1],
+        );
+        writer.flush();
+    }
+
+    let mut encoded = Vec::new();
+    {
+        let mut writer = BitWriter::from(&mut encoded);
+        let mut encoder = HuffmanEncoder::new(&table, &mut writer);
+        encoder.write_table();
+        writer.flush();
+    }
+    assert_eq!(encoded, expected);
+    assert_eq!(
+        table.cached_encoded_weight_description.get().map(Option::is_none),
+        Some(true)
+    );
 }
 
 #[test]
