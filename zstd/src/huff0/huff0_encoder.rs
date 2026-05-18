@@ -240,6 +240,14 @@ impl HuffmanTable {
         // minimum vs the exact `try_table_description_size` — so
         // selection is identical while the per-candidate FSE-encode
         // cost is gone. Issue: #167.
+        //
+        // Stack-allocated `weights_u8` buffer (256 B — counts.len() max
+        // = 256) absorbs the per-candidate `Vec<usize> → &[u8]`
+        // conversion that the proxy wants. Avoids the per-candidate
+        // `table.weights()` allocation (~256 B Vec) and lets the
+        // table-log search loop stay allocation-free past the
+        // mandatory `build_donor_limited_weights` Vec.
+        let mut weights_u8 = [0u8; 256];
         for table_log in min_table_log..=11 {
             let weights = build_donor_limited_weights(counts, table_log);
             if !huffman_weight_sum_is_power_of_two(&weights) {
@@ -255,8 +263,17 @@ impl HuffmanTable {
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
-            let table_weights = table.weights();
-            let trimmed = &table_weights[..table_weights.len() - 1];
+            // Donor `HUF_writeCTable` serializes `weights[..len-1]` — the
+            // decoder reconstructs the final weight from the Kraft-
+            // equality (sum of `2^(weight-1)` is a power of two). Pass
+            // the same trimmed slice to the proxy so it scores the
+            // *serialized* description, not the full table.
+            let trimmed_len = weights.len().saturating_sub(1);
+            for (slot, &w) in weights_u8[..trimmed_len].iter_mut().zip(weights.iter()) {
+                debug_assert!(w <= u8::MAX as usize);
+                *slot = w as u8;
+            }
+            let trimmed = &weights_u8[..trimmed_len];
             // Cheap proxy. If `None`, the candidate would not serialize
             // either as FSE or raw — skip it; the caller validates the
             // chosen table with `writeable_table_description_size` and
@@ -479,7 +496,13 @@ fn cheap_desc_size_proxy(weights: &[u8]) -> Option<usize> {
     // empirically-derived upper bound for our `acc_log = 6` weight tables.
     const FSE_HEADER_OVERHEAD_BYTES: usize = 8;
     let fse_size = fse_payload_bytes + FSE_HEADER_OVERHEAD_BYTES;
-    let fse_ok = fse_size <= 127;
+    // Donor `encode_weight_description` rejects only `encoded.len() >= 128`,
+    // so `encoded.len() == 127` is the largest accepted FSE-encoded payload
+    // and the total serialized description (`encoded.len() + 1` length-byte
+    // prefix) is exactly 128 B in that boundary case. `fse_size` here is
+    // the TOTAL including the length byte — accept `<= 128`, not `<= 127`,
+    // otherwise the proxy would skip a valid candidate at the boundary.
+    let fse_ok = fse_size <= 128;
 
     match (fse_ok, raw_ok) {
         (true, true) => Some(fse_size.min(raw_size)),
@@ -1030,9 +1053,12 @@ fn from_data() {
 ///   serializable description.
 #[test]
 fn cheap_desc_size_proxy_is_conservative_vs_exact() {
-    // Each case: (weights, label). All weights ∈ 0..=12, length matches
-    // the `weights[..len-1]` slice that `try_table_description_size`
-    // hands to the proxy (i.e. last sentinel weight already trimmed).
+    // Each case: (weights, label). All weights ∈ 0..=12. Each `weights`
+    // is a FULL weight vector (one entry per symbol, including the
+    // sentinel last entry); the test trims to `[..len-1]` before
+    // calling the proxy so it sees the same serialized slice that
+    // `try_table_description_size` (which trims internally) does on
+    // the exact path.
     let cases: &[(Vec<u8>, &str)] = &[
         (alloc::vec![1, 2, 3, 4, 5], "small uniform"),
         (alloc::vec![1; 13], "all-ones 13"),
@@ -1044,9 +1070,6 @@ fn cheap_desc_size_proxy_is_conservative_vs_exact() {
         ((0..13u8).cycle().take(127).collect(), "cycle at raw limit"),
     ];
     for (weights, label) in cases {
-        let proxy = cheap_desc_size_proxy(weights);
-        // Build the actual table from these weights and ask for the
-        // exact size via the existing encoder path.
         let weights_usize: alloc::vec::Vec<usize> = weights.iter().map(|&w| w as usize).collect();
         if !huffman_weight_sum_is_power_of_two(&weights_usize) {
             // Skip cases the encoder would reject upstream.
@@ -1054,6 +1077,11 @@ fn cheap_desc_size_proxy_is_conservative_vs_exact() {
         }
         let table = HuffmanTable::build_from_weights(&weights_usize);
         let exact = table.try_table_description_size();
+        // Match what `try_table_description_size` actually scores — it
+        // trims the last weight before invoking the encoder. Pass the
+        // same trimmed slice to the proxy.
+        let trimmed = &weights[..weights.len() - 1];
+        let proxy = cheap_desc_size_proxy(trimmed);
         match (proxy, exact) {
             (Some(p), Some(e)) => {
                 // Proxy is allowed to overestimate; flag a hard
