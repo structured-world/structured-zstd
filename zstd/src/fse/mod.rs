@@ -62,10 +62,16 @@ fn tables_equal() {
 fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
     // Per-symbol `Vec<State>` storage was dropped in #110 — the encoder now
     // holds only `nextStateTable` (donor parity) and per-symbol
-    // `symbolTT`. Recover the (symbol, input_state) → next_state mapping
-    // by enumerating `next_state` over every input state value: each
-    // decode-table slot must be reached by exactly one (symbol, prev)
-    // pair whose `next.baseline` / `next.num_bits` match the decoder.
+    // `symbolTT`. Verify decoder/encoder parity by enumerating every
+    // valid `(symbol, input_state)` transition and asserting that:
+    //   (a) `next.index` lands on a decoder slot owned by `symbol`
+    //       (the transition reaches a state that decodes back to the
+    //       same symbol — without this, a broken encoder routing
+    //       symbol A into symbol B's slot would slip through), and
+    //   (b) `baseline` / `num_bits` from the encoder match what the
+    //       decoder records for that slot.
+    // After enumerating, every decoder slot must have been hit at
+    // least once (full coverage).
     let table_size = enc_table.table_size;
     let mut hit = alloc::vec![false; table_size];
     for symbol_u in 0..=255u16 {
@@ -76,19 +82,24 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
         for input_state in 0..table_size {
             let next = enc_table.next_state(symbol, input_state);
             let dec_state = &dec_table.decode[next.index];
-            if dec_state.symbol == symbol {
-                assert_eq!(
-                    next.baseline, dec_state.new_state as usize,
-                    "decode/encode baseline mismatch at slot {} (symbol {symbol})",
-                    next.index
-                );
-                assert_eq!(
-                    next.num_bits, dec_state.num_bits,
-                    "decode/encode num_bits mismatch at slot {} (symbol {symbol})",
-                    next.index
-                );
-                hit[next.index] = true;
-            }
+            assert_eq!(
+                dec_state.symbol, symbol,
+                "encoder transition for symbol {symbol} from state {input_state} \
+                 lands on decoder slot {} which decodes to symbol {} \
+                 (encoder/decoder routing mismatch)",
+                next.index, dec_state.symbol
+            );
+            assert_eq!(
+                next.baseline, dec_state.new_state as usize,
+                "decode/encode baseline mismatch at slot {} (symbol {symbol})",
+                next.index
+            );
+            assert_eq!(
+                next.num_bits, dec_state.num_bits,
+                "decode/encode num_bits mismatch at slot {} (symbol {symbol})",
+                next.index
+            );
+            hit[next.index] = true;
         }
     }
     for (idx, was_hit) in hit.iter().enumerate() {

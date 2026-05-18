@@ -702,11 +702,15 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         "FSE spread must cycle exactly once through tableSize positions"
     );
 
-    // Phase 3 — emit `nextStateTable` ordered by (symbol, slot). For
-    // each table slot `u`, look up its symbol and write `table_size + u`
-    // into the symbol's running cumul cursor. Donor stores the value
-    // pre-shifted by `table_size` so `FSE_encodeSymbol` can index
-    // directly without an extra add on the hot path.
+    // Phase 3 — emit `state_table_flat` (donor `nextStateTable`)
+    // ordered by `(symbol, slot)`. Walk every table slot `u`, look up
+    // its owning symbol via `table_symbol[u]`, and write the raw slot
+    // `u` into that symbol's running cumul cursor. The Rust convention
+    // stores raw slots (`0..table_size`); donor stores `table_size + u`
+    // pre-shifted and recovers `u` on read by subtracting `table_size`.
+    // Both representations encode the same `(symbol → next_slot)`
+    // mapping; [`FSETable::next_state`] is written against the raw-slot
+    // convention so the pre-shift is intentionally skipped here.
     let mut state_table_flat: alloc::vec::Vec<u16> = alloc::vec![0u16; table_size];
     let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
