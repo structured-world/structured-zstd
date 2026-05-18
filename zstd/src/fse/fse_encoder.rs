@@ -666,15 +666,24 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // `nextStateTable` slot in sorted-by-symbol layout.
     let mut table_symbol = alloc::vec![0u8; table_size];
     let mut high_threshold = (table_size - 1) as isize;
-    let mut cumul = [0u16; 257];
+    // `cumul` / running prefix-sum holds slot counts up to `table_size`.
+    // Decoder accepts `accuracy_log` up to `ENTRY_MAX_ACCURACY_LOG = 16`
+    // and `fse_decoder::FSETable::to_encoder_table` round-trips through
+    // this builder; at `acc_log == 16` the prefix sum reaches 65 536
+    // which overflows `u16` (max 65 535). Keep `cumul` / `cursor` at
+    // `u32` so the cumulative count is representable for every valid
+    // `acc_log`. Slot indices written into `state_table_flat` stay in
+    // `0..table_size-1` (≤ u16::MAX) and remain `u16` — only the
+    // running cursor needs the wider type.
+    let mut cumul = [0u32; 257];
     for (symbol, &prob) in probs.iter().enumerate() {
-        let bump = match prob {
+        let bump: u32 = match prob {
             -1 => {
                 table_symbol[high_threshold as usize] = symbol as u8;
                 high_threshold -= 1;
                 1
             }
-            p if p > 0 => p as u16,
+            p if p > 0 => p as u32,
             _ => 0,
         };
         cumul[symbol + 1] = cumul[symbol] + bump;
