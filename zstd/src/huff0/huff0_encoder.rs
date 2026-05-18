@@ -1,6 +1,17 @@
 use alloc::vec::Vec;
-use core::cell::OnceCell;
 use core::cmp::Ordering;
+
+/// Cache primitive for `HuffmanTable::cached_encoded_weight_description`.
+/// `std::sync::OnceLock` is `Sync` (atomic-init), so wrapping it inside
+/// `pub struct HuffmanTable` keeps the type's auto-traits intact for
+/// downstream consumers that share encoder tables across threads. The
+/// no_std fallback uses `core::cell::OnceCell` (`!Sync`) — same
+/// performance, narrower thread-safety, expected for callers building
+/// without `feature = "std"`.
+#[cfg(feature = "std")]
+type CachedDescription = std::sync::OnceLock<Option<Vec<u8>>>;
+#[cfg(not(feature = "std"))]
+type CachedDescription = core::cell::OnceCell<Option<Vec<u8>>>;
 
 use crate::{
     bit_io::BitWriter,
@@ -230,7 +241,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
-    cached_encoded_weight_description: OnceCell<Option<Vec<u8>>>,
+    cached_encoded_weight_description: CachedDescription,
 }
 
 impl HuffmanTable {
@@ -398,7 +409,7 @@ impl HuffmanTable {
         let table_log = highest_bit_set(weight_sum) - 1;
         let mut table = HuffmanTable {
             codes: alloc::vec![(0, 0); weights.len()],
-            cached_encoded_weight_description: OnceCell::new(),
+            cached_encoded_weight_description: CachedDescription::new(),
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
