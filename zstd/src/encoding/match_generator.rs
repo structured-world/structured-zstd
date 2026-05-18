@@ -3992,14 +3992,32 @@ fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
+    // Greedy-specific routing assertion: `MatchGeneratorDriver::
+    // start_matching` for `BackendTag::Row` has a
+    // `debug_assert_eq!(matcher.lazy_depth, 0)` invariant that
+    // dispatches L4 unconditionally into `start_matching_greedy`.
+    // If a future change rerouted L4 through the `start_matching`
+    // (depth >= 1) path, this assertion would catch it before the
+    // round-trip tests below — round-trip alone passes on the lazy
+    // parser too. Together with the round-trip suite this pins the
+    // greedy-vs-lazy routing decision at the level table layer.
+    assert_eq!(
+        driver.row_matcher().lazy_depth,
+        0,
+        "L4 must route to start_matching_greedy (lazy_depth == 0)",
+    );
 }
 
 /// Level 4 maps to `StrategyTag::Greedy` which dispatches into
 /// [`super::row::RowMatchGenerator::start_matching_greedy`]. Round-trip
-/// a small repeating pattern and a cross-slice case so the donor-parity
-/// greedy parse (default `start = pos + 1`, repcode probe, immediate-rep
-/// loop, miss skip-step) cannot silently drift without also breaking
-/// reconstruction.
+/// alone doesn't pin the greedy-vs-lazy choice (a lazy parser would
+/// also reconstruct the input correctly) — that piece is locked down
+/// by the `lazy_depth == 0` assertion in
+/// [`driver_level4_selects_row_backend`]. This test guards the parse
+/// output itself: a small repeating pattern must produce at least one
+/// `Sequence::Triple`, so a future regression that emits literals-only
+/// (e.g. a `min_match` or rep-probe guard regression) is caught
+/// independently of routing.
 #[test]
 fn driver_level4_greedy_round_trip_single_slice() {
     let mut driver = MatchGeneratorDriver::new(64, 2);

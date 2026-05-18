@@ -238,7 +238,8 @@ impl RowMatchGenerator {
     ///
     /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
     /// `depth == 0`, `dictMode == ZSTD_noDict`. The structural features
-    /// that distinguish "greedy" from a depth-1 lazy with `lazy_depth = 0`:
+    /// that distinguish this greedy parse from the lazy parse in
+    /// [`Self::start_matching`] (which `lazy_depth >= 1` strategies use):
     ///
     /// 1. **Default `start = pos + 1`**: each iteration first probes the
     ///    repcode bank at `abs_pos + 1` (treating one literal byte as
