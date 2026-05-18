@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779109094261,
+  "lastUpdate": 1779112353729,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -39074,6 +39074,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.2,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "198982749+Copilot@users.noreply.github.com",
+            "name": "Copilot",
+            "username": "Copilot"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c71559ebec21ae783f3be1e2dda7a35630d6e2dc",
+          "message": "perf(huff0): cache encoded weight-description bytes on `HuffmanTable` and reuse in emit path (#170)\n\n* Initial plan\n\n* perf(huff0): cache encoded weight descriptions on HuffmanTable\n\nAgent-Logs-Url: https://github.com/structured-world/structured-zstd/sessions/6bdb0283-45b1-4909-8dde-e9b2114fbf4c\n\nCo-authored-by: polaz <4152123+polaz@users.noreply.github.com>\n\n* perf(huff0): avoid duplicate raw-weight recompute in write_table fallback\n\nAgent-Logs-Url: https://github.com/structured-world/structured-zstd/sessions/29cef8e6-3ed8-4ed3-a365-84f0ebf18546\n\nCo-authored-by: polaz <4152123+polaz@users.noreply.github.com>\n\n* refactor(huff0): dedupe raw table write path in write_table\n\nAgent-Logs-Url: https://github.com/structured-world/structured-zstd/sessions/29cef8e6-3ed8-4ed3-a365-84f0ebf18546\n\nCo-authored-by: polaz <4152123+polaz@users.noreply.github.com>\n\n* fix(huff0): preserve Sync auto-trait on HuffmanTable cached description field\n\n`core::cell::OnceCell` is `!Sync`, which made `pub HuffmanTable`\nsilently lose its `Sync` auto-trait when the cache field was added.\nDownstream consumers sharing encoder tables across threads would\nsee this as a breaking change.\n\nIntroduce a `CachedDescription` type alias that resolves to:\n\n- `std::sync::OnceLock<Option<Vec<u8>>>` when `feature = \"std\"` is\n  active — `Sync` via atomic-init, lock-free read-fast-path.\n- `core::cell::OnceCell<Option<Vec<u8>>>` otherwise — keeps no_std\n  builds working, narrower thread-safety expected for no_std\n  embedded targets that don't share heap state across threads.\n\nSame `get` / `get_or_init` interface in both branches, no call-site\nchanges needed beyond the constructor (`CachedDescription::new()`).\nBenchmark on `compress/level_2_dfast/small-4k-log-lines/matrix/pure_rust`:\n36.0 µs after the switch, within criterion noise of the pre-fix\n37.3 µs — the std-build atomic-init read-path is effectively free.\n\n* fix(huff0): drop weights recompute in cold-path raw fallback; gate cache to std builds\n\nCold-path raw fallback recomputed `weights()` twice — once via\n`cached_encoded_weight_description_with_weights(weights)` to\ninitialize the cache, then again inside the prior\n`write_raw_table_description()` helper that fetched its own\nweights slice. For small / low-cardinality tables that's a\nmeasurable hotspot. Inline the raw-write path in `write_table`\nso it reuses the already-computed `weights` slice in the cold\nbranch, while keeping the cached-`None` sentinel branch using a\nsingle fresh recompute (unavoidable — the cache stores only the\nFSE encoding, not the raw nibbles). The `write_raw_table_description`\nhelper goes away — its one remaining caller was the cached-`None`\npath, inlined there too.\n\nCache field `cached_encoded_weight_description` is now\n`#[cfg(feature = \"std\")]`. `core::cell::OnceCell` is `!Sync`, so\nin no_std builds the cache would have broken the `Sync` auto-trait\nfor `pub HuffmanTable` — potentially breaking downstream consumers\nrunning no_std+alloc with `Arc<HuffmanTable>`. std builds keep\n`OnceLock<Option<Vec<u8>>>` (Sync, atomic-init). no_std builds drop\nthe cache field entirely and revert to recompute-every-time —\n`try_table_description_size` and `write_table` get cfg-branched\nnon-cached paths that match pre-cache semantics exactly.\n\nCache-touching tests are gated on `feature = \"std\"` so the test\nsuite still compiles in no_std-only configurations.\n\n---------\n\nCo-authored-by: copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>\nCo-authored-by: polaz <4152123+polaz@users.noreply.github.com>\nCo-authored-by: Dmitry Prudnikov <mail@polaz.com>",
+          "timestamp": "2026-05-18T16:06:27+03:00",
+          "tree_id": "11fe54d8610c59c466ff7135e1a826dedc59c64a",
+          "url": "https://github.com/structured-world/structured-zstd/commit/c71559ebec21ae783f3be1e2dda7a35630d6e2dc"
+        },
+        "date": 1779112350676,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.14,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 313.479,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 207.11,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.507,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.431,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 8.148,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.941,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.019,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.359,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.358,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.842,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.754,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.102,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.369,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.051,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.465,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.092,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.35,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
