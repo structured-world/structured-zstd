@@ -884,16 +884,18 @@ struct SplitEstimator<'a> {
 
 impl SplitEstimator<'_> {
     /// Run a single estimator probe seeded from `entry`. Returns the would-be
-    /// emitted byte count for this partition plus the post-probe state to
-    /// feed into the sibling partition. When the partition would raw-fallback
-    /// (compressed estimate ≥ source minus min_gain), the real encoder
-    /// restores the entry state, so we return `entry` unchanged.
+    /// emitted byte count for this partition, a `raw_fallback` flag (true
+    /// when the estimate said this range will be emitted as a raw block in
+    /// the real encoder — the cost is then capped at `source_len + 3`), and
+    /// the post-probe state to feed into the sibling partition. When the
+    /// partition would raw-fallback, the real encoder restores the entry
+    /// state, so we return `entry` unchanged.
     fn estimate_subblock_size(
         &mut self,
         start_idx: usize,
         end_idx: usize,
         entry: &ProbeEntryState,
-    ) -> (usize, ProbeEntryState) {
+    ) -> (usize, bool, ProbeEntryState) {
         let lit_start = self.prefix_sums.lit[start_idx];
         let lit_len = self.prefix_sums.lit_range(start_idx, end_idx);
         let match_len = self.prefix_sums.ml_range(start_idx, end_idx);
@@ -934,7 +936,7 @@ impl SplitEstimator<'_> {
                 offset_hist: self.scratch_state.offset_hist,
             }
         };
-        (cost, post)
+        (cost, raw_fallback, post)
     }
 
     fn derive_block_splits(
@@ -949,7 +951,25 @@ impl SplitEstimator<'_> {
             return;
         }
         let entry = self.block_entry.clone();
-        let (full, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        let (full, full_raw_fallback, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        // G3 — donor `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
+        // bails out to a single raw block when `estBlockSize > srcSize`,
+        // skipping the per-sub-block split work entirely. Our equivalent
+        // signal is `raw_fallback == true` on the whole-block probe: the
+        // estimator already decided the whole range will be emitted raw
+        // by the real encoder. Returning with `partitions` left empty
+        // lets `compress_block_with_post_split`'s outer loop emit the
+        // block as a single partition — `emit_single_sequence_block`
+        // then takes the expansion-fallback path and writes a raw block,
+        // matching donor while avoiding the bisect's recursive
+        // `estimate_subblock_size` walks that would have produced the
+        // same all-raw result anyway. Cheap insertion: the `full`
+        // probe ran whether or not bisect proceeds, so this adds zero
+        // estimator work on the bail-out path and saves all subsequent
+        // bisect probes on incompressible blocks.
+        if full_raw_fallback {
+            return;
+        }
         self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
     }
 
@@ -971,15 +991,15 @@ impl SplitEstimator<'_> {
         {
             // Leaf: this range will be emitted as a single partition, so the
             // exit state is the post-state of that single-partition probe.
-            return self.estimate_subblock_size(start_idx, end_idx, &entry).1;
+            return self.estimate_subblock_size(start_idx, end_idx, &entry).2;
         }
         let mid_idx = (start_idx + end_idx) / 2;
-        let (first, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
+        let (first, _, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
         // Donor parity: score the right half from the left's post-state,
         // not from the parent's block-entry state. Without this propagation
         // `second` is evaluated as a fresh-block start, biasing the
         // `first + second < full` decision toward overly optimistic splits.
-        let (second, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
+        let (second, _, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
         if first + second < full {
             // If the left side gets further split, the true state at
             // `mid_idx` is the left subtree's exit state, not `first_post`.
@@ -995,7 +1015,7 @@ impl SplitEstimator<'_> {
                 .derive_block_splits_with_full(mid_idx, end_idx, second, left_post, partitions);
         }
         // No split here — this range will be emitted as one partition.
-        self.estimate_subblock_size(start_idx, end_idx, &entry).1
+        self.estimate_subblock_size(start_idx, end_idx, &entry).2
     }
 }
 
