@@ -279,11 +279,13 @@ jobs:
           # only the two canonical levels (`level_3_dfast` = donor
           # default, `level_22_btultra2` = max compression) bundled
           # into a single shard per target — three shards total, cheap
-          # PR feedback. On a `push: main` (post-merge), one shard
-          # per strategy group runs (fast / dfast / greedy / lazy /
-          # btopt / btultra / btultra2 — seven groups × three targets
-          # = 21 shards), so the published gh-pages snapshot keeps
-          # full coverage for the dashboard + tagged baselines.
+          # PR feedback. On a `push: main` (post-merge), one shard per
+          # strategy group runs — nine groups (fast split into
+          # `fast-neg` / `fast-pos`; lazy split into `lazy-lower` /
+          # `lazy-upper` to keep the worst-case per-shard wall under
+          # the 120-min CI cap) × three targets = 27 shards, so the
+          # published gh-pages snapshot keeps full coverage for the
+          # dashboard + tagged baselines (#164).
           EVENT_NAME: ${{ github.event_name }}
         run: |
           cat > targets.json <<'EOF'
@@ -343,8 +345,12 @@ jobs:
             cat > shards.json <<'EOF'
           [
             {
-              "id": "fast",
-              "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast,level_-2_fast,level_-1_fast,level_1_fast"
+              "id": "fast-neg",
+              "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast"
+            },
+            {
+              "id": "fast-pos",
+              "levels": "level_-2_fast,level_-1_fast,level_1_fast"
             },
             {
               "id": "dfast",
@@ -355,8 +361,12 @@ jobs:
               "levels": "level_4_greedy"
             },
             {
-              "id": "lazy",
-              "levels": "level_5_lazy,level_6_lazy,level_7_lazy,level_8_lazy,level_9_lazy,level_10_lazy,level_11_lazy,level_12_lazy,level_13_lazy,level_14_lazy,level_15_lazy"
+              "id": "lazy-lower",
+              "levels": "level_5_lazy,level_6_lazy,level_7_lazy,level_8_lazy,level_9_lazy"
+            },
+            {
+              "id": "lazy-upper",
+              "levels": "level_10_lazy,level_11_lazy,level_12_lazy,level_13_lazy,level_14_lazy,level_15_lazy"
             },
             {
               "id": "btopt",
@@ -454,9 +464,10 @@ jobs:
         # Shard plan is resolved in `bench-matrix.outputs.shards`.
         # Each shard owns one strategy-grouped level bundle (PR runs
         # a single `pr-canonical` shard with level_3 + level_22; main
-        # runs seven strategy groups). `shard.levels` is a CSV that
-        # we forward into `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` so the
-        # bench binary iterates the requested levels in one process.
+        # runs nine strategy groups — see #164 for the fast/lazy
+        # split rationale). `shard.levels` is a CSV that we forward
+        # into `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` so the bench
+        # binary iterates the requested levels in one process.
         shard: ${{ fromJSON(needs.bench-matrix.outputs.shards) }}
     runs-on: ubuntu-latest
     steps:

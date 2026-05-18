@@ -505,33 +505,65 @@ fn configure_group<M: criterion::measurement::Measurement>(
     group: &mut criterion::BenchmarkGroup<'_, M>,
     scenario: &Scenario,
 ) {
+    // CI wall-time tuning (#164):
+    //
+    // criterion 0.8 hard-asserts `sample_size >= 10` (`benchmark_group.rs:97`
+    // / `lib.rs:519`). The floor is set in source and cannot be lowered
+    // without forking criterion, so we tune `measurement_time` and
+    // `warm_up_time` to cut per-bench wall-clock instead.
+    //
+    // Pre-tuning budget per `bench_function` (one side):
+    //   Small:    3s measurement + 3s default warm-up = 6s
+    //   Corpus/Entropy: 8s + 3s default warm-up      = 11s
+    //   Large/Silesia:  10s + 0.5s warm-up           = 10.5s
+    //
+    // Each `pure_rust` / `c_ffi` pair doubles that. Across the 21
+    // strategy shards × ~7 scenarios × 3 bench groups (compress,
+    // decompress rust_stream, decompress c_stream) × 2 sides, the
+    // worst shard (`lazy`, 11 levels) reached the 120-min CI cap.
+    //
+    // Post-tuning (criterion still gets >= 10 samples; only the
+    // wall-clock budget shrinks where the measured per-iter is faster
+    // than the budget — slow-per-iter benches are bound by
+    // `samples × per_iter` regardless of budget):
+    //   Small:    1s + 0.2s = 1.2s per side (×2 = 2.4s) — 60% cut
+    //   Corpus/Entropy: 3s + 0.5s = 3.5s per side (×2 = 7s) — 68% cut
+    //   Large/Silesia:  20s + 0.5s — bumped UP from 10s. The slowest
+    //     combos on i686 (level_22_btultra2 / 100 MiB) need ~2 s per
+    //     iter × 10 samples ≈ 20 s wall; the old 10 s budget produced
+    //     persistent criterion "increase target time" warnings and
+    //     occasional flaky measurements. Budget is dwarfed by the
+    //     actual per-iter cost on slow combos, so this only widens the
+    //     warning-free envelope — fast combos still finish under
+    //     budget.
+    //
+    // For very small inputs (1-10 KiB) Small still keeps `sample_size(30)` to
+    // amortise the per-sample fixed cost across more measurements — those
+    // benches finish their 30 samples well inside 1 s thanks to tight
+    // per-iter timings.
     match scenario.class {
         ScenarioClass::Small => {
             group.sample_size(30);
-            group.measurement_time(Duration::from_secs(3));
+            group.measurement_time(Duration::from_secs(1));
+            group.warm_up_time(Duration::from_millis(200));
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Corpus | ScenarioClass::Entropy => {
-            // criterion 0.8 hard-asserts `sample_size >= 10` at runtime,
-            // so dropping below 10 is not an option (commit 73868b0
-            // tried `sample_size(3)` and every bench shard panicked at
-            // `benchmark_group.rs:97: assertion failed: n >= 10`).
-            // Instead, give criterion enough wall-clock budget — the
-            // earlier warning was "increase target time to 5.2s" on the
-            // slowest combo (level_22_btultra2 + 1 MiB decodecorpus).
-            // 8s covers that with headroom while keeping per-shard
-            // total runtime bounded (~11 min worst-case strategy shard).
             group.sample_size(10);
-            group.measurement_time(Duration::from_secs(8));
+            group.measurement_time(Duration::from_secs(3));
+            group.warm_up_time(Duration::from_millis(500));
             group.sampling_mode(SamplingMode::Flat);
         }
         ScenarioClass::Large | ScenarioClass::Silesia => {
-            // Same `sample_size >= 10` floor. Large/Silesia payloads
-            // (~16-100 MiB) take longer per iteration, so bump the
-            // measurement budget further — 10s covers level_22_btultra2
-            // on 16 MiB streams with margin.
+            // Large/Silesia payloads (16-100 MiB) on slow targets
+            // (i686 + level_22_btultra2) need ~2 s per iter ×
+            // 10 samples ≈ 20 s wall. Old 10 s budget caused
+            // "increase target time" warnings + occasional flakies;
+            // widening to 20 s covers the slowest combo without
+            // affecting wall on faster targets (criterion exits the
+            // budget early when samples complete).
             group.sample_size(10);
-            group.measurement_time(Duration::from_secs(10));
+            group.measurement_time(Duration::from_secs(20));
             group.warm_up_time(Duration::from_millis(500));
             group.sampling_mode(SamplingMode::Flat);
         }
