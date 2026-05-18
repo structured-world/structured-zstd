@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779094415975,
+  "lastUpdate": 1779109094261,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -38870,6 +38870,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.199,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "414355a0b0d487fb40484c4b85589ea62b8c4049",
+          "message": "perf(huff0): #167 cheap entropy proxy for table_log selection — no FSE-encode per candidate (#168)\n\n* perf(huff0): replace FSE-encode-per-candidate with cheap entropy proxy\n\n#167. `HuffmanTable::build_from_counts` previously called\n`try_table_description_size` per `min_table_log..=11` candidate, which\nran a full FSE-encode of the weight stream against a freshly-built FSE\ntable just to count bytes (~31 % inclusive on the 4 KiB compress\nprofile after #166).\n\nReplace with `cheap_desc_size_proxy(weights)`: an integer entropy\nestimate that reproduces the donor `HUF_writeCTable_wksp` decision\n(FSE vs raw nibble) without touching the FSE encoder.\n\n- FSE estimate: `sum(c_i * ceil_log2(total / c_i))` over the 13-bin\n  weight histogram + 8 B header overhead (empirical upper bound for\n  the `acc_log = 6` weight FSE table seen in\n  `encode_weight_description`).\n- Raw nibble: exact `weights.len().div_ceil(2) + 1`, representable\n  when `weights.len() <= 128`.\n- Return min of the two when both are representable.\n\nValidated:\n- 502/502 lib tests (incl. new `cheap_desc_size_proxy_is_conservative_vs_exact`)\n- `compare_ffi` ratio REPORT sweep across all scenarios × all levels:\n  no new `rust_bytes > ffi_bytes` cells; `decodecorpus-z000033` L18/L19\n  *improved* by 442 B each (R=443 434 → 442 992) — the proxy steers\n  selection to a marginally tighter `table_log` on those cells. Every\n  small-4k-log-lines cell preserved (L1_fast R=154 ≤ C=157, L2_dfast\n  R=150 ≤ C=157, …).\n\nSpeed (`compress/level_2_dfast/small-4k-log-lines/matrix/pure_rust`):\n47.4 µs → 34.2 µs (−28 % on top of #166; cumulative −59 % vs the\npre-#165 baseline). Gap vs donor 6.7× → 4.8×.\n\n* fix(huff0): use ceiling division in cheap_desc_size_proxy entropy bound\n\n`cheap_desc_size_proxy` claims to be a conservative entropy upper\nbound, but used truncating integer division for `total / c` before\n`ceil_log2`. For non-integer ratios (e.g. `total=10, c=4 → 2.5`) this\ntruncated to `2`, the subsequent `ceil_log2` emitted `1` bit, and the\nproxy under-shot the real entropy ≥ 2 bits per symbol.\n\nSwitch to `total.div_ceil(c)` so the ceiling is taken BEFORE the\n`ceil_log2` step. Ratio sweep across `compare_ffi` corpus × every\nsupported level: no new `rust_bytes > ffi_bytes` cells; small-4k-log\nunchanged; z000033 L18/L19 *improved* (R=442 992 → 442 863).\nsmall-4k-log L2_dfast pure_rust 34.2 µs → 32.8 µs (slightly faster:\nthe tighter estimate cuts off more candidates earlier in the\n`min_table_log..=11` loop's monotone-increase break).\n\nAdded `cheap_desc_size_proxy_edge_cases` covering every `(fse_ok,\nraw_ok)` arm plus the `n == 0` early-out and the `ratio <= 1` clamp\nbranch — the prior test only hit a handful of input shapes, leaving\nthe `(true, false)` / `(false, true)` / `(false, false)` arms and the\nearly-out without coverage.\n\n* fix(huff0): cheap_desc_size_proxy off-by-one + drop per-candidate Vec alloc\n\nThree threads from PR #168 review.\n\n- **fse_ok off-by-one.** `encode_weight_description` rejects only\n  `encoded.len() >= 128`, so `encoded.len() == 127` is the largest\n  accepted FSE payload and the total serialized description\n  (`encoded.len() + 1` length-byte prefix) is exactly 128 B at the\n  boundary. The proxy's `fse_size` includes the length byte — accept\n  `<= 128`, not `<= 127`. As written the proxy would skip a valid\n  candidate at the exact boundary and force a worse fallback.\n\n- **Per-candidate `Vec<u8>` alloc.** `build_from_counts` called\n  `table.weights()` per `table_log` candidate just to score\n  `desc_size` — fresh `Vec<u8>` allocation each iteration. Replace\n  with a stack-allocated `[u8; 256]` buffer reused across iterations\n  (counts.len() max is 256). The Vec from\n  `build_donor_limited_weights` already carries the same weight\n  values; just copy them into the buffer.\n\n- **Test slice-length mismatch.** `cheap_desc_size_proxy_is_conservative_vs_exact`\n  compared `proxy(weights)` (N items) against\n  `table.try_table_description_size()` (which trims `[..N-1]`\n  internally). Fix: trim `weights` before calling the proxy so both\n  paths score the same serialized slice.\n\nAll 503/503 lib tests pass, clippy / fmt clean. Targeted ratio sweep\n(small-4k-log L1-L3, z000033 L1-L3, large-log-stream L1-L3):\nunchanged — no new R>C cells, no regression.\n\n* test(huff0): rebuild conservative-vs-exact fixtures from build_from_counts; align proxy docs\n\n`cheap_desc_size_proxy_is_conservative_vs_exact` silently skipped\nevery hand-curated fixture because their weight vectors\n([1,2,3,4,5], [1;13], [6;50], (0..13).cycle().take(120), ...) all\nfailed `huffman_weight_sum_is_power_of_two` — Kraft equality must\nhold for a valid Huffman weight set, and the synthetic arrays never\ndid. The loop body was unreachable; the test passed trivially.\n\n- Rebuild fixtures via `HuffmanTable::build_from_counts(counts)` →\n  `table.weights()`. The encoder's own output is Kraft-valid by\n  construction. Counts inputs cover skewed, uniform, geometric, wide\n  alphabets, and near-raw-limit cases.\n- Add an `exercised > 0` assertion to fail loud if a future refactor\n  silently skips all fixtures again.\n- Fix `raw_floor`: the writer's raw representation for the trimmed\n  slice is `trimmed.len().div_ceil(2) + 1` (nibbles + length byte),\n  not `weights.len().div_ceil(2)`.\n\nDoc fixes:\n- `cheap_desc_size_proxy` docstring: \"representable when result is\n  < 128 bytes\" → \"<= 128 bytes\" — `encode_weight_description` rejects\n  only `encoded.len() >= 128`, so total `encoded.len() + 1` length-byte\n  prefix tops out at exactly 128. The code at the `fse_ok` site\n  already uses `<= 128`; the doc was out of sync.\n- `cheap_desc_size_proxy` docstring: explicitly document that\n  `n == 0` returns `None` (raw could in principle encode an empty\n  slice as just the length byte, but production callers never hand\n  `n == 0` here — `build_from_counts` short-circuits on\n  `symbol_cardinality <= 1`).",
+          "timestamp": "2026-05-18T15:08:12+03:00",
+          "tree_id": "27771c3538b8406c9c6a796528aa1e2dfc28ed00",
+          "url": "https://github.com/structured-world/structured-zstd/commit/414355a0b0d487fb40484c4b85589ea62b8c4049"
+        },
+        "date": 1779109090580,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 307.884,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 268.794,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.925,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.567,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.012,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.381,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.933,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.507,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.369,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.516,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.351,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.409,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.036,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.598,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.063,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.341,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
