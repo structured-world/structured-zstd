@@ -283,7 +283,7 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, hash_fill_step: 1, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
     /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
@@ -1220,7 +1220,23 @@ impl MatchGeneratorDriver {
                 while matcher.next_sequence(&mut *handle_sequence) {}
             }
             BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
-            BackendTag::Row => self.row_matcher_mut().start_matching(handle_sequence),
+            BackendTag::Row => {
+                // Donor `ZSTD_compressBlock_lazy_generic` with `depth == 0`
+                // is a structurally different parse (default `start = ip + 1`,
+                // greedy repcode commit, immediate-rep loop after store)
+                // versus the lazy / lazy2 parse used by L5+. Dispatch on
+                // the runtime `lazy_depth` knob so L4 takes the dedicated
+                // greedy path while L5+ keeps the existing lazy machinery
+                // — `pick_lazy_match` is what gives L5+ its ratio win, and
+                // we don't want to retire that path just because L4 wants
+                // donor-parity greedy.
+                let matcher = self.row_matcher_mut();
+                if matcher.lazy_depth == 0 {
+                    matcher.start_matching_greedy(handle_sequence);
+                } else {
+                    matcher.start_matching(handle_sequence);
+                }
+            }
             BackendTag::HashChain => self
                 .hc_matcher_mut()
                 .start_matching_strategy::<S>(handle_sequence),
