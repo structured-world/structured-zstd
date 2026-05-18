@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 use core::cmp::Ordering;
 
 use crate::{
@@ -109,12 +110,12 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     fn write_table(&mut self) {
-        let weights = self.weights();
-        let weights = &weights[..weights.len() - 1]; // don't encode last weight
-        if let Some(fse_description) = Self::encode_weight_description(weights) {
+        if let Some(fse_description) = self.table.cached_encoded_weight_description() {
             self.writer.write_bits(fse_description.len() as u8, 8);
-            self.writer.append_bytes(&fse_description);
+            self.writer.append_bytes(fse_description);
         } else {
+            let weights = self.weights();
+            let weights = &weights[..weights.len() - 1]; // don't encode last weight
             Self::write_raw_weight_description(self.writer, weights);
         }
     }
@@ -210,6 +211,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
+    cached_encoded_weight_description: OnceCell<Option<Vec<u8>>>,
 }
 
 impl HuffmanTable {
@@ -313,14 +315,12 @@ impl HuffmanTable {
 
     /// Returns exact writable table-description size when representable.
     pub(crate) fn try_table_description_size(&self) -> Option<usize> {
-        let weights = self.weights();
-        let weights = &weights[..weights.len() - 1];
-        if let Some(fse_description) = HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
-        {
+        if let Some(fse_description) = self.cached_encoded_weight_description() {
             return Some(fse_description.len() + 1);
         }
-        if weights.len() <= 128 {
-            Some(weights.len().div_ceil(2) + 1)
+        let raw_weights_len = self.codes.len().saturating_sub(1);
+        if raw_weights_len <= 128 {
+            Some(raw_weights_len.div_ceil(2) + 1)
         } else {
             None
         }
@@ -338,6 +338,16 @@ impl HuffmanTable {
             .copied()
             .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
             .collect::<Vec<u8>>()
+    }
+
+    fn cached_encoded_weight_description(&self) -> Option<&[u8]> {
+        self.cached_encoded_weight_description
+            .get_or_init(|| {
+                let weights = self.weights();
+                let weights = &weights[..weights.len() - 1];
+                HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
+            })
+            .as_deref()
     }
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
@@ -364,6 +374,7 @@ impl HuffmanTable {
         let table_log = highest_bit_set(weight_sum) - 1;
         let mut table = HuffmanTable {
             codes: alloc::vec![(0, 0); weights.len()],
+            cached_encoded_weight_description: OnceCell::new(),
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
@@ -1234,6 +1245,35 @@ fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
         &weights,
         &description
     ));
+}
+
+#[test]
+fn cached_encoded_weight_description_is_reused_for_write_table() {
+    let mut data = Vec::new();
+    for symbol in 0u8..=255 {
+        data.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
+    }
+    let table = HuffmanTable::build_from_data(&data);
+    let desc_size = table
+        .writeable_table_description_size()
+        .expect("table description must be writable");
+    let cached = table
+        .cached_encoded_weight_description
+        .get()
+        .and_then(Option::as_ref)
+        .expect("large alphabet fixture must cache FSE description")
+        .clone();
+    assert_eq!(desc_size, cached.len() + 1);
+
+    let mut encoded = Vec::new();
+    {
+        let mut writer = BitWriter::from(&mut encoded);
+        let mut encoder = HuffmanEncoder::new(&table, &mut writer);
+        encoder.write_table();
+        writer.flush();
+    }
+    assert_eq!(encoded[0] as usize, cached.len());
+    assert_eq!(&encoded[1..], cached.as_slice());
 }
 
 #[test]
