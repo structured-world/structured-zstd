@@ -778,6 +778,17 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
         let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
         let state_table_index = (init_value >> init_nb_bits_out) as isize + delta_find_state;
+        // Donor `FSE_initCState2` guarantees this index is in
+        // `0..table_size` by construction (`delta_find_state` is bounded
+        // by `total - probability`, and `(value >> nb_bits_out)` is
+        // bounded by `2 * probability - 1`). The `debug_assert` makes
+        // the invariant explicit so a future regression in the donor
+        // arithmetic surfaces in dev builds before the silent
+        // `as usize` wraparound.
+        debug_assert!(
+            state_table_index >= 0,
+            "FSE start_state index must be non-negative (got {state_table_index} for symbol {symbol})"
+        );
         let start_index = state_table_flat[state_table_index as usize] as usize;
 
         // Max nb_bits across all input states `0..table_size`. Donor
