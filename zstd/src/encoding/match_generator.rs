@@ -1221,21 +1221,30 @@ impl MatchGeneratorDriver {
             }
             BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
             BackendTag::Row => {
-                // Donor `ZSTD_compressBlock_lazy_generic` with `depth == 0`
-                // is a structurally different parse (default `start = ip + 1`,
-                // greedy repcode commit, immediate-rep loop after store)
-                // versus the lazy / lazy2 parse used by L5+. Dispatch on
-                // the runtime `lazy_depth` knob so L4 takes the dedicated
-                // greedy path while L5+ keeps the existing lazy machinery
-                // — `pick_lazy_match` is what gives L5+ its ratio win, and
-                // we don't want to retire that path just because L4 wants
-                // donor-parity greedy.
+                // The Row backend is currently selected only by
+                // `StrategyTag::Greedy` (level 4) — see
+                // `StrategyTag::backend` in `strategy.rs`. Donor
+                // `ZSTD_compressBlock_lazy_generic` with `depth == 0`
+                // is a structurally different parse (default
+                // `start = ip + 1`, greedy repcode commit,
+                // immediate-rep loop after store) versus the lazy /
+                // lazy2 parse the plain `start_matching` runs, so L4
+                // dispatches directly to `start_matching_greedy`.
+                //
+                // The `debug_assert!` documents the invariant: any
+                // future routing of L5+ through the Row backend must
+                // first decide whether `start_matching_greedy` (depth
+                // == 0) or `start_matching` (depth >= 1, with
+                // `pick_lazy_match`) is the right entry point and
+                // adjust this dispatch accordingly. Today only
+                // `lazy_depth == 0` ever lands here.
                 let matcher = self.row_matcher_mut();
-                if matcher.lazy_depth == 0 {
-                    matcher.start_matching_greedy(handle_sequence);
-                } else {
-                    matcher.start_matching(handle_sequence);
-                }
+                debug_assert_eq!(
+                    matcher.lazy_depth, 0,
+                    "Row backend currently expects lazy_depth == 0 (donor-greedy); \
+                     wire a depth-aware dispatch before routing lazy levels here",
+                );
+                matcher.start_matching_greedy(handle_sequence);
             }
             BackendTag::HashChain => self
                 .hc_matcher_mut()
@@ -3983,6 +3992,129 @@ fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
+}
+
+/// Level 4 maps to `StrategyTag::Greedy` which dispatches into
+/// [`super::row::RowMatchGenerator::start_matching_greedy`]. Round-trip
+/// a small repeating pattern and a cross-slice case so the donor-parity
+/// greedy parse (default `start = pos + 1`, repcode probe, immediate-rep
+/// loop, miss skip-step) cannot silently drift without also breaking
+/// reconstruction.
+#[test]
+fn driver_level4_greedy_round_trip_single_slice() {
+    let mut driver = MatchGeneratorDriver::new(64, 2);
+    driver.reset(CompressionLevel::Level(4));
+    let input = b"abcdefgh_abcdefgh_abcdefgh_abcdefgh";
+    let mut space = driver.get_next_space();
+    space[..input.len()].copy_from_slice(input);
+    space.truncate(input.len());
+    driver.commit_space(space);
+
+    let mut reconstructed: Vec<u8> = Vec::new();
+    let mut saw_triple = false;
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            saw_triple = true;
+            reconstructed.extend_from_slice(literals);
+            let start = reconstructed.len() - offset;
+            for i in 0..match_len {
+                let byte = reconstructed[start + i];
+                reconstructed.push(byte);
+            }
+        }
+    });
+    assert_eq!(
+        reconstructed,
+        input.to_vec(),
+        "L4 greedy parse failed to reconstruct repeating-pattern input",
+    );
+    assert!(
+        saw_triple,
+        "L4 greedy parse on a repeating pattern must emit at least one match (Triple)",
+    );
+}
+
+#[test]
+fn driver_level4_greedy_round_trip_cross_slice() {
+    // Verifies that the greedy parse carries repcode / hash-table state
+    // across slice boundaries: the second slice repeats the first byte
+    // for byte, so the parse must pick up matches reaching back into
+    // the previous slice's history.
+    let mut driver = MatchGeneratorDriver::new(32, 4);
+    driver.reset(CompressionLevel::Level(4));
+    let chunk = b"the quick brown fox jumps over!!";
+    assert_eq!(chunk.len(), 32);
+
+    let mut first = driver.get_next_space();
+    first[..chunk.len()].copy_from_slice(chunk);
+    first.truncate(chunk.len());
+    driver.commit_space(first);
+
+    let mut first_recon: Vec<u8> = Vec::new();
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => first_recon.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            first_recon.extend_from_slice(literals);
+            let start = first_recon.len() - offset;
+            for i in 0..match_len {
+                let byte = first_recon[start + i];
+                first_recon.push(byte);
+            }
+        }
+    });
+    assert_eq!(
+        first_recon,
+        chunk.to_vec(),
+        "first slice failed to round-trip"
+    );
+
+    let mut second = driver.get_next_space();
+    second[..chunk.len()].copy_from_slice(chunk);
+    second.truncate(chunk.len());
+    driver.commit_space(second);
+
+    let mut full = first_recon.clone();
+    let mut saw_cross_slice_match = false;
+    driver.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => full.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            // A match whose offset reaches >= the current slice's literal
+            // run plus the second slice's index means we matched into the
+            // first slice — exactly the cross-slice behavior under test.
+            if offset >= chunk.len() {
+                saw_cross_slice_match = true;
+            }
+            full.extend_from_slice(literals);
+            let start = full.len() - offset;
+            for i in 0..match_len {
+                let byte = full[start + i];
+                full.push(byte);
+            }
+        }
+    });
+    let mut expected = chunk.to_vec();
+    expected.extend_from_slice(chunk);
+    assert_eq!(
+        full, expected,
+        "cross-slice L4 greedy parse failed to reconstruct"
+    );
+    assert!(
+        saw_cross_slice_match,
+        "L4 greedy parse must match across slice boundaries (history is shared)",
+    );
 }
 
 #[test]
