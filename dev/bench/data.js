@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779112353729,
+  "lastUpdate": 1779144546726,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -39278,6 +39278,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "62fe6e140f9c3ad207227bb9a163e443ff9111e2",
+          "message": "perf(encoder): donor-parity greedy parse at L4 — ratio + speed win (#179)\n\n* perf(encoder): donor-parity greedy parse at L4 — win on ratio + speed\n\nL4 (`StrategyTag::Greedy`) was routed through the Row backend's plain\n`start_matching` with `lazy_depth = 1`, paying for an unconditional\ndepth-1 lookahead while still calling itself \"greedy\". Donor\n`ZSTD_compressBlock_lazy_generic` at `depth == 0` (`zstd_lazy.c:1560`)\nis structurally different — that's why the strategy is named \"greedy\":\nnot because the matches are long, but because each iteration greedily\nprefers the cheaper `1 literal + repcode` encoding over a 0-literal\nregular match.\n\nAdd `RowMatchGenerator::start_matching_greedy` that mirrors donor's\ndepth-0 lazy_generic flow and dispatch L4 (lazy_depth = 0) to it.\nStructural features carried over:\n\n  - **Default `start = pos + 1`**: probe the repcode bank at `abs_pos +\n    1` before regular search, so a near-repcode beats a longer regular\n    offset on encoding cost.\n  - **`if depth == 0: goto _storeSequence`**: a rep hit ends the\n    iteration without paying for the regular search at `abs_pos`. Our\n    hybrid still runs the regular search and picks the longer of (rep@\n    +1, regular@pos) — pure donor commit-on-first-rep was tried and\n    cost +1.1pp ratio vs main because donor recovers the loss via\n    components we don't replicate (`minMatch = 5`, block splitting).\n    The hybrid keeps the speed shape and reclaims the ratio.\n  - **Immediate-repcode loop after store**: scan forward for\n    back-to-back `offset_2` hits with `lit_len = 0`. The donor\n    `offset_1 ↔ offset_2` swap is reproduced by\n    `encode_offset_with_history(actual = offset_hist[1], lit_len = 0)`.\n  - **Skip-step grows on miss**: shift right by 10 (donor uses 8).\n    Shift = 8 cost ~3pp ratio loss; shift = ∞ (no grow) cost ~+14%\n    speed. Shift = 10 sits at the sweet spot — only kicks in past ~1\n    KiB literal run, so on structured data the step stays at 1.\n  - **Repcode min_match = 4** (donor `MEM_read32 + ZSTD_count`).\n    `ROW_MIN_MATCH_LEN = 6` gates the regular row-table search; the\n    independent repcode probe benefits from the lower threshold because\n    4–5-byte reps are cheap to encode and frequently beat the literal\n    alternative.\n\n`pick_lazy_match_shared` is intentionally not called from the new path\n— depth == 0 means no lookahead, emit on first viable hit.\n\nL4 measurements vs main (criterion `--baseline`, p < 0.05 unless noted):\n\n| Scenario              | rust_bytes Δ | time Δ |\n|-----------------------|--------------|--------|\n| small-1k-random       | 0            | +3.4%  |\n| small-10k-random      | 0            | -0.2% (noise, p=0.96) |\n| small-4k-log-lines    | 0            | -5.1%  |\n| decodecorpus-z000033  | -1277 bytes  | -24.0% |\n| high-entropy-1m       | 0            | -7.8%  |\n| low-entropy-1m        | 0            | -2.4%  |\n| large-log-stream      | -2 bytes     | +9.0%  |\n\nRatio: 5 cells equal, 2 cells better, **0 cells worse**. The 2 speed\nregressions (small-1k-random, large-log-stream) reflect a different\nhotpath: profile on large-log-stream shows\n`RowMatchGenerator::skip_matching_with_hint` consuming ~25% of self\ntime, dominating any per-iteration delta in the parse loop. Tracked\nseparately (see follow-up issue) — independent of this PR.\n\nRefs #178\n\n* fix(encoder): widen L4 greedy tail probe + tighten Row dispatch\n\n`row/mod.rs:290`: outer-loop guard relaxed from\n`pos + ROW_MIN_MATCH_LEN <= current_len` to\n`pos + GREEDY_MIN_LOOKAHEAD <= current_len` where\n`GREEDY_MIN_LOOKAHEAD = REP_MIN_MATCH_LEN + 1 = 5`. The previous\nbound was over-strict: a repcode probe at `abs_pos + 1` only needs\n4 bytes of lookahead beyond that probe point, so the last 5-byte\nposition was unreachable even though its rep probe would succeed.\n`REP_MIN_MATCH_LEN` is hoisted out of the loop body so the new\nouter guard can reference it.\n\n`row/mod.rs:242` (doc): bullet (2) of the greedy parse description\nclaimed \"the regular search at abs_pos is skipped entirely\" — that\nis donor's depth-0 behavior, not ours. Rewritten to document the\nhybrid form (rep probe at +1 *and* regular search at pos, longer\nwins, ties go to rep). Explicitly notes why donor's pure\ncommit-on-first-rep was rejected: ratio cliff without minMatch=5\nand superblock entropy sharing.\n\n`row/mod.rs:367` (doc): comment said `SKIP_STRENGTH = 12` (~4 KiB\nmiss-run threshold) but the constant is 10 (~1 KiB). Comment\nrealigned to the actual value.\n\n`match_generator.rs:1223` (dispatch): the `Row` backend arm had a\nruntime `if matcher.lazy_depth == 0` with a fall-through to the\nplain `start_matching` path, but `StrategyTag::backend` maps only\n`Greedy` → `Row`, so the `else` was unreachable in normal\noperation. Replaced with unconditional `start_matching_greedy`\nplus a `debug_assert_eq!(matcher.lazy_depth, 0, …)` documenting\nthe invariant.\n\nThe plain `start_matching` / `best_match` / `pick_lazy_match` /\n`repcode_candidate` methods on `RowMatchGenerator` now have no\nin-tree caller. Marked `#[allow(dead_code)]` rather than deleted:\na future routing of a lazy strategy through the Row backend would\notherwise have to re-derive the rep+row best-of-two pick and the\n`pick_lazy_match` driver. Doc comment makes the rationale explicit.\n\n`match_generator.rs` tests: new\n`driver_level4_greedy_round_trip_single_slice` locks down L4 greedy\nreconstruction on a repeating-pattern single slice and asserts at\nleast one `Sequence::Triple` is emitted (the rep probe must produce\na match). `driver_level4_greedy_round_trip_cross_slice` commits two\nidentical slices and asserts the parse matches into the first\nslice's history (offset >= chunk.len()). Covers the new\n`start_matching_greedy` entry point + cross-block hash-table\nseeding.\n\nVerified locally:\n  - cargo nextest run: 521 / 521 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n  - compare_ffi L4 REPORT lines: ratio unchanged on all scenarios\n    (538142 z000033, 8947 large-log-stream, ...)\n\n* test(encoder): drop dead immediate-rep loop + cover L4 greedy edge cases\n\nThe immediate-rep loop inside `start_matching_greedy` was unreachable\non every test and bench workload: a `panic!` probe placed inside the\nloop body ran the full 528-test suite without firing. The donor design\nit mirrors is single-rep, where the inner loop catches hits the main\nloop's single-slot probe wouldn't. Our main-loop rep probe goes\nthrough `repcode_candidate_shared` which already evaluates rep1, rep2,\nrep3 plus the `ll0` fallback — the inner-loop slot is subsumed by the\nnext outer-iteration rep probe of the same slot, so the inner loop is\ndead by construction. Removed.\n\nSide effect on `decodecorpus-z000033` (L4): rust_bytes 538142 -> 537897\n(-245 bytes), because the loop's offset_hist rotations on the few\ninputs where its slice-equality check passed turned out to bias\nsubsequent encoding decisions slightly the wrong way. Other scenarios\nunchanged.\n\nTests added (all hit `start_matching_greedy` via L4 driver):\n- `l4_greedy_round_trip` private test helper: commits multi-slice data\n  per-slice with drive interleaved (single-shot driving loses earlier\n  slices' bytes once they fall out of the window).\n- `driver_level4_greedy_tail_rep_only_reachable` — cross-slice payload\n  whose tail position lives in the 5-byte window that was unreachable\n  under the old `pos + ROW_MIN_MATCH_LEN <= current_len` guard. Asserts\n  at least one match emitted from that region.\n- `driver_level4_greedy_empty_input_emits_nothing` — `current_len == 0`\n  early-return guard exercises.\n- `driver_level4_greedy_sub_min_lookahead_input` — 4-byte payload\n  below `GREEDY_MIN_LOOKAHEAD = 5`; outer loop never runs, all bytes\n  emit as literals.\n- `driver_level4_greedy_incompressible_input` — 256 pseudo-random\n  bytes hit the miss-branch + skip-step path with no rep / row\n  candidate.\n- `driver_level4_greedy_long_literal_run_skip_step_growth` — 2 KiB of\n  pseudo-random data drives the literal-run length past the\n  `SKIP_STRENGTH = 10` threshold so the per-miss step grows beyond 1.\n- `driver_level4_greedy_all_zeros_heavy_rep1` — heavy rep1 path\n  (offset = 1, byte-against-prev-byte). Asserts `max_offset == 1`.\n- `driver_level4_greedy_periodic_pattern_rep_cascade` — 16-byte period\n  repeated 32x; locks the steady-state rep-cascade at offset >= 16.\n\nDoc on `start_matching_greedy` updated: the donor immediate-rep\nparagraph is rewritten to explain WHY it's omitted (single-rep donor\nvs three-rep us) and that removal was empirically validated via the\npanic probe.\n\nCoverage on `row/mod.rs`: 89.12% -> 96.69%. Remaining gaps are micro-\nbranches (rep probe at exact end-of-buffer, regular-strictly-longer-\nthan-rep arm, history compaction drain) and the `#[allow(dead_code)]`\n`start_matching` / `best_match` / `pick_lazy_match` / `repcode_candidate`\nscaffold for future lazy-on-Row routing.\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n  - compare_ffi L4 REPORT (post-removal):\n      decodecorpus-z000033: rust_bytes 537897 (was 538142, -245)\n      large-log-stream:     rust_bytes 8947  (unchanged)\n      others:               unchanged\n\n* test(encoder): pin L4 routing via lazy_depth assertion + clarify doc\n\n`driver_level4_selects_row_backend`: extended to also assert\n`driver.row_matcher().lazy_depth == 0` after `reset(Level(4))`. The\ndispatcher in `MatchGeneratorDriver::start_matching` has a\n`debug_assert_eq!(matcher.lazy_depth, 0)` invariant that routes\n`BackendTag::Row` unconditionally into `start_matching_greedy` — but\nthat invariant is only checked in debug builds. The runtime assertion\nhere pins the routing choice in release tests too, so a future change\nthat rerouted L4 through the lazy parse (`start_matching` with\n`lazy_depth >= 1`) would surface before the round-trip suite runs.\nRound-trip correctness alone passes on either parser, which is why\nthat suite needs a routing-specific companion.\n\nDoc fixes:\n  - `row/mod.rs:237` (start_matching_greedy docs): reworded \"from a\n    depth-1 lazy with `lazy_depth = 0`\" — internally inconsistent\n    (lazy_depth = 0 IS greedy, not depth-1 lazy). Now reads \"from\n    the lazy parse in `start_matching` which `lazy_depth >= 1`\n    strategies use\", removing the contradictory phrasing.\n  - Round-trip test doc updated to acknowledge that round-trip alone\n    does NOT pin the greedy-vs-lazy choice (the lazy_depth assertion\n    in the sibling test does), and to describe what the round-trip\n    suite actually guards (non-empty triple emission on structured\n    input).\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n\n* docs(encoder): correct dispatch invariant location refs + pin abs_pos bound\n\nTwo doc-only corrections + one declined suggestion with measurement\nrationale baked into the source comment.\n\n`row/mod.rs:172` (dead-code `start_matching` doc): the dispatch\ninvariant referenced by this scaffold method lives in the\n`BackendTag::Row` arm of `MatchGeneratorDriver::compress_block`\n(`match_generator.rs:1230` area), not in\n`MatchGeneratorDriver::start_matching`. The doc comment had it on the\nwrong method, which would mislead anyone navigating the call stack\nfrom this scaffold back to its sole caller.\n\n`match_generator.rs:3995` (`driver_level4_selects_row_backend` test\ncomment): same reference fix — the `debug_assert_eq!` lives inside\n`compress_block` not `start_matching`.\n\n`row/mod.rs:411` (`insert_positions` bound): added an explanatory\ncomment pinning the `abs_pos` lower bound and explaining WHY the\nnarrower range is intentional. The wider range\n`[candidate.start, candidate.start + match_len)` was tried and\nregresses `rust_bytes` on `decodecorpus-z000033` by +447\n(537897 -> 538344). `extend_backwards_shared` absorbs literal bytes\nthat were already row-indexed on earlier miss iterations via\n`insert_position(abs_pos)`, so re-indexing them at emit time\noverwrites the same `abs_pos -> position` mapping a second time\nand evicts more recent row-slot tenants. The narrow `abs_pos` bound\nkeeps the row table healthier and the ratio +0 / -447 the right\ndirection.\n\nNo code-behavior change (the function body's emit logic is the same).\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n  - compare_ffi L4 z000033 rust_bytes: 537897 (unchanged from\n    pre-doc-fix baseline)\n\n* test(encoder): tighten tail rep-only test to second-slice-specific assertion\n\nThe previous `driver_level4_greedy_tail_rep_only_reachable` asserted\n`triples >= 1` on a combined-payload round-trip — too weak, because\nthe original first slice (`\"BEEF_BEEF_aaaaaa\"`) already contained\n\"BEEF\" twice and would emit at least one match through the regular\nrow-table path even if the `GREEDY_MIN_LOOKAHEAD = REP_MIN_MATCH_LEN\n+ 1` guard relaxation regressed and the second-slice tail rep stayed\nunreachable. Pass-through assertion masking the case under test.\n\nReplace with a slice-by-slice drive that counts triples emitted from\nthe **second slice's** `start_matching` pass and a deliberately\nconstructed payload that triggers the exact tail boundary:\n\n- First slice: `\"ABCDABCDABCDABCD\"` (16 bytes, strict period 4)\n  guarantees `offset_hist[0] = 4` by the time the parse reaches the\n  end of the slice.\n- Second slice: `\"ABCDA\"` — exactly 5 bytes\n  (= `GREEDY_MIN_LOOKAHEAD`). Outer loop runs once at `pos = 0`. The\n  regular `row_candidate` requires 6 bytes from `abs_pos`, which is\n  past the live-history end, so the only viable hit is the\n  `abs_pos + 1` rep probe. `second[1..5] == \"BCDA\"` matches the\n  4-byte sequence `first[13..16] ++ second[0] == \"BCDA\"` at offset\n  4, and `extend_backwards_shared` then absorbs `second[0]` for a\n  5-byte rep match. With the old `pos + ROW_MIN_MATCH_LEN <=\n  current_len` guard the outer loop would have refused to enter\n  (0 + 6 > 5); with the relaxed `pos + GREEDY_MIN_LOOKAHEAD <=\n  current_len` guard it enters and the rep fires.\n\nWithout this strengthening, a future regression on the loop guard\nwould not surface here. With it, the test fails immediately.\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n\n* docs(encoder): soften skip-step test comment to match what it actually asserts\n\nThe `driver_level4_greedy_long_literal_run_skip_step_growth` test\ncomment claimed it would catch \"a future change to SKIP_STRENGTH\"\nthat would silently skip valid match positions, but the test body\nonly asserts bit-exact round-trip — round-trip would pass on\nSKIP_STRENGTH = 6 or 14 as well, since both produce valid sequences,\njust at different per-iteration costs. The doc overstated the\nguarantee.\n\nRewrite the comment to describe what the test actually verifies: a\nsmoke that the miss branch + step-grow path in\nstart_matching_greedy survives 2 KiB of incompressible input without\npanicking or violating round-trip. Pinning the exact step growth\nwould require returning step / iteration metadata from the parse,\nwhich is invasive plumbing for a constant that has been stable since\nthe original tuning round.\n\nDoc-only change. No code-behavior delta. Existing test continues to\nrun as a stress smoke for the skip-step path.\n\nVerified compile: cargo build --release clean.",
+          "timestamp": "2026-05-19T01:01:03+03:00",
+          "tree_id": "853311b21334cfcba52f93406d4b354aef7640af",
+          "url": "https://github.com/structured-world/structured-zstd/commit/62fe6e140f9c3ad207227bb9a163e443ff9111e2"
+        },
+        "date": 1779144544195,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.135,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.084,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 329.341,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 212.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.785,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.696,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.738,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.984,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.556,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.912,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.036,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.139,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.099,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.999,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.293,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.474,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.076,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.66,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.113,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.344,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
