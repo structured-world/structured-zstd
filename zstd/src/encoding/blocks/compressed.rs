@@ -958,18 +958,19 @@ impl SplitEstimator<'_> {
         // the `raw_fallback` flag from `estimate_subblock_size`, which
         // fires on the **stricter** `emitted_payload >= source_len -
         // min_gain` condition (where `min_gain = (source_len >> 8) + 2`,
-        // ≈0.4% margin — see line 917 of this file). So we bail in a
-        // narrow band `[source_len - min_gain, source_len + 3]` where
-        // donor would still recurse and *might* find a compressible
-        // split.
+        // ≈0.4% margin — see the `min_gain` computation inside
+        // `estimate_subblock_size` above). So we bail in a narrow band
+        // `[source_len - min_gain, source_len + 3]` where donor would
+        // still recurse and *might* find a compressible split.
         //
         // Why this is safe ratio-wise:
         // - The bail-out routes to `compress_block_with_post_split`'s
-        //   single-partition path → `emit_single_sequence_block` →
-        //   which has the SAME `min_gain` expansion fallback at line
-        //   779-780. So whatever block we bail on would have been
-        //   raw-fallbacked by the real emit anyway, by the same
-        //   threshold.
+        //   single-partition path → `emit_single_sequence_block`,
+        //   which applies the SAME `min_gain` expansion fallback (its
+        //   `buffers.compressed.len() >= source_len - min_gain` check
+        //   right before deciding raw-fallback). So whatever block we
+        //   bail on would have been raw-fallbacked by the real emit
+        //   anyway, by the same threshold.
         // - For a missed split-win to matter, both sub-blocks would
         //   need to compress strictly (no raw-fallback in either
         //   half), AND `cost(first) + cost(second) < source_len + 3`.
