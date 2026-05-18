@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779066050359,
+  "lastUpdate": 1779070914377,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -38457,6 +38457,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.35,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "70c08304e4d29b30199ce5742c878659cd30a879",
+          "message": "perf(fse): replace next_state linear search with donor-parity flat tables + tune CI bench budgets (#165)\n\n* perf(fse): replace next_state linear search with donor-parity flat tables\n\n`FSETable::next_state(symbol, idx)` previously called\n`SymbolStates::get` which scanned `Vec<State>` per symbol via\n`.iter().find(state.contains(idx))`. On a typical level_3_dfast\nencode of decodecorpus-z000033 this fired ~3 × N_sequences times\n(LL + ML + OF per sequence), with each call walking through\n5–30 states. `encode_sequences` showed up at 13.7% Rust self-time\nvs `ZSTD_encodeSequences` 6.4% on the C donor.\n\nRoot cause: the donor-parity precomputed tables (`deltaNbBits`,\n`deltaFindState`, flat `nextStateTable`) were already built in\n`build_table_from_probabilities` for the donor `FSE_encodeSymbol`\narithmetic — used to populate `Vec<State>` and then discarded.\n\nChange:\n\n- Add `state_table_flat: Box<[u16]>` and `symbol_tt: [SymbolTT; 256]`\n  to `FSETable`. Populated in `build_table_from_probabilities` from\n  the same intermediates that fed the legacy `Vec<State>` push loop.\n  Donor parity: `state_table_flat` mirrors `nextStateTable` byte for\n  byte (u16, table_size entries); `SymbolTT` mirrors\n  `FSE_symbolCompressionTransform`.\n\n- `FSETable::next_state` now returns `State` by value, computed via\n  donor arithmetic:\n  ```text\n  value      = (1 << acc_log) + idx\n  nb_bits    = (value + delta_nb_bits) >> 16\n  baseline   = idx & !((1 << nb_bits) - 1)\n  next_index = state_table_flat[(value >> nb_bits) + delta_find_state]\n  ```\n  O(1) lookup, no Vec deref, no Option wrap, no linear scan.\n\n- `FSETable::start_state` returns `State` by value (was `&State`) to\n  match the new shape so callers don't juggle lifetimes; still backed\n  by the existing `Vec<State>` storage (called once per stream, not\n  hot).\n\n- `State` gains `Copy` (4 fields, all Copy).\n\n- Retired methods: `SymbolStates::get` and `State::contains` (callers\n  removed). `State.last_index` kept (used by the BTreeSet dedup in\n  the builder) with `#[allow(dead_code)]` since it is no longer read\n  on the encode hot path.\n\n- Caller-side: `encode_sequences` (`blocks/compressed.rs`) and the\n  internal `FSEEncoder` glue (`fse/fse_encoder.rs`) now store\n  `Option<State>` instead of `Option<&State>` — natural fit for the\n  new by-value return shape.\n\nMeasurement (standalone, 200 iters, level_3_dfast / z000033, same\nsession A/B):\n\n| fixture | baseline | after | delta |\n|---------|---------:|------:|------:|\n| z000033 (target, compressible) | 20543 µs | 18286 µs | **−11.0%** |\n| 1 MiB pseudo-random | 699 µs | 712 µs | +2% noise |\n| 1 MiB repeating pattern | 1179 µs | 1183 µs | neutral |\n\nz000033 is the canonical Phase-7 ratio-gap fixture — the encode_sequences\npath is hot exactly there. Random / RLE-shape inputs barely touch\nencode_sequences (raw fast-path / single short block) so the change is\ncorrectly neutral.\n\nGates green:\n- `cargo nextest run -p structured-zstd --features dict_builder bench_internals` 526/526\n- `cargo test --doc --features dict_builder bench_internals` 12/12\n- `cargo clippy --features dict_builder bench_internals --all-targets -- -D warnings` clean\n- `level22_sequences_match_donor_on_corpus_proxy` ratio gate PASS\n\n* ci(bench): tune criterion budgets + split fast/lazy shards (#164)\n\ncriterion 0.8 hard-asserts `sample_size >= 10` (`benchmark_group.rs:97`,\n`lib.rs:519`) so cutting the sample count is not an option without\nforking criterion. Two complementary changes here drop the worst-case\nshard wall under the 120-min CI cap while preserving (or improving)\nmeasurement quality.\n\n## 1. `configure_group` budget tuning (`zstd/benches/compare_ffi.rs`)\n\n| Class | Old | New | Δ per side (×2) |\n|-------|-----|-----|----------------|\n| Small (1–10 KiB) | 3 s + ~3 s default warmup | 1 s + 0.2 s warmup | -8 s |\n| Corpus / Entropy (1 MiB) | 8 s + ~3 s default warmup | 3 s + 0.5 s warmup | -15 s |\n| Large / Silesia (16–100 MiB) | 10 s + 0.5 s | **20 s** + 0.5 s | +20 s |\n\nSmall / Corpus / Entropy: the old budgets were wall-bound by the\nmeasurement window (criterion fit samples in less time than allotted).\nShrinking the budget reclaims that headroom; sample count stays at\n30 / 10 respectively so measurement quality is unchanged on\nfast-per-iter benches.\n\nLarge / Silesia: the old 10 s was too tight. i686 / level_22_btultra2 /\n100 MiB takes ~2 s per iter × 10 samples ≈ 20 s wall, so the budget\nwas producing \"increase target time\" warnings + occasional flaky\nmeasurements on the slowest combos. Widening to 20 s removes the\nwarning envelope without affecting wall on faster combos (criterion\nexits the budget early once samples complete).\n\n## 2. Split `fast` and `lazy` shards (`.github/workflows/ci.yml`)\n\n`lazy` carried 11 levels (5–15) and `fast` 8 levels (-7..=-1, 1) —\ntogether ~50% of the main-push bench surface. The `lazy` shard at\n120 min remained the consistent CI bottleneck.\n\nNew split:\n- `fast-neg` (-7..=-3), `fast-pos` (-2..=-1, 1)\n- `lazy-lower` (5..=9), `lazy-upper` (10..=15)\n\nOther shards unchanged: dfast (2,3), greedy (4), btopt (16,17),\nbtultra (18,19), btultra2 (20..=22). Total strategy groups now 9\n(was 7) × 3 targets = **27 main-push shards (was 21)**.\n\n## 3. .gitignore: add `CLAUDE.md`\n\nProject-local Claude rules file (created in an earlier session) is\nprivate to the maintainer's setup, mirrors `.claude/` and `AGENTS.md`\nwhich are already ignored. Stops `CLAUDE.md` from showing up in\n`git status` after every session.\n\n## Expected impact\n\n- Worst-case shard wall: 120-min cap → ~30–40 min headroom (lazy now\n  split in half + ~60% measurement savings on Small/Corpus/Entropy).\n- Large/Silesia measurement-quality regression: fixed.\n- Total CI bench parallel jobs go from 21 to 27 — same `runs-on:\n  ubuntu-latest` matrix expands, GitHub-hosted runner quota\n  accommodates fine.\n\n* ci(bench): skip entire bench pipeline on release-plz PRs (#164)\n\nRelease-plz PRs are version-bump only (no source-code changes), so\nrunning the full bench matrix (build × 3 targets + 27 strategy\nshards on main / 3 on PR + aggregate + pages + regression) is pure\nCI waste — ~30 min wall + GitHub-hosted runner minutes consumed\nfor zero usable output.\n\nAdd an `if:` filter on `bench-matrix` that excludes:\n- `release-plz[bot]` as PR author\n- branch names starting with `release-plz-`\n\nThe skip cascades through `needs:` so every downstream bench job\n(`bench-build`, `benchmark`, `benchmark-aggregate`,\n`benchmark-pages`, `benchmark-regression-check`) is automatically\ngated out by GH Actions' default skip-when-needs-skipped semantics.\n\n`benchmark-regression-check` already had its own equivalent filter\nfrom PR #159; this commit moves the gate one job upstream so the\nwhole pipeline noops cleanly instead of running shards and then\ndiscarding the merged report at the gh-pages step (which is gated\non `push && main` only).\n\n* fix(fse): switch SymbolTT.delta_nb_bits to u32 for 16-bit-target safety\n\nCodeRabbit caught a 16-bit-target overflow in the new\n`FSETable::next_state` flat-table arithmetic. The donor 16.16\nfixed-point value `delta_nb_bits` was stored as `usize`, but the\n`<<16` / `>>16` shifts assume at least 32-bit width. On 16-bit\ntargets (AVR, MSP430, no-atomic Cortex-M0 — explicitly supported\nprofiles for this crate per the `critical-section` feature docs)\n`usize` is 16 bits and those shifts silently overflow to zero,\nbreaking the encode arithmetic.\n\nDonor `fse_compress.c` uses `U32` throughout the same fixed-point\nmath for the same reason — this aligns us with that invariant.\n\nChange:\n- `SymbolTT.delta_nb_bits: usize` → `u32`\n- Build-time arithmetic in `build_table_from_probabilities` now\n  computes `delta_nb_bits` in `u32` (`-1 | 1` and `probability > 1`\n  arms both updated to `<< 16` on u32 operands).\n- The dedup-loop fixed-point math (`current_value + delta_nb_bits`,\n  `current_value >> num_bits`) switched to u32 to keep the same\n  invariant.\n- `FSETable::next_state` casts `value` to u32 at the start of the\n  arithmetic, then back to `usize` only at the final indexing sites\n  (`1usize << nb_bits`, `value >> nb_bits` slot lookup).\n\nBehavior unchanged on 32-bit / 64-bit targets; only the silent-wrap\nbug on 16-bit `usize` targets is fixed.",
+          "timestamp": "2026-05-18T04:20:37+03:00",
+          "tree_id": "74aca8ce327f5e35b72095f52b7ce19a7231647e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/70c08304e4d29b30199ce5742c878659cd30a879"
+        },
+        "date": 1779070912356,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.19,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 411.584,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 227.742,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.526,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.218,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.599,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.017,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.395,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.933,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.082,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 17.789,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.748,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.139,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.308,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.068,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.049,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.214,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.088,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.352,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.349,
             "unit": "ms"
           },
           {
