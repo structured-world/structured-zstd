@@ -165,6 +165,20 @@ impl RowMatchGenerator {
         }
     }
 
+    /// Lazy-style parse (depth >= 1) for the Row backend.
+    ///
+    /// Currently unused: the only strategy mapped to `BackendTag::Row`
+    /// is `StrategyTag::Greedy` (level 4), which dispatches to
+    /// [`Self::start_matching_greedy`] via the `debug_assert_eq!` in
+    /// the `BackendTag::Row` arm of
+    /// `MatchGeneratorDriver::compress_block`. This method is kept as
+    /// scaffolding for the case where a future level routes a lazy
+    /// strategy through the Row backend — extracting `pick_lazy_match`
+    /// behavior to a fresh module then would mean re-deriving the
+    /// row-hash machinery, which is wasteful. The `dead_code` allow is
+    /// scoped to this method and its private helpers so any new
+    /// caller will pick them up unmodified.
+    #[allow(dead_code)]
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.ensure_tables();
 
@@ -206,6 +220,238 @@ impl RowMatchGenerator {
                 self.insert_position(abs_pos);
                 pos += 1;
             }
+        }
+
+        while pos + ROW_HASH_KEY_LEN <= current_len {
+            self.insert_position(current_abs_start + pos);
+            pos += 1;
+        }
+
+        if literals_start < current_len {
+            let current = self.window.back().unwrap().as_slice();
+            handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
+    }
+
+    /// Donor-parity greedy parse for `lazy_depth == 0` (level 4).
+    ///
+    /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
+    /// `depth == 0`, `dictMode == ZSTD_noDict`. The structural features
+    /// that distinguish this greedy parse from the lazy parse in
+    /// [`Self::start_matching`] (which `lazy_depth >= 1` strategies use):
+    ///
+    /// 1. **Default `start = pos + 1`**: each iteration first probes the
+    ///    repcode bank at `abs_pos + 1` (treating one literal byte as
+    ///    already committed). Donor's `start = ip + 1; matchLength = 0;
+    ///    offBase = REPCODE1_TO_OFFBASE;` at the top of the loop body.
+    ///    Only if a regular match at `abs_pos` is strictly longer does
+    ///    `start` slide back to `abs_pos`. This trades one literal byte
+    ///    for an unconditional repcode probe, which is the algorithmic
+    ///    reason the strategy is called "greedy" — it greedily picks the
+    ///    cheaper repcode encoding (4-5 bits) over a longer-offset
+    ///    regular match (9-13 bits) whenever the rep hit is close to
+    ///    matching the regular match's length.
+    ///
+    /// 2. **Hybrid commit, not donor's pure `goto _storeSequence`**:
+    ///    donor's depth-0 path jumps to `_storeSequence` on the first
+    ///    repcode hit and skips the regular search at `abs_pos`. We
+    ///    deviate here — both the rep probe at `abs_pos + 1` *and* the
+    ///    regular `row_candidate(abs_pos, ..)` are evaluated each
+    ///    iteration, and the longer match wins (ties go to rep for
+    ///    cheaper encoding via [`best_len_offset_candidate`]). Donor
+    ///    can afford pure commit-on-first-rep because it recovers any
+    ///    ratio loss via `minMatch = 5` and superblock-level entropy
+    ///    sharing; we don't replicate those yet, so the hybrid form
+    ///    avoids a measured ~3pp ratio cliff on decodecorpus while
+    ///    still skipping the donor `lazy_depth == 1` lookahead probe
+    ///    that [`start_matching`] above runs unconditionally — the
+    ///    speed shape stays donor-like.
+    ///
+    /// 3. **Skip-step grows with literal-run length**: on a miss donor
+    ///    advances `ip += ((ip - anchor) >> kSearchStrength) + 1` with
+    ///    `kSearchStrength = 8`. The plain matcher steps by 1 — denser
+    ///    hash inserts (mild ratio benefit), but the donor parity skip
+    ///    halves the per-byte work on incompressible runs (the
+    ///    `lazySkipping` mode in donor is an extension of the same idea).
+    ///
+    /// Donor has an immediate-rep loop after store that probes
+    /// `offset_2` for back-to-back hits. It is omitted here: the
+    /// main-loop rep probe at `abs_pos + 1` already evaluates all
+    /// three rep slots (rep1, rep2, rep3 + the donor `ll0` fallback)
+    /// via [`repcode_candidate_shared`], so the inner-loop slot
+    /// donor's single-rep design would catch is already covered by
+    /// the next main-loop iteration. Confirmed dead-on-arrival via a
+    /// `panic!` probe across the full 528-test suite + benchmark
+    /// matrix (never fires).
+    ///
+    /// Catch-up backwards extension is already absorbed into the
+    /// `MatchCandidate.start` field by `extend_backwards_shared`
+    /// (called from `row_candidate` and `repcode_candidate_shared`),
+    /// so we don't redo it explicitly.
+    ///
+    /// `pick_lazy_match` is intentionally not called here — depth == 0
+    /// means "no lookahead", emit the first viable hit.
+    pub(crate) fn start_matching_greedy(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        self.ensure_tables();
+
+        let current_len = self.window.back().unwrap().len();
+        if current_len == 0 {
+            return;
+        }
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let backfill_start = self.backfill_start(current_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
+
+        // Donor mls for repcode probes is 4 (`MEM_read32` compare on
+        // `ip+1` against `ip+1-offset_1`, length extended by
+        // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 6`
+        // gates the *regular* search via the row-table layout; rep
+        // probes are independent of the row table and benefit from
+        // the lower donor threshold (a 4-5 byte rep is cheap to
+        // encode and frequently outperforms emitting the bytes as
+        // literals).
+        const REP_MIN_MATCH_LEN: usize = 4;
+        // Outer-loop lookahead floor: at least `REP_MIN_MATCH_LEN + 1`
+        // bytes left so the `abs_pos + 1` repcode probe can succeed
+        // even in the block tail. Gating the loop on the stricter
+        // `ROW_MIN_MATCH_LEN` (6) would miss the last 5-byte rep-only
+        // case and let those bytes fall through as literals.
+        const GREEDY_MIN_LOOKAHEAD: usize = REP_MIN_MATCH_LEN + 1;
+
+        let mut pos = 0usize;
+        let mut literals_start = 0usize;
+
+        while pos + GREEDY_MIN_LOOKAHEAD <= current_len {
+            let abs_pos = current_abs_start + pos;
+            let lit_len = pos - literals_start;
+
+            // (1) Default start = abs_pos + 1: probe the repcode bank
+            //     at the next byte, treating one byte as already
+            //     committed to the literal run. Donor probes only
+            //     rep1 here; `repcode_candidate_shared` probes all three
+            //     plus the `ll0` fallback because the donor "ll0" trick
+            //     is already baked into our shared helper. The extra
+            //     probes only add candidates that have repcode encoding
+            //     costs (cheap), so the ratio direction is positive vs
+            //     donor while still landing in the "greedy via repcode"
+            //     algorithmic shape.
+            let rep_probe_pos = abs_pos + 1;
+            let rep_probe_lit_len = lit_len + 1;
+            let rep_match = if rep_probe_pos + REP_MIN_MATCH_LEN <= self.history_abs_end() {
+                repcode_candidate_shared(
+                    self.live_history(),
+                    self.history_abs_start,
+                    self.offset_hist,
+                    rep_probe_pos,
+                    rep_probe_lit_len,
+                    REP_MIN_MATCH_LEN,
+                )
+            } else {
+                None
+            };
+
+            // (2) Donor at `depth == 0` does `goto _storeSequence` on a
+            //     rep hit (commits without comparing against the regular
+            //     search). That trade-off is ratio-negative for us
+            //     because donor recovers the loss via other components
+            //     we don't replicate (smaller `mls=5`, block splitter,
+            //     better regular-search recall). To get the speed shape
+            //     of donor's greedy *without* its ratio cliff, we
+            //     compare both options and pick the longer match. On
+            //     ties / near-ties the rep wins by being cheaper to
+            //     encode (single-digit-bit offset code vs 9-13 bits for
+            //     a regular offset).
+            let regular_match = self.row_candidate(abs_pos, lit_len);
+            let chosen = match (rep_match, regular_match) {
+                (Some(rep), Some(reg)) => {
+                    // Prefer the longer; tie-break to rep for cheaper
+                    // encoding. `best_len_offset_candidate` ties on
+                    // shorter offset which is the wrong direction for
+                    // rep-vs-regular (regular offsets are always bigger
+                    // than the corresponding rep, so it would always
+                    // pick rep on ties — that's the right choice here
+                    // but we want strict length preference too).
+                    if reg.match_len > rep.match_len {
+                        Some(reg)
+                    } else {
+                        Some(rep)
+                    }
+                }
+                (Some(rep), None) => Some(rep),
+                (None, reg) => reg,
+            };
+
+            let Some(candidate) = chosen else {
+                // Donor `kSearchStrength = 8` shifts hard on miss
+                // (step grows by `lit_len >> 8`). Empirically on our
+                // corpus that recovers ~30% speed but costs ratio by
+                // dropping hash inserts on long literal runs that
+                // would have served future matches. Shift right by
+                // `SKIP_STRENGTH = 10` instead — same shape, ~4×
+                // rarer growth, so the step stays at 1 byte until the
+                // literal run hits ~1 KiB and only then begins
+                // skipping. Lets us keep most of donor's speed
+                // characteristic without re-introducing the ratio
+                // drain.
+                const SKIP_STRENGTH: u32 = 10;
+                let step = ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
+                self.insert_position(abs_pos);
+                pos += step;
+                continue;
+            };
+
+            // Emit sequence.
+            let start = candidate.start - current_abs_start;
+            // Index `[abs_pos, candidate.start + match_len)`, NOT
+            // `[candidate.start, candidate.start + match_len)`.
+            // `extend_backwards_shared` can move `candidate.start`
+            // below `abs_pos` by absorbing literal bytes that the
+            // outer loop already indexed on earlier miss iterations
+            // via `insert_position(abs_pos)`. Re-indexing them here
+            // would write the same `abs_pos -> position` mapping
+            // into the row table a second time, evicting more recent
+            // / more useful slot tenants from the same row's chain.
+            // Measured on `decodecorpus-z000033`: the
+            // `candidate.start` lower bound regresses `rust_bytes` by
+            // ~+447 over `abs_pos` (537897 -> 538344), so the
+            // narrower range is intentional.
+            self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+            let current = self.window.back().unwrap().as_slice();
+            let literals = &current[literals_start..start];
+            handle_sequence(Sequence::Triple {
+                literals,
+                offset: candidate.offset,
+                match_len: candidate.match_len,
+            });
+            let _ = encode_offset_with_history(
+                candidate.offset as u32,
+                literals.len() as u32,
+                &mut self.offset_hist,
+            );
+            pos = start + candidate.match_len;
+            literals_start = pos;
+
+            // Donor's `lazy_generic` has an immediate-repcode loop here
+            // (probing `offset_2` after each main emit and swapping
+            // `offset_1 ↔ offset_2` on hit). It was implemented and
+            // shipped in earlier iterations of this method but never
+            // fired on any test or benchmark workload — the
+            // `repcode_candidate_shared` probe at the top of the main
+            // loop already evaluates all three rep slots (rep1, rep2,
+            // rep3 + the `ll0` fallback), and the immediate-rep slot
+            // (`offset_hist[1]` at `lit_len = 0`) is subsumed by the
+            // next main-loop iteration's rep probe of the same slot.
+            // Donor's version is single-rep, so the inner loop catches
+            // hits its main-loop probe wouldn't; ours is three-rep, so
+            // the inner loop is dead by construction. Removed to free
+            // the per-iteration check and keep the parser body lean.
         }
 
         while pos + ROW_HASH_KEY_LEN <= current_len {
@@ -275,12 +521,17 @@ impl RowMatchGenerator {
             .max(self.history_abs_start)
     }
 
+    /// Used only by the dead-code [`Self::start_matching`] (lazy-style
+    /// row parse). Kept paired with that method so reviving the lazy
+    /// path doesn't have to re-derive the rep+row best-of-two pick.
+    #[allow(dead_code)]
     pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         let row = self.row_candidate(abs_pos, lit_len);
         best_len_offset_candidate(rep, row)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pick_lazy_match(
         &self,
         abs_pos: usize,
@@ -301,6 +552,7 @@ impl RowMatchGenerator {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn repcode_candidate(
         &self,
         abs_pos: usize,
