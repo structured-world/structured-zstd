@@ -968,14 +968,20 @@ impl SplitEstimator<'_> {
         //   single-partition path → `emit_single_sequence_block`,
         //   which applies the SAME `min_gain` expansion fallback (its
         //   `buffers.compressed.len() >= source_len - min_gain` check
-        //   right before deciding raw-fallback). So whatever block we
-        //   bail on would have been raw-fallbacked by the real emit
-        //   anyway, by the same threshold.
-        // - For a missed split-win to matter, both sub-blocks would
-        //   need to compress strictly (no raw-fallback in either
-        //   half), AND `cost(first) + cost(second) < source_len + 3`.
-        //   The wider donor band gives at most `min_gain` bytes of
-        //   theoretical recoverable ratio per block.
+        //   right before deciding raw-fallback). So for the
+        //   single-partition path specifically, any block we bail on
+        //   here would also raw-fallback there by the same threshold —
+        //   no wire-output drift from this bail-out vs the "let the
+        //   real emit decide" alternative.
+        // - Returning here does skip the split case, so this is NOT a
+        //   proof that a recursive split could never do better: in
+        //   principle, both sub-blocks could compress strictly (no
+        //   raw-fallback in either half) and beat the whole-block
+        //   outcome. For such a missed split-win to matter, both
+        //   sub-blocks would need to compress strictly AND
+        //   `cost(first) + cost(second) < source_len + 3`. The wider
+        //   donor band gives at most `min_gain` bytes of theoretical
+        //   recoverable ratio per block.
         // - Empirically validated: `compare_ffi --list` REPORT lines
         //   show **zero rust_bytes delta** vs main on every
         //   (scenario, level) cell across the full bench matrix.
