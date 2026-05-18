@@ -60,15 +60,42 @@ fn tables_equal() {
 
 #[cfg(any(test, feature = "fuzz_exports"))]
 fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
-    for (idx, dec_state) in dec_table.decode.iter().enumerate() {
-        let enc_states = &enc_table.states[dec_state.symbol as usize];
-        let enc_state = enc_states
-            .states
-            .iter()
-            .find(|state| state.index == idx)
-            .unwrap();
-        assert_eq!(enc_state.baseline, dec_state.new_state as usize);
-        assert_eq!(enc_state.num_bits, dec_state.num_bits);
+    // Per-symbol `Vec<State>` storage was dropped in #110 — the encoder now
+    // holds only `nextStateTable` (donor parity) and per-symbol
+    // `symbolTT`. Recover the (symbol, input_state) → next_state mapping
+    // by enumerating `next_state` over every input state value: each
+    // decode-table slot must be reached by exactly one (symbol, prev)
+    // pair whose `next.baseline` / `next.num_bits` match the decoder.
+    let table_size = enc_table.table_size;
+    let mut hit = alloc::vec![false; table_size];
+    for symbol_u in 0..=255u16 {
+        let symbol = symbol_u as u8;
+        if enc_table.symbol_probability(symbol) == 0 {
+            continue;
+        }
+        for input_state in 0..table_size {
+            let next = enc_table.next_state(symbol, input_state);
+            let dec_state = &dec_table.decode[next.index];
+            if dec_state.symbol == symbol {
+                assert_eq!(
+                    next.baseline, dec_state.new_state as usize,
+                    "decode/encode baseline mismatch at slot {} (symbol {symbol})",
+                    next.index
+                );
+                assert_eq!(
+                    next.num_bits, dec_state.num_bits,
+                    "decode/encode num_bits mismatch at slot {} (symbol {symbol})",
+                    next.index
+                );
+                hit[next.index] = true;
+            }
+        }
+    }
+    for (idx, was_hit) in hit.iter().enumerate() {
+        assert!(
+            *was_hit,
+            "decoder slot {idx} not reached by any (symbol, prev_state) encoder transition"
+        );
     }
 }
 
