@@ -4306,12 +4306,19 @@ fn driver_level4_greedy_incompressible_input() {
 #[test]
 fn driver_level4_greedy_long_literal_run_skip_step_growth() {
     // 2 KiB of unstructured bytes drives the literal-run length past
-    // the `SKIP_STRENGTH = 10` threshold (~1 KiB) so the per-miss
-    // step grows beyond 1. Without this regression test, a future
-    // change to `SKIP_STRENGTH` could silently skip valid match
-    // positions on long literal runs without anyone noticing — round-
-    // trip still passes, but the parse-loop iteration count would
-    // drift.
+    // the `SKIP_STRENGTH = 10` threshold (~1 KiB), so the miss branch
+    // + per-miss step-grow path in `start_matching_greedy` is
+    // exercised. This test is a stress smoke — it only asserts
+    // bit-exact round-trip + no panic / `debug_assert!` fires; it
+    // does NOT pin the `SKIP_STRENGTH` constant or the per-iteration
+    // step count (round-trip would still pass on `SKIP_STRENGTH = 6`
+    // or `= 14` since both produce valid sequences). Pinning the
+    // exact step growth would require returning step / iteration
+    // metadata from the parse, which is invasive plumbing for a
+    // constant that hasn't been re-tuned in months. The value of
+    // this test is catching panics or correctness regressions on
+    // long incompressible runs, which is what its existing
+    // round-trip assertion checks.
     let mut data = alloc::vec::Vec::with_capacity(2048);
     let mut x: u32 = 0xC0FF_EE00;
     for _ in 0..2048 {
