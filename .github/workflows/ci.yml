@@ -264,8 +264,18 @@ jobs:
     # `runtime_setup` runs only on the bench shards (e.g. `i686-gnu`
     # needs gcc-multilib's 32-bit loader at runtime, while `x86_64-musl`
     # only needs `musl-tools` for the build).
+    #
+    # Release-plz PRs are version-bump-only (no source changes), so the
+    # entire bench pipeline (matrix → build → shards → aggregate →
+    # pages → regression) is gated out for them via this `if:` filter.
+    # The skip cascades through `needs:` so downstream bench jobs
+    # also stay green-skipped on those PRs. See #164.
     name: Resolve bench target matrix
     needs: lint
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.user.login != 'release-plz[bot]' &&
+       !startsWith(github.head_ref, 'release-plz-'))
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
