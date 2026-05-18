@@ -4205,24 +4205,52 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
 /// 5-byte position was unreachable. The rep probe at `abs_pos + 1`
 /// only needs 4 bytes of lookahead beyond the probe point, so the
 /// guard was relaxed to `pos + GREEDY_MIN_LOOKAHEAD <= current_len`
-/// (5). Construct a slice whose tail position carries a 4-byte
-/// repcode match that would have been missed under the old guard.
+/// (5). This test drives the slices separately and asserts a match
+/// is emitted **from the second slice's parse pass**, so a future
+/// regression that re-tightens the guard or breaks the cross-slice
+/// repcode lookup fails the test instead of being masked by
+/// first-slice matches.
 #[test]
 fn driver_level4_greedy_tail_rep_only_reachable() {
-    // Cross-slice: first slice establishes a 4-byte repeating
-    // anchor; second slice ends exactly at a position whose
-    // `abs_pos + 1..abs_pos + 5` matches a repcode reaching back
-    // into the first slice.
-    let first: &[u8] = b"BEEF_BEEF_aaaaaa"; // 16 bytes — "BEEF" pattern + filler
-    let second: &[u8] = b"xyzBEEF"; // 7 bytes — last 4 bytes are a rep
-    let mut combined = first.to_vec();
-    combined.extend_from_slice(second);
-    let (triples, _) = l4_greedy_round_trip(16, 2, &combined);
-    // The parse must emit at least one match — exactly the case the
-    // tightened guard ensures is reachable.
+    // Period-4 first slice locks rep1 = 4 into `offset_hist` by the
+    // time the parse reaches the slice tail. Second slice is exactly
+    // 5 bytes ( = `GREEDY_MIN_LOOKAHEAD`) so the outer loop runs
+    // **once** at `pos = 0`; the regular `row_candidate` requires 6
+    // bytes from `abs_pos`, which is past the live history, so the
+    // only viable hit is the `abs_pos + 1` rep probe. `second[0..]`
+    // is shaped so the rep probe at `abs_pos + 1` finds a 4-byte
+    // match at offset 4 (`second[1..5] == first[13..16] ++ second[0]
+    // == "BCDA"`), and `extend_backwards_shared` then absorbs
+    // `second[0]` into the match (extending one byte back into the
+    // implicit anchor, no further because anchor itself is the
+    // current `abs_pos`).
+    let first: &[u8] = b"ABCDABCDABCDABCD"; // 16 bytes — strict period 4
+    let second: &[u8] = b"ABCDA"; // 5 bytes — exact GREEDY_MIN_LOOKAHEAD
+    let mut driver = MatchGeneratorDriver::new(16, 2);
+    driver.reset(CompressionLevel::Level(4));
+
+    let mut first_space = driver.get_next_space();
+    first_space[..first.len()].copy_from_slice(first);
+    first_space.truncate(first.len());
+    driver.commit_space(first_space);
+    driver.start_matching(|_| {});
+
+    let mut second_space = driver.get_next_space();
+    second_space[..second.len()].copy_from_slice(second);
+    second_space.truncate(second.len());
+    driver.commit_space(second_space);
+
+    let mut second_slice_triples = 0usize;
+    driver.start_matching(|seq| {
+        if matches!(seq, Sequence::Triple { .. }) {
+            second_slice_triples += 1;
+        }
+    });
+
     assert!(
-        triples >= 1,
-        "tail rep-only position must produce a match (got {triples} triples)",
+        second_slice_triples >= 1,
+        "tail rep-only position must produce a match in the second slice \
+         (got {second_slice_triples} triples)",
     );
 }
 
