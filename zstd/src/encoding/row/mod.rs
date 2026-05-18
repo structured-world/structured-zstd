@@ -169,8 +169,9 @@ impl RowMatchGenerator {
     ///
     /// Currently unused: the only strategy mapped to `BackendTag::Row`
     /// is `StrategyTag::Greedy` (level 4), which dispatches to
-    /// [`Self::start_matching_greedy`] via the `debug_assert!` in
-    /// `MatchGeneratorDriver::start_matching`. This method is kept as
+    /// [`Self::start_matching_greedy`] via the `debug_assert_eq!` in
+    /// the `BackendTag::Row` arm of
+    /// `MatchGeneratorDriver::compress_block`. This method is kept as
     /// scaffolding for the case where a future level routes a lazy
     /// strategy through the Row backend — extracting `pick_lazy_match`
     /// behavior to a fresh module then would mean re-deriving the
@@ -408,6 +409,19 @@ impl RowMatchGenerator {
 
             // Emit sequence.
             let start = candidate.start - current_abs_start;
+            // Index `[abs_pos, candidate.start + match_len)`, NOT
+            // `[candidate.start, candidate.start + match_len)`.
+            // `extend_backwards_shared` can move `candidate.start`
+            // below `abs_pos` by absorbing literal bytes that the
+            // outer loop already indexed on earlier miss iterations
+            // via `insert_position(abs_pos)`. Re-indexing them here
+            // would write the same `abs_pos -> position` mapping
+            // into the row table a second time, evicting more recent
+            // / more useful slot tenants from the same row's chain.
+            // Measured on `decodecorpus-z000033`: the
+            // `candidate.start` lower bound regresses `rust_bytes` by
+            // ~+447 over `abs_pos` (537897 -> 538344), so the
+            // narrower range is intentional.
             self.insert_positions(abs_pos, candidate.start + candidate.match_len);
             let current = self.window.back().unwrap().as_slice();
             let literals = &current[literals_start..start];

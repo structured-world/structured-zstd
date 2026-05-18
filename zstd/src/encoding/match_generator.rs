@@ -3992,15 +3992,16 @@ fn driver_level4_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(4));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
-    // Greedy-specific routing assertion: `MatchGeneratorDriver::
-    // start_matching` for `BackendTag::Row` has a
+    // Greedy-specific routing assertion: the `BackendTag::Row` arm of
+    // `MatchGeneratorDriver::compress_block` has a
     // `debug_assert_eq!(matcher.lazy_depth, 0)` invariant that
     // dispatches L4 unconditionally into `start_matching_greedy`.
-    // If a future change rerouted L4 through the `start_matching`
-    // (depth >= 1) path, this assertion would catch it before the
-    // round-trip tests below — round-trip alone passes on the lazy
-    // parser too. Together with the round-trip suite this pins the
-    // greedy-vs-lazy routing decision at the level table layer.
+    // If a future change rerouted L4 through the
+    // `RowMatchGenerator::start_matching` (depth >= 1) path, this
+    // assertion would catch it before the round-trip tests below —
+    // round-trip alone passes on the lazy parser too. Together with
+    // the round-trip suite this pins the greedy-vs-lazy routing
+    // decision at the level table layer.
     assert_eq!(
         driver.row_matcher().lazy_depth,
         0,
