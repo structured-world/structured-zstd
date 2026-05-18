@@ -146,7 +146,13 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
 /// negative offset, because of how delta_find_state is derived).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SymbolTT {
-    pub(crate) delta_nb_bits: usize,
+    /// Donor 16.16 fixed-point value. **`u32`, not `usize`** — on 16-bit
+    /// targets (AVR / MSP430 / Cortex-M0 in the no-atomic profile this
+    /// crate documents) `usize` is 16 bits, and `<<16` / `>>16` on a
+    /// `usize` would silently overflow to zero, breaking the
+    /// fixed-point math. Donor `fse_compress.c` uses `U32` throughout
+    /// the same arithmetic for the same reason.
+    pub(crate) delta_nb_bits: u32,
     pub(crate) delta_find_state: isize,
 }
 
@@ -187,9 +193,17 @@ impl FSETable {
         // `(value >> nb_bits)` is always large enough to keep the final
         // index non-negative; this is a construction invariant from
         // `build_table_from_probabilities`.
+        // Fixed-point arithmetic uses `u32` (donor parity, 16-bit-target
+        // safe — see `SymbolTT::delta_nb_bits` doc). `table_size` is
+        // `1 << acc_log` with `acc_log <= 12`, so `value <= 4096 + 4095`
+        // fits comfortably; the `<<16` half of the math lives entirely
+        // inside `delta_nb_bits` which was already computed in u32 by
+        // the builder. Result `nb_bits` is small (<= 8 for typical
+        // FSE tables) — cast to `usize` only at the final indexing
+        // sites (`(1usize << nb_bits)`, `value >> nb_bits` as slot).
         let tt = self.symbol_tt[symbol as usize];
-        let value = self.table_size + idx;
-        let nb_bits = (value + tt.delta_nb_bits) >> 16;
+        let value = (self.table_size + idx) as u32;
+        let nb_bits = ((value + tt.delta_nb_bits) >> 16) as usize;
         let mask = (1usize << nb_bits) - 1;
         let baseline = idx & !mask;
         let slot = ((value >> nb_bits) as isize + tt.delta_find_state) as usize;
@@ -701,14 +715,18 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             continue;
         }
         let probability_abs = probability.unsigned_abs() as usize;
-        let (delta_nb_bits, delta_find_state) = match probability {
+        // Donor 16.16 fixed-point arithmetic — performed in `u32` so a
+        // 16-bit `usize` target (AVR / MSP430 / no-atomic Cortex-M0)
+        // can't silently overflow the `<<16` shift. Donor
+        // `fse_compress.c` keeps the same width.
+        let (delta_nb_bits, delta_find_state): (u32, isize) = match probability {
             -1 | 1 => (
-                ((acc_log as usize) << 16).saturating_sub(1usize << acc_log),
+                ((acc_log as u32) << 16).saturating_sub(1u32 << acc_log),
                 symbol_transform_total as isize - 1,
             ),
             probability if probability > 1 => {
-                let probability = probability as usize;
-                let max_bits_out = acc_log as usize - (probability - 1).ilog2() as usize;
+                let probability = probability as u32;
+                let max_bits_out = (acc_log as u32) - (probability - 1).ilog2();
                 let min_state_plus = probability << max_bits_out;
                 (
                     (max_bits_out << 16).saturating_sub(min_state_plus),
@@ -738,8 +756,11 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         // lookup depends on which duplicate-keyed entry shows up first.
         let mut seen: BTreeSet<(usize, usize, usize, u8)> = BTreeSet::new();
         for current_index in 0..(1usize << acc_log) {
-            let current_value = (1usize << acc_log) + current_index;
-            let num_bits = (current_value + delta_nb_bits) >> 16;
+            // Same 16.16 fixed-point arithmetic as `next_state` —
+            // keep in `u32` for 16-bit-target safety, then cast back
+            // to `usize` at indexing sites.
+            let current_value = (1u32 << acc_log) + (current_index as u32);
+            let num_bits = ((current_value + delta_nb_bits) >> 16) as usize;
             let next_state_idx = (current_value >> num_bits) as isize + delta_find_state;
             let next_index = state_table[next_state_idx as usize];
             let mask = (1usize << num_bits) - 1;
