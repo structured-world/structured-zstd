@@ -110,3 +110,30 @@ fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
     let decoded = frame_dec.collect().expect("decoder returned no payload");
     assert_eq!(decoded.as_slice(), data);
 }
+
+#[test]
+fn malformed_block_does_not_panic_via_restore_checkpoint() {
+    // Regression for libFuzzer artifact crash-bfb3bc55... — a malformed
+    // block whose sequence section decodes more output than the upfront
+    // reserve(MAX_BLOCK_SIZE) could absorb. That forced RingBuffer::
+    // reserve_amortized between checkpoint() and the post-loop bitstream
+    // validity check, and the panic-on-cap-mismatch guard in
+    // restore_checkpoint() then turned the malformed input into a hard
+    // abort — an unintended DoS surface on untrusted bytes. Correct
+    // behaviour is to surface a normal decode Err.
+    extern crate std;
+    use std::io::Read;
+
+    let data: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x5d, 0x00, 0x00, 0xf7, 0x06, 0x5d, 0x00, 0x00, 0x5d, 0x00, 0x80,
+        0xf7, 0xff, 0x5d, 0x00, 0x00, 0x01, 0xe0, 0xe0, 0xe0, 0xe0, 0xe2, 0xe0, 0xa4, 0x00, 0x0c,
+        0x0c, 0x2c, 0x0c,
+    ];
+
+    if let Ok(mut decoder) = crate::decoding::StreamingDecoder::new(data) {
+        let mut output = alloc::vec::Vec::new();
+        let _ = decoder.read_to_end(&mut output);
+    }
+    // Reaching this point at all is the assertion: pre-fix the call
+    // above panicked inside restore_checkpoint's cap-mismatch guard.
+}
