@@ -25,15 +25,26 @@ const BIT_MASK: [u64; 65] = {
 /// Return the lowest `n` bits of `value` (zero the rest).
 ///
 /// On x86-64 with BMI2 this compiles to a single `bzhi` instruction.
-/// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
+/// Everywhere else it computes the mask via `u64::MAX >> (64 - n)`
+/// (replaced the previous `BIT_MASK[n]` table load — one shift + one
+/// predicted cmov vs one 3–5 cycle L1 load on the hot FSE path).
+///
 /// This function supports `n <= 64`; zstd callers normally guarantee
-/// `n <= 56` (the maximum single-symbol width in zstd).
-/// On the non-BMI2 fallback path, `n > 64` naturally panics via
-/// `BIT_MASK[n]` index-out-of-bounds. The `debug_assert` catches
-/// misuse on the BMI2 path (where `_bzhi_u64` would silently
-/// truncate) without adding a branch to the release hot path.
+/// `n <= 56` (the maximum single-symbol width in zstd). The
+/// `debug_assert!(n <= 64)` on the FIRST line of the function body
+/// (not just on `get_bits` callers) is the input-validation gate that
+/// the fuzz suite relies on — invalid `n > 64` (e.g. from a malformed
+/// FSE table or `accuracy_log`) trips it instead of silently returning
+/// 0 from the release path. On the BMI2 path `_bzhi_u64` would
+/// silently truncate without it; on the fallback path `checked_shr`
+/// returns `None` for the wrapping-underflow shift and the
+/// `unwrap_or(0)` would otherwise hide the upstream bug.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
+    // Input-validation gate documented in the rustdoc above — keep this
+    // as the first statement; removing it lets malformed inputs (`n >
+    // 64`) silently decode to 0 in release builds instead of being
+    // caught by the fuzz suite.
     debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {

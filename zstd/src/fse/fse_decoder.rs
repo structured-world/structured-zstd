@@ -241,33 +241,14 @@ impl FSETable {
             negative_idx
         };
 
-        // SAFETY: `table_size` ≤ `self.decode.capacity()` from the reserve
-        // at the start of this function. `copy_symbols_into_decode` below
-        // runs IMMEDIATELY after this and writes a full Entry to every
-        // slot via raw `ptr::write_unaligned` calls — there is no panic-
-        // able code between `set_len` and full initialization, so an
-        // unwind cannot leave reachable uninitialized Entry slots.
-        // On big-endian targets we keep the old resize-with-default path
-        // because the BE branch of `copy_symbols_into_decode` uses
-        // `iter_mut()` (which constructs `&mut Entry`), and that needs
-        // initialized storage. No production target we ship on is BE,
-        // so the extra zero-fill there is irrelevant.
-        #[cfg(target_endian = "little")]
-        unsafe {
-            self.decode.set_len(table_size);
-        }
-        #[cfg(not(target_endian = "little"))]
-        {
-            self.decode.resize(
-                table_size,
-                Entry {
-                    new_state: 0,
-                    symbol: 0,
-                    num_bits: 0,
-                },
-            );
-        }
-        self.copy_symbols_into_decode(&table_symbols);
+        // `copy_symbols_into_decode` is responsible for sizing
+        // `self.decode` AND writing every slot in 0..table_size before
+        // it returns. Keeping the set_len call adjacent to the init
+        // loop (rather than pre-extending here) is what guarantees no
+        // panic-able code can run between "tell Vec the length is
+        // table_size" and "every slot has a fully-initialized Entry".
+        // capacity is reserved earlier in this function.
+        self.copy_symbols_into_decode(&table_symbols, table_size);
         self.symbol_spread_buffer = table_symbols;
         for idx in negative_idx..table_size {
             self.decode[idx].num_bits = self.accuracy_log;
@@ -299,8 +280,9 @@ impl FSETable {
         Ok(())
     }
 
-    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8]) {
-        debug_assert_eq!(table_symbols.len(), self.decode.len());
+    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8], table_size: usize) {
+        debug_assert_eq!(table_symbols.len(), table_size);
+        debug_assert!(table_size <= self.decode.capacity());
 
         #[cfg(target_endian = "little")]
         {
@@ -308,30 +290,40 @@ impl FSETable {
             debug_assert_eq!(core::mem::offset_of!(Entry, new_state), 0);
             debug_assert_eq!(core::mem::offset_of!(Entry, symbol), 2);
             debug_assert_eq!(core::mem::offset_of!(Entry, num_bits), 3);
+            // SAFETY: capacity is guaranteed by the caller; the init
+            // loop immediately below writes a full Entry to every slot
+            // in 0..table_size via raw `ptr::write_unaligned`. The
+            // set_len + writes form a single panic-free window —
+            // nothing in between this call and the loop body can unwind
+            // (no allocations, no user-visible &mut self.decode[..],
+            // no borrows that could observe uninitialized slots).
+            unsafe {
+                self.decode.set_len(table_size);
+            }
             // Write two packed entries (8 bytes) at once:
             // Entry bytes are [new_state_lo, new_state_hi, symbol, num_bits].
             let mut idx = 0usize;
-            while idx + 1 < table_symbols.len() {
+            while idx + 1 < table_size {
                 let packed =
                     ((table_symbols[idx] as u64) << 16) | ((table_symbols[idx + 1] as u64) << 48);
-                // SAFETY: `idx + 1 < table_symbols.len()` and `table_symbols.len() == self.decode.len()`
-                // ensure `idx` and `idx + 1` are valid `self.decode` entries (2 x 4 bytes = 8 bytes).
-                // Unaligned writes are intentional because `Entry` alignment may be < 8.
+                // SAFETY: idx + 1 < table_size == self.decode.len()
+                // (just set above) and capacity covers two u32 slots.
+                // Unaligned writes are intentional because `Entry`
+                // alignment may be < 8.
                 unsafe {
                     ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u64>(), packed);
                 }
                 idx += 2;
             }
-            if idx < table_symbols.len() {
+            if idx < table_size {
                 // Trailing odd entry: write a full 4-byte Entry { new_state: 0,
                 // symbol, num_bits: 0 } via a single u32 store. Field assignment
                 // (`self.decode[idx].symbol = …`) would have left new_state /
                 // num_bits uninitialized after the set_len above — leaking UB
                 // until the per-entry baseline pass overwrote them.
                 let packed = (table_symbols[idx] as u32) << 16;
-                // SAFETY: `idx < table_symbols.len() == self.decode.len()` and
-                // the allocation has at least `table_size` capacity (reserved
-                // in `build_decoding_table`). Unaligned write is intentional
+                // SAFETY: idx < table_size == self.decode.len(), capacity
+                // covers a u32 slot. Unaligned write is intentional
                 // because `Entry`'s alignment may be < 4 on some targets.
                 unsafe {
                     ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u32>(), packed);
@@ -341,6 +333,18 @@ impl FSETable {
 
         #[cfg(not(target_endian = "little"))]
         {
+            // BE path uses iter_mut(), which constructs `&mut Entry` and
+            // therefore needs initialized storage — resize-with-default
+            // is the natural shape. No production target ships BE so
+            // the extra zero-fill is irrelevant.
+            self.decode.resize(
+                table_size,
+                Entry {
+                    new_state: 0,
+                    symbol: 0,
+                    num_bits: 0,
+                },
+            );
             for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
                 entry.symbol = symbol;
             }

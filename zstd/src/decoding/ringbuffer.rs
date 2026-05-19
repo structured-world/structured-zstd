@@ -82,8 +82,20 @@ impl RingBuffer {
     ///   `RingBuffer` instance.
     /// - No reallocation has happened in between (a `reserve_amortized`
     ///   bump would have shifted the ring-buffer indices).
+    /// - `head` has not moved since the corresponding `tail()` was
+    ///   captured. A `head` advance (drain) followed by `set_tail` to an
+    ///   old position would silently re-expose already-consumed bytes
+    ///   through `len()` / `as_slices()` — the full-vs-empty
+    ///   discriminator (invariant 4: `tail == 0` for "full", never
+    ///   `cap`) only stays consistent when `head` is fixed.
     /// - The bytes between `new_tail` and the current tail are not used
     ///   afterwards (callers truncate any view that depended on them).
+    ///
+    /// The sole caller today is `DecodeBuffer::try_restore_checkpoint`,
+    /// which is used only from the fused sequence executor — that path
+    /// never drains between checkpoint and restore, so `head` is
+    /// guaranteed fixed. Any future caller MUST audit the same
+    /// preconditions before using this method.
     #[inline]
     pub(super) unsafe fn set_tail(&mut self, new_tail: usize) {
         debug_assert!(

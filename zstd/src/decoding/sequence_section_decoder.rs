@@ -141,28 +141,16 @@ pub fn decode_and_execute_sequences(
         Ok(())
     }
 
+    // Single fused loop over all sequences. The state-update step
+    // (`ensure_bits` + per-decoder `update_state_fast`) is skipped on
+    // the final iteration — matching the donor `isLastSeq` template
+    // pattern (no pre-fetch of the next state when there is no next
+    // sequence). Under `#[inline(always)]` the trailing `if i + 1 <
+    // num_sequences` collapses to the same generated code as the
+    // previous split-shape version, but keeps the per-sequence body in
+    // one place so future edits to the hot path stay in sync.
     let num_sequences = section.num_sequences as usize;
-    if num_sequences > 1 {
-        for _ in 0..(num_sequences - 1) {
-            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            execute_one_sequence(
-                buffer,
-                literals_buffer,
-                &mut lit_cur,
-                literals_buffer_len,
-                offset_hist,
-                seq,
-            )?;
-            seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
-
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(&mut br);
-            ml_dec.update_state_fast(&mut br);
-            of_dec.update_state_fast(&mut br);
-        }
-    }
-
-    if num_sequences >= 1 {
+    for i in 0..num_sequences {
         let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
         execute_one_sequence(
             buffer,
@@ -173,6 +161,13 @@ pub fn decode_and_execute_sequences(
             seq,
         )?;
         seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+
+        if i + 1 < num_sequences {
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(&mut br);
+            ml_dec.update_state_fast(&mut br);
+            of_dec.update_state_fast(&mut br);
+        }
     }
 
     // Post-loop bitstream validation. On failure roll back the buffer

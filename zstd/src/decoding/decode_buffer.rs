@@ -533,7 +533,7 @@ mod tests {
         buf.push(&[0xAA, 0xBB]);
         assert_eq!(buf.len(), 5);
         // Drain & verify content.
-        let mut drained: Vec<u8> = vec::Vec::new();
+        let mut drained: Vec<u8> = Vec::new();
         buf.drain_to_writer(&mut drained).unwrap();
         assert_eq!(drained, alloc::vec![1, 2, 3, 0xAA, 0xBB]);
     }

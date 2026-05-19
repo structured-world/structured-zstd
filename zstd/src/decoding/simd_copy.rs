@@ -208,6 +208,17 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     // Portable fallback: two overlapping unaligned u64 writes cover 1..=16
     // bytes. Still cheaper than the scalar-strategy loop + indirect call the
     // previous dispatcher imposed on every small copy.
+    //
+    // Reachability matrix (kept here so any future arch arm slotted
+    // between the existing arms knows it must terminate with `return`
+    // or its code will be silently dead):
+    //   • aarch64+neon                                 → arm above returns
+    //   • std + x86/x86_64 + runtime-SSE2              → arm above returns
+    //   • std + x86/x86_64 + NO runtime-SSE2           → reaches here
+    //   • no-std + x86/x86_64 + target_feature=sse2    → arm above returns
+    //   • no-std + x86/x86_64 + NO target_feature=sse2 → reaches here
+    //   • any other arch (riscv64, wasm32, …)          → reaches here
+    // Anything new MUST `return` from its own arm before this comment.
     #[allow(unreachable_code)]
     unsafe {
         let lo: u64 = src.cast::<u64>().read_unaligned();

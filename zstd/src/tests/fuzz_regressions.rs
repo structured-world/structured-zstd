@@ -130,10 +130,19 @@ fn malformed_block_does_not_panic_via_restore_checkpoint() {
         0x0c, 0x2c, 0x0c,
     ];
 
-    if let Ok(mut decoder) = crate::decoding::StreamingDecoder::new(data) {
-        let mut output = alloc::vec::Vec::new();
-        let _ = decoder.read_to_end(&mut output);
-    }
-    // Reaching this point at all is the assertion: pre-fix the call
-    // above panicked inside restore_checkpoint's cap-mismatch guard.
+    // Pre-fix: `restore_checkpoint`'s cap-mismatch assert turned the
+    // malformed block into a panic. Post-fix: frame construction
+    // succeeds (the header is well-formed) and `read_to_end` surfaces
+    // a normal decode `Err` once the corrupt block trips the bitstream
+    // validity check. Assert both legs explicitly so a future
+    // regression that lets the malformed block decode "successfully"
+    // (or that breaks frame construction) cannot silently re-mask the
+    // panic the way an `if let Ok(..) { let _ = ... }` shape would.
+    let mut decoder = crate::decoding::StreamingDecoder::new(data)
+        .expect("regression artifact must pass frame-header construction");
+    let mut output = alloc::vec::Vec::new();
+    assert!(
+        decoder.read_to_end(&mut output).is_err(),
+        "malformed block must surface a decode Err, not decode successfully"
+    );
 }
