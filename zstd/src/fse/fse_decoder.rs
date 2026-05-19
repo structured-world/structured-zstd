@@ -195,18 +195,36 @@ impl FSETable {
         self.decode.clear();
 
         let table_size = 1 << self.accuracy_log;
-        if self.decode.len() < table_size {
-            self.decode.reserve(table_size - self.decode.len());
+        // After clear(), len == 0, so reserve(table_size) guarantees capacity
+        // ≥ table_size — required precondition for the set_len below.
+        self.decode.reserve(table_size);
+
+        // Skip the zero-fill resize: `copy_symbols_into_decode` below writes a
+        // full Entry (new_state, symbol, num_bits) for every slot on the
+        // little-endian fast path, and the subsequent baseline/num_bits passes
+        // overwrite the fields they care about. On big-endian we keep the old
+        // resize so the iter_mut path stays safe — no production target we
+        // ship on is BE, so the perf cost there is irrelevant.
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `table_size` ≤ `self.decode.capacity()` (just reserved
+            // if needed), and `copy_symbols_into_decode` below writes every
+            // byte of every Entry via raw `ptr::write_unaligned` calls before
+            // any read touches them. The trailing baselines/num_bits passes
+            // (lines below) only overwrite already-initialized fields.
+            unsafe { self.decode.set_len(table_size) };
         }
-        //fill with dummy entries
-        self.decode.resize(
-            table_size,
-            Entry {
-                new_state: 0,
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
+        #[cfg(not(target_endian = "little"))]
+        {
+            self.decode.resize(
+                table_size,
+                Entry {
+                    new_state: 0,
+                    symbol: 0,
+                    num_bits: 0,
+                },
+            );
+        }
 
         let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
         table_symbols.clear();
@@ -302,7 +320,19 @@ impl FSETable {
                 idx += 2;
             }
             if idx < table_symbols.len() {
-                self.decode[idx].symbol = table_symbols[idx];
+                // Trailing odd entry: write a full 4-byte Entry { new_state: 0,
+                // symbol, num_bits: 0 } via a single u32 store. Field assignment
+                // (`self.decode[idx].symbol = …`) would have left new_state /
+                // num_bits uninitialized after the set_len above — leaking UB
+                // until the per-entry baseline pass overwrote them.
+                let packed = (table_symbols[idx] as u32) << 16;
+                // SAFETY: `idx < table_symbols.len() == self.decode.len()` and
+                // the allocation has at least `table_size` capacity (reserved
+                // in `build_decoding_table`). Unaligned write is intentional
+                // because `Entry`'s alignment may be < 4 on some targets.
+                unsafe {
+                    ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u32>(), packed);
+                }
             }
         }
 
