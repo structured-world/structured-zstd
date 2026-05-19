@@ -280,7 +280,7 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 const LEVEL_TABLE: [LevelParams; 22] = [
     // Lvl  Strategy       wlog  step  lazy  HC config                                   row config
     // ---  -------------- ----  ----  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 17, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 19, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, hash_fill_step: 1, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
@@ -420,12 +420,16 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 // Negative levels: ultra-fast with the Simple backend.
                 // Acceleration grows with magnitude, expressed as larger
                 // hash_fill_step (fewer positions indexed).
+                // `window_log = 19` matches donor's "base for negative
+                // levels" row in `clevels.h`, so the SuffixStore-per-
+                // WindowEntry has enough span to recall periodic
+                // patterns across `MAX_BLOCK_SIZE` boundaries.
                 let acceleration =
                     (n.saturating_abs() as usize).min((-CompressionLevel::MIN_LEVEL) as usize);
                 let step = (acceleration + 3).min(128);
                 LevelParams {
                     strategy_tag: super::strategy::StrategyTag::Fast,
-                    window_log: 17,
+                    window_log: 19,
                     hash_fill_step: step,
                     lazy_depth: 0,
                     hc: HC_CONFIG,
@@ -3984,7 +3988,7 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     assert_eq!(reconstructed, b"abcabcabcabcabcabcabcabc");
 
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.window_size(), (1u64 << 17));
+    assert_eq!(driver.window_size(), (1u64 << 19));
 }
 
 #[test]
@@ -5706,7 +5710,7 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     // exists; the assertion that storage is now `Simple` covers the
     // invariant the old hash_table/chain_table checks were proxying.
     driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.window_size(), (1u64 << 17));
+    assert_eq!(driver.window_size(), (1u64 << 19));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
 }
 
