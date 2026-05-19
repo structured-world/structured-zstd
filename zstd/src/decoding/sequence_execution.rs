@@ -27,29 +27,33 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         let seq = unsafe { *scratch.sequences.get_unchecked(idx) };
         prefetch_literals_n_plus_two(scratch, idx, literals_copy_counter);
 
-        if seq.ll > 0 {
-            let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
-                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                    wanted: high,
-                    have: scratch.literals_buffer.len(),
-                });
-            }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            literals_copy_counter += seq.ll as usize;
-
-            scratch.buffer.push(literals);
+        // Drop the per-iter `if seq.ll > 0` guard: when ll == 0 the slice
+        // `literals_copy_counter..literals_copy_counter` is empty, and
+        // `RingBuffer::extend` (called via `DecodeBuffer::push`) early-returns
+        // on zero-length data. Saves one branch per sequence on a hot path
+        // where ll == 0 occurs whenever sequences chain back-to-back without
+        // intervening literals (common with high-entropy / fast-level encoders).
+        let high = literals_copy_counter + seq.ll as usize;
+        if high > scratch.literals_buffer.len() {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: scratch.literals_buffer.len(),
+            });
         }
+        let literals = &scratch.literals_buffer[literals_copy_counter..high];
+        literals_copy_counter = high;
+        scratch.buffer.push(literals);
 
         let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
         if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset);
         }
-        if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
-        }
+        // `DecodeBuffer::repeat` already guards on `match_length == 0` (see
+        // its early return). Drop the redundant `if seq.ml > 0` branch on
+        // the hot path — saves one branch per sequence.
+        scratch
+            .buffer
+            .repeat(actual_offset as usize, seq.ml as usize)?;
 
         seq_sum += seq.ml;
         seq_sum += seq.ll;
