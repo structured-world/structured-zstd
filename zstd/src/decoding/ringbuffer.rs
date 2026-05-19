@@ -193,14 +193,36 @@ impl RingBuffer {
 
         debug_assert!(in_f1 + in_f2 == len);
 
+        // Route through `simd_copy::copy_bytes_overshooting` instead of raw
+        // `copy_from_nonoverlapping`. Profile (decompress L-1 fast
+        // decodecorpus-z000033 c_stream) showed `_platform_memmove` at 24%
+        // self-time, of which 943 ms was `execute_sequences → DecodeBuffer::
+        // push → RingBuffer::extend → memmove`. The previous direct
+        // `copy_from_nonoverlapping` lowered to a libc memmove call even
+        // for 1..=16 byte literal pushes; simd_copy's inline byte /
+        // overlapping-u64 tail path handles those without a function call.
+        //
+        // `data` is an external slice with no slack, so src.1 stays exact
+        // (`in_f1` / `in_f2`). For the first free slice, `f1_ptr + f1_len`
+        // lands at `self.cap` and the WILDCOPY_OVERLENGTH slack region
+        // beyond `cap` is writable, so dst.1 is inflated for `simd_copy`'s
+        // SIMD fast paths. The second free slice runs from buf[0] up to
+        // `head` — wildcopy overshoot would clobber readable data, so
+        // dst.1 stays exact there.
         unsafe {
-            // SAFETY: `in_f₁ + in_f₂ = len`, so this writes `len` bytes total
-            // upholding invariant 2
             if in_f1 > 0 {
-                f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
+                simd_copy::copy_bytes_overshooting(
+                    (ptr, in_f1),
+                    (f1_ptr, f1_len + WILDCOPY_OVERLENGTH),
+                    in_f1,
+                );
             }
             if in_f2 > 0 {
-                f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (ptr.add(in_f1), in_f2),
+                    (f2_ptr, f2_len),
+                    in_f2,
+                );
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.

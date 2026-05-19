@@ -56,6 +56,47 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         return;
     }
 
+    // Exact-length tail path: when the caller has no WILDCOPY_OVERLENGTH
+    // slack (e.g. RingBuffer call sites where dst.1 ends at `head`), the
+    // single-op fast path above falls through and the chunked SIMD kernels
+    // below also bail (`rounded > min_buffer_size`), leaving libc memmove
+    // as the only option. memmove was 24% of decode CPU on the profiled
+    // scenario. Replace it with inline byte / overlapping-u64 ops for
+    // copies up to 16 bytes — these write EXACTLY `copy_at_least` bytes
+    // without any overshoot, which is the contract the slack-less call
+    // sites require.
+    if copy_at_least <= 16 {
+        // SAFETY: `copy_at_least <= min(src.1, dst.1)` by this function's
+        // contract, so both branches read/write strictly within the
+        // caller's reported readable / writable spans.
+        unsafe {
+            if copy_at_least <= 8 {
+                // Byte-by-byte for 1..=8 bytes. The fixed-size loop unrolls
+                // into a sequence of immediate-offset loads/stores on every
+                // sane backend, so for the common 1..=8 case this is
+                // typically 2-3 cycles inline vs the ~10+ cycle call into
+                // libc memmove the previous fallback paid.
+                let mut i = 0;
+                while i < copy_at_least {
+                    dst.0.add(i).write(src.0.add(i).read());
+                    i += 1;
+                }
+            } else {
+                // 9..=16 bytes via two overlapping unaligned u64 ops. The
+                // overlap region is written twice with the same source
+                // bytes, so the net effect is exactly `copy_at_least` bytes
+                // copied — no overshoot past dst.0 + copy_at_least.
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi_offset = copy_at_least - 8;
+                let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
+            }
+        }
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
     // Chunked SIMD fast paths for larger copies. Each branch consults the
     // appropriate feature-detection mechanism (cached runtime detect under
     // std, compile-time target_feature otherwise) and falls through on miss
