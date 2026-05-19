@@ -61,7 +61,15 @@ impl<'t> FSEDecoder<'t> {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
-        self.state = self.table.decode[next_state];
+        // SAFETY: `new_state` and `num_bits` were paired by
+        // `calc_baseline_and_numbits` during table construction such that
+        // `new_state + (2.pow(num_bits) - 1) < table_size = self.table.decode.len()`.
+        // `add` is the value of `num_bits` bits read from the bitstream, so
+        // `add < 2.pow(num_bits)` by construction of `BitReaderReversed::get_bits_unchecked`.
+        // Therefore `next_state < self.table.decode.len()` and the indexed read
+        // is in bounds; LLVM cannot prove this invariant on its own because it
+        // spans the table-build and decode call sites.
+        self.state = unsafe { *self.table.decode.get_unchecked(next_state) };
     }
 }
 
