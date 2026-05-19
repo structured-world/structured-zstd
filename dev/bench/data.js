@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779208271354,
+  "lastUpdate": 1779228207480,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -40910,6 +40910,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "57e968f0a65481c0ef82ff9e75ca77e2e8f789de",
+          "message": "perf(decode): pack LL/ML metadata + hot-path micro-opts (#197)\n\n* perf(decode): pack LL/ML base+extra_bits into one u32 lookup\n\nReplace the previous pair of separate const arrays (LL_BASE [u32; 36] +\nLL_EXTRA_BITS [u8; 36] = 180 B over two cache-line regions, indexed\ntwice per sequence) with a single packed table (LL_META [u32; 36] =\n144 B, indexed once). Layout: low 24 bits = baseline (max 65536 fits\ntrivially), high 8 bits = extra_bits (max 16). Same for ML.\n\nHot path now performs one u32 load + a shift + mask to recover both\nfields, instead of two distinct loads from two cache-line regions.\nSaves one memory access per LL/ML pair, i.e. two accesses per\nsequence — compounds over thousands of sequences per block.\n\nValidity of the packing is enforced at compile time by reconstructing\nthe table via a const fn from the original donor-spec arrays, so the\nliteral table contents and the spec do not drift apart silently.\n\n* review(decode): enforce LL/ML pack invariants at compile time\n\nAddress Copilot finding on PR #197: pack_code_meta's doc comment\nclaimed compile-time validation but no asserts were actually present.\nAdd const-evaluated asserts that\n  - bases[i] & 0xFF00_0000 == 0   (baseline must fit in 24 bits)\n  - extra_bits[i] <= 16            (zstd format §3.1.1.3.2.1.1 limit)\n\nAny future spec extension that violates either invariant now fails\nthe build instead of silently clobbering the packed payload.\n\n* perf(ringbuffer): inline extend_from_within match-copy hot path\n\nextend_from_within_unchecked and its branchless variant are the\nhottest path from DecodeBuffer::repeat — every non-repcode,\nnon-overlapping match calls one of them. They were missing #[inline],\nso cross-crate consumers (the codepath through DecodeBuffer) could\nnot fold the flat-layout (head < tail) fast path into the caller and\npaid a real function-call hop per match copy.\n\nFor frames fitting in the window — the dominant case, and especially\nthe Fast-encoded blocks that dominate L=-7..L=1 — this is the\ndifference between one inlined SIMD copy and a non-inlined dispatch\nthrough free_slice_parts-shape branches.\n\nFirst step toward backlog item #132 (full flat-buffer DecodeBuffer\nmode). Full dual-mode refactor stays out of this PR; this inline\ngate alone unblocks the existing flat fast paths in extend() and\nreserve() so they actually compose with repeat().\n\n* perf(decode): drop runtime assert on lookup_ll/ml_code hot path\n\nAddress Copilot finding on PR #197: lookup_ll_code and lookup_ml_code\nwere paying a runtime assert!() (a release-mode bounds-checked indexed\nload) for an invariant that the FSE table construction already enforces\nupstream.\n\nThe LL FSE table is built with max_symbol == MAX_LITERAL_LENGTH_CODE\n(35); build_decoding_table returns FSETableError::TooManySymbols if\nread_probabilities yields more entries than that, and the RLE byte\npath is range-checked in maybe_update_fse_tables. ML uses the same\nshape with max_symbol == MAX_MATCH_LENGTH_CODE (52). A code reaching\neither lookup is invariant in 0..=35 / 0..=52.\n\nSwitch assert! -> debug_assert!() and use get_unchecked. Removes one\npredicted-but-still-branch per LL/ML symbol from the hot decode\nloop.\n\n* perf(decode): Phase 1 — generic DecodeBuffer + BufferBackend trait + FlatBuf\n\nLays compile-time-monomorphised scaffolding for backlog item #132\n(flat-buffer mode for frames the ring would never wrap on). The\nearlier dynamic-dispatch attempt (BufferStorage enum) measured a\n+43-58% regression on small-frame decompress because every push /\nrepeat paid a runtime match. The generic split here keeps both\nbackends as separate compiled instantiations; wrap dispatch is\nerased from the flat path at compile time rather than branched at\nruntime.\n\nNo behavioural change yet — every caller still pinned to\nDecodeBuffer with the RingBuffer trait default.\n\n- buffer_backend.rs: BufferBackend trait — storage-side interface\n  DecodeBuffer needs (extend, repeat-shape, drain-shape, rollback).\n- flat_buf.rs: FlatBuf Vec-backed no-wrap impl + 7 unit tests\n  (append, extend_and_fill, extend_from_within_unchecked,\n  drop_first_n head advance + match-source persistence, set_tail\n  rollback, clear). Capacity sized once at frame reset with\n  WILDCOPY_OVERLENGTH trailing slack so SIMD overshoots stay inside\n  the allocation.\n- ringbuffer.rs: impl BufferBackend for RingBuffer — thin forwarder.\n- decode_buffer.rs: parameterised over B: BufferBackend with\n  RingBuffer default; from_backend(buffer, window_size) constructor\n  wraps a pre-sized FlatBuf for Phase 2; DrainGuard becomes generic.\n- mod.rs: register buffer_backend + flat_buf modules.\n\nFlat backend allow(dead_code) until Phase 2 wires FrameDecoder.reset\nto switch on Single_Segment_flag (separate PR — caller cascade\nthrough DecoderScratch / block_decoder / sequence_section_decoder /\nsequence_execution all needs to become generic over B).\n\n513/513 lib tests pass (506 prior + 7 new FlatBuf), clippy clean on\ndefault + --no-default-features + --no-default-features --features\nhash.\n\n* perf(decode): Phase 2 — DecoderScratch generic over BufferBackend\n\nCascade the compile-time generic from Phase 1 (844f7617) up to\nDecoderScratch. The struct is now parameterised over a\nBufferBackend with the same RingBuffer default, so every existing\ncaller stays on the historical type via inference and no behavioural\nchange ships in this commit either.\n\nWiring FrameDecoder.reset to actually instantiate\nDecoderScratch<FlatBuf> on Single_Segment_flag frames is the next\nphase — that requires the FrameDecoderState type to become a small\nenum that holds either the Ring or Flat variant and pattern-match\nin the top-level FrameDecoder methods, so it stays as a separate\ncommit to keep this one as a pure infrastructure cascade.\n\n513/513 lib tests pass, clippy clean on all three feature modes.\n\n* perf(decode): Phase 3 — cascade BufferBackend generic into block/sequence decoders\n\nblock_decoder::decode_block_content, block_decoder::decompress_block,\nsequence_section_decoder::decode_and_execute_sequences,\nsequence_section_decoder::execute_one_sequence,\nsequence_execution::execute_sequences_fields — all become generic\nover B: BufferBackend. The compiler now monomorphises the full\nhot-path stack per backend; with FrameDecoderState still pinned to\nthe RingBuffer default no behavioural change ships, but the wiring\nfor the flat path is now mechanical (single FrameDecoderState\nvariant flip in the next phase).\n\n513/513 lib tests pass, clippy clean.\n\n* perf(decode): Phase 4 — wire FlatBuf in FrameDecoder + address round-3 review\n\nPhase 4 of backlog item #132. FrameDecoderState.decoder_scratch is\nnow a DecoderScratchKind enum that picks between\nDecoderScratch<RingBuffer> and DecoderScratch<FlatBuf> based on\nFrameHeader.descriptor.single_segment_flag() at reset time.\n\nMatch dispatch fires once per FrameDecoder entry point\n(decode_block_content, drain, can_drain, ...) — never inside the hot\npush/repeat loop, which stays fully monomorphised through the\nDecodeBuffer<B> generic landed in Phases 1-3.\n\nCritical: DecoderScratchKind::reset reuses the existing scratch\nallocations (FSE / HUF tables, sequence vec) when the backend kind\nis unchanged across frames. The first iteration replaced the whole\nscratch on every reset and measured +255% regression on small\nframes; the reuse path keeps the small-frame cost flat.\n\nBenchmark on M1 vs pre-Phase-4 baseline:\n- small-1k-random: 172 -> 166 ns (-3.5%)\n- small-4k-log-lines c_stream: 1.80 -> 1.65 us (-8%)\n- large-log-stream rust_stream: 18.0 -> 17.0 ms (-5%)\n- decodecorpus z000033: within +/- 1% noise\n\nAlso addressed CodeRabbit / Copilot round-3 review threads:\n\n- flat_buf::reserve math: Vec::reserve is \"additional from len\",\n  not \"delta from capacity\" — fix to use saturating_sub on the gap\n  so an alloc actually happens when len < capacity < len+n.\n- sequence_section_decoder::LL_META doc: now says \"rely on\n  debug_assert + unsafe get_unchecked + upstream gates\" instead of\n  the no-longer-existing release-mode runtime check.\n- decode_buffer::DecodeBuffer flat doc: \"selected by\n  FrameDecoder\" -> \"intended for selection\" until Phase 4 lands.\n- buffer_backend::WILDCOPY_OVERLENGTH: single shared constant, both\n  RingBuffer and FlatBuf import from buffer_backend so the slack\n  contract cannot drift.\n- buffer_backend::cap doc: clarified it's the per-instance\n  realloc-detection sentinel, not a portable size — RingBuffer's\n  cap excludes the slack, FlatBuf's includes it; the checkpoint\n  only compares equality on the same instance so the asymmetry is\n  fine.\n\n513/513 lib tests pass, clippy clean on default + --no-default-features\n+ --no-default-features --features hash.\n\n* fix(flat-buf): correct reserve math for multi-frame capacity growth\n\nlibFuzzer artifact crash-e33ba082... exercised a multi-frame stream\nwhere frame 2 reset to a flat backend with a larger window_size than\nframe 1's pre-existing FlatBuf capacity. The reserve(n) math from\nboth the original Phase 1 attempt and CodeRabbit's \"additional = n\n- available\" suggestion under-reserves on that case: when len == 0\nand the existing capacity is non-zero, `(n - available)` shrinks\nthe additional argument by exactly `available`, so Vec::reserve\nonly ensures `capacity >= (n - available) + slack`, which is short\nby `available`.\n\nSubsequent extend_from_within_unchecked then panicked on the\n`dst_off + len <= self.buf.capacity()` debug assert.\n\nFix: call `self.buf.reserve(n + WILDCOPY_OVERLENGTH)` directly.\nVec::reserve's contract is \"ensures capacity >= len + additional\",\nwhich is exactly the contract callers need; the gap-from-capacity\nforms above were re-deriving the same condition incorrectly.\n\nPinned the failing input as a regression test\n(`multi_frame_flat_buf_path_does_not_panic`) in\nsrc/tests/fuzz_regressions.rs alongside the existing\n`malformed_block_does_not_panic_via_restore_checkpoint` regression\nso any future iteration of the flat backend has to re-pass it.\n\n514/514 lib tests pass, clippy clean.\n\n* review: address round-5 + fuse RingBuffer reserve+flat-extend hot path\n\nTwo unrelated changes folded into one commit because the perf opt\nand the doc/test fixes shipped together while addressing review\nthreads:\n\n- ringbuffer: fuse reserve + flat-extend on the common literal push.\n  Profile (decodecorpus-z000033 L=-7 c_stream, 5GB workload via\n  samply at 4999Hz) put RingBuffer::extend at 15% self-time; a\n  share of that was the redundant `self.reserve(len)` call\n  dispatched before the existing flat fast path. Hoist a fused\n  fast path to the top of `extend`: when head <= tail AND\n  `len < cap - tail`, both reserve() AND the wrap-dispatch are\n  skipped. The strict `<` keeps tail < cap so invariant 4 holds\n  without the post-write normalisation branch; the original\n  `<=` flat path is kept as a second branch (behind reserve)\n  for the `tail+len==cap` boundary.\n- Cargo.toml: enable `debug = \"line-tables-only\"` on the bench\n  profile so samply can resolve hot function names.\n\nRound-5 review-thread fixes:\n\n- flat_buf::with_capacity: drop the zero-init of the slack region\n  entirely. FlatBuf only WRITES past `len` (extend, extend_and_fill,\n  extend_from_within_unchecked) before any matching `set_len`, and\n  only READS bytes inside `head..buf.len()` (as_slices, drain\n  helpers). The trailing slack region is therefore intentionally\n  uninitialised — no UB, no per-frame O(cap) zero pass.\n- decode_buffer / mod / scratch docs: drop the \"Phase 2 wiring\n  pending\" / \"intended for selection\" wording — FrameDecoder\n  already instantiates DecoderScratch<FlatBuf> via\n  DecoderScratchKind on single-segment frames.\n- mod.rs: remove `#[allow(dead_code)]` on flat_buf (genuinely\n  used now).\n- fuzz_regressions::multi_frame_flat_buf_path_does_not_panic:\n  `if let Ok(decoder) = StreamingDecoder::new(data)` →\n  `.expect(\"…\")` so a future regression that broke ctor for this\n  artifact cannot silently turn the test into a no-op.\n\n514/514 lib tests pass, clippy clean on default +\n--no-default-features + --no-default-features --features hash.\n\n* review: address round-6 — encode_l4 CLI args + FlatBuf doc clarifications\n\n- examples/encode_l4: replace hardcoded host-specific paths with CLI\n  argument parsing so the example is portable to any environment.\n- flat_buf::FlatBuf::head: expand the doc to clarify scope. FlatBuf is\n  selected by DecodeBuffer<FlatBuf> only for frames whose\n  Single_Segment_flag is set. Those frames decode in a single segment\n  of exactly frame_content_size bytes and never trigger\n  drain_to_window_size mid-stream — drain (and the corresponding\n  drop_first_n head advance) only happens at end-of-frame. The\n  \"drained prefix no longer visible to repeat\" semantics therefore\n  match RingBuffer's behaviour for the same call shape (both backends\n  expose only head..tail through len/as_slices), and the FlatBuf\n  path can't observe a streaming-drain scenario where the distinction\n  would matter.\n- flat_buf::set_tail SAFETY: refresh the note — re-exposed bytes were\n  already initialised (via prior writes before the corresponding\n  tail() capture), trailing slack region is intentionally\n  uninitialised (per the with_capacity contract) and never read by\n  any FlatBuf code path.\n\n514/514 lib tests pass, clippy clean on default + --no-default-features\n+ --no-default-features --features hash, encode_l4 example builds.\n\n* review: address round-7 — PR body sync + from_backend doc/allow cleanup\n\n- decode_buffer::from_backend: drop the stale \"once Phase 2 lands\"\n  wording and the now-redundant #[allow(dead_code)]. The function\n  is actively used by `FrameDecoder` via `DecoderScratchKind::new_flat`\n  to supply a `FlatBuf` pre-sized for `frame_content_size` — without\n  it, the default `new()` constructor would produce a zero-capacity\n  backend and force a realloc on the first push.\n- PR body refreshed via `gh pr edit` to cover BufferBackend +\n  FlatBuf wiring (Phase 1-4) and the fuzz fix, not just the original\n  LL/ML metadata pack from the first commit. Copilot's \"PR\n  description focuses on…\" thread (mod.rs:50) is addressed by the\n  body update.\n\n514/514 lib tests pass, clippy clean on default + --no-default-features\n+ --no-default-features --features hash.\n\n* review: address round-8 — from_backend clear + RingBuffer trait forward\n\n- decode_buffer::from_backend: call `buffer.clear()` so logical\n  counters (set to zero) are not inconsistent with a physically-\n  non-empty backend the caller might have handed in. On a fresh\n  backend (the only real call shape today) clear() is a no-op —\n  the two stores it issues vanish in per-frame reset noise. Hot\n  path (push/repeat) is untouched.\n- ringbuffer: trait impl of `cap()` and `tail()` now forwards to\n  the inherent `Self::cap(self)` / `Self::tail(self)` methods\n  instead of reading the field directly. Lets the inherent\n  surface be the single point that accesses the field, and drops\n  the `#[allow(dead_code)]` markers (the inherent fns are\n  genuinely used through the trait forwarder now).\n- Doc on the inherent cap()/tail() updated to match the forwarding\n  contract.\n\n514/514 lib tests pass, clippy clean on default + --no-default-features\n+ --no-default-features --features hash.\n\n* review: address round-9 — drop dead aarch64 arm in x86 huffman match + regression test\n\n- huff0_decoder::decode_symbol_and_advance: remove the dead\n  `#[cfg(target_arch = \"aarch64\")] Aarch64Neon | Aarch64Sve =>\n  unreachable!()` arm that lived inside the outer\n  `#[cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))]`\n  match. The two cfgs are mutually exclusive so the arm was\n  unreachable at compile time on every platform — Copilot caught\n  it as confusing dead code. Match is exhaustive on Scalar +\n  X86Bmi2/Avx2/Vbmi2 alone since the enum's aarch64 variants are\n  themselves cfg-gated away under the x86 cfg. Comment added so\n  future readers know not to re-introduce the dead arm.\n- decode_buffer test: add `from_backend_clears_prepopulated_backend`\n  regression test (round-8 fix lock-in) — feeds a populated\n  RingBuffer into `from_backend`, asserts `len() == 0` after\n  construction, then pushes fresh bytes and verifies drain returns\n  exactly those bytes (no stale leak).\n\n515/515 lib tests pass, clippy clean on default + --tests +\n--no-default-features + --no-default-features --features hash.\n\n* perf(flat-buf): skip zero-fill in extend_from_reader hot path\n\nAddress Copilot finding on PR #197: FlatBuf::extend_from_reader was\nusing Vec::resize(old + fill_length, 0) to grow length, then\nimmediately overwriting the freshly-zeroed bytes via read_exact.\nRaw blocks decode up to 128 KiB through this path, so the eager\nmemset doubled the write traffic on the raw-block reset shape.\n\nSwitch to a read-into-spare-capacity pattern: reserve(fill_length),\nbuild a `&mut [u8]` slice over the spare capacity via\nfrom_raw_parts_mut, hand it to read_exact, and only call set_len\nafter the read returns Ok. Failed reads leave length unchanged,\nmatching the prior truncate-on-error observable behaviour.\n\nSAFETY notes added inline cover the two unsafe blocks: the read_slot\nconstruction (capacity guarantee + sole-writer contract until\nset_len commits) and the set_len itself (initialisation contract).\n\n515/515 lib tests pass, clippy clean on default + --tests +\n--no-default-features + --no-default-features --features hash.\n\n* fix(flat-buf): tighten set_tail debug_assert to buf.len()\n\n`new_tail` only ever comes from a previous `tail()` call (== `buf.len()`),\nand `buf.len()` is monotonically non-decreasing between the checkpoint\nand the rollback (the caller only writes between snapshot and restore).\nAsserting `<= self.buf.capacity()` was a loose upper bound that would\nsilently let a caller bug pass through `set_len` into uninitialised slack\nbytes — UB. Tightening to `<= self.buf.len()` catches that in debug\nbuilds without changing release semantics.\n\n* style(huff0): wrap x86 match in cfg block for symmetric branches\n\nThe two `#[cfg]`-gated tail expressions (the x86 match and the\nnon-x86 scalar fallback) are both valid as `ExpressionWithBlock`\nstatements without a separating `;` — `match {...}` and `{...}` are\nboth block-terminated and the parser accepts them back-to-back.\nWrapping the x86 match in an outer `{}` makes the two branches\nsymmetrical (both are `#[cfg(...)] { ... }`) and removes the\nrecurring reviewer false-positive about the construct looking like\ntwo expression statements without a separator. Generated code is\nunchanged.\n\n* refactor(flat-buf): route extend_from_reader through self.reserve\n\nwith_capacity and BufferBackend::reserve both budget\nWILDCOPY_OVERLENGTH slack past the target capacity. The previous\nself.buf.reserve(fill_length) call inside extend_from_reader skipped\nthat slack — read_exact today does not overshoot so this is not a\ncorrectness bug, but it leaves a footgun if the raw-block path ever\npicks up SIMD/wildcopy writes. Routing through self.reserve makes\nthe slack invariant uniform across all growth paths.\n\n* fix(flat-buf): avoid &mut [u8] over uninitialised spare capacity in extend_from_reader\n\nForming `&mut [u8]` via `slice::from_raw_parts_mut` over uninitialised\nVec spare capacity is UB regardless of whether a subsequent write\ninitialises it — `&mut T` must always reference initialised memory of\nthe target type. The earlier shape skipped zero-fill before\nread_exact, which paid soundness for ~one memset per 128 KiB raw\nblock — net cost is negligible vs the UB risk on any future Read\nimpl that touches the buffer before writing.\n\nSwitches extend_from_reader to Vec::resize(.., 0) + indexed slice\nform. Also drops the redundant explicit BufferBackend import from\nthe test mod (use super::* already brings it in scope).",
+          "timestamp": "2026-05-20T00:14:14+03:00",
+          "tree_id": "2aa9dbc58d2c8fc9217c995f660a10d776c466bf",
+          "url": "https://github.com/structured-world/structured-zstd/commit/57e968f0a65481c0ef82ff9e75ca77e2e8f789de"
+        },
+        "date": 1779228201164,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 293.511,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 199.47,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.274,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.88,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.606,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.836,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.558,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.247,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.247,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.683,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.755,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.026,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.289,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.855,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.093,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.999,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
