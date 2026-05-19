@@ -188,7 +188,57 @@ fn decode_sequences_without_rle(
         "sequence section update bits exceed 56-bit budget"
     );
 
-    for _seq_idx in 0..section.num_sequences {
+    // Split the loop into a hot N-1 iteration body (always advances state)
+    // and a final tail iteration that skips the trailing state update. The
+    // previous unified loop branched per-iter on `target.len() <
+    // num_sequences` to decide whether to advance state; pulling the final
+    // iteration out removes both that branch and a target.len() materialize
+    // call from the hot path. The bits_remaining underflow check also moves
+    // out: donor zstd only validates bitstream exhaustion once after the
+    // sequence loop, not per-iteration. Same error semantics either way
+    // (the post-loop check catches the same underflow) and saves an isize
+    // multiply + 3 subtractions every iteration on the hot path.
+    let num_sequences = section.num_sequences as usize;
+    if num_sequences > 1 {
+        for _ in 0..(num_sequences - 1) {
+            let ll_code = ll_dec.decode_symbol();
+            let ml_code = ml_dec.decode_symbol();
+            let of_code = of_dec.decode_symbol();
+
+            let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+            let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+            if of_code > MAX_OFFSET_CODE {
+                return Err(DecodeSequenceError::UnsupportedOffset {
+                    offset_code: of_code,
+                });
+            }
+
+            let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+            let offset = obits as u32 + (1u32 << of_code);
+
+            if offset == 0 {
+                return Err(DecodeSequenceError::ZeroOffset);
+            }
+
+            target.push(Sequence {
+                ll: ll_value + ll_add as u32,
+                ml: ml_value + ml_add as u32,
+                of: offset,
+            });
+
+            // Batched refill + 3 state advances (interleaved sequence decode pattern).
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(br);
+            ml_dec.update_state_fast(br);
+            of_dec.update_state_fast(br);
+        }
+    }
+
+    if num_sequences >= 1 {
+        // Tail iteration: emit the final sequence but skip the state
+        // advance — there is no next iteration that would consume the
+        // updated states.
         let ll_code = ll_dec.decode_symbol();
         let ml_code = ml_dec.decode_symbol();
         let of_code = of_dec.decode_symbol();
@@ -214,23 +264,17 @@ fn decode_sequences_without_rle(
             ml: ml_value + ml_add as u32,
             of: offset,
         });
-
-        if target.len() < section.num_sequences as usize {
-            // One refill check for all three state updates (batched fast path).
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(br);
-            ml_dec.update_state_fast(br);
-            of_dec.update_state_fast(br);
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
     }
 
-    if br.bits_remaining() > 0 {
+    // Post-loop bitstream validation: a single check replaces the per-iter
+    // `if br.bits_remaining() < 0` we previously paid on every sequence.
+    let remaining = br.bits_remaining();
+    if remaining < 0 {
+        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+    }
+    if remaining > 0 {
         Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
+            bits_remaining: remaining,
         })
     } else {
         Ok(())
