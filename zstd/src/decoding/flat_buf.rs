@@ -119,7 +119,7 @@ impl BufferBackend for FlatBuf {
     #[inline]
     unsafe fn set_tail(&mut self, new_tail: usize) {
         debug_assert!(new_tail >= self.head);
-        debug_assert!(new_tail <= self.buf.capacity());
+        debug_assert!(new_tail <= self.buf.len());
         // SAFETY: forwarded to Vec::set_len. `new_tail` must come
         // from a previous `tail()` on this same instance (the
         // checkpoint's cap snapshot guarantees no realloc), so the
