@@ -159,22 +159,27 @@ fn decompress_literals(
             Decode4Mode::Checked
         };
 
-        // Donor-parity burst: decode `SYMBOLS_PER_BURST` symbols per stream
-        // (× 4 streams = `4 * SYMBOLS_PER_BURST` symbols per outer iteration)
-        // between bit-reader refill checks. Mirrors
-        // `HUF_DECODEFAST_4X1_LOOP_SYM = 5` in
-        // `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`.
+        // Variable-size burst: decode `symbols_per_burst` symbols per stream
+        // (× 4 streams = `4 * symbols_per_burst` symbols per outer iteration)
+        // between bit-reader refill checks. Inspired by donor
+        // `HUF_decompress4X1_usingDTable_internal_fast_c_loop`
+        // (huf_decompress.c:738-819), which uses a fixed 5-symbol unroll;
+        // we generalise to whatever the bit budget allows so narrower
+        // tables get more symbols-per-refill.
         //
-        // Burst size is computed so the maximum bits consumed per stream
-        // across one burst is `SYMBOLS_PER_BURST * max_num_bits <= 56`,
-        // matching the `BitReaderReversed::ensure_bits(n <= 56)` contract.
-        // For the dominant HUF table widths (`max_num_bits <= 11`) this
-        // selects 5; for the rare 12-bit literal tables it backs off to 4.
-        // `max_num_bits.max(1)` guards the degenerate zero-table case
-        // (compressed literal sections with `max_num_bits == 0` decode to
-        // empty output via the tail loop anyway).
-        let max_num_bits = scratch.table.max_num_bits.max(1);
-        let symbols_per_burst: usize = (56 / max_num_bits as usize).max(1);
+        // Burst size is `floor(56 / max_num_bits)`: the maximum bits
+        // consumed per stream across one burst is
+        // `symbols_per_burst * max_num_bits <= 56`, matching the
+        // `BitReaderReversed::ensure_bits(n <= 56)` contract. The
+        // Zstandard spec caps `max_num_bits` at 11
+        // (`huff0_decoder::MAX_MAX_NUM_BITS`), so `symbols_per_burst`
+        // lands in `[5, 56]` — 5 for full 11-bit tables, up to 56 for
+        // degenerate 1-bit tables. `build_decoder` always sets
+        // `max_num_bits >= 1` for valid frames, so no zero-divisor
+        // guard is needed here (corrupted/empty tables are rejected
+        // upstream before reaching this loop).
+        let max_num_bits = scratch.table.max_num_bits;
+        let symbols_per_burst: usize = 56 / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
         let burst_bits_isize = burst_bits as isize;
 
