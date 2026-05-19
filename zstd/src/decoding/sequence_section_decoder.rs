@@ -183,10 +183,17 @@ pub fn decode_and_execute_sequences(
     if remaining != 0 {
         // SAFETY: `buffer_checkpoint` and `saved_offset_hist` were
         // captured on the same `buffer` / `offset_hist` references at
-        // the top of this call. No reallocation has happened in between
-        // (buffer.reserve was called once before the checkpoint), and
-        // the bytes between the checkpoint and the current tail are
-        // discarded by the Err return below.
+        // the top of this call. The bytes between the checkpoint and
+        // the current tail are discarded by the Err return below.
+        //
+        // restore_checkpoint itself enforces the no-reallocation
+        // invariant: it captures `buffer.cap()` in the checkpoint and
+        // panics on mismatch. On a well-formed block the upfront
+        // `reserve(MAX_BLOCK_SIZE)` makes reallocation impossible (one
+        // zstd block decodes to at most MAX_BLOCK_SIZE bytes). On a
+        // malformed input that decodes past that bound a panic is
+        // preferable to silent wrong output — the cap-equality check
+        // is the load-bearing correctness guard, not a debug assert.
         unsafe {
             buffer.restore_checkpoint(buffer_checkpoint);
         }
