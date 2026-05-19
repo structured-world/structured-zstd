@@ -377,17 +377,21 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     let strategy = state.strategy_tag;
     let has_huf_table = state.last_huff_table.is_some();
     let min_lits = min_literals_to_compress(strategy, has_huf_table);
-    // RLE pre-check: donor `compress_literals` reaches RLE through
-    // `cLitSize == 1` after a full compress attempt
-    // (`zstd_compress_literals.c:192-201`), but only AFTER passing the
-    // `min_lits` gate — so donor at fast/dfast/greedy/lazy emits raw
-    // for 8..63 all-identical inputs. Our pre-check fires earlier and
-    // emits the smaller RLE block instead (2 bytes vs `1+len` raw): a
-    // strict win in compressed size on all-identical sections, no
-    // donor binary parity but better ratio. Note the order — RLE
-    // pre-check runs BEFORE `min_lits`. `estimate_literals_section_bytes`
-    // mirrors this order so probe costs match emit byte-for-byte.
-    if literals_vec.len() >= 8 && all_bytes_identical(literals_vec) {
+    // RLE pre-check: donor `compress_literals` reaches RLE only through
+    // the `cLitSize == 1` branch (`zstd_compress_literals.c:192-201`)
+    // after passing the `min_lits` gate and running a full HUF compress —
+    // so donor emits raw for any all-identical section under `min_lits`
+    // (e.g. 8..63 bytes at fast/dfast/greedy/lazy, 6..7 bytes with HUF
+    // reuse). RLE is unconditionally better than raw on any non-empty
+    // all-identical input (2 bytes vs `1 + len`), so our pre-check fires
+    // for ANY all-identical literal slice regardless of strategy/min_lits.
+    // This produces strictly smaller output than donor on the small
+    // all-identical edges while still matching donor on `>= min_lits`
+    // inputs (where donor's compress+`cLitSize==1` path reaches the same
+    // RLE block). Note the order — RLE pre-check runs BEFORE `min_lits`;
+    // `estimate_literals_section_bytes` mirrors this exactly so probe
+    // costs match emit byte-for-byte.
+    if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
         state.last_huff_table = None;
     } else if literals_vec.len() >= min_lits {
@@ -531,14 +535,12 @@ fn estimate_literals_section_bytes(
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
-    // **in the same order**. The emitter checks the RLE pre-shortcut
-    // (`len >= 8 && all_identical`) BEFORE the `min_lits` gate, so an
-    // all-identical 8-byte literal section emits a 2-byte RLE block under
-    // any strategy — including fast/dfast/greedy/lazy where `min_lits == 64`.
-    // If estimator gated `min_lits` first, it would predict a raw block
-    // for those inputs while the emitter writes RLE, biasing splitter
-    // probe costs. Keep the order identical to emit.
-    if literals.len() >= 8 && all_bytes_identical(literals) {
+    // **in the same order**. The emitter pre-checks `all_identical`
+    // (any non-empty section) BEFORE the `min_lits` gate — RLE is
+    // unconditionally smaller than raw on all-identical inputs, so it
+    // is selected regardless of strategy. Estimator must use the same
+    // ordering and predicate so probe costs match emit byte-for-byte.
+    if !literals.is_empty() && all_bytes_identical(literals) {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + 1;
     }
@@ -595,16 +597,23 @@ fn estimate_literals_section_bytes(
     let compressed_header = compressed_literals_header_bytes(literals.len());
     let total = compressed_header + tree_desc + payload;
 
-    // Mirror `compress_literals` raw fallback: compare on-wire sections
-    // *byte-for-byte* — `total` already includes the compressed literals
-    // header (and the Huffman tree description when emitting a new table),
-    // so the raw side must also include its own 1–3 byte header. Comparing
-    // against bare `literals.len()` would bias the splitter toward raw on
-    // small payloads where the raw header (1 byte for size < 32) is smaller
-    // than the compressed header (3 bytes for size < 1 KB).
+    // Donor `compress_literals` raw-fallback gate
+    // (`zstd_compress_literals.c:187-188`):
+    //   `cLitSize >= srcSize - minGain`
+    // where `cLitSize` is the encoded literals payload + tree description
+    // (output of `HUF_compress*`, excluding the surrounding lhSize bytes)
+    // and `srcSize` is the literal-payload length. In our terms:
+    //   - donor `cLitSize` ≡ `total - compressed_header` (tree_desc + payload)
+    //   - donor `srcSize`  ≡ `literals.len()`
+    // Using the on-wire `total >= raw_section_bytes - mg` form (which
+    // includes the compressed header on the LHS and the raw header on
+    // the RHS) skews the threshold by `compressed_header - raw_header`
+    // bytes and rejects compressed sections that donor would keep,
+    // losing ratio. Mirror donor's payload-vs-srcSize form here.
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let mg = min_gain(literals.len(), strategy);
-    if total >= raw_section_bytes.saturating_sub(mg) {
+    let donor_clit = total - compressed_header; // tree_desc + payload
+    if donor_clit >= literals.len().saturating_sub(mg) {
         *last_huff = None;
         return raw_section_bytes;
     }
@@ -1754,23 +1763,28 @@ fn compress_literals(
     writer.change_bits(size_index, encoded_len as u64, size_bits);
     let total_len = (writer.index() - reset_idx) / 8;
 
-    // Compare on-wire sections byte-for-byte: `total_len` already includes
-    // the compressed literals header + tree description + payload, so the
-    // raw side must also include its own 1–3 byte header
-    // (`uncompressed_literals_header_bytes`). Comparing against bare
-    // `literals.len()` would bias toward raw on small payloads where the
-    // raw header is smaller than the compressed header.
-    let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    // Donor `compress_literals` (`zstd_compress_literals.c:187-188`):
-    // `cLitSize >= srcSize - minGain` → raw fallback. `minGain` is
-    // strategy-aware (`min_gain` helper above; ~1.5% for fast..btopt,
-    // ~0.78% for btultra, ~0.39% for btultra2). Previously this check
-    // used bare `>= raw_section_bytes` (zero margin) which let
-    // marginally-compressing blocks emit huf when raw + reused table
-    // would compress better in the next block. Saturating subtraction
-    // covers tiny inputs where `raw_section_bytes < min_gain`.
+    // Donor `compress_literals` raw-fallback gate
+    // (`zstd_compress_literals.c:187-188`):
+    //   `cLitSize >= srcSize - minGain`
+    // where donor's `cLitSize` is the encoded literals payload plus the
+    // tree description (output of `HUF_compress*`, excluding the
+    // surrounding `lhSize` literals header), and `srcSize` is the
+    // literal-payload length. In our terms:
+    //   - donor `cLitSize` ≡ `total_len - compressed_literals_header_bytes`
+    //     (i.e. tree_desc + huf_payload, no lhSize)
+    //   - donor `srcSize`  ≡ `literals.len()`
+    // Comparing `total_len >= raw_section_bytes - minGain` (with the
+    // compressed-section lhSize on the LHS and raw-section header on
+    // the RHS) skews the threshold by `compressed_header - raw_header`
+    // bytes and rejects compressed sections that donor would keep —
+    // direct ratio loss. Mirror donor's payload-vs-srcSize form here.
+    // `minGain` is strategy-aware (`min_gain` helper above; ~1.56% for
+    // fast..btopt, ~0.78% for btultra, ~0.39% for btultra2). Saturating
+    // subtraction covers tiny inputs where `literals.len() < minGain`.
+    let compressed_header_len = compressed_literals_header_bytes(literals.len());
+    let donor_clit = total_len - compressed_header_len; // tree_desc + payload
     let mg = min_gain(literals.len(), strategy);
-    if total_len >= raw_section_bytes.saturating_sub(mg) {
+    if donor_clit >= literals.len().saturating_sub(mg) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
         HuffmanTableUpdate::Cleared
