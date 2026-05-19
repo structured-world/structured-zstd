@@ -260,6 +260,9 @@
           <label>Stage
             <select id="pf-stage"></select>
           </label>
+          <label>Snapshot
+            <select id="pf-snapshot"></select>
+          </label>
         </div>
         <div class="profile-toggles">
           <label><input type="checkbox" data-series="rust_speed" checked /> Rust speed</label>
@@ -344,7 +347,15 @@
         target: el("pf-target"),
         scenario: el("pf-scenario"),
         stage: el("pf-stage"),
+        snapshot: el("pf-snapshot"),
       };
+
+      // Sentinel for the snapshot dropdown's "latest" entry, which picks
+      // whichever record was generated last for each (level, metric)
+      // independently. Selecting a specific timestamp instead pins the
+      // chart to that one snapshot — useful when comparing two commits
+      // side-by-side via browser tabs.
+      const PROFILE_LATEST = "__latest__";
 
       function parseTimestamp(value) {
         const parsed = Date.parse(String(value || ""));
@@ -805,20 +816,29 @@
           target: profileSelectors.target.value,
           scenario: profileSelectors.scenario.value,
           stage: profileSelectors.stage.value,
+          snapshot: profileSelectors.snapshot.value || PROFILE_LATEST,
         };
       }
 
-      // Pick the latest record per (level, metric) for the chosen target /
-      // scenario / stage. We deliberately collapse the time axis here:
-      // the Level Profile view answers "how do we compare to FFI right
-      // now across every level" — historical drift is the delta chart's
-      // job above.
+      // Pick one record per (level, metric) for the chosen target /
+      // scenario / stage. When `snapshot === PROFILE_LATEST` we take
+      // whichever record is the most recent per (level, metric)
+      // independently — useful for the "current state across every
+      // level" view. When `snapshot` is a specific generated_at value
+      // (or commit sha) the chart is pinned to that exact run so the
+      // 4 lines describe one commit and nothing else, which is what
+      // you want when comparing two snapshots side-by-side.
       function buildProfileData(filter) {
-        const rows = state.records.filter((r) =>
-          (r.target || "unknown-target") === filter.target &&
-          r.scenario === filter.scenario &&
-          r.stage === filter.stage,
-        );
+        const rows = state.records.filter((r) => {
+          if ((r.target || "unknown-target") !== filter.target) return false;
+          if (r.scenario !== filter.scenario) return false;
+          if (r.stage !== filter.stage) return false;
+          if (filter.snapshot !== PROFILE_LATEST) {
+            const label = r.generated_at || r.commit_sha || "local-run";
+            if (label !== filter.snapshot) return false;
+          }
+          return true;
+        });
         const byLevelMetric = new Map();
         for (const row of rows) {
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
@@ -969,8 +989,11 @@
           el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, stage=${filter.stage}.`;
           return;
         }
+        const snapshotNote = filter.snapshot === PROFILE_LATEST
+          ? "latest per level"
+          : `snapshot=${filter.snapshot}`;
         el("profile-status").textContent =
-          `Showing ${levelCount} level point(s) for scenario=${filter.scenario}, stage=${filter.stage}.`;
+          `Showing ${levelCount} level point(s) for scenario=${filter.scenario}, stage=${filter.stage} (${snapshotNote}).`;
 
         const chartDatasets = buildProfileDatasets(datasets);
 
@@ -1039,8 +1062,19 @@
       }
 
       function bindProfileControls() {
-        for (const control of Object.values(profileSelectors)) {
-          control.addEventListener("change", renderProfileChart);
+        // Snapshot list depends on target/scenario/stage — repopulate it
+        // (preserving the current selection where possible) before each
+        // re-render whenever one of those upstream filters changes.
+        const cascading = ["target", "scenario", "stage"];
+        for (const [name, control] of Object.entries(profileSelectors)) {
+          if (cascading.includes(name)) {
+            control.addEventListener("change", () => {
+              repopulateSnapshotOptions();
+              renderProfileChart();
+            });
+          } else {
+            control.addEventListener("change", renderProfileChart);
+          }
         }
         for (const cb of document.querySelectorAll(".profile-toggles input[type=checkbox]")) {
           cb.addEventListener("change", (e) => {
@@ -1050,6 +1084,50 @@
             applyProfileToggles();
           });
         }
+      }
+
+      // Build a label per record that's stable across reloads but still
+      // informative: prefer the timestamp (which the dropdown sorts
+      // chronologically via compareUniqValues), but fall back to commit
+      // SHA when there's no timestamp and finally to "local-run". The
+      // dropdown value is this same label so the selection survives a
+      // filter change as long as the snapshot still produces data for
+      // the new filter.
+      function snapshotLabel(row) {
+        return row.generated_at || row.commit_sha || "local-run";
+      }
+
+      function repopulateSnapshotOptions() {
+        const filter = {
+          target: profileSelectors.target.value,
+          scenario: profileSelectors.scenario.value,
+          stage: profileSelectors.stage.value,
+        };
+        const labels = uniq(
+          state.records
+            .filter((r) =>
+              (r.target || "unknown-target") === filter.target &&
+              r.scenario === filter.scenario &&
+              r.stage === filter.stage,
+            )
+            .map(snapshotLabel),
+        );
+        const previous = profileSelectors.snapshot.value;
+        const fragment = document.createDocumentFragment();
+        const latestOpt = document.createElement("option");
+        latestOpt.value = PROFILE_LATEST;
+        latestOpt.textContent = "latest";
+        fragment.appendChild(latestOpt);
+        for (const label of labels) {
+          const opt = document.createElement("option");
+          opt.value = String(label);
+          opt.textContent = String(label);
+          fragment.appendChild(opt);
+        }
+        profileSelectors.snapshot.replaceChildren(fragment);
+        profileSelectors.snapshot.value = labels.includes(previous) || previous === PROFILE_LATEST
+          ? previous
+          : PROFILE_LATEST;
       }
 
       function renderProfileSelectors() {
@@ -1074,6 +1152,7 @@
         // "compress" is the canonical stage for level profile (level
         // sweeps only meaningfully exist on the compression side).
         populate(profileSelectors.stage, stages, stages.includes("compress") ? "compress" : stages[0]);
+        repopulateSnapshotOptions();
       }
 
       function currentFilter() {
