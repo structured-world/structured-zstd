@@ -532,7 +532,13 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    if all_bytes_identical(literals) {
+    // Mirror emit's RLE gate exactly: emitter only emits RLE when
+    // `len >= 8 && all_identical` (see comment at the RLE branch above).
+    // With reused HUF tables `min_lits == 6`, so a bare `all_identical`
+    // check here would have estimator predict a 1-byte RLE payload for
+    // 6-7 byte all-identical literals that the emitter would actually
+    // write as raw — splitter probe costs drift from real emit output.
+    if literals.len() >= 8 && all_bytes_identical(literals) {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + 1;
     }
