@@ -518,6 +518,32 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "restore_checkpoint")]
+    fn restore_checkpoint_after_realloc_panics() {
+        // Regression test: restore_checkpoint() must refuse to operate
+        // when an intervening RingBuffer reallocation has compacted the
+        // data layout (head reset to 0, tail to s1+s2). Without a cap
+        // guard, the captured `tail` value would silently point at the
+        // wrong logical position in the new buffer, producing wrong
+        // output without any observable error. Bound: a malformed
+        // sequence section that decodes more than MAX_BLOCK_SIZE bytes
+        // before the bitstream-validity check at the end of the fused
+        // sequence executor would trigger exactly this code path.
+        let mut buf = DecodeBuffer::new(64);
+        buf.push(&[0; 16]);
+        let cp = buf.checkpoint();
+        // Force a reallocation. RingBuffer grows by powers of two and
+        // 4 MiB is well above the initial 64-byte starting capacity, so
+        // reserve() must hit reserve_amortized().
+        buf.reserve(4 * 1024 * 1024);
+        buf.push(&[0; 16]);
+        // SAFETY (asserted by the test): the second invariant of
+        // restore_checkpoint — no intervening reallocation — is violated
+        // on purpose to verify the guard fires.
+        unsafe { buf.restore_checkpoint(cp) };
+    }
+
+    #[test]
     fn short_writer() {
         struct ShortWriter {
             buf: Vec<u8>,
