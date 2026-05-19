@@ -22,6 +22,7 @@ pub struct DecodeBuffer {
 pub(crate) struct DecodeBufferCheckpoint {
     tail: usize,
     total_output_counter: u64,
+    cap: usize,
 }
 
 impl Read for DecodeBuffer {
@@ -78,6 +79,7 @@ impl DecodeBuffer {
         DecodeBufferCheckpoint {
             tail: self.buffer.tail(),
             total_output_counter: self.total_output_counter,
+            cap: self.buffer.cap(),
         }
     }
 
@@ -86,15 +88,29 @@ impl DecodeBuffer {
     /// # Safety
     /// The caller must guarantee:
     /// - `cp` came from a `checkpoint()` on this same instance.
-    /// - The buffer has not been reallocated in between (no
-    ///   `reserve_amortized` bump).
     /// - The caller has not read out bytes between the checkpoint and now
     ///   (any callers reading buffer contents must treat the rolled-back
     ///   region as discarded).
+    ///
+    /// Panics (in both debug and release) if an intervening reallocation
+    /// has happened — `reserve_amortized` compacts the ring buffer
+    /// (head=0, tail=s1+s2), which invalidates the captured tail index.
+    /// The check is a load-bearing correctness guard, not a debug
+    /// assertion: silently restoring a stale tail produces wrong output
+    /// without any observable error.
     #[inline]
     pub(crate) unsafe fn restore_checkpoint(&mut self, cp: DecodeBufferCheckpoint) {
+        assert_eq!(
+            self.buffer.cap(),
+            cp.cap,
+            "restore_checkpoint: intervening reallocation invalidated the captured tail (cap {} → {})",
+            cp.cap,
+            self.buffer.cap()
+        );
         // SAFETY: forwarded to RingBuffer::set_tail; same invariants apply
-        // and the caller has affirmed them on the outer entry point.
+        // and the caller has affirmed them on the outer entry point. The
+        // cap-equality check above rules out reallocation-induced index
+        // shift between checkpoint and restore.
         unsafe { self.buffer.set_tail(cp.tail) };
         self.total_output_counter = cp.total_output_counter;
     }
@@ -500,6 +516,10 @@ mod tests {
         // before the first per-iter side-effect. This exercises the
         // primitive that supports that rollback.
         let mut buf = DecodeBuffer::new(1024);
+        // Mirror the fused sequence executor: reserve upfront so no
+        // RingBuffer reallocation happens between checkpoint and restore
+        // (restore_checkpoint requires a stable underlying allocation).
+        buf.reserve(64);
         buf.push(&[1, 2, 3]);
         let cp = buf.checkpoint();
         buf.push(&[4, 5, 6, 7]);
