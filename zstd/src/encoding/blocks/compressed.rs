@@ -79,6 +79,28 @@ fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -
     (src_size >> minlog) + 2
 }
 
+/// Donor `compress_literals` raw-fallback gate
+/// (`zstd_compress_literals.c:187-188`): emit raw when
+/// `cLitSize >= srcSize - minGain`, where `cLitSize` is the HUF payload
+/// plus tree description (the bytes `HUF_compress*` writes — excluding
+/// the surrounding literals lhSize) and `srcSize` is the literal-payload
+/// length. Compares payload-vs-srcSize, NOT on-wire-vs-on-wire, so the
+/// gate is symmetric in header overhead.
+///
+/// Centralized helper so `compress_literals` and
+/// `estimate_literals_section_bytes` share the exact same decision and
+/// neither side can drift back to the pre-2026-05 on-wire comparison
+/// (which inflated the threshold by `compressed_lhsize - raw_lhsize`
+/// bytes and rejected marginally-winning compressed sections).
+#[inline]
+fn use_raw_literal_fallback(
+    huf_section_size: usize,
+    literals_len: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+) -> bool {
+    huf_section_size >= literals_len.saturating_sub(min_gain(literals_len, strategy))
+}
+
 /// Donor `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256).
 const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162, 1130, 1100, 1073, 1047,
@@ -382,13 +404,14 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // after passing the `min_lits` gate and running a full HUF compress —
     // so donor emits raw for any all-identical section under `min_lits`
     // (e.g. 8..63 bytes at fast/dfast/greedy/lazy, 6..7 bytes with HUF
-    // reuse). RLE is unconditionally better than raw on any non-empty
-    // all-identical input (2 bytes vs `1 + len`), so our pre-check fires
-    // for ANY all-identical literal slice regardless of strategy/min_lits.
-    // This produces strictly smaller output than donor on the small
-    // all-identical edges while still matching donor on `>= min_lits`
-    // inputs (where donor's compress+`cLitSize==1` path reaches the same
-    // RLE block). Note the order — RLE pre-check runs BEFORE `min_lits`;
+    // reuse). RLE is at worst equal to raw on `len == 1`
+    // (both produce a 2-byte section) and strictly smaller for `len >= 2`
+    // (2 bytes vs `1 + len`), so our pre-check fires for ANY all-identical
+    // literal slice regardless of strategy/min_lits. This produces strictly
+    // smaller output than donor on the small all-identical edges while
+    // still matching donor on `>= min_lits` inputs (where donor's
+    // compress+`cLitSize==1` path reaches the same RLE block).
+    // Note the order — RLE pre-check runs BEFORE `min_lits`;
     // `estimate_literals_section_bytes` mirrors this exactly so probe
     // costs match emit byte-for-byte.
     if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
@@ -611,9 +634,8 @@ fn estimate_literals_section_bytes(
     // bytes and rejects compressed sections that donor would keep,
     // losing ratio. Mirror donor's payload-vs-srcSize form here.
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    let mg = min_gain(literals.len(), strategy);
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
-    if huf_section_size >= literals.len().saturating_sub(mg) {
+    if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         *last_huff = None;
         return raw_section_bytes;
     }
@@ -1783,8 +1805,7 @@ fn compress_literals(
     // subtraction covers tiny inputs where `literals.len() < minGain`.
     let compressed_header_len = compressed_literals_header_bytes(literals.len());
     let huf_section_size = total_len - compressed_header_len; // tree_desc + payload, no lhSize
-    let mg = min_gain(literals.len(), strategy);
-    if huf_section_size >= literals.len().saturating_sub(mg) {
+    if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
         HuffmanTableUpdate::Cleared
@@ -1882,6 +1903,46 @@ mod tests {
         assert_eq!(min_gain(0, StrategyTag::Fast), 2);
         assert_eq!(min_gain(63, StrategyTag::Fast), 2);
         assert_eq!(min_gain(64, StrategyTag::Fast), 3);
+    }
+
+    #[test]
+    fn use_raw_literal_fallback_uses_payload_vs_srcsize_threshold() {
+        use super::{compressed_literals_header_bytes, use_raw_literal_fallback};
+        // Donor formula: `huf_section_size >= literals_len - min_gain`,
+        // payload-vs-srcSize (no headers on either side). Verify the
+        // gate is symmetric in header overhead by hitting the boundary
+        // where the old on-wire `total >= raw_section - mg` form would
+        // have disagreed.
+        let strategy = StrategyTag::Fast; // min_gain(20, Fast) = (20>>6)+2 = 2
+
+        // literals_len = 20: raw_header = 1, compressed_header = 3.
+        // New threshold (payload-vs-srcSize):
+        //   keep huf iff huf_section_size <  20 - 2 = 18
+        //   fallback   iff huf_section_size >= 18
+        //
+        // Old (regressed) threshold on-wire-vs-on-wire:
+        //   total = huf_section_size + 3
+        //   fallback iff total >= (20 + 1) - 2 = 19
+        //                iff huf_section_size >= 16
+        //
+        // Gap where formulas disagree: huf_section_size in [16, 18).
+        // The new formula MUST keep huf in this gap.
+        let literals_len = 20usize;
+        // Sanity-check the literals-header constants the math relies on.
+        assert_eq!(compressed_literals_header_bytes(literals_len), 3);
+        assert_eq!(super::uncompressed_literals_header_bytes(literals_len), 1);
+
+        // Inside the gap — new keeps, old would have rejected:
+        assert!(!use_raw_literal_fallback(16, literals_len, strategy));
+        assert!(!use_raw_literal_fallback(17, literals_len, strategy));
+
+        // At/above new threshold — both new and old fall back:
+        assert!(use_raw_literal_fallback(18, literals_len, strategy));
+        assert!(use_raw_literal_fallback(19, literals_len, strategy));
+
+        // Below the old threshold — both keep:
+        assert!(!use_raw_literal_fallback(15, literals_len, strategy));
+        assert!(!use_raw_literal_fallback(0, literals_len, strategy));
     }
 
     #[test]
