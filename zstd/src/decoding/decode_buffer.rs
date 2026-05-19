@@ -83,36 +83,34 @@ impl DecodeBuffer {
         }
     }
 
-    /// Restore a checkpoint captured by [`checkpoint`].
+    /// Attempt to restore a checkpoint captured by [`checkpoint`].
     ///
-    /// # Safety
-    /// The caller must guarantee:
-    /// - `cp` came from a `checkpoint()` on this same instance.
-    /// - The caller has not read out bytes between the checkpoint and now
-    ///   (any callers reading buffer contents must treat the rolled-back
-    ///   region as discarded).
+    /// Returns `true` if the rollback was performed; `false` if an
+    /// intervening reallocation invalidated the captured tail index
+    /// (no state is mutated in that case).
     ///
-    /// Panics (in both debug and release) if an intervening reallocation
-    /// has happened — `reserve_amortized` compacts the ring buffer
-    /// (head=0, tail=s1+s2), which invalidates the captured tail index.
-    /// The check is a load-bearing correctness guard, not a debug
-    /// assertion: silently restoring a stale tail produces wrong output
-    /// without any observable error.
+    /// On a well-formed zstd block the upfront `reserve(MAX_BLOCK_SIZE)`
+    /// rules out reallocation, so this returns `true` on the hot path.
+    /// On a malformed block whose sequence section decodes past
+    /// `MAX_BLOCK_SIZE`, `RingBuffer::reserve_amortized` compacts the
+    /// buffer (head=0, tail=s1+s2) and the captured tail index becomes
+    /// meaningless — `false` is returned and the caller surfaces a
+    /// normal decode `Err` instead of restoring stale state. Reaching
+    /// this branch implies the frame is already corrupt; the partial
+    /// data left in the buffer is discarded by the `Err` return.
     #[inline]
-    pub(crate) unsafe fn restore_checkpoint(&mut self, cp: DecodeBufferCheckpoint) {
-        assert_eq!(
-            self.buffer.cap(),
-            cp.cap,
-            "restore_checkpoint: intervening reallocation invalidated the captured tail (cap {} → {})",
-            cp.cap,
-            self.buffer.cap()
-        );
-        // SAFETY: forwarded to RingBuffer::set_tail; same invariants apply
-        // and the caller has affirmed them on the outer entry point. The
-        // cap-equality check above rules out reallocation-induced index
-        // shift between checkpoint and restore.
+    pub(crate) fn try_restore_checkpoint(&mut self, cp: DecodeBufferCheckpoint) -> bool {
+        if self.buffer.cap() != cp.cap {
+            return false;
+        }
+        // SAFETY: cap-equality above proves the underlying allocation
+        // has not been reseated, so the captured `tail` still refers to
+        // the same logical and physical position. The caller is also
+        // responsible for treating any bytes between the captured tail
+        // and the current tail as discarded.
         unsafe { self.buffer.set_tail(cp.tail) };
         self.total_output_counter = cp.total_output_counter;
+        true
     }
 
     /// Pre-allocate capacity for `amount` additional bytes.
@@ -524,7 +522,10 @@ mod tests {
         let cp = buf.checkpoint();
         buf.push(&[4, 5, 6, 7]);
         assert_eq!(buf.len(), 7);
-        unsafe { buf.restore_checkpoint(cp) };
+        assert!(
+            buf.try_restore_checkpoint(cp),
+            "no realloc → restore must succeed"
+        );
         assert_eq!(buf.len(), 3, "len must reflect the checkpoint");
 
         // After restore, fresh writes must land contiguously where the
@@ -538,17 +539,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "restore_checkpoint")]
-    fn restore_checkpoint_after_realloc_panics() {
-        // Regression test: restore_checkpoint() must refuse to operate
-        // when an intervening RingBuffer reallocation has compacted the
-        // data layout (head reset to 0, tail to s1+s2). Without a cap
-        // guard, the captured `tail` value would silently point at the
-        // wrong logical position in the new buffer, producing wrong
-        // output without any observable error. Bound: a malformed
-        // sequence section that decodes more than MAX_BLOCK_SIZE bytes
-        // before the bitstream-validity check at the end of the fused
-        // sequence executor would trigger exactly this code path.
+    fn restore_checkpoint_after_realloc_returns_false() {
+        // Regression test: try_restore_checkpoint() must detect an
+        // intervening RingBuffer reallocation (which compacts the data
+        // layout and invalidates the captured tail) and refuse to
+        // restore, returning false instead of corrupting state or
+        // panicking. Triggered by a malformed zstd block whose sequence
+        // section decodes past MAX_BLOCK_SIZE; surfacing the failure to
+        // the caller as a normal decode Err is required behaviour —
+        // both silent wrong output AND an unconditional panic on
+        // untrusted input are unacceptable. libFuzzer artifact
+        // crash-bfb3bc55... originally exercised this branch via the
+        // panic guard added in the previous round.
         let mut buf = DecodeBuffer::new(64);
         buf.push(&[0; 16]);
         let cp = buf.checkpoint();
@@ -557,10 +559,12 @@ mod tests {
         // reserve() must hit reserve_amortized().
         buf.reserve(4 * 1024 * 1024);
         buf.push(&[0; 16]);
-        // SAFETY (asserted by the test): the second invariant of
-        // restore_checkpoint — no intervening reallocation — is violated
-        // on purpose to verify the guard fires.
-        unsafe { buf.restore_checkpoint(cp) };
+        assert!(
+            !buf.try_restore_checkpoint(cp),
+            "realloc happened → rollback must be refused"
+        );
+        // No state mutation when the restore is refused.
+        assert_eq!(buf.len(), 32);
     }
 
     #[test]
