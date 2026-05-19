@@ -206,13 +206,22 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
 
 #[inline(always)]
 fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_cursor: usize) {
-    if idx + 2 >= scratch.sequences.len() {
+    let seqs_len = scratch.sequences.len();
+    if idx + 2 >= seqs_len {
         return;
     }
 
-    let ll_curr = scratch.sequences[idx].ll as usize;
-    let ll_next = scratch.sequences[idx + 1].ll as usize;
-    let ll_n2 = scratch.sequences[idx + 2].ll as usize;
+    // SAFETY: bounds checked above (idx + 2 < seqs_len). Avoids three Vec
+    // bounds checks per sequence on the hot path. LLVM doesn't collapse
+    // the bounds checks because the borrow shape lets `sequences` appear
+    // mutable to other call sites in the loop body.
+    let (ll_curr, ll_next, ll_n2) = unsafe {
+        (
+            scratch.sequences.get_unchecked(idx).ll as usize,
+            scratch.sequences.get_unchecked(idx + 1).ll as usize,
+            scratch.sequences.get_unchecked(idx + 2).ll as usize,
+        )
+    };
     if ll_n2 < 64 {
         return;
     }
