@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779150700780,
+  "lastUpdate": 1779165229750,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -39681,6 +39681,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "05458e7499192098d38e92ef72271ebd55e3f96e",
+          "message": "feat(encoder): strategy-aware literal gates (G4 + G5) (#182)\n\n* docs(encoder): honest G3 bail-out wording — split-win is theoretically possible\n\nThe previous wording claimed the bail-out routes blocks that \"would\nhave been raw-fallbacked by the real emit anyway, by the same\nthreshold\". That is true ONLY for the single-partition path the\nbail-out routes to — it is NOT a proof that a recursive split could\nnever beat the whole-block outcome. In principle both sub-blocks\ncould compress strictly (no raw-fallback in either half) and produce\n`cost(first) + cost(second) < source_len + 3`. The wider donor band\ngives at most `min_gain` bytes of theoretical recoverable ratio per\nblock — small, but non-zero.\n\nComment split into two paragraphs:\n1. The \"no wire-output drift\" guarantee (only applies to the\n   single-partition path the bail-out actually takes).\n2. The \"what we forgo by skipping the split case\" caveat — both\n   sub-blocks would need to compress strictly AND beat the whole-\n   block cost; band is bounded by `min_gain`, empirically zero\n   delta in the bench matrix.\n\nNo behavior change. Doc-only.\n\n* feat(encoder): strategy-aware literal gates (G4 + G5)\n\nDonor `ZSTD_minLiteralsToCompress` (`zstd_compress_literals.c:114-127`)\nfloors literal-compression entry at `8 << shift` bytes with shift\nderived from strategy index (fast/dfast/greedy/lazy=3, btopt=2,\nbtultra=1, btultra2=0) and 6-byte floor on reused HUF tables.\nPreviously hardcoded `< 8` floor — same lower bound but ignored\nstrategy: btultra2 missed the 8-byte tail compression opportunity,\nbtopt missed 32-byte band, etc.\n\nDonor `ZSTD_minGain` (`zstd_compress_internal.h:677-684`) requires\ncompressed literals to beat raw by `(srcSize >> minlog) + 2` margin\nwhere minlog=6 for fast..btopt, 7 for btultra, 8 for btultra2.\nPreviously bare `>= raw_section_bytes` — overcompressed micro-wins\nthat fell back to raw on real emit, biasing splitter cost predictions.\n\n`CompressState.strategy_tag` plumbed through frame compressor,\nstreaming encoder, and `CompressedBlockScratch::scratch_state` so emit\nand estimator paths use identical gates — keeps splitter probe costs\nin sync with actual emit decisions.\n\n- Verified 514/514 lib tests pass, clippy + fmt clean\n- Full ratio matrix (203 cells): 0 deltas vs main — gates donor-equivalent\n  on current fixtures\n- Block-level `min_gain = (srcSize >> 8) + 2` (btultra2 margin) kept\n  uniform at `SplitEstimator::estimate_subblock_size` /\n  `emit_single_sequence_block` — migration to strategy-aware block-level\n  gain is a separate cleanup\n\nRelated: #23\n\n* fix(encoder): estimator RLE gate mirrors emit's >= 8 guard\n\nEmitter only emits RLE when `len >= 8 && all_identical`\n(`encode_block_parts_with_sequence_scratch` RLE branch). After G4\nlanded, estimator's `min_lits` can be 6 on reused HUF tables, so a\nbare `all_identical` check let estimator predict a 1-byte RLE payload\nfor 6-7 byte all-identical literals that the emitter would actually\nwrite as raw — splitter probe costs drift from real emit output.\n\nMirror the same `len >= 8` guard explicitly so estimator and emit\nstay byte-equivalent on every input.\n\nReported by CodeRabbit on PR #182.\n\n* fix(encoder): mirror emit order in estimator + cover gates with tests\n\nEmit checks the RLE pre-shortcut (`len >= 8 && all_identical`)\nBEFORE the strategy-aware `min_lits` gate, so an all-identical\n8-byte literal section emits a 2-byte RLE block under every\nstrategy — including fast/dfast/greedy/lazy where `min_lits == 64`.\nThe estimator previously gated `min_lits` first, predicting raw\nfor those inputs while emit wrote RLE — splitter probe costs\ndiverged. Swap the order in `estimate_literals_section_bytes` so\nboth paths agree byte-for-byte; update emit's RLE-pre-check\ncomment to be accurate about the donor divergence.\n\nAdd unit tests covering:\n\n- `min_literals_to_compress` per-strategy values with and without\n  HUF reuse (donor table from `zstd_compress_literals.c:114-127`)\n- `min_gain` per-strategy margins (`zstd_compress_internal.h:677-684`)\n  including small-source `(src >> minlog) + 2` edge\n- Estimator/emit parity for boundary literal lengths around each\n  strategy's `min_lits` and across the RLE `>= 8` cliff\n\nVerified 531/531 lib tests pass; ratio matrix (203 cells) shows\n0 delta vs main.\n\n* fix(encoder): donor-formula min_gain + RLE for any all-identical section\n\nTwo related parity fixes to the literal-section pipeline:\n\n1. min_gain comparison now matches donor formula. Previously compared\n   `total_len >= raw_section_bytes - mg` (compressed lhSize on LHS,\n   raw lhSize on RHS), which skewed the threshold by\n   `compressed_header - raw_header` bytes and forced raw fallback on\n   marginally-winning compressed sections that donor would keep. Switch\n   to donor's `cLitSize >= srcSize - minGain` form\n   (`zstd_compress_literals.c:187-188`): compare\n   `(total_len - compressed_header_len) >= literals.len() - mg`. Applied\n   in both estimator (`estimate_literals_section_bytes`) and emit\n   (`compress_literals`) so probe costs stay in lockstep.\n\n2. RLE pre-check fires for any non-empty all-identical literal section,\n   not just `len >= 8`. The old `len >= 8` floor caused 6/7-byte\n   all-identical sections with a reusable HUF table (`min_lits == 6`)\n   to skip RLE and emit a larger HUF block — donor reaches the same\n   RLE block via `cLitSize == 1` after the `min_lits` gate. Dropping\n   the floor matches donor on `>= min_lits` inputs and produces\n   strictly smaller output than donor on the `< min_lits` all-identical\n   edges (where donor falls through to raw). Applied symmetrically in\n   estimator and emit.\n\n531/531 lib tests pass; ratio matrix (203 cells via REPORT lines) shows\n0 delta vs main — both fixes are ratio-safe on current fixtures.\n\n* test(encoder): extend literal-gate parity test to HUF reuse path\n\nThe parity test previously only seeded `last_huff_table: None`, so the\nfloor-6 HUF reuse path (`ZSTD_minLiteralsToCompress` with valid prior\nHUF table) and 6/7-byte all-identical sections that newly route\nthrough the unconditional RLE pre-check were not exercised in\nestimator/emit parity.\n\nAdd cases:\n- Sub-`min_lits` all-identical (`len in 1..=7` at fast strategy):\n  exercises the new \"any non-empty all-identical → RLE\" path\n- Seeded HUF table with `Lazy` strategy at 6/7-byte all-identical and\n  16-byte non-identical: exercises the `min_lits == 6` floor and the\n  HUF-reuse decision under the new RLE pre-check\n\nAlso update the in-test docstring to drop the stale \"RLE `>= 8` cliff\"\nphrasing — the cliff was removed when RLE became unconditional for\nnon-empty all-identical inputs.\n\n531/531 lib tests pass.\n\n* refactor(encoder): rename literal-gate vars to describe value, not origin\n\n`donor_clit` told the reader where the formula came from, not what the\nvalue represents. Rename to `huf_section_size` (tree description plus\nHUF payload, excluding the literals lhSize) — describes the bytes\nthemselves so the call site is readable without recalling reference\nnaming conventions. Same rename in both the emit (`compress_literals`)\nand estimator (`estimate_literals_section_bytes`) sides.\n\nTest names follow the same principle:\n- `min_literals_to_compress_matches_donor_table`\n  → `min_literals_to_compress_returns_per_strategy_floor`\n- `min_gain_matches_donor_margin`\n  → `min_gain_returns_per_strategy_margin`\n\nBehavior unchanged; 531/531 lib tests pass, clippy/fmt clean, ratio\nmatrix 0 deltas vs main.\n\n* refactor(encoder): centralize raw-literal-fallback gate\n\nExtract `use_raw_literal_fallback(huf_section_size, literals_len,\nstrategy)` helper so `compress_literals` (emit) and\n`estimate_literals_section_bytes` (probe) share one decision point —\nneither side can drift back to an on-wire-vs-on-wire comparison that\ninflates the threshold by the lhSize delta and rejects marginally\ncompressed sections.\n\nAdd `use_raw_literal_fallback_uses_payload_vs_srcsize_threshold` test\nthat walks the 2-byte gap (`compressed_lhsize - raw_lhsize`) at\n`literals.len() = 20` to lock in the payload-vs-srcSize semantics.\n\nTighten the RLE shortcut docstring: RLE equals raw at `len == 1`\n(both 2 bytes), strictly smaller only at `len >= 2`.\n\n532/532 lib tests, clippy/fmt clean.\n\n* docs(encoder): clarify Lazy strategy mapping and min_gain usage scope\n\n`min_literals_to_compress` Lazy mapping: drop the \"most-aggressive-of-band\"\nphrasing — donor's shift table pins strategies 1..6 to `shift = 3`\nuniformly, so Lazy → 64-byte floor regardless of which donor index in\nthe 4..6 band we'd nominally pick. No aggressiveness gradient exists\nwithin this band.\n\n`min_gain` doc: split the donor formula (gates both block-level and\nliteral-section in donor) from the current crate usage (helper is\nwired into literal-section gates only; block-level emit and probe\nstill use uniform `(source_len >> 8) + 2`). Previous wording conflated\nthe two and read as if the helper were already plumbed everywhere.\n\n* docs(encoder): document strategy_tag invariant + accurate RLE-vs-raw\n\n`CompressState.strategy_tag` doc: replace the misleading \"defaults to\nFast\" wording with an explicit invariant — the field must be\ninitialized from the active `CompressionLevel` and re-synced on every\n`matcher.reset()`. There is no `Default` impl; production constructors\nand tests must supply a value.\n\n`estimate_literals_section_bytes` docstring: tighten the RLE-vs-raw\nsize claim so it matches the actual invariant — RLE equals raw at\n`len == 1` (both 2 bytes) and is strictly smaller for `len >= 2`,\ni.e. RLE is never worse than raw on all-identical input.\n\n* fix(encoder): sync strategy_tag on streaming reset path\n\n`StreamingEncoder::ensure_frame_started` resets the matcher and clears\nlast_huff / fse_tables for the new frame but did not refresh\n`state.strategy_tag` from the active compression level. That left the\nliteral-compression gates (`min_literals_to_compress`, `min_gain`)\nreading the construction-time strategy on every subsequent frame,\nwhich would silently leak the wrong gate floor if the encoder were\never extended with a between-frame level change.\n\nMirror `FrameCompressor::compress`'s reset-time sync at the streaming\nreset site so both entry points are byte-equivalent at the gate\nlevel. Tighten the `CompressState.strategy_tag` invariant docstring\nto enumerate the two owned reset sites explicitly. Add a regression\ntest that exercises the streaming reset across four levels and\nasserts the synced tag matches `StrategyTag::for_compression_level`.\n\n533/533 lib tests pass; clippy and fmt clean.\n\n* test(encoder): cover FrameCompressor::set_compression_level → strategy_tag\n\nThe streaming reset-time sync test only exercises a single fixed level\nper encoder, which would pass even with the reset-time sync deleted\nbecause the construction-time tag already matches. Add a regression\ntest that drives the level-change path explicitly: construct\n`FrameCompressor` at `CompressionLevel::Fastest`, call\n`set_compression_level(Best)` to cross from the Fast band into the\nBtUltra2 band, run a full `compress()` cycle, then verify\n`state.strategy_tag` reflects the new level's\n`StrategyTag::for_compression_level` resolution.\n\nIncludes an `assert_ne!` fixture invariant that the two chosen levels\nresolve to different `StrategyTag` variants, so a future renumbering\nthat collapses the bands would be loud about it rather than turning\nthe test into a no-op.\n\n534/534 lib tests pass; clippy and fmt clean.\n\n* docs(encoder): drop hard-coded byte counts in literal-gate rationale\n\n`min_literals_to_compress` doc: replace the \"≥30 bytes\" HUF\ntree-description lower bound with neutral phrasing — small alphabets\nwith low max symbols can serialize substantially smaller descriptions.\nThe exact byte cost depends on alphabet size and max symbol, not a\nfixed minimum; the surrounding sentence already conveys that\noverhead-dominates-payload is what drives the per-strategy floor.\n\nRLE-shortcut docstrings (emit and estimator branches): replace\n\"2 bytes vs `1 + len`\" with the header-helper-aware form. Both RLE\nand raw use the same `uncompressed_literals_header_bytes(len)`\n(1/2/3/5 bytes by length tier), so the size relationship is\nRLE = lhSize + 1, raw = lhSize + len → equal at `len == 1`, RLE\nsmaller by `len - 1` for `len >= 2`. The previous wording was only\ncorrect for the `len < 32` tier where lhSize = 1.\n\nNo code changes; clippy and fmt clean.\n\n* test(encoder): tighten strategy_tag regressions to actually fail without the sync\n\nThree factual cleanups so the literal-gate tests provably guard the\nreset-time `strategy_tag` sync and the docstrings around the RLE\npre-check stop misrepresenting historical behavior.\n\n- `set_compression_level_then_compress_refreshes_strategy_tag`: switch\n  from `CompressionLevel::Best` to `CompressionLevel::Level(20)` so the\n  post-switch tag genuinely crosses into the BtUltra2 band. `Best`\n  resolves to `Lazy` today, which keeps `min_literals_to_compress` in\n  the same `shift=3 → 64-byte` band as `Fast` and weakens the signal.\n  Add an explicit `assert_eq!(expected, StrategyTag::BtUltra2)` fixture\n  invariant so future renumbering breaks loudly.\n- `ensure_frame_started_refreshes_stale_strategy_tag_at_reset`\n  (renamed): the previous version constructed the encoder at the same\n  level it asserted, so `StreamingEncoder::new`'s own init satisfied\n  the assertion even if the reset-time sync were deleted. Now the test\n  deliberately corrupts `state.strategy_tag` to a sentinel\n  (`BtUltra2`) before the first write and asserts the reset path\n  restores the legitimate tag — a missing sync leaves the sentinel\n  visible and trips the assertion.\n- RLE pre-check docstring on the emit side: drop the \"6/7 bytes with\n  HUF reuse\" example. With HUF reuse `min_lits == 6`, so 6/7-byte\n  sections are NOT below the gate; donor would HUF-encode them and\n  reach RLE via `cLitSize == 1`. The justification for the pre-check\n  is the genuine under-gate range (e.g. 8..63 bytes at\n  fast/dfast/greedy/lazy without HUF reuse), not the HUF-reuse band.\n- Estimator/emit parity test prose: the historical behavior for\n  6/7-byte all-identical sections under the prior hardcoded `len >= 8`\n  gate was RAW (not HUF). Correct both the per-case rationale and the\n  block-level docstring; the test cases themselves are unchanged.\n\n534/534 lib tests pass; clippy and fmt clean.",
+          "timestamp": "2026-05-19T06:44:49+03:00",
+          "tree_id": "054bf427120c8ebc22d6703e3eb53cc420b801c2",
+          "url": "https://github.com/structured-world/structured-zstd/commit/05458e7499192098d38e92ef72271ebd55e3f96e"
+        },
+        "date": 1779165224267,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 308.354,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 256.627,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.507,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.446,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.374,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.936,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.136,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.002,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.323,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.483,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.075,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.662,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
             "unit": "ms"
           },
           {
