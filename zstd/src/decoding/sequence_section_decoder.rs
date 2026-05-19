@@ -434,17 +434,23 @@ const fn unpack_code_meta(meta: u32) -> (u32, u8) {
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 #[inline(always)]
 fn lookup_ll_code(code: u8) -> (u32, u8) {
-    // Untrusted frames may carry an FSE table whose decoded symbol exceeds
-    // the valid LL code range (0..=35). Mirror the original `match` panic
-    // semantics via the standard array bounds check — that single jae is
-    // predicted perfectly on real inputs and replaces the staircase of
-    // `match` arm comparisons the previous implementation produced.
+    // The FSE LL table is constructed with `max_symbol =
+    // MAX_LITERAL_LENGTH_CODE` (35); `build_decoding_table` returns
+    // `FSETableError::TooManySymbols` if `read_probabilities` produces
+    // more entries than that, and the RLE byte path is range-checked
+    // in `maybe_update_fse_tables`. So a `code` reaching this lookup
+    // is invariant 0..=35. Keep the `debug_assert` as a tripwire in
+    // case a future caller forgets one of those validations; drop the
+    // release-mode `assert!` so the hot path takes a single
+    // `get_unchecked` instead of a bounds-checked indexed load.
     let idx = code as usize;
-    assert!(
+    debug_assert!(
         idx < LL_META.len(),
         "Illegal literal length code was: {code}"
     );
-    unpack_code_meta(LL_META[idx])
+    // SAFETY: idx < LL_META.len() == 36 per the FSE table
+    // construction invariant documented above.
+    unpack_code_meta(unsafe { *LL_META.get_unchecked(idx) })
 }
 
 /// Look up the provided state value from a match length table predefined
@@ -453,9 +459,14 @@ fn lookup_ll_code(code: u8) -> (u32, u8) {
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 #[inline(always)]
 fn lookup_ml_code(code: u8) -> (u32, u8) {
+    // Same invariant as `lookup_ll_code`: the ML FSE table is built
+    // with `max_symbol = MAX_MATCH_LENGTH_CODE` (52) and the RLE byte
+    // is range-checked, so `code` reaching this lookup is 0..=52.
     let idx = code as usize;
-    assert!(idx < ML_META.len(), "Illegal match length code was: {code}");
-    unpack_code_meta(ML_META[idx])
+    debug_assert!(idx < ML_META.len(), "Illegal match length code was: {code}");
+    // SAFETY: idx < ML_META.len() == 53 per the FSE table
+    // construction invariant.
+    unpack_code_meta(unsafe { *ML_META.get_unchecked(idx) })
 }
 
 // This info is buried in the symbol compression mode table
