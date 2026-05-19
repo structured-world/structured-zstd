@@ -59,20 +59,17 @@ impl RingBuffer {
     /// `DecodeBuffer::checkpoint` so `restore_checkpoint` can detect an
     /// intervening reallocation (which compacts data and invalidates
     /// previously-captured tail indices). Reached via the
-    /// `BufferBackend::cap` trait method; the inherent fn is kept
-    /// `pub(super)` so the trait impl below has an item to forward to
-    /// without touching the field through a public surface.
+    /// `BufferBackend::cap` trait method, which forwards here so the
+    /// field stays accessed through a single inherent surface.
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn cap(&self) -> usize {
         self.cap
     }
 
     /// Current write cursor, used by `DecodeBuffer::checkpoint` to
     /// record a rollback point before speculative writes. Same
-    /// surface contract as `cap()` above.
+    /// forwarding contract as `cap()` above.
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn tail(&self) -> usize {
         self.tail
     }
@@ -843,11 +840,11 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     }
     #[inline]
     fn cap(&self) -> usize {
-        self.cap
+        Self::cap(self)
     }
     #[inline]
     fn tail(&self) -> usize {
-        self.tail
+        Self::tail(self)
     }
     #[inline]
     unsafe fn set_tail(&mut self, new_tail: usize) {
