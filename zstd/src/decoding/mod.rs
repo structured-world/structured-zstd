@@ -38,8 +38,19 @@ pub use frame_decoder::{BlockDecodingStrategy, FrameDecoder};
 pub use streaming_decoder::StreamingDecoder;
 
 pub(crate) mod block_decoder;
+pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
+// FlatBuf is the compile-time-monomorphised "frame fits in window"
+// backend selected via `DecodeBuffer<FlatBuf>`. Phase 1 of backlog
+// item #132 (this PR) lands the generic split + trait scaffolding +
+// the FlatBuf impl; Phase 2 wires `FrameDecoder` to actually pick the
+// flat backend on `Single_Segment_flag` frames. Allow dead-code in
+// the interim — the module is intentionally on disk so the type
+// surface and unit tests are reviewed alongside the trait, not as a
+// separate later drop.
+#[allow(dead_code)]
+pub(crate) mod flat_buf;
 pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
 pub(crate) mod prefetch;

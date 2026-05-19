@@ -60,15 +60,21 @@ impl RingBuffer {
     /// Current allocation capacity. Paired with `tail()` in
     /// `DecodeBuffer::checkpoint` so `restore_checkpoint` can detect an
     /// intervening reallocation (which compacts data and invalidates
-    /// previously-captured tail indices).
+    /// previously-captured tail indices). Reached via the
+    /// `BufferBackend::cap` trait method; the inherent fn is kept
+    /// `pub(super)` so the trait impl below has an item to forward to
+    /// without touching the field through a public surface.
     #[inline]
+    #[allow(dead_code)]
     pub(super) fn cap(&self) -> usize {
         self.cap
     }
 
-    /// Current write cursor, used by `DecodeBuffer::checkpoint` to record a
-    /// rollback point before speculative writes.
+    /// Current write cursor, used by `DecodeBuffer::checkpoint` to
+    /// record a rollback point before speculative writes. Same
+    /// surface contract as `cap()` above.
     #[inline]
+    #[allow(dead_code)]
     pub(super) fn tail(&self) -> usize {
         self.tail
     }
@@ -803,6 +809,73 @@ impl RingBuffer {
             );
             self.tail = (self.tail + len) % self.cap;
         }
+    }
+}
+
+impl super::buffer_backend::BufferBackend for RingBuffer {
+    #[inline]
+    fn new() -> Self {
+        Self::new()
+    }
+    #[inline]
+    fn clear(&mut self) {
+        Self::clear(self);
+    }
+    #[inline]
+    fn reserve(&mut self, n: usize) {
+        Self::reserve(self, n);
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        Self::len(self)
+    }
+    #[inline]
+    fn cap(&self) -> usize {
+        self.cap
+    }
+    #[inline]
+    fn tail(&self) -> usize {
+        self.tail
+    }
+    #[inline]
+    unsafe fn set_tail(&mut self, new_tail: usize) {
+        // SAFETY: forwarded; trait contract matches the inherent
+        // method's invariants documented in `set_tail` above.
+        unsafe { Self::set_tail(self, new_tail) };
+    }
+    #[inline]
+    fn extend(&mut self, data: &[u8]) {
+        Self::extend(self, data);
+    }
+    #[inline]
+    fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
+        Self::extend_and_fill(self, fill_with, fill_length);
+    }
+    #[inline]
+    fn extend_from_reader<R: crate::io::Read>(
+        &mut self,
+        read: R,
+        fill_length: usize,
+    ) -> Result<(), crate::io::Error> {
+        Self::extend_from_reader(self, read, fill_length)
+    }
+    #[inline]
+    unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
+        // SAFETY: forwarded.
+        unsafe { Self::extend_from_within_unchecked(self, start, len) };
+    }
+    #[inline]
+    unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
+        // SAFETY: forwarded.
+        unsafe { Self::extend_from_within_unchecked_branchless(self, start, len) };
+    }
+    #[inline]
+    fn as_slices(&self) -> (&[u8], &[u8]) {
+        Self::as_slices(self)
+    }
+    #[inline]
+    fn drop_first_n(&mut self, n: usize) {
+        Self::drop_first_n(self, n);
     }
 }
 

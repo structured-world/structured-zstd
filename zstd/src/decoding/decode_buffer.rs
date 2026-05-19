@@ -3,12 +3,26 @@ use alloc::vec::Vec;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 
+use super::buffer_backend::BufferBackend;
 use super::prefetch;
 use super::ringbuffer::RingBuffer;
 use crate::decoding::errors::DecodeBufferError;
 
-pub struct DecodeBuffer {
-    buffer: RingBuffer,
+/// Generic decode-side output buffer parameterised over the storage
+/// backend ([`BufferBackend`]). The default `RingBuffer` parameter
+/// preserves the historical API for callers that don't want to opt
+/// into the flat-buffer fast path.
+///
+/// Two concrete instantiations are used by the decoder:
+/// - `DecodeBuffer<RingBuffer>` — wrap-aware ring (default; the
+///   pre-existing decode path).
+/// - `DecodeBuffer<FlatBuf>` — non-wrapping Vec-backed fast path,
+///   selected by [`super::frame_decoder::FrameDecoder`] when the
+///   frame's `Single_Segment_flag` is set. The compiler emits a
+///   separate monomorphisation per backend so wrap dispatch is
+///   eliminated entirely on the flat side — see backlog item #132.
+pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
+    buffer: B,
     pub dict_content: Vec<u8>,
 
     pub window_size: usize,
@@ -25,7 +39,7 @@ pub(crate) struct DecodeBufferCheckpoint {
     cap: usize,
 }
 
-impl Read for DecodeBuffer {
+impl<B: BufferBackend> Read for DecodeBuffer<B> {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
         let max_amount = self.can_drain_to_window_size().unwrap_or(0);
         let amount = max_amount.min(target.len());
@@ -40,10 +54,25 @@ impl Read for DecodeBuffer {
     }
 }
 
-impl DecodeBuffer {
-    pub fn new(window_size: usize) -> DecodeBuffer {
+impl<B: BufferBackend> DecodeBuffer<B> {
+    pub fn new(window_size: usize) -> DecodeBuffer<B> {
         DecodeBuffer {
-            buffer: RingBuffer::new(),
+            buffer: B::new(),
+            dict_content: Vec::new(),
+            window_size,
+            total_output_counter: 0,
+            #[cfg(feature = "hash")]
+            hash: twox_hash::XxHash64::with_seed(0),
+        }
+    }
+
+    /// Wrap a pre-constructed backend (e.g. `FlatBuf::with_capacity`
+    /// sized for a single-segment frame) into a `DecodeBuffer`. Used
+    /// by `FrameDecoder` once Phase 2 of backlog item #132 lands.
+    #[allow(dead_code)]
+    pub fn from_backend(buffer: B, window_size: usize) -> DecodeBuffer<B> {
+        DecodeBuffer {
+            buffer,
             dict_content: Vec::new(),
             window_size,
             total_output_counter: 0,
@@ -427,12 +456,12 @@ impl DecodeBuffer {
             return Ok(0);
         }
 
-        struct DrainGuard<'a> {
-            buffer: &'a mut RingBuffer,
+        struct DrainGuard<'a, B: BufferBackend> {
+            buffer: &'a mut B,
             amount: usize,
         }
 
-        impl Drop for DrainGuard<'_> {
+        impl<B: BufferBackend> Drop for DrainGuard<'_, B> {
             fn drop(&mut self) {
                 if self.amount != 0 {
                     self.buffer.drop_first_n(self.amount);
@@ -499,7 +528,7 @@ fn use_branchless_wildcopy() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::DecodeBuffer;
+    use super::{DecodeBuffer, RingBuffer};
     use crate::io::{Error, ErrorKind, Write};
 
     extern crate std;
@@ -513,7 +542,7 @@ mod tests {
         // sequence executor must restore buffer state to the moment
         // before the first per-iter side-effect. This exercises the
         // primitive that supports that rollback.
-        let mut buf = DecodeBuffer::new(1024);
+        let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
         // Mirror the fused sequence executor: reserve upfront so no
         // RingBuffer reallocation happens between checkpoint and restore
         // (restore_checkpoint requires a stable underlying allocation).
@@ -551,7 +580,7 @@ mod tests {
         // untrusted input are unacceptable. libFuzzer artifact
         // crash-bfb3bc55... originally exercised this branch via the
         // panic guard added in the previous round.
-        let mut buf = DecodeBuffer::new(64);
+        let mut buf = DecodeBuffer::<RingBuffer>::new(64);
         buf.push(&[0; 16]);
         let cp = buf.checkpoint();
         // Force a reallocation. RingBuffer grows by powers of two and
@@ -595,7 +624,7 @@ mod tests {
             write_len: 10,
         };
 
-        let mut decode_buf = DecodeBuffer::new(100);
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
         decode_buf.push(b"0123456789");
         decode_buf.repeat(10, 90).unwrap();
         let repeats = 1000;
@@ -645,7 +674,7 @@ mod tests {
             block_every: 5,
         };
 
-        let mut decode_buf = DecodeBuffer::new(100);
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
         decode_buf.push(b"0123456789");
         decode_buf.repeat(10, 90).unwrap();
         let repeats = 1000;
@@ -705,7 +734,7 @@ mod tests {
         ];
 
         for (offset, match_len) in cases {
-            let mut decode_buf = DecodeBuffer::new(4 * 1024);
+            let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
             decode_buf.push(seed);
             decode_buf.repeat(offset, match_len).unwrap();
             let got = decode_buf.drain();
@@ -716,7 +745,7 @@ mod tests {
 
     #[test]
     fn repeat_zero_offset_returns_error() {
-        let mut decode_buf = DecodeBuffer::new(1024);
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1024);
         decode_buf.push(b"abcdef");
         let err = decode_buf.repeat(0, 5).unwrap_err();
         assert!(matches!(
@@ -727,7 +756,7 @@ mod tests {
 
     #[test]
     fn repeat_from_dict_full_copy_updates_total_output_counter() {
-        let mut decode_buf = DecodeBuffer::new(1);
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1);
         decode_buf.dict_content = b"0123456789".to_vec();
 
         decode_buf.repeat(10, 2).unwrap();
@@ -742,7 +771,7 @@ mod tests {
     fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() {
         let window = 32usize;
         let seed = b"0123456789abcdef0123456789abcdef";
-        let mut decode_buf = DecodeBuffer::new(window);
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(window);
         let mut model = Vec::new();
 
         decode_buf.push(seed);
