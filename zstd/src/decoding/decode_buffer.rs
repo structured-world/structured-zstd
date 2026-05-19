@@ -13,18 +13,16 @@ use crate::decoding::errors::DecodeBufferError;
 /// preserves the historical API for callers that don't want to opt
 /// into the flat-buffer fast path.
 ///
-/// Two concrete instantiations are planned for the decoder:
+/// Two concrete instantiations are used by the decoder:
 /// - `DecodeBuffer<RingBuffer>` — wrap-aware ring (default; the
-///   pre-existing decode path; the only one wired today).
+///   pre-existing decode path).
 /// - `DecodeBuffer<FlatBuf>` — non-wrapping Vec-backed fast path,
-///   intended for selection by
-///   [`super::frame_decoder::FrameDecoder`] when the frame's
-///   `Single_Segment_flag` is set. Wiring lands in Phase 4 of
-///   backlog item #132; the generic split here (Phases 1–3) is the
-///   compile-time scaffolding so that the eventual switch
-///   monomorphises each backend independently and erases wrap
-///   dispatch from the flat side at compile time rather than
-///   branching at runtime.
+///   selected by [`super::frame_decoder::FrameDecoder`] (via
+///   `DecoderScratchKind`) when the frame's `Single_Segment_flag`
+///   is set. The compiler emits a separate monomorphisation per
+///   backend so wrap dispatch is eliminated entirely on the flat
+///   side at compile time rather than branched at runtime — see
+///   backlog item #132.
 pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     buffer: B,
     pub dict_content: Vec<u8>,

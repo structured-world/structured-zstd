@@ -176,11 +176,15 @@ fn multi_frame_flat_buf_path_does_not_panic() {
     ];
 
     // Reaching the assertion at all (no panic from `read_to_end`) is
-    // the contract this test enforces — return value can be either
-    // Ok or Err depending on whether the constructed sequence of
-    // frames terminates cleanly.
-    if let Ok(mut decoder) = crate::decoding::StreamingDecoder::new(data) {
-        let mut output = alloc::vec::Vec::new();
-        let _ = decoder.read_to_end(&mut output);
-    }
+    // the contract this test enforces — the return value can be
+    // either Ok or Err depending on whether the constructed sequence
+    // of frames terminates cleanly. Frame-header construction MUST
+    // succeed (the bytes start with the zstd magic) so an
+    // `if let Ok(..)` shape would silently turn this regression into
+    // a no-op if a future change broke ctor for this artifact and
+    // hid the flat-buffer panic path that the test actually targets.
+    let mut decoder = crate::decoding::StreamingDecoder::new(data)
+        .expect("regression artifact must pass frame-header construction");
+    let mut output = alloc::vec::Vec::new();
+    let _ = decoder.read_to_end(&mut output);
 }

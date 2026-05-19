@@ -30,18 +30,20 @@ pub(crate) struct FlatBuf {
 
 impl FlatBuf {
     pub fn with_capacity(cap: usize) -> Self {
-        // +WILDCOPY_OVERLENGTH so SIMD overshoot writes from the last
-        // legitimate push / repeat land inside the allocation and not
-        // in unrelated heap memory.
-        let mut buf = Vec::with_capacity(cap + WILDCOPY_OVERLENGTH);
-        // Zero the slack region once so any read of the
-        // not-yet-written trailing bytes (from a wildcopy that reads
-        // past tail) sees defined values. The bytes are never returned
-        // to callers; this only keeps the read itself out of UB.
-        unsafe {
-            ptr::write_bytes(buf.as_mut_ptr(), 0, cap + WILDCOPY_OVERLENGTH);
+        // +WILDCOPY_OVERLENGTH so any future SIMD overshoot write from
+        // a `push` / `repeat` near the buffer boundary lands inside
+        // the allocation. The slack region is intentionally left
+        // uninitialised: FlatBuf's current API only reads bytes
+        // inside `head..buf.len()` (`as_slices`, drain helpers), and
+        // its mutating helpers (`extend`, `extend_and_fill`,
+        // `extend_from_within_unchecked`) only WRITE past `len`
+        // before any matching `set_len`, never read it. Skipping the
+        // zero pass is intentional — it avoids paying O(cap) on every
+        // small single-segment frame reset.
+        Self {
+            buf: Vec::with_capacity(cap + WILDCOPY_OVERLENGTH),
+            head: 0,
         }
-        Self { buf, head: 0 }
     }
 }
 
