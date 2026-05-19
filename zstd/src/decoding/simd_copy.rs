@@ -16,28 +16,19 @@ use std::sync::OnceLock;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 
-type CopyFn = unsafe fn(*const u8, *mut u8, usize);
-
-#[derive(Clone, Copy)]
-struct CopyStrategy {
-    chunk: usize,
-    copy: CopyFn,
-}
-
 /// Copies at least `copy_at_least` bytes from `src` to `dst`.
 ///
-/// This helper may over-copy up to
-/// `copy_at_least.next_multiple_of(strategy.chunk)`, i.e. at most
-/// `strategy.chunk - 1` extra bytes, mirroring zstd wildcopy semantics for
-/// faster inner loops.
+/// This helper may over-copy up to the chunk size of the chosen SIMD/scalar
+/// kernel (16, 32, or 64 bytes — at most chunk_size - 1 extra bytes), mirroring
+/// zstd wildcopy semantics for faster inner loops.
 ///
 /// # Safety
 /// Caller must guarantee:
 /// - `src.0` points to at least `src.1` readable bytes.
 /// - `dst.0` points to at least `dst.1` writable bytes.
 /// - `copy_at_least <= src.1` and `copy_at_least <= dst.1`.
-/// - `src.1` and `dst.1` are large enough for the selected strategy:
-///   if `min(src.1, dst.1) >= copy_at_least.next_multiple_of(strategy.chunk)`,
+/// - `src.1` and `dst.1` are large enough for the selected kernel:
+///   if `min(src.1, dst.1) >= copy_at_least` rounded up to the chunk size,
 ///   the SIMD/scalar chunk loop may copy that rounded-up amount.
 ///   Otherwise the function copies exactly `copy_at_least` bytes.
 /// - Source and destination regions do not overlap.
@@ -51,21 +42,200 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         return;
     }
 
-    let strategy = copy_strategy(copy_at_least);
     let min_buffer_size = core::cmp::min(src.1, dst.1);
-    let copy_multiple = copy_at_least.next_multiple_of(strategy.chunk);
 
-    if min_buffer_size >= copy_multiple {
-        unsafe { (strategy.copy)(src.0, dst.0, copy_multiple) };
+    // Single-op fast path: for any copy_at_least in 1..=16 with 16 bytes of
+    // slack on both sides, one vector store covers the request. Match copies
+    // with offset 8..15 funnel into repeat_in_chunks → here as 8..15-byte
+    // calls, and the previous chunk-loop dispatcher paid a function-call +
+    // loop-setup cost on every one of them. The single-op path collapses
+    // that to one load + one store, which is the donor wildcopy pattern.
+    if copy_at_least <= 16 && min_buffer_size >= 16 {
+        unsafe { single_op_copy_16(src.0, dst.0, copy_at_least) };
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    // Exact-length tail path: when the caller has no WILDCOPY_OVERLENGTH
+    // slack (e.g. RingBuffer call sites where dst.1 ends at `head`), the
+    // single-op fast path above falls through and the chunked SIMD kernels
+    // below also bail (`rounded > min_buffer_size`), leaving libc memmove
+    // as the only option. memmove was 24% of decode CPU on the profiled
+    // scenario. Replace it with inline byte / overlapping-u64 ops for
+    // copies up to 32 bytes — these write EXACTLY `copy_at_least` bytes
+    // without any overshoot, which is the contract the slack-less call
+    // sites require. 32-byte cap covers the typical literal-push size
+    // range (1..=24 bytes seen on the profiled corpus) and stays within
+    // a single straight-line block on the I-cache.
+    if copy_at_least <= 32 {
+        // SAFETY: `copy_at_least <= min(src.1, dst.1)` by this function's
+        // contract, so all branches below read/write strictly within the
+        // caller's reported readable / writable spans.
+        unsafe {
+            if copy_at_least <= 8 {
+                // Byte-by-byte for 1..=8 bytes. The fixed-size loop unrolls
+                // into a sequence of immediate-offset loads/stores on every
+                // sane backend, so for the common 1..=8 case this is
+                // typically 2-3 cycles inline vs the ~10+ cycle call into
+                // libc memmove the previous fallback paid.
+                let mut i = 0;
+                while i < copy_at_least {
+                    dst.0.add(i).write(src.0.add(i).read());
+                    i += 1;
+                }
+            } else if copy_at_least <= 16 {
+                // 9..=16 bytes via two overlapping unaligned u64 ops. The
+                // overlap region is written twice with the same source
+                // bytes, so the net effect is exactly `copy_at_least` bytes
+                // copied — no overshoot past dst.0 + copy_at_least.
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi_offset = copy_at_least - 8;
+                let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
+            } else {
+                // 17..=32 bytes: first 16 via two adjacent u64 stores, the
+                // trailing 1..=16 via the same overlapping-pair trick.
+                // Four loads + four stores total, all branch-free.
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi: u64 = src.0.add(8).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(8).cast::<u64>().write_unaligned(hi);
+                let tail_off = copy_at_least - 16;
+                let tail_lo: u64 = src.0.add(tail_off).cast::<u64>().read_unaligned();
+                let tail_hi: u64 = src.0.add(copy_at_least - 8).cast::<u64>().read_unaligned();
+                dst.0.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
+                dst.0
+                    .add(copy_at_least - 8)
+                    .cast::<u64>()
+                    .write_unaligned(tail_hi);
+            }
+        }
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    // Chunked SIMD fast paths for larger copies. Each branch consults the
+    // appropriate feature-detection mechanism (cached runtime detect under
+    // std, compile-time target_feature otherwise) and falls through on miss
+    // so a single dispatcher covers every arch + feature combination.
+    macro_rules! try_chunk_kernel {
+        ($chunk:expr, $kernel:ident) => {{
+            if copy_at_least >= $chunk {
+                let rounded = copy_at_least.next_multiple_of($chunk);
+                if min_buffer_size >= rounded {
+                    unsafe { $kernel(src.0, dst.0, rounded) };
+                    debug_assert_eq_copy(src, dst, copy_at_least);
+                    return;
+                }
+            }
+        }};
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let caps = detect_x86_caps();
+        if caps.avx512f {
+            try_chunk_kernel!(64, copy_avx512);
+        }
+        if caps.avx2 {
+            try_chunk_kernel!(32, copy_avx2);
+        }
+        if caps.sse2 {
+            try_chunk_kernel!(16, copy_sse2);
+        }
+    }
+
+    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        #[cfg(target_feature = "avx512f")]
+        try_chunk_kernel!(64, copy_avx512);
+        #[cfg(target_feature = "avx2")]
+        try_chunk_kernel!(32, copy_avx2);
+        #[cfg(target_feature = "sse2")]
+        try_chunk_kernel!(16, copy_sse2);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    try_chunk_kernel!(16, copy_neon);
+
+    // Final fallback: scalar 8-byte chunk loop if alignment permits, else
+    // an exact byte copy. Inlined directly to avoid the per-call dispatcher
+    // overhead the previous CopyFn function-pointer abstraction imposed.
+    let scalar_chunk = core::mem::size_of::<usize>();
+    let rounded = copy_at_least.next_multiple_of(scalar_chunk);
+    if min_buffer_size >= rounded {
+        unsafe { copy_scalar(src.0, dst.0, rounded) };
     } else {
         unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
     }
+    debug_assert_eq_copy(src, dst, copy_at_least);
+}
 
+/// Single 16-byte transfer covering any 1..=16 byte request. The caller
+/// guarantees 16 bytes of readable / writable slack on both sides so a full
+/// vector store is safe even when only the first `len` bytes are required —
+/// trailing bytes are written but the caller treats them as wildcopy overshoot.
+///
+/// # Safety
+/// `src` and `dst` must each point to at least 16 readable / writable bytes;
+/// regions must not overlap.
+#[inline(always)]
+unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len <= 16);
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        let v: uint8x16_t = vld1q_u8(src);
+        vst1q_u8(dst, v);
+        return;
+    }
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    unsafe {
+        if detect_x86_caps().sse2 {
+            copy_sse2(src, dst, 16);
+            return;
+        }
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ))]
+    unsafe {
+        copy_sse2(src, dst, 16);
+        return;
+    }
+    // Portable fallback: two overlapping unaligned u64 writes cover 1..=16
+    // bytes. Still cheaper than the scalar-strategy loop + indirect call the
+    // previous dispatcher imposed on every small copy.
+    //
+    // Reachability matrix (kept here so any future arch arm slotted
+    // between the existing arms knows it must terminate with `return`
+    // or its code will be silently dead):
+    //   • aarch64+neon                                 → arm above returns
+    //   • std + x86/x86_64 + runtime-SSE2              → arm above returns
+    //   • std + x86/x86_64 + NO runtime-SSE2           → reaches here
+    //   • no-std + x86/x86_64 + target_feature=sse2    → arm above returns
+    //   • no-std + x86/x86_64 + NO target_feature=sse2 → reaches here
+    //   • any other arch (riscv64, wasm32, …)          → reaches here
+    // Anything new MUST `return` from its own arm before this comment.
+    #[allow(unreachable_code)]
+    unsafe {
+        let lo: u64 = src.cast::<u64>().read_unaligned();
+        let hi_offset = len.saturating_sub(8);
+        let hi: u64 = src.add(hi_offset).cast::<u64>().read_unaligned();
+        dst.cast::<u64>().write_unaligned(lo);
+        dst.add(hi_offset).cast::<u64>().write_unaligned(hi);
+    }
+}
+
+#[inline(always)]
+fn debug_assert_eq_copy(_src: (*const u8, usize), _dst: (*mut u8, usize), _len: usize) {
     #[cfg(debug_assertions)]
     unsafe {
-        let src_bytes = core::slice::from_raw_parts(src.0, copy_at_least);
-        let dst_bytes = core::slice::from_raw_parts(dst.0, copy_at_least);
-        debug_assert_eq!(dst_bytes, src_bytes);
+        let s = core::slice::from_raw_parts(_src.0, _len);
+        let d = core::slice::from_raw_parts(_dst.0, _len);
+        debug_assert_eq!(s, d);
     }
 }
 
@@ -89,90 +259,58 @@ pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
     unsafe { copy_bytes_overshooting(src, dst, copy_at_least) };
 }
 
-#[inline(always)]
-fn scalar_strategy() -> CopyStrategy {
-    CopyStrategy {
-        chunk: core::mem::size_of::<usize>(),
-        copy: copy_scalar,
-    }
-}
-
-#[inline(always)]
-fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        let caps = detect_x86_caps();
-        if caps.avx512f && copy_at_least >= 64 {
-            return CopyStrategy {
-                chunk: 64,
-                copy: copy_avx512,
-            };
-        }
-        if caps.avx2 && copy_at_least >= 32 {
-            return CopyStrategy {
-                chunk: 32,
-                copy: copy_avx2,
-            };
-        }
-        if caps.sse2 && copy_at_least >= 16 {
-            return CopyStrategy {
-                chunk: 16,
-                copy: copy_sse2,
-            };
-        }
-        scalar_strategy()
-    }
-
-    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        if cfg!(target_feature = "avx512f") && copy_at_least >= 64 {
-            return CopyStrategy {
-                chunk: 64,
-                copy: copy_avx512,
-            };
-        }
-        if cfg!(target_feature = "avx2") && copy_at_least >= 32 {
-            return CopyStrategy {
-                chunk: 32,
-                copy: copy_avx2,
-            };
-        }
-        if cfg!(target_feature = "sse2") && copy_at_least >= 16 {
-            return CopyStrategy {
-                chunk: 16,
-                copy: copy_sse2,
-            };
-        }
-        scalar_strategy()
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        if copy_at_least >= 16 {
-            CopyStrategy {
-                chunk: 16,
-                copy: copy_neon,
-            }
-        } else {
-            scalar_strategy()
-        }
-    }
-
-    #[cfg(not(any(
-        all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")),
-        all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")),
-        all(target_arch = "aarch64", target_feature = "neon")
-    )))]
-    {
-        let _ = copy_at_least;
-        scalar_strategy()
-    }
-}
-
+/// Active chunk size for the chunk-loop dispatcher on this build. Used by
+/// `RingBuffer` tests to size scenarios that exercise single-chunk,
+/// multi-chunk, and capacity-tight (`chunk + 1`) copy shapes — keeping the
+/// tests architecture-agnostic.
 #[cfg(test)]
 #[inline]
 pub(crate) fn active_chunk_size_for_tests() -> usize {
-    copy_strategy(usize::MAX / 2).chunk
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let caps = detect_x86_caps();
+        if caps.avx512f {
+            return 64;
+        }
+        if caps.avx2 {
+            return 32;
+        }
+        if caps.sse2 {
+            return 16;
+        }
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx512f"
+    ))]
+    {
+        return 64;
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx2"
+    ))]
+    {
+        return 32;
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ))]
+    {
+        return 16;
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        return 16;
+    }
+    #[allow(unreachable_code)]
+    {
+        core::mem::size_of::<usize>()
+    }
 }
 
 #[inline(always)]
@@ -221,8 +359,13 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
+// `#[allow(dead_code)]` because in `--no-default-features` builds on x86
+// without `RUSTFLAGS="-C target-feature=+avx2"` the dispatcher cfg-gates
+// out every call site (runtime detection lives behind `feature = "std"`).
+// In std builds and target_feature=+avx2 builds the function is live.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
@@ -235,8 +378,11 @@ unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
+// Same `#[allow(dead_code)]` rationale as `copy_avx2`: cfg-gated out in
+// no-std builds without `target_feature=+avx512f`, live elsewhere.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
+#[allow(dead_code)]
 unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
@@ -250,6 +396,7 @@ unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline(always)]
 unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
@@ -279,8 +426,10 @@ mod tests {
 
     #[test]
     fn copy_bytes_overshooting_fallback_exact_copy_when_caps_are_tight() {
-        let chunk = active_chunk_size_for_tests();
-        let len = chunk + 1;
+        // Pick a size that exceeds the single-op fast path threshold (16)
+        // and the next chunk size on every supported arch, so the fallback
+        // path is exercised regardless of which kernel a given build picks.
+        let len = 65; // > AVX-512 chunk
         let src = vec![5_u8; len];
         let mut dst = vec![0_u8; len];
 
@@ -292,18 +441,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_bytes_overshooting_single_op_small() {
+        // Sub-16 copy with full 16-byte slack on both sides: single-op fast
+        // path covers it via one SIMD store (or two overlapping u64 stores
+        // on archs without 128-bit SIMD).
+        for len in 1..=16 {
+            let mut src = [0u8; 32];
+            for (i, b) in src.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            let mut dst = [0u8; 32];
+            unsafe {
+                copy_bytes_overshooting((src.as_ptr(), 32), (dst.as_mut_ptr(), 32), len);
+            }
+            assert_eq!(&dst[..len], &src[..len], "len={len}");
+        }
+    }
+
+    #[test]
     fn copy_scalar_copies_requested_bytes() {
         let src = [11_u8, 12, 13, 14, 15, 16, 17, 18];
         let mut dst = [0_u8; 8];
         unsafe { copy_scalar(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
         assert_eq!(dst, src);
-    }
-
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[test]
-    fn copy_strategy_uses_scalar_chunk_for_sub_sse_sizes() {
-        let strategy = copy_strategy(15);
-        assert_eq!(strategy.chunk, core::mem::size_of::<usize>());
     }
 
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]

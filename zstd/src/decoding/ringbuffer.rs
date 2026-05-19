@@ -1,8 +1,19 @@
 use crate::io::Read;
-use alloc::alloc::{alloc, dealloc};
+use alloc::alloc::{alloc_zeroed, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
 use super::simd_copy;
+
+/// Trailing slack appended to every RingBuffer allocation. Matches donor
+/// zstd's `WILDCOPY_OVERLENGTH` of 16 bytes — the largest single SIMD chunk
+/// `simd_copy::copy_bytes_overshooting` writes in one go (AVX-512 chunk is 64,
+/// but the single-op fast path that fires on copies ≤ 16 bytes is the place
+/// where this slack actually changes the dispatch outcome). The slack is
+/// physically present in the allocation but is never indexed via `head`/`tail`
+/// — those still wrap on `cap`. Slack bytes serve exclusively as an
+/// over-write / over-read landing zone so wildcopy stores/loads near the
+/// buffer boundary do not need a "min_buffer_size < copy_multiple" fallback.
+const WILDCOPY_OVERLENGTH: usize = 16;
 
 pub struct RingBuffer {
     // Safety invariants:
@@ -46,6 +57,56 @@ impl RingBuffer {
         x + y
     }
 
+    /// Current allocation capacity. Paired with `tail()` in
+    /// `DecodeBuffer::checkpoint` so `restore_checkpoint` can detect an
+    /// intervening reallocation (which compacts data and invalidates
+    /// previously-captured tail indices).
+    #[inline]
+    pub(super) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Current write cursor, used by `DecodeBuffer::checkpoint` to record a
+    /// rollback point before speculative writes.
+    #[inline]
+    pub(super) fn tail(&self) -> usize {
+        self.tail
+    }
+
+    /// Force the write cursor back to a previously captured value, undoing
+    /// any pushes / repeats issued after the corresponding `tail()` call.
+    ///
+    /// # Safety
+    /// The caller must guarantee:
+    /// - `new_tail` was returned by an earlier `tail()` call on this same
+    ///   `RingBuffer` instance.
+    /// - No reallocation has happened in between (a `reserve_amortized`
+    ///   bump would have shifted the ring-buffer indices).
+    /// - `head` has not moved since the corresponding `tail()` was
+    ///   captured. A `head` advance (drain) followed by `set_tail` to an
+    ///   old position would silently re-expose already-consumed bytes
+    ///   through `len()` / `as_slices()` — the full-vs-empty
+    ///   discriminator (invariant 4: `tail == 0` for "full", never
+    ///   `cap`) only stays consistent when `head` is fixed.
+    /// - The bytes between `new_tail` and the current tail are not used
+    ///   afterwards (callers truncate any view that depended on them).
+    ///
+    /// The sole caller today is `DecodeBuffer::try_restore_checkpoint`,
+    /// which is used only from the fused sequence executor — that path
+    /// never drains between checkpoint and restore, so `head` is
+    /// guaranteed fixed. Any future caller MUST audit the same
+    /// preconditions before using this method.
+    #[inline]
+    pub(super) unsafe fn set_tail(&mut self, new_tail: usize) {
+        debug_assert!(
+            new_tail < self.cap || self.cap == 0,
+            "new_tail ({}) must be < cap ({})",
+            new_tail,
+            self.cap
+        );
+        self.tail = new_tail;
+    }
+
     /// Return the amount of available space (in bytes) of the buffer.
     pub fn free(&self) -> usize {
         let (x, y) = self.free_slice_lengths();
@@ -61,7 +122,21 @@ impl RingBuffer {
     }
 
     /// Ensure that there's space for `amount` elements in the buffer.
+    #[inline]
     pub fn reserve(&mut self, amount: usize) {
+        // Flat fast path: when the data region hasn't wrapped (head ≤ tail)
+        // and the write does not cross `cap`, free space is trivially
+        // `cap - tail - 1 + head` ≥ `cap - tail - 1` ≥ `amount`. Skip
+        // free_slice_lengths' branch + saturating_sub on the common case
+        // that dominates frames fitting in the window (the same case the
+        // flat extend path optimises for).
+        // Use saturating arithmetic so a pathological `amount` close to
+        // `usize::MAX` cannot wrap `tail + amount` and let the fast
+        // path falsely report enough space — `extend` would then write
+        // past the allocation.
+        if self.head <= self.tail && amount < self.cap.saturating_sub(self.tail) {
+            return;
+        }
         let free = self.free();
         if free >= amount {
             return;
@@ -73,14 +148,22 @@ impl RingBuffer {
     #[inline(never)]
     #[cold]
     fn reserve_amortized(&mut self, amount: usize) {
-        // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        // SAFETY: if we were successfully able to construct this layout when we allocated then it's also valid do so now
+        let current_layout =
+            unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
 
         // Always have at least 1 unused element as the sentinel.
-        let new_cap = usize::max(
-            self.cap.next_power_of_two(),
-            (self.cap + amount).next_power_of_two(),
-        ) + 1;
+        // Use checked_add so a caller passing a huge `amount` (e.g.
+        // close to usize::MAX from a malformed `match_length`) cannot
+        // wrap `self.cap + amount` and produce an undersized `new_cap`
+        // that subsequent unsafe writes would trust.
+        let needed = self
+            .cap
+            .checked_add(amount)
+            .expect("ringbuffer capacity overflow");
+        let new_cap = usize::max(self.cap.next_power_of_two(), needed.next_power_of_two())
+            .checked_add(1)
+            .expect("ringbuffer capacity overflow");
 
         // Check that the capacity isn't bigger than isize::MAX, which is the max allowed by LLVM, or that
         // we are on a >= 64 bit system which will never allow that much memory to be allocated
@@ -89,13 +172,25 @@ impl RingBuffer {
             debug_assert!(usize::BITS >= 64 || new_cap < isize::MAX as usize);
         }
 
-        let new_layout = Layout::array::<u8>(new_cap)
-            .unwrap_or_else(|_| panic!("Could not create layout for u8 array of size {}", new_cap));
+        // Physical allocation includes WILDCOPY_OVERLENGTH bytes of trailing
+        // slack — see the const's doc comment for rationale. `new_cap` itself
+        // remains the indexing capacity (head/tail wrap on it).
+        let new_layout = Layout::array::<u8>(new_cap + WILDCOPY_OVERLENGTH).unwrap_or_else(|_| {
+            panic!(
+                "Could not create layout for u8 array of size {}",
+                new_cap + WILDCOPY_OVERLENGTH
+            )
+        });
 
-        // alloc the new memory region and panic if alloc fails
+        // alloc_zeroed (not plain alloc) so wildcopy reads that overshoot
+        // past `tail` into not-yet-written buffer bytes — or past `cap` into
+        // the slack region — observe defined values (0) instead of
+        // uninitialized memory. The zero content itself is irrelevant
+        // (overshoot writes are wildcopy garbage the caller never reads),
+        // but the read itself must not be UB.
         // TODO maybe rework this to generate an error?
         let new_buf = unsafe {
-            let new_buf = alloc(new_layout);
+            let new_buf = alloc_zeroed(new_layout);
 
             NonNull::new(new_buf).expect("Allocating new space for the ringbuffer failed")
         };
@@ -148,6 +243,13 @@ impl RingBuffer {
         }
     }
     /// Append the provided data to the end of `self`.
+    ///
+    /// `#[inline]` so the flat fast path below folds into the hot
+    /// `execute_sequences` -> `DecodeBuffer::push` -> here chain. After the
+    /// flat-extend refactor most calls return in ~5 instructions plus the
+    /// inline copy; keeping a separate stack frame for that work was a
+    /// noticeable fraction of the function-call overhead per literal push.
+    #[inline]
     pub fn extend(&mut self, data: &[u8]) {
         let len = data.len();
         let ptr = data.as_ptr();
@@ -160,6 +262,39 @@ impl RingBuffer {
         debug_assert!(self.len() + len < self.cap);
         debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
 
+        // Flat fast path: the write is one contiguous copy from `data` to
+        // `buf + tail` with no wraparound, no slice split, no second
+        // `simd_copy` call. Conditions:
+        //   1. head ≤ tail (no prior wrap of the data region), and
+        //   2. tail + len ≤ cap (the write itself does not cross `cap`).
+        // For frames that fit in the window (the common case on this bench
+        // and on most real-world streams), this path fires on every literal
+        // push and on every `extend_from_reader` slot. `simd_copy` can use
+        // the WILDCOPY_OVERLENGTH slack past `cap` for its SIMD overshoot
+        // since dst ends at `cap`.
+        //
+        // Profile (decompress L-1 fast decodecorpus-z000033 c_stream)
+        // showed `RingBuffer::extend` at 33.6% self-time AFTER the routing
+        // refactor — most of that was the 4-case dispatch through
+        // `free_slice_parts` for the wrap-shaped slow path on workloads
+        // that never wrap. Bypassing it for the flat case directly
+        // attacks that share.
+        if self.head <= self.tail && self.tail + len <= self.cap {
+            let dst_ptr = unsafe { self.buf.as_ptr().add(self.tail) };
+            let dst_cap = (self.cap - self.tail) + WILDCOPY_OVERLENGTH;
+            unsafe {
+                simd_copy::copy_bytes_overshooting((ptr, len), (dst_ptr, dst_cap), len);
+            }
+            // Invariant 4: `tail` is never `cap` except when full (then 0).
+            // After this write tail can land at `cap` if the literal push
+            // exactly filled the buffer — normalize to 0 in that case.
+            self.tail += len;
+            if self.tail == self.cap {
+                self.tail = 0;
+            }
+            return;
+        }
+
         let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
         debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
 
@@ -169,14 +304,52 @@ impl RingBuffer {
 
         debug_assert!(in_f1 + in_f2 == len);
 
+        // Route through `simd_copy::copy_bytes_overshooting` instead of raw
+        // `copy_from_nonoverlapping`. Profile (decompress L-1 fast
+        // decodecorpus-z000033 c_stream) showed `_platform_memmove` at 24%
+        // self-time, of which 943 ms was `execute_sequences → DecodeBuffer::
+        // push → RingBuffer::extend → memmove`. The previous direct
+        // `copy_from_nonoverlapping` lowered to a libc memmove call even
+        // for 1..=16 byte literal pushes; simd_copy's inline byte /
+        // overlapping-u64 tail path handles those without a function call.
+        //
+        // **Slack reachability**: `data` is an external slice with no slack
+        // so `src.1` stays exact (`in_f1` / `in_f2`). For `dst.1`, the
+        // first free slice ends at `self.cap` ONLY when `tail >= head` —
+        // then `free_slice_parts` returns `(buf+tail, cap-tail)` and the
+        // WILDCOPY_OVERLENGTH region beyond `cap` is the writable slack.
+        // When `tail < head` the first free slice is the inner gap
+        // `(buf+tail, head-tail)`; its end lands at `head`, so any
+        // wildcopy overshoot past it would clobber still-readable buffered
+        // output. f2 always ends at `head` (or is empty) so it never
+        // gets the slack either.
+        //
+        // **Secondary safety note**: even without this gate, the current
+        // `simd_copy::copy_bytes_overshooting` fast paths cannot actually
+        // overshoot for `extend`'s call shape because `min_buffer_size`
+        // is dominated by `src.1 == in_f1 == copy_at_least`. The
+        // single-op-16 path needs `min >= 16`, which requires
+        // `in_f1 >= 16` — and at that point `copy_at_least == 16` makes
+        // the write exactly 16 bytes. Chunked SIMD only fires when
+        // `rounded == in_f1` (multiple of chunk size), again exact-fit.
+        // The gate is still applied so the inflation does not become a
+        // latent UB hazard if a future `simd_copy` change derives its
+        // overshoot bound from `dst.1` alone.
+        let f1_dst_cap = if self.tail >= self.head {
+            f1_len + WILDCOPY_OVERLENGTH
+        } else {
+            f1_len
+        };
         unsafe {
-            // SAFETY: `in_f₁ + in_f₂ = len`, so this writes `len` bytes total
-            // upholding invariant 2
             if in_f1 > 0 {
-                f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
+                simd_copy::copy_bytes_overshooting((ptr, in_f1), (f1_ptr, f1_dst_cap), in_f1);
             }
             if in_f2 > 0 {
-                f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
+                simd_copy::copy_bytes_overshooting(
+                    (ptr.add(in_f1), in_f2),
+                    (f2_ptr, f2_len),
+                    in_f2,
+                );
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
@@ -314,21 +487,28 @@ impl RingBuffer {
             let src = (
                 // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                 unsafe { self.buf.as_ptr().add(self.head + start) }.cast_const(),
-                // Src length (see above diagram)
-                self.tail - self.head - start,
+                // Src length plus WILDCOPY slack — src + (tail - head - start) ends at
+                // `tail` (≤ `cap`); extending by WILDCOPY_OVERLENGTH places the read
+                // tail at most at `cap + WILDCOPY_OVERLENGTH`, which is still inside the
+                // physical allocation (see `reserve_amortized`). The overshoot bytes
+                // are wildcopy fill and are never consumed by the caller.
+                (self.tail - self.head - start) + WILDCOPY_OVERLENGTH,
             );
 
             let dst = (
                 // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                 unsafe { self.buf.as_ptr().add(self.tail) },
-                // Dst length (see above diagram)
-                self.cap - self.tail,
+                // Dst length plus WILDCOPY slack — dst ends at `cap`, the slack region
+                // beyond `cap` is owned by this allocation and absorbs any wildcopy
+                // overshoot writes without corrupting subsequent ring-buffer state.
+                (self.cap - self.tail) + WILDCOPY_OVERLENGTH,
             );
 
-            // SAFETY: `src` points at initialized data, `dst` points to writable memory,
-            // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
-            // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
-            // and source/destination regions do not overlap.
+            // SAFETY: `src` points at initialized data, `dst` points to writable memory
+            // (including WILDCOPY_OVERLENGTH bytes of slack past `cap`), and the
+            // `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+            // (`copy_len.next_multiple_of(active_chunk)`) selected by
+            // `copy_bytes_overshooting`, and source/destination regions do not overlap.
             unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_tail) }
 
             if after_tail < len {
@@ -348,12 +528,15 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: we are still within the memory range of `buf`
                     unsafe { src.0.add(after_tail) },
-                    // Src length (see above diagram)
+                    // Src length kept inflated by WILDCOPY_OVERLENGTH — original len
+                    // already accounted for the slack above.
                     src.1 - after_tail,
                 );
                 let dst = (
                     self.buf.as_ptr(),
-                    // Dst length overflowing (see above diagram)
+                    // Dst length is bounded by `head`; we cannot inflate by
+                    // WILDCOPY_OVERLENGTH here because overshoot writes would corrupt
+                    // the readable region starting at `head`.
                     self.head,
                 );
 
@@ -365,7 +548,7 @@ impl RingBuffer {
             }
         } else {
             #[allow(clippy::collapsible_else_if)]
-            if self.head + start > self.cap {
+            if self.head + start >= self.cap {
                 // Continuous read section and destination section:
                 //
                 //                  T           H
@@ -384,14 +567,16 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(start) }.cast_const(),
-                    // Src length (see above diagram)
-                    self.tail - start,
+                    // Src ends at `tail`; extending by WILDCOPY_OVERLENGTH reads at
+                    // most into the trailing slack region of the allocation.
+                    (self.tail - start) + WILDCOPY_OVERLENGTH,
                 );
 
                 let dst = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
-                    unsafe { self.buf.as_ptr().add(self.tail) }, // Dst length (see above diagram)
-                    // Dst length (see above diagram)
+                    unsafe { self.buf.as_ptr().add(self.tail) },
+                    // Dst length is bounded by `head` — wildcopy overshoot past `head`
+                    // would clobber readable data, so the slack does not apply here.
                     self.head - self.tail,
                 );
 
@@ -419,14 +604,15 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(self.head + start) }.cast_const(),
-                    // Src length - chunk 1 (see above diagram on the right)
-                    self.cap - self.head - start,
+                    // Src ends at `cap`; the WILDCOPY_OVERLENGTH slack region is
+                    // physically reachable from this read.
+                    (self.cap - self.head - start) + WILDCOPY_OVERLENGTH,
                 );
 
                 let dst = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(self.tail) },
-                    // Dst length (see above diagram)
+                    // Dst length is bounded by `head` — no slack room to inflate.
                     self.head - self.tail,
                 );
 
@@ -452,14 +638,16 @@ impl RingBuffer {
 
                     let src = (
                         self.buf.as_ptr().cast_const(),
-                        // Src length - chunk 2 (see above diagram on the left)
-                        self.tail,
+                        // Src ends at `tail`; inflate by WILDCOPY_OVERLENGTH to let
+                        // the SIMD fast paths fire on small `len - after_start`.
+                        self.tail + WILDCOPY_OVERLENGTH,
                     );
 
                     let dst = (
                         // SAFETY: we are still within the memory range of `buf`
                         unsafe { dst.0.add(after_start) },
-                        // Dst length (see above diagram)
+                        // Dst length bounded by `head` — overshoot past `head`
+                        // would clobber readable data, so cannot inflate.
                         dst.1 - after_start,
                     );
 
@@ -530,6 +718,21 @@ impl RingBuffer {
     /// This function is functionally the same as [RingBuffer::extend_from_within_unchecked],
     /// but it does not contain any branching operations.
     ///
+    /// NOTE on WILDCOPY_OVERLENGTH: unlike `extend_from_within_unchecked` and
+    /// `extend`, this path passes exact-fit `(ptr, len)` capacities through to
+    /// `copy_with_nobranch_check` / `simd_copy::copy_bytes_overshooting`. It
+    /// therefore cannot trigger `simd_copy`'s SIMD fast paths that require
+    /// `min(src.1, dst.1) >= 16` — short copies always take the
+    /// inline byte / overlapping-u64 fallback instead of single_op_copy_16.
+    /// This is intentional for now: the per-pointer head/tail relationship
+    /// needed to decide which capacities are safe to inflate is not
+    /// available inside `copy_with_nobranch_check`, and the branchless path
+    /// is gated to x86 targets via `decode_buffer::use_branchless_wildcopy`
+    /// where measurable x86 perf is needed to justify the extra plumbing.
+    /// On aarch64 (the profiling target for the WILDCOPY_OVERLENGTH work)
+    /// the unconditional `extend_from_within_unchecked` path is used, so
+    /// the slack contract is exercised end-to-end there.
+    ///
     /// SAFETY:
     /// Needs start + len <= self.len()
     /// And more then len reserved space
@@ -597,9 +800,11 @@ impl Drop for RingBuffer {
             return;
         }
 
-        // SAFETY: is we were succesfully able to construct this layout when we allocated then it's also valid do so now
+        // SAFETY: if we were successfully able to construct this layout when we allocated then it's also valid do so now.
+        // Layout matches `reserve_amortized` which inflates by WILDCOPY_OVERLENGTH.
         // Relies on / establishes invariant 1
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        let current_layout =
+            unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
 
         unsafe {
             dealloc(self.buf.as_ptr(), current_layout);
@@ -633,6 +838,20 @@ unsafe fn copy_without_checks(
     }
 }
 
+/// Reference implementation used only by the `copy_with_nobranch_check`
+/// equivalence test (`copy_with_nobranch_check_matches_checked_for_all_valid_case_masks`).
+/// Production code never calls this — `extend_from_within_unchecked_branchless`
+/// dispatches to `copy_with_nobranch_check` directly on x86.
+///
+/// Like its branchless sibling, this helper does **not** inflate the
+/// `src.1` / `dst.1` capacities passed to `simd_copy::copy_bytes_overshooting`
+/// by `WILDCOPY_OVERLENGTH`. The exact-fit lengths mean `simd_copy`'s
+/// `min_buffer_size >= 16` SIMD fast paths cannot trigger here — short
+/// copies always fall through to the inline byte / overlapping-u64 tail
+/// instead of `single_op_copy_16`. This is intentional for parity with the
+/// production branchless path (which has the same property for the same
+/// per-pointer head/tail reason documented on
+/// `extend_from_within_unchecked_branchless`).
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -684,6 +903,24 @@ unsafe fn copy_with_checks(
     }
 }
 
+/// 16-way case dispatch over the four `(m1|m2)_in_f(1|2)` non-empty
+/// combinations, used by `extend_from_within_unchecked_branchless` on x86
+/// to avoid the branch-misprediction pattern of the unconditional
+/// `extend_from_within_unchecked` path. `#[allow(dead_code)]` because the
+/// only caller is gated to x86 by `decode_buffer::use_branchless_wildcopy`
+/// — on aarch64 / wasm / etc. rustc sees this as unreachable.
+///
+/// **WILDCOPY_OVERLENGTH note:** like `copy_with_checks` above, the
+/// `(ptr, len)` tuples passed to `simd_copy::copy_bytes_overshooting`
+/// below are exact-fit. The caller (the branchless path) does not thread
+/// per-pointer head/tail context through to here, so we cannot safely
+/// inflate by `WILDCOPY_OVERLENGTH` the way `extend_from_within_unchecked`
+/// does. Consequence: short copies on the x86 branchless path always fall
+/// into `simd_copy`'s inline byte / overlapping-u64 tail rather than the
+/// `min_buffer_size >= 16` `single_op_copy_16` fast path. Aarch64 hot
+/// decode (the WILDCOPY profiling target) uses the unconditional path,
+/// which does inflate, so the slack contract is exercised end-to-end
+/// there.
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -1197,6 +1434,88 @@ mod tests {
         combined.extend_from_slice(s1);
         combined.extend_from_slice(s2);
         assert_eq!(combined, alloc::vec![0xAB; 7]);
+    }
+
+    /// Construct a RingBuffer in the wrapped state where `tail < head`.
+    /// Data occupies `[head, cap)` followed by `[0, tail)`, leaving the
+    /// free region as `[tail, head)` — i.e. the **first** free slice
+    /// returned by `free_slice_parts` is the inner gap, NOT a span that
+    /// ends at `cap`.
+    fn build_tail_before_head(cap_hint: usize, head_pos: usize, tail_pos: usize) -> RingBuffer {
+        assert!(tail_pos < head_pos);
+        let mut rb = RingBuffer::new();
+        rb.reserve(cap_hint);
+        let actual_cap = rb.cap;
+        // Fill almost the whole buffer so we can carve out tail < head.
+        let fill_len = actual_cap - 2;
+        let prefix = alloc::vec![0xCD; fill_len];
+        rb.extend(&prefix);
+        // Drop bytes so `head` lands at the target. Tail stays at fill_len.
+        rb.drop_first_n(head_pos);
+        // Now extend just enough to wrap tail past `cap` and land it at
+        // `tail_pos`. From the current state (head=head_pos, tail=fill_len),
+        // we need `tail_pos = (fill_len + extra) % cap`, so
+        // `extra = (tail_pos + cap - fill_len) % cap`.
+        let extra = (tail_pos + actual_cap - fill_len) % actual_cap;
+        rb.extend(&alloc::vec![0xCD; extra]);
+        assert_eq!(rb.head, head_pos);
+        assert_eq!(rb.tail, tail_pos);
+        assert!(
+            rb.tail < rb.head,
+            "expected wrapped layout: tail={} head={}",
+            rb.tail,
+            rb.head
+        );
+        rb
+    }
+
+    #[test]
+    fn extend_wrapped_layout_preserves_bytes_past_head() {
+        // Regression test for the WILDCOPY_OVERLENGTH inflation bug.
+        // When `tail < head` the first free slice returned by
+        // `free_slice_parts` is the inner `[tail, head)` gap — it does NOT
+        // end at `cap`. A previous version of `RingBuffer::extend` always
+        // added WILDCOPY_OVERLENGTH to the destination capacity passed to
+        // `simd_copy::copy_bytes_overshooting`, which on this layout would
+        // allow wildcopy overshoot writes to clobber bytes at `[head,
+        // head+16)` — still-readable data the caller has not consumed yet.
+        // The current code gates the inflation on `tail >= head`; this
+        // test asserts that bytes at `head..head+16` survive an extend()
+        // that fills the inner gap nearly to capacity.
+        let mut rb = build_tail_before_head(128, 80, 10);
+        let head_before = rb.head;
+        let cap = rb.cap;
+        // Sample a window of bytes immediately past `head` and confirm
+        // they are the prefill (0xCD); these are the bytes any erroneous
+        // wildcopy overshoot would corrupt.
+        let mut sentinel = [0u8; 16];
+        unsafe {
+            for (i, slot) in sentinel.iter_mut().enumerate() {
+                *slot = rb.buf.as_ptr().add((head_before + i) % cap).read();
+            }
+        }
+        assert!(sentinel.iter().all(|&b| b == 0xCD), "pre-state sentinel");
+
+        // Fill the inner free region with a recognisable pattern, leaving
+        // exactly the 1-byte sentinel gap the RingBuffer always reserves.
+        let free_before = rb.free();
+        let payload = alloc::vec![0x42; free_before];
+        rb.extend(&payload);
+
+        // The bytes at [head, head+16) must still be the original 0xCD
+        // prefill — any overshoot would have written 0x42 over them.
+        unsafe {
+            for i in 0..16usize {
+                let actual = rb.buf.as_ptr().add((head_before + i) % cap).read();
+                assert_eq!(
+                    actual,
+                    0xCD,
+                    "byte at head+{i} (raw idx {}) was clobbered: got {:#04x}",
+                    (head_before + i) % cap,
+                    actual
+                );
+            }
+        }
     }
 
     #[test]

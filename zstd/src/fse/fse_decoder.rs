@@ -57,11 +57,19 @@ impl<'t> FSEDecoder<'t> {
     /// This is the "fast path" used in the interleaved sequence decode loop
     /// where a single refill check covers all three FSE state updates.
     #[inline(always)]
-    pub fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
+    pub(crate) fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
-        self.state = self.table.decode[next_state];
+        // SAFETY: `new_state` and `num_bits` were paired by
+        // `calc_baseline_and_numbits` during table construction such that
+        // `new_state + (2.pow(num_bits) - 1) < table_size = self.table.decode.len()`.
+        // `add` is the value of `num_bits` bits read from the bitstream, so
+        // `add < 2.pow(num_bits)` by construction of `BitReaderReversed::get_bits_unchecked`.
+        // Therefore `next_state < self.table.decode.len()` and the indexed read
+        // is in bounds; LLVM cannot prove this invariant on its own because it
+        // spans the table-build and decode call sites.
+        self.state = unsafe { *self.table.decode.get_unchecked(next_state) };
     }
 }
 
@@ -187,18 +195,13 @@ impl FSETable {
         self.decode.clear();
 
         let table_size = 1 << self.accuracy_log;
-        if self.decode.len() < table_size {
-            self.decode.reserve(table_size - self.decode.len());
-        }
-        //fill with dummy entries
-        self.decode.resize(
-            table_size,
-            Entry {
-                new_state: 0,
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
+        // After clear(), len == 0, so reserve(table_size) guarantees capacity
+        // ≥ table_size. The matching `set_len` runs later, right before
+        // `copy_symbols_into_decode`, so that any panic in the intervening
+        // table_symbols / symbol_spread_buffer allocations unwinds with
+        // `self.decode.len() == 0` instead of leaving uninitialized Entry
+        // slots reachable through `&mut self.decode[..]` on the next call.
+        self.decode.reserve(table_size);
 
         let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
         table_symbols.clear();
@@ -238,7 +241,14 @@ impl FSETable {
             negative_idx
         };
 
-        self.copy_symbols_into_decode(&table_symbols);
+        // `copy_symbols_into_decode` is responsible for sizing
+        // `self.decode` AND writing every slot in 0..table_size before
+        // it returns. Keeping the set_len call adjacent to the init
+        // loop (rather than pre-extending here) is what guarantees no
+        // panic-able code can run between "tell Vec the length is
+        // table_size" and "every slot has a fully-initialized Entry".
+        // capacity is reserved earlier in this function.
+        self.copy_symbols_into_decode(&table_symbols, table_size);
         self.symbol_spread_buffer = table_symbols;
         for idx in negative_idx..table_size {
             self.decode[idx].num_bits = self.accuracy_log;
@@ -270,8 +280,9 @@ impl FSETable {
         Ok(())
     }
 
-    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8]) {
-        debug_assert_eq!(table_symbols.len(), self.decode.len());
+    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8], table_size: usize) {
+        debug_assert_eq!(table_symbols.len(), table_size);
+        debug_assert!(table_size <= self.decode.capacity());
 
         #[cfg(target_endian = "little")]
         {
@@ -279,27 +290,61 @@ impl FSETable {
             debug_assert_eq!(core::mem::offset_of!(Entry, new_state), 0);
             debug_assert_eq!(core::mem::offset_of!(Entry, symbol), 2);
             debug_assert_eq!(core::mem::offset_of!(Entry, num_bits), 3);
+            // SAFETY: capacity is guaranteed by the caller; the init
+            // loop immediately below writes a full Entry to every slot
+            // in 0..table_size via raw `ptr::write_unaligned`. The
+            // set_len + writes form a single panic-free window —
+            // nothing in between this call and the loop body can unwind
+            // (no allocations, no user-visible &mut self.decode[..],
+            // no borrows that could observe uninitialized slots).
+            unsafe {
+                self.decode.set_len(table_size);
+            }
             // Write two packed entries (8 bytes) at once:
             // Entry bytes are [new_state_lo, new_state_hi, symbol, num_bits].
             let mut idx = 0usize;
-            while idx + 1 < table_symbols.len() {
+            while idx + 1 < table_size {
                 let packed =
                     ((table_symbols[idx] as u64) << 16) | ((table_symbols[idx + 1] as u64) << 48);
-                // SAFETY: `idx + 1 < table_symbols.len()` and `table_symbols.len() == self.decode.len()`
-                // ensure `idx` and `idx + 1` are valid `self.decode` entries (2 x 4 bytes = 8 bytes).
-                // Unaligned writes are intentional because `Entry` alignment may be < 8.
+                // SAFETY: idx + 1 < table_size == self.decode.len()
+                // (just set above) and capacity covers two u32 slots.
+                // Unaligned writes are intentional because `Entry`
+                // alignment may be < 8.
                 unsafe {
                     ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u64>(), packed);
                 }
                 idx += 2;
             }
-            if idx < table_symbols.len() {
-                self.decode[idx].symbol = table_symbols[idx];
+            if idx < table_size {
+                // Trailing odd entry: write a full 4-byte Entry { new_state: 0,
+                // symbol, num_bits: 0 } via a single u32 store. Field assignment
+                // (`self.decode[idx].symbol = …`) would have left new_state /
+                // num_bits uninitialized after the set_len above — leaking UB
+                // until the per-entry baseline pass overwrote them.
+                let packed = (table_symbols[idx] as u32) << 16;
+                // SAFETY: idx < table_size == self.decode.len(), capacity
+                // covers a u32 slot. Unaligned write is intentional
+                // because `Entry`'s alignment may be < 4 on some targets.
+                unsafe {
+                    ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u32>(), packed);
+                }
             }
         }
 
         #[cfg(not(target_endian = "little"))]
         {
+            // BE path uses iter_mut(), which constructs `&mut Entry` and
+            // therefore needs initialized storage — resize-with-default
+            // is the natural shape. No production target ships BE so
+            // the extra zero-fill is irrelevant.
+            self.decode.resize(
+                table_size,
+                Entry {
+                    new_state: 0,
+                    symbol: 0,
+                    num_bits: 0,
+                },
+            );
             for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
                 entry.symbol = symbol;
             }

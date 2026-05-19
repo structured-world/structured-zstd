@@ -1,63 +1,58 @@
-use super::prefetch;
-use super::scratch::DecoderScratch;
+use super::decode_buffer::DecodeBuffer;
+use crate::blocks::sequence_section::Sequence;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::ExecuteSequencesError;
 
-/// Take the provided decoder and execute the sequences stored within
-pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    let mut literals_copy_counter = 0;
-    let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0;
+/// Field-level variant of [`execute_sequences`] used when the caller cannot
+/// hand over a full `&mut DecoderScratch` (e.g. another field is immutably
+/// borrowed at the call site). Takes the same subset of fields the workspace
+/// version touches and runs the identical execution loop. Used by the
+/// fused `decode_and_execute_sequences` for its RLE-mode fallback.
+pub(crate) fn execute_sequences_fields(
+    buffer: &mut DecodeBuffer,
+    literals_buffer: &[u8],
+    offset_hist: &mut [u32; 3],
+    sequences: &[Sequence],
+) -> Result<(), ExecuteSequencesError> {
+    let mut literals_copy_counter: usize = 0;
+    let old_buffer_size = buffer.len();
+    let mut seq_sum: u32 = 0;
 
-    // Reserve once for the maximum possible decoded block output (128 KB per
-    // the zstd spec). This avoids repeated re-allocations inside the hot
-    // execute loop without an extra scan over the sequence vector, and is
-    // inherently bounded against corrupted inputs.
-    scratch.buffer.reserve(MAX_BLOCK_SIZE as usize);
+    buffer.reserve(MAX_BLOCK_SIZE as usize);
 
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
-        prefetch_literals_n_plus_two(scratch, idx, literals_copy_counter);
-
-        if seq.ll > 0 {
-            let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
-                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                    wanted: high,
-                    have: scratch.literals_buffer.len(),
-                });
-            }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            literals_copy_counter += seq.ll as usize;
-
-            scratch.buffer.push(literals);
+    let literals_buffer_len = literals_buffer.len();
+    for seq in sequences {
+        let seq = *seq;
+        let high = literals_copy_counter + seq.ll as usize;
+        if high > literals_buffer_len {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: literals_buffer_len,
+            });
         }
+        // SAFETY: literals_copy_counter <= high <= literals_buffer_len.
+        let literals = unsafe { literals_buffer.get_unchecked(literals_copy_counter..high) };
+        literals_copy_counter = high;
+        buffer.push(literals);
 
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
+        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
         if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset);
         }
-        if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
-        }
+        buffer.repeat(actual_offset as usize, seq.ml as usize)?;
 
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
+        seq_sum = seq_sum.wrapping_add(seq.ml).wrapping_add(seq.ll);
     }
-    if literals_copy_counter < scratch.literals_buffer.len() {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
-        seq_sum += rest_literals.len() as u32;
+    if literals_copy_counter < literals_buffer_len {
+        let rest_literals = &literals_buffer[literals_copy_counter..];
+        buffer.push(rest_literals);
+        seq_sum = seq_sum.wrapping_add(rest_literals.len() as u32);
     }
 
-    let diff = scratch.buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
+    let diff = buffer.len() - old_buffer_size;
+    debug_assert_eq!(
+        seq_sum as usize, diff,
+        "seq_sum {seq_sum} != buffer growth {diff}"
     );
     Ok(())
 }
@@ -65,7 +60,27 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+    // Fast path: offset_value >= 4 means a fresh (non-repcode) offset, which
+    // is the dominant case for non-trivial corpora. Donor (zstd_decompress_block.c
+    // ZSTD_updateRep) special-cases this with a straight shift: rotate the
+    // history down and store `offset_value - 3` at slot 0. No rule table, no
+    // branchless masks. The slow path below handles repcode 1..=3 with the
+    // full RULES table dispatch.
+    if offset_value >= 4 {
+        let actual = offset_value - 3;
+        scratch[2] = scratch[1];
+        scratch[1] = scratch[0];
+        scratch[0] = actual;
+        return actual;
+    }
+
+    do_offset_history_repcode(offset_value, lit_len, scratch)
+}
+
+#[cold]
+#[inline(never)]
+fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
         scratch_idx: usize,
@@ -177,30 +192,6 @@ fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) ->
     scratch[2] = select_u32(old2, old1, update_b);
 
     actual_offset
-}
-
-#[inline(always)]
-fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_cursor: usize) {
-    if idx + 2 >= scratch.sequences.len() {
-        return;
-    }
-
-    let ll_curr = scratch.sequences[idx].ll as usize;
-    let ll_next = scratch.sequences[idx + 1].ll as usize;
-    let ll_n2 = scratch.sequences[idx + 2].ll as usize;
-    if ll_n2 < 64 {
-        return;
-    }
-
-    let (start, overflow_a) = literals_cursor.overflowing_add(ll_curr);
-    let (start, overflow_b) = start.overflowing_add(ll_next);
-    let (end, overflow_c) = start.overflowing_add(ll_n2);
-    if !(overflow_a || overflow_b || overflow_c)
-        && start <= end
-        && end <= scratch.literals_buffer.len()
-    {
-        prefetch::prefetch_slice(&scratch.literals_buffer[start..end]);
-    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,14 @@ pub struct DecodeBuffer {
     pub hash: twox_hash::XxHash64,
 }
 
+/// Rollback token produced by [`DecodeBuffer::checkpoint`].
+#[derive(Copy, Clone)]
+pub(crate) struct DecodeBufferCheckpoint {
+    tail: usize,
+    total_output_counter: u64,
+    cap: usize,
+}
+
 impl Read for DecodeBuffer {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
         let max_amount = self.can_drain_to_window_size().unwrap_or(0);
@@ -60,6 +68,51 @@ impl DecodeBuffer {
         self.buffer.len()
     }
 
+    /// Capture a rollback point covering the buffer's write cursor and the
+    /// total-output counter. Pair with [`restore_checkpoint`] to undo
+    /// speculative pushes/repeats made after the capture — used by the fused
+    /// sequence executor to roll back when the post-loop bitstream
+    /// validation rejects a malformed block, restoring the
+    /// transactional-on-error semantics the legacy two-pass pipeline had.
+    #[inline]
+    pub(crate) fn checkpoint(&self) -> DecodeBufferCheckpoint {
+        DecodeBufferCheckpoint {
+            tail: self.buffer.tail(),
+            total_output_counter: self.total_output_counter,
+            cap: self.buffer.cap(),
+        }
+    }
+
+    /// Attempt to restore a checkpoint captured by [`checkpoint`].
+    ///
+    /// Returns `true` if the rollback was performed; `false` if an
+    /// intervening reallocation invalidated the captured tail index
+    /// (no state is mutated in that case).
+    ///
+    /// On a well-formed zstd block the upfront `reserve(MAX_BLOCK_SIZE)`
+    /// rules out reallocation, so this returns `true` on the hot path.
+    /// On a malformed block whose sequence section decodes past
+    /// `MAX_BLOCK_SIZE`, `RingBuffer::reserve_amortized` compacts the
+    /// buffer (head=0, tail=s1+s2) and the captured tail index becomes
+    /// meaningless — `false` is returned and the caller surfaces a
+    /// normal decode `Err` instead of restoring stale state. Reaching
+    /// this branch implies the frame is already corrupt; the partial
+    /// data left in the buffer is discarded by the `Err` return.
+    #[inline]
+    pub(crate) fn try_restore_checkpoint(&mut self, cp: DecodeBufferCheckpoint) -> bool {
+        if self.buffer.cap() != cp.cap {
+            return false;
+        }
+        // SAFETY: cap-equality above proves the underlying allocation
+        // has not been reseated, so the captured `tail` still refers to
+        // the same logical and physical position. The caller is also
+        // responsible for treating any bytes between the captured tail
+        // and the current tail as discarded.
+        unsafe { self.buffer.set_tail(cp.tail) };
+        self.total_output_counter = cp.total_output_counter;
+        true
+    }
+
     /// Pre-allocate capacity for `amount` additional bytes.
     ///
     /// Call this before a batch of `push`/`repeat` operations to avoid
@@ -97,6 +150,7 @@ impl DecodeBuffer {
         Ok(())
     }
 
+    #[inline]
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
@@ -451,6 +505,67 @@ mod tests {
     extern crate std;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn checkpoint_restore_undoes_pushes() {
+        // Regression test for the fused-decode transactional contract:
+        // when the post-loop bitstream validation fails, the fused
+        // sequence executor must restore buffer state to the moment
+        // before the first per-iter side-effect. This exercises the
+        // primitive that supports that rollback.
+        let mut buf = DecodeBuffer::new(1024);
+        // Mirror the fused sequence executor: reserve upfront so no
+        // RingBuffer reallocation happens between checkpoint and restore
+        // (restore_checkpoint requires a stable underlying allocation).
+        buf.reserve(64);
+        buf.push(&[1, 2, 3]);
+        let cp = buf.checkpoint();
+        buf.push(&[4, 5, 6, 7]);
+        assert_eq!(buf.len(), 7);
+        assert!(
+            buf.try_restore_checkpoint(cp),
+            "no realloc → restore must succeed"
+        );
+        assert_eq!(buf.len(), 3, "len must reflect the checkpoint");
+
+        // After restore, fresh writes must land contiguously where the
+        // first push left off (no stale tail bytes leaking through).
+        buf.push(&[0xAA, 0xBB]);
+        assert_eq!(buf.len(), 5);
+        // Drain & verify content.
+        let mut drained: Vec<u8> = Vec::new();
+        buf.drain_to_writer(&mut drained).unwrap();
+        assert_eq!(drained, alloc::vec![1, 2, 3, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn restore_checkpoint_after_realloc_returns_false() {
+        // Regression test: try_restore_checkpoint() must detect an
+        // intervening RingBuffer reallocation (which compacts the data
+        // layout and invalidates the captured tail) and refuse to
+        // restore, returning false instead of corrupting state or
+        // panicking. Triggered by a malformed zstd block whose sequence
+        // section decodes past MAX_BLOCK_SIZE; surfacing the failure to
+        // the caller as a normal decode Err is required behaviour —
+        // both silent wrong output AND an unconditional panic on
+        // untrusted input are unacceptable. libFuzzer artifact
+        // crash-bfb3bc55... originally exercised this branch via the
+        // panic guard added in the previous round.
+        let mut buf = DecodeBuffer::new(64);
+        buf.push(&[0; 16]);
+        let cp = buf.checkpoint();
+        // Force a reallocation. RingBuffer grows by powers of two and
+        // 4 MiB is well above the initial 64-byte starting capacity, so
+        // reserve() must hit reserve_amortized().
+        buf.reserve(4 * 1024 * 1024);
+        buf.push(&[0; 16]);
+        assert!(
+            !buf.try_restore_checkpoint(cp),
+            "realloc happened → rollback must be refused"
+        );
+        // No state mutation when the restore is refused.
+        assert_eq!(buf.len(), 32);
+    }
 
     #[test]
     fn short_writer() {

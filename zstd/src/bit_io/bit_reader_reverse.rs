@@ -5,12 +5,12 @@ use std::sync::OnceLock;
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
 /// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
 ///
-/// Using a lookup table instead of computing the mask on every call
-/// eliminates a shift + subtract on the hot decode path.
-/// On BMI2-capable x86-64 CPUs the table is bypassed entirely in favour
-/// of the single-cycle `bzhi` instruction (see [`mask_lower_bits`]).
-// On BMI2 builds the table is only used by tests; suppress dead_code there.
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
+/// `mask_lower_bits` no longer reads this table — it computes the mask
+/// via `u64::MAX >> (64 - n)` to save a load. The table is still used
+/// by the BMI2 PEXT triple-extract path on x86-64 (where the mask is
+/// constructed once per call and then fed to `_pext_u64`), and by the
+/// tests that verify mask values directly.
+#[cfg(any(test, all(feature = "std", target_arch = "x86_64")))]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
@@ -25,15 +25,26 @@ const BIT_MASK: [u64; 65] = {
 /// Return the lowest `n` bits of `value` (zero the rest).
 ///
 /// On x86-64 with BMI2 this compiles to a single `bzhi` instruction.
-/// Everywhere else it falls back to the pre-computed [`BIT_MASK`] table.
+/// Everywhere else it computes the mask via `u64::MAX >> (64 - n)`
+/// (replaced the previous `BIT_MASK[n]` table load — one shift + one
+/// predicted cmov vs one 3–5 cycle L1 load on the hot FSE path).
+///
 /// This function supports `n <= 64`; zstd callers normally guarantee
-/// `n <= 56` (the maximum single-symbol width in zstd).
-/// On the non-BMI2 fallback path, `n > 64` naturally panics via
-/// `BIT_MASK[n]` index-out-of-bounds. The `debug_assert` catches
-/// misuse on the BMI2 path (where `_bzhi_u64` would silently
-/// truncate) without adding a branch to the release hot path.
+/// `n <= 56` (the maximum single-symbol width in zstd). The
+/// `debug_assert!(n <= 64)` on the FIRST line of the function body
+/// (not just on `get_bits` callers) is the input-validation gate that
+/// the fuzz suite relies on — invalid `n > 64` (e.g. from a malformed
+/// FSE table or `accuracy_log`) trips it instead of silently returning
+/// 0 from the release path. On the BMI2 path `_bzhi_u64` would
+/// silently truncate without it; on the fallback path `checked_shr`
+/// returns `None` for the wrapping-underflow shift and the
+/// `unwrap_or(0)` would otherwise hide the upstream bug.
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
+    // Input-validation gate documented in the rustdoc above — keep this
+    // as the first statement; removing it lets malformed inputs (`n >
+    // 64`) silently decode to 0 in release builds instead of being
+    // caught by the fuzz suite.
     debug_assert!(n <= 64, "mask_lower_bits: n must be <= 64, got {}", n);
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
@@ -42,7 +53,22 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     {
-        value & BIT_MASK[n as usize]
+        // Compute the mask via `u64::MAX >> (64 - n)` instead of a
+        // `BIT_MASK[n]` table load. One shift + one (predicted) cmov
+        // vs one L1 load (3-5 cycle latency). For the hot FSE bitstream
+        // decode path this fires 3x per sequence; saving the load
+        // latency per call compounds over thousands of sequences.
+        //
+        // `checked_shr` returns `None` when the shift count is ≥ 64,
+        // which happens exactly when `n == 0` (`64 - 0 = 64`) or when
+        // the debug_assert above would have fired (`n > 64`, underflow
+        // wraps to a huge value). Mapping both to `0` gives the
+        // mathematically-correct empty mask for n=0 and a safe-ish
+        // fallback for the invalid range.
+        let mask = u64::MAX
+            .checked_shr(64u32.wrapping_sub(n as u32))
+            .unwrap_or(0);
+        value & mask
     }
 }
 
@@ -160,8 +186,18 @@ impl<'s> BitReaderReversed<'s> {
         }
     }
 
-    /// We refill the container in full bytes, shifting the still unread portion to the left, and filling the lower bits with new data
-    #[cold]
+    /// Refill the bit container with up to 64 fresh bits from `source`.
+    ///
+    /// Hot path (mid-stream, `self.index >= bytes_consumed`) is `#[inline(always)]`
+    /// and folds into every caller — three operations: subtract index, mask
+    /// off byte-aligned bit count, load 8 bytes. The pre-PR version wore a
+    /// blanket `#[cold]` annotation which actively penalised the hot path
+    /// (refill fires roughly every 2 sequences during sequence decode, so
+    /// it is NOT cold). The rare edge cases — running out of source, going
+    /// past the start of the stream, exhausting all useful bits — branch
+    /// out to `refill_slow` which keeps the `#[cold] #[inline(never)]`
+    /// treatment they actually deserve.
+    #[inline(always)]
     fn refill(&mut self) {
         let bytes_consumed = self.bits_consumed as usize / 8;
         if bytes_consumed == 0 {
@@ -176,7 +212,22 @@ impl<'s> BitReaderReversed<'s> {
             self.bits_consumed &= 7;
             self.bit_container =
                 u64::from_le_bytes((&self.source[self.index..][..8]).try_into().unwrap());
-        } else if self.index > 0 {
+        } else {
+            self.refill_slow();
+        }
+
+        // Assert that at least `56 = 64 - 8` bits are available to read.
+        debug_assert!(self.bits_consumed < 8);
+    }
+
+    /// End-of-stream refill paths — runs when the next 8-byte window would
+    /// underflow the source buffer. Kept `#[cold] #[inline(never)]` so the
+    /// hot mid-stream path in [`refill`] folds into call sites without
+    /// dragging these branches along.
+    #[cold]
+    #[inline(never)]
+    fn refill_slow(&mut self) {
+        if self.index > 0 {
             // Read the last portion of source into the `bit_container`
             if self.source.len() >= 8 {
                 self.bit_container = u64::from_le_bytes((&self.source[..8]).try_into().unwrap());
@@ -203,9 +254,6 @@ impl<'s> BitReaderReversed<'s> {
             self.bits_consumed = 0;
             self.bit_container = 0;
         }
-
-        // Assert that at least `56 = 64 - 8` bits are available to read.
-        debug_assert!(self.bits_consumed < 8);
     }
 
     /// Read `n` number of bits from the source. Will read at most 56 bits.

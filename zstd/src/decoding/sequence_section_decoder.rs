@@ -6,26 +6,48 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::decoding::errors::DecodeSequenceError;
+use crate::common::MAX_BLOCK_SIZE;
+use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
+use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
 use crate::fse::FSEDecoder;
 use alloc::vec::Vec;
 
-/// Decode the provided source as a series of sequences into the supplied `target`.
-pub fn decode_sequences(
+/// Fused decode + execute pipeline: decodes each sequence from the FSE
+/// bitstream and immediately executes it (literal copy + match copy)
+/// without materialising the intermediate `Vec<Sequence>` round-trip.
+///
+/// Donor parity: zstd's `ZSTD_decompressSequences_body` interleaves
+/// `ZSTD_decodeSequence` and `ZSTD_execSequence` in one loop, keeping
+/// the `seq_t` in registers. We were paying ~24 B/seq × 2 (write + read)
+/// of L1↔L2 traffic on the dropped Vec<Sequence> roundtrip plus the
+/// per-iter Vec::push overhead.
+///
+/// Falls back to the legacy two-pass pipeline (`decode_sequences` +
+/// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
+/// is rare on perf-relevant corpora and not worth duplicating.
+pub fn decode_and_execute_sequences(
     section: &SequencesHeader,
     source: &[u8],
-    scratch: &mut FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let bytes_read = maybe_update_fse_tables(section, source, scratch)?;
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    // Reset the fallback sequences vec on entry. The non-RLE fast path
+    // never writes to it, so without this clear it would carry whatever
+    // entries the previous block left behind — a stale-data hazard for
+    // any external caller that inspects scratch.sequences after decode.
+    rle_fallback_sequences.clear();
 
+    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
     vprintln!("Updating tables used {} bytes", bytes_read);
 
     let bit_stream = &source[bytes_read..];
-
     let mut br = BitReaderReversed::new(bit_stream);
 
-    //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
+    // Skip the 0-padding at the end of the last byte and consume the
+    // start-of-stream `1` bit.
     let mut skipped_bits = 0;
     loop {
         let val = br.get_bits(1);
@@ -35,14 +57,197 @@ pub fn decode_sequences(
         }
     }
     if skipped_bits > 8 {
-        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-        return Err(DecodeSequenceError::ExtraPadding { skipped_bits });
+        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
     }
 
-    if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, scratch, target)
-    } else {
-        decode_sequences_without_rle(section, &mut br, scratch, target)
+    // RLE-mode blocks: fall back to the legacy two-pass pipeline. These
+    // are uncommon in real-world corpora; fusing them too would double
+    // the source maintenance for zero observed wins.
+    if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
+        decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
+        execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
+        return Ok(());
+    }
+
+    let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = FSEDecoder::new(&fse.offsets);
+
+    ll_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    of_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    ml_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+
+    let max_update_bits = fse.literal_lengths.accuracy_log
+        + fse.match_lengths.accuracy_log
+        + fse.offsets.accuracy_log;
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
+
+    buffer.reserve(MAX_BLOCK_SIZE as usize);
+    let old_buffer_size = buffer.len();
+    let literals_buffer_len = literals_buffer.len();
+    let mut lit_cur: usize = 0;
+    let mut seq_sum: u32 = 0;
+
+    // Transactional rollback state. The fused decode+execute commits
+    // each sequence's side-effects (literal push, match repeat, offset
+    // history update) immediately, but the bitstream-exhaustion check
+    // happens once after the loop. If that final check fails on a
+    // malformed input, restore the buffer write cursor and offset
+    // history to their pre-loop values so the caller observes the
+    // legacy two-pass semantics: an Err leaves no partial output and no
+    // mutated repeat-history behind.
+    let buffer_checkpoint = buffer.checkpoint();
+    let saved_offset_hist = *offset_hist;
+
+    #[inline(always)]
+    fn execute_one_sequence(
+        buffer: &mut super::decode_buffer::DecodeBuffer,
+        literals: &[u8],
+        lit_cur: &mut usize,
+        lit_len: usize,
+        offset_hist: &mut [u32; 3],
+        seq: Sequence,
+    ) -> Result<(), DecompressBlockError> {
+        let high = *lit_cur + seq.ll as usize;
+        if high > lit_len {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: lit_len,
+            }
+            .into());
+        }
+        // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
+        // (high = lit_cur + seq.ll, seq.ll >= 0).
+        let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+        *lit_cur = high;
+        buffer.push(lits);
+
+        let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+        if actual == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset.into());
+        }
+        buffer
+            .repeat(actual as usize, seq.ml as usize)
+            .map_err(ExecuteSequencesError::from)?;
+        Ok(())
+    }
+
+    // Single fused loop over all sequences. The state-update step
+    // (`ensure_bits` + per-decoder `update_state_fast`) is skipped on
+    // the final iteration — matching the donor `isLastSeq` template
+    // pattern (no pre-fetch of the next state when there is no next
+    // sequence). Under `#[inline(always)]` the trailing `if i + 1 <
+    // num_sequences` collapses to the same generated code as the
+    // previous split-shape version, but keeps the per-sequence body in
+    // one place so future edits to the hot path stay in sync.
+    let num_sequences = section.num_sequences as usize;
+    for i in 0..num_sequences {
+        let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+        execute_one_sequence(
+            buffer,
+            literals_buffer,
+            &mut lit_cur,
+            literals_buffer_len,
+            offset_hist,
+            seq,
+        )?;
+        seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+
+        if i + 1 < num_sequences {
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(&mut br);
+            ml_dec.update_state_fast(&mut br);
+            of_dec.update_state_fast(&mut br);
+        }
+    }
+
+    // Post-loop bitstream validation. On failure roll back the buffer
+    // and offset history so a malformed block leaves no partial
+    // side-effects behind — restoring the transactional contract the
+    // legacy two-pass pipeline upheld.
+    let remaining = br.bits_remaining();
+    if remaining != 0 {
+        // try_restore_checkpoint succeeds when no reallocation happened
+        // between the checkpoint and now (the common case: upfront
+        // reserve(MAX_BLOCK_SIZE) covers a well-formed block). When a
+        // malformed block decodes past that bound, reserve_amortized
+        // fires and compacts the ring buffer — the captured tail is no
+        // longer meaningful and the rollback is skipped. Either way the
+        // caller observes the same Err below; the partial data left in
+        // the buffer in the latter case is discarded with the frame.
+        //
+        // Crucially, only restore the repcode history when the buffer
+        // rollback actually happened. If the buffer keeps its
+        // speculative bytes, rewinding `offset_hist` would leave the
+        // workspace internally inconsistent for any subsequent reuse
+        // after the `Err`.
+        if buffer.try_restore_checkpoint(buffer_checkpoint) {
+            *offset_hist = saved_offset_hist;
+        }
+
+        if remaining < 0 {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+        }
+        return Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: remaining,
+        }
+        .into());
+    }
+
+    // Tail literals: any bytes in the literals_buffer that no sequence
+    // claimed get pushed after the last sequence.
+    if lit_cur < literals_buffer_len {
+        let rest = &literals_buffer[lit_cur..];
+        buffer.push(rest);
+        seq_sum = seq_sum.wrapping_add(rest.len() as u32);
+    }
+
+    let diff = buffer.len() - old_buffer_size;
+    debug_assert_eq!(
+        seq_sum as usize, diff,
+        "seq_sum {seq_sum} != buffer growth {diff}"
+    );
+    Ok(())
+}
+
+/// Per-sequence decode helper used by `decode_and_execute_sequences`.
+/// Identical to the inner `decode_one_sequence` of
+/// `decode_sequences_without_rle` — separate copy because Rust does not
+/// let us share a private fn-item across two outer functions cleanly.
+#[inline(always)]
+fn decode_one_sequence_inline(
+    ll_dec: &mut FSEDecoder<'_>,
+    ml_dec: &mut FSEDecoder<'_>,
+    of_dec: &mut FSEDecoder<'_>,
+    br: &mut BitReaderReversed<'_>,
+) -> Sequence {
+    let ll_code = ll_dec.decode_symbol();
+    let ml_code = ml_dec.decode_symbol();
+    let of_code = of_dec.decode_symbol();
+
+    let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+    let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+    debug_assert!(of_code <= MAX_OFFSET_CODE);
+
+    let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+    let offset = obits as u32 + (1u32 << of_code);
+
+    debug_assert_ne!(offset, 0);
+
+    Sequence {
+        ll: ll_value + ll_add as u32,
+        ml: ml_value + ml_add as u32,
+        of: offset,
     }
 }
 
@@ -109,18 +314,16 @@ fn decode_sequences_with_rle(
         let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
         let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
 
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
+        // OF code / offset==0 checks dropped per FSE invariants (see comment
+        // in decode_sequences_without_rle). For RLE mode, the singleton
+        // of_rle byte is validated at maybe_update_fse_tables; for FSE mode,
+        // build_decoding_table caps symbols at MAX_OFFSET_CODE.
+        debug_assert!(of_code <= MAX_OFFSET_CODE);
 
         let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
         let offset = obits as u32 + (1u32 << of_code);
 
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
+        debug_assert_ne!(offset, 0);
 
         target.push(Sequence {
             ll: ll_value + ll_add as u32,
@@ -158,146 +361,66 @@ fn decode_sequences_with_rle(
     }
 }
 
-fn decode_sequences_without_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+/// Baseline value emitted by literal-length code `code`. Donor parity:
+/// `LL_base` table in the zstd reference (`zstd_compress_internal.h`).
+/// Per Zstandard format §3.1.1.3.2.1.1.1, valid codes are 0..=35; the
+/// FSE decoder guarantees codes never exceed 35, so callers index this
+/// array unconditionally and rely on the debug_assert in the helper
+/// below to catch any future invariant break.
+const LL_BASE: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
 
-    ll_dec.init_state(br)?;
-    of_dec.init_state(br)?;
-    ml_dec.init_state(br)?;
+/// Number of extra bits to read after the literal-length code (donor
+/// `LL_bits`). Same domain as [`LL_BASE`].
+const LL_EXTRA_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
 
-    target.clear();
-    target.reserve(section.num_sequences as usize);
+/// Baseline value emitted by match-length code `code` (donor `ML_base`).
+/// Codes 0..=52 per Zstandard format §3.1.1.3.2.1.1.2.
+const ML_BASE: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
+    2051, 4099, 8195, 16387, 32771, 65539,
+];
 
-    // Maximum bits consumed by the three state updates combined.
-    // LL and ML accuracy logs are at most 9, OF at most 8, so the ceiling is 26.
-    // A single ensure_bits call (which guarantees ≥56 bits after refill) replaces
-    // three individual per-update refill checks, eliminating two branches per
-    // iteration on the hot decode path.
-    let max_update_bits = scratch.literal_lengths.accuracy_log
-        + scratch.match_lengths.accuracy_log
-        + scratch.offsets.accuracy_log;
-    debug_assert!(
-        max_update_bits <= 56,
-        "sequence section update bits exceed 56-bit budget"
-    );
-
-    for _seq_idx in 0..section.num_sequences {
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
-        let of_code = of_dec.decode_symbol();
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            // One refill check for all three state updates (batched fast path).
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(br);
-            ml_dec.update_state_fast(br);
-            of_dec.update_state_fast(br);
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
+/// Number of extra bits to read after the match-length code (donor `ML_bits`).
+const ML_EXTRA_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
 
 /// Look up the provided state value from a literal length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
+#[inline(always)]
 fn lookup_ll_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => unreachable!("Illegal literal length code was: {}", code),
-    }
+    // Untrusted frames may carry an FSE table whose decoded symbol exceeds
+    // the valid LL code range (0..=35). Mirror the original `match` panic
+    // semantics via the standard array bounds check — that single jae is
+    // predicted perfectly on real inputs and replaces the staircase of
+    // `match` arm comparisons the previous implementation produced.
+    let idx = code as usize;
+    assert!(
+        idx < LL_BASE.len(),
+        "Illegal literal length code was: {code}"
+    );
+    (LL_BASE[idx], LL_EXTRA_BITS[idx])
 }
 
 /// Look up the provided state value from a match length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
+#[inline(always)]
 fn lookup_ml_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => unreachable!("Illegal match length code was: {}", code),
-    }
+    let idx = code as usize;
+    assert!(idx < ML_BASE.len(), "Illegal match length code was: {code}");
+    (ML_BASE[idx], ML_EXTRA_BITS[idx])
 }
 
 // This info is buried in the symbol compression mode table

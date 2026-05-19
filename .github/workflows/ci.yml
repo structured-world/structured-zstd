@@ -176,6 +176,34 @@ jobs:
         working-directory: zstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
 
+  no-std:
+    # Build-only smoke test that the crate compiles under no_std + alloc.
+    # The decoder ships #![no_std] with optional `std` feature gating the
+    # io::Read/Write impls + runtime CPUID detection; without this gate
+    # nothing catches a regression where a new `use std::...` slips into
+    # a hot decode path and silently breaks downstream embedded users.
+    # Two configurations cover the realistic deployment surface:
+    # alloc-only (zero features) and alloc + xxhash content checksum.
+    # Clippy runs cargo's compile checks plus linting, so a separate
+    # `cargo check` pass would just duplicate work.
+    needs: lint
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: no-std
+      - name: Clippy (no_std)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features -- -D warnings
+      - name: Clippy (no_std + hash)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features hash -- -D warnings
+
   codecov:
     needs: lint
     timeout-minutes: 15
