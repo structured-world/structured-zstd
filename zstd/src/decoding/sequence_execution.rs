@@ -16,6 +16,11 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     scratch.buffer.reserve(MAX_BLOCK_SIZE as usize);
 
     let sequences_len = scratch.sequences.len();
+    // Hoist `literals_buffer.len()` out of the loop — the buffer is not
+    // mutated by anything we call inside the iteration (push writes to
+    // scratch.buffer, not literals_buffer), so the length is loop-invariant
+    // but the borrow checker keeps re-reading it on every iter.
+    let literals_buffer_len = scratch.literals_buffer.len();
     for idx in 0..sequences_len {
         // SAFETY: idx is bounded by the range header `0..sequences_len`, and
         // sequences_len is captured before the loop so the slice cannot
@@ -34,13 +39,21 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         // where ll == 0 occurs whenever sequences chain back-to-back without
         // intervening literals (common with high-entropy / fast-level encoders).
         let high = literals_copy_counter + seq.ll as usize;
-        if high > scratch.literals_buffer.len() {
+        if high > literals_buffer_len {
             return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
                 wanted: high,
-                have: scratch.literals_buffer.len(),
+                have: literals_buffer_len,
             });
         }
-        let literals = &scratch.literals_buffer[literals_copy_counter..high];
+        // SAFETY: `literals_copy_counter <= high <= literals_buffer_len` enforces
+        // bounds, verified by the check immediately above. `high` is monotone
+        // (literals_copy_counter only advances), so successive slices read
+        // disjoint regions of the literals buffer.
+        let literals = unsafe {
+            scratch
+                .literals_buffer
+                .get_unchecked(literals_copy_counter..high)
+        };
         literals_copy_counter = high;
         scratch.buffer.push(literals);
 
@@ -58,7 +71,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
         seq_sum += seq.ml;
         seq_sum += seq.ll;
     }
-    if literals_copy_counter < scratch.literals_buffer.len() {
+    if literals_copy_counter < literals_buffer_len {
         let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
         scratch.buffer.push(rest_literals);
         seq_sum += rest_literals.len() as u32;
