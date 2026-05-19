@@ -336,8 +336,13 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
+// `#[allow(dead_code)]` because in `--no-default-features` builds on x86
+// without `RUSTFLAGS="-C target-feature=+avx2"` the dispatcher cfg-gates
+// out every call site (runtime detection lives behind `feature = "std"`).
+// In std builds and target_feature=+avx2 builds the function is live.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
@@ -350,8 +355,11 @@ unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
+// Same `#[allow(dead_code)]` rationale as `copy_avx2`: cfg-gated out in
+// no-std builds without `target_feature=+avx512f`, live elsewhere.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
+#[allow(dead_code)]
 unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
