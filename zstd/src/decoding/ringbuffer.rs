@@ -591,6 +591,21 @@ impl RingBuffer {
     /// This function is functionally the same as [RingBuffer::extend_from_within_unchecked],
     /// but it does not contain any branching operations.
     ///
+    /// NOTE on WILDCOPY_OVERLENGTH: unlike `extend_from_within_unchecked` and
+    /// `extend`, this path passes exact-fit `(ptr, len)` capacities through to
+    /// `copy_with_nobranch_check` / `simd_copy::copy_bytes_overshooting`. It
+    /// therefore cannot trigger `simd_copy`'s SIMD fast paths that require
+    /// `min(src.1, dst.1) >= 16` — short copies always take the
+    /// inline byte / overlapping-u64 fallback instead of single_op_copy_16.
+    /// This is intentional for now: the per-pointer head/tail relationship
+    /// needed to decide which capacities are safe to inflate is not
+    /// available inside `copy_with_nobranch_check`, and the branchless path
+    /// is gated to x86 targets via `decode_buffer::use_branchless_wildcopy`
+    /// where measurable x86 perf is needed to justify the extra plumbing.
+    /// On aarch64 (the profiling target for the WILDCOPY_OVERLENGTH work)
+    /// the unconditional `extend_from_within_unchecked` path is used, so
+    /// the slack contract is exercised end-to-end there.
+    ///
     /// SAFETY:
     /// Needs start + len <= self.len()
     /// And more then len reserved space
