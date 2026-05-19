@@ -406,8 +406,8 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // the `cLitSize == 1` branch (`zstd_compress_literals.c:192-201`)
     // after passing the `min_lits` gate and running a full HUF compress —
     // so donor emits raw for any all-identical section under `min_lits`
-    // (e.g. 8..63 bytes at fast/dfast/greedy/lazy, 6..7 bytes with HUF
-    // reuse). RLE and raw share the same lhSize for a given `len`
+    // (e.g. 8..63 bytes at fast/dfast/greedy/lazy without HUF reuse).
+    // RLE and raw share the same lhSize for a given `len`
     // (both use `uncompressed_literals_header_bytes`), so RLE = lhSize + 1
     // and raw = lhSize + len. That makes RLE equal to raw on `len == 1`
     // and smaller by exactly `len - 1` bytes for `len >= 2`, regardless of
@@ -1966,9 +1966,11 @@ mod tests {
         // estimator's predicted size MUST equal the bytes the emitter
         // actually writes. Cases include: (a) fresh state with
         // `last_huff_table: None` covering the strategy-specific
-        // `min_lits` band (8/16/32/64), (b) seeded HUF-reuse state
-        // covering the lowered floor of 6 and 6/7-byte all-identical
-        // sections that previously hit the HUF path instead of RLE,
+        // `min_lits` band (8/16/32/64), (b) seeded HUF-reuse state at
+        // the lowered floor of 6 — under the prior hardcoded `len >= 8`
+        // gate 6/7-byte all-identical sections went raw, now they pass
+        // `min_lits == 6` and the donor-parity HUF+`cLitSize==1` path
+        // would route them to RLE; the pre-check shortcuts that path,
         // (c) sub-`min_lits` all-identical sections that take the
         // RLE pre-check regardless of strategy.
         type Inputs = &'static [(usize, bool)];
@@ -1997,12 +1999,13 @@ mod tests {
                 false,
                 &[(8, true), (31, true), (32, false)],
             ),
-            // HUF reuse path: floor drops to 6, so 6/7-byte sections
-            // previously hit the HUF compress path. With the RLE
-            // pre-check now non-empty-only, all-identical 6/7-byte
-            // sections must route through RLE and stay byte-equivalent
-            // estimator-vs-emit. Also exercise non-identical 6-byte
-            // raw fallback and 16-byte HUF reuse path.
+            // HUF reuse path: floor drops to 6. Under the prior
+            // hardcoded `len >= 8` gate 6/7-byte sections went raw;
+            // post-fix, all-identical 6/7-byte sections take the RLE
+            // pre-check and stay byte-equivalent estimator-vs-emit
+            // (donor parity would route them HUF→cLitSize==1→RLE).
+            // Also exercise non-identical 6-byte raw fallback and
+            // 16-byte HUF reuse path.
             (
                 StrategyTag::Lazy,
                 true,

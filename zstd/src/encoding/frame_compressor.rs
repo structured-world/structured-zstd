@@ -2227,10 +2227,14 @@ mod tests {
     /// Regression: `set_compression_level` followed by `compress()` must
     /// refresh `state.strategy_tag` through the reset-time sync so the
     /// literal-compression gates (`min_literals_to_compress`,
-    /// `min_gain`) use the NEW level's strategy. Picks a level pair that
-    /// crosses strategy bands (Fastest=Fast band → Best=BtUltra2 band)
-    /// so a missed sync would leave the construction-time tag visible
-    /// and trip the assertion.
+    /// `min_gain`) use the NEW level's strategy. Picks a level pair
+    /// that genuinely crosses strategy bands — `Fastest` resolves to
+    /// `Fast`, `Level(20)` resolves to `BtUltra2` — so a missed sync
+    /// would leave the construction-time tag visible and trip the
+    /// assertion. `CompressionLevel::Best` would also pass type-wise
+    /// but resolves to `Lazy` today, which keeps `min_literals_to_compress`
+    /// in the same `shift=3 → 64-byte` band as `Fast` and weakens the
+    /// signal that the gate floor actually moved.
     #[cfg(feature = "std")]
     #[test]
     fn set_compression_level_then_compress_refreshes_strategy_tag() {
@@ -2250,17 +2254,24 @@ mod tests {
         // Switch to a level whose resolved strategy lives in a different
         // band, then run a full compress cycle — the matcher.reset()
         // inside `compress` is the only site that can refresh the tag.
-        compressor.set_compression_level(CompressionLevel::Best);
+        let new_level = CompressionLevel::Level(20);
+        compressor.set_compression_level(new_level);
         compressor.set_source(data.as_slice());
         compressor.set_drain(&mut out);
         compressor.compress();
 
         let new_tag = compressor.state.strategy_tag;
-        let expected = StrategyTag::for_compression_level(CompressionLevel::Best);
+        let expected = StrategyTag::for_compression_level(new_level);
         assert_eq!(
             new_tag, expected,
             "strategy_tag must follow set_compression_level → compress, \
              got {new_tag:?} expected {expected:?}",
+        );
+        assert_eq!(
+            expected,
+            StrategyTag::BtUltra2,
+            "test fixture invariant: Level(20) must resolve to BtUltra2 \
+             so the post-switch tag visibly crosses the band boundary",
         );
         assert_ne!(
             new_tag, initial_tag,
