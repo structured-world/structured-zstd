@@ -1752,9 +1752,11 @@ mod tests {
             crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefgh".to_vec())
                 .expect("raw dictionary should be valid");
 
-        // Payload must exceed the encoder's advertised window (128 KiB for
-        // Fastest) so the test actually exercises cross-window-boundary behavior.
-        let payload = b"abcdefgh".repeat(128 * 1024 / 8 + 64);
+        // Payload must exceed the encoder's advertised window (512 KiB
+        // for Fastest after `window_log = 19` alignment with donor's
+        // L1 fast row in `clevels.h`) so the test actually exercises
+        // cross-window-boundary behavior.
+        let payload = b"abcdefgh".repeat(512 * 1024 / 8 + 64);
         let matcher = MatchGeneratorDriver::new(1024, 1);
 
         let mut no_dict_output = Vec::new();
