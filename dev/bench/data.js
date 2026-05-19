@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779144546726,
+  "lastUpdate": 1779150700780,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -39477,6 +39477,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.343,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f5014d5c96736371e86b1d4381751c67fec9a111",
+          "message": "perf(encoder): G3 — whole-block bail-out before partition split (#181)\n\n* perf(encoder): G3 — whole-block bail-out before partition split\n\nPort donor `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c\n:530-532`) whole-block bail-out into `SplitEstimator::derive_block_splits`.\nDonor short-circuits to a single raw block when the cheap whole-block\nsize estimate exceeds the source — we now do the same, skipping the\nrecursive bisect's per-sub-block probes on incompressible blocks that\nwould all raw-fallback anyway.\n\n`estimate_subblock_size` now returns the existing internal\n`raw_fallback` flag (previously thrown away after capping cost at\n`source_len + 3`). `derive_block_splits` reads that flag on the\nwhole-block probe and returns with `partitions` empty if it's set —\nwhich lets `compress_block_with_post_split`'s outer emit loop walk\nthe block as one partition and take the existing\n`emit_single_sequence_block` expansion-fallback path to write a raw\nblock. Same wire output as donor's bail-out, but without the bisect's\nrecursive `estimate_subblock_size` walks.\n\nCheap insertion: the whole-block `full` probe runs whether or not\nbisect proceeds, so this adds zero estimator work on the bail-out path\nand saves all subsequent bisect probes on blocks the estimator already\nclassified as raw.\n\nMeasured (clean back-to-back runs, no concurrent work):\n\n| Cell                                    | Δ time | p   |\n|-----------------------------------------|--------|-----|\n| level_22_btultra2/decodecorpus-z000033  | -5.0%  | sig |\n| level_22_btultra2/high-entropy-1m       | -4.3%  | 0.07 (borderline) |\n| level_22_btultra2/small-1k-random       | -2.4%  | noise |\n| level_4_greedy/small-1k-random          | -2.4%  | noise |\n| level_3_dfast/decodecorpus-z000033      | -1.1%  | noise |\n| (others)                                | <1%    | noise |\n\nSignal is concentrated on btultra2 long-input cells where the optimal\nparser produces >300 sequences and the bisect would otherwise probe\nmultiple raw-fallback sub-blocks. Smaller strategies (fast/dfast/\ngreedy) usually take the existing `sequences.len() <= 4` shortcut or\nthe `< MIN_SEQUENCES_BLOCK_SPLITTING = 300` early-return — G3 doesn't\napply there.\n\nRatio impact: zero. Verified via `STRUCTURED_ZSTD_EMIT_REPORT=1\ncargo bench --bench compare_ffi -- --list` REPORT lines on all\nlevels × all scenarios: rust_bytes identical to main on every cell.\nG3 only changes which code path the bail-out takes, not what bytes\nthe encoder emits.\n\nbtultra2 incompressible fast-skip preserved: high-entropy-1m at\nL19/L22 (the 10× speed win vs FFI on incompressible data) lives in\nthe `sequences.len() <= 4` shortcut *above* this estimator, never\nreaches `derive_block_splits`. Measurement confirms: high-entropy\ncells show noise or borderline-positive deltas, never regressions.\n\nFoundation for follow-up block-split work (#23 G1/G2/G4/G5/G6): the\nexposed `raw_fallback` signal is needed by superblock shared-entropy\n(G1) and the cost-budgeted carve (G2) too.\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n  - compare_ffi --list REPORT lines: rust_bytes identical to main\n    on all (scenario, level) cells\n  - speed bench: 1 sig win, 1 borderline, 7 noise (no losses)\n\nRefs #23\n\n* docs(encoder): clarify G3 bail-out semantics + destructure tuple returns\n\n`derive_block_splits` G3 bail-out comment: previously described\ndonor's strict `estBlockSize > srcSize` condition, but the actual\ntrigger is the stricter `raw_fallback` flag from\n`estimate_subblock_size` which fires on `emitted_payload >=\nsource_len - min_gain` (~0.4% margin). The discrepancy means we\nbail in a narrow band `[source_len - min_gain, source_len + 3]`\nwhere donor would still recurse and *might* find a compressible\nsplit. Comment rewritten to accurately describe the min-gain-based\ntrigger and explain why this remains ratio-safe:\n\n1. The bail-out routes to the single-partition path which has the\n   same min_gain expansion fallback. Whatever block we bail on\n   would have been raw-fallbacked by the real emit anyway, by the\n   same threshold.\n2. For a missed split-win to matter, both sub-blocks would need to\n   compress strictly (no raw-fallback), AND `cost(first) +\n   cost(second) < source_len + 3`. The wider donor band gives at\n   most `min_gain` bytes of theoretical recoverable ratio per\n   block.\n3. Empirically validated: `compare_ffi --list` REPORT lines show\n   zero rust_bytes delta vs main on every (scenario, level) cell\n   across the full bench matrix.\n\n`derive_block_splits_with_full` leaf + single-partition returns:\nreplaced `.2` tuple field accesses with destructured `let (_cost,\n_raw_fallback, post)` bindings so the named return becomes\nobvious. Two occurrences (leaf branch + no-split branch).\n\nNo behavior change. Doc + readability only.\n\nVerified:\n  - cargo nextest run: 528 / 528 pass (3 skipped)\n  - cargo clippy --all-targets --features dict_builder: clean\n  - cargo fmt --check: clean\n\n* docs(encoder): replace G3 bail-out line-number refs with named anchors\n\nTwo line-number citations inside the G3 bail-out comment block\nreferred to internal locations that will drift the moment the file\ngets reformatted or new code lands above them:\n\n- \"see line 917 of this file\" → now reads \"see the `min_gain`\n  computation inside `estimate_subblock_size` above\" (refers to\n  the function by name in the same impl block).\n- \"the SAME `min_gain` expansion fallback at line 779-780\" → now\n  reads \"applies the SAME `min_gain` expansion fallback (its\n  `buffers.compressed.len() >= source_len - min_gain` check right\n  before deciding raw-fallback)\" — pinned to the condition itself\n  inside `emit_single_sequence_block`.\n\nBoth citations now point at function names and concrete conditions\nthat grep can find regardless of line drift, so a future move of\neither block doesn't silently rot the comment.\n\nNo behavior change. Doc-only.",
+          "timestamp": "2026-05-19T02:47:26+03:00",
+          "tree_id": "4576cea978eb84035833636d345c293ae7714c21",
+          "url": "https://github.com/structured-world/structured-zstd/commit/f5014d5c96736371e86b1d4381751c67fec9a111"
+        },
+        "date": 1779150696124,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 290.978,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 236.888,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.506,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.54,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.014,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.939,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.827,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.092,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.98,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.319,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.546,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.078,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.665,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.339,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.337,
             "unit": "ms"
           },
           {
