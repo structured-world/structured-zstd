@@ -1,8 +1,19 @@
 use crate::io::Read;
-use alloc::alloc::{alloc, dealloc};
+use alloc::alloc::{alloc_zeroed, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
 use super::simd_copy;
+
+/// Trailing slack appended to every RingBuffer allocation. Matches donor
+/// zstd's `WILDCOPY_OVERLENGTH` of 16 bytes — the largest single SIMD chunk
+/// `simd_copy::copy_bytes_overshooting` writes in one go (AVX-512 chunk is 64,
+/// but the single-op fast path that fires on copies ≤ 16 bytes is the place
+/// where this slack actually changes the dispatch outcome). The slack is
+/// physically present in the allocation but is never indexed via `head`/`tail`
+/// — those still wrap on `cap`. Slack bytes serve exclusively as an
+/// over-write / over-read landing zone so wildcopy stores/loads near the
+/// buffer boundary do not need a "min_buffer_size < copy_multiple" fallback.
+const WILDCOPY_OVERLENGTH: usize = 16;
 
 pub struct RingBuffer {
     // Safety invariants:
@@ -73,8 +84,9 @@ impl RingBuffer {
     #[inline(never)]
     #[cold]
     fn reserve_amortized(&mut self, amount: usize) {
-        // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        // SAFETY: if we were successfully able to construct this layout when we allocated then it's also valid do so now
+        let current_layout =
+            unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
 
         // Always have at least 1 unused element as the sentinel.
         let new_cap = usize::max(
@@ -89,13 +101,25 @@ impl RingBuffer {
             debug_assert!(usize::BITS >= 64 || new_cap < isize::MAX as usize);
         }
 
-        let new_layout = Layout::array::<u8>(new_cap)
-            .unwrap_or_else(|_| panic!("Could not create layout for u8 array of size {}", new_cap));
+        // Physical allocation includes WILDCOPY_OVERLENGTH bytes of trailing
+        // slack — see the const's doc comment for rationale. `new_cap` itself
+        // remains the indexing capacity (head/tail wrap on it).
+        let new_layout = Layout::array::<u8>(new_cap + WILDCOPY_OVERLENGTH).unwrap_or_else(|_| {
+            panic!(
+                "Could not create layout for u8 array of size {}",
+                new_cap + WILDCOPY_OVERLENGTH
+            )
+        });
 
-        // alloc the new memory region and panic if alloc fails
+        // alloc_zeroed (not plain alloc) so wildcopy reads that overshoot
+        // past `tail` into not-yet-written buffer bytes — or past `cap` into
+        // the slack region — observe defined values (0) instead of
+        // uninitialized memory. The zero content itself is irrelevant
+        // (overshoot writes are wildcopy garbage the caller never reads),
+        // but the read itself must not be UB.
         // TODO maybe rework this to generate an error?
         let new_buf = unsafe {
-            let new_buf = alloc(new_layout);
+            let new_buf = alloc_zeroed(new_layout);
 
             NonNull::new(new_buf).expect("Allocating new space for the ringbuffer failed")
         };
@@ -314,21 +338,28 @@ impl RingBuffer {
             let src = (
                 // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                 unsafe { self.buf.as_ptr().add(self.head + start) }.cast_const(),
-                // Src length (see above diagram)
-                self.tail - self.head - start,
+                // Src length plus WILDCOPY slack — src + (tail - head - start) ends at
+                // `tail` (≤ `cap`); extending by WILDCOPY_OVERLENGTH places the read
+                // tail at most at `cap + WILDCOPY_OVERLENGTH`, which is still inside the
+                // physical allocation (see `reserve_amortized`). The overshoot bytes
+                // are wildcopy fill and are never consumed by the caller.
+                (self.tail - self.head - start) + WILDCOPY_OVERLENGTH,
             );
 
             let dst = (
                 // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                 unsafe { self.buf.as_ptr().add(self.tail) },
-                // Dst length (see above diagram)
-                self.cap - self.tail,
+                // Dst length plus WILDCOPY slack — dst ends at `cap`, the slack region
+                // beyond `cap` is owned by this allocation and absorbs any wildcopy
+                // overshoot writes without corrupting subsequent ring-buffer state.
+                (self.cap - self.tail) + WILDCOPY_OVERLENGTH,
             );
 
-            // SAFETY: `src` points at initialized data, `dst` points to writable memory,
-            // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
-            // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
-            // and source/destination regions do not overlap.
+            // SAFETY: `src` points at initialized data, `dst` points to writable memory
+            // (including WILDCOPY_OVERLENGTH bytes of slack past `cap`), and the
+            // `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
+            // (`copy_len.next_multiple_of(active_chunk)`) selected by
+            // `copy_bytes_overshooting`, and source/destination regions do not overlap.
             unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_tail) }
 
             if after_tail < len {
@@ -348,12 +379,15 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: we are still within the memory range of `buf`
                     unsafe { src.0.add(after_tail) },
-                    // Src length (see above diagram)
+                    // Src length kept inflated by WILDCOPY_OVERLENGTH — original len
+                    // already accounted for the slack above.
                     src.1 - after_tail,
                 );
                 let dst = (
                     self.buf.as_ptr(),
-                    // Dst length overflowing (see above diagram)
+                    // Dst length is bounded by `head`; we cannot inflate by
+                    // WILDCOPY_OVERLENGTH here because overshoot writes would corrupt
+                    // the readable region starting at `head`.
                     self.head,
                 );
 
@@ -384,14 +418,16 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(start) }.cast_const(),
-                    // Src length (see above diagram)
-                    self.tail - start,
+                    // Src ends at `tail`; extending by WILDCOPY_OVERLENGTH reads at
+                    // most into the trailing slack region of the allocation.
+                    (self.tail - start) + WILDCOPY_OVERLENGTH,
                 );
 
                 let dst = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
-                    unsafe { self.buf.as_ptr().add(self.tail) }, // Dst length (see above diagram)
-                    // Dst length (see above diagram)
+                    unsafe { self.buf.as_ptr().add(self.tail) },
+                    // Dst length is bounded by `head` — wildcopy overshoot past `head`
+                    // would clobber readable data, so the slack does not apply here.
                     self.head - self.tail,
                 );
 
@@ -419,14 +455,15 @@ impl RingBuffer {
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(self.head + start) }.cast_const(),
-                    // Src length - chunk 1 (see above diagram on the right)
-                    self.cap - self.head - start,
+                    // Src ends at `cap`; the WILDCOPY_OVERLENGTH slack region is
+                    // physically reachable from this read.
+                    (self.cap - self.head - start) + WILDCOPY_OVERLENGTH,
                 );
 
                 let dst = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
                     unsafe { self.buf.as_ptr().add(self.tail) },
-                    // Dst length (see above diagram)
+                    // Dst length is bounded by `head` — no slack room to inflate.
                     self.head - self.tail,
                 );
 
@@ -452,14 +489,16 @@ impl RingBuffer {
 
                     let src = (
                         self.buf.as_ptr().cast_const(),
-                        // Src length - chunk 2 (see above diagram on the left)
-                        self.tail,
+                        // Src ends at `tail`; inflate by WILDCOPY_OVERLENGTH to let
+                        // the SIMD fast paths fire on small `len - after_start`.
+                        self.tail + WILDCOPY_OVERLENGTH,
                     );
 
                     let dst = (
                         // SAFETY: we are still within the memory range of `buf`
                         unsafe { dst.0.add(after_start) },
-                        // Dst length (see above diagram)
+                        // Dst length bounded by `head` — overshoot past `head`
+                        // would clobber readable data, so cannot inflate.
                         dst.1 - after_start,
                     );
 
@@ -597,9 +636,11 @@ impl Drop for RingBuffer {
             return;
         }
 
-        // SAFETY: is we were succesfully able to construct this layout when we allocated then it's also valid do so now
+        // SAFETY: if we were successfully able to construct this layout when we allocated then it's also valid do so now.
+        // Layout matches `reserve_amortized` which inflates by WILDCOPY_OVERLENGTH.
         // Relies on / establishes invariant 1
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        let current_layout =
+            unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
 
         unsafe {
             dealloc(self.buf.as_ptr(), current_layout);
