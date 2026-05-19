@@ -748,6 +748,19 @@
       // (which leaves `meta.hidden === null`).
       function renderHtmlLegend(chart, container, onToggle) {
         if (!chart || !container) return;
+        // Capture which legend row had keyboard focus before we tear
+        // down the buttons. Toggling a series with Enter/Space replaces
+        // the active element, so without this every keyboard activation
+        // drops focus out of the legend and forces the user to Tab back
+        // in — extremely tedious when flipping several series in a row.
+        // We restore focus to the same dataset index after the rebuild
+        // so keyboard-only multi-toggle interaction matches mouse use.
+        const active = document.activeElement;
+        let focusedIndex = null;
+        if (active && container.contains(active) && active.dataset && active.dataset.legendIndex != null) {
+          focusedIndex = Number(active.dataset.legendIndex);
+        }
+
         container.replaceChildren();
         const datasets = chart.data.datasets || [];
         for (let i = 0; i < datasets.length; i++) {
@@ -759,6 +772,7 @@
           const item = document.createElement("button");
           item.type = "button";
           item.className = "html-legend-item";
+          item.dataset.legendIndex = String(i);
           const visible = chart.isDatasetVisible(i);
           item.setAttribute("aria-pressed", visible ? "true" : "false");
           if (!visible) item.classList.add("hidden-series");
@@ -788,6 +802,13 @@
           });
 
           container.appendChild(item);
+        }
+
+        if (focusedIndex != null) {
+          const restored = container.querySelector(
+            `[data-legend-index="${focusedIndex}"]`,
+          );
+          if (restored) restored.focus();
         }
       }
 
@@ -927,6 +948,24 @@
         // The pre-fix code summed across every generated_at, which
         // silently turned "latest" into a time-average rather than a
         // single-snapshot pin.
+        // `key` is the X-axis bucket (level + logical metric) into
+        // which the average will accumulate. `latestKey` is finer-
+        // grained: when a dimension is on `__all__` (cumulative mode),
+        // that dimension is folded into the latest-snapshot lookup so
+        // each cohort keeps ITS OWN most-recent snapshot before we
+        // average across cohorts. Without this, the global latest
+        // snapshot for one (level, lm) would silently drop every
+        // cohort that didn't happen to run at the same timestamp,
+        // biasing the result toward whichever target/scenario ran
+        // most recently.
+        const cohortKey = (row) => {
+          const parts = [];
+          if (filter.target === ALWAYS) parts.push(`target=${row.target || "unknown-target"}`);
+          if (filter.scenario === ALWAYS) parts.push(`scenario=${row.scenario}`);
+          if (filter.level === ALWAYS) parts.push(`level=${row.level}`);
+          return parts.join("|");
+        };
+
         const matchingRows = [];
         const latestPerKey = new Map();
         for (const row of state.records) {
@@ -935,11 +974,13 @@
           const lm = logicalMetric(row);
           if (!lm) continue;
           const key = `${row.level}|${lm}`;
-          matchingRows.push({ row, lm, key });
+          const cohort = cohortKey(row);
+          const latestKey = cohort ? `${key}|${cohort}` : key;
+          matchingRows.push({ row, lm, key, latestKey });
           if (filter.snapshot === PROFILE_LATEST) {
-            const previous = latestPerKey.get(key);
+            const previous = latestPerKey.get(latestKey);
             if (!previous || compareByGeneratedAt(row, previous) > 0) {
-              latestPerKey.set(key, row);
+              latestPerKey.set(latestKey, row);
             }
           }
         }
@@ -949,9 +990,9 @@
           (b.generated_at || b.commit_sha || "local-run");
 
         const byLevelLogical = new Map();
-        for (const { row, lm, key } of matchingRows) {
+        for (const { row, lm, key, latestKey } of matchingRows) {
           if (filter.snapshot === PROFILE_LATEST) {
-            const winner = latestPerKey.get(key);
+            const winner = latestPerKey.get(latestKey);
             if (!winner || !sameSnapshotLabel(row, winner)) continue;
           }
           let agg = byLevelLogical.get(key);
