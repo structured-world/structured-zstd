@@ -1807,6 +1807,7 @@ mod tests {
     use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
     use crate::encoding::strategy::StrategyTag;
     use crate::fse::fse_encoder::build_table_from_symbol_counts;
+    use crate::huff0::huff0_encoder;
     use alloc::vec::Vec;
 
     fn tables_match(
@@ -1890,30 +1891,80 @@ mod tests {
             encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
         };
         // For each strategy at boundary literal lengths around `min_lits`
-        // and across the RLE pre-check `>= 8` cliff, estimator's predicted
-        // size MUST equal the bytes the emitter actually writes.
-        let cases: &[(StrategyTag, &[(usize, bool)])] = &[
+        // and across the all-identical RLE pre-check (fires for any
+        // non-empty all-identical input under every strategy/HUF state),
+        // estimator's predicted size MUST equal the bytes the emitter
+        // actually writes. Cases include: (a) fresh state with
+        // `last_huff_table: None` covering the strategy-specific
+        // `min_lits` band (8/16/32/64), (b) seeded HUF-reuse state
+        // covering the lowered floor of 6 and 6/7-byte all-identical
+        // sections that previously hit the HUF path instead of RLE,
+        // (c) sub-`min_lits` all-identical sections that take the
+        // RLE pre-check regardless of strategy.
+        type Inputs = &'static [(usize, bool)];
+        let cases: &[(StrategyTag, bool, Inputs)] = &[
+            // (strategy, seed_huff_reuse, [(len, all_identical)])
             (
                 StrategyTag::Fast,
-                &[(8, true), (8, false), (63, true), (63, false), (64, false)],
+                false,
+                &[
+                    (1, true), // sub-min_lits all-identical → RLE
+                    (5, true), // sub-min_lits all-identical → RLE
+                    (8, true),
+                    (8, false),
+                    (63, true),
+                    (63, false),
+                    (64, false),
+                ],
             ),
             (
                 StrategyTag::BtUltra2,
+                false,
                 &[(7, true), (7, false), (8, true), (8, false), (16, false)],
             ),
-            (StrategyTag::BtOpt, &[(8, true), (31, true), (32, false)]),
+            (
+                StrategyTag::BtOpt,
+                false,
+                &[(8, true), (31, true), (32, false)],
+            ),
+            // HUF reuse path: floor drops to 6, so 6/7-byte sections
+            // previously hit the HUF compress path. With the RLE
+            // pre-check now non-empty-only, all-identical 6/7-byte
+            // sections must route through RLE and stay byte-equivalent
+            // estimator-vs-emit. Also exercise non-identical 6-byte
+            // raw fallback and 16-byte HUF reuse path.
+            (
+                StrategyTag::Lazy,
+                true,
+                &[(6, true), (7, true), (6, false), (16, false)],
+            ),
         ];
 
-        for (strat, inputs) in cases {
+        for (strat, seed_huff, inputs) in cases {
             for (len, identical) in *inputs {
                 let literals: Vec<u8> = if *identical {
                     alloc::vec![0x5Au8; *len]
                 } else {
                     (0..*len as u8).collect()
                 };
+                // Seed both estimator and emit state with the same
+                // synthetic HUF table when `seed_huff` is true so the
+                // reuse path's `min_lits == 6` floor is exercised.
+                // Counts from a varied byte sequence give a valid
+                // (writeable) table that survives the `decide_huff_reuse`
+                // decision when literals are large enough to consider it.
+                let seed_table = if *seed_huff {
+                    let mut counts = [0usize; 256];
+                    for b in (0..=63u8).chain(64..=127u8) {
+                        counts[b as usize] = 1;
+                    }
+                    Some(huff0_encoder::HuffmanTable::build_from_counts(&counts))
+                } else {
+                    None
+                };
                 let mut est_state = CompressState::<EntropyOnlyMatcher> {
                     matcher: EntropyOnlyMatcher,
-                    last_huff_table: None,
+                    last_huff_table: seed_table.clone(),
                     fse_tables: FseTables::new(),
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
@@ -1921,7 +1972,7 @@ mod tests {
                 };
                 let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                     matcher: EntropyOnlyMatcher,
-                    last_huff_table: None,
+                    last_huff_table: seed_table,
                     fse_tables: FseTables::new(),
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
@@ -1941,8 +1992,9 @@ mod tests {
                 assert_eq!(
                     est,
                     emitted.len(),
-                    "estimator/emit parity broken: strategy={:?} len={} identical={} est={} emit={}",
+                    "estimator/emit parity broken: strategy={:?} seed_huff={} len={} identical={} est={} emit={}",
                     strat,
+                    seed_huff,
                     len,
                     identical,
                     est,
