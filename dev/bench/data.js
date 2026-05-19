@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779181440206,
+  "lastUpdate": 1779202570735,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -40293,6 +40293,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8cfa86dc16fdb480a9a707706317b65a1bca85b3",
+          "message": "feat(dashboard): level-profile chart (6 lines) + HTML legend + sign-gated parity band (#193)\n\n* feat(dashboard): level-profile chart, HTML legend, sign-gated parity band\n\n- Add Level Profile chart: per-level speed (MiB/s, left axis) + ratio\n  (right axis) with filled+smoothed lines, 4 toggle checkboxes for the\n  Rust/FFI × speed/ratio cross-product, and target/scenario/stage\n  filters. Toggles use dataset.hidden + chart.update(\"none\") so the\n  chart is not recreated on every interaction.\n- Replace Chart.js built-in legend on both charts with a custom HTML\n  legend: full-row click target (fixes the misaligned click box where\n  only the colour swatch responded while wrapped labels drifted), and\n  a scrollable container so no series is silently hidden when there\n  are too many to fit. Click toggles dataset visibility via the same\n  Chart.js meta.hidden mechanism, preserving the prior UX.\n- Sign-gate \"Outside parity band\" classification by metric direction:\n  ratio regressions only when delta > BAND_HIGH (Rust produced larger\n  output), throughput regressions only when delta < BAND_LOW (Rust\n  slower), peak-alloc regressions only when delta > BAND_HIGH (Rust\n  allocated more). Wins (deviation in our favour) are surfaced as a\n  separate \"notable wins not counted\" tally and no longer inflate the\n  regression count.\n\nCloses #183\n\n* fix(dashboard): in-place profile chart updates + correct legend hidden state\n\n- renderProfileChart now patches labels + datasets in place and calls\n  chart.update(\"none\") on every selector change. The previous path\n  destroyed and recreated the chart on each switch, contradicting the\n  \"repopulate without recreating the chart\" acceptance criterion and\n  dropping internal Chart.js state (animation continuity, scale state)\n  between scenario/stage/target switches.\n- Custom HTML legend now uses chart.isDatasetVisible(i) to decide\n  whether to apply the hidden-series style. The previous check on\n  meta.hidden missed datasets constructed with dataset.hidden = true\n  (where Chart.js leaves meta.hidden === null), so the legend row\n  rendered as visible even when the series was hidden.\n- Profile chart legend clicks now flow through profileSeriesVisibility\n  and sync the matching checkbox, so toggling a series via the legend\n  no longer produces a checkbox/series UI mismatch and survives the\n  next scenario switch. Delta-chart legend keeps the simpler direct\n  toggle path.\n- Removed bandLabelForRow — was unused.\n\n* feat(dashboard): add snapshot selector to Level Profile chart\n\nAdds a fourth dropdown (\"Snapshot\") that pins the 4 profile lines to a\nsingle benchmark run rather than always picking the latest record per\n(level, metric). Default value is \"latest\" (previous behaviour). The\ndropdown lists every generated_at value (or commit_sha when timestamp\nis missing) that produced data for the currently chosen target /\nscenario / stage, and repopulates when those upstream filters change\nwhile preserving the active selection where possible.\n\nUse case: compare two specific commits side-by-side by opening the\ndashboard in two browser tabs and pinning each tab to a different\nsnapshot — the 4 smoothed lines then describe exactly one commit per\nview, with no implicit \"newest wins\" merging across runs.\n\n* fix(dashboard): source filter for profile + a11y legend buttons\n\n- Add a Source dropdown to the Level Profile chart, mirroring the\n  delta chart's Source filter. Without it, stages that have multiple\n  source values (e.g. decompress benches emitting rust_stream and\n  c_stream) would silently collide on the same level keys and render\n  a mixed/incorrect profile. The source value is now part of the\n  filter cascade (target/scenario/stage → source → snapshot), and the\n  row-selection key includes source so decompress profiles are\n  unambiguous.\n- Render custom HTML legend rows as <button type=\"button\"> instead\n  of <div>, with aria-pressed reflecting series visibility. Native\n  buttons give keyboard activation (Enter/Space), focus styling, and\n  a button role for screen readers without any extra JS, so the\n  legend is operable without a mouse.\n\n* refactor(dashboard): redesign Level Profile to 6 lines, one snapshot\n\nReplace the 4-line per-stage profile (which needed stage + source\ndropdowns) with a 6-line strategy-comparison view rendered for a single\nsnapshot:\n\n- Rust compress speed (MiB/s, left axis)\n- FFI compress speed (MiB/s, left axis)\n- Rust decompress speed (MiB/s, left axis, dashed)\n- FFI decompress speed (MiB/s, left axis, dashed)\n- Rust output ratio (right axis, dashed) — compressed/input, lower=better\n- FFI output ratio (right axis, dashed)\n\nDecompress rows collapse across the source dimension (rust_stream /\nc_stream) because each row already carries both rust_value and ffi_value\n— source is bench bookkeeping, not a comparison side. Stage no longer\nneeds a dropdown because both compress and decompress live on the chart\nat once. Right axis title is now explicit about ratio semantics\n(compressed/input, lower=better) so readers don't assume the\nconventional input/output definition where higher is better.\n\nFilters: Target + Scenario + Snapshot. Six independent toggle\ncheckboxes for the series. Legend rows remain accessible buttons with\naria-pressed.\n\n* fix(dashboard): average decompress speed across source variants\n\nbuildProfileData() previously stored only one row per\n${level}|decompress_speed and let the most-recent-by-generated_at row\nwin. In practice both decompress source variants (rust_stream and\nc_stream) share the same generated_at within a single snapshot, so the\n\"winner\" was iteration-order-dependent — typically c_stream — and the\nchart silently reflected only one stream variant instead of both.\n\nReplace the \"keep one row\" path with a sum/count accumulator and emit\nthe arithmetic mean of rust_value and ffi_value across all matching\nrows. For compress and ratio there is exactly one source per (level,\nsnapshot), so the mean degenerates to the single observation and the\ndisplayed value is unchanged. For decompress, both stream variants now\ncontribute equally, giving a deterministic Rust/FFI comparison that\ndoesn't depend on which source row arrived first.\n\n* refactor(dashboard): drive Level Profile from top filters, support 'all'\n\nDrop the profile chart's own Target / Scenario selectors and read those\nvalues (plus Level) from the existing page-wide filter row that drives\nthe delta chart. The top selectors already support an `__all__`\nsentinel which the profile chart interprets as \"average across that\ndimension\":\n\n- Target = all → mean across every reported target\n- Scenario = all → mean across every corpus\n- Level = all → every level on the X-axis (no narrowing)\n\nWhen one of those is pinned to a specific value, the profile narrows to\nthat value. Level = specific renders a single X-axis point.\n\nSnapshot stays on the profile section because the top chart's From/To\npair defines a time window, not a single-snapshot pin — the two\ncontrols express different intents.\n\nThe top-filter change handler now fans out to both `rerender()` (delta\nchart) and the profile chart, repopulating the profile's snapshot list\nwhen target/scenario/level change. Profile-status text reflects all\nthree dimensions so it's clear when a view is cumulative vs narrowed.\n\n* fix(dashboard): respect PROFILE_LATEST as single-snapshot pin\n\nbuildProfileData() previously summed every matching row regardless of\ngenerated_at when the snapshot dropdown was on \"latest\", turning the\n\"most recent record per (level, logical-metric)\" intent into a\ntime-average across the entire history of that target+scenario+level.\n\nReplace the single-pass sum with a two-pass aggregation:\n\n  Pass 1 — collect every matching row and, when snapshot=latest,\n           remember the most recent generated_at per (level, lm).\n  Pass 2 — fold each row into the running mean only if its\n           generated_at matches the chosen snapshot for that key. For\n           \"latest\" this restricts the mean to one snapshot per key,\n           then averages across source variants (rust_stream +\n           c_stream for decompress) and across any \"all\" dimension\n           (scenarios when scenario=all, etc.) within that snapshot.\n           For a pinned snapshot, matchesFilter() already narrowed us\n           down, so this just collapses source.\n\nAlso pass \"none\" to chart.update() in the HTML legend click handler\nso toggling a series is instant — the default 1s animation was\nvisibly janky with six datasets on the profile chart.\n\n* fix(dashboard): preserve legend focus + per-cohort latest snapshot\n\nTwo correctness/UX fixes in the bench dashboard:\n\n* renderHtmlLegend() now captures document.activeElement's data-\n  legendIndex before replaceChildren() and restores focus to the\n  matching new button after rebuild. Previously every keyboard\n  toggle (Enter/Space) dropped focus out of the legend, forcing the\n  user to Tab back in between every series flip.\n\n* buildProfileData() now keys latestPerKey by (level, logical-metric)\n  PLUS any cumulative (\"__all__\") dimension (target, scenario,\n  level), giving each cohort its own most-recent snapshot before the\n  cross-cohort mean. The previous key collapsed every cohort onto a\n  single global snapshot per (level, lm), silently dropping any\n  cohort whose timestamp didn't match — biasing the result toward\n  whichever target/scenario ran most recently instead of producing\n  the intended unbiased mean across cohorts.\n\n* fix(dashboard): preserve legend scroll position across rerenders\n\nrenderHtmlLegend() now snapshots container.scrollTop before\nreplaceChildren() and restores it after focus restoration. When a\ntoggle was triggered from outside the legend (a profile-series\ncheckbox above the chart, or a top-filter change) the existing\nfocus-restore path never fired and a long legend silently jumped\nback to the top on every re-render. Restoring scrollTop keeps the\nvisible window stable regardless of which control fired the rebuild.\n\nDone AFTER focus() because focus() on a partially-visible element\ncan itself scroll the container.\n\n* fix(dashboard): deterministic latest-snapshot pick without generated_at\n\nPROFILE_LATEST mode chose the per-key \"most recent\" row via\ncompareByGeneratedAt() which only inspects generated_at. When records\nlack a parseable timestamp but carry commit_sha (loaded payloads from\nolder CI runs, local-run artifacts, etc.) every pairwise comparison\nreturned 0 and the \"latest\" winner was whichever row appeared first\nin iteration order — arbitrary and not stable across renders.\nSubsequent filtering by sameSnapshotLabel() (which uses\ngenerated_at || commit_sha || \"local-run\" as identity) could then\nsilently restrict to an inconsistent cohort.\n\nAdd compareSnapshotIdentity() — same primary ordering as\ncompareByGeneratedAt() (timestamp), with a lexicographic commit_sha\nfallback when both rows have no parseable timestamp. Not\nchronologically meaningful in the fallback case, but deterministic\nacross runs and consistent with snapshotLabel()'s identity, which is\nwhat the cohort-locking logic actually requires.\n\nNo regression test added: the dashboard is a single-file HTML view\nwith no JS test harness, so this is verified manually by loading a\npayload with timestamp-less records.\n\n* docs(dashboard): clarify \"latest\" snapshot vs pinned-snapshot copy\n\nThe Level Profile section header said \"Six lines for a single snapshot\"\nbut the default PROFILE_LATEST mode picks each (level, logical-metric,\ncohort) point from its own most-recent snapshot independently, so the\ndisplayed points can mix generated_at values across the X-axis.\n\nRewrite the section description to spell out both modes explicitly,\nand amend the profile-status note so the user always sees which mode\nis active and what it implies for cross-point provenance.",
+          "timestamp": "2026-05-19T17:09:57+03:00",
+          "tree_id": "2ff766534901cb0319ffa13f92195e77cc44ce0f",
+          "url": "https://github.com/structured-world/structured-zstd/commit/8cfa86dc16fdb480a9a707706317b65a1bca85b3"
+        },
+        "date": 1779202566405,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.142,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 276.222,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.651,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.497,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.302,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 7.352,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.995,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 7.334,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.936,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.336,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.287,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.116,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.912,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.632,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.496,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.076,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.646,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.345,
             "unit": "ms"
           },
           {
