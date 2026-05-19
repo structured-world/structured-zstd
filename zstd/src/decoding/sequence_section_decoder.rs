@@ -181,22 +181,15 @@ pub fn decode_and_execute_sequences(
     // legacy two-pass pipeline upheld.
     let remaining = br.bits_remaining();
     if remaining != 0 {
-        // SAFETY: `buffer_checkpoint` and `saved_offset_hist` were
-        // captured on the same `buffer` / `offset_hist` references at
-        // the top of this call. The bytes between the checkpoint and
-        // the current tail are discarded by the Err return below.
-        //
-        // restore_checkpoint itself enforces the no-reallocation
-        // invariant: it captures `buffer.cap()` in the checkpoint and
-        // panics on mismatch. On a well-formed block the upfront
-        // `reserve(MAX_BLOCK_SIZE)` makes reallocation impossible (one
-        // zstd block decodes to at most MAX_BLOCK_SIZE bytes). On a
-        // malformed input that decodes past that bound a panic is
-        // preferable to silent wrong output — the cap-equality check
-        // is the load-bearing correctness guard, not a debug assert.
-        unsafe {
-            buffer.restore_checkpoint(buffer_checkpoint);
-        }
+        // try_restore_checkpoint succeeds when no reallocation happened
+        // between the checkpoint and now (the common case: upfront
+        // reserve(MAX_BLOCK_SIZE) covers a well-formed block). When a
+        // malformed block decodes past that bound, reserve_amortized
+        // fires and compacts the ring buffer — the captured tail is no
+        // longer meaningful and the rollback is skipped. Either way the
+        // caller observes the same Err below; the partial data left in
+        // the buffer in the latter case is discarded with the frame.
+        let _restored = buffer.try_restore_checkpoint(buffer_checkpoint);
         *offset_hist = saved_offset_hist;
 
         if remaining < 0 {
