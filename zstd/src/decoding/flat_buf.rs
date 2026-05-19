@@ -22,9 +22,26 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 
 pub(crate) struct FlatBuf {
     buf: Vec<u8>,
-    /// Bytes in `buf[..head]` have already been handed to the output
-    /// sink. They are retained until end-of-frame so back-references
-    /// (`repeat`) into the recent history still resolve.
+    /// Bytes in `buf[..head]` have already been handed to the
+    /// output sink and are no longer visible through the
+    /// [`BufferBackend`] surface (`len`, `as_slices`,
+    /// `extend_from_within_unchecked` all index relative to `head`).
+    /// They live on physically in the allocation because the linear
+    /// `Vec` layout never reuses that region — discarding them would
+    /// require a memmove of the active window.
+    ///
+    /// Scope: `FlatBuf` is selected by `DecodeBuffer<FlatBuf>` only
+    /// for frames whose `FrameHeader.descriptor.single_segment_flag()`
+    /// is set. Such frames decode in a single segment of exactly
+    /// `frame_content_size` bytes and never trigger
+    /// `drain_to_window_size_writer` mid-stream — drain (and the
+    /// corresponding `drop_first_n` head advance) only happens at
+    /// end-of-frame. The "drained prefix no longer visible to
+    /// `repeat`" semantics therefore match `RingBuffer`'s
+    /// behaviour for the same call shape (both backends expose only
+    /// `head..tail` through `len`/`as_slices`), and the FlatBuf
+    /// path can't observe a streaming-drain scenario where the
+    /// distinction would matter.
     head: usize,
 }
 
@@ -103,9 +120,16 @@ impl BufferBackend for FlatBuf {
     unsafe fn set_tail(&mut self, new_tail: usize) {
         debug_assert!(new_tail >= self.head);
         debug_assert!(new_tail <= self.buf.capacity());
-        // SAFETY: forwarded to Vec::set_len. Slack region initialised
-        // at `with_capacity`; bytes between new_tail and the prior
-        // tail are discarded by the caller per `BufferBackend::set_tail`.
+        // SAFETY: forwarded to Vec::set_len. `new_tail` must come
+        // from a previous `tail()` on this same instance (the
+        // checkpoint's cap snapshot guarantees no realloc), so the
+        // bytes re-exposed in `0..new_tail` were already written and
+        // are initialised. Bytes between `new_tail` and the prior
+        // tail are discarded by the caller per
+        // `BufferBackend::set_tail` and never read again. The
+        // trailing slack region past `buf.len()` is intentionally
+        // uninitialised (see `with_capacity`) and never read by any
+        // FlatBuf code path.
         unsafe { self.buf.set_len(new_tail) };
     }
 
