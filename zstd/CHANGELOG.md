@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.22](https://github.com/structured-world/structured-zstd/compare/v0.0.21...v0.0.22) - 2026-05-19
+
+### Added
+
+- *(encoder)* strategy-aware literal gates (G4 + G5) ([#182](https://github.com/structured-world/structured-zstd/pull/182))
+- *(bench)* #99 Rust↔FFI sequence-stream comparator ([#149](https://github.com/structured-world/structured-zstd/pull/149))
+
+### Documentation
+
+- bump quick-start dep version to 0.0.21 + drop legacy ruzstd Changelog.md ([#155](https://github.com/structured-world/structured-zstd/pull/155))
+
+### Performance
+
+- *(decode)* pack LL/ML metadata + hot-path micro-opts ([#197](https://github.com/structured-world/structured-zstd/pull/197))
+- *(decode)* fused sequence executor + SIMD/FSE hot-path cleanup + DoS-safe rollback ([#194](https://github.com/structured-world/structured-zstd/pull/194))
+- *(encoder)* align Fast strategy window_log with donor (17 → 19) ([#187](https://github.com/structured-world/structured-zstd/pull/187))
+- *(encoder)* inline hash-chain walk into hash_chain_candidate (lazy L1) ([#185](https://github.com/structured-world/structured-zstd/pull/185))
+- *(encoder)* G3 — whole-block bail-out before partition split ([#181](https://github.com/structured-world/structured-zstd/pull/181))
+- *(encoder)* donor-parity greedy parse at L4 — ratio + speed win ([#179](https://github.com/structured-world/structured-zstd/pull/179))
+- *(huff0)* cache encoded weight-description bytes on `HuffmanTable` and reuse in emit path ([#170](https://github.com/structured-world/structured-zstd/pull/170))
+- *(huff0)* #167 cheap entropy proxy for table_log selection — no FSE-encode per candidate ([#168](https://github.com/structured-world/structured-zstd/pull/168))
+- *(fse)* donor FSE_buildCTable_wksp parity — drop per-symbol Vec<State> ([#166](https://github.com/structured-world/structured-zstd/pull/166))
+- *(fse)* replace next_state linear search with donor-parity flat tables + tune CI bench budgets ([#165](https://github.com/structured-world/structured-zstd/pull/165))
+
 ## [0.0.21](https://github.com/structured-world/structured-zstd/compare/v0.0.20...v0.0.21) - 2026-05-17
 
 ### Added
