@@ -1,9 +1,72 @@
+use super::decode_buffer::DecodeBuffer;
 use super::prefetch;
 use super::scratch::DecoderScratch;
+use crate::blocks::sequence_section::Sequence;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::ExecuteSequencesError;
 
-/// Take the provided decoder and execute the sequences stored within
+/// Field-level variant of [`execute_sequences`] used when the caller cannot
+/// hand over a full `&mut DecoderScratch` (e.g. another field is immutably
+/// borrowed at the call site). Takes the same subset of fields the workspace
+/// version touches and runs the identical execution loop. Used by the
+/// fused `decode_and_execute_sequences` for its RLE-mode fallback.
+pub(crate) fn execute_sequences_fields(
+    buffer: &mut DecodeBuffer,
+    literals_buffer: &[u8],
+    offset_hist: &mut [u32; 3],
+    sequences: &[Sequence],
+) -> Result<(), ExecuteSequencesError> {
+    let mut literals_copy_counter: usize = 0;
+    let old_buffer_size = buffer.len();
+    let mut seq_sum: u32 = 0;
+
+    buffer.reserve(MAX_BLOCK_SIZE as usize);
+
+    let literals_buffer_len = literals_buffer.len();
+    for seq in sequences {
+        let seq = *seq;
+        let high = literals_copy_counter + seq.ll as usize;
+        if high > literals_buffer_len {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: literals_buffer_len,
+            });
+        }
+        // SAFETY: literals_copy_counter <= high <= literals_buffer_len.
+        let literals = unsafe { literals_buffer.get_unchecked(literals_copy_counter..high) };
+        literals_copy_counter = high;
+        buffer.push(literals);
+
+        let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+        if actual_offset == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset);
+        }
+        buffer.repeat(actual_offset as usize, seq.ml as usize)?;
+
+        seq_sum = seq_sum.wrapping_add(seq.ml).wrapping_add(seq.ll);
+    }
+    if literals_copy_counter < literals_buffer_len {
+        let rest_literals = &literals_buffer[literals_copy_counter..];
+        buffer.push(rest_literals);
+        seq_sum = seq_sum.wrapping_add(rest_literals.len() as u32);
+    }
+
+    let diff = buffer.len() - old_buffer_size;
+    debug_assert_eq!(
+        seq_sum as usize, diff,
+        "seq_sum {seq_sum} != buffer growth {diff}"
+    );
+    Ok(())
+}
+
+/// Take the provided decoder and execute the sequences stored within.
+///
+/// Legacy two-pass entrypoint. Production decode now uses the fused
+/// `decode_and_execute_sequences` in `sequence_section_decoder` which
+/// avoids the intermediate `Vec<Sequence>` round-trip. Kept here for
+/// the public API surface and external callers that still iterate
+/// through scratch.sequences explicitly.
+#[allow(dead_code)]
 pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
     let mut literals_copy_counter = 0;
     let old_buffer_size = scratch.buffer.len();
@@ -90,7 +153,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     // Fast path: offset_value >= 4 means a fresh (non-repcode) offset, which
     // is the dominant case for non-trivial corpora. Donor (zstd_decompress_block.c
     // ZSTD_updateRep) special-cases this with a straight shift: rotate the
@@ -224,6 +287,7 @@ fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32
     actual_offset
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_cursor: usize) {
     let seqs_len = scratch.sequences.len();

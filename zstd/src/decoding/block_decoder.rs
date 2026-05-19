@@ -4,7 +4,7 @@ use super::super::blocks::literals_section::LiteralsSection;
 use super::super::blocks::literals_section::LiteralsSectionType;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::decode_literals;
-use super::sequence_section_decoder::decode_sequences;
+use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
@@ -12,7 +12,6 @@ use crate::decoding::errors::{
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -186,14 +185,22 @@ impl BlockDecoder {
         vprintln!("Slice for sequences: {}", raw.len());
 
         if seq_section.num_sequences != 0 {
-            decode_sequences(
+            // Fused decode + execute: avoids the Vec<Sequence> round-trip
+            // and inlines the per-iter execute_one_sequence work next to
+            // the FSE state advance. Falls back to the legacy two-pass
+            // pipeline internally when any of LL/ML/OF is in RLE mode.
+            // Pass field-level borrows so `raw` (immutable view into
+            // workspace.block_content_buffer) can coexist with the mutable
+            // borrows on the FSE / decode-buffer / offset-hist fields.
+            decode_and_execute_sequences(
                 &seq_section,
                 raw,
                 &mut workspace.fse,
+                &mut workspace.buffer,
+                &mut workspace.offset_hist,
+                &workspace.literals_buffer,
                 &mut workspace.sequences,
             )?;
-            vprintln!("Executing sequences");
-            execute_sequences(workspace)?;
         } else {
             if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
