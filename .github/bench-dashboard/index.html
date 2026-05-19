@@ -260,21 +260,19 @@
       <section class="card" style="margin-top: 14px">
         <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (compress + decompress + ratio)</h2>
         <p style="font-size: 0.9rem">
-          Six lines per scenario for a single snapshot, X-axis stepped by compression
-          level: Rust vs FFI compression speed (left axis), Rust vs FFI decompression
+          Six lines for a single snapshot, X-axis stepped by compression level:
+          Rust vs FFI compression speed (left axis), Rust vs FFI decompression
           speed (left axis), and Rust vs FFI output ratio (right axis,
-          <code>compressed/input</code>, lower=better). Decompress rows are averaged
-          across both <code>source</code> variants (<code>rust_stream</code> +
-          <code>c_stream</code>) per side, giving one deterministic data point per
-          (level, side) regardless of bench iteration order.
+          <code>compressed/input</code>, lower=better). Controlled by the
+          <strong>Target</strong>, <strong>Scenario</strong>, and
+          <strong>Level</strong> selectors at the top of the page (default
+          <code>all</code> = cumulative arithmetic mean across that dimension).
+          Decompress rows are additionally averaged across both
+          <code>source</code> variants (<code>rust_stream</code> +
+          <code>c_stream</code>) per side, giving one deterministic data point
+          per (level, side) regardless of bench iteration order.
         </p>
         <div class="filters">
-          <label>Target
-            <select id="pf-target"></select>
-          </label>
-          <label>Scenario
-            <select id="pf-scenario"></select>
-          </label>
           <label>Snapshot
             <select id="pf-snapshot"></select>
           </label>
@@ -362,9 +360,13 @@
         to: el("f-to"),
       };
 
+      // Profile chart reuses the page-wide Target/Scenario/Level
+      // dropdowns from the top delta chart — they already support an
+      // `__all__` sentinel which the profile interprets as "average
+      // across that dimension". Snapshot is profile-specific because
+      // the top chart's From/To pair is a time window, not a single
+      // snapshot pin.
       const profileSelectors = {
-        target: el("pf-target"),
-        scenario: el("pf-scenario"),
         snapshot: el("pf-snapshot"),
       };
 
@@ -838,8 +840,9 @@
 
       function profileFilter() {
         return {
-          target: profileSelectors.target.value,
-          scenario: profileSelectors.scenario.value,
+          target: selectors.target.value,
+          scenario: selectors.scenario.value,
+          level: selectors.level.value,
           snapshot: profileSelectors.snapshot.value || PROFILE_LATEST,
         };
       }
@@ -873,9 +876,15 @@
       // dimension for decompress (rust_stream vs c_stream) because the
       // Rust/FFI comparison already lives inside each row.
       function buildProfileData(filter) {
+        // Top filters use the `ALWAYS` sentinel ("__all__") to mean
+        // "don't filter on this dimension". When that's set on target /
+        // scenario / level, the accumulator below ends up summing rows
+        // from every value of that dimension and the result is the
+        // arithmetic mean across them.
         const matchesFilter = (r) => {
-          if ((r.target || "unknown-target") !== filter.target) return false;
-          if (r.scenario !== filter.scenario) return false;
+          if (filter.target !== ALWAYS && (r.target || "unknown-target") !== filter.target) return false;
+          if (filter.scenario !== ALWAYS && r.scenario !== filter.scenario) return false;
+          if (filter.level !== ALWAYS && r.level !== filter.level) return false;
           if (filter.snapshot !== PROFILE_LATEST) {
             const label = r.generated_at || r.commit_sha || "local-run";
             if (label !== filter.snapshot) return false;
@@ -1072,7 +1081,7 @@
       function renderProfileChart() {
         const filter = profileFilter();
         if (!filter.target || !filter.scenario) {
-          el("profile-status").textContent = "Select target and scenario to render the level profile.";
+          el("profile-status").textContent = "Pick Target and Scenario (or leave them on 'all') to render the level profile.";
           return;
         }
         const { levels, levelCount, datasets } = buildProfileData(filter);
@@ -1086,14 +1095,14 @@
             state.profileChart.update("none");
           }
           el("legend-profile").replaceChildren();
-          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}.`;
+          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
           return;
         }
         const snapshotNote = filter.snapshot === PROFILE_LATEST
           ? "latest per level"
           : `snapshot=${filter.snapshot}`;
         el("profile-status").textContent =
-          `Showing ${levelCount} level point(s) for scenario=${filter.scenario} (${snapshotNote}).`;
+          `Showing ${levelCount} level point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
 
         const chartDatasets = buildProfileDatasets(datasets);
 
@@ -1162,20 +1171,12 @@
       }
 
       function bindProfileControls() {
-        // Filter cascade: target/scenario change → snapshot list may
-        // change. Snapshot is repopulated before re-rendering and the
-        // current selection is preserved when it remains valid.
-        const cascade = ["target", "scenario"];
-        for (const [name, control] of Object.entries(profileSelectors)) {
-          if (cascade.includes(name)) {
-            control.addEventListener("change", () => {
-              repopulateSnapshotOptions();
-              renderProfileChart();
-            });
-          } else {
-            control.addEventListener("change", renderProfileChart);
-          }
-        }
+        // Snapshot is the only profile-owned selector; it just triggers
+        // a re-render. Target/Scenario/Level live on the top delta
+        // chart's filter row and are wired into the profile chart from
+        // `bindFilters()` below, which fans every top-filter change
+        // out to both `rerender()` (delta chart) and the profile.
+        profileSelectors.snapshot.addEventListener("change", renderProfileChart);
         for (const cb of document.querySelectorAll(".profile-toggles input[type=checkbox]")) {
           cb.addEventListener("change", (e) => {
             const key = e.currentTarget.dataset.series;
@@ -1198,19 +1199,19 @@
       }
 
       function repopulateSnapshotOptions() {
-        const filter = {
-          target: profileSelectors.target.value,
-          scenario: profileSelectors.scenario.value,
-        };
-        // Snapshot list lives at (target, scenario) granularity now —
-        // the chart draws all stages together, so any snapshot that
-        // contributed compress OR decompress rows for this scenario is
-        // a valid pick.
+        const target = selectors.target.value;
+        const scenario = selectors.scenario.value;
+        const level = selectors.level.value;
+        // Honor `ALWAYS` on every dimension — when target/scenario/
+        // level are "all", the snapshot list is the union across every
+        // value of those dimensions (any snapshot that produced data
+        // for any combination is a valid pick).
         const labels = uniq(
           state.records
             .filter((r) =>
-              (r.target || "unknown-target") === filter.target &&
-              r.scenario === filter.scenario,
+              (target === ALWAYS || (r.target || "unknown-target") === target) &&
+              (scenario === ALWAYS || r.scenario === scenario) &&
+              (level === ALWAYS || r.level === level),
             )
             .map(snapshotLabel),
         );
@@ -1233,23 +1234,10 @@
       }
 
       function renderProfileSelectors() {
-        const targets = uniq(state.records.map((r) => r.target || "unknown-target"));
-        const scenarios = uniq(state.records.map((r) => r.scenario).filter(Boolean));
-
-        const populate = (sel, values, preferred) => {
-          const fragment = document.createDocumentFragment();
-          for (const value of values) {
-            const opt = document.createElement("option");
-            opt.value = String(value);
-            opt.textContent = String(value);
-            fragment.appendChild(opt);
-          }
-          sel.replaceChildren(fragment);
-          if (preferred && values.includes(preferred)) sel.value = preferred;
-        };
-
-        populate(profileSelectors.target, targets, targets[0]);
-        populate(profileSelectors.scenario, scenarios, scenarios[0]);
+        // Target / Scenario / Level are owned by the top delta chart's
+        // selectors (the profile reads them via `currentFilter()`-style
+        // lookups in `profileFilter()`). Only the profile-specific
+        // Snapshot dropdown needs populating here.
         repopulateSnapshotOptions();
       }
 
@@ -1277,8 +1265,21 @@
       }
 
       function bindFilters() {
-        for (const control of Object.values(selectors)) {
-          control.addEventListener("change", rerender);
+        // Top filters drive both charts: the delta chart via
+        // `rerender()` (time window + status), and the profile chart
+        // via target/scenario/level which now live on `selectors`.
+        // Snapshot list also depends on those three dimensions, so
+        // it's repopulated (preserving the current pin where valid)
+        // on every top-filter change.
+        const profileDimensions = new Set(["target", "scenario", "level"]);
+        for (const [name, control] of Object.entries(selectors)) {
+          control.addEventListener("change", () => {
+            rerender();
+            if (profileDimensions.has(name)) {
+              repopulateSnapshotOptions();
+              renderProfileChart();
+            }
+          });
         }
       }
 
