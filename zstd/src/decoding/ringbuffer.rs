@@ -506,7 +506,7 @@ impl RingBuffer {
             }
         } else {
             #[allow(clippy::collapsible_else_if)]
-            if self.head + start > self.cap {
+            if self.head + start >= self.cap {
                 // Continuous read section and destination section:
                 //
                 //                  T           H
