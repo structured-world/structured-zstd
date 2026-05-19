@@ -780,7 +780,10 @@
               return;
             }
             chart.setDatasetVisibility(i, nextVisible);
-            chart.update();
+            // `"none"` skips animation — toggling a series should be
+            // instant, especially with many datasets where the default
+            // 1s animation looks janky on every click.
+            chart.update("none");
             renderHtmlLegend(chart, container, onToggle);
           });
 
@@ -905,24 +908,52 @@
           return null;
         };
 
-        // For each (level, logical-metric) we accumulate ALL matching
-        // rows and average the Rust + FFI values per side. This matters
-        // for decompress: the bench emits two source variants
-        // (`rust_stream` and `c_stream`) per (level, snapshot) which
-        // measure decompressing differently-encoded inputs. Picking the
-        // "first" one would silently surface c_stream-only or
-        // rust_stream-only numbers depending on iteration order;
-        // averaging gives a deterministic, fair Rust/FFI comparison
-        // that doesn't depend on which stream variant arrives first.
-        // For compress and ratio there is only one source per (level,
-        // snapshot), so the mean degenerates to the single observation.
-        const byLevelLogical = new Map();
+        // Two-pass aggregation:
+        //
+        //   Pass 1 — collect every matching row, indexed by
+        //            (level, logical-metric). When `filter.snapshot ===
+        //            PROFILE_LATEST` we also remember the most recent
+        //            generated_at observed for each key.
+        //   Pass 2 — fold each row into the running mean only if its
+        //            generated_at matches the chosen snapshot for that
+        //            key. For `PROFILE_LATEST` this restricts the mean
+        //            to ONE snapshot per (level, lm) — the most recent
+        //            one — and then averages across source variants
+        //            within that snapshot (relevant for decompress,
+        //            where rust_stream and c_stream coexist). For a
+        //            pinned snapshot, matchesFilter() already narrowed
+        //            us to that snapshot, so this just collapses source.
+        //
+        // The pre-fix code summed across every generated_at, which
+        // silently turned "latest" into a time-average rather than a
+        // single-snapshot pin.
+        const matchingRows = [];
+        const latestPerKey = new Map();
         for (const row of state.records) {
           if (!matchesFilter(row)) continue;
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
           const lm = logicalMetric(row);
           if (!lm) continue;
           const key = `${row.level}|${lm}`;
+          matchingRows.push({ row, lm, key });
+          if (filter.snapshot === PROFILE_LATEST) {
+            const previous = latestPerKey.get(key);
+            if (!previous || compareByGeneratedAt(row, previous) > 0) {
+              latestPerKey.set(key, row);
+            }
+          }
+        }
+
+        const sameSnapshotLabel = (a, b) =>
+          (a.generated_at || a.commit_sha || "local-run") ===
+          (b.generated_at || b.commit_sha || "local-run");
+
+        const byLevelLogical = new Map();
+        for (const { row, lm, key } of matchingRows) {
+          if (filter.snapshot === PROFILE_LATEST) {
+            const winner = latestPerKey.get(key);
+            if (!winner || !sameSnapshotLabel(row, winner)) continue;
+          }
           let agg = byLevelLogical.get(key);
           if (!agg) {
             agg = { level: row.level, rust_sum: 0, ffi_sum: 0, count: 0 };
