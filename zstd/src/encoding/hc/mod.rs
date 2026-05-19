@@ -227,6 +227,26 @@ impl HcMatcher {
             return None;
         }
 
+        // Chain walk is inlined below — avoids the per-call 4 KiB
+        // `[usize; MAX_HC_SEARCH_DEPTH]` array that
+        // [`Self::chain_candidates`] materializes (zero-init on entry,
+        // memcpy on return). At lazy_depth=2 (L7+) `pick_lazy_match`
+        // triggers up to three chain walks per committed position, so
+        // the array form costs ~12 KiB of stack traffic per accepted
+        // match. Donor (`zstd_lazy.c` `ZSTD_HcFindBestMatch`) runs a
+        // single fused loop with no intermediate buffer; mirror that.
+        // `chain_candidates` is kept under `#[cfg(test)]` callers as a
+        // dump-style helper for the chain-walk unit tests.
+        let hash = table.hash_position(&concat[current_idx..]);
+        let chain_mask = (1usize << table.chain_log) - 1;
+        let mut cur = table.hash_table[hash];
+        // Cap loop at MAX_HC_SEARCH_DEPTH so a misconfigured
+        // `search_depth > MAX_HC_SEARCH_DEPTH` (BT modes set it from the
+        // donor config, which can exceed our cap) cannot run forever.
+        let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        let mut steps = 0usize;
+        let history_abs_start = table.history_abs_start;
+
         let mut best: Option<MatchCandidate> = None;
         // Donor speculative tail check (`zstd_lazy.c:714`,
         // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
@@ -277,51 +297,106 @@ impl HcMatcher {
         //   walks we fall through to the full `common_prefix_len` so
         //   the offset-bits advantage is given a chance to win.
         let history_tail = concat.len();
-        for candidate_abs in self.chain_candidates(table, abs_pos) {
-            if candidate_abs == usize::MAX {
+        while steps < max_chain_steps {
+            if cur == HC_EMPTY {
                 break;
             }
-            let candidate_idx = candidate_abs - table.history_abs_start;
-            // `abs_pos > candidate_abs` is invariant for in-range chain
-            // entries (filtered by `chain_candidates`), so the subtraction
-            // never underflows.
-            let new_offset = abs_pos - candidate_abs;
-            if let Some(best_ref) = best
-                && new_offset >= best_ref.offset
-                && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
+            let candidate_rel = cur.wrapping_sub(1) as usize;
+            let candidate_abs_opt =
+                super::match_table::storage::MatchTable::stored_abs_position_fast(
+                    cur,
+                    table.position_base,
+                    table.index_shift,
+                );
+            let next = table.chain_table[candidate_rel & chain_mask];
+            steps += 1;
+            // Self-loop: two positions share `candidate_rel & chain_mask`;
+            // stop after processing this slot.
+            let self_loop = next == cur;
+
+            // Only process candidates in the live window [history_abs_start, abs_pos).
+            if let Some(candidate_abs) = candidate_abs_opt
+                && candidate_abs >= history_abs_start
+                && candidate_abs < abs_pos
             {
-                let m_end = candidate_idx + tail_off + 4;
-                let i_end = current_idx + tail_off + 4;
-                // Bounds-fail (`i_end > history_tail`) is a SAFE skip — not
-                // a missed optimization. Under the per-iteration
-                // precondition `new_offset >= best.offset`, new candidates
-                // have equal-or-worse `offset_bits`, so to outscore `best`
-                // they need strictly *larger* `match_len`. Bounds fail
-                // ⟺ `current_idx + best.match_len − lit_len + 1 >
-                // history_tail` ⟺ forward bytes at `current_idx`
-                // (`F_max := history_tail − current_idx`) satisfy
-                // `F_max ≤ best.match_len − lit_len`. Any candidate at
-                // `current_idx` has `match_len ≤ F_max + lit_len ≤
-                // best.match_len`, so it cannot strictly outscore. Falling
-                // through to `common_prefix_len` would only run a wasted
-                // walk that can never improve `best`.
-                if i_end > history_tail || m_end > history_tail {
-                    continue;
-                }
-                if concat[candidate_idx + tail_off..m_end] != concat[current_idx + tail_off..i_end]
+                let candidate_idx = candidate_abs - history_abs_start;
+                // `abs_pos > candidate_abs` is invariant under the bounds check
+                // above, so the subtraction never underflows.
+                let new_offset = abs_pos - candidate_abs;
+                // Donor speculative tail check (`zstd_lazy.c:714`,
+                // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
+                // expensive `common_prefix_len` walk on a 4-byte tail compare
+                // proving the new candidate can possibly reach the *forward*
+                // length required to outscore `best` under
+                // [`Self::better_candidate`] (gain = `len*4 - offset_bits`).
+                //
+                // Correctness — backward-extension–aware bound:
+                //   `best.match_len` is the *total* length stored by
+                //   [`Self::extend_backwards`]: forward bytes from
+                //   `current_idx` plus up to `lit_len` backward bytes
+                //   (`B_best = abs_pos − best.start`, capped by `lit_len`).
+                //   A new candidate can in principle replace `B_best` of its
+                //   own length with up to `lit_len` backward bytes, so the
+                //   worst-case forward length it needs to outscore `best`
+                //   is `best.match_len − lit_len + 1`. The 4-byte tail probe
+                //   at offset `best.match_len − lit_len − 3` covers exactly
+                //   that boundary.
+                //
+                // Walk-order argument (offset monotonicity — REQUIRED gate
+                // precondition, enforced per-iteration):
+                //   Chain walks are LIFO in their dense form (newest first →
+                //   strictly increasing offset). But the chain table is
+                //   `chain_log`-bits wide; when a position is re-inserted at
+                //   the same masked chain index after the cycle wraps, an
+                //   older chain link can point into a slot that has since
+                //   been overwritten with a newer (closer) position, breaking
+                //   monotonicity. The gate's bound is only sound when
+                //   `new_offset >= best.offset`; otherwise fall through to
+                //   the full `common_prefix_len` so the offset-bits advantage
+                //   is given a chance to win.
+                let mut skip = false;
+                if let Some(best_ref) = best
+                    && new_offset >= best_ref.offset
+                    && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
                 {
-                    continue;
+                    let m_end = candidate_idx + tail_off + 4;
+                    let i_end = current_idx + tail_off + 4;
+                    // Bounds-fail is a SAFE skip — see longer rationale in the
+                    // gate's git history. Briefly: under the monotonicity
+                    // precondition above, bounds-fail proves no in-range
+                    // candidate at this `current_idx` can outscore `best`.
+                    if i_end > history_tail
+                        || m_end > history_tail
+                        || concat[candidate_idx + tail_off..m_end]
+                            != concat[current_idx + tail_off..i_end]
+                    {
+                        skip = true;
+                    }
+                }
+
+                if !skip {
+                    let match_len =
+                        common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+                    if match_len >= HC_MIN_MATCH_LEN {
+                        let candidate = Self::extend_backwards(
+                            table,
+                            candidate_abs,
+                            abs_pos,
+                            match_len,
+                            lit_len,
+                        );
+                        best = Self::better_candidate(best, Some(candidate));
+                        if best.is_some_and(|b| b.match_len >= self.target_len) {
+                            return best;
+                        }
+                    }
                 }
             }
-            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= HC_MIN_MATCH_LEN {
-                let candidate =
-                    Self::extend_backwards(table, candidate_abs, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
-                if best.is_some_and(|b| b.match_len >= self.target_len) {
-                    return best;
-                }
+
+            if self_loop {
+                break;
             }
+            cur = next;
         }
         best
     }
