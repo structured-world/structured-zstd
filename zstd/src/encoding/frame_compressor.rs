@@ -398,9 +398,12 @@ pub(crate) struct CompressState<M: Matcher> {
     ///
     /// **Invariant (required of every construction site):** must be
     /// initialized from the active `CompressionLevel` via
-    /// `StrategyTag::for_compression_level`, and re-synced on every
-    /// `matcher.reset()` so the level-aware gates stay correct after
-    /// a level change. There is no `Default` impl — production paths
+    /// `StrategyTag::for_compression_level`, and re-synced from the
+    /// active level alongside every `matcher.reset()` call so the
+    /// level-aware gates stay correct after a level change. The two
+    /// reset sites that own this sync are `FrameCompressor::compress`
+    /// and `StreamingEncoder::ensure_frame_started`. There is no
+    /// `Default` impl — production constructors
     /// (`FrameCompressor::new`, `new_with_matcher`, the streaming
     /// encoder constructor) plumb this explicitly. Tests that build
     /// `CompressState` by hand must also supply a value.

@@ -236,6 +236,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.fse_tables.ll_previous = None;
         self.state.fse_tables.ml_previous = None;
         self.state.fse_tables.of_previous = None;
+        // Sync `state.strategy_tag` from the active compression level so the
+        // literal-compression gates (`min_literals_to_compress`, `min_gain`
+        // in `encoding::blocks::compressed`) see the correct strategy for
+        // every frame. Mirrors `FrameCompressor::compress` and keeps both
+        // entry points byte-equivalent at the gate level.
+        self.state.strategy_tag =
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -1173,6 +1180,46 @@ mod tests {
             header.window_size().unwrap() >= 1024,
             "window descriptor should be present when single-segment is disabled"
         );
+    }
+
+    #[test]
+    fn ensure_frame_started_syncs_strategy_tag_from_compression_level() {
+        // The literal-compression gates (`min_literals_to_compress`,
+        // `min_gain`) read `state.strategy_tag`. Regression: every reset
+        // site MUST refresh that tag from the active compression level,
+        // otherwise gates use stale strategy after a frame start.
+        use crate::encoding::strategy::StrategyTag;
+        // Pick a level pair whose resolved StrategyTag differs so a
+        // missed sync would visibly leak the construction-time value.
+        let cases = [
+            (
+                CompressionLevel::Fastest,
+                StrategyTag::for_compression_level(CompressionLevel::Fastest),
+            ),
+            (
+                CompressionLevel::Default,
+                StrategyTag::for_compression_level(CompressionLevel::Default),
+            ),
+            (
+                CompressionLevel::Better,
+                StrategyTag::for_compression_level(CompressionLevel::Better),
+            ),
+            (
+                CompressionLevel::Best,
+                StrategyTag::for_compression_level(CompressionLevel::Best),
+            ),
+        ];
+        for (level, expected_tag) in cases {
+            let mut encoder = StreamingEncoder::new(Vec::new(), level);
+            // First write triggers `ensure_frame_started` → matcher reset
+            // → strategy_tag sync.
+            encoder.write_all(b"x").unwrap();
+            assert_eq!(
+                encoder.state.strategy_tag, expected_tag,
+                "strategy_tag drift after frame start at level {level:?}",
+            );
+            let _ = encoder.finish().unwrap();
+        }
     }
 
     #[test]
