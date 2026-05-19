@@ -17,6 +17,13 @@ pub struct DecodeBuffer {
     pub hash: twox_hash::XxHash64,
 }
 
+/// Rollback token produced by [`DecodeBuffer::checkpoint`].
+#[derive(Copy, Clone)]
+pub(crate) struct DecodeBufferCheckpoint {
+    tail: usize,
+    total_output_counter: u64,
+}
+
 impl Read for DecodeBuffer {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
         let max_amount = self.can_drain_to_window_size().unwrap_or(0);
@@ -58,6 +65,38 @@ impl DecodeBuffer {
 
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Capture a rollback point covering the buffer's write cursor and the
+    /// total-output counter. Pair with [`restore_checkpoint`] to undo
+    /// speculative pushes/repeats made after the capture — used by the fused
+    /// sequence executor to roll back when the post-loop bitstream
+    /// validation rejects a malformed block, restoring the
+    /// transactional-on-error semantics the legacy two-pass pipeline had.
+    #[inline]
+    pub(crate) fn checkpoint(&self) -> DecodeBufferCheckpoint {
+        DecodeBufferCheckpoint {
+            tail: self.buffer.tail(),
+            total_output_counter: self.total_output_counter,
+        }
+    }
+
+    /// Restore a checkpoint captured by [`checkpoint`].
+    ///
+    /// # Safety
+    /// The caller must guarantee:
+    /// - `cp` came from a `checkpoint()` on this same instance.
+    /// - The buffer has not been reallocated in between (no
+    ///   `reserve_amortized` bump).
+    /// - The caller has not read out bytes between the checkpoint and now
+    ///   (any callers reading buffer contents must treat the rolled-back
+    ///   region as discarded).
+    #[inline]
+    pub(crate) unsafe fn restore_checkpoint(&mut self, cp: DecodeBufferCheckpoint) {
+        // SAFETY: forwarded to RingBuffer::set_tail; same invariants apply
+        // and the caller has affirmed them on the outer entry point.
+        unsafe { self.buffer.set_tail(cp.tail) };
+        self.total_output_counter = cp.total_output_counter;
     }
 
     /// Pre-allocate capacity for `amount` additional bytes.
@@ -452,6 +491,31 @@ mod tests {
     extern crate std;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn checkpoint_restore_undoes_pushes() {
+        // Regression test for the fused-decode transactional contract:
+        // when the post-loop bitstream validation fails, the fused
+        // sequence executor must restore buffer state to the moment
+        // before the first per-iter side-effect. This exercises the
+        // primitive that supports that rollback.
+        let mut buf = DecodeBuffer::new(1024);
+        buf.push(&[1, 2, 3]);
+        let cp = buf.checkpoint();
+        buf.push(&[4, 5, 6, 7]);
+        assert_eq!(buf.len(), 7);
+        unsafe { buf.restore_checkpoint(cp) };
+        assert_eq!(buf.len(), 3, "len must reflect the checkpoint");
+
+        // After restore, fresh writes must land contiguously where the
+        // first push left off (no stale tail bytes leaking through).
+        buf.push(&[0xAA, 0xBB]);
+        assert_eq!(buf.len(), 5);
+        // Drain & verify content.
+        let mut drained: Vec<u8> = vec::Vec::new();
+        buf.drain_to_writer(&mut drained).unwrap();
+        assert_eq!(drained, alloc::vec![1, 2, 3, 0xAA, 0xBB]);
+    }
 
     #[test]
     fn short_writer() {

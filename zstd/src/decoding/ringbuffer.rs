@@ -57,6 +57,35 @@ impl RingBuffer {
         x + y
     }
 
+    /// Current write cursor, used by `DecodeBuffer::checkpoint` to record a
+    /// rollback point before speculative writes.
+    #[inline]
+    pub(super) fn tail(&self) -> usize {
+        self.tail
+    }
+
+    /// Force the write cursor back to a previously captured value, undoing
+    /// any pushes / repeats issued after the corresponding `tail()` call.
+    ///
+    /// # Safety
+    /// The caller must guarantee:
+    /// - `new_tail` was returned by an earlier `tail()` call on this same
+    ///   `RingBuffer` instance.
+    /// - No reallocation has happened in between (a `reserve_amortized`
+    ///   bump would have shifted the ring-buffer indices).
+    /// - The bytes between `new_tail` and the current tail are not used
+    ///   afterwards (callers truncate any view that depended on them).
+    #[inline]
+    pub(super) unsafe fn set_tail(&mut self, new_tail: usize) {
+        debug_assert!(
+            new_tail < self.cap || self.cap == 0,
+            "new_tail ({}) must be < cap ({})",
+            new_tail,
+            self.cap
+        );
+        self.tail = new_tail;
+    }
+
     /// Return the amount of available space (in bytes) of the buffer.
     pub fn free(&self) -> usize {
         let (x, y) = self.free_slice_lengths();

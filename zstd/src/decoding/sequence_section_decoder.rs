@@ -34,6 +34,12 @@ pub fn decode_and_execute_sequences(
     literals_buffer: &[u8],
     rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
+    // Reset the fallback sequences vec on entry. The non-RLE fast path
+    // never writes to it, so without this clear it would carry whatever
+    // entries the previous block left behind — a stale-data hazard for
+    // any external caller that inspects scratch.sequences after decode.
+    rle_fallback_sequences.clear();
+
     let bytes_read = maybe_update_fse_tables(section, source, fse)?;
     vprintln!("Updating tables used {} bytes", bytes_read);
 
@@ -90,6 +96,17 @@ pub fn decode_and_execute_sequences(
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
+
+    // Transactional rollback state. The fused decode+execute commits
+    // each sequence's side-effects (literal push, match repeat, offset
+    // history update) immediately, but the bitstream-exhaustion check
+    // happens once after the loop. If that final check fails on a
+    // malformed input, restore the buffer write cursor and offset
+    // history to their pre-loop values so the caller observes the
+    // legacy two-pass semantics: an Err leaves no partial output and no
+    // mutated repeat-history behind.
+    let buffer_checkpoint = buffer.checkpoint();
+    let saved_offset_hist = *offset_hist;
 
     #[inline(always)]
     fn execute_one_sequence(
@@ -158,12 +175,26 @@ pub fn decode_and_execute_sequences(
         seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
     }
 
-    // Post-loop bitstream validation.
+    // Post-loop bitstream validation. On failure roll back the buffer
+    // and offset history so a malformed block leaves no partial
+    // side-effects behind — restoring the transactional contract the
+    // legacy two-pass pipeline upheld.
     let remaining = br.bits_remaining();
-    if remaining < 0 {
-        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
-    }
-    if remaining > 0 {
+    if remaining != 0 {
+        // SAFETY: `buffer_checkpoint` and `saved_offset_hist` were
+        // captured on the same `buffer` / `offset_hist` references at
+        // the top of this call. No reallocation has happened in between
+        // (buffer.reserve was called once before the checkpoint), and
+        // the bytes between the checkpoint and the current tail are
+        // discarded by the Err return below.
+        unsafe {
+            buffer.restore_checkpoint(buffer_checkpoint);
+        }
+        *offset_hist = saved_offset_hist;
+
+        if remaining < 0 {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+        }
         return Err(DecodeSequenceError::ExtraBits {
             bits_remaining: remaining,
         }
