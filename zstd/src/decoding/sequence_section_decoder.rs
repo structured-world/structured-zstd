@@ -365,8 +365,13 @@ fn decode_sequences_with_rle(
 /// Donor parity: `LL_base` + `LL_bits` from the zstd reference
 /// (`zstd_compress_internal.h`). Per Zstandard format §3.1.1.3.2.1.1.1,
 /// valid codes are 0..=35; the FSE decoder guarantees codes never
-/// exceed 35, so callers index this array unconditionally and rely on
-/// the assert in the helper below to catch any future invariant break.
+/// exceed 35 (table built with `max_symbol = MAX_LITERAL_LENGTH_CODE`
+/// and `build_decoding_table` rejects oversize symbol probabilities;
+/// RLE bytes range-checked in `maybe_update_fse_tables`). Release
+/// builds rely on those upstream gates plus the `unsafe`
+/// `get_unchecked` in the helper below; `debug_assert!` there is a
+/// fuzz-time tripwire for future invariant breaks, not a runtime
+/// release-mode bounds check.
 ///
 /// Layout: low 24 bits = baseline (max 65536 fits), high 8 bits =
 /// extra_bits (max 16). One u32 load on the hot path returns both

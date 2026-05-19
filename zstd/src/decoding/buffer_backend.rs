@@ -21,8 +21,12 @@ use crate::io::{Error, Read};
 
 /// Trailing-slack count both backends pad their physical allocation
 /// with so SIMD wildcopy reads / writes can overshoot the live region
-/// without leaving the allocation.
-#[allow(dead_code)] // Used by `flat_buf` (Phase 2 wiring still pending).
+/// without leaving the allocation. Matches donor zstd's
+/// `WILDCOPY_OVERLENGTH` (16 bytes = the largest single chunk
+/// `simd_copy::copy_bytes_overshooting` writes when its single-op
+/// fast path fires on copies ≤ 16 bytes). Both `RingBuffer` and
+/// `FlatBuf` reuse this single constant so the slack contract
+/// cannot drift between backends.
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 16;
 
 /// Storage operations the decoder needs from its output buffer.
@@ -47,8 +51,17 @@ pub(crate) trait BufferBackend: Sized {
     /// Live byte count: bytes between the logical head and tail.
     fn len(&self) -> usize;
 
-    /// Physical allocation capacity. Used as the realloc-detection
-    /// sentinel in [`super::decode_buffer::DecodeBufferCheckpoint`].
+    /// Realloc-detection sentinel for
+    /// [`super::decode_buffer::DecodeBufferCheckpoint`]. The exact
+    /// value is backend-specific (RingBuffer returns its ring-
+    /// indexing capacity, which does not include the trailing
+    /// [`WILDCOPY_OVERLENGTH`] slack bytes; FlatBuf returns the
+    /// full `Vec::capacity` which does include them). The contract
+    /// the checkpoint relies on is invariant per-instance: `cap()`
+    /// stays equal across calls as long as no reallocation has
+    /// happened. Equality is the only operation the checkpoint
+    /// performs — the absolute value is never compared across
+    /// backends.
     fn cap(&self) -> usize;
 
     /// Physical write cursor — paired with [`Self::set_tail`] for the

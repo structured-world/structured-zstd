@@ -61,10 +61,16 @@ impl BufferBackend for FlatBuf {
 
     #[inline]
     fn reserve(&mut self, n: usize) {
-        let needed = self.buf.len().saturating_add(n);
-        if needed > self.buf.capacity() {
+        // `Vec::reserve(additional)` is "additional bytes beyond len",
+        // not "delta from capacity" — compute the gap correctly so an
+        // allocation does happen when len < capacity < len+n. The
+        // previous shape silently under-reserved on that case and
+        // could leave fewer than `n` writable bytes available to a
+        // subsequent unsafe extend.
+        let available = self.buf.capacity().saturating_sub(self.buf.len());
+        if available < n {
             self.buf
-                .reserve(needed - self.buf.capacity() + WILDCOPY_OVERLENGTH);
+                .reserve((n - available).saturating_add(WILDCOPY_OVERLENGTH));
         }
     }
 

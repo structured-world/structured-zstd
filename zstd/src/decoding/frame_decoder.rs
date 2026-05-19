@@ -6,8 +6,12 @@
 
 use super::frame;
 use crate::decoding;
+use crate::decoding::block_decoder::BlockDecoder;
+use crate::decoding::decode_buffer::DecodeBuffer;
 use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
-use crate::decoding::errors::FrameDecoderError;
+use crate::decoding::errors::{DecodeBlockContentError, FrameDecoderError};
+use crate::decoding::flat_buf::FlatBuf;
+use crate::decoding::ringbuffer::RingBuffer;
 use crate::decoding::scratch::DecoderScratch;
 use crate::io::{Error, Read, Write};
 use alloc::collections::BTreeMap;
@@ -78,9 +82,162 @@ pub struct FrameDecoder {
     shared_dicts: (),
 }
 
+/// Backend-tagged decode scratch — chosen at frame-reset time based
+/// on the parsed `FrameHeader.descriptor.single_segment_flag()` and
+/// kept stable through the lifetime of the frame. The match in each
+/// helper below dispatches **once per call** (e.g. once per block in
+/// `decode_block_content`, once per drain in `drain_to_writer`) —
+/// never inside the hot push/repeat loop, which is fully
+/// monomorphised through the `DecoderScratch<B>` generic.
+enum DecoderScratchKind {
+    Ring(DecoderScratch<RingBuffer>),
+    Flat(DecoderScratch<FlatBuf>),
+}
+
+impl DecoderScratchKind {
+    fn new_ring(window_size: usize) -> Self {
+        let mut s = DecoderScratch::<RingBuffer>::new(window_size);
+        s.buffer.reserve(window_size);
+        Self::Ring(s)
+    }
+
+    /// Construct a flat-backed scratch sized for a single-segment
+    /// frame. `frame_content_size` is the upcoming output size in
+    /// bytes (== `window_size` when the flag is set).
+    fn new_flat(frame_content_size: usize) -> Self {
+        let flat = FlatBuf::with_capacity(frame_content_size);
+        // DecoderScratch's default ctor would discard the pre-sized
+        // FlatBuf — go through from_backend so the buffer carries the
+        // capacity the constructor wants.
+        let mut s = DecoderScratch::<FlatBuf>::new(frame_content_size);
+        s.buffer = DecodeBuffer::from_backend(flat, frame_content_size);
+        Self::Flat(s)
+    }
+
+    /// Reset (or transition between) backends for a new frame.
+    /// Reuses the existing `DecoderScratch` allocations (FSE / HUF
+    /// tables, sequence vec, etc.) when the backend kind is unchanged
+    /// — only the underlying buffer is re-sized for the new frame.
+    /// Building a fresh `DecoderScratch` on every frame would
+    /// re-allocate everything and was measured at +255 % vs ring on
+    /// small frames; reusing it keeps the small-frame cost flat.
+    fn reset(&mut self, frame: &frame::FrameHeader, window_size: usize) {
+        if frame.descriptor.single_segment_flag() {
+            match self {
+                Self::Flat(s) => {
+                    s.reset(window_size);
+                    // DecodeBuffer::reset clears + reserves
+                    // window_size; FlatBuf's reserve grows the
+                    // backing Vec if the new FCS is larger than
+                    // what's already allocated. No alloc when the
+                    // previous flat frame had >= this capacity.
+                }
+                Self::Ring(_) => *self = Self::new_flat(window_size),
+            }
+        } else {
+            match self {
+                Self::Ring(s) => s.reset(window_size),
+                Self::Flat(_) => *self = Self::new_ring(window_size),
+            }
+        }
+    }
+
+    fn init_from_dict(&mut self, dict: &Dictionary) {
+        match self {
+            Self::Ring(s) => s.init_from_dict(dict),
+            Self::Flat(s) => s.init_from_dict(dict),
+        }
+    }
+
+    #[inline]
+    fn buffer_len(&self) -> usize {
+        match self {
+            Self::Ring(s) => s.buffer.len(),
+            Self::Flat(s) => s.buffer.len(),
+        }
+    }
+
+    fn buffer_drain(&mut self) -> Vec<u8> {
+        match self {
+            Self::Ring(s) => s.buffer.drain(),
+            Self::Flat(s) => s.buffer.drain(),
+        }
+    }
+
+    fn buffer_drain_to_window_size(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Ring(s) => s.buffer.drain_to_window_size(),
+            Self::Flat(s) => s.buffer.drain_to_window_size(),
+        }
+    }
+
+    fn buffer_drain_to_writer(&mut self, sink: impl Write) -> Result<usize, Error> {
+        match self {
+            Self::Ring(s) => s.buffer.drain_to_writer(sink),
+            Self::Flat(s) => s.buffer.drain_to_writer(sink),
+        }
+    }
+
+    fn buffer_drain_to_window_size_writer(&mut self, sink: impl Write) -> Result<usize, Error> {
+        match self {
+            Self::Ring(s) => s.buffer.drain_to_window_size_writer(sink),
+            Self::Flat(s) => s.buffer.drain_to_window_size_writer(sink),
+        }
+    }
+
+    fn buffer_can_drain(&self) -> usize {
+        match self {
+            Self::Ring(s) => s.buffer.can_drain(),
+            Self::Flat(s) => s.buffer.can_drain(),
+        }
+    }
+
+    fn buffer_can_drain_to_window_size(&self) -> Option<usize> {
+        match self {
+            Self::Ring(s) => s.buffer.can_drain_to_window_size(),
+            Self::Flat(s) => s.buffer.can_drain_to_window_size(),
+        }
+    }
+
+    fn buffer_read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            Self::Ring(s) => s.buffer.read(target),
+            Self::Flat(s) => s.buffer.read(target),
+        }
+    }
+
+    fn buffer_read_all(&mut self, target: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            Self::Ring(s) => s.buffer.read_all(target),
+            Self::Flat(s) => s.buffer.read_all(target),
+        }
+    }
+
+    fn decode_block_content<R: Read>(
+        &mut self,
+        decoder: &mut BlockDecoder,
+        header: &crate::blocks::block::BlockHeader,
+        source: R,
+    ) -> Result<u64, DecodeBlockContentError> {
+        match self {
+            Self::Ring(s) => decoder.decode_block_content(header, s, source),
+            Self::Flat(s) => decoder.decode_block_content(header, s, source),
+        }
+    }
+
+    #[cfg(feature = "hash")]
+    fn hash_finish(&self) -> u64 {
+        use core::hash::Hasher;
+        match self {
+            Self::Ring(s) => s.buffer.hash.finish(),
+            Self::Flat(s) => s.buffer.hash.finish(),
+        }
+    }
+}
+
 struct FrameDecoderState {
     pub frame_header: frame::FrameHeader,
-    decoder_scratch: DecoderScratch,
+    decoder_scratch: DecoderScratchKind,
     frame_finished: bool,
     block_counter: usize,
     bytes_read_counter: u64,
@@ -109,8 +266,11 @@ impl FrameDecoderState {
             });
         }
 
-        let mut decoder_scratch = DecoderScratch::new(window_size as usize);
-        decoder_scratch.buffer.reserve(window_size as usize);
+        let decoder_scratch = if frame.descriptor.single_segment_flag() {
+            DecoderScratchKind::new_flat(window_size as usize)
+        } else {
+            DecoderScratchKind::new_ring(window_size as usize)
+        };
         Ok(FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
@@ -137,10 +297,11 @@ impl FrameDecoderState {
             });
         }
 
+        self.decoder_scratch
+            .reset(&frame_header, window_size as usize);
         self.frame_header = frame_header;
         self.frame_finished = false;
         self.block_counter = 0;
-        self.decoder_scratch.reset(window_size as usize);
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
@@ -404,10 +565,8 @@ impl FrameDecoder {
     /// Only a sensible value after all decoded bytes have been collected/read from the FrameDecoder
     #[cfg(feature = "hash")]
     pub fn get_calculated_checksum(&self) -> Option<u32> {
-        use core::hash::Hasher;
-
         let state = self.state.as_ref()?;
-        let cksum_64bit = state.decoder_scratch.buffer.hash.finish();
+        let cksum_64bit = state.decoder_scratch.hash_finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
     }
@@ -459,7 +618,7 @@ impl FrameDecoder {
 
         let mut block_dec = decoding::block_decoder::new();
 
-        let buffer_size_before = state.decoder_scratch.buffer.len();
+        let buffer_size_before = state.decoder_scratch.buffer_len();
         let block_counter_before = state.block_counter;
         loop {
             vprintln!("################");
@@ -478,14 +637,15 @@ impl FrameDecoder {
                 block_header.decompressed_size
             );
 
-            let bytes_read_in_block_body = block_dec
-                .decode_block_content(&block_header, &mut state.decoder_scratch, &mut source)
+            let bytes_read_in_block_body = state
+                .decoder_scratch
+                .decode_block_content(&mut block_dec, &block_header, &mut source)
                 .map_err(err::FailedToReadBlockBody)?;
             state.bytes_read_counter += bytes_read_in_block_body;
 
             state.block_counter += 1;
 
-            vprintln!("Output: {}", state.decoder_scratch.buffer.len());
+            vprintln!("Output: {}", state.decoder_scratch.buffer_len());
 
             if block_header.last_block {
                 state.frame_finished = true;
@@ -509,7 +669,7 @@ impl FrameDecoder {
                     }
                 }
                 BlockDecodingStrategy::UptoBytes(n) => {
-                    if state.decoder_scratch.buffer.len() - buffer_size_before >= n {
+                    if state.decoder_scratch.buffer_len() - buffer_size_before >= n {
                         break;
                     }
                 }
@@ -525,9 +685,9 @@ impl FrameDecoder {
         let finished = self.is_finished();
         let state = self.state.as_mut()?;
         if finished {
-            Some(state.decoder_scratch.buffer.drain())
+            Some(state.decoder_scratch.buffer_drain())
         } else {
-            state.decoder_scratch.buffer.drain_to_window_size()
+            state.decoder_scratch.buffer_drain_to_window_size()
         }
     }
 
@@ -540,9 +700,9 @@ impl FrameDecoder {
             Some(s) => s,
         };
         if finished {
-            state.decoder_scratch.buffer.drain_to_writer(w)
+            state.decoder_scratch.buffer_drain_to_writer(w)
         } else {
-            state.decoder_scratch.buffer.drain_to_window_size_writer(w)
+            state.decoder_scratch.buffer_drain_to_window_size_writer(w)
         }
     }
 
@@ -556,12 +716,11 @@ impl FrameDecoder {
             Some(s) => s,
         };
         if finished {
-            state.decoder_scratch.buffer.can_drain()
+            state.decoder_scratch.buffer_can_drain()
         } else {
             state
                 .decoder_scratch
-                .buffer
-                .can_drain_to_window_size()
+                .buffer_can_drain_to_window_size()
                 .unwrap_or(0)
         }
     }
@@ -635,12 +794,9 @@ impl FrameDecoder {
                     }
                     state.bytes_read_counter += u64::from(block_header_size);
 
-                    let bytes_read_in_block_body = block_dec
-                        .decode_block_content(
-                            &block_header,
-                            &mut state.decoder_scratch,
-                            &mut mt_source,
-                        )
+                    let bytes_read_in_block_body = state
+                        .decoder_scratch
+                        .decode_block_content(&mut block_dec, &block_header, &mut mt_source)
                         .map_err(err::FailedToReadBlockBody)?;
                     state.bytes_read_counter += bytes_read_in_block_body;
                     state.block_counter += 1;
@@ -818,9 +974,9 @@ impl Read for FrameDecoder {
             Some(s) => s,
         };
         if state.frame_finished {
-            state.decoder_scratch.buffer.read_all(target)
+            state.decoder_scratch.buffer_read_all(target)
         } else {
-            state.decoder_scratch.buffer.read(target)
+            state.decoder_scratch.buffer_read(target)
         }
     }
 }

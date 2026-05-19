@@ -2,18 +2,16 @@ use crate::io::Read;
 use alloc::alloc::{alloc_zeroed, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
+use super::buffer_backend::WILDCOPY_OVERLENGTH;
 use super::simd_copy;
 
-/// Trailing slack appended to every RingBuffer allocation. Matches donor
-/// zstd's `WILDCOPY_OVERLENGTH` of 16 bytes — the largest single SIMD chunk
-/// `simd_copy::copy_bytes_overshooting` writes in one go (AVX-512 chunk is 64,
-/// but the single-op fast path that fires on copies ≤ 16 bytes is the place
-/// where this slack actually changes the dispatch outcome). The slack is
-/// physically present in the allocation but is never indexed via `head`/`tail`
-/// — those still wrap on `cap`. Slack bytes serve exclusively as an
-/// over-write / over-read landing zone so wildcopy stores/loads near the
-/// buffer boundary do not need a "min_buffer_size < copy_multiple" fallback.
-const WILDCOPY_OVERLENGTH: usize = 16;
+// `WILDCOPY_OVERLENGTH` is shared with `flat_buf` via
+// `buffer_backend.rs` to guarantee both backends size their trailing
+// slack identically — drift would invalidate the shared safety
+// assumption that wildcopy SIMD overshoot stores/loads near the
+// buffer boundary do not need a "min_buffer_size < copy_multiple"
+// fallback. See [`super::buffer_backend::WILDCOPY_OVERLENGTH`] for
+// the donor-parity rationale.
 
 pub struct RingBuffer {
     // Safety invariants:
