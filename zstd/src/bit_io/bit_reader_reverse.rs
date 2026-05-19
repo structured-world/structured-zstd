@@ -5,12 +5,12 @@ use std::sync::OnceLock;
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
 /// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
 ///
-/// Using a lookup table instead of computing the mask on every call
-/// eliminates a shift + subtract on the hot decode path.
-/// On BMI2-capable x86-64 CPUs the table is bypassed entirely in favour
-/// of the single-cycle `bzhi` instruction (see [`mask_lower_bits`]).
-// On BMI2 builds the table is only used by tests; suppress dead_code there.
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "bmi2"), allow(dead_code))]
+/// `mask_lower_bits` no longer reads this table — it computes the mask
+/// via `u64::MAX >> (64 - n)` to save a load. The table is still used
+/// by the BMI2 PEXT triple-extract path on x86-64 (where the mask is
+/// constructed once per call and then fed to `_pext_u64`), and by the
+/// tests that verify mask values directly.
+#[cfg(any(test, all(feature = "std", target_arch = "x86_64")))]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
