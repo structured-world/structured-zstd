@@ -612,8 +612,8 @@ fn estimate_literals_section_bytes(
     // losing ratio. Mirror donor's payload-vs-srcSize form here.
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let mg = min_gain(literals.len(), strategy);
-    let donor_clit = total - compressed_header; // tree_desc + payload
-    if donor_clit >= literals.len().saturating_sub(mg) {
+    let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
+    if huf_section_size >= literals.len().saturating_sub(mg) {
         *last_huff = None;
         return raw_section_bytes;
     }
@@ -1782,9 +1782,9 @@ fn compress_literals(
     // fast..btopt, ~0.78% for btultra, ~0.39% for btultra2). Saturating
     // subtraction covers tiny inputs where `literals.len() < minGain`.
     let compressed_header_len = compressed_literals_header_bytes(literals.len());
-    let donor_clit = total_len - compressed_header_len; // tree_desc + payload
+    let huf_section_size = total_len - compressed_header_len; // tree_desc + payload, no lhSize
     let mg = min_gain(literals.len(), strategy);
-    if donor_clit >= literals.len().saturating_sub(mg) {
+    if huf_section_size >= literals.len().saturating_sub(mg) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
         HuffmanTableUpdate::Cleared
@@ -1847,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn min_literals_to_compress_matches_donor_table() {
+    fn min_literals_to_compress_returns_per_strategy_floor() {
         for strat in [
             StrategyTag::Fast,
             StrategyTag::Dfast,
@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn min_gain_matches_donor_margin() {
+    fn min_gain_returns_per_strategy_margin() {
         let src = 4096usize;
         for strat in [
             StrategyTag::Fast,
