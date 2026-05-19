@@ -237,67 +237,66 @@ fn decode_sequences_without_rle(
     }
 }
 
+/// Baseline value emitted by literal-length code `code`. Donor parity:
+/// `LL_base` table in the zstd reference (`zstd_compress_internal.h`).
+/// Per Zstandard format §3.1.1.3.2.1.1.1, valid codes are 0..=35; the
+/// FSE decoder guarantees codes never exceed 35, so callers index this
+/// array unconditionally and rely on the debug_assert in the helper
+/// below to catch any future invariant break.
+const LL_BASE: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
+
+/// Number of extra bits to read after the literal-length code (donor
+/// `LL_bits`). Same domain as [`LL_BASE`].
+const LL_EXTRA_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
+
+/// Baseline value emitted by match-length code `code` (donor `ML_base`).
+/// Codes 0..=52 per Zstandard format §3.1.1.3.2.1.1.2.
+const ML_BASE: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
+    2051, 4099, 8195, 16387, 32771, 65539,
+];
+
+/// Number of extra bits to read after the match-length code (donor `ML_bits`).
+const ML_EXTRA_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
+
 /// Look up the provided state value from a literal length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
+#[inline(always)]
 fn lookup_ll_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => unreachable!("Illegal literal length code was: {}", code),
-    }
+    // Untrusted frames may carry an FSE table whose decoded symbol exceeds
+    // the valid LL code range (0..=35). Mirror the original `match` panic
+    // semantics via the standard array bounds check — that single jae is
+    // predicted perfectly on real inputs and replaces the staircase of
+    // `match` arm comparisons the previous implementation produced.
+    let idx = code as usize;
+    assert!(
+        idx < LL_BASE.len(),
+        "Illegal literal length code was: {code}"
+    );
+    (LL_BASE[idx], LL_EXTRA_BITS[idx])
 }
 
 /// Look up the provided state value from a match length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
+#[inline(always)]
 fn lookup_ml_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => unreachable!("Illegal match length code was: {}", code),
-    }
+    let idx = code as usize;
+    assert!(idx < ML_BASE.len(), "Illegal match length code was: {code}");
+    (ML_BASE[idx], ML_EXTRA_BITS[idx])
 }
 
 // This info is buried in the symbol compression mode table
