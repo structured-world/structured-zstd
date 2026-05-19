@@ -149,43 +149,31 @@ impl BufferBackend for FlatBuf {
         mut read: R,
         fill_length: usize,
     ) -> Result<(), Error> {
-        // Read directly into spare capacity to skip the
-        // `Vec::resize(.., 0)` zero-fill — Raw blocks can be up to
-        // 128 KiB, so eagerly memsetting then overwriting via
-        // `read_exact` would double the write traffic on the
-        // raw-block hot path. The `set_len` only runs after the
-        // read succeeds, so a failed read leaves length unchanged
-        // (same observable behaviour as the prior truncate-on-error
-        // shape).
+        // Forming `&mut [u8]` over uninitialised `Vec` spare
+        // capacity is UB even before any write — `&mut T` must
+        // always reference initialised, valid memory of the target
+        // type. Initialise via `Vec::resize(.., 0)` first, then
+        // hand the resulting initialised slice to `read_exact`.
+        // The earlier "read straight into spare capacity to skip
+        // the zero-fill" shape traded soundness for a ~one-memset-
+        // per-128-KiB-raw-block win; not worth the UB.
+        // On read failure, truncate the Vec back to its pre-call
+        // length so observable behaviour matches the previous
+        // truncate-on-error shape.
         let old = self.buf.len();
-        // Route through the backend's own `reserve`, which adds
-        // `WILDCOPY_OVERLENGTH` slack on top of `fill_length`. The
-        // raw-block path here doesn't overshoot today (`read_exact`
-        // writes exactly `fill_length` bytes), but keeping the slack
-        // invariant uniform across `with_capacity` / `reserve` /
-        // `extend_from_reader` means a future SIMD/wildcopy writer
-        // for the raw-block path can land without re-auditing the
-        // grow code.
+        let new_len = old + fill_length;
+        // Routes through `BufferBackend::reserve`, which keeps the
+        // `WILDCOPY_OVERLENGTH` slack invariant uniform with
+        // `with_capacity` / inline `reserve` growth paths.
         self.reserve(fill_length);
-        // SAFETY: `reserve` guarantees capacity >= old + fill_length
-        // (in fact >= old + fill_length + WILDCOPY_OVERLENGTH);
-        // the slice covers exactly `fill_length` writable bytes past
-        // the current end. The bytes are MaybeUninit-style
-        // uninitialised at this point — `read_exact` is the only
-        // writer until `set_len` commits below, so no safe code can
-        // observe uninitialised slots.
-        let read_slot: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(old), fill_length) };
+        self.buf.resize(new_len, 0);
+        let read_slot = &mut self.buf[old..new_len];
         match read.read_exact(read_slot) {
-            Ok(()) => {
-                // SAFETY: `read_exact` returned Ok, so all
-                // `fill_length` bytes in `read_slot` are now
-                // initialised. Capacity covers `old + fill_length`
-                // via the `reserve` above.
-                unsafe { self.buf.set_len(old + fill_length) };
-                Ok(())
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.buf.truncate(old);
+                Err(e)
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -227,7 +215,6 @@ impl BufferBackend for FlatBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoding::buffer_backend::BufferBackend;
 
     #[test]
     fn with_capacity_starts_empty() {
