@@ -14,3 +14,4 @@ members = ["zstd", "cli"]
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+debug = "line-tables-only"

@@ -25,11 +25,11 @@ use alloc::vec::Vec;
 /// Falls back to the legacy two-pass pipeline (`decode_sequences` +
 /// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
 /// is rare on perf-relevant corpora and not worth duplicating.
-pub fn decode_and_execute_sequences(
+pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
     rle_fallback_sequences: &mut Vec<Sequence>,
@@ -109,8 +109,8 @@ pub fn decode_and_execute_sequences(
     let saved_offset_hist = *offset_hist;
 
     #[inline(always)]
-    fn execute_one_sequence(
-        buffer: &mut super::decode_buffer::DecodeBuffer,
+    fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
+        buffer: &mut super::decode_buffer::DecodeBuffer<B>,
         literals: &[u8],
         lit_cur: &mut usize,
         lit_len: usize,
@@ -361,37 +361,77 @@ fn decode_sequences_with_rle(
     }
 }
 
-/// Baseline value emitted by literal-length code `code`. Donor parity:
-/// `LL_base` table in the zstd reference (`zstd_compress_internal.h`).
-/// Per Zstandard format §3.1.1.3.2.1.1.1, valid codes are 0..=35; the
-/// FSE decoder guarantees codes never exceed 35, so callers index this
-/// array unconditionally and rely on the debug_assert in the helper
-/// below to catch any future invariant break.
-const LL_BASE: [u32; 36] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
-    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-];
+/// Packed (baseline, extra_bits) pairs for literal-length codes.
+/// Donor parity: `LL_base` + `LL_bits` from the zstd reference
+/// (`zstd_compress_internal.h`). Per Zstandard format §3.1.1.3.2.1.1.1,
+/// valid codes are 0..=35; the FSE decoder guarantees codes never
+/// exceed 35 (table built with `max_symbol = MAX_LITERAL_LENGTH_CODE`
+/// and `build_decoding_table` rejects oversize symbol probabilities;
+/// RLE bytes range-checked in `maybe_update_fse_tables`). Release
+/// builds rely on those upstream gates plus the `unsafe`
+/// `get_unchecked` in the helper below; `debug_assert!` there is a
+/// fuzz-time tripwire for future invariant breaks, not a runtime
+/// release-mode bounds check.
+///
+/// Layout: low 24 bits = baseline (max 65536 fits), high 8 bits =
+/// extra_bits (max 16). One u32 load on the hot path returns both
+/// fields — replaces the previous pair of separate `LL_BASE[idx]` +
+/// `LL_EXTRA_BITS[idx]` loads (two distinct cache-line touches into
+/// 144 B + 36 B = 180 B; packed table is 144 B = one contiguous
+/// region).
+const LL_META: [u32; 36] = pack_code_meta(
+    &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    ],
+    &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16,
+    ],
+);
 
-/// Number of extra bits to read after the literal-length code (donor
-/// `LL_bits`). Same domain as [`LL_BASE`].
-const LL_EXTRA_BITS: [u8; 36] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
-    12, 13, 14, 15, 16,
-];
+/// Packed (baseline, extra_bits) pairs for match-length codes.
+/// Donor parity: `ML_base` + `ML_bits`. Codes 0..=52 per Zstandard
+/// format §3.1.1.3.2.1.1.2. Same packed layout as [`LL_META`].
+const ML_META: [u32; 53] = pack_code_meta(
+    &[
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
+        1027, 2051, 4099, 8195, 16387, 32771, 65539,
+    ],
+    &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ],
+);
 
-/// Baseline value emitted by match-length code `code` (donor `ML_base`).
-/// Codes 0..=52 per Zstandard format §3.1.1.3.2.1.1.2.
-const ML_BASE: [u32; 53] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
-    2051, 4099, 8195, 16387, 32771, 65539,
-];
+/// Build the packed (baseline, extra_bits) table at compile time so the
+/// const arrays above are self-validating against the source spec.
+const fn pack_code_meta<const N: usize>(bases: &[u32; N], extra_bits: &[u8; N]) -> [u32; N] {
+    let mut out = [0u32; N];
+    let mut i = 0;
+    while i < N {
+        // Compile-time gate: keep the high 8 bits of `bases[i]`
+        // available for the packed extra_bits field, and keep
+        // extra_bits within the Zstandard format limit (max 16 bits
+        // per §3.1.1.3.2.1.1). Any spec extension that violates
+        // either invariant fails the build instead of silently
+        // clobbering the packed payload.
+        assert!(bases[i] & 0xFF00_0000 == 0, "baseline must fit in 24 bits");
+        assert!(extra_bits[i] <= 16, "extra_bits exceeds zstd format limit");
+        out[i] = bases[i] | ((extra_bits[i] as u32) << 24);
+        i += 1;
+    }
+    out
+}
 
-/// Number of extra bits to read after the match-length code (donor `ML_bits`).
-const ML_EXTRA_BITS: [u8; 53] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-];
+/// Unpack the (baseline, extra_bits) tuple from a packed [`LL_META`] /
+/// [`ML_META`] entry. Inlined so the shift+mask collapses to ALU ops
+/// with no cross-function call overhead on the hot path.
+#[inline(always)]
+const fn unpack_code_meta(meta: u32) -> (u32, u8) {
+    (meta & 0x00FF_FFFF, (meta >> 24) as u8)
+}
 
 /// Look up the provided state value from a literal length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
@@ -399,17 +439,23 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 #[inline(always)]
 fn lookup_ll_code(code: u8) -> (u32, u8) {
-    // Untrusted frames may carry an FSE table whose decoded symbol exceeds
-    // the valid LL code range (0..=35). Mirror the original `match` panic
-    // semantics via the standard array bounds check — that single jae is
-    // predicted perfectly on real inputs and replaces the staircase of
-    // `match` arm comparisons the previous implementation produced.
+    // The FSE LL table is constructed with `max_symbol =
+    // MAX_LITERAL_LENGTH_CODE` (35); `build_decoding_table` returns
+    // `FSETableError::TooManySymbols` if `read_probabilities` produces
+    // more entries than that, and the RLE byte path is range-checked
+    // in `maybe_update_fse_tables`. So a `code` reaching this lookup
+    // is invariant 0..=35. Keep the `debug_assert` as a tripwire in
+    // case a future caller forgets one of those validations; drop the
+    // release-mode `assert!` so the hot path takes a single
+    // `get_unchecked` instead of a bounds-checked indexed load.
     let idx = code as usize;
-    assert!(
-        idx < LL_BASE.len(),
+    debug_assert!(
+        idx < LL_META.len(),
         "Illegal literal length code was: {code}"
     );
-    (LL_BASE[idx], LL_EXTRA_BITS[idx])
+    // SAFETY: idx < LL_META.len() == 36 per the FSE table
+    // construction invariant documented above.
+    unpack_code_meta(unsafe { *LL_META.get_unchecked(idx) })
 }
 
 /// Look up the provided state value from a match length table predefined
@@ -418,9 +464,14 @@ fn lookup_ll_code(code: u8) -> (u32, u8) {
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 #[inline(always)]
 fn lookup_ml_code(code: u8) -> (u32, u8) {
+    // Same invariant as `lookup_ll_code`: the ML FSE table is built
+    // with `max_symbol = MAX_MATCH_LENGTH_CODE` (52) and the RLE byte
+    // is range-checked, so `code` reaching this lookup is 0..=52.
     let idx = code as usize;
-    assert!(idx < ML_BASE.len(), "Illegal match length code was: {code}");
-    (ML_BASE[idx], ML_EXTRA_BITS[idx])
+    debug_assert!(idx < ML_META.len(), "Illegal match length code was: {code}");
+    // SAFETY: idx < ML_META.len() == 53 per the FSE table
+    // construction invariant.
+    unpack_code_meta(unsafe { *ML_META.get_unchecked(idx) })
 }
 
 // This info is buried in the symbol compression mode table

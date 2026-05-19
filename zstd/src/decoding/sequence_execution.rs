@@ -8,8 +8,8 @@ use crate::decoding::errors::ExecuteSequencesError;
 /// borrowed at the call site). Takes the same subset of fields the workspace
 /// version touches and runs the identical execution loop. Used by the
 /// fused `decode_and_execute_sequences` for its RLE-mode fallback.
-pub(crate) fn execute_sequences_fields(
-    buffer: &mut DecodeBuffer,
+pub(crate) fn execute_sequences_fields<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut DecodeBuffer<B>,
     literals_buffer: &[u8],
     offset_hist: &mut [u32; 3],
     sequences: &[Sequence],

@@ -1,7 +1,9 @@
 //! Structures that wrap around various decoders to make decoding easier.
 
 use super::super::blocks::sequence_section::Sequence;
+use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
+use super::ringbuffer::RingBuffer;
 use crate::decoding::dictionary::Dictionary;
 use crate::fse::FSETable;
 use crate::huff0::HuffmanTable;
@@ -12,14 +14,19 @@ use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 
-/// A block level decoding buffer.
-pub struct DecoderScratch {
+/// A block level decoding buffer, parameterised over the output
+/// storage backend ([`BufferBackend`]). Default `RingBuffer` keeps
+/// the historical API; `DecoderScratch<FlatBuf>` is instantiated by
+/// [`super::frame_decoder::FrameDecoder`] (via `DecoderScratchKind`)
+/// when the frame's `Single_Segment_flag` is set — see backlog item
+/// #132.
+pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     /// The decoder used for Huffman blocks.
     pub huf: HuffmanScratch,
     /// The decoder used for FSE blocks.
     pub fse: FSEScratch,
 
-    pub buffer: DecodeBuffer,
+    pub buffer: DecodeBuffer<B>,
     pub offset_hist: [u32; 3],
 
     pub literals_buffer: Vec<u8>,
@@ -27,8 +34,8 @@ pub struct DecoderScratch {
     pub block_content_buffer: Vec<u8>,
 }
 
-impl DecoderScratch {
-    pub fn new(window_size: usize) -> DecoderScratch {
+impl<B: BufferBackend> DecoderScratch<B> {
+    pub fn new(window_size: usize) -> DecoderScratch<B> {
         DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),

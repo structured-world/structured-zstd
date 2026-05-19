@@ -38,8 +38,16 @@ pub use frame_decoder::{BlockDecodingStrategy, FrameDecoder};
 pub use streaming_decoder::StreamingDecoder;
 
 pub(crate) mod block_decoder;
+pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
+// FlatBuf is the compile-time-monomorphised "frame fits in window"
+// backend selected via `DecodeBuffer<FlatBuf>`. `FrameDecoder`'s
+// `DecoderScratchKind` picks it when the frame header has
+// `Single_Segment_flag` set; the ring backend remains the default
+// for multi-segment frames. See backlog item #132 for the wiring
+// rationale.
+pub(crate) mod flat_buf;
 pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
 pub(crate) mod prefetch;
