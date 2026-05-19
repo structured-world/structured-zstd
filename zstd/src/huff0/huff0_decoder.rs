@@ -207,13 +207,15 @@ impl<'t> HuffmanDecoder<'t> {
         // inner `cfg(target_arch = "aarch64")` arm would be dead
         // (outer x86 cfg already false on aarch64).
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        match self.kernel {
-            HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
-            HuffmanDecodeKernel::X86Bmi2
-            | HuffmanDecodeKernel::X86Avx2
-            | HuffmanDecodeKernel::X86Vbmi2 => {
-                // SAFETY: This path is selected only after runtime/static feature checks.
-                unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
+        {
+            match self.kernel {
+                HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
+                HuffmanDecodeKernel::X86Bmi2
+                | HuffmanDecodeKernel::X86Avx2
+                | HuffmanDecodeKernel::X86Vbmi2 => {
+                    // SAFETY: This path is selected only after runtime/static feature checks.
+                    unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
+                }
             }
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
