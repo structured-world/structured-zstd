@@ -25,11 +25,11 @@ use alloc::vec::Vec;
 /// Falls back to the legacy two-pass pipeline (`decode_sequences` +
 /// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
 /// is rare on perf-relevant corpora and not worth duplicating.
-pub fn decode_and_execute_sequences(
+pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
     rle_fallback_sequences: &mut Vec<Sequence>,
@@ -109,8 +109,8 @@ pub fn decode_and_execute_sequences(
     let saved_offset_hist = *offset_hist;
 
     #[inline(always)]
-    fn execute_one_sequence(
-        buffer: &mut super::decode_buffer::DecodeBuffer,
+    fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
+        buffer: &mut super::decode_buffer::DecodeBuffer<B>,
         literals: &[u8],
         lit_cur: &mut usize,
         lit_len: usize,

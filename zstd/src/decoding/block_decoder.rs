@@ -41,10 +41,10 @@ impl BlockDecoder {
     /// The decode buffer inside `workspace` may be reserved or grown during
     /// decoding. For some block types the decompressed size is known up front,
     /// but this is not guaranteed before any data is written.
-    pub fn decode_block_content(
+    pub fn decode_block_content<B: super::buffer_backend::BufferBackend>(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch,
+        workspace: &mut DecoderScratch<B>,
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {
@@ -106,10 +106,10 @@ impl BlockDecoder {
         }
     }
 
-    fn decompress_block(
+    fn decompress_block<B: super::buffer_backend::BufferBackend>(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch<B>, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
         workspace
