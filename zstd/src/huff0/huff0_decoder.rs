@@ -194,9 +194,15 @@ impl<'t> HuffmanDecoder<'t> {
     /// Decode symbol and advance state in one table lookup.
     #[inline(always)]
     pub fn decode_symbol_and_advance(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
+        // On x86 the BMI2 kernel uses `_bzhi_u64` and is a real
+        // perf win over the scalar `((state << n) & mask) | new_bits`
+        // sequence, so the runtime match is load-bearing. On aarch64
+        // both NEON and SVE arms previously aliased the scalar body
+        // verbatim — the match was paying a 3-arm dispatch cost for
+        // zero benefit. Collapsed to a direct scalar call there.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         match self.kernel {
             HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HuffmanDecodeKernel::X86Bmi2
             | HuffmanDecodeKernel::X86Avx2
             | HuffmanDecodeKernel::X86Vbmi2 => {
@@ -204,9 +210,11 @@ impl<'t> HuffmanDecoder<'t> {
                 unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
             }
             #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Neon => self.decode_symbol_and_advance_aarch64_neon(br),
-            #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Sve => self.decode_symbol_and_advance_aarch64_sve(br),
+            HuffmanDecodeKernel::Aarch64Neon | HuffmanDecodeKernel::Aarch64Sve => unreachable!(),
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            self.decode_symbol_and_advance_scalar(br)
         }
     }
 
@@ -513,21 +521,14 @@ impl<'t> HuffmanDecoder<'t> {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    fn decode_symbol_and_advance_aarch64_neon(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let entry = self.table.decode[self.state as usize];
-        let new_bits = br.get_bits(entry.num_bits);
-        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
-        entry.symbol
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn decode_symbol_and_advance_aarch64_sve(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
-        let entry = self.table.decode[self.state as usize];
-        let new_bits = br.get_bits(entry.num_bits);
-        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
-        entry.symbol
-    }
+    // aarch64 NEON / SVE kernels for `decode_symbol_and_advance` were
+    // identical clones of the scalar body — no NEON/SVE intrinsics
+    // were ever in use here (the SIMD kernels live in `decode4_*`
+    // below, where they actually batch four streams). The aarch64
+    // arm of `decode_symbol_and_advance` now calls
+    // `decode_symbol_and_advance_scalar` directly; keeping the
+    // duplicate functions around just so the match could enumerate
+    // them was dead code.
 }
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values

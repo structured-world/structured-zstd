@@ -406,11 +406,14 @@ const fn pack_code_meta<const N: usize>(bases: &[u32; N], extra_bits: &[u8; N]) 
     let mut out = [0u32; N];
     let mut i = 0;
     while i < N {
-        // baseline fits in 24 bits (max LL/ML baseline is 65539);
-        // extra_bits fits in 8 bits (max 16). Pack high 8 bits =
-        // extra_bits, low 24 bits = baseline. Assertions live below
-        // (in the lookup helpers, where bounds are checked on every
-        // call) and at build time (`debug_assert` on the call sites).
+        // Compile-time gate: keep the high 8 bits of `bases[i]`
+        // available for the packed extra_bits field, and keep
+        // extra_bits within the Zstandard format limit (max 16 bits
+        // per §3.1.1.3.2.1.1). Any spec extension that violates
+        // either invariant fails the build instead of silently
+        // clobbering the packed payload.
+        assert!(bases[i] & 0xFF00_0000 == 0, "baseline must fit in 24 bits");
+        assert!(extra_bits[i] <= 16, "extra_bits exceeds zstd format limit");
         out[i] = bases[i] | ((extra_bits[i] as u32) << 24);
         i += 1;
     }
