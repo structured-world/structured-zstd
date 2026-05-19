@@ -460,10 +460,21 @@ impl RingBuffer {
     /// Copies data from the provided range to the end of the buffer, without
     /// first verifying that the unoccupied capacity is available.
     ///
+    /// `#[inline]` is load-bearing: this is the hottest call from
+    /// `DecodeBuffer::repeat` (match-copy on every non-repcode, non-
+    /// overlapping sequence). Without it, the compiler cannot fold the
+    /// `head < tail` flat-layout fast path into the caller and the
+    /// per-block decode pays a real function-call hop. For frames that
+    /// fit in the window (the dominant case — Fast-encoded blocks
+    /// especially), this is the difference between one inlined SIMD
+    /// copy and a non-inlined dispatch through `free_slice_parts`-shape
+    /// branches.
+    ///
     /// SAFETY:
     /// For this to be safe two requirements need to hold:
     /// 1. start + len <= self.len() so we do not copy uninitialised memory
     /// 2. More then len reserved space so we do not write out-of-bounds
+    #[inline]
     #[warn(unsafe_op_in_unsafe_fn)]
     pub unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         debug_assert!(start + len <= self.len());
@@ -736,6 +747,7 @@ impl RingBuffer {
     /// SAFETY:
     /// Needs start + len <= self.len()
     /// And more then len reserved space
+    #[inline]
     pub unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
         // SAFETY: caller guarantees the source range is valid and enough free
         // space exists; the raw-pointer arithmetic and copy stay within those bounds.
