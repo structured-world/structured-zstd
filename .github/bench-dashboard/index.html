@@ -260,17 +260,22 @@
       <section class="card" style="margin-top: 14px">
         <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (compress + decompress + ratio)</h2>
         <p style="font-size: 0.9rem">
-          Six lines for a single snapshot, X-axis stepped by compression level:
-          Rust vs FFI compression speed (left axis), Rust vs FFI decompression
-          speed (left axis), and Rust vs FFI output ratio (right axis,
+          Six lines plotted against compression level on the X-axis: Rust vs
+          FFI compression speed (left axis), Rust vs FFI decompression speed
+          (left axis), and Rust vs FFI output ratio (right axis,
           <code>compressed/input</code>, lower=better). Controlled by the
           <strong>Target</strong>, <strong>Scenario</strong>, and
           <strong>Level</strong> selectors at the top of the page (default
           <code>all</code> = cumulative arithmetic mean across that dimension).
-          Decompress rows are additionally averaged across both
-          <code>source</code> variants (<code>rust_stream</code> +
-          <code>c_stream</code>) per side, giving one deterministic data point
-          per (level, side) regardless of bench iteration order.
+          The <strong>Snapshot</strong> dropdown either pins all six lines to
+          one <code>generated_at</code> run, or — on the default
+          <code>latest</code> setting — picks each (level, metric) point from
+          the most recent snapshot of its own cohort independently, so points
+          can come from different snapshots across the X-axis. Decompress rows
+          are additionally averaged across both <code>source</code> variants
+          (<code>rust_stream</code> + <code>c_stream</code>) per side, giving
+          one deterministic data point per (level, side) regardless of bench
+          iteration order.
         </p>
         <div class="filters">
           <label>Snapshot
@@ -1203,8 +1208,8 @@
           return;
         }
         const snapshotNote = filter.snapshot === PROFILE_LATEST
-          ? "latest per level"
-          : `snapshot=${filter.snapshot}`;
+          ? "latest per (level, metric, cohort) — points may come from different snapshots"
+          : `snapshot=${filter.snapshot} (all points from this single run)`;
         el("profile-status").textContent =
           `Showing ${levelCount} level point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
 
