@@ -2223,4 +2223,49 @@ mod tests {
         decoder.collect_to_writer(&mut decoded).unwrap();
         assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
     }
+
+    /// Regression: `set_compression_level` followed by `compress()` must
+    /// refresh `state.strategy_tag` through the reset-time sync so the
+    /// literal-compression gates (`min_literals_to_compress`,
+    /// `min_gain`) use the NEW level's strategy. Picks a level pair that
+    /// crosses strategy bands (Fastest=Fast band → Best=BtUltra2 band)
+    /// so a missed sync would leave the construction-time tag visible
+    /// and trip the assertion.
+    #[cfg(feature = "std")]
+    #[test]
+    fn set_compression_level_then_compress_refreshes_strategy_tag() {
+        use super::CompressionLevel;
+        use crate::encoding::strategy::StrategyTag;
+
+        let data = vec![0xABu8; 256];
+        let mut out = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        let initial_tag = compressor.state.strategy_tag;
+        assert_eq!(
+            initial_tag,
+            StrategyTag::for_compression_level(CompressionLevel::Fastest),
+            "construction-time strategy_tag must reflect initial level",
+        );
+
+        // Switch to a level whose resolved strategy lives in a different
+        // band, then run a full compress cycle — the matcher.reset()
+        // inside `compress` is the only site that can refresh the tag.
+        compressor.set_compression_level(CompressionLevel::Best);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut out);
+        compressor.compress();
+
+        let new_tag = compressor.state.strategy_tag;
+        let expected = StrategyTag::for_compression_level(CompressionLevel::Best);
+        assert_eq!(
+            new_tag, expected,
+            "strategy_tag must follow set_compression_level → compress, \
+             got {new_tag:?} expected {expected:?}",
+        );
+        assert_ne!(
+            new_tag, initial_tag,
+            "test fixture invariant: chosen levels must resolve to \
+             different StrategyTag variants",
+        );
+    }
 }
