@@ -377,12 +377,16 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     let strategy = state.strategy_tag;
     let has_huf_table = state.last_huff_table.is_some();
     let min_lits = min_literals_to_compress(strategy, has_huf_table);
-    // RLE keeps a separate `>= 8 + all_bytes_identical` gate: donor's
-    // `cLitSize == 1` RLE-detection path (`zstd_compress_literals.c:192-201`)
-    // fires after the compress attempt, but our pre-check is cheaper and
-    // produces the same RLE block for `len >= 8 && all_identical`. RLE
-    // for sub-8-byte all-identical inputs goes through the raw path in
-    // both donor (`srcSize < 8` arm) and us — same wire output.
+    // RLE pre-check: donor `compress_literals` reaches RLE through
+    // `cLitSize == 1` after a full compress attempt
+    // (`zstd_compress_literals.c:192-201`), but only AFTER passing the
+    // `min_lits` gate — so donor at fast/dfast/greedy/lazy emits raw
+    // for 8..63 all-identical inputs. Our pre-check fires earlier and
+    // emits the smaller RLE block instead (2 bytes vs `1+len` raw): a
+    // strict win in compressed size on all-identical sections, no
+    // donor binary parity but better ratio. Note the order — RLE
+    // pre-check runs BEFORE `min_lits`. `estimate_literals_section_bytes`
+    // mirrors this order so probe costs match emit byte-for-byte.
     if literals_vec.len() >= 8 && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
         state.last_huff_table = None;
@@ -526,21 +530,22 @@ fn estimate_literals_section_bytes(
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> usize {
-    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches.
+    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
+    // **in the same order**. The emitter checks the RLE pre-shortcut
+    // (`len >= 8 && all_identical`) BEFORE the `min_lits` gate, so an
+    // all-identical 8-byte literal section emits a 2-byte RLE block under
+    // any strategy — including fast/dfast/greedy/lazy where `min_lits == 64`.
+    // If estimator gated `min_lits` first, it would predict a raw block
+    // for those inputs while the emitter writes RLE, biasing splitter
+    // probe costs. Keep the order identical to emit.
+    if literals.len() >= 8 && all_bytes_identical(literals) {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + 1;
+    }
     let min_lits = min_literals_to_compress(strategy, last_huff.is_some());
     if literals.len() < min_lits {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    }
-    // Mirror emit's RLE gate exactly: emitter only emits RLE when
-    // `len >= 8 && all_identical` (see comment at the RLE branch above).
-    // With reused HUF tables `min_lits == 6`, so a bare `all_identical`
-    // check here would have estimator predict a 1-byte RLE payload for
-    // 6-7 byte all-identical literals that the emitter would actually
-    // write as raw — splitter probe costs drift from real emit output.
-    if literals.len() >= 8 && all_bytes_identical(literals) {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + 1;
     }
 
     counts.fill(0);
@@ -1782,9 +1787,11 @@ mod tests {
 
     use super::{
         FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_match_len,
-        encode_offset_with_history, previous_table, remember_last_used_tables,
+        encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
+        remember_last_used_tables,
     };
     use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
+    use crate::encoding::strategy::StrategyTag;
     use crate::fse::fse_encoder::build_table_from_symbol_counts;
     use alloc::vec::Vec;
 
@@ -1822,6 +1829,113 @@ mod tests {
         let mut hist = [10, 20, 30];
         assert_eq!(encode_offset_with_history(9, 0, &mut hist), 3);
         assert_eq!(hist, [9, 10, 20]);
+    }
+
+    #[test]
+    fn min_literals_to_compress_matches_donor_table() {
+        for strat in [
+            StrategyTag::Fast,
+            StrategyTag::Dfast,
+            StrategyTag::Greedy,
+            StrategyTag::Lazy,
+        ] {
+            assert_eq!(min_literals_to_compress(strat, false), 64);
+            assert_eq!(min_literals_to_compress(strat, true), 6);
+        }
+        assert_eq!(min_literals_to_compress(StrategyTag::BtOpt, false), 32);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtOpt, true), 6);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra, false), 16);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra, true), 6);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra2, false), 8);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra2, true), 6);
+    }
+
+    #[test]
+    fn min_gain_matches_donor_margin() {
+        let src = 4096usize;
+        for strat in [
+            StrategyTag::Fast,
+            StrategyTag::Dfast,
+            StrategyTag::Greedy,
+            StrategyTag::Lazy,
+            StrategyTag::BtOpt,
+        ] {
+            assert_eq!(min_gain(src, strat), (src >> 6) + 2);
+        }
+        assert_eq!(min_gain(src, StrategyTag::BtUltra), (src >> 7) + 2);
+        assert_eq!(min_gain(src, StrategyTag::BtUltra2), (src >> 8) + 2);
+        assert_eq!(min_gain(0, StrategyTag::Fast), 2);
+        assert_eq!(min_gain(63, StrategyTag::Fast), 2);
+        assert_eq!(min_gain(64, StrategyTag::Fast), 3);
+    }
+
+    #[test]
+    fn estimator_literals_section_mirrors_emit_for_short_inputs() {
+        use super::{
+            CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
+            encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        };
+        // For each strategy at boundary literal lengths around `min_lits`
+        // and across the RLE pre-check `>= 8` cliff, estimator's predicted
+        // size MUST equal the bytes the emitter actually writes.
+        let cases: &[(StrategyTag, &[(usize, bool)])] = &[
+            (
+                StrategyTag::Fast,
+                &[(8, true), (8, false), (63, true), (63, false), (64, false)],
+            ),
+            (
+                StrategyTag::BtUltra2,
+                &[(7, true), (7, false), (8, true), (8, false), (16, false)],
+            ),
+            (StrategyTag::BtOpt, &[(8, true), (31, true), (32, false)]),
+        ];
+
+        for (strat, inputs) in cases {
+            for (len, identical) in *inputs {
+                let literals: Vec<u8> = if *identical {
+                    alloc::vec![0x5Au8; *len]
+                } else {
+                    (0..*len as u8).collect()
+                };
+                let mut est_state = CompressState::<EntropyOnlyMatcher> {
+                    matcher: EntropyOnlyMatcher,
+                    last_huff_table: None,
+                    fse_tables: FseTables::new(),
+                    block_scratch: CompressedBlockScratch::new(),
+                    offset_hist: [1, 4, 8],
+                    strategy_tag: *strat,
+                };
+                let mut emit_state = CompressState::<EntropyOnlyMatcher> {
+                    matcher: EntropyOnlyMatcher,
+                    last_huff_table: None,
+                    fse_tables: FseTables::new(),
+                    block_scratch: CompressedBlockScratch::new(),
+                    offset_hist: [1, 4, 8],
+                    strategy_tag: *strat,
+                };
+                let mut workspace = EstimatorWorkspace::default();
+                let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+                let mut emitted: Vec<u8> = Vec::new();
+                let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
+                encode_block_parts_with_sequence_scratch(
+                    &mut emit_state,
+                    &literals,
+                    &[],
+                    &mut emitted,
+                    &mut scratch,
+                );
+                assert_eq!(
+                    est,
+                    emitted.len(),
+                    "estimator/emit parity broken: strategy={:?} len={} identical={} est={} emit={}",
+                    strat,
+                    len,
+                    identical,
+                    est,
+                    emitted.len(),
+                );
+            }
+        }
     }
 
     #[test]
