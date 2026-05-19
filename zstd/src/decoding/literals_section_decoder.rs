@@ -158,6 +158,87 @@ fn decompress_literals(
         } else {
             Decode4Mode::Checked
         };
+
+        // Donor-parity burst: decode `SYMBOLS_PER_BURST` symbols per stream
+        // (× 4 streams = `4 * SYMBOLS_PER_BURST` symbols per outer iteration)
+        // between bit-reader refill checks. Mirrors
+        // `HUF_DECODEFAST_4X1_LOOP_SYM = 5` in
+        // `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`.
+        //
+        // Burst size is computed so the maximum bits consumed per stream
+        // across one burst is `SYMBOLS_PER_BURST * max_num_bits <= 56`,
+        // matching the `BitReaderReversed::ensure_bits(n <= 56)` contract.
+        // For the dominant HUF table widths (`max_num_bits <= 11`) this
+        // selects 5; for the rare 12-bit literal tables it backs off to 4.
+        // `max_num_bits.max(1)` guards the degenerate zero-table case
+        // (compressed literal sections with `max_num_bits == 0` decode to
+        // empty output via the tail loop anyway).
+        let max_num_bits = scratch.table.max_num_bits.max(1);
+        let symbols_per_burst: usize = (56 / max_num_bits as usize).max(1);
+        let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
+        let burst_bits_isize = burst_bits as isize;
+
+        // Per-stream bound used to decide whether the next burst can fit
+        // entirely inside the bit budget. Donor uses an explicit
+        // pre-computed `olimit`; the `bits_remaining > burst_bits_isize`
+        // check here serves the same role — the burst can consume at most
+        // `burst_bits` per stream and we want at least `max_bits` left
+        // over so the tail loop has a clean termination condition.
+        while brs[0].bits_remaining() > burst_bits_isize
+            && brs[1].bits_remaining() > burst_bits_isize
+            && brs[2].bits_remaining() > burst_bits_isize
+            && brs[3].bits_remaining() > burst_bits_isize
+            && cursors[0] + symbols_per_burst <= ends[0]
+            && cursors[1] + symbols_per_burst <= ends[1]
+            && cursors[2] + symbols_per_burst <= ends[2]
+            && cursors[3] + symbols_per_burst <= ends[3]
+        {
+            // Single refill check per stream per burst — drops the per-call
+            // `bits_consumed + n > 64` branch that `get_bits` performs
+            // inside `advance_state_by_bits`. Donor `HUF_4X1_RELOAD_STREAM`
+            // (huf_decompress.c:795-804) does the equivalent at the end of
+            // each 5-symbol burst.
+            brs[0].ensure_bits(burst_bits);
+            brs[1].ensure_bits(burst_bits);
+            brs[2].ensure_bits(burst_bits);
+            brs[3].ensure_bits(burst_bits);
+
+            for _ in 0..symbols_per_burst {
+                let (symbols, bits) = match decode4_mode {
+                    Decode4Mode::Unchecked => {
+                        // SAFETY: guarded by decode4_has_shared_table_and_kernel above.
+                        unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
+                    }
+                    Decode4Mode::Checked => HuffmanDecoder::decode4_symbols_and_num_bits(&decoders),
+                };
+
+                target[cursors[0]] = symbols[0];
+                target[cursors[1]] = symbols[1];
+                target[cursors[2]] = symbols[2];
+                target[cursors[3]] = symbols[3];
+                cursors[0] += 1;
+                cursors[1] += 1;
+                cursors[2] += 1;
+                cursors[3] += 1;
+
+                // _unchecked: the burst-level ensure_bits above already
+                // covers `symbols_per_burst * max_num_bits` bits per stream
+                // and each `bits[i]` is `<= max_num_bits`, so cumulative
+                // consumption inside the burst can never exceed the ensured
+                // budget.
+                decoders[0].advance_state_by_bits_unchecked(&mut brs[0], bits[0]);
+                decoders[1].advance_state_by_bits_unchecked(&mut brs[1], bits[1]);
+                decoders[2].advance_state_by_bits_unchecked(&mut brs[2], bits[2]);
+                decoders[3].advance_state_by_bits_unchecked(&mut brs[3], bits[3]);
+            }
+        }
+
+        // Spill-over: a few symbols may still fit in each stream after the
+        // last burst exits its bound check (e.g. cursors close to ends, or
+        // a stream's bit budget dropped just under `burst_bits` while the
+        // others still had room). Walk one symbol at a time using the
+        // checked path until each stream individually trips its termination
+        // condition.
         while brs[0].bits_remaining() > -max_bits
             && brs[1].bits_remaining() > -max_bits
             && brs[2].bits_remaining() > -max_bits

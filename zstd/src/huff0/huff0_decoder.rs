@@ -240,6 +240,28 @@ impl<'t> HuffmanDecoder<'t> {
     #[inline(always)]
     pub(crate) fn advance_state_by_bits(&mut self, br: &mut BitReaderReversed<'_>, num_bits: u8) {
         let new_bits = br.get_bits(num_bits);
+        self.advance_state_from_bits(num_bits, new_bits);
+    }
+
+    /// Advance state without invoking a refill check on the bit reader.
+    ///
+    /// The caller MUST have ensured (via `br.ensure_bits(sum_of_num_bits)`)
+    /// that the reader holds enough bits to satisfy every unchecked read
+    /// across the burst. Used by the 5-symbols-per-stream HUF unroll —
+    /// donor parity with `HUF_4X1_DECODE_SYMBOL` inside
+    /// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`.
+    #[inline(always)]
+    pub(crate) fn advance_state_by_bits_unchecked(
+        &mut self,
+        br: &mut BitReaderReversed<'_>,
+        num_bits: u8,
+    ) {
+        let new_bits = br.get_bits_unchecked(num_bits);
+        self.advance_state_from_bits(num_bits, new_bits);
+    }
+
+    #[inline(always)]
+    fn advance_state_from_bits(&mut self, num_bits: u8, new_bits: u64) {
         match self.kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HuffmanDecodeKernel::X86Bmi2
