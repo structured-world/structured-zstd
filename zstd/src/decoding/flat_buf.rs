@@ -61,17 +61,25 @@ impl BufferBackend for FlatBuf {
 
     #[inline]
     fn reserve(&mut self, n: usize) {
-        // `Vec::reserve(additional)` is "additional bytes beyond len",
-        // not "delta from capacity" — compute the gap correctly so an
-        // allocation does happen when len < capacity < len+n. The
-        // previous shape silently under-reserved on that case and
-        // could leave fewer than `n` writable bytes available to a
-        // subsequent unsafe extend.
-        let available = self.buf.capacity().saturating_sub(self.buf.len());
-        if available < n {
-            self.buf
-                .reserve((n - available).saturating_add(WILDCOPY_OVERLENGTH));
-        }
+        // `Vec::reserve(additional)` guarantees
+        // `capacity >= len + additional`; passing
+        // `n + WILDCOPY_OVERLENGTH` is the exact contract callers
+        // need (room for `n` bytes plus the SIMD overshoot slack).
+        //
+        // Previous attempts computed the reserve amount as
+        // `(n - available)` or `(needed - capacity)`, both of which
+        // under-reserve when `len > 0`. Concrete repro: on a
+        // multi-frame stream where frame 2 has `window_size > frame
+        // 1's capacity` and `len == 0` post-reset, `available ==
+        // old_capacity`, so `additional = (n - old_capacity) +
+        // slack`; `Vec::reserve` then only ensures
+        // `new_capacity >= len + additional = (n - old_capacity) +
+        // slack`, which is short by `old_capacity`. Subsequent
+        // `extend_from_within_unchecked` then panicked on the
+        // `dst_off + len <= capacity` debug assert.
+        // libFuzzer artifact crash-e33ba082… exercises exactly that
+        // shape.
+        self.buf.reserve(n.saturating_add(WILDCOPY_OVERLENGTH));
     }
 
     #[inline]
