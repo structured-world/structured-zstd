@@ -262,9 +262,11 @@
         <p style="font-size: 0.9rem">
           Six lines per scenario for a single snapshot, X-axis stepped by compression
           level: Rust vs FFI compression speed (left axis), Rust vs FFI decompression
-          speed (left axis), and Rust vs FFI compression ratio (right axis). Decompress
-          rows collapse across <code>source</code> values — strategy comparison only
-          cares about the (level, stage) pair, not the bench's internal stream variant.
+          speed (left axis), and Rust vs FFI output ratio (right axis,
+          <code>compressed/input</code>, lower=better). Decompress rows are averaged
+          across both <code>source</code> variants (<code>rust_stream</code> +
+          <code>c_stream</code>) per side, giving one deterministic data point per
+          (level, side) regardless of bench iteration order.
         </p>
         <div class="filters">
           <label>Target
@@ -894,6 +896,17 @@
           return null;
         };
 
+        // For each (level, logical-metric) we accumulate ALL matching
+        // rows and average the Rust + FFI values per side. This matters
+        // for decompress: the bench emits two source variants
+        // (`rust_stream` and `c_stream`) per (level, snapshot) which
+        // measure decompressing differently-encoded inputs. Picking the
+        // "first" one would silently surface c_stream-only or
+        // rust_stream-only numbers depending on iteration order;
+        // averaging gives a deterministic, fair Rust/FFI comparison
+        // that doesn't depend on which stream variant arrives first.
+        // For compress and ratio there is only one source per (level,
+        // snapshot), so the mean degenerates to the single observation.
         const byLevelLogical = new Map();
         for (const row of state.records) {
           if (!matchesFilter(row)) continue;
@@ -901,14 +914,18 @@
           const lm = logicalMetric(row);
           if (!lm) continue;
           const key = `${row.level}|${lm}`;
-          const existing = byLevelLogical.get(key);
-          if (!existing || compareByGeneratedAt(row, existing) > 0) {
-            byLevelLogical.set(key, row);
+          let agg = byLevelLogical.get(key);
+          if (!agg) {
+            agg = { level: row.level, rust_sum: 0, ffi_sum: 0, count: 0 };
+            byLevelLogical.set(key, agg);
           }
+          agg.rust_sum += row.rust_value;
+          agg.ffi_sum += row.ffi_value;
+          agg.count += 1;
         }
 
         const levelSet = new Set();
-        for (const row of byLevelLogical.values()) levelSet.add(row.level);
+        for (const agg of byLevelLogical.values()) levelSet.add(agg.level);
         const levels = Array.from(levelSet)
           .map((value) => ({ value, parsed: parseLevelId(value) }))
           .sort((a, b) => {
@@ -924,13 +941,14 @@
 
         // Speed records carry bytes/sec; convert to MiB/s for axis legibility.
         const lookup = (level, lm, side) => {
-          const row = byLevelLogical.get(`${level}|${lm}`);
-          if (!row) return null;
-          const raw = side === "rust" ? row.rust_value : row.ffi_value;
+          const agg = byLevelLogical.get(`${level}|${lm}`);
+          if (!agg || agg.count === 0) return null;
+          const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
+          const mean = sum / agg.count;
           if (lm === "compress_speed" || lm === "decompress_speed") {
-            return raw / (1024 * 1024);
+            return mean / (1024 * 1024);
           }
-          return raw;
+          return mean;
         };
 
         const series = (lm, side) =>
