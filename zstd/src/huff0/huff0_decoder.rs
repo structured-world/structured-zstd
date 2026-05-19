@@ -546,8 +546,16 @@ impl<'t> HuffmanDecoder<'t> {
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
-    decode: Vec<Entry>,
-    packed_decode: Vec<u32>,
+    /// `pub(crate)` for direct indexing on the HUF 4-stream burst hot
+    /// path (donor parity with `huf_decompress.c:HUF_4X1_DECODE_SYMBOL`):
+    /// the literals decoder reads `decode[bits >> shift]` once per
+    /// symbol per stream without going through a getter.
+    pub(crate) decode: Vec<Entry>,
+    /// Packed `symbol | (num_bits << 8)` per state index.
+    /// `pub(crate)` — same rationale as [`Self::decode`]: the HUF
+    /// 4-stream burst hot path indexes this directly for a single-load
+    /// table lookup matching donor `huf_decompress.c:dtable[index]`.
+    pub(crate) packed_decode: Vec<u32>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
@@ -914,9 +922,13 @@ impl Default for HuffmanTable {
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
     /// The byte that the prefix code replaces during encoding.
-    symbol: u8,
+    ///
+    /// `pub(crate)` so the HUF 4-stream burst hot path in
+    /// `literals_section_decoder` can read the field directly via
+    /// `decode[idx].symbol` without going through an accessor.
+    pub(crate) symbol: u8,
     /// The number of bits the prefix code occupies.
-    num_bits: u8,
+    pub(crate) num_bits: u8,
 }
 
 /// Assert that the provided value is greater than zero, and returns the

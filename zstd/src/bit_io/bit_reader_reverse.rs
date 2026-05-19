@@ -156,7 +156,16 @@ pub struct BitReaderReversed<'s> {
     index: usize,
 
     /// How many bits have been consumed from `bit_container`.
-    bits_consumed: u8,
+    ///
+    /// `pub(crate)` so the HUF 4-stream hot loop in
+    /// `decoding::literals_section_decoder` can lift the reader state
+    /// into a local `bits[4]` register layout (donor parity with
+    /// `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`):
+    /// inside the burst, all symbol-decode work happens against a
+    /// `bits[s]` u64 that fuses the decoder state with pending input
+    /// bits, and the field is written back only at the burst boundary.
+    /// Outside the burst the field is treated as opaque internal state.
+    pub(crate) bits_consumed: u8,
 
     /// How many bits have been consumed past the end of the input. Will be zero until all the input
     /// has been read.
@@ -167,7 +176,9 @@ pub struct BitReaderReversed<'s> {
 
     /// The reader doesn't read directly from the source, it reads bits from here, and the container
     /// is "refilled" as it's emptied.
-    bit_container: u64,
+    ///
+    /// `pub(crate)` — see [`Self::bits_consumed`] for the rationale.
+    pub(crate) bit_container: u64,
 }
 
 impl<'s> BitReaderReversed<'s> {
