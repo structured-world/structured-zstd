@@ -97,6 +97,7 @@ impl DecodeBuffer {
         Ok(())
     }
 
+    #[inline]
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
