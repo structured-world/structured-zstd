@@ -57,6 +57,15 @@ impl RingBuffer {
         x + y
     }
 
+    /// Current allocation capacity. Paired with `tail()` in
+    /// `DecodeBuffer::checkpoint` so `restore_checkpoint` can detect an
+    /// intervening reallocation (which compacts data and invalidates
+    /// previously-captured tail indices).
+    #[inline]
+    pub(super) fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// Current write cursor, used by `DecodeBuffer::checkpoint` to record a
     /// rollback point before speculative writes.
     #[inline]
