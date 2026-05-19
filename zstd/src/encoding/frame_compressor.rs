@@ -394,10 +394,16 @@ pub(crate) struct CompressState<M: Matcher> {
     /// `matcher.reset()` call. Used by the literal-compression gates
     /// (`min_literals_to_compress`, `min_gain`) in
     /// `encoding::blocks::compressed` to mirror donor's strategy-aware
-    /// thresholds (`zstd_compress_literals.c:114-127, 187-188`). Defaults
-    /// to `Fast` so a `CompressState` constructed without an explicit
-    /// reset still has a valid value (matches the level-1 default donor
-    /// would emit for `disableLiteralCompression == 0`).
+    /// thresholds (`zstd_compress_literals.c:114-127, 187-188`).
+    ///
+    /// **Invariant (required of every construction site):** must be
+    /// initialized from the active `CompressionLevel` via
+    /// `StrategyTag::for_compression_level`, and re-synced on every
+    /// `matcher.reset()` so the level-aware gates stay correct after
+    /// a level change. There is no `Default` impl — production paths
+    /// (`FrameCompressor::new`, `new_with_matcher`, the streaming
+    /// encoder constructor) plumb this explicitly. Tests that build
+    /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
 }
 

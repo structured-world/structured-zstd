@@ -560,10 +560,12 @@ fn estimate_literals_section_bytes(
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
     // **in the same order**. The emitter pre-checks `all_identical`
-    // (any non-empty section) BEFORE the `min_lits` gate — RLE is
-    // unconditionally smaller than raw on all-identical inputs, so it
-    // is selected regardless of strategy. Estimator must use the same
-    // ordering and predicate so probe costs match emit byte-for-byte.
+    // (any non-empty section) BEFORE the `min_lits` gate — on
+    // all-identical inputs RLE is equal to raw at `len == 1` (both
+    // 2 bytes) and strictly smaller for `len >= 2`, so it is never
+    // worse than raw and is selected regardless of strategy. Estimator
+    // must use the same ordering and predicate so probe costs match
+    // emit byte-for-byte.
     if !literals.is_empty() && all_bytes_identical(literals) {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + 1;
