@@ -172,6 +172,13 @@ impl RingBuffer {
         }
     }
     /// Append the provided data to the end of `self`.
+    ///
+    /// `#[inline]` so the flat fast path below folds into the hot
+    /// `execute_sequences` -> `DecodeBuffer::push` -> here chain. After the
+    /// flat-extend refactor most calls return in ~5 instructions plus the
+    /// inline copy; keeping a separate stack frame for that work was a
+    /// noticeable fraction of the function-call overhead per literal push.
+    #[inline]
     pub fn extend(&mut self, data: &[u8]) {
         let len = data.len();
         let ptr = data.as_ptr();
