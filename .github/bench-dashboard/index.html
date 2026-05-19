@@ -619,6 +619,25 @@
         return rows.reduce((latest, row) => (compareByGeneratedAt(row, latest) > 0 ? row : latest));
       }
 
+      // Profile-chart "latest snapshot" selection uses this comparator
+      // instead of `compareByGeneratedAt` so it stays consistent with
+      // the snapshot identity defined by `snapshotLabel()`
+      // (`generated_at || commit_sha || "local-run"`). When records
+      // lack a parseable `generated_at`, raw `compareByGeneratedAt`
+      // returns 0 between any two such rows and the "latest" pick
+      // becomes arbitrary across runs; subsequent filtering by
+      // `sameSnapshotLabel` would then keep an inconsistent cohort.
+      // Falling back to lexicographic `commit_sha` order gives the
+      // same input the same winner every time — not chronologically
+      // meaningful, but deterministic, which is the property we need.
+      function compareSnapshotIdentity(a, b) {
+        const ts = compareByGeneratedAt(a, b);
+        if (ts !== 0) return ts;
+        const aSha = a.commit_sha || "";
+        const bSha = b.commit_sha || "";
+        return aSha.localeCompare(bSha);
+      }
+
       function setStatusText(message, className) {
         const status = el("status");
         status.replaceChildren(document.createTextNode(message));
@@ -992,7 +1011,7 @@
           matchingRows.push({ row, lm, key, latestKey });
           if (filter.snapshot === PROFILE_LATEST) {
             const previous = latestPerKey.get(latestKey);
-            if (!previous || compareByGeneratedAt(row, previous) > 0) {
+            if (!previous || compareSnapshotIdentity(row, previous) > 0) {
               latestPerKey.set(latestKey, row);
             }
           }
