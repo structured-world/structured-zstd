@@ -42,7 +42,22 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     {
-        value & BIT_MASK[n as usize]
+        // Compute the mask via `u64::MAX >> (64 - n)` instead of a
+        // `BIT_MASK[n]` table load. One shift + one (predicted) cmov
+        // vs one L1 load (3-5 cycle latency). For the hot FSE bitstream
+        // decode path this fires 3x per sequence; saving the load
+        // latency per call compounds over thousands of sequences.
+        //
+        // `checked_shr` returns `None` when the shift count is ≥ 64,
+        // which happens exactly when `n == 0` (`64 - 0 = 64`) or when
+        // the debug_assert above would have fired (`n > 64`, underflow
+        // wraps to a huge value). Mapping both to `0` gives the
+        // mathematically-correct empty mask for n=0 and a safe-ish
+        // fallback for the invalid range.
+        let mask = u64::MAX
+            .checked_shr(64u32.wrapping_sub(n as u32))
+            .unwrap_or(0);
+        value & mask
     }
 }
 
