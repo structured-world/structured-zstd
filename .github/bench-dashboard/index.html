@@ -78,9 +78,79 @@
         margin-top: 14px;
         min-height: 460px;
       }
-      #chart {
+      #chart, #chart-profile {
         width: 100% !important;
         height: 440px !important;
+      }
+      /* HTML legend replaces Chart.js built-in legend: a full-width row
+         is the click target (fixing the issue where only the colour swatch
+         registered clicks and wrapped labels drifted onto the next line),
+         and the container scrolls when series count exceeds the visible
+         height (fixing silent series hiding by Chart.js). */
+      .html-legend {
+        margin-top: 10px;
+        max-height: 180px;
+        overflow-y: auto;
+        border-top: 1px solid #e4ece8;
+        padding-top: 8px;
+      }
+      .html-legend-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        line-height: 1.3;
+        user-select: none;
+        /* Render <button> elements as full-width text rows rather than
+           default button chrome — the buttons exist for a11y (keyboard +
+           screen reader support), not for visual styling. */
+        width: 100%;
+        background: transparent;
+        border: 1px solid transparent;
+        text-align: left;
+        font-family: inherit;
+        color: inherit;
+      }
+      .html-legend-item:hover {
+        background: var(--accent-soft);
+      }
+      .html-legend-item:focus-visible {
+        outline: none;
+        border-color: var(--accent);
+        background: var(--accent-soft);
+      }
+      .html-legend-item.hidden-series .html-legend-label {
+        text-decoration: line-through;
+        opacity: 0.55;
+      }
+      .html-legend-swatch {
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        flex-shrink: 0;
+      }
+      .html-legend-label {
+        flex: 1;
+        overflow-wrap: anywhere;
+      }
+      .profile-toggles {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 10px;
+      }
+      .profile-toggles label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.88rem;
+        cursor: pointer;
+      }
+      .profile-toggles input[type="checkbox"] {
+        margin: 0;
       }
       #status {
         margin-top: 8px;
@@ -183,7 +253,48 @@
         <div class="chart-wrap">
           <canvas id="chart"></canvas>
         </div>
+        <div id="legend-delta" class="html-legend"></div>
         <div id="status"></div>
+      </section>
+
+      <section class="card" style="margin-top: 14px">
+        <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (compress + decompress + ratio)</h2>
+        <p style="font-size: 0.9rem">
+          Six lines plotted against compression level on the X-axis: Rust vs
+          FFI compression speed (left axis), Rust vs FFI decompression speed
+          (left axis), and Rust vs FFI output ratio (right axis,
+          <code>compressed/input</code>, lower=better). Controlled by the
+          <strong>Target</strong>, <strong>Scenario</strong>, and
+          <strong>Level</strong> selectors at the top of the page (default
+          <code>all</code> = cumulative arithmetic mean across that dimension).
+          The <strong>Snapshot</strong> dropdown either pins all six lines to
+          one <code>generated_at</code> run, or — on the default
+          <code>latest</code> setting — picks each (level, metric) point from
+          the most recent snapshot of its own cohort independently, so points
+          can come from different snapshots across the X-axis. Decompress rows
+          are additionally averaged across both <code>source</code> variants
+          (<code>rust_stream</code> + <code>c_stream</code>) per side, giving
+          one deterministic data point per (level, side) regardless of bench
+          iteration order.
+        </p>
+        <div class="filters">
+          <label>Snapshot
+            <select id="pf-snapshot"></select>
+          </label>
+        </div>
+        <div class="profile-toggles">
+          <label><input type="checkbox" data-series="rust_compress_speed" checked /> Rust compress</label>
+          <label><input type="checkbox" data-series="ffi_compress_speed" checked /> FFI compress</label>
+          <label><input type="checkbox" data-series="rust_decompress_speed" checked /> Rust decompress</label>
+          <label><input type="checkbox" data-series="ffi_decompress_speed" checked /> FFI decompress</label>
+          <label><input type="checkbox" data-series="rust_ratio" checked /> Rust ratio</label>
+          <label><input type="checkbox" data-series="ffi_ratio" checked /> FFI ratio</label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart-profile"></canvas>
+        </div>
+        <div id="legend-profile" class="html-legend"></div>
+        <div id="profile-status" style="margin-top: 8px; font-size: 0.88rem"></div>
       </section>
 
       <details class="card">
@@ -228,6 +339,15 @@
       const state = {
         records: [],
         chart: null,
+        profileChart: null,
+        profileSeriesVisibility: {
+          rust_compress_speed: true,
+          ffi_compress_speed: true,
+          rust_decompress_speed: true,
+          ffi_decompress_speed: true,
+          rust_ratio: true,
+          ffi_ratio: true,
+        },
         timeIndex: new Map(),
         windowInitialized: false,
       };
@@ -244,6 +364,23 @@
         from: el("f-from"),
         to: el("f-to"),
       };
+
+      // Profile chart reuses the page-wide Target/Scenario/Level
+      // dropdowns from the top delta chart — they already support an
+      // `__all__` sentinel which the profile interprets as "average
+      // across that dimension". Snapshot is profile-specific because
+      // the top chart's From/To pair is a time window, not a single
+      // snapshot pin.
+      const profileSelectors = {
+        snapshot: el("pf-snapshot"),
+      };
+
+      // Sentinel for the snapshot dropdown's "latest" entry, which picks
+      // whichever record was generated last for each (level, metric)
+      // independently. Selecting a specific timestamp instead pins the
+      // chart to that one snapshot — useful when comparing two commits
+      // side-by-side via browser tabs.
+      const PROFILE_LATEST = "__latest__";
 
       function parseTimestamp(value) {
         const parsed = Date.parse(String(value || ""));
@@ -487,6 +624,25 @@
         return rows.reduce((latest, row) => (compareByGeneratedAt(row, latest) > 0 ? row : latest));
       }
 
+      // Profile-chart "latest snapshot" selection uses this comparator
+      // instead of `compareByGeneratedAt` so it stays consistent with
+      // the snapshot identity defined by `snapshotLabel()`
+      // (`generated_at || commit_sha || "local-run"`). When records
+      // lack a parseable `generated_at`, raw `compareByGeneratedAt`
+      // returns 0 between any two such rows and the "latest" pick
+      // becomes arbitrary across runs; subsequent filtering by
+      // `sameSnapshotLabel` would then keep an inconsistent cohort.
+      // Falling back to lexicographic `commit_sha` order gives the
+      // same input the same winner every time — not chronologically
+      // meaningful, but deterministic, which is the property we need.
+      function compareSnapshotIdentity(a, b) {
+        const ts = compareByGeneratedAt(a, b);
+        if (ts !== 0) return ts;
+        const aSha = a.commit_sha || "";
+        const bSha = b.commit_sha || "";
+        return aSha.localeCompare(bSha);
+      }
+
       function setStatusText(message, className) {
         const status = el("status");
         status.replaceChildren(document.createTextNode(message));
@@ -498,6 +654,30 @@
         if (!rawKey) return String(seriesId || "unknown-series");
         const [metric, stage, scenario, level, source] = rawKey.split("|");
         return `${target} • ${scenario || "scenario"} • ${stage || "stage"}:${level || "level"} • ${source || "none"} • ${metric || "metric"}`;
+      }
+
+      // Sign-gated regression classification. A value "outside the parity
+      // band" is only a regression when it moves AGAINST us:
+      // - compression_ratio:    delta = rust_ratio / ffi_ratio; per emitter
+      //   interpretation (run-benchmarks.sh), delta > 1 means Rust produced
+      //   a LARGER compressed output than FFI — that's a ratio regression.
+      //   delta < 1 is a win and must not count as "outside band".
+      // - throughput_bytes_per_sec: delta > 1 means Rust faster than FFI.
+      //   delta < 1 (Rust slower) is the regression direction.
+      // - peak_alloc_bytes: delta > 1 means Rust allocated more than FFI —
+      //   that's the regression direction.
+      // For any other / unknown metric, fall back to symmetric out-of-band
+      // detection so we don't silently drop signals from future metrics.
+      function isRegression(row) {
+        if (typeof row.delta_ratio !== "number") return false;
+        const metric = row.metric;
+        if (metric === "throughput_bytes_per_sec") {
+          return row.delta_ratio < BAND_LOW;
+        }
+        if (metric === "compression_ratio" || metric === "peak_alloc_bytes") {
+          return row.delta_ratio > BAND_HIGH;
+        }
+        return row.delta_ratio < BAND_LOW || row.delta_ratio > BAND_HIGH;
       }
 
       function updateStatus(filtered) {
@@ -522,32 +702,45 @@
         if (latestPerSeries.length === 1) {
           const latest = latestPerSeries[0].row;
           const pct = ((latest.delta_ratio - 1) * 100).toFixed(2);
+          const regression = isRegression(latest);
           const inBand = latest.delta_ratio >= BAND_LOW && latest.delta_ratio <= BAND_HIGH;
+          const label = regression
+            ? "outside parity band"
+            : inBand
+              ? "within parity band"
+              : "outside band (win — Rust beat FFI)";
           setStatusText(
-            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} parity band`,
-            inBand ? "near-parity" : "outside-band",
+            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}`,
+            regression ? "outside-band" : "near-parity",
           );
           return;
         }
         const perSeries = latestPerSeries.map(({ seriesId, row }) => {
           const pct = ((row.delta_ratio - 1) * 100).toFixed(2);
+          const regression = isRegression(row);
           const inBand = row.delta_ratio >= BAND_LOW && row.delta_ratio <= BAND_HIGH;
           const deviation = Math.abs(row.delta_ratio - 1);
+          const verdict = regression ? "outside band" : inBand ? "within band" : "win";
           return {
             seriesId,
+            regression,
             inBand,
             deviation,
-            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${inBand ? "within" : "outside"} band`,
+            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}`,
           };
         });
         const status = el("status");
         status.replaceChildren();
-        const outsideBand = perSeries.filter((item) => !item.inBand);
-        const focus = (outsideBand.length ? outsideBand : perSeries)
+        const regressions = perSeries.filter((item) => item.regression);
+        const wins = perSeries.filter((item) => !item.regression && !item.inBand);
+        const focus = (regressions.length ? regressions : perSeries)
           .sort((a, b) => b.deviation - a.deviation)
           .slice(0, 8);
         const summary = document.createElement("div");
-        summary.textContent = `Latest series: ${perSeries.length}. Outside parity band: ${outsideBand.length}. Showing top ${focus.length} by deviation.`;
+        summary.textContent =
+          `Latest series: ${perSeries.length}. Outside parity band: ${regressions.length}` +
+          (wins.length ? ` (notable wins not counted: ${wins.length}).` : ".") +
+          ` Showing top ${focus.length} by deviation.`;
         status.appendChild(summary);
         if (focus.length > 0) {
           const list = document.createElement("ul");
@@ -558,7 +751,102 @@
           }
           status.appendChild(list);
         }
-        status.className = outsideBand.length === 0 ? "near-parity" : "outside-band";
+        status.className = regressions.length === 0 ? "near-parity" : "outside-band";
+      }
+
+      // Replaces Chart.js built-in legend. Each row is a full-width click
+      // target (fixes the bug where only the colour swatch registered
+      // clicks while the wrapping label drifted to the next line), the
+      // container scrolls when there are too many series for the visible
+      // area (fixes silent series hiding), and toggling visibility uses
+      // the same Chart.js `meta.hidden` mechanism the built-in legend
+      // used so dataset rendering stays identical.
+      // `onToggle(index, ds, nextVisible)` lets the caller route the
+      // visibility change through external state (e.g. the profile
+      // chart's checkbox-backed `profileSeriesVisibility`). When
+      // omitted, the legend toggles the dataset directly — matching
+      // the built-in Chart.js legend behaviour the delta chart relies
+      // on. Hidden detection uses `chart.isDatasetVisible(i)` so the
+      // `hidden-series` styling reflects both `meta.hidden` toggles
+      // (legend clicks) AND `dataset.hidden` set at construction time
+      // (which leaves `meta.hidden === null`).
+      function renderHtmlLegend(chart, container, onToggle) {
+        if (!chart || !container) return;
+        // Capture which legend row had keyboard focus before we tear
+        // down the buttons. Toggling a series with Enter/Space replaces
+        // the active element, so without this every keyboard activation
+        // drops focus out of the legend and forces the user to Tab back
+        // in — extremely tedious when flipping several series in a row.
+        // We restore focus to the same dataset index after the rebuild
+        // so keyboard-only multi-toggle interaction matches mouse use.
+        const active = document.activeElement;
+        let focusedIndex = null;
+        if (active && container.contains(active) && active.dataset && active.dataset.legendIndex != null) {
+          focusedIndex = Number(active.dataset.legendIndex);
+        }
+        // Snapshot scroll position too — replaceChildren() resets it,
+        // and when the toggle was triggered from OUTSIDE the legend
+        // (e.g. a profile-series checkbox above the chart, or a
+        // top-filter change) the focus path above never fires, so a
+        // long legend would silently jump back to the top on every
+        // re-render. Restoring scrollTop after the rebuild keeps the
+        // visible window stable regardless of which control fired.
+        const previousScrollTop = container.scrollTop;
+
+        container.replaceChildren();
+        const datasets = chart.data.datasets || [];
+        for (let i = 0; i < datasets.length; i++) {
+          const ds = datasets[i];
+          // <button> gives keyboard activation (Enter/Space), focus
+          // outline, and a button role for screen readers without any
+          // extra JS. aria-pressed reflects current visibility so AT
+          // users hear "pressed" / "not pressed" instead of guessing.
+          const item = document.createElement("button");
+          item.type = "button";
+          item.className = "html-legend-item";
+          item.dataset.legendIndex = String(i);
+          const visible = chart.isDatasetVisible(i);
+          item.setAttribute("aria-pressed", visible ? "true" : "false");
+          if (!visible) item.classList.add("hidden-series");
+
+          const swatch = document.createElement("span");
+          swatch.className = "html-legend-swatch";
+          swatch.style.background = String(ds.borderColor || ds.backgroundColor || "#888");
+          item.appendChild(swatch);
+
+          const label = document.createElement("span");
+          label.className = "html-legend-label";
+          label.textContent = ds.label || `series ${i + 1}`;
+          item.appendChild(label);
+
+          item.addEventListener("click", () => {
+            const nextVisible = !chart.isDatasetVisible(i);
+            if (typeof onToggle === "function") {
+              onToggle(i, ds, nextVisible);
+              return;
+            }
+            chart.setDatasetVisibility(i, nextVisible);
+            // `"none"` skips animation — toggling a series should be
+            // instant, especially with many datasets where the default
+            // 1s animation looks janky on every click.
+            chart.update("none");
+            renderHtmlLegend(chart, container, onToggle);
+          });
+
+          container.appendChild(item);
+        }
+
+        if (focusedIndex != null) {
+          const restored = container.querySelector(
+            `[data-legend-index="${focusedIndex}"]`,
+          );
+          if (restored) restored.focus();
+        }
+        // Restore AFTER focus() — focus() on a partially-visible
+        // element can itself scroll the container, so applying the
+        // saved scrollTop last preserves the visible window the user
+        // had before the toggle.
+        container.scrollTop = previousScrollTop;
       }
 
       function renderChart(filtered) {
@@ -603,11 +891,463 @@
               },
             },
             plugins: {
-              legend: { position: "bottom" },
+              legend: { display: false },
             },
             maintainAspectRatio: false,
           },
         });
+        renderHtmlLegend(state.chart, el("legend-delta"));
+      }
+
+      function profileFilter() {
+        return {
+          target: selectors.target.value,
+          scenario: selectors.scenario.value,
+          level: selectors.level.value,
+          snapshot: profileSelectors.snapshot.value || PROFILE_LATEST,
+        };
+      }
+
+      // Stage classification — the chart cares about three logical
+      // measurements: compress speed, decompress speed, and compression
+      // ratio. Decompress benches emit per-stream-variant source values
+      // (`rust_stream`, `c_stream`), but for the strategy-comparison
+      // view we collapse across those: each row already carries both
+      // rust_value and ffi_value, so the source dimension is just bench
+      // bookkeeping and doesn't change what the chart shows.
+      function isCompressStage(stage) {
+        return stage === "compress";
+      }
+      function isDecompressStage(stage) {
+        return typeof stage === "string" && stage.indexOf("decompress") === 0;
+      }
+
+      // Pick one record per (level, metric) for the chosen target /
+      // scenario / stage. When `snapshot === PROFILE_LATEST` we take
+      // whichever record is the most recent per (level, metric)
+      // independently — useful for the "current state across every
+      // level" view. When `snapshot` is a specific generated_at value
+      // (or commit sha) the chart is pinned to that exact run so the
+      // 4 lines describe one commit and nothing else, which is what
+      // you want when comparing two snapshots side-by-side.
+      // Build one record per (level, logical-metric) where the logical
+      // metrics are: compress_speed, decompress_speed, ratio. For each
+      // (level, logical-metric) we keep the most recent row that matches
+      // the snapshot/target/scenario filter — this collapses the source
+      // dimension for decompress (rust_stream vs c_stream) because the
+      // Rust/FFI comparison already lives inside each row.
+      function buildProfileData(filter) {
+        // Top filters use the `ALWAYS` sentinel ("__all__") to mean
+        // "don't filter on this dimension". When that's set on target /
+        // scenario / level, the accumulator below ends up summing rows
+        // from every value of that dimension and the result is the
+        // arithmetic mean across them.
+        const matchesFilter = (r) => {
+          if (filter.target !== ALWAYS && (r.target || "unknown-target") !== filter.target) return false;
+          if (filter.scenario !== ALWAYS && r.scenario !== filter.scenario) return false;
+          if (filter.level !== ALWAYS && r.level !== filter.level) return false;
+          if (filter.snapshot !== PROFILE_LATEST) {
+            const label = r.generated_at || r.commit_sha || "local-run";
+            if (label !== filter.snapshot) return false;
+          }
+          return true;
+        };
+
+        // Logical metric per row (chart-side category, not bench metric):
+        //   `compress_speed`   — throughput at stage=compress
+        //   `decompress_speed` — throughput at any decompress stage
+        //   `ratio`            — compression_ratio at stage=compress
+        const logicalMetric = (row) => {
+          if (row.metric === "compression_ratio" && isCompressStage(row.stage)) return "ratio";
+          if (row.metric === "throughput_bytes_per_sec") {
+            if (isCompressStage(row.stage)) return "compress_speed";
+            if (isDecompressStage(row.stage)) return "decompress_speed";
+          }
+          return null;
+        };
+
+        // Two-pass aggregation:
+        //
+        //   Pass 1 — collect every matching row, indexed by
+        //            (level, logical-metric). When `filter.snapshot ===
+        //            PROFILE_LATEST` we also remember the most recent
+        //            generated_at observed for each key.
+        //   Pass 2 — fold each row into the running mean only if its
+        //            generated_at matches the chosen snapshot for that
+        //            key. For `PROFILE_LATEST` this restricts the mean
+        //            to ONE snapshot per (level, lm) — the most recent
+        //            one — and then averages across source variants
+        //            within that snapshot (relevant for decompress,
+        //            where rust_stream and c_stream coexist). For a
+        //            pinned snapshot, matchesFilter() already narrowed
+        //            us to that snapshot, so this just collapses source.
+        //
+        // The pre-fix code summed across every generated_at, which
+        // silently turned "latest" into a time-average rather than a
+        // single-snapshot pin.
+        // `key` is the X-axis bucket (level + logical metric) into
+        // which the average will accumulate. `latestKey` is finer-
+        // grained: when a dimension is on `__all__` (cumulative mode),
+        // that dimension is folded into the latest-snapshot lookup so
+        // each cohort keeps ITS OWN most-recent snapshot before we
+        // average across cohorts. Without this, the global latest
+        // snapshot for one (level, lm) would silently drop every
+        // cohort that didn't happen to run at the same timestamp,
+        // biasing the result toward whichever target/scenario ran
+        // most recently.
+        const cohortKey = (row) => {
+          const parts = [];
+          if (filter.target === ALWAYS) parts.push(`target=${row.target || "unknown-target"}`);
+          if (filter.scenario === ALWAYS) parts.push(`scenario=${row.scenario}`);
+          if (filter.level === ALWAYS) parts.push(`level=${row.level}`);
+          return parts.join("|");
+        };
+
+        const matchingRows = [];
+        const latestPerKey = new Map();
+        for (const row of state.records) {
+          if (!matchesFilter(row)) continue;
+          if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
+          const lm = logicalMetric(row);
+          if (!lm) continue;
+          const key = `${row.level}|${lm}`;
+          const cohort = cohortKey(row);
+          const latestKey = cohort ? `${key}|${cohort}` : key;
+          matchingRows.push({ row, lm, key, latestKey });
+          if (filter.snapshot === PROFILE_LATEST) {
+            const previous = latestPerKey.get(latestKey);
+            if (!previous || compareSnapshotIdentity(row, previous) > 0) {
+              latestPerKey.set(latestKey, row);
+            }
+          }
+        }
+
+        const sameSnapshotLabel = (a, b) =>
+          (a.generated_at || a.commit_sha || "local-run") ===
+          (b.generated_at || b.commit_sha || "local-run");
+
+        const byLevelLogical = new Map();
+        for (const { row, lm, key, latestKey } of matchingRows) {
+          if (filter.snapshot === PROFILE_LATEST) {
+            const winner = latestPerKey.get(latestKey);
+            if (!winner || !sameSnapshotLabel(row, winner)) continue;
+          }
+          let agg = byLevelLogical.get(key);
+          if (!agg) {
+            agg = { level: row.level, rust_sum: 0, ffi_sum: 0, count: 0 };
+            byLevelLogical.set(key, agg);
+          }
+          agg.rust_sum += row.rust_value;
+          agg.ffi_sum += row.ffi_value;
+          agg.count += 1;
+        }
+
+        const levelSet = new Set();
+        for (const agg of byLevelLogical.values()) levelSet.add(agg.level);
+        const levels = Array.from(levelSet)
+          .map((value) => ({ value, parsed: parseLevelId(value) }))
+          .sort((a, b) => {
+            if (a.parsed && b.parsed) return a.parsed.numeric - b.parsed.numeric;
+            if (a.parsed) return -1;
+            if (b.parsed) return 1;
+            return a.value.localeCompare(b.value);
+          });
+
+        const levelLabels = levels.map((entry) =>
+          entry.parsed ? entry.parsed.label : entry.value,
+        );
+
+        // Speed records carry bytes/sec; convert to MiB/s for axis legibility.
+        const lookup = (level, lm, side) => {
+          const agg = byLevelLogical.get(`${level}|${lm}`);
+          if (!agg || agg.count === 0) return null;
+          const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
+          const mean = sum / agg.count;
+          if (lm === "compress_speed" || lm === "decompress_speed") {
+            return mean / (1024 * 1024);
+          }
+          return mean;
+        };
+
+        const series = (lm, side) =>
+          levels.map((e) => lookup(e.value, lm, side));
+
+        return {
+          levels: levelLabels,
+          levelCount: levels.length,
+          datasets: [
+            {
+              seriesKey: "rust_compress_speed",
+              label: "Rust compress (MiB/s)",
+              data: series("compress_speed", "rust"),
+              yAxisID: "y",
+              borderColor: "hsl(150 65% 38%)",
+              backgroundColor: "hsla(150 65% 38% / 0.25)",
+            },
+            {
+              seriesKey: "ffi_compress_speed",
+              label: "FFI compress (MiB/s)",
+              data: series("compress_speed", "ffi"),
+              yAxisID: "y",
+              borderColor: "hsl(205 65% 45%)",
+              backgroundColor: "hsla(205 65% 45% / 0.25)",
+            },
+            {
+              seriesKey: "rust_decompress_speed",
+              label: "Rust decompress (MiB/s)",
+              data: series("decompress_speed", "rust"),
+              yAxisID: "y",
+              borderColor: "hsl(170 65% 28%)",
+              backgroundColor: "hsla(170 65% 28% / 0.25)",
+              borderDash: [2, 3],
+            },
+            {
+              seriesKey: "ffi_decompress_speed",
+              label: "FFI decompress (MiB/s)",
+              data: series("decompress_speed", "ffi"),
+              yAxisID: "y",
+              borderColor: "hsl(225 65% 35%)",
+              backgroundColor: "hsla(225 65% 35% / 0.25)",
+              borderDash: [2, 3],
+            },
+            // "ratio" here is the bench emitter's compression_ratio
+            // value, which is compressed_size / input_size — i.e. the
+            // output fraction, where LOWER means BETTER compression
+            // (a 0.30 value compresses to 30% of input). The axis and
+            // dataset labels say so explicitly to keep readers from
+            // assuming the conventional input/output definition where
+            // larger is better.
+            {
+              seriesKey: "rust_ratio",
+              label: "Rust output ratio (lower=better)",
+              data: series("ratio", "rust"),
+              yAxisID: "y1",
+              borderColor: "hsl(30 75% 45%)",
+              backgroundColor: "hsla(30 75% 45% / 0.25)",
+              borderDash: [6, 4],
+            },
+            {
+              seriesKey: "ffi_ratio",
+              label: "FFI output ratio (lower=better)",
+              data: series("ratio", "ffi"),
+              yAxisID: "y1",
+              borderColor: "hsl(340 65% 50%)",
+              backgroundColor: "hsla(340 65% 50% / 0.25)",
+              borderDash: [6, 4],
+            },
+          ],
+        };
+      }
+
+      // Single source of truth for the chart instance: created once on
+      // first render, then patched in place on every selector change
+      // (scenario / stage / target) and on every toggle. Recreating the
+      // chart would drop animation continuity AND the Chart.js-internal
+      // visibility state — both regressions the PR's acceptance criteria
+      // explicitly call out ("repopulate without recreating the chart").
+      function buildProfileDatasets(rawDatasets) {
+        return rawDatasets.map((ds) => ({
+          label: ds.label,
+          data: ds.data,
+          yAxisID: ds.yAxisID,
+          borderColor: ds.borderColor,
+          backgroundColor: ds.backgroundColor,
+          borderDash: ds.borderDash,
+          borderWidth: 2,
+          pointRadius: 3,
+          spanGaps: true,
+          tension: 0.35,
+          fill: "origin",
+          hidden: !state.profileSeriesVisibility[ds.seriesKey],
+          _seriesKey: ds.seriesKey,
+        }));
+      }
+
+      function onProfileLegendToggle(index, ds, nextVisible) {
+        const key = ds._seriesKey;
+        if (key) {
+          // Persist visibility across re-renders and keep the checkbox UI
+          // in sync — without this, clicking the legend produced a state
+          // mismatch with the checkbox, and a subsequent scenario switch
+          // would silently restore the hidden series.
+          state.profileSeriesVisibility[key] = nextVisible;
+          const checkbox = document.querySelector(
+            `.profile-toggles input[type=checkbox][data-series="${key}"]`,
+          );
+          if (checkbox) checkbox.checked = nextVisible;
+        }
+        if (state.profileChart) {
+          state.profileChart.setDatasetVisibility(index, nextVisible);
+          state.profileChart.update("none");
+          renderHtmlLegend(
+            state.profileChart,
+            el("legend-profile"),
+            onProfileLegendToggle,
+          );
+        }
+      }
+
+      function renderProfileChart() {
+        const filter = profileFilter();
+        if (!filter.target || !filter.scenario) {
+          el("profile-status").textContent = "Pick Target and Scenario (or leave them on 'all') to render the level profile.";
+          return;
+        }
+        const { levels, levelCount, datasets } = buildProfileData(filter);
+        if (!levelCount) {
+          if (state.profileChart) {
+            // No data for the chosen filter — clear the chart in place
+            // rather than destroying it, so the next non-empty selection
+            // still updates the existing instance.
+            state.profileChart.data.labels = [];
+            state.profileChart.data.datasets = [];
+            state.profileChart.update("none");
+          }
+          el("legend-profile").replaceChildren();
+          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
+          return;
+        }
+        const snapshotNote = filter.snapshot === PROFILE_LATEST
+          ? "latest per (level, metric, cohort) — points may come from different snapshots"
+          : `snapshot=${filter.snapshot} (all points from this single run)`;
+        el("profile-status").textContent =
+          `Showing ${levelCount} level point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
+
+        const chartDatasets = buildProfileDatasets(datasets);
+
+        if (state.profileChart) {
+          // In-place update path: swap labels + datasets, then ask
+          // Chart.js to redraw without animation. This preserves the
+          // chart instance (tooltips, scales, animation state) across
+          // every target/scenario/stage switch.
+          state.profileChart.data.labels = levels;
+          state.profileChart.data.datasets = chartDatasets;
+          state.profileChart.update("none");
+        } else {
+          state.profileChart = new Chart(el("chart-profile"), {
+            type: "line",
+            data: { labels: levels, datasets: chartDatasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              scales: {
+                x: {
+                  title: { display: true, text: "Compression level" },
+                  ticks: { autoSkip: false, maxRotation: 60, minRotation: 30 },
+                },
+                y: {
+                  type: "linear",
+                  position: "left",
+                  title: { display: true, text: "Throughput (MiB/s)" },
+                  beginAtZero: true,
+                },
+                y1: {
+                  type: "linear",
+                  position: "right",
+                  title: { display: true, text: "Output size ratio (compressed/input, lower=better)" },
+                  grid: { drawOnChartArea: false },
+                },
+              },
+              plugins: {
+                legend: { display: false },
+                tooltip: { mode: "index", intersect: false },
+              },
+            },
+          });
+        }
+        renderHtmlLegend(
+          state.profileChart,
+          el("legend-profile"),
+          onProfileLegendToggle,
+        );
+      }
+
+      function applyProfileToggles() {
+        if (!state.profileChart) return;
+        const datasets = state.profileChart.data.datasets || [];
+        for (let i = 0; i < datasets.length; i++) {
+          const key = datasets[i]._seriesKey;
+          if (!key) continue;
+          state.profileChart.setDatasetVisibility(i, !!state.profileSeriesVisibility[key]);
+        }
+        state.profileChart.update("none");
+        renderHtmlLegend(
+          state.profileChart,
+          el("legend-profile"),
+          onProfileLegendToggle,
+        );
+      }
+
+      function bindProfileControls() {
+        // Snapshot is the only profile-owned selector; it just triggers
+        // a re-render. Target/Scenario/Level live on the top delta
+        // chart's filter row and are wired into the profile chart from
+        // `bindFilters()` below, which fans every top-filter change
+        // out to both `rerender()` (delta chart) and the profile.
+        profileSelectors.snapshot.addEventListener("change", renderProfileChart);
+        for (const cb of document.querySelectorAll(".profile-toggles input[type=checkbox]")) {
+          cb.addEventListener("change", (e) => {
+            const key = e.currentTarget.dataset.series;
+            if (!key) return;
+            state.profileSeriesVisibility[key] = e.currentTarget.checked;
+            applyProfileToggles();
+          });
+        }
+      }
+
+      // Build a label per record that's stable across reloads but still
+      // informative: prefer the timestamp (which the dropdown sorts
+      // chronologically via compareUniqValues), but fall back to commit
+      // SHA when there's no timestamp and finally to "local-run". The
+      // dropdown value is this same label so the selection survives a
+      // filter change as long as the snapshot still produces data for
+      // the new filter.
+      function snapshotLabel(row) {
+        return row.generated_at || row.commit_sha || "local-run";
+      }
+
+      function repopulateSnapshotOptions() {
+        const target = selectors.target.value;
+        const scenario = selectors.scenario.value;
+        const level = selectors.level.value;
+        // Honor `ALWAYS` on every dimension — when target/scenario/
+        // level are "all", the snapshot list is the union across every
+        // value of those dimensions (any snapshot that produced data
+        // for any combination is a valid pick).
+        const labels = uniq(
+          state.records
+            .filter((r) =>
+              (target === ALWAYS || (r.target || "unknown-target") === target) &&
+              (scenario === ALWAYS || r.scenario === scenario) &&
+              (level === ALWAYS || r.level === level),
+            )
+            .map(snapshotLabel),
+        );
+        const previous = profileSelectors.snapshot.value;
+        const fragment = document.createDocumentFragment();
+        const latestOpt = document.createElement("option");
+        latestOpt.value = PROFILE_LATEST;
+        latestOpt.textContent = "latest";
+        fragment.appendChild(latestOpt);
+        for (const label of labels) {
+          const opt = document.createElement("option");
+          opt.value = String(label);
+          opt.textContent = String(label);
+          fragment.appendChild(opt);
+        }
+        profileSelectors.snapshot.replaceChildren(fragment);
+        profileSelectors.snapshot.value = labels.includes(previous) || previous === PROFILE_LATEST
+          ? previous
+          : PROFILE_LATEST;
+      }
+
+      function renderProfileSelectors() {
+        // Target / Scenario / Level are owned by the top delta chart's
+        // selectors (the profile reads them via `currentFilter()`-style
+        // lookups in `profileFilter()`). Only the profile-specific
+        // Snapshot dropdown needs populating here.
+        repopulateSnapshotOptions();
       }
 
       function currentFilter() {
@@ -634,8 +1374,21 @@
       }
 
       function bindFilters() {
-        for (const control of Object.values(selectors)) {
-          control.addEventListener("change", rerender);
+        // Top filters drive both charts: the delta chart via
+        // `rerender()` (time window + status), and the profile chart
+        // via target/scenario/level which now live on `selectors`.
+        // Snapshot list also depends on those three dimensions, so
+        // it's repopulated (preserving the current pin where valid)
+        // on every top-filter change.
+        const profileDimensions = new Set(["target", "scenario", "level"]);
+        for (const [name, control] of Object.entries(selectors)) {
+          control.addEventListener("change", () => {
+            rerender();
+            if (profileDimensions.has(name)) {
+              repopulateSnapshotOptions();
+              renderProfileChart();
+            }
+          });
         }
       }
 
@@ -729,6 +1482,9 @@
         selectors.metric.value = availableMetrics.includes(defaultMetric) ? defaultMetric : (availableMetrics[0] || ALWAYS);
         bindFilters();
         rerender();
+        renderProfileSelectors();
+        bindProfileControls();
+        renderProfileChart();
         renderRawSummary();
       }
 
