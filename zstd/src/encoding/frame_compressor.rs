@@ -390,6 +390,24 @@ pub(crate) struct CompressState<M: Matcher> {
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
     pub(crate) offset_hist: [u32; 3],
+    /// Strategy tag resolved from the current `CompressionLevel` at every
+    /// `matcher.reset()` call. Used by the literal-compression gates
+    /// (`min_literals_to_compress`, `min_gain`) in
+    /// `encoding::blocks::compressed` to mirror donor's strategy-aware
+    /// thresholds (`zstd_compress_literals.c:114-127, 187-188`).
+    ///
+    /// **Invariant (required of every construction site):** must be
+    /// initialized from the active `CompressionLevel` via
+    /// `StrategyTag::for_compression_level`, and re-synced from the
+    /// active level alongside every `matcher.reset()` call so the
+    /// level-aware gates stay correct after a level change. The two
+    /// reset sites that own this sync are `FrameCompressor::compress`
+    /// and `StreamingEncoder::ensure_frame_started`. There is no
+    /// `Default` impl — production constructors
+    /// (`FrameCompressor::new`, `new_with_matcher`, the streaming
+    /// encoder constructor) plumb this explicitly. Tests that build
+    /// `CompressState` by hand must also supply a value.
+    pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -408,6 +426,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -430,6 +451,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             compression_level,
             #[cfg(feature = "hash")]
@@ -489,6 +513,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.offset_hist = [1, 4, 8];
+        // Sync `state.strategy_tag` to the level resolved at this reset so
+        // the literal-compression gates (`min_literals_to_compress` /
+        // `min_gain` in `encoding::blocks::compressed`) see the correct
+        // strategy for the next frame. Frame-by-frame level changes go
+        // through this same `compress()` entry point, so re-syncing here
+        // covers level switches without touching the matcher dispatch.
+        self.state.strategy_tag =
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -2190,5 +2222,61 @@ mod tests {
         let mut decoded = Vec::with_capacity(data.len());
         decoder.collect_to_writer(&mut decoded).unwrap();
         assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
+    }
+
+    /// Regression: `set_compression_level` followed by `compress()` must
+    /// refresh `state.strategy_tag` through the reset-time sync so the
+    /// literal-compression gates (`min_literals_to_compress`,
+    /// `min_gain`) use the NEW level's strategy. Picks a level pair
+    /// that genuinely crosses strategy bands — `Fastest` resolves to
+    /// `Fast`, `Level(20)` resolves to `BtUltra2` — so a missed sync
+    /// would leave the construction-time tag visible and trip the
+    /// assertion. `CompressionLevel::Best` would also pass type-wise
+    /// but resolves to `Lazy` today, which keeps `min_literals_to_compress`
+    /// in the same `shift=3 → 64-byte` band as `Fast` and weakens the
+    /// signal that the gate floor actually moved.
+    #[cfg(feature = "std")]
+    #[test]
+    fn set_compression_level_then_compress_refreshes_strategy_tag() {
+        use super::CompressionLevel;
+        use crate::encoding::strategy::StrategyTag;
+
+        let data = vec![0xABu8; 256];
+        let mut out = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        let initial_tag = compressor.state.strategy_tag;
+        assert_eq!(
+            initial_tag,
+            StrategyTag::for_compression_level(CompressionLevel::Fastest),
+            "construction-time strategy_tag must reflect initial level",
+        );
+
+        // Switch to a level whose resolved strategy lives in a different
+        // band, then run a full compress cycle — the matcher.reset()
+        // inside `compress` is the only site that can refresh the tag.
+        let new_level = CompressionLevel::Level(20);
+        compressor.set_compression_level(new_level);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut out);
+        compressor.compress();
+
+        let new_tag = compressor.state.strategy_tag;
+        let expected = StrategyTag::for_compression_level(new_level);
+        assert_eq!(
+            new_tag, expected,
+            "strategy_tag must follow set_compression_level → compress, \
+             got {new_tag:?} expected {expected:?}",
+        );
+        assert_eq!(
+            expected,
+            StrategyTag::BtUltra2,
+            "test fixture invariant: Level(20) must resolve to BtUltra2 \
+             so the post-switch tag visibly crosses the band boundary",
+        );
+        assert_ne!(
+            new_tag, initial_tag,
+            "test fixture invariant: chosen levels must resolve to \
+             different StrategyTag variants",
+        );
     }
 }

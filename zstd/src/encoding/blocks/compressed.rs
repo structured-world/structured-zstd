@@ -13,6 +13,97 @@ use crate::{
 const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
 const MAX_NB_BLOCK_SPLITS: usize = 196;
 
+/// Donor `ZSTD_minLiteralsToCompress` (`zstd_compress_literals.c:114-127`):
+/// strategy-aware floor below which `compress_literals` does not even
+/// attempt huf compression and falls back to raw.
+///
+/// Formula: `shift = MIN(9 - donor_strategy, 3); mintc = (huf_repeat ==
+/// valid) ? 6 : (8 << shift)`. With huf reuse available, the per-block huf
+/// header overhead is gone, so the cheap floor is 6 bytes. Without it, the
+/// huf tree-description must be serialized per block — alphabet size and
+/// max symbol determine its exact byte cost, but on payloads near the
+/// per-strategy floor that overhead dominates and the compressed section
+/// loses to raw. Donor's shift table picks the floor per strategy:
+/// strategy 1..6 → 64 bytes, strategy 7 (btopt) → 32, strategy 8 (btultra)
+/// → 16, strategy 9 (btultra2) → 8.
+///
+/// Our `StrategyTag` enum has seven variants (no separate lazy2/btlazy2 —
+/// the `Lazy` variant covers donor strategies 4..6). Within the
+/// fast..lazy2 band donor's shift table is flat: strategies 1..6 all
+/// pin `shift = MIN(9 - strat, 3) = 3`, so `Lazy → 64-byte floor`
+/// regardless of which donor index (4, 5, or 6) we'd nominally use.
+/// No aggressiveness gradient within this band to preserve.
+#[inline]
+fn min_literals_to_compress(
+    strategy: crate::encoding::strategy::StrategyTag,
+    has_huf_table: bool,
+) -> usize {
+    use crate::encoding::strategy::StrategyTag;
+    if has_huf_table {
+        return 6;
+    }
+    let shift: u32 = match strategy {
+        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => 3,
+        StrategyTag::BtOpt => 2,
+        StrategyTag::BtUltra => 1,
+        StrategyTag::BtUltra2 => 0,
+    };
+    8usize << shift
+}
+
+/// Donor `ZSTD_minGain` (`zstd_compress_internal.h:677-684`):
+/// strategy-aware minimum-compression margin. In donor it gates both
+/// the block-level "compressed block must beat raw + minGain" decision
+/// and the literal-section `cLitSize >= srcSize - minGain` fallback.
+///
+/// Formula: `minlog = (strat >= btultra) ? strat - 1 : 6; (src_size >>
+/// minlog) + 2`. So:
+/// - fast..btopt (strat 1..7): minlog=6 → ~1.5% margin + 2 bytes
+/// - btultra (strat 8): minlog=7 → ~0.78% margin + 2 bytes
+/// - btultra2 (strat 9): minlog=8 → ~0.39% margin + 2 bytes
+///
+/// **Current usage in this crate:** wired into the literal-section
+/// raw-fallback gate (`compress_literals` +
+/// `estimate_literals_section_bytes`) only — those sites previously
+/// had no margin at all (bare `>= raw_section_bytes`).
+/// **Not yet wired into** the block-level emit/probe paths
+/// (`emit_single_sequence_block`, `SplitEstimator::estimate_subblock_size`),
+/// which still use a uniform `(source_len >> 8) + 2` calculation
+/// (the btultra2 value applied across all strategies). Migrating
+/// those sites is a separate cleanup.
+#[inline]
+fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -> usize {
+    use crate::encoding::strategy::StrategyTag;
+    let minlog: u32 = match strategy {
+        StrategyTag::BtUltra => 7,
+        StrategyTag::BtUltra2 => 8,
+        _ => 6,
+    };
+    (src_size >> minlog) + 2
+}
+
+/// Donor `compress_literals` raw-fallback gate
+/// (`zstd_compress_literals.c:187-188`): emit raw when
+/// `cLitSize >= srcSize - minGain`, where `cLitSize` is the HUF payload
+/// plus tree description (the bytes `HUF_compress*` writes — excluding
+/// the surrounding literals lhSize) and `srcSize` is the literal-payload
+/// length. Compares payload-vs-srcSize, NOT on-wire-vs-on-wire, so the
+/// gate is symmetric in header overhead.
+///
+/// Centralized helper so `compress_literals` and
+/// `estimate_literals_section_bytes` share the exact same decision and
+/// neither side can drift back to the pre-2026-05 on-wire comparison
+/// (which inflated the threshold by `compressed_lhsize - raw_lhsize`
+/// bytes and rejected marginally-winning compressed sections).
+#[inline]
+fn use_raw_literal_fallback(
+    huf_section_size: usize,
+    literals_len: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+) -> bool {
+    huf_section_size >= literals_len.saturating_sub(min_gain(literals_len, strategy))
+}
+
 /// Donor `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256).
 const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162, 1130, 1100, 1073, 1047,
@@ -203,6 +294,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             fse_tables: clone_fse_tables(&state.fse_tables),
             block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: state.offset_hist,
+            strategy_tag: state.strategy_tag,
         },
         workspace,
     };
@@ -302,11 +394,42 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // literals section
 
     let mut writer = BitWriter::from(output);
-    if literals_vec.len() >= 8 && all_bytes_identical(literals_vec) {
+    // Donor `compress_literals` (`zstd_compress_literals.c:153-160`):
+    // `srcSize < ZSTD_minLiteralsToCompress(strategy, prevHuf->repeatMode)`
+    // → `ZSTD_noCompressLiterals` (raw). The threshold is strategy-aware
+    // (see `min_literals_to_compress`). With huf reuse available the
+    // floor drops to 6 since there is no per-block huf-header overhead.
+    let strategy = state.strategy_tag;
+    let has_huf_table = state.last_huff_table.is_some();
+    let min_lits = min_literals_to_compress(strategy, has_huf_table);
+    // RLE pre-check: donor `compress_literals` reaches RLE only through
+    // the `cLitSize == 1` branch (`zstd_compress_literals.c:192-201`)
+    // after passing the `min_lits` gate and running a full HUF compress —
+    // so donor emits raw for any all-identical section under `min_lits`
+    // (e.g. 8..63 bytes at fast/dfast/greedy/lazy without HUF reuse).
+    // RLE and raw share the same lhSize for a given `len`
+    // (both use `uncompressed_literals_header_bytes`), so RLE = lhSize + 1
+    // and raw = lhSize + len. That makes RLE equal to raw on `len == 1`
+    // and smaller by exactly `len - 1` bytes for `len >= 2`, regardless of
+    // the lhSize tier (1 / 2 / 3 / 5 bytes). Our pre-check fires for ANY
+    // all-identical literal slice regardless of strategy/min_lits.
+    // This produces strictly smaller output than donor on the small
+    // all-identical edges while still matching donor on `>= min_lits`
+    // inputs (where donor's compress+`cLitSize==1` path reaches the same
+    // RLE block).
+    // Note the order — RLE pre-check runs BEFORE `min_lits`;
+    // `estimate_literals_section_bytes` mirrors this exactly so probe
+    // costs match emit byte-for-byte.
+    if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
         state.last_huff_table = None;
-    } else if literals_vec.len() >= 8 {
-        match compress_literals(literals_vec, state.last_huff_table.as_ref(), &mut writer) {
+    } else if literals_vec.len() >= min_lits {
+        match compress_literals(
+            literals_vec,
+            state.last_huff_table.as_ref(),
+            &mut writer,
+            strategy,
+        ) {
             HuffmanTableUpdate::New(table) => {
                 state.last_huff_table.replace(table);
             }
@@ -416,6 +539,7 @@ fn estimate_block_parts_size<M: Matcher>(
         literals_vec,
         &mut state.last_huff_table,
         &mut workspace.lit_counts,
+        state.strategy_tag,
     );
 
     let seq_bytes = if workspace.sequences.is_empty() {
@@ -437,15 +561,25 @@ fn estimate_literals_section_bytes(
     literals: &[u8],
     last_huff: &mut Option<huff0_encoder::HuffmanTable>,
     counts: &mut [usize; 256],
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> usize {
-    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches.
-    if literals.len() < 8 {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    }
-    if all_bytes_identical(literals) {
+    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
+    // **in the same order**. The emitter pre-checks `all_identical`
+    // (any non-empty section) BEFORE the `min_lits` gate — RLE and raw
+    // share `uncompressed_literals_header_bytes(len)` (1/2/3/5 bytes by
+    // length tier), so on all-identical inputs RLE = lhSize + 1 equals
+    // raw = lhSize + len at `len == 1` and is smaller by `len - 1` for
+    // `len >= 2`. RLE is never worse than raw, so it is selected
+    // regardless of strategy. Estimator must use the same ordering and
+    // predicate so probe costs match emit byte-for-byte.
+    if !literals.is_empty() && all_bytes_identical(literals) {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + 1;
+    }
+    let min_lits = min_literals_to_compress(strategy, last_huff.is_some());
+    if literals.len() < min_lits {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
 
     counts.fill(0);
@@ -495,15 +629,22 @@ fn estimate_literals_section_bytes(
     let compressed_header = compressed_literals_header_bytes(literals.len());
     let total = compressed_header + tree_desc + payload;
 
-    // Mirror `compress_literals` raw fallback: compare on-wire sections
-    // *byte-for-byte* — `total` already includes the compressed literals
-    // header (and the Huffman tree description when emitting a new table),
-    // so the raw side must also include its own 1–3 byte header. Comparing
-    // against bare `literals.len()` would bias the splitter toward raw on
-    // small payloads where the raw header (1 byte for size < 32) is smaller
-    // than the compressed header (3 bytes for size < 1 KB).
+    // Donor `compress_literals` raw-fallback gate
+    // (`zstd_compress_literals.c:187-188`):
+    //   `cLitSize >= srcSize - minGain`
+    // where `cLitSize` is the encoded literals payload + tree description
+    // (output of `HUF_compress*`, excluding the surrounding lhSize bytes)
+    // and `srcSize` is the literal-payload length. In our terms:
+    //   - donor `cLitSize` ≡ `total - compressed_header` (tree_desc + payload)
+    //   - donor `srcSize`  ≡ `literals.len()`
+    // Using the on-wire `total >= raw_section_bytes - mg` form (which
+    // includes the compressed header on the LHS and the raw header on
+    // the RHS) skews the threshold by `compressed_header - raw_header`
+    // bytes and rejects compressed sections that donor would keep,
+    // losing ratio. Mirror donor's payload-vs-srcSize form here.
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    if total >= raw_section_bytes {
+    let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
+    if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         *last_huff = None;
         return raw_section_bytes;
     }
@@ -968,14 +1109,20 @@ impl SplitEstimator<'_> {
         //   single-partition path → `emit_single_sequence_block`,
         //   which applies the SAME `min_gain` expansion fallback (its
         //   `buffers.compressed.len() >= source_len - min_gain` check
-        //   right before deciding raw-fallback). So whatever block we
-        //   bail on would have been raw-fallbacked by the real emit
-        //   anyway, by the same threshold.
-        // - For a missed split-win to matter, both sub-blocks would
-        //   need to compress strictly (no raw-fallback in either
-        //   half), AND `cost(first) + cost(second) < source_len + 3`.
-        //   The wider donor band gives at most `min_gain` bytes of
-        //   theoretical recoverable ratio per block.
+        //   right before deciding raw-fallback). So for the
+        //   single-partition path specifically, any block we bail on
+        //   here would also raw-fallback there by the same threshold —
+        //   no wire-output drift from this bail-out vs the "let the
+        //   real emit decide" alternative.
+        // - Returning here does skip the split case, so this is NOT a
+        //   proof that a recursive split could never do better: in
+        //   principle, both sub-blocks could compress strictly (no
+        //   raw-fallback in either half) and beat the whole-block
+        //   outcome. For such a missed split-win to matter, both
+        //   sub-blocks would need to compress strictly AND
+        //   `cost(first) + cost(second) < source_len + 3`. The wider
+        //   donor band gives at most `min_gain` bytes of theoretical
+        //   recoverable ratio per block.
         // - Empirically validated: `compare_ffi --list` REPORT lines
         //   show **zero rust_bytes delta** vs main on every
         //   (scenario, level) cell across the full bench matrix.
@@ -1582,6 +1729,7 @@ fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
 
@@ -1646,14 +1794,27 @@ fn compress_literals(
     writer.change_bits(size_index, encoded_len as u64, size_bits);
     let total_len = (writer.index() - reset_idx) / 8;
 
-    // Compare on-wire sections byte-for-byte: `total_len` already includes
-    // the compressed literals header + tree description + payload, so the
-    // raw side must also include its own 1–3 byte header
-    // (`uncompressed_literals_header_bytes`). Comparing against bare
-    // `literals.len()` would bias toward raw on small payloads where the
-    // raw header is smaller than the compressed header.
-    let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
-    if total_len >= raw_section_bytes {
+    // Donor `compress_literals` raw-fallback gate
+    // (`zstd_compress_literals.c:187-188`):
+    //   `cLitSize >= srcSize - minGain`
+    // where donor's `cLitSize` is the encoded literals payload plus the
+    // tree description (output of `HUF_compress*`, excluding the
+    // surrounding `lhSize` literals header), and `srcSize` is the
+    // literal-payload length. In our terms:
+    //   - donor `cLitSize` ≡ `total_len - compressed_literals_header_bytes`
+    //     (i.e. tree_desc + huf_payload, no lhSize)
+    //   - donor `srcSize`  ≡ `literals.len()`
+    // Comparing `total_len >= raw_section_bytes - minGain` (with the
+    // compressed-section lhSize on the LHS and raw-section header on
+    // the RHS) skews the threshold by `compressed_header - raw_header`
+    // bytes and rejects compressed sections that donor would keep —
+    // direct ratio loss. Mirror donor's payload-vs-srcSize form here.
+    // `minGain` is strategy-aware (`min_gain` helper above; ~1.56% for
+    // fast..btopt, ~0.78% for btultra, ~0.39% for btultra2). Saturating
+    // subtraction covers tiny inputs where `literals.len() < minGain`.
+    let compressed_header_len = compressed_literals_header_bytes(literals.len());
+    let huf_section_size = total_len - compressed_header_len; // tree_desc + payload, no lhSize
+    if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
         HuffmanTableUpdate::Cleared
@@ -1670,10 +1831,13 @@ mod tests {
 
     use super::{
         FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_match_len,
-        encode_offset_with_history, previous_table, remember_last_used_tables,
+        encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
+        remember_last_used_tables,
     };
     use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
+    use crate::encoding::strategy::StrategyTag;
     use crate::fse::fse_encoder::build_table_from_symbol_counts;
+    use crate::huff0::huff0_encoder;
     use alloc::vec::Vec;
 
     fn tables_match(
@@ -1713,6 +1877,207 @@ mod tests {
     }
 
     #[test]
+    fn min_literals_to_compress_returns_per_strategy_floor() {
+        for strat in [
+            StrategyTag::Fast,
+            StrategyTag::Dfast,
+            StrategyTag::Greedy,
+            StrategyTag::Lazy,
+        ] {
+            assert_eq!(min_literals_to_compress(strat, false), 64);
+            assert_eq!(min_literals_to_compress(strat, true), 6);
+        }
+        assert_eq!(min_literals_to_compress(StrategyTag::BtOpt, false), 32);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtOpt, true), 6);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra, false), 16);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra, true), 6);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra2, false), 8);
+        assert_eq!(min_literals_to_compress(StrategyTag::BtUltra2, true), 6);
+    }
+
+    #[test]
+    fn min_gain_returns_per_strategy_margin() {
+        let src = 4096usize;
+        for strat in [
+            StrategyTag::Fast,
+            StrategyTag::Dfast,
+            StrategyTag::Greedy,
+            StrategyTag::Lazy,
+            StrategyTag::BtOpt,
+        ] {
+            assert_eq!(min_gain(src, strat), (src >> 6) + 2);
+        }
+        assert_eq!(min_gain(src, StrategyTag::BtUltra), (src >> 7) + 2);
+        assert_eq!(min_gain(src, StrategyTag::BtUltra2), (src >> 8) + 2);
+        assert_eq!(min_gain(0, StrategyTag::Fast), 2);
+        assert_eq!(min_gain(63, StrategyTag::Fast), 2);
+        assert_eq!(min_gain(64, StrategyTag::Fast), 3);
+    }
+
+    #[test]
+    fn use_raw_literal_fallback_uses_payload_vs_srcsize_threshold() {
+        use super::{compressed_literals_header_bytes, use_raw_literal_fallback};
+        // Donor formula: `huf_section_size >= literals_len - min_gain`,
+        // payload-vs-srcSize (no headers on either side). Verify the
+        // gate is symmetric in header overhead by hitting the boundary
+        // where the old on-wire `total >= raw_section - mg` form would
+        // have disagreed.
+        let strategy = StrategyTag::Fast; // min_gain(20, Fast) = (20>>6)+2 = 2
+
+        // literals_len = 20: raw_header = 1, compressed_header = 3.
+        // New threshold (payload-vs-srcSize):
+        //   keep huf iff huf_section_size <  20 - 2 = 18
+        //   fallback   iff huf_section_size >= 18
+        //
+        // Old (regressed) threshold on-wire-vs-on-wire:
+        //   total = huf_section_size + 3
+        //   fallback iff total >= (20 + 1) - 2 = 19
+        //                iff huf_section_size >= 16
+        //
+        // Gap where formulas disagree: huf_section_size in [16, 18).
+        // The new formula MUST keep huf in this gap.
+        let literals_len = 20usize;
+        // Sanity-check the literals-header constants the math relies on.
+        assert_eq!(compressed_literals_header_bytes(literals_len), 3);
+        assert_eq!(super::uncompressed_literals_header_bytes(literals_len), 1);
+
+        // Inside the gap — new keeps, old would have rejected:
+        assert!(!use_raw_literal_fallback(16, literals_len, strategy));
+        assert!(!use_raw_literal_fallback(17, literals_len, strategy));
+
+        // At/above new threshold — both new and old fall back:
+        assert!(use_raw_literal_fallback(18, literals_len, strategy));
+        assert!(use_raw_literal_fallback(19, literals_len, strategy));
+
+        // Below the old threshold — both keep:
+        assert!(!use_raw_literal_fallback(15, literals_len, strategy));
+        assert!(!use_raw_literal_fallback(0, literals_len, strategy));
+    }
+
+    #[test]
+    fn estimator_literals_section_mirrors_emit_for_short_inputs() {
+        use super::{
+            CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
+            encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        };
+        // For each strategy at boundary literal lengths around `min_lits`
+        // and across the all-identical RLE pre-check (fires for any
+        // non-empty all-identical input under every strategy/HUF state),
+        // estimator's predicted size MUST equal the bytes the emitter
+        // actually writes. Cases include: (a) fresh state with
+        // `last_huff_table: None` covering the strategy-specific
+        // `min_lits` band (8/16/32/64), (b) seeded HUF-reuse state at
+        // the lowered floor of 6 — under the prior hardcoded `len >= 8`
+        // gate 6/7-byte all-identical sections went raw, now they pass
+        // `min_lits == 6` and the donor-parity HUF+`cLitSize==1` path
+        // would route them to RLE; the pre-check shortcuts that path,
+        // (c) sub-`min_lits` all-identical sections that take the
+        // RLE pre-check regardless of strategy.
+        type Inputs = &'static [(usize, bool)];
+        let cases: &[(StrategyTag, bool, Inputs)] = &[
+            // (strategy, seed_huff_reuse, [(len, all_identical)])
+            (
+                StrategyTag::Fast,
+                false,
+                &[
+                    (1, true), // sub-min_lits all-identical → RLE
+                    (5, true), // sub-min_lits all-identical → RLE
+                    (8, true),
+                    (8, false),
+                    (63, true),
+                    (63, false),
+                    (64, false),
+                ],
+            ),
+            (
+                StrategyTag::BtUltra2,
+                false,
+                &[(7, true), (7, false), (8, true), (8, false), (16, false)],
+            ),
+            (
+                StrategyTag::BtOpt,
+                false,
+                &[(8, true), (31, true), (32, false)],
+            ),
+            // HUF reuse path: floor drops to 6. Under the prior
+            // hardcoded `len >= 8` gate 6/7-byte sections went raw;
+            // post-fix, all-identical 6/7-byte sections take the RLE
+            // pre-check and stay byte-equivalent estimator-vs-emit
+            // (donor parity would route them HUF→cLitSize==1→RLE).
+            // Also exercise non-identical 6-byte raw fallback and
+            // 16-byte HUF reuse path.
+            (
+                StrategyTag::Lazy,
+                true,
+                &[(6, true), (7, true), (6, false), (16, false)],
+            ),
+        ];
+
+        for (strat, seed_huff, inputs) in cases {
+            for (len, identical) in *inputs {
+                let literals: Vec<u8> = if *identical {
+                    alloc::vec![0x5Au8; *len]
+                } else {
+                    (0..*len as u8).collect()
+                };
+                // Seed both estimator and emit state with the same
+                // synthetic HUF table when `seed_huff` is true so the
+                // reuse path's `min_lits == 6` floor is exercised.
+                // Counts from a varied byte sequence give a valid
+                // (writeable) table that survives the `decide_huff_reuse`
+                // decision when literals are large enough to consider it.
+                let seed_table = if *seed_huff {
+                    let mut counts = [0usize; 256];
+                    for b in (0..=63u8).chain(64..=127u8) {
+                        counts[b as usize] = 1;
+                    }
+                    Some(huff0_encoder::HuffmanTable::build_from_counts(&counts))
+                } else {
+                    None
+                };
+                let mut est_state = CompressState::<EntropyOnlyMatcher> {
+                    matcher: EntropyOnlyMatcher,
+                    last_huff_table: seed_table.clone(),
+                    fse_tables: FseTables::new(),
+                    block_scratch: CompressedBlockScratch::new(),
+                    offset_hist: [1, 4, 8],
+                    strategy_tag: *strat,
+                };
+                let mut emit_state = CompressState::<EntropyOnlyMatcher> {
+                    matcher: EntropyOnlyMatcher,
+                    last_huff_table: seed_table,
+                    fse_tables: FseTables::new(),
+                    block_scratch: CompressedBlockScratch::new(),
+                    offset_hist: [1, 4, 8],
+                    strategy_tag: *strat,
+                };
+                let mut workspace = EstimatorWorkspace::default();
+                let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+                let mut emitted: Vec<u8> = Vec::new();
+                let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
+                encode_block_parts_with_sequence_scratch(
+                    &mut emit_state,
+                    &literals,
+                    &[],
+                    &mut emitted,
+                    &mut scratch,
+                );
+                assert_eq!(
+                    est,
+                    emitted.len(),
+                    "estimator/emit parity broken: strategy={:?} seed_huff={} len={} identical={} est={} emit={}",
+                    strat,
+                    seed_huff,
+                    len,
+                    identical,
+                    est,
+                    emitted.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn encode_match_len_uses_correct_upper_range_base() {
         assert_eq!(encode_match_len(65539), (52, 0, 16));
         assert_eq!(encode_match_len(65540), (52, 1, 16));
@@ -1727,6 +2092,7 @@ mod tests {
             fse_tables: FseTables::new(),
             block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: [10, 20, 30],
+            strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         };
         let source = [0xA5; 8];
         let sequences = [RawSequence {

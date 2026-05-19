@@ -66,6 +66,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             pending: Vec::new(),
             encoded_scratch: Vec::new(),
@@ -233,6 +236,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.fse_tables.ll_previous = None;
         self.state.fse_tables.ml_previous = None;
         self.state.fse_tables.of_previous = None;
+        // Sync `state.strategy_tag` from the active compression level so the
+        // literal-compression gates (`min_literals_to_compress`, `min_gain`
+        // in `encoding::blocks::compressed`) see the correct strategy for
+        // every frame. Mirrors `FrameCompressor::compress` and keeps both
+        // entry points byte-equivalent at the gate level.
+        self.state.strategy_tag =
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -1170,6 +1180,52 @@ mod tests {
             header.window_size().unwrap() >= 1024,
             "window descriptor should be present when single-segment is disabled"
         );
+    }
+
+    #[test]
+    fn ensure_frame_started_refreshes_stale_strategy_tag_at_reset() {
+        // The literal-compression gates (`min_literals_to_compress`,
+        // `min_gain`) read `state.strategy_tag`. Regression: every
+        // reset site MUST refresh that tag from the active compression
+        // level — relying on construction-time initialization alone is
+        // not enough, because later mutations or reuse patterns can
+        // leave the tag stale.
+        //
+        // To exercise the RESET-time refresh (not just the
+        // construction-time init that `StreamingEncoder::new` does for
+        // free), this test deliberately corrupts `state.strategy_tag`
+        // to a value that does NOT match the active level, then
+        // triggers `ensure_frame_started` and asserts the reset path
+        // wrote the correct tag back. If the sync line in
+        // `ensure_frame_started` were deleted, the corrupted value
+        // would survive the write and fail the assertion.
+        use crate::encoding::strategy::StrategyTag;
+        for level in [
+            CompressionLevel::Fastest,
+            CompressionLevel::Default,
+            CompressionLevel::Better,
+            CompressionLevel::Best,
+        ] {
+            let expected = StrategyTag::for_compression_level(level);
+            let mut encoder = StreamingEncoder::new(Vec::new(), level);
+            // Pick a sentinel that differs from the legitimate tag so
+            // a missing reset-time sync is observable. BtUltra2 is the
+            // most-aggressive variant; the four levels above resolve
+            // to Fast/Dfast/Lazy/Lazy respectively, none equal to it.
+            let sentinel = StrategyTag::BtUltra2;
+            assert_ne!(
+                expected, sentinel,
+                "sentinel must differ from the legitimate tag at level {level:?}",
+            );
+            encoder.state.strategy_tag = sentinel;
+            encoder.write_all(b"x").unwrap();
+            assert_eq!(
+                encoder.state.strategy_tag, expected,
+                "reset-time strategy_tag sync missing at level {level:?}: \
+                 sentinel survived `ensure_frame_started`",
+            );
+            let _ = encoder.finish().unwrap();
+        }
     }
 
     #[test]
