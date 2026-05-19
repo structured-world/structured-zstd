@@ -625,13 +625,6 @@
         return row.delta_ratio < BAND_LOW || row.delta_ratio > BAND_HIGH;
       }
 
-      function bandLabelForRow(row) {
-        if (typeof row.delta_ratio !== "number") return "n/a";
-        if (isRegression(row)) return "outside";
-        const inBand = row.delta_ratio >= BAND_LOW && row.delta_ratio <= BAND_HIGH;
-        return inBand ? "within" : "win";
-      }
-
       function updateStatus(filtered) {
         const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
         if (!numericRows.length) {
@@ -713,16 +706,24 @@
       // area (fixes silent series hiding), and toggling visibility uses
       // the same Chart.js `meta.hidden` mechanism the built-in legend
       // used so dataset rendering stays identical.
-      function renderHtmlLegend(chart, container) {
+      // `onToggle(index, ds, nextVisible)` lets the caller route the
+      // visibility change through external state (e.g. the profile
+      // chart's checkbox-backed `profileSeriesVisibility`). When
+      // omitted, the legend toggles the dataset directly — matching
+      // the built-in Chart.js legend behaviour the delta chart relies
+      // on. Hidden detection uses `chart.isDatasetVisible(i)` so the
+      // `hidden-series` styling reflects both `meta.hidden` toggles
+      // (legend clicks) AND `dataset.hidden` set at construction time
+      // (which leaves `meta.hidden === null`).
+      function renderHtmlLegend(chart, container, onToggle) {
         if (!chart || !container) return;
         container.replaceChildren();
         const datasets = chart.data.datasets || [];
         for (let i = 0; i < datasets.length; i++) {
           const ds = datasets[i];
-          const meta = chart.getDatasetMeta(i);
           const item = document.createElement("div");
           item.className = "html-legend-item";
-          if (meta.hidden) item.classList.add("hidden-series");
+          if (!chart.isDatasetVisible(i)) item.classList.add("hidden-series");
 
           const swatch = document.createElement("span");
           swatch.className = "html-legend-swatch";
@@ -735,10 +736,14 @@
           item.appendChild(label);
 
           item.addEventListener("click", () => {
-            const currentMeta = chart.getDatasetMeta(i);
-            currentMeta.hidden = currentMeta.hidden === null ? !chart.data.datasets[i].hidden : !currentMeta.hidden;
+            const nextVisible = !chart.isDatasetVisible(i);
+            if (typeof onToggle === "function") {
+              onToggle(i, ds, nextVisible);
+              return;
+            }
+            chart.setDatasetVisibility(i, nextVisible);
             chart.update();
-            renderHtmlLegend(chart, container);
+            renderHtmlLegend(chart, container, onToggle);
           });
 
           container.appendChild(item);
@@ -896,26 +901,14 @@
         };
       }
 
-      function renderProfileChart() {
-        const filter = profileFilter();
-        if (!filter.target || !filter.scenario || !filter.stage) {
-          el("profile-status").textContent = "Select target, scenario and stage to render the level profile.";
-          return;
-        }
-        const { levels, levelCount, datasets } = buildProfileData(filter);
-        if (!levelCount) {
-          if (state.profileChart) {
-            state.profileChart.destroy();
-            state.profileChart = null;
-          }
-          el("legend-profile").replaceChildren();
-          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, stage=${filter.stage}.`;
-          return;
-        }
-        el("profile-status").textContent =
-          `Showing ${levelCount} level point(s) for scenario=${filter.scenario}, stage=${filter.stage}.`;
-
-        const chartDatasets = datasets.map((ds) => ({
+      // Single source of truth for the chart instance: created once on
+      // first render, then patched in place on every selector change
+      // (scenario / stage / target) and on every toggle. Recreating the
+      // chart would drop animation continuity AND the Chart.js-internal
+      // visibility state — both regressions the PR's acceptance criteria
+      // explicitly call out ("repopulate without recreating the chart").
+      function buildProfileDatasets(rawDatasets) {
+        return rawDatasets.map((ds) => ({
           label: ds.label,
           data: ds.data,
           yAxisID: ds.yAxisID,
@@ -930,40 +923,103 @@
           hidden: !state.profileSeriesVisibility[ds.seriesKey],
           _seriesKey: ds.seriesKey,
         }));
+      }
 
-        if (state.profileChart) state.profileChart.destroy();
-        state.profileChart = new Chart(el("chart-profile"), {
-          type: "line",
-          data: { labels: levels, datasets: chartDatasets },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: "index", intersect: false },
-            scales: {
-              x: {
-                title: { display: true, text: "Compression level" },
-                ticks: { autoSkip: false, maxRotation: 60, minRotation: 30 },
+      function onProfileLegendToggle(index, ds, nextVisible) {
+        const key = ds._seriesKey;
+        if (key) {
+          // Persist visibility across re-renders and keep the checkbox UI
+          // in sync — without this, clicking the legend produced a state
+          // mismatch with the checkbox, and a subsequent scenario switch
+          // would silently restore the hidden series.
+          state.profileSeriesVisibility[key] = nextVisible;
+          const checkbox = document.querySelector(
+            `.profile-toggles input[type=checkbox][data-series="${key}"]`,
+          );
+          if (checkbox) checkbox.checked = nextVisible;
+        }
+        if (state.profileChart) {
+          state.profileChart.setDatasetVisibility(index, nextVisible);
+          state.profileChart.update("none");
+          renderHtmlLegend(
+            state.profileChart,
+            el("legend-profile"),
+            onProfileLegendToggle,
+          );
+        }
+      }
+
+      function renderProfileChart() {
+        const filter = profileFilter();
+        if (!filter.target || !filter.scenario || !filter.stage) {
+          el("profile-status").textContent = "Select target, scenario and stage to render the level profile.";
+          return;
+        }
+        const { levels, levelCount, datasets } = buildProfileData(filter);
+        if (!levelCount) {
+          if (state.profileChart) {
+            // No data for the chosen filter — clear the chart in place
+            // rather than destroying it, so the next non-empty selection
+            // still updates the existing instance.
+            state.profileChart.data.labels = [];
+            state.profileChart.data.datasets = [];
+            state.profileChart.update("none");
+          }
+          el("legend-profile").replaceChildren();
+          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, stage=${filter.stage}.`;
+          return;
+        }
+        el("profile-status").textContent =
+          `Showing ${levelCount} level point(s) for scenario=${filter.scenario}, stage=${filter.stage}.`;
+
+        const chartDatasets = buildProfileDatasets(datasets);
+
+        if (state.profileChart) {
+          // In-place update path: swap labels + datasets, then ask
+          // Chart.js to redraw without animation. This preserves the
+          // chart instance (tooltips, scales, animation state) across
+          // every target/scenario/stage switch.
+          state.profileChart.data.labels = levels;
+          state.profileChart.data.datasets = chartDatasets;
+          state.profileChart.update("none");
+        } else {
+          state.profileChart = new Chart(el("chart-profile"), {
+            type: "line",
+            data: { labels: levels, datasets: chartDatasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              scales: {
+                x: {
+                  title: { display: true, text: "Compression level" },
+                  ticks: { autoSkip: false, maxRotation: 60, minRotation: 30 },
+                },
+                y: {
+                  type: "linear",
+                  position: "left",
+                  title: { display: true, text: "Throughput (MiB/s)" },
+                  beginAtZero: true,
+                },
+                y1: {
+                  type: "linear",
+                  position: "right",
+                  title: { display: true, text: "Compression ratio" },
+                  grid: { drawOnChartArea: false },
+                },
               },
-              y: {
-                type: "linear",
-                position: "left",
-                title: { display: true, text: "Throughput (MiB/s)" },
-                beginAtZero: true,
-              },
-              y1: {
-                type: "linear",
-                position: "right",
-                title: { display: true, text: "Compression ratio" },
-                grid: { drawOnChartArea: false },
+              plugins: {
+                legend: { display: false },
+                tooltip: { mode: "index", intersect: false },
               },
             },
-            plugins: {
-              legend: { display: false },
-              tooltip: { mode: "index", intersect: false },
-            },
-          },
-        });
-        renderHtmlLegend(state.profileChart, el("legend-profile"));
+          });
+        }
+        renderHtmlLegend(
+          state.profileChart,
+          el("legend-profile"),
+          onProfileLegendToggle,
+        );
       }
 
       function applyProfileToggles() {
@@ -972,11 +1028,14 @@
         for (let i = 0; i < datasets.length; i++) {
           const key = datasets[i]._seriesKey;
           if (!key) continue;
-          const meta = state.profileChart.getDatasetMeta(i);
-          meta.hidden = !state.profileSeriesVisibility[key];
+          state.profileChart.setDatasetVisibility(i, !!state.profileSeriesVisibility[key]);
         }
         state.profileChart.update("none");
-        renderHtmlLegend(state.profileChart, el("legend-profile"));
+        renderHtmlLegend(
+          state.profileChart,
+          el("legend-profile"),
+          onProfileLegendToggle,
+        );
       }
 
       function bindProfileControls() {
