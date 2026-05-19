@@ -268,15 +268,27 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
             return 16;
         }
     }
-    #[cfg(all(not(feature = "std"), target_feature = "avx512f"))]
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx512f"
+    ))]
     {
         return 64;
     }
-    #[cfg(all(not(feature = "std"), target_feature = "avx2"))]
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx2"
+    ))]
     {
         return 32;
     }
-    #[cfg(all(not(feature = "std"), target_feature = "sse2"))]
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ))]
     {
         return 16;
     }

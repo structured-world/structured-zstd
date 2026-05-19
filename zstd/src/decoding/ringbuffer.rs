@@ -184,6 +184,39 @@ impl RingBuffer {
         debug_assert!(self.len() + len < self.cap);
         debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
 
+        // Flat fast path: the write is one contiguous copy from `data` to
+        // `buf + tail` with no wraparound, no slice split, no second
+        // `simd_copy` call. Conditions:
+        //   1. head ≤ tail (no prior wrap of the data region), and
+        //   2. tail + len ≤ cap (the write itself does not cross `cap`).
+        // For frames that fit in the window (the common case on this bench
+        // and on most real-world streams), this path fires on every literal
+        // push and on every `extend_from_reader` slot. `simd_copy` can use
+        // the WILDCOPY_OVERLENGTH slack past `cap` for its SIMD overshoot
+        // since dst ends at `cap`.
+        //
+        // Profile (decompress L-1 fast decodecorpus-z000033 c_stream)
+        // showed `RingBuffer::extend` at 33.6% self-time AFTER the routing
+        // refactor — most of that was the 4-case dispatch through
+        // `free_slice_parts` for the wrap-shaped slow path on workloads
+        // that never wrap. Bypassing it for the flat case directly
+        // attacks that share.
+        if self.head <= self.tail && self.tail + len <= self.cap {
+            let dst_ptr = unsafe { self.buf.as_ptr().add(self.tail) };
+            let dst_cap = (self.cap - self.tail) + WILDCOPY_OVERLENGTH;
+            unsafe {
+                simd_copy::copy_bytes_overshooting((ptr, len), (dst_ptr, dst_cap), len);
+            }
+            // Invariant 4: `tail` is never `cap` except when full (then 0).
+            // After this write tail can land at `cap` if the literal push
+            // exactly filled the buffer — normalize to 0 in that case.
+            self.tail += len;
+            if self.tail == self.cap {
+                self.tail = 0;
+            }
+            return;
+        }
+
         let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
         debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
 
