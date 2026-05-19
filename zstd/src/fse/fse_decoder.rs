@@ -196,35 +196,12 @@ impl FSETable {
 
         let table_size = 1 << self.accuracy_log;
         // After clear(), len == 0, so reserve(table_size) guarantees capacity
-        // ≥ table_size — required precondition for the set_len below.
+        // ≥ table_size. The matching `set_len` runs later, right before
+        // `copy_symbols_into_decode`, so that any panic in the intervening
+        // table_symbols / symbol_spread_buffer allocations unwinds with
+        // `self.decode.len() == 0` instead of leaving uninitialized Entry
+        // slots reachable through `&mut self.decode[..]` on the next call.
         self.decode.reserve(table_size);
-
-        // Skip the zero-fill resize: `copy_symbols_into_decode` below writes a
-        // full Entry (new_state, symbol, num_bits) for every slot on the
-        // little-endian fast path, and the subsequent baseline/num_bits passes
-        // overwrite the fields they care about. On big-endian we keep the old
-        // resize so the iter_mut path stays safe — no production target we
-        // ship on is BE, so the perf cost there is irrelevant.
-        #[cfg(target_endian = "little")]
-        {
-            // SAFETY: `table_size` ≤ `self.decode.capacity()` (just reserved
-            // if needed), and `copy_symbols_into_decode` below writes every
-            // byte of every Entry via raw `ptr::write_unaligned` calls before
-            // any read touches them. The trailing baselines/num_bits passes
-            // (lines below) only overwrite already-initialized fields.
-            unsafe { self.decode.set_len(table_size) };
-        }
-        #[cfg(not(target_endian = "little"))]
-        {
-            self.decode.resize(
-                table_size,
-                Entry {
-                    new_state: 0,
-                    symbol: 0,
-                    num_bits: 0,
-                },
-            );
-        }
 
         let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
         table_symbols.clear();
@@ -264,6 +241,32 @@ impl FSETable {
             negative_idx
         };
 
+        // SAFETY: `table_size` ≤ `self.decode.capacity()` from the reserve
+        // at the start of this function. `copy_symbols_into_decode` below
+        // runs IMMEDIATELY after this and writes a full Entry to every
+        // slot via raw `ptr::write_unaligned` calls — there is no panic-
+        // able code between `set_len` and full initialization, so an
+        // unwind cannot leave reachable uninitialized Entry slots.
+        // On big-endian targets we keep the old resize-with-default path
+        // because the BE branch of `copy_symbols_into_decode` uses
+        // `iter_mut()` (which constructs `&mut Entry`), and that needs
+        // initialized storage. No production target we ship on is BE,
+        // so the extra zero-fill there is irrelevant.
+        #[cfg(target_endian = "little")]
+        unsafe {
+            self.decode.set_len(table_size);
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            self.decode.resize(
+                table_size,
+                Entry {
+                    new_state: 0,
+                    symbol: 0,
+                    num_bits: 0,
+                },
+            );
+        }
         self.copy_symbols_into_decode(&table_symbols);
         self.symbol_spread_buffer = table_symbols;
         for idx in negative_idx..table_size {
