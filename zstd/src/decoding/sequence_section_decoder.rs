@@ -109,18 +109,16 @@ fn decode_sequences_with_rle(
         let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
         let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
 
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
+        // OF code / offset==0 checks dropped per FSE invariants (see comment
+        // in decode_sequences_without_rle). For RLE mode, the singleton
+        // of_rle byte is validated at maybe_update_fse_tables; for FSE mode,
+        // build_decoding_table caps symbols at MAX_OFFSET_CODE.
+        debug_assert!(of_code <= MAX_OFFSET_CODE);
 
         let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
         let offset = obits as u32 + (1u32 << of_code);
 
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
+        debug_assert_ne!(offset, 0);
 
         target.push(Sequence {
             ll: ll_value + ll_add as u32,
@@ -208,18 +206,26 @@ fn decode_sequences_without_rle(
             let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
             let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
 
-            if of_code > MAX_OFFSET_CODE {
-                return Err(DecodeSequenceError::UnsupportedOffset {
-                    offset_code: of_code,
-                });
-            }
+            // `of_code > MAX_OFFSET_CODE` was a defense-in-depth check that
+            // is mathematically unreachable: FSE table construction
+            // (`AlignedFSETable::new(MAX_OFFSET_CODE)` + `TooManySymbols`
+            // guard in `build_decoding_table`) bounds every emitted symbol
+            // by `max_symbol = 31`, and RLE-mode validation at
+            // `maybe_update_fse_tables` line ~415 enforces the same upper
+            // bound on the singleton byte. The `offset == 0` check is also
+            // unreachable: `1u32 << of_code` is ≥ 1 for any `of_code` in
+            // 0..=31. Replace both with debug_asserts so any future
+            // invariant break trips in tests without paying for the branch
+            // on the hot path in release builds.
+            debug_assert!(
+                of_code <= MAX_OFFSET_CODE,
+                "FSE invariant: of_code ({of_code}) must be <= MAX_OFFSET_CODE ({MAX_OFFSET_CODE})"
+            );
 
             let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
             let offset = obits as u32 + (1u32 << of_code);
 
-            if offset == 0 {
-                return Err(DecodeSequenceError::ZeroOffset);
-            }
+            debug_assert_ne!(offset, 0, "FSE invariant: 1u32 << of_code is always >= 1");
 
             target.push(Sequence {
                 ll: ll_value + ll_add as u32,
@@ -246,18 +252,14 @@ fn decode_sequences_without_rle(
         let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
         let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
 
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
+        // Same FSE invariants as the main loop body — see the longer
+        // comment in the `num_sequences > 1` branch above.
+        debug_assert!(of_code <= MAX_OFFSET_CODE);
 
         let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
         let offset = obits as u32 + (1u32 << of_code);
 
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
+        debug_assert_ne!(offset, 0);
 
         target.push(Sequence {
             ll: ll_value + ll_add as u32,
