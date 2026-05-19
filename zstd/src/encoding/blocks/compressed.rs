@@ -26,10 +26,11 @@ const MAX_NB_BLOCK_SPLITS: usize = 196;
 /// → 16, strategy 9 (btultra2) → 8.
 ///
 /// Our `StrategyTag` enum has seven variants (no separate lazy2/btlazy2 —
-/// the `Lazy` variant covers donor strategies 4..6). Map our variants to
-/// donor strategy numbers using the most-aggressive-of-band mapping
-/// (`Lazy → strat=5 → shift=3`) so the threshold matches what donor would
-/// pick for the levels we route to that variant.
+/// the `Lazy` variant covers donor strategies 4..6). Within the
+/// fast..lazy2 band donor's shift table is flat: strategies 1..6 all
+/// pin `shift = MIN(9 - strat, 3) = 3`, so `Lazy → 64-byte floor`
+/// regardless of which donor index (4, 5, or 6) we'd nominally use.
+/// No aggressiveness gradient within this band to preserve.
 #[inline]
 fn min_literals_to_compress(
     strategy: crate::encoding::strategy::StrategyTag,
@@ -49,9 +50,9 @@ fn min_literals_to_compress(
 }
 
 /// Donor `ZSTD_minGain` (`zstd_compress_internal.h:677-684`):
-/// strategy-aware minimum-compression margin used by both block-level
-/// emit ("compressed block must beat raw + minGain bytes") and the
-/// literal-section expansion check.
+/// strategy-aware minimum-compression margin. In donor it gates both
+/// the block-level "compressed block must beat raw + minGain" decision
+/// and the literal-section `cLitSize >= srcSize - minGain` fallback.
 ///
 /// Formula: `minlog = (strat >= btultra) ? strat - 1 : 6; (src_size >>
 /// minlog) + 2`. So:
@@ -59,15 +60,15 @@ fn min_literals_to_compress(
 /// - btultra (strat 8): minlog=7 → ~0.78% margin + 2 bytes
 /// - btultra2 (strat 9): minlog=8 → ~0.39% margin + 2 bytes
 ///
-/// Used in `compress_literals` and `estimate_literals_section_bytes` to
-/// match donor's `cLitSize >= srcSize - minGain` raw-fallback gate.
-/// Existing block-level emit / probe paths (`emit_single_sequence_block`,
-/// `SplitEstimator::estimate_subblock_size`) already use `min_log = 8`
-/// directly (`source_len >> 8 + 2`) — that is the btultra2 margin, the
-/// most permissive of the band, applied uniformly. Migrating those sites
-/// to this strategy-aware helper is a separate cleanup; this commit only
-/// wires the helper into the literal-section gates that previously had
-/// no `min_gain` margin at all (bare `>= raw_section_bytes`).
+/// **Current usage in this crate:** wired into the literal-section
+/// raw-fallback gate (`compress_literals` +
+/// `estimate_literals_section_bytes`) only — those sites previously
+/// had no margin at all (bare `>= raw_section_bytes`).
+/// **Not yet wired into** the block-level emit/probe paths
+/// (`emit_single_sequence_block`, `SplitEstimator::estimate_subblock_size`),
+/// which still use a uniform `(source_len >> 8) + 2` calculation
+/// (the btultra2 value applied across all strategies). Migrating
+/// those sites is a separate cleanup.
 #[inline]
 fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -> usize {
     use crate::encoding::strategy::StrategyTag;
