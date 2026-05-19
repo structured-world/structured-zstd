@@ -62,12 +62,14 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // below also bail (`rounded > min_buffer_size`), leaving libc memmove
     // as the only option. memmove was 24% of decode CPU on the profiled
     // scenario. Replace it with inline byte / overlapping-u64 ops for
-    // copies up to 16 bytes — these write EXACTLY `copy_at_least` bytes
+    // copies up to 32 bytes — these write EXACTLY `copy_at_least` bytes
     // without any overshoot, which is the contract the slack-less call
-    // sites require.
-    if copy_at_least <= 16 {
+    // sites require. 32-byte cap covers the typical literal-push size
+    // range (1..=24 bytes seen on the profiled corpus) and stays within
+    // a single straight-line block on the I-cache.
+    if copy_at_least <= 32 {
         // SAFETY: `copy_at_least <= min(src.1, dst.1)` by this function's
-        // contract, so both branches read/write strictly within the
+        // contract, so all branches below read/write strictly within the
         // caller's reported readable / writable spans.
         unsafe {
             if copy_at_least <= 8 {
@@ -81,7 +83,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
                     dst.0.add(i).write(src.0.add(i).read());
                     i += 1;
                 }
-            } else {
+            } else if copy_at_least <= 16 {
                 // 9..=16 bytes via two overlapping unaligned u64 ops. The
                 // overlap region is written twice with the same source
                 // bytes, so the net effect is exactly `copy_at_least` bytes
@@ -91,6 +93,22 @@ pub(crate) unsafe fn copy_bytes_overshooting(
                 let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
                 dst.0.cast::<u64>().write_unaligned(lo);
                 dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
+            } else {
+                // 17..=32 bytes: first 16 via two adjacent u64 stores, the
+                // trailing 1..=16 via the same overlapping-pair trick.
+                // Four loads + four stores total, all branch-free.
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi: u64 = src.0.add(8).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(8).cast::<u64>().write_unaligned(hi);
+                let tail_off = copy_at_least - 16;
+                let tail_lo: u64 = src.0.add(tail_off).cast::<u64>().read_unaligned();
+                let tail_hi: u64 = src.0.add(copy_at_least - 8).cast::<u64>().read_unaligned();
+                dst.0.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
+                dst.0
+                    .add(copy_at_least - 8)
+                    .cast::<u64>()
+                    .write_unaligned(tail_hi);
             }
         }
         debug_assert_eq_copy(src, dst, copy_at_least);
