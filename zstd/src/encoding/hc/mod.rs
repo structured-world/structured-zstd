@@ -235,8 +235,14 @@ impl HcMatcher {
         // the array form costs ~12 KiB of stack traffic per accepted
         // match. Donor (`zstd_lazy.c` `ZSTD_HcFindBestMatch`) runs a
         // single fused loop with no intermediate buffer; mirror that.
-        // `chain_candidates` is kept under `#[cfg(test)]` callers as a
-        // dump-style helper for the chain-walk unit tests.
+        //
+        // `chain_candidates` itself is still alive — the chain-walk
+        // unit tests drive it directly, and the BT-optimal HC
+        // candidate collector in `match_generator.rs` consumes it
+        // through a macro pipeline that inherits the array form.
+        // Inlining the array out of that BT-optimal callsite is a
+        // separate, larger refactor; this commit only addresses the
+        // lazy hot path.
         let hash = table.hash_position(&concat[current_idx..]);
         let chain_mask = (1usize << table.chain_log) - 1;
         let mut cur = table.hash_table[hash];
@@ -323,37 +329,9 @@ impl HcMatcher {
                 // `abs_pos > candidate_abs` is invariant under the bounds check
                 // above, so the subtraction never underflows.
                 let new_offset = abs_pos - candidate_abs;
-                // Donor speculative tail check (`zstd_lazy.c:714`,
-                // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
-                // expensive `common_prefix_len` walk on a 4-byte tail compare
-                // proving the new candidate can possibly reach the *forward*
-                // length required to outscore `best` under
-                // [`Self::better_candidate`] (gain = `len*4 - offset_bits`).
-                //
-                // Correctness — backward-extension–aware bound:
-                //   `best.match_len` is the *total* length stored by
-                //   [`Self::extend_backwards`]: forward bytes from
-                //   `current_idx` plus up to `lit_len` backward bytes
-                //   (`B_best = abs_pos − best.start`, capped by `lit_len`).
-                //   A new candidate can in principle replace `B_best` of its
-                //   own length with up to `lit_len` backward bytes, so the
-                //   worst-case forward length it needs to outscore `best`
-                //   is `best.match_len − lit_len + 1`. The 4-byte tail probe
-                //   at offset `best.match_len − lit_len − 3` covers exactly
-                //   that boundary.
-                //
-                // Walk-order argument (offset monotonicity — REQUIRED gate
-                // precondition, enforced per-iteration):
-                //   Chain walks are LIFO in their dense form (newest first →
-                //   strictly increasing offset). But the chain table is
-                //   `chain_log`-bits wide; when a position is re-inserted at
-                //   the same masked chain index after the cycle wraps, an
-                //   older chain link can point into a slot that has since
-                //   been overwritten with a newer (closer) position, breaking
-                //   monotonicity. The gate's bound is only sound when
-                //   `new_offset >= best.offset`; otherwise fall through to
-                //   the full `common_prefix_len` so the offset-bits advantage
-                //   is given a chance to win.
+                // Speculative tail gate — full rationale (backward-extension
+                // bound + walk-order/offset-monotonicity precondition) is in
+                // the comment block right above this loop.
                 let mut skip = false;
                 if let Some(best_ref) = best
                     && new_offset >= best_ref.offset
