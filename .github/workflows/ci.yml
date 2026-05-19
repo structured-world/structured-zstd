@@ -3,8 +3,25 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only / dashboard-only commits don't touch code, tests, or
+    # bench inputs — no reason to spin up the full lint → test (3 OS) →
+    # cross-i686 → msrv → codecov → fuzz → 27-shard bench pipeline.
+    # The dashboard's `index.html` republish path lives in
+    # `pages-only.yml`, which is gated on these same paths inversely.
+    paths-ignore:
+      - '**.md'
+      - '.github/bench-dashboard/**'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.github/bench-dashboard/**'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
 
 permissions:
   contents: read

@@ -1,0 +1,56 @@
+name: Pages-only deploy
+
+# Lightweight companion to ci.yml: deploys the dashboard shell
+# (`.github/bench-dashboard/index.html`) to gh-pages without running
+# the full bench/test/build pipeline. Triggered ONLY when paths that
+# ci.yml ignores actually change — the two workflows partition the
+# push space so every commit hits exactly one of them.
+#
+# Bench data files (benchmark-report.md, benchmark-delta.json, etc.)
+# on gh-pages are NOT touched here — they're produced by the bench
+# pipeline in ci.yml and remain authoritative.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/bench-dashboard/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-only-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-dashboard:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate bot token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          token: ${{ steps.bot-token.outputs.token }}
+          path: gh-pages
+
+      - name: Copy dashboard shell and push
+        run: |
+          mkdir -p gh-pages/dev/bench
+          cp .github/bench-dashboard/index.html gh-pages/dev/bench/index.html
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/index.html
+          git diff --cached --quiet || git commit -m "chore(dashboard): refresh index.html"
+          git push origin gh-pages
