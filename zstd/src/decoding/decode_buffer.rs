@@ -70,8 +70,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
 
     /// Wrap a pre-constructed backend (e.g. `FlatBuf::with_capacity`
     /// sized for a single-segment frame) into a `DecodeBuffer`. Used
-    /// by `FrameDecoder` once Phase 2 of backlog item #132 lands.
-    #[allow(dead_code)]
+    /// by `FrameDecoder` (via `DecoderScratchKind::new_flat`) to
+    /// supply a `FlatBuf` pre-sized for `frame_content_size` —
+    /// the default `new()` constructor would otherwise produce a
+    /// zero-capacity backend and force a realloc on the first push.
     pub fn from_backend(buffer: B, window_size: usize) -> DecodeBuffer<B> {
         DecodeBuffer {
             buffer,
