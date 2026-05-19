@@ -250,30 +250,16 @@ fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
-            let rust_compressed = structured_zstd::encoding::compress_slice_to_vec(
-                &scenario.bytes[..],
-                level.rust_level,
-            );
-            let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
                 scenario,
                 level,
                 "rust_stream",
-                &rust_compressed,
                 expected_len,
                 emit_reports,
             );
-            bench_decompress_source(
-                c,
-                scenario,
-                level,
-                "c_stream",
-                &ffi_compressed,
-                expected_len,
-                emit_reports,
-            );
+            bench_decompress_source(c, scenario, level, "c_stream", expected_len, emit_reports);
         }
     }
 }
@@ -283,12 +269,9 @@ fn bench_decompress_source(
     scenario: &Scenario,
     level: LevelConfig,
     source: &'static str,
-    compressed: &[u8],
     expected_len: usize,
     _emit_reports: bool,
 ) {
-    assert_decompress_matches_reference(scenario, compressed, expected_len);
-
     let benchmark_name = format!(
         "decompress/{}/{}/{}/matrix",
         level.name, scenario.id, source
@@ -297,7 +280,33 @@ fn bench_decompress_source(
     configure_group(&mut group, scenario);
     group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
+    // Compression of the input stream is the setup step for this group's
+    // decode timings. Defer it into a OnceCell that materializes only when
+    // at least one of `pure_rust`/`c_ffi` is selected by the active filter
+    // — without this, `cargo bench -- --profile-time` with a tight filter
+    // still paid the cost of compressing every (scenario, level, source)
+    // combo upfront, swamping samply profiles with encode CPU samples and
+    // hiding the decode hot path we actually wanted to inspect.
+    let compressed = std::cell::OnceCell::<Vec<u8>>::new();
+    let materialize = || -> &[u8] {
+        compressed
+            .get_or_init(|| {
+                let bytes = match source {
+                    "rust_stream" => structured_zstd::encoding::compress_slice_to_vec(
+                        &scenario.bytes[..],
+                        level.rust_level,
+                    ),
+                    "c_stream" => ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level),
+                    other => panic!("bench_decompress_source: unknown source {other}"),
+                };
+                assert_decompress_matches_reference(scenario, &bytes, expected_len);
+                bytes
+            })
+            .as_slice()
+    };
+
     group.bench_function("pure_rust", |b| {
+        let compressed = materialize();
         let mut target = vec![0u8; expected_len];
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
@@ -315,6 +324,7 @@ fn bench_decompress_source(
         // pure-Rust loop above which reuses one `FrameDecoder` and
         // one `target`. Creating a fresh DCtx per iteration would
         // dominate sub-millisecond samples.
+        let compressed = materialize();
         let mut dctx = FfiDCtxHandle::new();
         let mut target = vec![0u8; expected_len];
         b.iter(|| {
