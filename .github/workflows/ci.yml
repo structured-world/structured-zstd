@@ -167,21 +167,19 @@ jobs:
     # a hot decode path and silently breaks downstream embedded users.
     # Two configurations cover the realistic deployment surface:
     # alloc-only (zero features) and alloc + xxhash content checksum.
+    # Clippy runs cargo's compile checks plus linting, so a separate
+    # `cargo check` pass would just duplicate work.
     needs: lint
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: no-std
-      - name: Check (no_std, alloc-only)
-        working-directory: zstd
-        run: cargo check -p structured-zstd --no-default-features
-      - name: Check (no_std + hash)
-        working-directory: zstd
-        run: cargo check -p structured-zstd --no-default-features --features hash
       - name: Clippy (no_std)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features -- -D warnings
