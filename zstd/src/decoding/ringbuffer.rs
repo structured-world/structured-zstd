@@ -110,7 +110,17 @@ impl RingBuffer {
     }
 
     /// Ensure that there's space for `amount` elements in the buffer.
+    #[inline]
     pub fn reserve(&mut self, amount: usize) {
+        // Flat fast path: when the data region hasn't wrapped (head ≤ tail)
+        // and the write does not cross `cap`, free space is trivially
+        // `cap - tail - 1 + head` ≥ `cap - tail - 1` ≥ `amount`. Skip
+        // free_slice_lengths' branch + saturating_sub on the common case
+        // that dominates frames fitting in the window (the same case the
+        // flat extend path optimises for).
+        if self.head <= self.tail && self.tail + amount < self.cap {
+            return;
+        }
         let free = self.free();
         if free >= amount {
             return;
