@@ -186,6 +186,7 @@ mod tests {
             fse_tables: FseTables::new(),
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
+            strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         };
         let mut output = Vec::new();
 
@@ -213,6 +214,7 @@ mod tests {
             fse_tables: FseTables::new(),
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
+            strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         };
         let mut output = Vec::new();
 

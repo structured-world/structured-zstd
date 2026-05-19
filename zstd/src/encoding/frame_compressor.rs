@@ -390,6 +390,15 @@ pub(crate) struct CompressState<M: Matcher> {
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
     pub(crate) offset_hist: [u32; 3],
+    /// Strategy tag resolved from the current `CompressionLevel` at every
+    /// `matcher.reset()` call. Used by the literal-compression gates
+    /// (`min_literals_to_compress`, `min_gain`) in
+    /// `encoding::blocks::compressed` to mirror donor's strategy-aware
+    /// thresholds (`zstd_compress_literals.c:114-127, 187-188`). Defaults
+    /// to `Fast` so a `CompressState` constructed without an explicit
+    /// reset still has a valid value (matches the level-1 default donor
+    /// would emit for `disableLiteralCompression == 0`).
+    pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -408,6 +417,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -430,6 +442,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             compression_level,
             #[cfg(feature = "hash")]
@@ -489,6 +504,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.offset_hist = [1, 4, 8];
+        // Sync `state.strategy_tag` to the level resolved at this reset so
+        // the literal-compression gates (`min_literals_to_compress` /
+        // `min_gain` in `encoding::blocks::compressed`) see the correct
+        // strategy for the next frame. Frame-by-frame level changes go
+        // through this same `compress()` entry point, so re-syncing here
+        // covers level switches without touching the matcher dispatch.
+        self.state.strategy_tag =
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {

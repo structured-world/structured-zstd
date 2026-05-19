@@ -66,6 +66,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
+                strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
             },
             pending: Vec::new(),
             encoded_scratch: Vec::new(),
