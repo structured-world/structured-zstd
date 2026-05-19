@@ -91,6 +91,26 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
 fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+    // Fast path: offset_value >= 4 means a fresh (non-repcode) offset, which
+    // is the dominant case for non-trivial corpora. Donor (zstd_decompress_block.c
+    // ZSTD_updateRep) special-cases this with a straight shift: rotate the
+    // history down and store `offset_value - 3` at slot 0. No rule table, no
+    // branchless masks. The slow path below handles repcode 1..=3 with the
+    // full RULES table dispatch.
+    if offset_value >= 4 {
+        let actual = offset_value - 3;
+        scratch[2] = scratch[1];
+        scratch[1] = scratch[0];
+        scratch[0] = actual;
+        return actual;
+    }
+
+    do_offset_history_repcode(offset_value, lit_len, scratch)
+}
+
+#[cold]
+#[inline(never)]
+fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
         scratch_idx: usize,
