@@ -196,42 +196,58 @@ fn decode_sequences_without_rle(
     // sequence loop, not per-iteration. Same error semantics either way
     // (the post-loop check catches the same underflow) and saves an isize
     // multiply + 3 subtractions every iteration on the hot path.
+    // Inline helper: identical sequence-decode body for both the hot N-1
+    // iterations and the tail. Folding the duplicated code into one
+    // #[inline(always)] helper lets the compiler specialize each call site
+    // (main loop / tail) while keeping the source single-sourced.
+    //
+    // FSE invariants used here:
+    // - `of_code <= MAX_OFFSET_CODE` (31): `AlignedFSETable::new(MAX_OFFSET_CODE)`
+    //   plus `build_decoding_table`'s `TooManySymbols` guard bounds every
+    //   emitted symbol; RLE-mode setup validates the singleton byte.
+    // - `offset != 0`: `1u32 << of_code` is ≥ 1 for any `of_code` in 0..=31,
+    //   so `obits + (1 << of_code)` ≥ 1.
+    // Both invariants are debug_asserted; release builds drop the branches.
+    #[inline(always)]
+    fn decode_one_sequence(
+        ll_dec: &mut FSEDecoder<'_>,
+        ml_dec: &mut FSEDecoder<'_>,
+        of_dec: &mut FSEDecoder<'_>,
+        br: &mut BitReaderReversed<'_>,
+    ) -> Sequence {
+        let ll_code = ll_dec.decode_symbol();
+        let ml_code = ml_dec.decode_symbol();
+        let of_code = of_dec.decode_symbol();
+
+        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+        debug_assert!(
+            of_code <= MAX_OFFSET_CODE,
+            "FSE invariant: of_code ({of_code}) must be <= MAX_OFFSET_CODE ({MAX_OFFSET_CODE})"
+        );
+
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + (1u32 << of_code);
+
+        debug_assert_ne!(offset, 0, "FSE invariant: 1u32 << of_code is always >= 1");
+
+        Sequence {
+            ll: ll_value + ll_add as u32,
+            ml: ml_value + ml_add as u32,
+            of: offset,
+        }
+    }
+
     let num_sequences = section.num_sequences as usize;
     if num_sequences > 1 {
         for _ in 0..(num_sequences - 1) {
-            let ll_code = ll_dec.decode_symbol();
-            let ml_code = ml_dec.decode_symbol();
-            let of_code = of_dec.decode_symbol();
-
-            let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-            let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-            // `of_code > MAX_OFFSET_CODE` was a defense-in-depth check that
-            // is mathematically unreachable: FSE table construction
-            // (`AlignedFSETable::new(MAX_OFFSET_CODE)` + `TooManySymbols`
-            // guard in `build_decoding_table`) bounds every emitted symbol
-            // by `max_symbol = 31`, and RLE-mode validation at
-            // `maybe_update_fse_tables` line ~415 enforces the same upper
-            // bound on the singleton byte. The `offset == 0` check is also
-            // unreachable: `1u32 << of_code` is ≥ 1 for any `of_code` in
-            // 0..=31. Replace both with debug_asserts so any future
-            // invariant break trips in tests without paying for the branch
-            // on the hot path in release builds.
-            debug_assert!(
-                of_code <= MAX_OFFSET_CODE,
-                "FSE invariant: of_code ({of_code}) must be <= MAX_OFFSET_CODE ({MAX_OFFSET_CODE})"
-            );
-
-            let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-            let offset = obits as u32 + (1u32 << of_code);
-
-            debug_assert_ne!(offset, 0, "FSE invariant: 1u32 << of_code is always >= 1");
-
-            target.push(Sequence {
-                ll: ll_value + ll_add as u32,
-                ml: ml_value + ml_add as u32,
-                of: offset,
-            });
+            target.push(decode_one_sequence(
+                &mut ll_dec,
+                &mut ml_dec,
+                &mut of_dec,
+                br,
+            ));
 
             // Batched refill + 3 state advances (interleaved sequence decode pattern).
             br.ensure_bits(max_update_bits);
@@ -245,27 +261,12 @@ fn decode_sequences_without_rle(
         // Tail iteration: emit the final sequence but skip the state
         // advance — there is no next iteration that would consume the
         // updated states.
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
-        let of_code = of_dec.decode_symbol();
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        // Same FSE invariants as the main loop body — see the longer
-        // comment in the `num_sequences > 1` branch above.
-        debug_assert!(of_code <= MAX_OFFSET_CODE);
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        debug_assert_ne!(offset, 0);
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
+        target.push(decode_one_sequence(
+            &mut ll_dec,
+            &mut ml_dec,
+            &mut of_dec,
+            br,
+        ));
     }
 
     // Post-loop bitstream validation: a single check replaces the per-iter
