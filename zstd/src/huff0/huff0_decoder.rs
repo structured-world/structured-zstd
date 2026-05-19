@@ -200,6 +200,12 @@ impl<'t> HuffmanDecoder<'t> {
         // both NEON and SVE arms previously aliased the scalar body
         // verbatim — the match was paying a 3-arm dispatch cost for
         // zero benefit. Collapsed to a direct scalar call there.
+        // The enum's Aarch64Neon / Aarch64Sve variants are themselves
+        // cfg-gated to target_arch = "aarch64", so under the outer
+        // x86 cfg below they don't exist — the match here is
+        // exhaustive on Scalar + X86Bmi2/Avx2/Vbmi2 alone, and an
+        // inner `cfg(target_arch = "aarch64")` arm would be dead
+        // (outer x86 cfg already false on aarch64).
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         match self.kernel {
             HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
@@ -209,11 +215,16 @@ impl<'t> HuffmanDecoder<'t> {
                 // SAFETY: This path is selected only after runtime/static feature checks.
                 unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
             }
-            #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Neon | HuffmanDecodeKernel::Aarch64Sve => unreachable!(),
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         {
+            // aarch64 and portable targets: the X86* arms compile out
+            // entirely, so the match would collapse to a single arm.
+            // Bypass the match and call scalar directly — both
+            // Aarch64Neon and Aarch64Sve specialisations were
+            // verbatim clones of the scalar body (they were dropped
+            // in an earlier commit), and no NEON/SVE intrinsics
+            // exist for the single-symbol decode shape.
             self.decode_symbol_and_advance_scalar(br)
         }
     }

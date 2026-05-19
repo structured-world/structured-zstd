@@ -540,11 +540,31 @@ fn use_branchless_wildcopy() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{DecodeBuffer, RingBuffer};
+    use crate::decoding::buffer_backend::BufferBackend;
     use crate::io::{Error, ErrorKind, Write};
 
     extern crate std;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn from_backend_clears_prepopulated_backend() {
+        // Regression for the round-8 review fix: `from_backend` must
+        // normalise a caller-supplied backend so the logical counters
+        // (total_output_counter=0, dict_content=empty) stay consistent
+        // with the physical buffer contents. A future caller that
+        // wires up a non-fresh backend should not silently leak stale
+        // bytes into the new decode.
+        let mut backend = RingBuffer::new();
+        BufferBackend::extend(&mut backend, b"stale");
+        assert!(BufferBackend::len(&backend) > 0);
+
+        let mut buf = DecodeBuffer::<RingBuffer>::from_backend(backend, 1024);
+        assert_eq!(buf.len(), 0, "from_backend must clear pre-populated bytes");
+
+        buf.push(b"ok");
+        assert_eq!(buf.drain(), b"ok");
+    }
 
     #[test]
     fn checkpoint_restore_undoes_pushes() {
