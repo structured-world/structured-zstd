@@ -361,37 +361,69 @@ fn decode_sequences_with_rle(
     }
 }
 
-/// Baseline value emitted by literal-length code `code`. Donor parity:
-/// `LL_base` table in the zstd reference (`zstd_compress_internal.h`).
-/// Per Zstandard format §3.1.1.3.2.1.1.1, valid codes are 0..=35; the
-/// FSE decoder guarantees codes never exceed 35, so callers index this
-/// array unconditionally and rely on the debug_assert in the helper
-/// below to catch any future invariant break.
-const LL_BASE: [u32; 36] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
-    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-];
+/// Packed (baseline, extra_bits) pairs for literal-length codes.
+/// Donor parity: `LL_base` + `LL_bits` from the zstd reference
+/// (`zstd_compress_internal.h`). Per Zstandard format §3.1.1.3.2.1.1.1,
+/// valid codes are 0..=35; the FSE decoder guarantees codes never
+/// exceed 35, so callers index this array unconditionally and rely on
+/// the assert in the helper below to catch any future invariant break.
+///
+/// Layout: low 24 bits = baseline (max 65536 fits), high 8 bits =
+/// extra_bits (max 16). One u32 load on the hot path returns both
+/// fields — replaces the previous pair of separate `LL_BASE[idx]` +
+/// `LL_EXTRA_BITS[idx]` loads (two distinct cache-line touches into
+/// 144 B + 36 B = 180 B; packed table is 144 B = one contiguous
+/// region).
+const LL_META: [u32; 36] = pack_code_meta(
+    &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    ],
+    &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16,
+    ],
+);
 
-/// Number of extra bits to read after the literal-length code (donor
-/// `LL_bits`). Same domain as [`LL_BASE`].
-const LL_EXTRA_BITS: [u8; 36] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
-    12, 13, 14, 15, 16,
-];
+/// Packed (baseline, extra_bits) pairs for match-length codes.
+/// Donor parity: `ML_base` + `ML_bits`. Codes 0..=52 per Zstandard
+/// format §3.1.1.3.2.1.1.2. Same packed layout as [`LL_META`].
+const ML_META: [u32; 53] = pack_code_meta(
+    &[
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
+        1027, 2051, 4099, 8195, 16387, 32771, 65539,
+    ],
+    &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ],
+);
 
-/// Baseline value emitted by match-length code `code` (donor `ML_base`).
-/// Codes 0..=52 per Zstandard format §3.1.1.3.2.1.1.2.
-const ML_BASE: [u32; 53] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
-    2051, 4099, 8195, 16387, 32771, 65539,
-];
+/// Build the packed (baseline, extra_bits) table at compile time so the
+/// const arrays above are self-validating against the source spec.
+const fn pack_code_meta<const N: usize>(bases: &[u32; N], extra_bits: &[u8; N]) -> [u32; N] {
+    let mut out = [0u32; N];
+    let mut i = 0;
+    while i < N {
+        // baseline fits in 24 bits (max LL/ML baseline is 65539);
+        // extra_bits fits in 8 bits (max 16). Pack high 8 bits =
+        // extra_bits, low 24 bits = baseline. Assertions live below
+        // (in the lookup helpers, where bounds are checked on every
+        // call) and at build time (`debug_assert` on the call sites).
+        out[i] = bases[i] | ((extra_bits[i] as u32) << 24);
+        i += 1;
+    }
+    out
+}
 
-/// Number of extra bits to read after the match-length code (donor `ML_bits`).
-const ML_EXTRA_BITS: [u8; 53] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-];
+/// Unpack the (baseline, extra_bits) tuple from a packed [`LL_META`] /
+/// [`ML_META`] entry. Inlined so the shift+mask collapses to ALU ops
+/// with no cross-function call overhead on the hot path.
+#[inline(always)]
+const fn unpack_code_meta(meta: u32) -> (u32, u8) {
+    (meta & 0x00FF_FFFF, (meta >> 24) as u8)
+}
 
 /// Look up the provided state value from a literal length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
@@ -406,10 +438,10 @@ fn lookup_ll_code(code: u8) -> (u32, u8) {
     // `match` arm comparisons the previous implementation produced.
     let idx = code as usize;
     assert!(
-        idx < LL_BASE.len(),
+        idx < LL_META.len(),
         "Illegal literal length code was: {code}"
     );
-    (LL_BASE[idx], LL_EXTRA_BITS[idx])
+    unpack_code_meta(LL_META[idx])
 }
 
 /// Look up the provided state value from a match length table predefined
@@ -419,8 +451,8 @@ fn lookup_ll_code(code: u8) -> (u32, u8) {
 #[inline(always)]
 fn lookup_ml_code(code: u8) -> (u32, u8) {
     let idx = code as usize;
-    assert!(idx < ML_BASE.len(), "Illegal match length code was: {code}");
-    (ML_BASE[idx], ML_EXTRA_BITS[idx])
+    assert!(idx < ML_META.len(), "Illegal match length code was: {code}");
+    unpack_code_meta(ML_META[idx])
 }
 
 // This info is buried in the symbol compression mode table
