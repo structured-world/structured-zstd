@@ -160,8 +160,18 @@ impl<'s> BitReaderReversed<'s> {
         }
     }
 
-    /// We refill the container in full bytes, shifting the still unread portion to the left, and filling the lower bits with new data
-    #[cold]
+    /// Refill the bit container with up to 64 fresh bits from `source`.
+    ///
+    /// Hot path (mid-stream, `self.index >= bytes_consumed`) is `#[inline(always)]`
+    /// and folds into every caller — three operations: subtract index, mask
+    /// off byte-aligned bit count, load 8 bytes. The pre-PR version wore a
+    /// blanket `#[cold]` annotation which actively penalised the hot path
+    /// (refill fires roughly every 2 sequences during sequence decode, so
+    /// it is NOT cold). The rare edge cases — running out of source, going
+    /// past the start of the stream, exhausting all useful bits — branch
+    /// out to `refill_slow` which keeps the `#[cold] #[inline(never)]`
+    /// treatment they actually deserve.
+    #[inline(always)]
     fn refill(&mut self) {
         let bytes_consumed = self.bits_consumed as usize / 8;
         if bytes_consumed == 0 {
@@ -176,7 +186,22 @@ impl<'s> BitReaderReversed<'s> {
             self.bits_consumed &= 7;
             self.bit_container =
                 u64::from_le_bytes((&self.source[self.index..][..8]).try_into().unwrap());
-        } else if self.index > 0 {
+        } else {
+            self.refill_slow();
+        }
+
+        // Assert that at least `56 = 64 - 8` bits are available to read.
+        debug_assert!(self.bits_consumed < 8);
+    }
+
+    /// End-of-stream refill paths — runs when the next 8-byte window would
+    /// underflow the source buffer. Kept `#[cold] #[inline(never)]` so the
+    /// hot mid-stream path in [`refill`] folds into call sites without
+    /// dragging these branches along.
+    #[cold]
+    #[inline(never)]
+    fn refill_slow(&mut self) {
+        if self.index > 0 {
             // Read the last portion of source into the `bit_container`
             if self.source.len() >= 8 {
                 self.bit_container = u64::from_le_bytes((&self.source[..8]).try_into().unwrap());
@@ -203,9 +228,6 @@ impl<'s> BitReaderReversed<'s> {
             self.bits_consumed = 0;
             self.bit_container = 0;
         }
-
-        // Assert that at least `56 = 64 - 8` bits are available to read.
-        debug_assert!(self.bits_consumed < 8);
     }
 
     /// Read `n` number of bits from the source. Will read at most 56 bits.
