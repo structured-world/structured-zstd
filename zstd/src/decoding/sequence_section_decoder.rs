@@ -6,11 +6,225 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::decoding::errors::DecodeSequenceError;
+use crate::common::MAX_BLOCK_SIZE;
+use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
+use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
 use crate::fse::FSEDecoder;
 use alloc::vec::Vec;
 
+/// Fused decode + execute pipeline: decodes each sequence from the FSE
+/// bitstream and immediately executes it (literal copy + match copy)
+/// without materialising the intermediate `Vec<Sequence>` round-trip.
+///
+/// Donor parity: zstd's `ZSTD_decompressSequences_body` interleaves
+/// `ZSTD_decodeSequence` and `ZSTD_execSequence` in one loop, keeping
+/// the `seq_t` in registers. We were paying ~24 B/seq × 2 (write + read)
+/// of L1↔L2 traffic on the dropped Vec<Sequence> roundtrip plus the
+/// per-iter Vec::push overhead.
+///
+/// Falls back to the legacy two-pass pipeline (`decode_sequences` +
+/// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
+/// is rare on perf-relevant corpora and not worth duplicating.
+pub fn decode_and_execute_sequences(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
+    vprintln!("Updating tables used {} bytes", bytes_read);
+
+    let bit_stream = &source[bytes_read..];
+    let mut br = BitReaderReversed::new(bit_stream);
+
+    // Skip the 0-padding at the end of the last byte and consume the
+    // start-of-stream `1` bit.
+    let mut skipped_bits = 0;
+    loop {
+        let val = br.get_bits(1);
+        skipped_bits += 1;
+        if val == 1 || skipped_bits > 8 {
+            break;
+        }
+    }
+    if skipped_bits > 8 {
+        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
+    }
+
+    // RLE-mode blocks: fall back to the legacy two-pass pipeline. These
+    // are uncommon in real-world corpora; fusing them too would double
+    // the source maintenance for zero observed wins.
+    if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
+        decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
+        execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
+        return Ok(());
+    }
+
+    let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = FSEDecoder::new(&fse.offsets);
+
+    ll_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    of_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    ml_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+
+    let max_update_bits = fse.literal_lengths.accuracy_log
+        + fse.match_lengths.accuracy_log
+        + fse.offsets.accuracy_log;
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
+
+    buffer.reserve(MAX_BLOCK_SIZE as usize);
+    let old_buffer_size = buffer.len();
+    let literals_buffer_len = literals_buffer.len();
+    let mut lit_cur: usize = 0;
+    let mut seq_sum: u32 = 0;
+
+    #[inline(always)]
+    fn execute_one_sequence(
+        buffer: &mut super::decode_buffer::DecodeBuffer,
+        literals: &[u8],
+        lit_cur: &mut usize,
+        lit_len: usize,
+        offset_hist: &mut [u32; 3],
+        seq: Sequence,
+    ) -> Result<(), DecompressBlockError> {
+        let high = *lit_cur + seq.ll as usize;
+        if high > lit_len {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: lit_len,
+            }
+            .into());
+        }
+        // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
+        // (high = lit_cur + seq.ll, seq.ll >= 0).
+        let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+        *lit_cur = high;
+        buffer.push(lits);
+
+        let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+        if actual == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset.into());
+        }
+        buffer
+            .repeat(actual as usize, seq.ml as usize)
+            .map_err(ExecuteSequencesError::from)?;
+        Ok(())
+    }
+
+    let num_sequences = section.num_sequences as usize;
+    if num_sequences > 1 {
+        for _ in 0..(num_sequences - 1) {
+            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            execute_one_sequence(
+                buffer,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                offset_hist,
+                seq,
+            )?;
+            seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(&mut br);
+            ml_dec.update_state_fast(&mut br);
+            of_dec.update_state_fast(&mut br);
+        }
+    }
+
+    if num_sequences >= 1 {
+        let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+        execute_one_sequence(
+            buffer,
+            literals_buffer,
+            &mut lit_cur,
+            literals_buffer_len,
+            offset_hist,
+            seq,
+        )?;
+        seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+    }
+
+    // Post-loop bitstream validation.
+    let remaining = br.bits_remaining();
+    if remaining < 0 {
+        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+    }
+    if remaining > 0 {
+        return Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: remaining,
+        }
+        .into());
+    }
+
+    // Tail literals: any bytes in the literals_buffer that no sequence
+    // claimed get pushed after the last sequence.
+    if lit_cur < literals_buffer_len {
+        let rest = &literals_buffer[lit_cur..];
+        buffer.push(rest);
+        seq_sum = seq_sum.wrapping_add(rest.len() as u32);
+    }
+
+    let diff = buffer.len() - old_buffer_size;
+    debug_assert_eq!(
+        seq_sum as usize, diff,
+        "seq_sum {seq_sum} != buffer growth {diff}"
+    );
+    Ok(())
+}
+
+/// Per-sequence decode helper used by `decode_and_execute_sequences`.
+/// Identical to the inner `decode_one_sequence` of
+/// `decode_sequences_without_rle` — separate copy because Rust does not
+/// let us share a private fn-item across two outer functions cleanly.
+#[inline(always)]
+fn decode_one_sequence_inline(
+    ll_dec: &mut FSEDecoder<'_>,
+    ml_dec: &mut FSEDecoder<'_>,
+    of_dec: &mut FSEDecoder<'_>,
+    br: &mut BitReaderReversed<'_>,
+) -> Sequence {
+    let ll_code = ll_dec.decode_symbol();
+    let ml_code = ml_dec.decode_symbol();
+    let of_code = of_dec.decode_symbol();
+
+    let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+    let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+    debug_assert!(of_code <= MAX_OFFSET_CODE);
+
+    let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+    let offset = obits as u32 + (1u32 << of_code);
+
+    debug_assert_ne!(offset, 0);
+
+    Sequence {
+        ll: ll_value + ll_add as u32,
+        ml: ml_value + ml_add as u32,
+        of: offset,
+    }
+}
+
 /// Decode the provided source as a series of sequences into the supplied `target`.
+///
+/// Legacy two-pass entrypoint. Production decode now uses the fused
+/// `decode_and_execute_sequences` above which skips the intermediate
+/// `Vec<Sequence>` round-trip. Kept here for the public API surface
+/// and external callers that need the explicit sequence list.
+#[allow(dead_code)]
 pub fn decode_sequences(
     section: &SequencesHeader,
     source: &[u8],
@@ -156,6 +370,7 @@ fn decode_sequences_with_rle(
     }
 }
 
+#[allow(dead_code)]
 fn decode_sequences_without_rle(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_>,
