@@ -149,14 +149,34 @@ impl BufferBackend for FlatBuf {
         mut read: R,
         fill_length: usize,
     ) -> Result<(), Error> {
+        // Read directly into spare capacity to skip the
+        // `Vec::resize(.., 0)` zero-fill — Raw blocks can be up to
+        // 128 KiB, so eagerly memsetting then overwriting via
+        // `read_exact` would double the write traffic on the
+        // raw-block hot path. The `set_len` only runs after the
+        // read succeeds, so a failed read leaves length unchanged
+        // (same observable behaviour as the prior truncate-on-error
+        // shape).
         let old = self.buf.len();
-        self.buf.resize(old + fill_length, 0);
-        match read.read_exact(&mut self.buf[old..old + fill_length]) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.buf.truncate(old);
-                Err(e)
+        self.buf.reserve(fill_length);
+        // SAFETY: `reserve(fill_length)` guarantees capacity >= old +
+        // fill_length; the slice covers `fill_length` writable bytes
+        // past the current end. The bytes are MaybeUninit-style
+        // uninitialised at this point — `read_exact` is the only
+        // writer until `set_len` commits below, so no safe code can
+        // observe uninitialised slots.
+        let read_slot: &mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(old), fill_length) };
+        match read.read_exact(read_slot) {
+            Ok(()) => {
+                // SAFETY: `read_exact` returned Ok, so all
+                // `fill_length` bytes in `read_slot` are now
+                // initialised. Capacity covers `old + fill_length`
+                // via the `reserve` above.
+                unsafe { self.buf.set_len(old + fill_length) };
+                Ok(())
             }
+            Err(e) => Err(e),
         }
     }
 
