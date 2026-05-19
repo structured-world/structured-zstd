@@ -57,7 +57,7 @@ impl<'t> FSEDecoder<'t> {
     /// This is the "fast path" used in the interleaved sequence decode loop
     /// where a single refill check covers all three FSE state updates.
     #[inline(always)]
-    pub fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
+    pub(crate) fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;

@@ -130,7 +130,11 @@ impl RingBuffer {
         // free_slice_lengths' branch + saturating_sub on the common case
         // that dominates frames fitting in the window (the same case the
         // flat extend path optimises for).
-        if self.head <= self.tail && self.tail + amount < self.cap {
+        // Use saturating arithmetic so a pathological `amount` close to
+        // `usize::MAX` cannot wrap `tail + amount` and let the fast
+        // path falsely report enough space — `extend` would then write
+        // past the allocation.
+        if self.head <= self.tail && amount < self.cap.saturating_sub(self.tail) {
             return;
         }
         let free = self.free();
@@ -149,10 +153,17 @@ impl RingBuffer {
             unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
 
         // Always have at least 1 unused element as the sentinel.
-        let new_cap = usize::max(
-            self.cap.next_power_of_two(),
-            (self.cap + amount).next_power_of_two(),
-        ) + 1;
+        // Use checked_add so a caller passing a huge `amount` (e.g.
+        // close to usize::MAX from a malformed `match_length`) cannot
+        // wrap `self.cap + amount` and produce an undersized `new_cap`
+        // that subsequent unsafe writes would trust.
+        let needed = self
+            .cap
+            .checked_add(amount)
+            .expect("ringbuffer capacity overflow");
+        let new_cap = usize::max(self.cap.next_power_of_two(), needed.next_power_of_two())
+            .checked_add(1)
+            .expect("ringbuffer capacity overflow");
 
         // Check that the capacity isn't bigger than isize::MAX, which is the max allowed by LLVM, or that
         // we are on a >= 64 bit system which will never allow that much memory to be allocated

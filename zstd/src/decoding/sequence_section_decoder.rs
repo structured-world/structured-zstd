@@ -184,8 +184,15 @@ pub fn decode_and_execute_sequences(
         // longer meaningful and the rollback is skipped. Either way the
         // caller observes the same Err below; the partial data left in
         // the buffer in the latter case is discarded with the frame.
-        let _restored = buffer.try_restore_checkpoint(buffer_checkpoint);
-        *offset_hist = saved_offset_hist;
+        //
+        // Crucially, only restore the repcode history when the buffer
+        // rollback actually happened. If the buffer keeps its
+        // speculative bytes, rewinding `offset_hist` would leave the
+        // workspace internally inconsistent for any subsequent reuse
+        // after the `Err`.
+        if buffer.try_restore_checkpoint(buffer_checkpoint) {
+            *offset_hist = saved_offset_hist;
+        }
 
         if remaining < 0 {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
