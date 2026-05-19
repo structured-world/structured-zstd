@@ -158,10 +158,19 @@ impl BufferBackend for FlatBuf {
         // (same observable behaviour as the prior truncate-on-error
         // shape).
         let old = self.buf.len();
-        self.buf.reserve(fill_length);
-        // SAFETY: `reserve(fill_length)` guarantees capacity >= old +
-        // fill_length; the slice covers `fill_length` writable bytes
-        // past the current end. The bytes are MaybeUninit-style
+        // Route through the backend's own `reserve`, which adds
+        // `WILDCOPY_OVERLENGTH` slack on top of `fill_length`. The
+        // raw-block path here doesn't overshoot today (`read_exact`
+        // writes exactly `fill_length` bytes), but keeping the slack
+        // invariant uniform across `with_capacity` / `reserve` /
+        // `extend_from_reader` means a future SIMD/wildcopy writer
+        // for the raw-block path can land without re-auditing the
+        // grow code.
+        self.reserve(fill_length);
+        // SAFETY: `reserve` guarantees capacity >= old + fill_length
+        // (in fact >= old + fill_length + WILDCOPY_OVERLENGTH);
+        // the slice covers exactly `fill_length` writable bytes past
+        // the current end. The bytes are MaybeUninit-style
         // uninitialised at this point — `read_exact` is the only
         // writer until `set_len` commits below, so no safe code can
         // observe uninitialised slots.
