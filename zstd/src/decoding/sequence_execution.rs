@@ -1,6 +1,4 @@
 use super::decode_buffer::DecodeBuffer;
-use super::prefetch;
-use super::scratch::DecoderScratch;
 use crate::blocks::sequence_section::Sequence;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::ExecuteSequencesError;
@@ -55,97 +53,6 @@ pub(crate) fn execute_sequences_fields(
     debug_assert_eq!(
         seq_sum as usize, diff,
         "seq_sum {seq_sum} != buffer growth {diff}"
-    );
-    Ok(())
-}
-
-/// Take the provided decoder and execute the sequences stored within.
-///
-/// Legacy two-pass entrypoint. Production decode now uses the fused
-/// `decode_and_execute_sequences` in `sequence_section_decoder` which
-/// avoids the intermediate `Vec<Sequence>` round-trip. Kept here for
-/// the public API surface and external callers that still iterate
-/// through scratch.sequences explicitly.
-#[allow(dead_code)]
-pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    let mut literals_copy_counter = 0;
-    let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0;
-
-    // Reserve once for the maximum possible decoded block output (128 KB per
-    // the zstd spec). This avoids repeated re-allocations inside the hot
-    // execute loop without an extra scan over the sequence vector, and is
-    // inherently bounded against corrupted inputs.
-    scratch.buffer.reserve(MAX_BLOCK_SIZE as usize);
-
-    let sequences_len = scratch.sequences.len();
-    // Hoist `literals_buffer.len()` out of the loop — the buffer is not
-    // mutated by anything we call inside the iteration (push writes to
-    // scratch.buffer, not literals_buffer), so the length is loop-invariant
-    // but the borrow checker keeps re-reading it on every iter.
-    let literals_buffer_len = scratch.literals_buffer.len();
-    for idx in 0..sequences_len {
-        // SAFETY: idx is bounded by the range header `0..sequences_len`, and
-        // sequences_len is captured before the loop so the slice cannot
-        // shrink under us. LLVM does not elide this bounds check on its
-        // own because `scratch.sequences` is a Vec field reached through
-        // the `&mut DecoderScratch` reference, and the indexed access
-        // happens after `scratch.buffer.reserve(...)` which the borrow
-        // checker treats as a potential mutation of unrelated state.
-        let seq = unsafe { *scratch.sequences.get_unchecked(idx) };
-        prefetch_literals_n_plus_two(scratch, idx, literals_copy_counter);
-
-        // Drop the per-iter `if seq.ll > 0` guard: when ll == 0 the slice
-        // `literals_copy_counter..literals_copy_counter` is empty, and
-        // `RingBuffer::extend` (called via `DecodeBuffer::push`) early-returns
-        // on zero-length data. Saves one branch per sequence on a hot path
-        // where ll == 0 occurs whenever sequences chain back-to-back without
-        // intervening literals (common with high-entropy / fast-level encoders).
-        let high = literals_copy_counter + seq.ll as usize;
-        if high > literals_buffer_len {
-            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                wanted: high,
-                have: literals_buffer_len,
-            });
-        }
-        // SAFETY: `literals_copy_counter <= high <= literals_buffer_len` enforces
-        // bounds, verified by the check immediately above. `high` is monotone
-        // (literals_copy_counter only advances), so successive slices read
-        // disjoint regions of the literals buffer.
-        let literals = unsafe {
-            scratch
-                .literals_buffer
-                .get_unchecked(literals_copy_counter..high)
-        };
-        literals_copy_counter = high;
-        scratch.buffer.push(literals);
-
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
-        if actual_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
-        }
-        // `DecodeBuffer::repeat` already guards on `match_length == 0` (see
-        // its early return). Drop the redundant `if seq.ml > 0` branch on
-        // the hot path — saves one branch per sequence.
-        scratch
-            .buffer
-            .repeat(actual_offset as usize, seq.ml as usize)?;
-
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
-    }
-    if literals_copy_counter < literals_buffer_len {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
-        seq_sum += rest_literals.len() as u32;
-    }
-
-    let diff = scratch.buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
     );
     Ok(())
 }
@@ -285,40 +192,6 @@ fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32
     scratch[2] = select_u32(old2, old1, update_b);
 
     actual_offset
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-fn prefetch_literals_n_plus_two(scratch: &DecoderScratch, idx: usize, literals_cursor: usize) {
-    let seqs_len = scratch.sequences.len();
-    if idx + 2 >= seqs_len {
-        return;
-    }
-
-    // SAFETY: bounds checked above (idx + 2 < seqs_len). Avoids three Vec
-    // bounds checks per sequence on the hot path. LLVM doesn't collapse
-    // the bounds checks because the borrow shape lets `sequences` appear
-    // mutable to other call sites in the loop body.
-    let (ll_curr, ll_next, ll_n2) = unsafe {
-        (
-            scratch.sequences.get_unchecked(idx).ll as usize,
-            scratch.sequences.get_unchecked(idx + 1).ll as usize,
-            scratch.sequences.get_unchecked(idx + 2).ll as usize,
-        )
-    };
-    if ll_n2 < 64 {
-        return;
-    }
-
-    let (start, overflow_a) = literals_cursor.overflowing_add(ll_curr);
-    let (start, overflow_b) = start.overflowing_add(ll_next);
-    let (end, overflow_c) = start.overflowing_add(ll_n2);
-    if !(overflow_a || overflow_b || overflow_c)
-        && start <= end
-        && end <= scratch.literals_buffer.len()
-    {
-        prefetch::prefetch_slice(&scratch.literals_buffer[start..end]);
-    }
 }
 
 #[cfg(test)]
