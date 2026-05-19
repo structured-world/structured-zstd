@@ -760,6 +760,14 @@
         if (active && container.contains(active) && active.dataset && active.dataset.legendIndex != null) {
           focusedIndex = Number(active.dataset.legendIndex);
         }
+        // Snapshot scroll position too — replaceChildren() resets it,
+        // and when the toggle was triggered from OUTSIDE the legend
+        // (e.g. a profile-series checkbox above the chart, or a
+        // top-filter change) the focus path above never fires, so a
+        // long legend would silently jump back to the top on every
+        // re-render. Restoring scrollTop after the rebuild keeps the
+        // visible window stable regardless of which control fired.
+        const previousScrollTop = container.scrollTop;
 
         container.replaceChildren();
         const datasets = chart.data.datasets || [];
@@ -810,6 +818,11 @@
           );
           if (restored) restored.focus();
         }
+        // Restore AFTER focus() — focus() on a partially-visible
+        // element can itself scroll the container, so applying the
+        // saved scrollTop last preserves the visible window the user
+        // had before the toggle.
+        container.scrollTop = previousScrollTop;
       }
 
       function renderChart(filtered) {
