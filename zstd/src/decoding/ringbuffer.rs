@@ -202,20 +202,36 @@ impl RingBuffer {
         // for 1..=16 byte literal pushes; simd_copy's inline byte /
         // overlapping-u64 tail path handles those without a function call.
         //
-        // `data` is an external slice with no slack, so src.1 stays exact
-        // (`in_f1` / `in_f2`). For the first free slice, `f1_ptr + f1_len`
-        // lands at `self.cap` and the WILDCOPY_OVERLENGTH slack region
-        // beyond `cap` is writable, so dst.1 is inflated for `simd_copy`'s
-        // SIMD fast paths. The second free slice runs from buf[0] up to
-        // `head` — wildcopy overshoot would clobber readable data, so
-        // dst.1 stays exact there.
+        // **Slack reachability**: `data` is an external slice with no slack
+        // so `src.1` stays exact (`in_f1` / `in_f2`). For `dst.1`, the
+        // first free slice ends at `self.cap` ONLY when `tail >= head` —
+        // then `free_slice_parts` returns `(buf+tail, cap-tail)` and the
+        // WILDCOPY_OVERLENGTH region beyond `cap` is the writable slack.
+        // When `tail < head` the first free slice is the inner gap
+        // `(buf+tail, head-tail)`; its end lands at `head`, so any
+        // wildcopy overshoot past it would clobber still-readable buffered
+        // output. f2 always ends at `head` (or is empty) so it never
+        // gets the slack either.
+        //
+        // **Secondary safety note**: even without this gate, the current
+        // `simd_copy::copy_bytes_overshooting` fast paths cannot actually
+        // overshoot for `extend`'s call shape because `min_buffer_size`
+        // is dominated by `src.1 == in_f1 == copy_at_least`. The
+        // single-op-16 path needs `min >= 16`, which requires
+        // `in_f1 >= 16` — and at that point `copy_at_least == 16` makes
+        // the write exactly 16 bytes. Chunked SIMD only fires when
+        // `rounded == in_f1` (multiple of chunk size), again exact-fit.
+        // The gate is still applied so the inflation does not become a
+        // latent UB hazard if a future `simd_copy` change derives its
+        // overshoot bound from `dst.1` alone.
+        let f1_dst_cap = if self.tail >= self.head {
+            f1_len + WILDCOPY_OVERLENGTH
+        } else {
+            f1_len
+        };
         unsafe {
             if in_f1 > 0 {
-                simd_copy::copy_bytes_overshooting(
-                    (ptr, in_f1),
-                    (f1_ptr, f1_len + WILDCOPY_OVERLENGTH),
-                    in_f1,
-                );
+                simd_copy::copy_bytes_overshooting((ptr, in_f1), (f1_ptr, f1_dst_cap), in_f1);
             }
             if in_f2 > 0 {
                 simd_copy::copy_bytes_overshooting(
@@ -711,6 +727,20 @@ unsafe fn copy_without_checks(
     }
 }
 
+/// Reference implementation used only by the `copy_with_nobranch_check`
+/// equivalence test (`copy_with_nobranch_check_matches_checked_for_all_valid_case_masks`).
+/// Production code never calls this — `extend_from_within_unchecked_branchless`
+/// dispatches to `copy_with_nobranch_check` directly on x86.
+///
+/// Like its branchless sibling, this helper does **not** inflate the
+/// `src.1` / `dst.1` capacities passed to `simd_copy::copy_bytes_overshooting`
+/// by `WILDCOPY_OVERLENGTH`. The exact-fit lengths mean `simd_copy`'s
+/// `min_buffer_size >= 16` SIMD fast paths cannot trigger here — short
+/// copies always fall through to the inline byte / overlapping-u64 tail
+/// instead of `single_op_copy_16`. This is intentional for parity with the
+/// production branchless path (which has the same property for the same
+/// per-pointer head/tail reason documented on
+/// `extend_from_within_unchecked_branchless`).
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -762,6 +792,24 @@ unsafe fn copy_with_checks(
     }
 }
 
+/// 16-way case dispatch over the four `(m1|m2)_in_f(1|2)` non-empty
+/// combinations, used by `extend_from_within_unchecked_branchless` on x86
+/// to avoid the branch-misprediction pattern of the unconditional
+/// `extend_from_within_unchecked` path. `#[allow(dead_code)]` because the
+/// only caller is gated to x86 by `decode_buffer::use_branchless_wildcopy`
+/// — on aarch64 / wasm / etc. rustc sees this as unreachable.
+///
+/// **WILDCOPY_OVERLENGTH note:** like `copy_with_checks` above, the
+/// `(ptr, len)` tuples passed to `simd_copy::copy_bytes_overshooting`
+/// below are exact-fit. The caller (the branchless path) does not thread
+/// per-pointer head/tail context through to here, so we cannot safely
+/// inflate by `WILDCOPY_OVERLENGTH` the way `extend_from_within_unchecked`
+/// does. Consequence: short copies on the x86 branchless path always fall
+/// into `simd_copy`'s inline byte / overlapping-u64 tail rather than the
+/// `min_buffer_size >= 16` `single_op_copy_16` fast path. Aarch64 hot
+/// decode (the WILDCOPY profiling target) uses the unconditional path,
+/// which does inflate, so the slack contract is exercised end-to-end
+/// there.
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -1275,6 +1323,88 @@ mod tests {
         combined.extend_from_slice(s1);
         combined.extend_from_slice(s2);
         assert_eq!(combined, alloc::vec![0xAB; 7]);
+    }
+
+    /// Construct a RingBuffer in the wrapped state where `tail < head`.
+    /// Data occupies `[head, cap)` followed by `[0, tail)`, leaving the
+    /// free region as `[tail, head)` — i.e. the **first** free slice
+    /// returned by `free_slice_parts` is the inner gap, NOT a span that
+    /// ends at `cap`.
+    fn build_tail_before_head(cap_hint: usize, head_pos: usize, tail_pos: usize) -> RingBuffer {
+        assert!(tail_pos < head_pos);
+        let mut rb = RingBuffer::new();
+        rb.reserve(cap_hint);
+        let actual_cap = rb.cap;
+        // Fill almost the whole buffer so we can carve out tail < head.
+        let fill_len = actual_cap - 2;
+        let prefix = alloc::vec![0xCD; fill_len];
+        rb.extend(&prefix);
+        // Drop bytes so `head` lands at the target. Tail stays at fill_len.
+        rb.drop_first_n(head_pos);
+        // Now extend just enough to wrap tail past `cap` and land it at
+        // `tail_pos`. From the current state (head=head_pos, tail=fill_len),
+        // we need `tail_pos = (fill_len + extra) % cap`, so
+        // `extra = (tail_pos + cap - fill_len) % cap`.
+        let extra = (tail_pos + actual_cap - fill_len) % actual_cap;
+        rb.extend(&alloc::vec![0xCD; extra]);
+        assert_eq!(rb.head, head_pos);
+        assert_eq!(rb.tail, tail_pos);
+        assert!(
+            rb.tail < rb.head,
+            "expected wrapped layout: tail={} head={}",
+            rb.tail,
+            rb.head
+        );
+        rb
+    }
+
+    #[test]
+    fn extend_wrapped_layout_preserves_bytes_past_head() {
+        // Regression test for the WILDCOPY_OVERLENGTH inflation bug.
+        // When `tail < head` the first free slice returned by
+        // `free_slice_parts` is the inner `[tail, head)` gap — it does NOT
+        // end at `cap`. A previous version of `RingBuffer::extend` always
+        // added WILDCOPY_OVERLENGTH to the destination capacity passed to
+        // `simd_copy::copy_bytes_overshooting`, which on this layout would
+        // allow wildcopy overshoot writes to clobber bytes at `[head,
+        // head+16)` — still-readable data the caller has not consumed yet.
+        // The current code gates the inflation on `tail >= head`; this
+        // test asserts that bytes at `head..head+16` survive an extend()
+        // that fills the inner gap nearly to capacity.
+        let mut rb = build_tail_before_head(128, 80, 10);
+        let head_before = rb.head;
+        let cap = rb.cap;
+        // Sample a window of bytes immediately past `head` and confirm
+        // they are the prefill (0xCD); these are the bytes any erroneous
+        // wildcopy overshoot would corrupt.
+        let mut sentinel = [0u8; 16];
+        unsafe {
+            for i in 0..16 {
+                sentinel[i] = rb.buf.as_ptr().add((head_before + i) % cap).read();
+            }
+        }
+        assert!(sentinel.iter().all(|&b| b == 0xCD), "pre-state sentinel");
+
+        // Fill the inner free region with a recognisable pattern, leaving
+        // exactly the 1-byte sentinel gap the RingBuffer always reserves.
+        let free_before = rb.free();
+        let payload = alloc::vec![0x42; free_before];
+        rb.extend(&payload);
+
+        // The bytes at [head, head+16) must still be the original 0xCD
+        // prefill — any overshoot would have written 0x42 over them.
+        unsafe {
+            for i in 0..16 {
+                let actual = rb.buf.as_ptr().add((head_before + i) % cap).read();
+                assert_eq!(
+                    actual,
+                    0xCD,
+                    "byte at head+{i} (raw idx {}) was clobbered: got {:#04x}",
+                    (head_before + i) % cap,
+                    actual
+                );
+            }
+        }
     }
 
     #[test]
