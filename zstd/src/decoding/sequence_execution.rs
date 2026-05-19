@@ -15,8 +15,16 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
     // inherently bounded against corrupted inputs.
     scratch.buffer.reserve(MAX_BLOCK_SIZE as usize);
 
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
+    let sequences_len = scratch.sequences.len();
+    for idx in 0..sequences_len {
+        // SAFETY: idx is bounded by the range header `0..sequences_len`, and
+        // sequences_len is captured before the loop so the slice cannot
+        // shrink under us. LLVM does not elide this bounds check on its
+        // own because `scratch.sequences` is a Vec field reached through
+        // the `&mut DecoderScratch` reference, and the indexed access
+        // happens after `scratch.buffer.reserve(...)` which the borrow
+        // checker treats as a potential mutation of unrelated state.
+        let seq = unsafe { *scratch.sequences.get_unchecked(idx) };
         prefetch_literals_n_plus_two(scratch, idx, literals_copy_counter);
 
         if seq.ll > 0 {
