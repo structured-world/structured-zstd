@@ -258,11 +258,13 @@
       </section>
 
       <section class="card" style="margin-top: 14px">
-        <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (speed + ratio)</h2>
+        <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (compress + decompress + ratio)</h2>
         <p style="font-size: 0.9rem">
-          Absolute throughput and compression ratio per level for a single scenario, with
-          Rust and FFI overlaid. Filled-area lines make horizontal divergence (level
-          where Rust falls behind FFI on speed or ratio) easy to spot.
+          Six lines per scenario for a single snapshot, X-axis stepped by compression
+          level: Rust vs FFI compression speed (left axis), Rust vs FFI decompression
+          speed (left axis), and Rust vs FFI compression ratio (right axis). Decompress
+          rows collapse across <code>source</code> values — strategy comparison only
+          cares about the (level, stage) pair, not the bench's internal stream variant.
         </p>
         <div class="filters">
           <label>Target
@@ -271,19 +273,15 @@
           <label>Scenario
             <select id="pf-scenario"></select>
           </label>
-          <label>Stage
-            <select id="pf-stage"></select>
-          </label>
-          <label>Source
-            <select id="pf-source"></select>
-          </label>
           <label>Snapshot
             <select id="pf-snapshot"></select>
           </label>
         </div>
         <div class="profile-toggles">
-          <label><input type="checkbox" data-series="rust_speed" checked /> Rust speed</label>
-          <label><input type="checkbox" data-series="ffi_speed" checked /> FFI speed</label>
+          <label><input type="checkbox" data-series="rust_compress_speed" checked /> Rust compress</label>
+          <label><input type="checkbox" data-series="ffi_compress_speed" checked /> FFI compress</label>
+          <label><input type="checkbox" data-series="rust_decompress_speed" checked /> Rust decompress</label>
+          <label><input type="checkbox" data-series="ffi_decompress_speed" checked /> FFI decompress</label>
           <label><input type="checkbox" data-series="rust_ratio" checked /> Rust ratio</label>
           <label><input type="checkbox" data-series="ffi_ratio" checked /> FFI ratio</label>
         </div>
@@ -338,8 +336,10 @@
         chart: null,
         profileChart: null,
         profileSeriesVisibility: {
-          rust_speed: true,
-          ffi_speed: true,
+          rust_compress_speed: true,
+          ffi_compress_speed: true,
+          rust_decompress_speed: true,
+          ffi_decompress_speed: true,
           rust_ratio: true,
           ffi_ratio: true,
         },
@@ -363,8 +363,6 @@
       const profileSelectors = {
         target: el("pf-target"),
         scenario: el("pf-scenario"),
-        stage: el("pf-stage"),
-        source: el("pf-source"),
         snapshot: el("pf-snapshot"),
       };
 
@@ -840,16 +838,22 @@
         return {
           target: profileSelectors.target.value,
           scenario: profileSelectors.scenario.value,
-          stage: profileSelectors.stage.value,
-          // Decompress stages emit per-implementation source values
-          // (`rust_stream`, `c_stream`) that share the same level keys.
-          // Without filtering by source the 4 profile lines would
-          // silently mix runs and render an incorrect chart, so the
-          // source dropdown is mandatory in the grouping key alongside
-          // target/scenario/stage.
-          source: profileSelectors.source.value,
           snapshot: profileSelectors.snapshot.value || PROFILE_LATEST,
         };
+      }
+
+      // Stage classification — the chart cares about three logical
+      // measurements: compress speed, decompress speed, and compression
+      // ratio. Decompress benches emit per-stream-variant source values
+      // (`rust_stream`, `c_stream`), but for the strategy-comparison
+      // view we collapse across those: each row already carries both
+      // rust_value and ffi_value, so the source dimension is just bench
+      // bookkeeping and doesn't change what the chart shows.
+      function isCompressStage(stage) {
+        return stage === "compress";
+      }
+      function isDecompressStage(stage) {
+        return typeof stage === "string" && stage.indexOf("decompress") === 0;
       }
 
       // Pick one record per (level, metric) for the chosen target /
@@ -860,30 +864,51 @@
       // (or commit sha) the chart is pinned to that exact run so the
       // 4 lines describe one commit and nothing else, which is what
       // you want when comparing two snapshots side-by-side.
+      // Build one record per (level, logical-metric) where the logical
+      // metrics are: compress_speed, decompress_speed, ratio. For each
+      // (level, logical-metric) we keep the most recent row that matches
+      // the snapshot/target/scenario filter — this collapses the source
+      // dimension for decompress (rust_stream vs c_stream) because the
+      // Rust/FFI comparison already lives inside each row.
       function buildProfileData(filter) {
-        const rows = state.records.filter((r) => {
+        const matchesFilter = (r) => {
           if ((r.target || "unknown-target") !== filter.target) return false;
           if (r.scenario !== filter.scenario) return false;
-          if (r.stage !== filter.stage) return false;
-          if ((r.source || "none") !== filter.source) return false;
           if (filter.snapshot !== PROFILE_LATEST) {
             const label = r.generated_at || r.commit_sha || "local-run";
             if (label !== filter.snapshot) return false;
           }
           return true;
-        });
-        const byLevelMetric = new Map();
-        for (const row of rows) {
+        };
+
+        // Logical metric per row (chart-side category, not bench metric):
+        //   `compress_speed`   — throughput at stage=compress
+        //   `decompress_speed` — throughput at any decompress stage
+        //   `ratio`            — compression_ratio at stage=compress
+        const logicalMetric = (row) => {
+          if (row.metric === "compression_ratio" && isCompressStage(row.stage)) return "ratio";
+          if (row.metric === "throughput_bytes_per_sec") {
+            if (isCompressStage(row.stage)) return "compress_speed";
+            if (isDecompressStage(row.stage)) return "decompress_speed";
+          }
+          return null;
+        };
+
+        const byLevelLogical = new Map();
+        for (const row of state.records) {
+          if (!matchesFilter(row)) continue;
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
-          const key = `${row.level}|${row.metric}`;
-          const existing = byLevelMetric.get(key);
+          const lm = logicalMetric(row);
+          if (!lm) continue;
+          const key = `${row.level}|${lm}`;
+          const existing = byLevelLogical.get(key);
           if (!existing || compareByGeneratedAt(row, existing) > 0) {
-            byLevelMetric.set(key, row);
+            byLevelLogical.set(key, row);
           }
         }
 
         const levelSet = new Set();
-        for (const row of byLevelMetric.values()) levelSet.add(row.level);
+        for (const row of byLevelLogical.values()) levelSet.add(row.level);
         const levels = Array.from(levelSet)
           .map((value) => ({ value, parsed: parseLevelId(value) }))
           .sort((a, b) => {
@@ -897,57 +922,81 @@
           entry.parsed ? entry.parsed.label : entry.value,
         );
 
-        const lookup = (level, metric, side) => {
-          const row = byLevelMetric.get(`${level}|${metric}`);
+        // Speed records carry bytes/sec; convert to MiB/s for axis legibility.
+        const lookup = (level, lm, side) => {
+          const row = byLevelLogical.get(`${level}|${lm}`);
           if (!row) return null;
-          // Speed records carry bytes/sec, divide to MiB/s for axis legibility.
-          if (metric === "throughput_bytes_per_sec") {
-            return side === "rust" ? row.rust_value / (1024 * 1024) : row.ffi_value / (1024 * 1024);
+          const raw = side === "rust" ? row.rust_value : row.ffi_value;
+          if (lm === "compress_speed" || lm === "decompress_speed") {
+            return raw / (1024 * 1024);
           }
-          return side === "rust" ? row.rust_value : row.ffi_value;
+          return raw;
         };
 
-        const rustSpeed = levels.map((e) => lookup(e.value, "throughput_bytes_per_sec", "rust"));
-        const ffiSpeed = levels.map((e) => lookup(e.value, "throughput_bytes_per_sec", "ffi"));
-        const rustRatio = levels.map((e) => lookup(e.value, "compression_ratio", "rust"));
-        const ffiRatio = levels.map((e) => lookup(e.value, "compression_ratio", "ffi"));
+        const series = (lm, side) =>
+          levels.map((e) => lookup(e.value, lm, side));
 
         return {
           levels: levelLabels,
           levelCount: levels.length,
           datasets: [
             {
-              seriesKey: "rust_speed",
-              label: "Rust speed (MiB/s)",
-              data: rustSpeed,
+              seriesKey: "rust_compress_speed",
+              label: "Rust compress (MiB/s)",
+              data: series("compress_speed", "rust"),
               yAxisID: "y",
               borderColor: "hsl(150 65% 38%)",
-              backgroundColor: "hsla(150 65% 38% / 0.3)",
+              backgroundColor: "hsla(150 65% 38% / 0.25)",
             },
             {
-              seriesKey: "ffi_speed",
-              label: "FFI speed (MiB/s)",
-              data: ffiSpeed,
+              seriesKey: "ffi_compress_speed",
+              label: "FFI compress (MiB/s)",
+              data: series("compress_speed", "ffi"),
               yAxisID: "y",
               borderColor: "hsl(205 65% 45%)",
-              backgroundColor: "hsla(205 65% 45% / 0.3)",
+              backgroundColor: "hsla(205 65% 45% / 0.25)",
             },
             {
+              seriesKey: "rust_decompress_speed",
+              label: "Rust decompress (MiB/s)",
+              data: series("decompress_speed", "rust"),
+              yAxisID: "y",
+              borderColor: "hsl(170 65% 28%)",
+              backgroundColor: "hsla(170 65% 28% / 0.25)",
+              borderDash: [2, 3],
+            },
+            {
+              seriesKey: "ffi_decompress_speed",
+              label: "FFI decompress (MiB/s)",
+              data: series("decompress_speed", "ffi"),
+              yAxisID: "y",
+              borderColor: "hsl(225 65% 35%)",
+              backgroundColor: "hsla(225 65% 35% / 0.25)",
+              borderDash: [2, 3],
+            },
+            // "ratio" here is the bench emitter's compression_ratio
+            // value, which is compressed_size / input_size — i.e. the
+            // output fraction, where LOWER means BETTER compression
+            // (a 0.30 value compresses to 30% of input). The axis and
+            // dataset labels say so explicitly to keep readers from
+            // assuming the conventional input/output definition where
+            // larger is better.
+            {
               seriesKey: "rust_ratio",
-              label: "Rust ratio",
-              data: rustRatio,
+              label: "Rust output ratio (lower=better)",
+              data: series("ratio", "rust"),
               yAxisID: "y1",
               borderColor: "hsl(30 75% 45%)",
-              backgroundColor: "hsla(30 75% 45% / 0.3)",
+              backgroundColor: "hsla(30 75% 45% / 0.25)",
               borderDash: [6, 4],
             },
             {
               seriesKey: "ffi_ratio",
-              label: "FFI ratio",
-              data: ffiRatio,
+              label: "FFI output ratio (lower=better)",
+              data: series("ratio", "ffi"),
               yAxisID: "y1",
               borderColor: "hsl(340 65% 50%)",
-              backgroundColor: "hsla(340 65% 50% / 0.3)",
+              backgroundColor: "hsla(340 65% 50% / 0.25)",
               borderDash: [6, 4],
             },
           ],
@@ -1004,8 +1053,8 @@
 
       function renderProfileChart() {
         const filter = profileFilter();
-        if (!filter.target || !filter.scenario || !filter.stage) {
-          el("profile-status").textContent = "Select target, scenario and stage to render the level profile.";
+        if (!filter.target || !filter.scenario) {
+          el("profile-status").textContent = "Select target and scenario to render the level profile.";
           return;
         }
         const { levels, levelCount, datasets } = buildProfileData(filter);
@@ -1019,14 +1068,14 @@
             state.profileChart.update("none");
           }
           el("legend-profile").replaceChildren();
-          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, stage=${filter.stage}, source=${filter.source}.`;
+          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}.`;
           return;
         }
         const snapshotNote = filter.snapshot === PROFILE_LATEST
           ? "latest per level"
           : `snapshot=${filter.snapshot}`;
         el("profile-status").textContent =
-          `Showing ${levelCount} level point(s) for scenario=${filter.scenario}, stage=${filter.stage}, source=${filter.source} (${snapshotNote}).`;
+          `Showing ${levelCount} level point(s) for scenario=${filter.scenario} (${snapshotNote}).`;
 
         const chartDatasets = buildProfileDatasets(datasets);
 
@@ -1060,7 +1109,7 @@
                 y1: {
                   type: "linear",
                   position: "right",
-                  title: { display: true, text: "Compression ratio" },
+                  title: { display: true, text: "Output size ratio (compressed/input, lower=better)" },
                   grid: { drawOnChartArea: false },
                 },
               },
@@ -1095,21 +1144,12 @@
       }
 
       function bindProfileControls() {
-        // Filter cascade:
-        //   target/scenario/stage change → source list may change
-        //                                  → snapshot list may change
-        //   source change                 → snapshot list may change
-        // Each downstream selector is repopulated before re-rendering,
-        // preserving the existing selection where it remains valid.
-        const cascadeUpper = ["target", "scenario", "stage"];
+        // Filter cascade: target/scenario change → snapshot list may
+        // change. Snapshot is repopulated before re-rendering and the
+        // current selection is preserved when it remains valid.
+        const cascade = ["target", "scenario"];
         for (const [name, control] of Object.entries(profileSelectors)) {
-          if (cascadeUpper.includes(name)) {
-            control.addEventListener("change", () => {
-              repopulateSourceOptions();
-              repopulateSnapshotOptions();
-              renderProfileChart();
-            });
-          } else if (name === "source") {
+          if (cascade.includes(name)) {
             control.addEventListener("change", () => {
               repopulateSnapshotOptions();
               renderProfileChart();
@@ -1139,47 +1179,20 @@
         return row.generated_at || row.commit_sha || "local-run";
       }
 
-      function repopulateSourceOptions() {
-        const target = profileSelectors.target.value;
-        const scenario = profileSelectors.scenario.value;
-        const stage = profileSelectors.stage.value;
-        const sources = uniq(
-          state.records
-            .filter((r) =>
-              (r.target || "unknown-target") === target &&
-              r.scenario === scenario &&
-              r.stage === stage,
-            )
-            .map((r) => r.source || "none"),
-        );
-        const previous = profileSelectors.source.value;
-        const fragment = document.createDocumentFragment();
-        for (const value of sources) {
-          const opt = document.createElement("option");
-          opt.value = String(value);
-          opt.textContent = String(value);
-          fragment.appendChild(opt);
-        }
-        profileSelectors.source.replaceChildren(fragment);
-        profileSelectors.source.value = sources.includes(previous)
-          ? previous
-          : (sources.includes("none") ? "none" : (sources[0] || "none"));
-      }
-
       function repopulateSnapshotOptions() {
         const filter = {
           target: profileSelectors.target.value,
           scenario: profileSelectors.scenario.value,
-          stage: profileSelectors.stage.value,
-          source: profileSelectors.source.value,
         };
+        // Snapshot list lives at (target, scenario) granularity now —
+        // the chart draws all stages together, so any snapshot that
+        // contributed compress OR decompress rows for this scenario is
+        // a valid pick.
         const labels = uniq(
           state.records
             .filter((r) =>
               (r.target || "unknown-target") === filter.target &&
-              r.scenario === filter.scenario &&
-              r.stage === filter.stage &&
-              (r.source || "none") === filter.source,
+              r.scenario === filter.scenario,
             )
             .map(snapshotLabel),
         );
@@ -1204,7 +1217,6 @@
       function renderProfileSelectors() {
         const targets = uniq(state.records.map((r) => r.target || "unknown-target"));
         const scenarios = uniq(state.records.map((r) => r.scenario).filter(Boolean));
-        const stages = uniq(state.records.map((r) => r.stage).filter(Boolean));
 
         const populate = (sel, values, preferred) => {
           const fragment = document.createDocumentFragment();
@@ -1220,10 +1232,6 @@
 
         populate(profileSelectors.target, targets, targets[0]);
         populate(profileSelectors.scenario, scenarios, scenarios[0]);
-        // "compress" is the canonical stage for level profile (level
-        // sweeps only meaningfully exist on the compression side).
-        populate(profileSelectors.stage, stages, stages.includes("compress") ? "compress" : stages[0]);
-        repopulateSourceOptions();
         repopulateSnapshotOptions();
       }
 
