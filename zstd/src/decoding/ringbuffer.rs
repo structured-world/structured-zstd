@@ -1379,8 +1379,8 @@ mod tests {
         // wildcopy overshoot would corrupt.
         let mut sentinel = [0u8; 16];
         unsafe {
-            for i in 0..16 {
-                sentinel[i] = rb.buf.as_ptr().add((head_before + i) % cap).read();
+            for (i, slot) in sentinel.iter_mut().enumerate() {
+                *slot = rb.buf.as_ptr().add((head_before + i) % cap).read();
             }
         }
         assert!(sentinel.iter().all(|&b| b == 0xCD), "pre-state sentinel");
@@ -1394,7 +1394,7 @@ mod tests {
         // The bytes at [head, head+16) must still be the original 0xCD
         // prefill — any overshoot would have written 0x42 over them.
         unsafe {
-            for i in 0..16 {
+            for i in 0..16usize {
                 let actual = rb.buf.as_ptr().add((head_before + i) % cap).read();
                 assert_eq!(
                     actual,
