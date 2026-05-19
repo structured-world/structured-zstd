@@ -20,8 +20,10 @@ const MAX_NB_BLOCK_SPLITS: usize = 196;
 /// Formula: `shift = MIN(9 - donor_strategy, 3); mintc = (huf_repeat ==
 /// valid) ? 6 : (8 << shift)`. With huf reuse available, the per-block huf
 /// header overhead is gone, so the cheap floor is 6 bytes. Without it, the
-/// huf tree-description overhead (≥30 bytes) dominates on small payloads
-/// and we'd produce a worse-than-raw block — donor's shift table gives
+/// huf tree-description must be serialized per block — alphabet size and
+/// max symbol determine its exact byte cost, but on payloads near the
+/// per-strategy floor that overhead dominates and the compressed section
+/// loses to raw. Donor's shift table picks the floor per strategy:
 /// strategy 1..6 → 64 bytes, strategy 7 (btopt) → 32, strategy 8 (btultra)
 /// → 16, strategy 9 (btultra2) → 8.
 ///
@@ -405,13 +407,16 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // after passing the `min_lits` gate and running a full HUF compress —
     // so donor emits raw for any all-identical section under `min_lits`
     // (e.g. 8..63 bytes at fast/dfast/greedy/lazy, 6..7 bytes with HUF
-    // reuse). RLE is at worst equal to raw on `len == 1`
-    // (both produce a 2-byte section) and strictly smaller for `len >= 2`
-    // (2 bytes vs `1 + len`), so our pre-check fires for ANY all-identical
-    // literal slice regardless of strategy/min_lits. This produces strictly
-    // smaller output than donor on the small all-identical edges while
-    // still matching donor on `>= min_lits` inputs (where donor's
-    // compress+`cLitSize==1` path reaches the same RLE block).
+    // reuse). RLE and raw share the same lhSize for a given `len`
+    // (both use `uncompressed_literals_header_bytes`), so RLE = lhSize + 1
+    // and raw = lhSize + len. That makes RLE equal to raw on `len == 1`
+    // and smaller by exactly `len - 1` bytes for `len >= 2`, regardless of
+    // the lhSize tier (1 / 2 / 3 / 5 bytes). Our pre-check fires for ANY
+    // all-identical literal slice regardless of strategy/min_lits.
+    // This produces strictly smaller output than donor on the small
+    // all-identical edges while still matching donor on `>= min_lits`
+    // inputs (where donor's compress+`cLitSize==1` path reaches the same
+    // RLE block).
     // Note the order — RLE pre-check runs BEFORE `min_lits`;
     // `estimate_literals_section_bytes` mirrors this exactly so probe
     // costs match emit byte-for-byte.
@@ -560,12 +565,13 @@ fn estimate_literals_section_bytes(
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
     // **in the same order**. The emitter pre-checks `all_identical`
-    // (any non-empty section) BEFORE the `min_lits` gate — on
-    // all-identical inputs RLE is equal to raw at `len == 1` (both
-    // 2 bytes) and strictly smaller for `len >= 2`, so it is never
-    // worse than raw and is selected regardless of strategy. Estimator
-    // must use the same ordering and predicate so probe costs match
-    // emit byte-for-byte.
+    // (any non-empty section) BEFORE the `min_lits` gate — RLE and raw
+    // share `uncompressed_literals_header_bytes(len)` (1/2/3/5 bytes by
+    // length tier), so on all-identical inputs RLE = lhSize + 1 equals
+    // raw = lhSize + len at `len == 1` and is smaller by `len - 1` for
+    // `len >= 2`. RLE is never worse than raw, so it is selected
+    // regardless of strategy. Estimator must use the same ordering and
+    // predicate so probe costs match emit byte-for-byte.
     if !literals.is_empty() && all_bytes_identical(literals) {
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + 1;
