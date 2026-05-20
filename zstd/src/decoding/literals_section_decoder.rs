@@ -370,28 +370,37 @@ mod burst_gate_tests {
     //! Regression coverage for the HUF 4-stream burst-gate boundary
     //! states in `decompress_literals`:
     //!
-    //!   1. `bits_consumed == max_num_bits` — exact lower boundary of
-    //!      the burst gate; gate is entered with zero slack.
-    //!   2. `bits_consumed + burst_bits == 64` — exact upper boundary;
-    //!      burst consumes all remaining bits in the 64-bit window
+    //!   1. `bits_consumed == max_num_bits` — lower boundary of the
+    //!      burst gate, where the gate is entered with zero slack.
+    //!   2. `bits_consumed + burst_bits == 64` — upper boundary, where
+    //!      the burst consumes all remaining bits in the 64-bit window
     //!      without overflow.
     //!   3. SIMD-fallback → refill → burst re-entry — outer loop falls
-    //!      back to the SIMD 4-symbol path, a `BitReaderReversed` refill
-    //!      occurs, the next iteration re-enters the burst path once
-    //!      `bits_consumed` grows back into burst range.
+    //!      back to the SIMD 4-symbol path, a `BitReaderReversed`
+    //!      refill occurs, the next iteration re-enters the burst path
+    //!      once `bits_consumed` grows back into burst range.
     //!
-    //! Each named test pins a deterministic shape that exercises the
-    //! corresponding state; the sweep test covers the gate in aggregate
-    //! across many `(size, alphabet)` combinations so any subset hits
-    //! the exact boundary conditions deterministically while the rest
-    //! supplies broad regression coverage.
+    //! Each named test pins an input shape chosen to drive the gate
+    //! through the corresponding regime — short skewed input for the
+    //! initial-entry lower-bound, long mid-cardinality streams for
+    //! many upper-bound brushes, multi-segment input for repeated
+    //! SIMD↔burst transitions. The sweep test covers the gate in
+    //! aggregate across many `(size, alphabet)` combinations.
     //!
-    //! All cases assert roundtrip correctness through the full encoder
-    //! → 4-stream HUF block → `decode_literals` path. A burst-gate
-    //! regression that returns the wrong symbol or desynchronises a
-    //! stream produces either a `DecompressLiteralsError` from the
-    //! `BitstreamReadMismatch` / `DecodedLiteralCountMismatch` guards
-    //! or a mismatched decoded buffer — both fail the assertion.
+    //! These tests do NOT assert that a specific
+    //! `(bits_consumed, burst_bits)` configuration is hit deterministically
+    //! on any single iteration — that would require white-box state
+    //! instrumentation that the current decoder does not expose. They
+    //! assert end-to-end roundtrip correctness through the full
+    //! encoder → 4-stream HUF block → `decode_literals` path; a
+    //! burst-gate regression that returns the wrong symbol or
+    //! desynchronises a stream produces either a
+    //! `DecompressLiteralsError` from the `BitstreamReadMismatch` /
+    //! `DecodedLiteralCountMismatch` guards or a mismatched decoded
+    //! buffer — both fail the assertion. The `max_num_bits` range
+    //! checks in the per-test helper also detect silent drift where
+    //! the encoder's table-generation choice shifts the test out of
+    //! the intended gate regime.
     use super::*;
     use crate::bit_io::BitWriter;
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
@@ -457,18 +466,19 @@ mod burst_gate_tests {
         );
     }
 
-    /// Lower boundary: `bits_consumed == max_num_bits` on first burst entry.
+    /// Lower boundary: targets `bits_consumed == max_num_bits` on
+    /// early burst entries.
     ///
-    /// 64 symbols with skewed weights drive `max_num_bits` into the
-    /// 8..=11 band (so `symbols_per_burst >= 4`); a short stream forces
-    /// the first burst iteration to start from `bits_consumed`
-    /// immediately at the gate threshold rather than well above it.
-    /// Decoder must not lose the low stream bits when the shift formula
-    /// runs at the threshold.
+    /// A short stream with a skewed 23-symbol alphabet keeps
+    /// `max_num_bits` in the 5..=11 band and limits the number of
+    /// burst iterations, so early iterations run with `bits_consumed`
+    /// near the gate threshold. The decoder must not lose low stream
+    /// bits when the shift formula runs close to the threshold;
+    /// roundtrip correctness over short input is the regression signal.
     #[test]
     fn burst_gate_lower_boundary_short_skewed_alphabet() {
-        // 36 bytes, 32-symbol skewed distribution — encoder picks
-        // max_num_bits ≈ 6..8.
+        // 36 bytes, 23 distinct symbols, skewed distribution —
+        // encoder picks max_num_bits in the 5..=11 band.
         let mut data: Vec<u8> = Vec::with_capacity(36);
         data.extend_from_slice(&[
             0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
