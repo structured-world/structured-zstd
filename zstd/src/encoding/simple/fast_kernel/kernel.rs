@@ -392,6 +392,7 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Capture every emitted sequence as `(literals_bytes, offset,
@@ -480,5 +481,282 @@ mod tests {
             "explicit-offset match must have offset > 0 (got {})",
             triple.1,
         );
+    }
+
+    /// Helper that accepts a non-zero `rep` and pre-populated hash
+    /// table so individual tests can exercise specific kernel branches
+    /// (rep path, prefix filter, stale-entry hardening). Shares the
+    /// same accounting invariant as `run_block` plus returns the
+    /// captured tuples for behavioural assertions.
+    fn run_block_with_rep(
+        data: &[u8],
+        hash_log: u32,
+        rep: [u32; 2],
+    ) -> (Vec<(Vec<u8>, usize, usize)>, FastBlockResult) {
+        let mut table = FastHashTable::new(hash_log, 4);
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+        let result = compress_block_fast::<4>(data, 0, 0, &mut table, rep, &mut handle);
+        let acct: usize = tuples
+            .iter()
+            .map(|(lits, _off, mlen)| lits.len() + mlen)
+            .sum::<usize>()
+            + result.tail_literals_len;
+        assert_eq!(acct, data.len(), "kernel must account for every input byte");
+        (tuples, result)
+    }
+
+    /// Repcode path: uniform data + `rep[0] = 1` means every 4-byte
+    /// window at any `ip0 > 0` matches `data[ip0-1..ip0+3]`. The
+    /// kernel must emit a Triple with `offset == 1` and large
+    /// `match_len`. Hits the `rep_check` branch on the very first
+    /// loop iteration.
+    #[test]
+    fn repcode_match_emits_with_rep_offset_one() {
+        let data = vec![0x42u8; 64];
+        let (tuples, _) = run_block_with_rep(&data, 8, [1, 4]);
+        let rep_triple = tuples
+            .iter()
+            .find(|(_, off, m)| *off == 1 && *m > 0)
+            .unwrap_or_else(|| panic!("repcode Triple at offset=1 expected, got {tuples:?}"));
+        assert!(
+            rep_triple.2 >= 4,
+            "match_len must be ≥ MIN_MATCH=4 (got {})",
+            rep_triple.2,
+        );
+        // Uniform-buffer rep match should extend far — the first match
+        // covers nearly the whole tail after subtracting the initial
+        // literal byte and the HASH_READ_SIZE trailing cap. Assert a
+        // reasonable lower bound rather than an exact value (count
+        // logic chooses chunk boundaries deterministically but the
+        // chunk count depends on the LE/BE branch).
+        assert!(
+            rep_triple.2 >= 32,
+            "uniform-byte rep extension must consume most of the buffer, got {}",
+            rep_triple.2,
+        );
+    }
+
+    /// Explicit-match backward extension: a marker byte before the
+    /// repeated pattern lets the kernel walk the match back by one
+    /// byte once the 4-byte forward probe at the hashed position
+    /// fires.
+    ///
+    /// Layout: `"X"` literal at 0, then `AAAA` 4-byte block at 1..5,
+    /// distinct filler, then `"X"` + `AAAA` again starting at 10. The
+    /// kernel hashes the second `AAAA` at ip0=11 (or wherever step
+    /// lands close to it), reads the stored index of the first
+    /// `AAAA`, and the backward-extension while-loop walks back
+    /// because `data[ip0 - 1] == data[match_pos - 1] == 'X'`.
+    #[test]
+    fn explicit_match_backward_extension_extends_by_marker_byte() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"XAAAA"); // 0..5, the seed copy
+        data.extend_from_slice(b"_____"); // 5..10, distinct filler
+        data.extend_from_slice(b"XAAAA"); // 10..15, the repeating copy
+        data.extend_from_slice(b"________"); // 15..23, HASH_READ_SIZE pad
+        let (tuples, _) = run_block_with_rep(&data, 12, [0, 0]);
+        let triple = tuples
+            .iter()
+            .find(|(_, _, m)| *m > 0)
+            .unwrap_or_else(|| panic!("expected an explicit-match Triple, got {tuples:?}"));
+        // Backward extension must lift the match length above the
+        // bare MIN_MATCH=4: at least 5 bytes ("XAAAA").
+        assert!(
+            triple.2 >= 5,
+            "backward extension must lift match_len above MIN_MATCH (got {})",
+            triple.2,
+        );
+        // The literals before this match must NOT include the 'X' at
+        // position 10 — backward extension consumed it as part of the
+        // match.
+        assert!(
+            !triple.0.ends_with(b"X"),
+            "backward extension must absorb the 'X' marker byte (literals: {:?})",
+            triple.0,
+        );
+    }
+
+    /// `prefix_start_index` filter: a stale hash entry pointing at a
+    /// position BELOW `prefix_start_index` must be rejected even when
+    /// the byte-for-byte cmp would have succeeded. Engineered by
+    /// pre-populating the table with an in-range-by-bytes but
+    /// below-prefix index.
+    #[test]
+    fn prefix_start_index_filter_rejects_below_window() {
+        // Uniform data — every 4-byte window has the same hash and
+        // the same bytes, so a stale entry at any position would
+        // raw-cmp-match. Pre-set the hash slot for ip0=1 to index 0,
+        // then run with prefix_start_index=5. Without the filter the
+        // kernel would happily emit a Triple at offset=1; with it,
+        // the candidate is rejected.
+        let data = vec![0xAAu8; 64];
+        let mut table = FastHashTable::new(8, 4);
+        // SAFETY: data has ≥ 4 readable bytes at index 1.
+        let h = unsafe { table.hash_ptr::<4>(data.as_ptr().add(1)) };
+        // SAFETY: h came from hash_ptr on this same table.
+        unsafe { table.put(h, 0) };
+
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+        // prefix_start_index=5 blocks index 0.
+        let _ = compress_block_fast::<4>(&data, 0, 5, &mut table, [0, 0], &mut handle);
+
+        // Every Triple emitted must reference a position ≥ 5, i.e.
+        // the offset must NOT exceed the distance from ip0 to the
+        // prefix start. With uniform data and prefix_start_index=5,
+        // legitimate matches first become possible around ip0=9 with
+        // offset ≤ 4 — none should be at offset=1 (the rejected stale
+        // candidate) or larger than ip0-5.
+        for (lits, off, m) in &tuples {
+            if *m > 0 {
+                assert_ne!(
+                    *off, 1,
+                    "stale entry at index 0 must be filtered out by prefix_start_index=5",
+                );
+                // After a literals run the anchor advances by exactly
+                // `lits.len()` bytes (literals are written from
+                // `anchor..ip0`), so `ip0 == anchor + lits.len() ==
+                // lits.len()` here (anchor starts at 0).
+                let ip0 = lits.len();
+                // The offset must keep the match referent above prefix
+                // start.
+                assert!(
+                    *off <= ip0,
+                    "match offset {off} would point below anchor {ip0}",
+                );
+            }
+        }
+    }
+
+    /// Hardening regression (round 3, finding #11): a hash entry
+    /// pointing AT or AFTER the current `ip0` must be rejected
+    /// before the 4-byte raw compare. Without this guard the kernel
+    /// would compute `offset = ip0 - match_pos` and wrap into a
+    /// gigantic offset → emit a Triple with a meaningless backward
+    /// reference.
+    ///
+    /// Engineered scenario: uniform data so the raw-cmp at any two
+    /// positions always succeeds; pre-populate the hash slot that
+    /// ip0=1 will probe with a forward-pointing stale index (150);
+    /// without the `match_pos < ip_pos` filter the very first
+    /// iteration would emit `Triple { offset = 1 - 150 = u_wrap, ... }`.
+    /// Test asserts every emitted Triple has an offset ≤ data.len()
+    /// — only achievable when the stale forward index is rejected.
+    #[test]
+    fn match_found_rejects_stale_forward_entry() {
+        let data = vec![0u8; 200];
+        let mut table = FastHashTable::new(8, 4);
+        // SAFETY: data has ≥ 4 readable bytes at index 1.
+        let h = unsafe { table.hash_ptr::<4>(data.as_ptr().add(1)) };
+        // SAFETY: h came from hash_ptr on this same table.
+        unsafe { table.put(h, 150) };
+
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+        let _ = compress_block_fast::<4>(&data, 0, 0, &mut table, [0, 0], &mut handle);
+
+        for (_, off, m) in &tuples {
+            if *m > 0 {
+                assert!(
+                    *off > 0 && *off <= data.len(),
+                    "every emitted offset must reference an in-buffer backward position (got {off})",
+                );
+            }
+        }
+    }
+
+    /// Input exactly `HASH_READ_SIZE` bytes long: the short-input
+    /// branch fires because `data.len() < block_start + HASH_READ_SIZE`
+    /// is `8 < 0 + 8` → false, so we enter the main loop, but
+    /// `ilimit = 8 - 8 = 0` makes `while ip0 < ilimit` zero-iteration
+    /// (ip0 starts at 1 ≥ 0). Result: zero emissions, entire input
+    /// reported as tail.
+    #[test]
+    fn block_exactly_hash_read_size_emits_no_sequences() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let (tuples, result) = run_block_with_rep(&data, 8, [0, 0]);
+        assert!(
+            tuples.is_empty(),
+            "exactly HASH_READ_SIZE bytes must produce no main-loop iterations",
+        );
+        assert_eq!(result.tail_literals_len, data.len());
+    }
+
+    /// Input one byte shorter than `HASH_READ_SIZE`: the short-input
+    /// branch fires (`7 < 8`), the kernel returns immediately with
+    /// the full input as tail and no callback invocations.
+    #[test]
+    fn block_just_below_hash_read_size_emits_no_sequences() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7];
+        let (tuples, result) = run_block_with_rep(&data, 8, [0, 0]);
+        assert!(tuples.is_empty());
+        assert_eq!(result.tail_literals_len, data.len());
+    }
+
+    /// Repcode save/restore: when the incoming `rep_offset1` is
+    /// larger than the addressable history (`max_rep = ip0 -
+    /// prefix_start_index`), the kernel stashes it into
+    /// `offset_saved1` and zeroes the live rep. If no explicit match
+    /// promotes a new rep during the block, `_cleanup` must restore
+    /// the saved value into the returned `rep[0]` so cross-block
+    /// repcode history isn't lost. The unaffected `rep[1]` is the
+    /// secondary witness that no mutation occurred mid-block.
+    #[test]
+    fn rep_offset_save_restore_when_out_of_range() {
+        // Random-looking distinct bytes — no real matches the kernel
+        // would discover; deterministic xorshift keeps the stream
+        // reproducible.
+        let mut data = vec![0u8; 64];
+        let mut state = 0x1234_5678u32;
+        for byte in &mut data {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        // rep_offset1 huge — far exceeds any plausible ip0 in a
+        // 64-byte block. Must be stashed and restored unchanged.
+        let huge = 9999;
+        let mut table = FastHashTable::new(10, 4);
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+        let result = compress_block_fast::<4>(&data, 0, 0, &mut table, [huge, 7], &mut handle);
+        assert_eq!(
+            result.rep[0], huge,
+            "out-of-range rep_offset1 must be restored verbatim across the block",
+        );
+        // rep_offset2 was also out of range (max_rep ≈ 0..63, 7 > 1).
+        // Donor restores it through offset_saved2; the in-range
+        // restoration path is the second witness.
+        assert_eq!(result.rep[1], 7, "rep_offset2 (also stashed) must restore");
     }
 }
