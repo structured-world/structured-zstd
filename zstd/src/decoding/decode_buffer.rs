@@ -289,30 +289,71 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             offset > 0,
             "offset must be non-zero to avoid modulo by zero in short-offset path"
         );
-        let mut base = [0u8; 8];
+
+        // Read the repeating period (`offset` bytes) from the existing
+        // buffer surface. Cap the read at 7 so callers with offset > 7
+        // never reach this function — `repeat_overlapping` dispatches
+        // the offset >= 8 cases elsewhere.
+        debug_assert!(offset <= 7, "repeat_short_offset is the offset<8 path");
+        let mut base = [0u8; 7];
         for (i, slot) in base.iter_mut().take(offset).enumerate() {
             *slot = self.byte_at(start_idx + i);
         }
 
-        let mut phase_patterns = [[0u8; 8]; 7];
+        // Fast path: offset ∈ {1, 2, 4} — the period divides 16, so
+        // every 16-byte window of the repeating pattern is identical
+        // and one pre-built chunk feeds the entire loop with zero
+        // phase tracking. Inner loop = one 16-byte SIMD store + one
+        // add.
+        if matches!(offset, 1 | 2 | 4) {
+            let mut chunk16 = [0u8; 16];
+            for i in 0..16 {
+                chunk16[i] = base[i % offset];
+            }
+            let mut copied = 0usize;
+            while copied + 16 <= match_length {
+                self.buffer.extend(&chunk16);
+                copied += 16;
+            }
+            if copied < match_length {
+                let tail = match_length - copied;
+                self.buffer.extend(&chunk16[..tail]);
+            }
+            return;
+        }
+
+        // offset ∈ {3, 5, 6, 7}: the period does NOT divide 16, so each
+        // 16-byte window starts at a different sub-position of the
+        // repeating pattern. Pre-build all `offset` phase-shifted
+        // 16-byte windows and index by the current phase; advancing the
+        // cursor by 16 bytes shifts the phase by `16 % offset`. This
+        // keeps the inner-loop store at 16 bytes (same throughput as
+        // the divides-16 fast path), trading a 7×16 = 112-byte stack
+        // buffer + one modulo-by-small-constant for the doubled width
+        // vs the previous 8-byte phase pattern.
+        //
+        // LCM(offset, 16) = 48 / 80 / 48 / 112 bytes for offset
+        // ∈ {3, 5, 6, 7}; the phase cycles through every `offset` 16-
+        // byte stores so the steady-state period equals the LCM.
+        let mut phase_patterns_16 = [[0u8; 16]; 7];
         for phase in 0..offset {
-            for i in 0..8 {
-                phase_patterns[phase][i] = base[(phase + i) % offset];
+            for i in 0..16 {
+                phase_patterns_16[phase][i] = base[(phase + i) % offset];
             }
         }
 
-        let phase_step = 8 % offset;
+        let phase_step = 16 % offset;
         let mut phase = 0usize;
         let mut copied = 0usize;
-        while copied + 8 <= match_length {
-            self.buffer.extend(&phase_patterns[phase]);
-            copied += 8;
+        while copied + 16 <= match_length {
+            self.buffer.extend(&phase_patterns_16[phase]);
+            copied += 16;
             phase = (phase + phase_step) % offset;
         }
 
         if copied < match_length {
             let tail = match_length - copied;
-            self.buffer.extend(&phase_patterns[phase][..tail]);
+            self.buffer.extend(&phase_patterns_16[phase][..tail]);
         }
     }
 
@@ -856,5 +897,47 @@ mod tests {
         }
         let drain_len = model.len() - window;
         model.drain(0..drain_len).collect()
+    }
+
+    /// Drive `DecodeBuffer::repeat` through the short-offset path and
+    /// compare against the canonical `output[i] = base[i % offset]`
+    /// reference, covering offsets that hit both the SIMD-16 fast path
+    /// (1, 2, 4) and the 8-byte phase-pattern path (3, 5, 6, 7).
+    ///
+    /// Regression guard for the SIMD-16 specialisation: when `period
+    /// divides 16` (offset ∈ {1,2,4}), the inner loop emits 16-byte
+    /// chunks via a pre-built `[u8; 16]` instead of 8-byte phase
+    /// patterns. Tail lengths span both `match_length % 16 == 0` and
+    /// non-zero remainders so the tail-extend codepath is also
+    /// exercised.
+    #[test]
+    fn repeat_short_offset_matches_canonical_for_all_offsets_and_lengths() {
+        for offset in 1usize..=7 {
+            let mut base = [0u8; 7];
+            for (i, slot) in base.iter_mut().enumerate().take(offset) {
+                *slot = b'A' + (i as u8);
+            }
+            for &match_length in &[
+                1usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 47, 48, 49, 64,
+                127, 128, 4096,
+            ] {
+                let mut buf = DecodeBuffer::<RingBuffer>::new(8192);
+                buf.push(&base[..offset]);
+                buf.repeat(offset, match_length).unwrap_or_else(|e| {
+                    panic!("repeat failed for offset={offset} match_length={match_length}: {e:?}")
+                });
+
+                let actual = buf.drain();
+                let mut expected = Vec::with_capacity(offset + match_length);
+                expected.extend_from_slice(&base[..offset]);
+                for i in 0..match_length {
+                    expected.push(base[i % offset]);
+                }
+                assert_eq!(
+                    actual, expected,
+                    "mismatch at offset={offset} match_length={match_length}",
+                );
+            }
+        }
     }
 }
