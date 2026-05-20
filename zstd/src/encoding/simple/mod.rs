@@ -24,6 +24,8 @@ use super::match_table::helpers::{
     FAST_HASH_FILL_STEP, INCOMPRESSIBLE_SKIP_STEP, MIN_MATCH_LEN, common_prefix_len,
 };
 
+pub(crate) mod fast_kernel;
+
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
 pub(crate) struct SuffixStore {
