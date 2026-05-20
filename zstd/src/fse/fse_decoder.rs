@@ -34,28 +34,153 @@ impl<'t> FSEDecoder<'t> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
+        // Externally-constructible-table guard: when
+        // `feature = "fuzz_exports"` is on, `FSETable.decode` /
+        // `FSETable.accuracy_log` are settable from outside the crate,
+        // so a fuzz harness can hand the decoder a mis-shaped table
+        // that skips `build_decoding_table`'s invariants. Validate the
+        // table-shape invariant `decode.len() == 1 << accuracy_log`
+        // up-front and surface as a typed `InvalidTableShape` error
+        // (distinct from `TableIsUninitialized` to keep fuzz triage
+        // unambiguous) — without this, `read_entry`'s bounds-checked
+        // indexing under the same cfg would panic on a malformed
+        // table, which fuzz harnesses cannot distinguish from a
+        // legitimate decoder failure. `checked_shl` covers the
+        // pathological case where `accuracy_log >= usize::BITS`.
+        #[cfg(feature = "fuzz_exports")]
+        {
+            let accuracy_log = self.table.accuracy_log;
+            let decode_len = self.table.decode.len();
+            let expected = 1usize.checked_shl(accuracy_log.into()).ok_or(
+                FSEDecoderError::InvalidTableShape {
+                    decode_len,
+                    accuracy_log,
+                },
+            )?;
+            if decode_len != expected {
+                return Err(FSEDecoderError::InvalidTableShape {
+                    decode_len,
+                    accuracy_log,
+                });
+            }
+        }
         let new_state = bits.get_bits(self.table.accuracy_log);
-        self.state = self.table.decode[new_state as usize];
+        // SAFETY: `accuracy_log` bits read from the bitstream produce
+        // `new_state < (1 << accuracy_log) = table_size = decode.len()`.
+        // `build_decoding_table` ensures the table is sized exactly
+        // `1 << accuracy_log` entries. The bounds check that the
+        // checked indexing would emit is provably redundant. Under
+        // `feature = "fuzz_exports"` `read_entry` falls back to the
+        // bounds-checked path — see comment on `read_entry`.
+        self.state = self.read_entry(new_state as usize);
 
         Ok(())
     }
 
     /// Advance the internal state to decode the next symbol in the bitstream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on an `FSEDecoder` whose backing `FSETable` has
+    /// not been built yet (empty `decode` vec). `FSEDecoder::new`
+    /// produces such a decoder with a zero-default `state`; the
+    /// well-behaved pipeline is `new` → `init_state` → `update_state*`,
+    /// and `init_state` returns `Err` on an uninitialized table. This
+    /// assertion converts what would otherwise be UB (from the
+    /// unchecked indexing in `read_entry`) into a clear fail-fast
+    /// panic that surfaces the API misuse immediately instead of
+    /// leaving the bitstream and decode state silently desynchronised.
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
+        // Public-API safety guard: `FSEDecoder::new` builds a decoder
+        // with a zero-default `state` (Entry { new_state: 0, num_bits:
+        // 0, symbol: 0 }) regardless of whether the table was actually
+        // populated. A caller that constructs the decoder and then
+        // calls `update_state` BEFORE a successful `init_state` would
+        // hit `read_entry(0)` → `get_unchecked(0)` on an empty
+        // `decode` vec — UB in release mode, since `debug_assert!` is
+        // stripped. Fail-fast with `assert!` instead of silently
+        // returning so that misuse surfaces immediately rather than
+        // leaving the bitstream advanced by some bits but the decode
+        // state stuck at the zero-default Entry — a corruption mode
+        // that the caller has no way to diagnose. The well-behaved
+        // decode pipeline always pairs `new` → `init_state` →
+        // `update_state*`, so this branch is strongly biased "not
+        // taken" and the predictor amortises it to zero cost on the
+        // hot path. The corresponding `update_state_fast` is
+        // `pub(crate)` with controlled callers, so it relies on the
+        // documented precondition instead of paying for a per-call
+        // check.
+        assert!(
+            !self.table.decode.is_empty(),
+            concat!(
+                "FSEDecoder::update_state called on an uninitialized table; ",
+                "call init_state successfully before any update_state* call",
+            ),
+        );
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
-        self.state = self.table.decode[next_state];
+        // SAFETY: same invariant as `update_state_fast` below —
+        // `new_state` and `num_bits` were paired by
+        // `calc_baseline_and_numbits` during table construction such
+        // that `new_state + (1 << num_bits) - 1 < table_size =
+        // decode.len()`. `add < 1 << num_bits` by definition of the
+        // `num_bits`-wide read, so `next_state < decode.len()`.
+        self.state = self.read_entry(next_state);
+    }
+
+    /// Read `decode[idx]` — bounds-checked under `fuzz_exports`, unchecked
+    /// otherwise. The call sites all hold the FSE invariant `idx <
+    /// decode.len()` by construction (`init_state` reads
+    /// `accuracy_log` bits, `update_state*` derive `next_state` from
+    /// `Entry.new_state + add` where `calc_baseline_and_numbits`
+    /// guarantees `new_state + (1 << num_bits) - 1 < table_size`).
+    /// Under `fuzz_exports` external code can construct a mis-shaped
+    /// table that violates the invariant — fall back to checked
+    /// indexing so a fuzz harness sees a panic rather than UB, even
+    /// when the fuzz binary is built in release mode (which makes
+    /// `debug_assert!` a no-op and is the default for `cargo fuzz`).
+    #[inline(always)]
+    fn read_entry(&self, idx: usize) -> Entry {
+        #[cfg(feature = "fuzz_exports")]
+        {
+            self.table.decode[idx]
+        }
+        #[cfg(not(feature = "fuzz_exports"))]
+        // SAFETY: see comments at the individual call sites — `idx` is
+        // invariant-bounded by the FSE table-build / state-transition
+        // contract. LLVM cannot prove this on its own because the
+        // invariant spans `build_decoding_table` and decode call sites.
+        unsafe {
+            *self.table.decode.get_unchecked(idx)
+        }
     }
 
     /// Advance the internal state **without** an individual refill check.
     ///
-    /// The caller **must** guarantee that enough bits are available in the bit
-    /// reader (e.g. via [`BitReaderReversed::ensure_bits`] with a budget that
-    /// covers this and any other unchecked reads in the same batch).
+    /// # Preconditions (caller-enforced)
+    ///
+    /// 1. **Bit budget:** enough bits MUST be available in the bit
+    ///    reader (e.g. via [`BitReaderReversed::ensure_bits`] with a
+    ///    budget that covers this and any other unchecked reads in the
+    ///    same batch).
+    /// 2. **State initialisation:** [`init_state`] MUST have returned
+    ///    `Ok` on this decoder before any `update_state_fast` call.
+    ///    Calling `update_state_fast` on a fresh `FSEDecoder::new`
+    ///    output (which holds a zero-default `state` and may reference
+    ///    an empty `decode` vec) would resolve to
+    ///    `read_entry(0).get_unchecked(0)` on an empty slice — UB.
+    ///    The empty-table guard in [`update_state`] is intentionally
+    ///    omitted here to keep the per-sequence fast path branch-free;
+    ///    the only call site (`decode_and_execute_sequences`) always
+    ///    succeeds `init_state` before entering the per-sequence loop,
+    ///    so the precondition holds by construction.
     ///
     /// This is the "fast path" used in the interleaved sequence decode loop
     /// where a single refill check covers all three FSE state updates.
+    ///
+    /// [`init_state`]: Self::init_state
+    /// [`update_state`]: Self::update_state
     #[inline(always)]
     pub(crate) fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
@@ -68,8 +193,10 @@ impl<'t> FSEDecoder<'t> {
         // `add < 2.pow(num_bits)` by construction of `BitReaderReversed::get_bits_unchecked`.
         // Therefore `next_state < self.table.decode.len()` and the indexed read
         // is in bounds; LLVM cannot prove this invariant on its own because it
-        // spans the table-build and decode call sites.
-        self.state = unsafe { *self.table.decode.get_unchecked(next_state) };
+        // spans the table-build and decode call sites. Under
+        // `feature = "fuzz_exports"` `read_entry` falls back to bounds-checked
+        // indexing — see comment on `read_entry`.
+        self.state = self.read_entry(next_state);
     }
 }
 

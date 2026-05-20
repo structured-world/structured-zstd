@@ -1001,6 +1001,15 @@ impl From<GetBitsError> for FSETableError {
 pub enum FSEDecoderError {
     GetBitsError(GetBitsError),
     TableIsUninitialized,
+    /// Externally constructed `FSETable` violates the
+    /// `decode.len() == 1 << accuracy_log` shape invariant. Only
+    /// reachable under `feature = "fuzz_exports"`, where fuzz
+    /// harnesses can set the `FSETable.decode` / `accuracy_log`
+    /// fields directly and skip `build_decoding_table`.
+    InvalidTableShape {
+        decode_len: usize,
+        accuracy_log: u8,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -1020,6 +1029,19 @@ impl core::fmt::Display for FSEDecoderError {
             FSEDecoderError::TableIsUninitialized => {
                 write!(f, "Tried to use an uninitialized table!")
             }
+            FSEDecoderError::InvalidTableShape {
+                decode_len,
+                accuracy_log,
+            } => match 1usize.checked_shl((*accuracy_log).into()) {
+                Some(expected) => write!(
+                    f,
+                    "FSETable shape invariant violated: decode.len() = {decode_len}, expected 1 << accuracy_log = {expected} (accuracy_log = {accuracy_log})",
+                ),
+                None => write!(
+                    f,
+                    "FSETable shape invariant violated: decode.len() = {decode_len}, accuracy_log = {accuracy_log} overflows 1 << accuracy_log for usize",
+                ),
+            },
         }
     }
 }
