@@ -154,9 +154,14 @@ pub(crate) struct FastBlockResult {
 ///
 /// Entry-time `assert!`s reject misuse loudly in every build (debug
 /// AND release) rather than silently miscompressing:
-/// - `block_start > data.len()` — would wrap
-///   `block_start + HASH_READ_SIZE` in the short-input guard and
-///   skip the early return.
+/// - `block_start > data.len()` — invalidates the block range and
+///   breaks the arithmetic used by both code paths: in the
+///   short-input branch `tail_literals_len = data.len() -
+///   block_start` underflows; in the main loop
+///   `block_start + HASH_READ_SIZE` can wrap and skip the
+///   short-input early-return entirely, then `base.add(ip0)`
+///   reads out of bounds. Either side is a clean panic instead
+///   of UB / garbage output.
 /// - `data.len() > u32::MAX as usize` — the kernel stores
 ///   absolute positions into a u32 hash table and computes offsets
 ///   as u32, so larger inputs would silently truncate match indices.

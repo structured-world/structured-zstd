@@ -87,22 +87,27 @@ impl FastHashTable {
     /// - `mls` outside `4..=8`.
     ///
     /// Target-size / allocation failures (per-host, not per-input):
-    /// - `1usize << hash_log` overflowing `usize` on the current
-    ///   target. On 32-bit hosts that fires at `hash_log >= 32`;
-    ///   even the donor cap (`30`) hits the practical 2 GiB
-    ///   address-space limit before reaching the formal usize
-    ///   overflow, so anything close to `hash_log = 30` is
-    ///   borderline on 32-bit and will OOM the allocator.
-    /// - `entries * size_of::<u32>()` overflowing `usize` (same
-    ///   class of overflow at a different multiply step).
+    /// - `1usize << hash_log` overflowing `usize`. Only reachable on
+    ///   32-bit hosts at `hash_log >= 32` — but `validate_params`
+    ///   already pins `hash_log <= ZSTD_HASHLOG_MAX = 30`, so this
+    ///   path is unreachable today for the donor-compatible band.
+    ///   Kept here as a tripwire if `ZSTD_HASHLOG_MAX` is ever
+    ///   raised past `31`.
+    /// - `entries * size_of::<u32>()` overflowing `usize`. This is
+    ///   the deterministic 32-bit failure mode at `hash_log = 30`:
+    ///   `1 << 30` entries × 4 bytes = 4 GiB, which is the full
+    ///   32-bit address space and overflows the `usize` multiply
+    ///   before `vec![]` is even called. The `checked_mul` guard
+    ///   surfaces this as a clear panic instead of the opaque
+    ///   `Vec`-internal capacity-overflow message.
     /// - Global allocator failure when actually allocating the
     ///   table backing storage — propagates as the standard
     ///   `Vec::with_capacity` allocation-failure panic.
     ///
-    /// The parameter-range and target-size guards both fire BEFORE
-    /// the `vec![]` call, so allocator failure (the third bullet)
-    /// is the only panic that depends on runtime memory state. The
-    /// first two are deterministic given the inputs and target.
+    /// All three guards fire BEFORE control reaches `vec![]`, so
+    /// allocator failure (the third bullet) is the only panic that
+    /// depends on runtime memory state. The first two are
+    /// deterministic given the inputs and target architecture.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
         validate_params(hash_log, mls);
         // Per-target allocation feasibility: `1 << hash_log` u32 entries
