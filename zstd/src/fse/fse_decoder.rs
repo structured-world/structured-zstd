@@ -78,6 +78,18 @@ impl<'t> FSEDecoder<'t> {
     }
 
     /// Advance the internal state to decode the next symbol in the bitstream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on an `FSEDecoder` whose backing `FSETable` has
+    /// not been built yet (empty `decode` vec). `FSEDecoder::new`
+    /// produces such a decoder with a zero-default `state`; the
+    /// well-behaved pipeline is `new` → `init_state` → `update_state*`,
+    /// and `init_state` returns `Err` on an uninitialised table. This
+    /// assertion converts what would otherwise be UB (from the
+    /// unchecked indexing in `read_entry`) into a clear fail-fast
+    /// panic that surfaces the API misuse immediately instead of
+    /// leaving the bitstream and decode state silently desynchronised.
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         // Public-API safety guard: `FSEDecoder::new` builds a decoder
         // with a zero-default `state` (Entry { new_state: 0, num_bits:
@@ -85,17 +97,24 @@ impl<'t> FSEDecoder<'t> {
         // populated. A caller that constructs the decoder and then
         // calls `update_state` BEFORE a successful `init_state` would
         // hit `read_entry(0)` → `get_unchecked(0)` on an empty
-        // `decode` vec — UB in release mode, since debug_assert is
-        // stripped. The well-behaved decode pipeline always pairs
-        // `new` → `init_state` → `update_state*`, so this branch is
-        // strongly biased "not taken" and the predictor amortises it
-        // to zero cost on the hot path. The corresponding
-        // `update_state_fast` is `pub(crate)` with controlled
-        // callers, so it relies on the documented precondition
-        // instead of paying for a per-call check.
-        if self.table.decode.is_empty() {
-            return;
-        }
+        // `decode` vec — UB in release mode, since `debug_assert!` is
+        // stripped. Fail-fast with `assert!` instead of silently
+        // returning so that misuse surfaces immediately rather than
+        // leaving the bitstream advanced by some bits but the decode
+        // state stuck at the zero-default Entry — a corruption mode
+        // that the caller has no way to diagnose. The well-behaved
+        // decode pipeline always pairs `new` → `init_state` →
+        // `update_state*`, so this branch is strongly biased "not
+        // taken" and the predictor amortises it to zero cost on the
+        // hot path. The corresponding `update_state_fast` is
+        // `pub(crate)` with controlled callers, so it relies on the
+        // documented precondition instead of paying for a per-call
+        // check.
+        assert!(
+            !self.table.decode.is_empty(),
+            "FSEDecoder::update_state called on an uninitialised table; \
+             call init_state successfully before any update_state* call",
+        );
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
