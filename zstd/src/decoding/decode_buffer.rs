@@ -359,6 +359,55 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Issue an L1 prefetch hint for the cache line that an upcoming
+    /// `repeat(offset, _)` (called one or more iterations later) will
+    /// read from. Used by the sequence decode pipeline to overlap
+    /// memory latency of long-distance match sources with the decode
+    /// of the next sequence.
+    ///
+    /// Caller should gate on `offset > L1_WORKING_SET` (~32 KiB) — for
+    /// smaller offsets the source bytes are already in L1 from recent
+    /// writes and the prefetch is wasted work (cache pollution on top of
+    /// instruction overhead). Cache-line granularity = 64 B; the prefetch
+    /// covers up to 4 lines (256 B) starting at the source position so a
+    /// short long-distance match still warms the kernel's working set.
+    ///
+    /// No-op (early return) when `offset` is zero or exceeds the current
+    /// buffer length — in either case the subsequent `repeat` will error
+    /// out and the prefetch would point at garbage memory.
+    ///
+    /// Distinct from the inline `prefetch_match_source_inline` hint
+    /// inside `repeat()` which fires AT copy time (zero head start, only
+    /// signals the HW prefetcher); this one is meant to be called with
+    /// `LOOKAHEAD >= 1` iteration of distance so the cache line arrives
+    /// before the load issues.
+    #[inline(always)]
+    pub(crate) fn prefetch_lookahead(&self, offset: usize) {
+        let buf_len = self.buffer.len();
+        if offset == 0 || offset > buf_len {
+            return;
+        }
+        let logical_idx = buf_len - offset;
+        let (s1, s2) = self.buffer.as_slices();
+        // The visible region is laid out as `s1` followed by `s2` in
+        // logical order. Position `logical_idx` falls into `s1` iff it
+        // is below `s1.len()`. Take a slice up to one cache-line worth
+        // and hand it to the platform prefetch primitive.
+        const PREFETCH_LEN: usize = 256;
+        let slice = if logical_idx < s1.len() {
+            let avail = s1.len() - logical_idx;
+            &s1[logical_idx..logical_idx + avail.min(PREFETCH_LEN)]
+        } else {
+            let idx_in_s2 = logical_idx - s1.len();
+            if idx_in_s2 >= s2.len() {
+                return;
+            }
+            let avail = s2.len() - idx_in_s2;
+            &s2[idx_in_s2..idx_in_s2 + avail.min(PREFETCH_LEN)]
+        };
+        prefetch::prefetch_slice(slice);
+    }
+
     #[inline(always)]
     fn byte_at(&self, idx: usize) -> u8 {
         let (s1, s2) = self.buffer.as_slices();
