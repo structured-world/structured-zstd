@@ -145,19 +145,111 @@ fn decompress_literals(
         let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
-        // Fast interleaved loop: decode 4 symbols/bit-counts via decode4 helper
-        // (which may use packed/SIMD gather+unpack kernels), then advance the
-        // 4 stream states independently. This gives the CPU's out-of-order
-        // engine more independent work to schedule, hiding decode latency.
-        enum Decode4Mode {
-            Unchecked,
-            Checked,
+        // Donor-style burst loop.
+        //
+        // bits[s] register (per stream) layout, MSB → LSB:
+        //   [ state (max_num_bits) | stream (≤ 64 - 2·max bits) | zeros + sentinel ]
+        //
+        // Our `decoder.state` is conceptually "the next max-bit
+        // lookahead window starting at the current consumption point";
+        // the stream bits that constitute it sit in `bit_container` at
+        // positions `[(64 - bits_consumed), (63 - bits_consumed + max))`
+        // BUT ONLY when `bits_consumed >= max_num_bits`. After a refill
+        // `bits_consumed` resets to `[0, 7]`, where those positions
+        // partially fall outside the current window — the formula then
+        // would lose low stream bits. Guard the burst by requiring
+        // `bits_consumed >= max_num_bits` on every stream; if any
+        // stream falls below, the tail loop runs single-symbol until
+        // the invariant is restored.
+        let max_num_bits = scratch.table.max_num_bits;
+        // symbols_per_burst * max ≤ 63 - max so the sentinel stays
+        // below the state region after the worst-case T-shift.
+        // For max=11: 4 symbols. For max=8: 6 symbols.
+        let symbols_per_burst: usize = (63 - max_num_bits as usize) / max_num_bits as usize;
+        let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
+        let burst_bits_isize = burst_bits as isize;
+        let table_shift = (64 - max_num_bits) as u32;
+        let state_shift = 64 - max_num_bits;
+        let packed = scratch.table.packed_decode.as_slice();
+
+        while symbols_per_burst >= 1
+            && brs[0].bits_remaining() > burst_bits_isize
+            && brs[1].bits_remaining() > burst_bits_isize
+            && brs[2].bits_remaining() > burst_bits_isize
+            && brs[3].bits_remaining() > burst_bits_isize
+            && cursors[0] + symbols_per_burst <= ends[0]
+            && cursors[1] + symbols_per_burst <= ends[1]
+            && cursors[2] + symbols_per_burst <= ends[2]
+            && cursors[3] + symbols_per_burst <= ends[3]
+            && brs[0].bits_consumed >= max_num_bits
+            && brs[1].bits_consumed >= max_num_bits
+            && brs[2].bits_consumed >= max_num_bits
+            && brs[3].bits_consumed >= max_num_bits
+            // Without an `ensure_bits` call inside the loop we must
+            // also confirm the burst fits inside the current
+            // `bit_container` (no refill in-flight). After consume,
+            // `bits_consumed + burst_bits ≤ 64` so the inner shifts
+            // never read past the loaded 8-byte window.
+            && (brs[0].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[1].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[2].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[3].bits_consumed as usize) + burst_bits as usize <= 64
+        {
+            let mut bits = [
+                (decoders[0].state << state_shift)
+                    | ((brs[0].bit_container << brs[0].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[1].state << state_shift)
+                    | ((brs[1].bit_container << brs[1].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[2].state << state_shift)
+                    | ((brs[2].bit_container << brs[2].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[3].state << state_shift)
+                    | ((brs[3].bit_container << brs[3].bits_consumed) >> max_num_bits)
+                    | 1,
+            ];
+
+            for _ in 0..symbols_per_burst {
+                let idx0 = (bits[0] >> table_shift) as usize;
+                let entry0 = packed[idx0];
+                target[cursors[0]] = (entry0 & 0xFF) as u8;
+                cursors[0] += 1;
+                bits[0] <<= (entry0 >> 8) & 0xFF;
+
+                let idx1 = (bits[1] >> table_shift) as usize;
+                let entry1 = packed[idx1];
+                target[cursors[1]] = (entry1 & 0xFF) as u8;
+                cursors[1] += 1;
+                bits[1] <<= (entry1 >> 8) & 0xFF;
+
+                let idx2 = (bits[2] >> table_shift) as usize;
+                let entry2 = packed[idx2];
+                target[cursors[2]] = (entry2 & 0xFF) as u8;
+                cursors[2] += 1;
+                bits[2] <<= (entry2 >> 8) & 0xFF;
+
+                let idx3 = (bits[3] >> table_shift) as usize;
+                let entry3 = packed[idx3];
+                target[cursors[3]] = (entry3 & 0xFF) as u8;
+                cursors[3] += 1;
+                bits[3] <<= (entry3 >> 8) & 0xFF;
+            }
+
+            for s in 0..4 {
+                let consumed = bits[s].trailing_zeros() as u8;
+                brs[s].bits_consumed += consumed;
+                decoders[s].state = bits[s] >> table_shift;
+            }
         }
-        let decode4_mode = if HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders) {
-            Decode4Mode::Unchecked
-        } else {
-            Decode4Mode::Checked
-        };
+
+        // SIMD 4-symbol main loop: runs when the donor burst gate
+        // (bits_consumed >= max_num_bits) is not satisfied, e.g.
+        // right after a refill rebases bits_consumed to [0, 7]. Uses
+        // the existing `decode4_symbols_and_num_bits` SIMD lookup +
+        // per-symbol `advance_state_by_bits` so the slow path still
+        // beats the single-symbol tail.
+        let decode4_unchecked = HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders);
         while brs[0].bits_remaining() > -max_bits
             && brs[1].bits_remaining() > -max_bits
             && brs[2].bits_remaining() > -max_bits
@@ -167,27 +259,24 @@ fn decompress_literals(
             && cursors[2] < ends[2]
             && cursors[3] < ends[3]
         {
-            let (symbols, bits) = match decode4_mode {
-                Decode4Mode::Unchecked => {
-                    // SAFETY: guarded by decode4_has_shared_table_and_kernel above.
-                    unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
-                }
-                Decode4Mode::Checked => HuffmanDecoder::decode4_symbols_and_num_bits(&decoders),
+            let (symbols, nbits) = if decode4_unchecked {
+                // SAFETY: same-table-and-kernel verified above.
+                unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
+            } else {
+                HuffmanDecoder::decode4_symbols_and_num_bits(&decoders)
             };
-
             target[cursors[0]] = symbols[0];
-            target[cursors[1]] = symbols[1];
-            target[cursors[2]] = symbols[2];
-            target[cursors[3]] = symbols[3];
             cursors[0] += 1;
+            target[cursors[1]] = symbols[1];
             cursors[1] += 1;
+            target[cursors[2]] = symbols[2];
             cursors[2] += 1;
+            target[cursors[3]] = symbols[3];
             cursors[3] += 1;
-
-            decoders[0].advance_state_by_bits(&mut brs[0], bits[0]);
-            decoders[1].advance_state_by_bits(&mut brs[1], bits[1]);
-            decoders[2].advance_state_by_bits(&mut brs[2], bits[2]);
-            decoders[3].advance_state_by_bits(&mut brs[3], bits[3]);
+            decoders[0].advance_state_by_bits(&mut brs[0], nbits[0]);
+            decoders[1].advance_state_by_bits(&mut brs[1], nbits[1]);
+            decoders[2].advance_state_by_bits(&mut brs[2], nbits[2]);
+            decoders[3].advance_state_by_bits(&mut brs[3], nbits[3]);
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
