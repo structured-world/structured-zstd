@@ -259,26 +259,39 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
             // Repcode match — backward extension by 1 if the byte
             // before ip0 also matches the byte before the rep source.
             //
-            // The window guard `(new_ip - 1 - rep_off) >= prefix_start`
-            // mirrors the explicit-match path's prefix bound. In the
-            // current single-block kernel it is provably redundant —
-            // the block-entry save/restore zeroes `rep_offset1`
-            // whenever `rep_offset1 > ip0 - prefix_start` at block
-            // start, and `anchor <= new_ip` keeps `new_ip - 1 >=
-            // anchor >= block_start`, so `new_ip - 1 - rep_off`
-            // can never dip below `prefix_start`. The explicit check
-            // exists for future call shapes (cross-block reuse,
-            // shared hash table) where `rep_off` could legitimately
-            // hit the `ip0 == prefix_start` boundary and the single
-            // extension byte would otherwise reach below the window.
-            // Costs a predicted-not-taken branch on the hot rep path.
+            // No explicit `(new_ip - 1 - rep_off) >= prefix_start`
+            // window guard here — mirrors donor's noDict rep path,
+            // which also omits it. Safety follows from two invariants
+            // the kernel maintains every iteration:
+            //
+            // 1. Block-entry save/restore (above) zeroes `rep_offset1`
+            //    whenever the incoming value exceeds
+            //    `ip0 - prefix_start_index` at block start, so any
+            //    surviving non-zero rep satisfies
+            //    `ip0_start - rep_offset1 >= prefix_start`.
+            //
+            // 2. The explicit-match path's backward extension uses a
+            //    STRICT `match_pos > prefix_start_index` bound when
+            //    it promotes a fresh offset into `rep_offset1`, so
+            //    `new_rep = ip0_promote - match_pos < ip0_promote -
+            //    prefix_start` (strict). At any later iteration
+            //    `ip0' > ip0_promote` and `rep_offset1` is unchanged,
+            //    so `ip0' - rep_offset1 >= prefix_start + 1`, i.e.
+            //    `(ip0' - 1) - rep_offset1 >= prefix_start`.
+            //
+            // Combined, every loop iteration that enters this branch
+            // already satisfies `new_ip - 1 - rep_off >=
+            // prefix_start`, so the extra check would be dead code on
+            // the hot path. If a future call shape weakens either
+            // invariant (e.g. shared hash table across resets without
+            // re-running save/restore) the explicit guard must be
+            // re-added — see the explicit-match path at the
+            // `match_pos > prefix_start_index` line for the
+            // structurally symmetric bound that proves it.
             let mut m_len: usize = 4;
             let rep_off = rep_offset1 as usize;
             let mut new_ip = ip0;
-            if new_ip > anchor
-                && new_ip > rep_off
-                && (new_ip - 1 - rep_off) >= prefix_start_index as usize
-                && data[new_ip - 1] == data[new_ip - 1 - rep_off]
+            if new_ip > anchor && new_ip > rep_off && data[new_ip - 1] == data[new_ip - 1 - rep_off]
             {
                 new_ip -= 1;
                 m_len += 1;
