@@ -9,13 +9,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Donor `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
-/// across all four `mls` instantiations: even though `mls >= 5` widens
-/// the hash to a `u64` reduction, the Fast strategy's per-level
-/// `hashLog` is sourced from the donor's `ZSTD_defaultCParameters`
-/// table where the maximum is `14` (level 1, `srcSize > 256 KB`), and
-/// the user-tunable upper bound is `30`. Enforcing this in the
-/// constructor catches misuse before the first `hash_ptr` would
-/// otherwise panic on the `(32 - hash_log)` / `(64 - hash_log)` shift.
+/// across all five `mls` instantiations (`mls ∈ {4, 5, 6, 7, 8}`): even
+/// though `mls >= 5` widens the hash to a `u64` reduction, the Fast
+/// strategy's per-level `hashLog` is sourced from the donor's
+/// `ZSTD_defaultCParameters` table where the maximum is `14` (level 1,
+/// `srcSize > 256 KB`), and the user-tunable upper bound is `30`.
+/// Enforcing this in the constructor catches misuse before the first
+/// `hash_ptr` would otherwise panic on the `(32 - hash_log)` /
+/// `(64 - hash_log)` shift.
 const ZSTD_HASHLOG_MAX: u32 = 30;
 
 /// Donor multiplicative hash constants — exact bit-for-bit match with
@@ -86,8 +87,36 @@ impl FastHashTable {
     /// Also panics if `mls` is outside `4..=8`.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
         validate_params(hash_log, mls);
+        // Per-target allocation feasibility: `1 << hash_log` u32 entries
+        // = `1 << (hash_log + 2)` bytes. On 32-bit hosts that overflows
+        // `usize` at `hash_log >= 30` (4 GiB exceeds the address space).
+        // `validate_params` already pins `hash_log <= ZSTD_HASHLOG_MAX
+        // = 30`, but on 32-bit the maximum that actually fits is `<=
+        // 29` (2 GiB) — anything larger panics deep inside `Vec::with_
+        // capacity` with a generic allocation message. Surface a clear
+        // panic at construction so the failure mode is obvious instead.
+        let entries = 1usize.checked_shl(hash_log).unwrap_or_else(|| {
+            panic!(
+                "FastHashTable cannot allocate 2^{hash_log} u32 entries on this target: \
+                 `1usize << {hash_log}` overflows {0}-bit usize",
+                usize::BITS,
+            )
+        });
+        let bytes = entries
+            .checked_mul(core::mem::size_of::<u32>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "FastHashTable cannot allocate {entries} u32 entries on this target: \
+                 byte size overflows {0}-bit usize",
+                    usize::BITS,
+                )
+            });
+        // Use `bytes` to compute as a tripwire — actual allocation
+        // still goes through `vec![]` so the global allocator picks
+        // the strategy (zeroed page mapping, etc.).
+        let _ = bytes;
         Self {
-            table: vec![0u32; 1usize << hash_log],
+            table: vec![0u32; entries],
             hash_log,
             mls,
         }

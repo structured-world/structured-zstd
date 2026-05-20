@@ -26,8 +26,14 @@ const SEARCH_STRENGTH: usize = 6;
 /// boundary check.
 const HASH_READ_SIZE: usize = 8;
 
-/// Donor's `MEM_read32(ptr)` — unaligned little-endian 4-byte load,
-/// used by the raw match probe at the hot path.
+/// Donor's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
+/// used by the raw match probe on the hot path. The result is only
+/// ever compared for equality against another `read32` of the same
+/// width on the same host, so the byte ordering does not matter — both
+/// sides experience the same endianness, and `a == b` holds iff the
+/// underlying byte sequences match. No `.to_le()` conversion is needed
+/// (donor's C `MEM_read32` is also implemented as a native-endian
+/// `memcpy` for the same reason).
 ///
 /// # Safety
 ///
@@ -142,12 +148,17 @@ pub(crate) struct FastBlockResult {
 /// kernel falls into the short-input early-return branch and emits no
 /// sequences, which may not be what the caller wanted.
 ///
-/// `data.len()` SHOULD be at least `HASH_READ_SIZE` (8) bytes longer
-/// than the caller wants to actually match against. The
-/// `ilimit = data.len() - HASH_READ_SIZE` cap ensures every hash/probe
-/// read stays in range; for the trailing 7 bytes the caller must
-/// emit them as literals (this is the kernel's `tail_literals_len`
-/// return value).
+/// `data.len()` SHOULD be at least `HASH_READ_SIZE` (8) bytes long.
+/// The `ilimit = data.len() - HASH_READ_SIZE` cap constrains where
+/// the main loop hashes and probes — i.e. it stops emitting new
+/// matches once `ip0 >= ilimit`. It does NOT mean the trailing 7
+/// bytes are ALWAYS literals: an in-progress forward match found at
+/// `ip0 < ilimit` extends through `count_forward` and can reach all
+/// the way to `iend`, leaving `tail_literals_len = 0`. The kernel
+/// reports the actual number of trailing literal bytes (zero or
+/// more) in `FastBlockResult.tail_literals_len`, and the caller
+/// emits a terminal `Sequence::Literals` only when that value is
+/// non-zero.
 ///
 /// # Sequence emission contract
 ///
@@ -175,14 +186,25 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
     debug_assert_eq!(MLS, hash_table.mls(), "MLS must match hash_table's mls");
-    // Real runtime checks (not debug_assert) — these prevent UB in
-    // release builds. `block_start > data.len()` would wrap
-    // `block_start + HASH_READ_SIZE` in the short-input guard below
-    // and proceed into the main loop with an out-of-bounds ip0.
-    // `data.len() > u32::MAX` would silently truncate position
-    // values when the kernel stores them into the u32 hash table or
-    // computes `offset = ip0 - match_pos` as a u32, corrupting both
-    // match indices and repcode history.
+    // Real runtime checks (not debug_assert) — both run in every
+    // build because they catch distinct failure modes:
+    //
+    // `block_start > data.len()` is a memory-safety risk: it would
+    // wrap `block_start + HASH_READ_SIZE` in the short-input guard
+    // below, skip the early return, and proceed into the main loop
+    // with an out-of-bounds ip0 → OOB read via `base.add(ip0)`.
+    //
+    // `data.len() > u32::MAX` is an algorithmic-correctness risk:
+    // the kernel stores absolute positions into a u32 hash table
+    // (`ip0 as u32`) and computes offsets as u32 (`offset as u32`).
+    // For inputs above 4 GiB the silent truncation would corrupt
+    // match indices and repcode offsets — every downstream pointer
+    // read still stays in-bounds (we re-bound by `data.len()`
+    // before any dereference), so it's not memory-unsafe, but the
+    // emitted sequences would reference wrong positions and the
+    // decoder would produce wrong output. Surfacing the bound at
+    // entry turns this into a loud assertion instead of silent
+    // miscompression.
     assert!(
         block_start <= data.len(),
         "block_start ({block_start}) must not exceed data.len() ({})",
@@ -698,29 +720,38 @@ mod tests {
         // prefix_start_index=5 blocks index 0.
         let _ = compress_block_fast::<4>(&data, 0, 5, &mut table, [0, 0], &mut handle);
 
-        // Every Triple emitted must reference a position ≥ 5, i.e.
-        // the offset must NOT exceed the distance from ip0 to the
-        // prefix start. With uniform data and prefix_start_index=5,
-        // legitimate matches first become possible around ip0=9 with
-        // offset ≤ 4 — none should be at offset=1 (the rejected stale
-        // candidate) or larger than ip0-5.
+        // Walk emitted sequences in order, tracking the running
+        // `anchor` cursor (which equals the start of the current
+        // emit's literal-run). For each Triple the match begins at
+        // `match_start = anchor + lits.len()` and references
+        // `match_start - offset`; that source position MUST be at or
+        // above `prefix_start_index = 5`. The simpler `off <= ip0`
+        // form fails for the second+ Triple — `lits.len()` only
+        // equals `ip0` for the first emit (when anchor still sits at
+        // block_start=0); a single-byte tracker keeps the bound
+        // correct across multiple emits.
+        let mut anchor: usize = 0;
         for (lits, off, m) in &tuples {
             if *m > 0 {
                 assert_ne!(
                     *off, 1,
                     "stale entry at index 0 must be filtered out by prefix_start_index=5",
                 );
-                // After a literals run the anchor advances by exactly
-                // `lits.len()` bytes (literals are written from
-                // `anchor..ip0`), so `ip0 == anchor + lits.len() ==
-                // lits.len()` here (anchor starts at 0).
-                let ip0 = lits.len();
-                // The offset must keep the match referent above prefix
-                // start.
+                let match_start = anchor + lits.len();
+                let match_src = match_start
+                    .checked_sub(*off)
+                    .expect("offset must not exceed match_start (would wrap)");
                 assert!(
-                    *off <= ip0,
-                    "match offset {off} would point below anchor {ip0}",
+                    match_src >= 5,
+                    "match source {match_src} below prefix_start_index=5 \
+                     (match_start={match_start}, offset={off})",
                 );
+                anchor = match_start + m;
+            } else {
+                // Pure-literals callback (currently never emitted by
+                // the kernel — kept defensive for future contract
+                // changes): advance anchor by the literal run length.
+                anchor += lits.len();
             }
         }
     }
