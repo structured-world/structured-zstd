@@ -40,9 +40,28 @@ impl FastHashTable {
     /// the first real input position to at least `1` so the sentinel
     /// can never be confused with a valid match (the donor achieves
     /// this via `ip0 += (ip0 == prefixStart)`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hash_log` is `0` or `≥ usize::BITS`. `0` would make
+    /// the `hash_ptr` reduction shift by the full word width (`32` for
+    /// mls=4, `64` for mls≥5), which is UB / panic in Rust. `≥
+    /// usize::BITS` makes `1usize << hash_log` overflow — on 32-bit
+    /// targets that's anything ≥ 32, on 64-bit targets anything ≥ 64.
+    /// Donor's `ZSTD_HASHLOG_MAX` is `30` so any sane caller stays in
+    /// `1..=30`; this assertion only catches outright misuse.
+    /// Also panics if `mls` is outside `4..=8`.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
-        debug_assert!(hash_log <= 32, "hash_log > 32 would overflow u32 indexing");
-        debug_assert!(
+        assert!(
+            hash_log > 0,
+            "hash_log must be > 0 (a zero log would make hash_ptr shift by the full word width)",
+        );
+        assert!(
+            hash_log < usize::BITS,
+            "hash_log {hash_log} >= usize::BITS {} would overflow `1usize << hash_log`",
+            usize::BITS,
+        );
+        assert!(
             (4..=8).contains(&mls),
             "ZSTD Fast strategy only supports mls 4..=8 (got {mls})",
         );

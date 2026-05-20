@@ -61,10 +61,19 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
         let b = unsafe { core::ptr::read_unaligned(m.cast::<u64>()) };
         let diff = a ^ b;
         if diff != 0 {
-            // Native-endian XOR — the byte ordering cancels out when
-            // we ask "how many low-order bytes are equal", since both
-            // operands were loaded with the same endianness.
+            // Donor's `ZSTD_NbCommonBytes` picks `__builtin_ctzll`
+            // on little-endian and `__builtin_clzll` on big-endian:
+            // both native-endian XOR loads put the first byte of
+            // the input in the LOW byte of the u64 on LE and the
+            // HIGH byte on BE, so "how many common low-order
+            // bytes" translates to `ctz/8` on LE and `clz/8` on BE.
+            // Without the cfg gate, BE targets would report the
+            // common-bytes count from the wrong end of `diff` and
+            // produce wrong match lengths.
+            #[cfg(target_endian = "little")]
             let common = (diff.trailing_zeros() / 8) as usize;
+            #[cfg(target_endian = "big")]
+            let common = (diff.leading_zeros() / 8) as usize;
             // SAFETY: `common < 8` (otherwise `diff == 0`), and the
             // caller's source range covers ≥ `common` more bytes (we
             // already verified the 8-byte chunk is in range).

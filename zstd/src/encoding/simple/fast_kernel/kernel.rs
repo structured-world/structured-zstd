@@ -104,6 +104,21 @@ pub(crate) struct FastBlockResult {
 /// for the trailing 7 bytes the caller must already have decided to
 /// emit them as literals (this is the kernel's `tail_literals_len`
 /// return value).
+///
+/// # Sequence emission contract
+///
+/// The kernel emits ONLY in-block sequences (literals + match
+/// pairs and pure-literal runs from anchor advances inside the
+/// main loop). It NEVER emits a terminal `Sequence::Literals`
+/// covering the trailing bytes from the last anchor to the end of
+/// `data` — those bytes are accounted for by
+/// `FastBlockResult.tail_literals_len`, and emitting them is the
+/// caller's responsibility. This rule applies UNIFORMLY across
+/// every exit branch, including the early-return short-input
+/// branch below; without this uniformity a caller wrapping the
+/// kernel's output would have to special-case "did the kernel
+/// already emit the tail" per branch, which is exactly the
+/// inconsistency this contract removes.
 #[inline(always)]
 pub(crate) fn compress_block_fast<const MLS: u32>(
     data: &[u8],
@@ -116,19 +131,16 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
     debug_assert_eq!(MLS, hash_table.mls(), "MLS must match hash_table's mls");
     debug_assert!(block_start <= data.len(), "block_start past data end",);
 
-    // Block too short to do any matching — emit the whole tail as
-    // literals. Donor falls into the `_cleanup` path with `anchor =
-    // istart`, returning `iend - anchor`.
+    // Block too short to do any matching — report the whole block
+    // as trailing literals without emitting anything. Donor mirrors
+    // the same shape via the `_cleanup` path (`anchor = istart`,
+    // returns `iend - anchor`). The caller emits the
+    // `Sequence::Literals` wrapper per the contract above; we don't
+    // double-emit here.
     if data.len() < block_start + HASH_READ_SIZE {
-        let tail_literals_len = data.len() - block_start;
-        if tail_literals_len > 0 {
-            handle_sequence(Sequence::Literals {
-                literals: &data[block_start..],
-            });
-        }
         return FastBlockResult {
             rep,
-            tail_literals_len: 0,
+            tail_literals_len: data.len() - block_start,
         };
     }
 
@@ -336,90 +348,91 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
 
-    #[allow(dead_code)]
-    fn run_block<'a>(data: &'a [u8], hash_log: u32, mls: u32) -> Vec<Sequence<'a>> {
+    /// Capture every emitted sequence as `(literals_bytes, offset,
+    /// match_len)` plus the final `FastBlockResult` so each test can
+    /// assert byte-level accounting and the actual match decisions
+    /// without fighting the borrow checker over `Sequence<'_>`
+    /// lifetimes (a `Sequence` borrow lives only as long as the
+    /// closure scope; cloning the literal bytes into the tuple
+    /// detaches the capture from that lifetime).
+    fn run_block(
+        data: &[u8],
+        hash_log: u32,
+        mls: u32,
+    ) -> (Vec<(Vec<u8>, usize, usize)>, FastBlockResult) {
         let mut table = FastHashTable::new(hash_log, mls);
-        let mut seqs: Vec<Sequence<'a>> = Vec::new();
-        // For the test runner we collect with a `'static` lifetime by
-        // re-borrowing. Simpler: just emit `(literals_len, offset,
-        // match_len)` tuples — but since `Sequence::Literals`/`Triple`
-        // borrow `data`, the lifetime check forces the `Vec` and
-        // closure to share a scope. Use a `Vec<(Vec<u8>, usize,
-        // usize)>` instead.
         let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                tuples.push((literals.to_vec(), offset, match_len));
+            }
+            Sequence::Literals { literals } => {
+                tuples.push((literals.to_vec(), 0, 0));
+            }
+        };
         let result = match mls {
-            4 => compress_block_fast::<4>(data, 0, 0, &mut table, [0, 0], |seq| match seq {
-                Sequence::Triple {
-                    literals,
-                    offset,
-                    match_len,
-                } => {
-                    tuples.push((literals.to_vec(), offset, match_len));
-                }
-                Sequence::Literals { literals } => {
-                    tuples.push((literals.to_vec(), 0, 0));
-                }
-            }),
-            5 => compress_block_fast::<5>(data, 0, 0, &mut table, [0, 0], |seq| match seq {
-                Sequence::Triple {
-                    literals,
-                    offset,
-                    match_len,
-                } => {
-                    tuples.push((literals.to_vec(), offset, match_len));
-                }
-                Sequence::Literals { literals } => {
-                    tuples.push((literals.to_vec(), 0, 0));
-                }
-            }),
+            4 => compress_block_fast::<4>(data, 0, 0, &mut table, [0, 0], &mut handle),
+            5 => compress_block_fast::<5>(data, 0, 0, &mut table, [0, 0], &mut handle),
             _ => panic!("test helper only supports mls=4 and mls=5"),
         };
-        // Verify the total bytes account for the entire input:
-        // sum(literals_len) + sum(match_len) + tail_literals_len ==
-        // data.len(). This catches off-by-ones in the kernel that
-        // would otherwise produce a corrupt stream.
+        // Accounting invariant: literals + matches + tail == input.
         let acct: usize = tuples
             .iter()
             .map(|(lits, _off, mlen)| lits.len() + mlen)
             .sum::<usize>()
             + result.tail_literals_len;
         assert_eq!(acct, data.len(), "kernel must account for every input byte",);
-        seqs.clear();
-        // Convert the tuples back into Sequence-shaped values just so
-        // the caller can pattern-match. Use the original `data` for
-        // the borrow.
-        let _ = tuples;
-        seqs
+        (tuples, result)
     }
 
     /// Tail-too-small case: input ≤ HASH_READ_SIZE produces zero
-    /// match sequences and the entire input is the tail literals.
+    /// sequence emissions; the kernel reports the whole block as
+    /// `tail_literals_len` and the caller is expected to wrap it in
+    /// the terminal `Sequence::Literals`.
     #[test]
-    fn short_input_emits_only_tail_literals() {
+    fn short_input_reports_tail_without_emission() {
         let data = [1u8, 2, 3, 4, 5];
-        let mut table = FastHashTable::new(8, 4);
-        let mut count = 0;
-        let result = compress_block_fast::<4>(&data, 0, 0, &mut table, [0, 0], |seq| match seq {
-            Sequence::Literals { literals } => {
-                assert_eq!(literals, &data[..]);
-                count += 1;
-            }
-            Sequence::Triple { .. } => panic!("no Triple expected on short input"),
-        });
-        assert_eq!(count, 1, "exactly one Literals sequence emitted");
-        assert_eq!(result.tail_literals_len, 0);
+        let (tuples, result) = run_block(&data, 8, 4);
+        assert!(
+            tuples.is_empty(),
+            "kernel must NOT emit sequences for short inputs (got {tuples:?})",
+        );
+        assert_eq!(result.tail_literals_len, data.len());
     }
 
     /// Repeated pattern with a clear long match — the kernel should
-    /// detect it and emit one Triple covering the repeated suffix.
+    /// detect it and emit at least one Triple. Verifies via the
+    /// captured tuples that an actual match was produced (`match_len
+    /// >= MIN_MATCH=4`, non-zero offset).
     #[test]
     fn finds_long_repeat_in_simple_pattern() {
-        // First half is a distinct prefix; second half repeats the
-        // first half verbatim. The kernel should match the second
-        // half against the first.
         let mut data = Vec::new();
         data.extend_from_slice(b"ABCDEFGHIJKLMNOP");
         data.extend_from_slice(b"ABCDEFGHIJKLMNOP");
-        let _ = run_block(&data, 8, 4);
+        // Need ≥ 8 trailing bytes past the last match position so
+        // `ilimit = data.len() - HASH_READ_SIZE` keeps the inner
+        // loop active long enough to scan the repeated second half.
+        // Pad with distinct bytes to keep the kernel out of any
+        // extra repcode branches.
+        data.extend_from_slice(b"________");
+        let (tuples, _result) = run_block(&data, 12, 4);
+        let triple = tuples
+            .iter()
+            .find(|(_, _, m)| *m > 0)
+            .expect("kernel must emit at least one Triple for the repeated half");
+        assert!(
+            triple.2 >= 4,
+            "match_len must be ≥ MIN_MATCH=4 (got {})",
+            triple.2,
+        );
+        assert!(
+            triple.1 > 0,
+            "explicit-offset match must have offset > 0 (got {})",
+            triple.1,
+        );
     }
 }
