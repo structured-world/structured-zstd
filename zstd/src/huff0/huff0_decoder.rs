@@ -128,6 +128,12 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
 
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
+    /// Read by `decode_symbol_and_advance` (x86 BMI2 dispatch) and by
+    /// `decode4_symbols_and_num_bits_for_kernel` (SIMD fallback in
+    /// `literals_section_decoder::decode_literals` when the donor
+    /// burst is gated out post-refill). The donor burst itself
+    /// bypasses kernel dispatch by indexing
+    /// `HuffmanTable::packed_decode` directly.
     kernel: HuffmanDecodeKernel,
     /// State is used to index into the table.
     pub state: u64,
@@ -547,7 +553,13 @@ impl<'t> HuffmanDecoder<'t> {
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
-    packed_decode: Vec<u32>,
+    /// Packed `symbol | (num_bits << 8)` per state index, exposed
+    /// `pub(crate)` because the HUF 4-stream burst hot path in
+    /// `literals_section_decoder::decode_literals` indexes it
+    /// directly (`packed_decode[idx]`) for a single-load table lookup
+    /// matching donor `huf_decompress.c:dtable[index]` — bypassing the
+    /// kernel-dispatch path used by SIMD fallback.
+    pub(crate) packed_decode: Vec<u32>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
