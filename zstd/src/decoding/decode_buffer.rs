@@ -322,38 +322,40 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             return;
         }
 
-        // offset ∈ {3, 5, 6, 7}: the period does NOT divide 16, so each
-        // 16-byte window starts at a different sub-position of the
-        // repeating pattern. Pre-build all `offset` phase-shifted
-        // 16-byte windows and index by the current phase; advancing the
-        // cursor by 16 bytes shifts the phase by `16 % offset`. This
-        // keeps the inner-loop store at 16 bytes (same throughput as
-        // the divides-16 fast path), trading a 7×16 = 112-byte stack
-        // buffer + one modulo-by-small-constant for the doubled width
-        // vs the previous 8-byte phase pattern.
+        // offset ∈ {3, 5, 6, 7}: 8-byte phase-pattern path. Each phase
+        // is the 8-byte view of the repeating period starting at that
+        // sub-position; advancing the cursor by 8 bytes shifts the
+        // phase by `8 % offset` (mod offset).
         //
-        // LCM(offset, 16) = 48 / 80 / 48 / 112 bytes for offset
-        // ∈ {3, 5, 6, 7}; the phase cycles through every `offset` 16-
-        // byte stores so the steady-state period equals the LCM.
-        let mut phase_patterns_16 = [[0u8; 16]; 7];
+        // A 16-byte version (LCM(offset, 16) ∈ {48, 80, 48, 112}) was
+        // measured on Intel i9-9900K — the doubled inner-loop store
+        // width was offset by a 7×16 = 112-byte phase-pattern setup
+        // cost (2× the 8-byte setup). On `decodecorpus-z000033`
+        // short-offset matches are short enough that setup dominates
+        // total cost, so the 16-byte version was a net regression on
+        // every level except `level_1_fast` (where it broke even). The
+        // 8-byte path retained here keeps the setup small (7×8 = 56 B)
+        // and is the fastest measured option for these offsets on
+        // realistic input.
+        let mut phase_patterns = [[0u8; 8]; 7];
         for phase in 0..offset {
-            for i in 0..16 {
-                phase_patterns_16[phase][i] = base[(phase + i) % offset];
+            for i in 0..8 {
+                phase_patterns[phase][i] = base[(phase + i) % offset];
             }
         }
 
-        let phase_step = 16 % offset;
+        let phase_step = 8 % offset;
         let mut phase = 0usize;
         let mut copied = 0usize;
-        while copied + 16 <= match_length {
-            self.buffer.extend(&phase_patterns_16[phase]);
-            copied += 16;
+        while copied + 8 <= match_length {
+            self.buffer.extend(&phase_patterns[phase]);
+            copied += 8;
             phase = (phase + phase_step) % offset;
         }
 
         if copied < match_length {
             let tail = match_length - copied;
-            self.buffer.extend(&phase_patterns_16[phase][..tail]);
+            self.buffer.extend(&phase_patterns[phase][..tail]);
         }
     }
 
