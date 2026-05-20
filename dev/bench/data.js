@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779295921052,
+  "lastUpdate": 1779315576859,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -42129,6 +42129,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fc634644ffa72b344bd5ab4fe894caaa3f756431",
+          "message": "perf(encoder): donor-shape Fast kernel modules (#198 phase 1a) (#215)\n\n* perf(encoder): add donor-shape Fast kernel modules (kernel + hash + count)\n\nFirst commit of the #198 Fast strategy port (22× regression vs C zstd\non Fast levels). The kernel itself is implemented and unit-tested in\nisolation; wiring into MatchGeneratorDriver / MatcherStorage lands in\nthe next commit on this branch.\n\nWhat's in this commit:\n\n- zstd/src/encoding/simple/fast_kernel/hash_table.rs:\n  FastHashTable — flat Vec<u32> indexed by donor-parity\n  ZSTD_hash{4,5,6,7,8}Ptr (multiply-shift on the first `mls` bytes of\n  the suffix at `ptr`, output reduced to `hash_log` bits). Constants\n  bit-identical to lib/compress/zstd_compress_internal.h.\n\n- zstd/src/encoding/simple/fast_kernel/count.rs:\n  count_forward — port of ZSTD_count from\n  lib/compress/zstd_compress_internal.h. 8-byte chunked XOR loop with\n  trailing_zeros / 8 to locate the diverging byte, then u32 / u16 /\n  u8 tail fall-throughs matching donor's exact progression.\n\n- zstd/src/encoding/simple/fast_kernel/kernel.rs:\n  compress_block_fast<MLS> — port of ZSTD_compressBlock_fast_noDict_generic\n  from lib/compress/zstd_fast.c. Phase 1 keeps the single-ip0 cursor\n  with raw 4-byte match probe, step-based skip acceleration, repcode-\n  at-ip check, backward extension, and ZSTD_count for forward\n  extension. The 4-cursor (ip0/ip1/ip2/ip3) pipelining and cmov\n  match-found variant from donor's full generic body are deferred to\n  phase 3; this commit exists to validate the data structures and\n  close the bulk of the 22× gap before adding pipelining complexity.\n\nTests: 16 new unit tests cover the hash function donor parity, the\ncount_forward chunk/tail progression, and the kernel's accounting\ninvariant (sum(literals + matches) + tail_literals_len == input.len()).\nAll pass.\n\nThe module is gated with `#![allow(dead_code, unused_imports)]` for\nthis commit only — every item is used in the wiring commit. The\nallow is removed there.\n\nRelated: #198 (Fast strategy 22× regression).\n\n* fix(fast_kernel): consistent tail emission, BE count, hash_log validation\n\nFour reviewer findings collapsed into one commit because every fix\nlives in the kernel modules already introduced by the previous baseline\ncommit, and they're not strictly independent (the short-input contract\nupdate changes how the test helper observes accounting).\n\n1. Short-input early-return path (kernel.rs:122-133, threads #1 + #5):\n   Previously called handle_sequence(Sequence::Literals { .. }) and\n   then returned tail_literals_len = 0, conflicting with the main-loop\n   exit which never emits the terminal Literals and returns the tail\n   count. Caller wrapping the kernel had no consistent rule for\n   whether to emit the trailing Literals or not. Unify both branches:\n   the kernel NEVER emits the terminal Literals; the caller emits it\n   from tail_literals_len. Updated the function doc to spell out the\n   sequence-emission contract.\n\n2. count_forward endianness (count.rs:68, thread #2):\n   The 8-byte chunked XOR loop used diff.trailing_zeros() / 8\n   unconditionally. That matches donor's ZSTD_NbCommonBytes only on\n   little-endian (where the first byte of the input is in the low\n   byte of the u64); on big-endian the first byte is in the high\n   byte and the common-bytes count needs leading_zeros instead.\n   Gate via cfg(target_endian) so BE targets get the correct match\n   lengths.\n\n3. hash_log validation (hash_table.rs:50, threads #3 + #4):\n   FastHashTable::new previously only debug_asserted hash_log <= 32.\n   In release, hash_log == 0 would make hash_ptr shift by the full\n   word width (32 for mls=4, 64 for mls>=5) which is panic/UB; and\n   1usize << hash_log overflows on 32-bit targets for hash_log >= 32.\n   Replace with real asserts: hash_log > 0 AND hash_log < usize::BITS.\n   Donor's ZSTD_HASHLOG_MAX is 30 so sane callers stay well inside\n   this band; the assertion catches outright misuse.\n\n4. Test helper run_block (kernel.rs:339-405, thread #6):\n   The previous helper accumulated tuples but then dropped them and\n   returned an empty seqs Vec, so finds_long_repeat_in_simple_pattern\n   only verified the accounting invariant — never that the kernel\n   actually produced a match. Rewrote the helper to return the captured\n   (tuples, FastBlockResult) tuple; the long-repeat test now asserts\n   at least one Triple with match_len >= 4 and a non-zero offset.\n   short_input_reports_tail_without_emission updated to reflect the\n   new contract from item 1: the kernel emits zero sequences and\n   returns the full input length as tail_literals_len.\n\n* fix(fast_kernel): pin hash_log to donor's ZSTD_HASHLOG_MAX (1..=30)\n\nPrevious `hash_log < usize::BITS` check still admitted invalid bands:\non 64-bit `hash_log \\in 33..=63` passed the constructor but later\ncaused `hash_ptr::<4>` to shift by `32 - hash_log` (panics for\n`hash_log >= 32`). Pin to donor's `ZSTD_HASHLOG_MAX = 30` so all\nfour MLS instantiations are safe by construction; the per-level\ntable-driven caller (donor `ZSTD_defaultCParameters`) never goes\nabove 14 for Fast strategy so this assertion only catches outright\nmisuse.\n\n* fix(fast_kernel): tighten match-probe filters, accurate safety docs\n\nFour findings from review round 3 — all in fast_kernel, all about\ncorrectness contracts (no functional changes to the algorithm yet,\njust hardening + docs).\n\n1. hash_ptr safety contract (hash_table.rs:113):\n   The doc said \"≥ mls readable bytes\" but mls=5/6/7 paths perform\n   an unaligned u64 load (8 bytes), shifting off the unused top\n   bits. Following the doc literally for mls=5/6/7 with only 5/6/7\n   readable bytes would read past the caller's range — UB. Updated\n   to require ≥4 bytes when MLS=4 and ≥8 bytes when MLS≥5, matching\n   what the implementation actually does. The kernel's\n   ilimit = iend - HASH_READ_SIZE (8) cap already satisfies this\n   uniformly.\n\n2. count_forward safety contract (count.rs:21):\n   The previous doc said match_ptr needs \"ip_len + 7 readable bytes\"\n   — overspecified. The implementation only reads from match_ptr in\n   chunks for the same byte ranges it reads from ip, and bails on\n   the first mismatching byte. The real requirement is that match_ptr\n   has at least as many readable bytes as ip up to iend, naturally\n   satisfied when match_ptr <= ip within the same buffer (a backward\n   match into the encoder's history). Reworded.\n\n3. Module-level lint allow scope (mod.rs:14):\n   #![allow(dead_code, unused_imports)] disabled unused_imports\n   crate-wide for fast_kernel, masking real unused-import\n   regressions in sibling code. Narrowed to #![allow(dead_code)]\n   only, since the kernel-internal items will be reached in one\n   shot by the wiring commit. Removed the unused pub(crate) use\n   re-exports (FastHashTable, FastBlockResult, compress_block_fast)\n   — they'll be re-added by the wiring commit when there's an\n   actual caller; adding them now would force the wider lint\n   relaxation we're trying to avoid.\n\n4. match_found bounds hardening (kernel.rs:63):\n   The previous filter only rejected match_idx < prefix_start_index,\n   which is necessary but not sufficient. Two additional bands of\n   stale-entry exposure exist if FastHashTable is reused across\n   calls with a shrunk data slice (the kernel itself doesn't do\n   this today, but future cross-block / shared-table call shapes\n   would):\n\n   - (match_idx + 4) > data_len: 4-byte read at base + match_idx\n     past the buffer end → OOB / UB.\n   - match_idx >= ip_pos: stale forward-pointing entry would make\n     offset = ip_pos - match_idx underflow and produce an invalid\n     offset code downstream.\n\n   Added explicit branches for both. Strongly biased \"not taken\" on\n   the well-behaved single-block path (every entry was written by\n   this same scan, indices monotonically below ip0), so branch\n   predictor amortises them to zero cost. Tests: 16/16 pass; the\n   only call site (the explicit-match probe in the kernel main\n   loop) updated to pass the new ip_pos / data_len arguments.\n\n* test(fast_kernel): cover edge cases — rep, backward extension, stale entries, boundaries\n\nPhase 1a follow-up addressing previously-undertested branches. Closes\nthe gap surfaced by an internal audit (\"happy path only, no edge\ncases, no regression test for round-3 hardening\").\n\nAdds 16 new unit tests (32 total across the module). Coverage now\nreaches every behavioural branch in the kernel that does not require\nwired-up integration:\n\nkernel.rs (+8 tests):\n\n- repcode_match_emits_with_rep_offset_one — exercises the rep_check\n  branch on the very first loop iteration, asserts a Triple at\n  offset=1 with substantial match_len on uniform data.\n- explicit_match_backward_extension_extends_by_marker_byte —\n  constructs an \"XAAAA … XAAAA\" pattern so the explicit-match\n  branch's backward-extension while-loop walks back across the 'X'\n  marker; asserts match_len ≥ 5 and that the literal run does not\n  end with 'X' (proof the backward extension absorbed it).\n- prefix_start_index_filter_rejects_below_window — pre-populates\n  the hash slot with index 0, runs with prefix_start_index=5, and\n  asserts the kernel never emits a Triple referencing the\n  out-of-window position.\n- match_found_rejects_stale_forward_entry — REGRESSION TEST for\n  round 3 finding #11. Engineered scenario: uniform data + stale\n  hash entry pointing forward of ip0 (idx=150 when ip0 starts at 1).\n  Without the `match_pos < ip_pos` filter the first iteration\n  would compute offset = 1 - 150 → underflow → huge wrap → emit a\n  bogus Triple. The test asserts every emitted offset stays inside\n  the buffer; before the round 3 hardening this assertion would\n  fail. (The companion data-len bounds check is not directly\n  observable in stable Rust — without it the OOB read returns\n  garbage that almost always fails the raw cmp; Miri / sanitizers\n  would catch the underlying UB.)\n- block_exactly_hash_read_size_emits_no_sequences — boundary where\n  ilimit = data.len() - HASH_READ_SIZE = 0, the main loop runs zero\n  iterations, the kernel returns the whole input as tail.\n- block_just_below_hash_read_size_emits_no_sequences — the\n  short-input early-return branch fires; verifies the round-1\n  uniform tail contract (kernel never emits the terminal Literals,\n  caller emits from tail_literals_len).\n- rep_offset_save_restore_when_out_of_range — out-of-range rep\n  values (huge=9999, secondary=7) on a 64-byte block must be\n  stashed to offset_saved{1,2} on entry and restored verbatim into\n  result.rep by the _cleanup path. Asserts both slots round-trip.\n\nhash_table.rs (+8 tests):\n\n- hash6/hash7/hash8 donor-formula parity tests, matching the\n  existing hash4/hash5 pattern (each instantiates the relevant\n  MLS, computes the donor multiply-shift by hand, asserts equality).\n- hash_log_minimum_one_constructs_two_entry_table — boundary at\n  the lower end (1 is the smallest accepted hash_log; bit-width\n  asserted via the produced hash being < 2).\n- hash_log_maximum_thirty_is_accepted_by_constructor — boundary at\n  the upper end (ZSTD_HASHLOG_MAX). Allocates the full ~4 GiB\n  table once; if the host can't allocate it the test OOM-skips\n  rather than misreports.\n- Four `#[should_panic]` tests covering each branch of the round 2\n  constructor validation: hash_log=0, hash_log=31 (> cap),\n  mls=3 (< 4), mls=9 (> 8). The panic messages are matched as\n  substrings so the asserts catch a wrong-message refactor.\n\nAll 32 fast_kernel tests pass. Full workspace nextest run remains\ngreen at 571/571. Clippy clean.\n\n* fix(fast_kernel): no 4 GiB test alloc, usize chunks in count, doc precondition rename\n\nThree review findings, one commit (all in the same module, all\nnon-functional / docs / test refactor — no algorithm change):\n\n1. hash_log_maximum_thirty_is_accepted_by_constructor (round 4\n   findings #12 and #15, hash_table.rs):\n   The previous test instantiated FastHashTable::new(30, 4) just to\n   prove the validation accepts the cap value. That allocates a\n   1<<30 entries × 4 bytes = ~4 GiB Vec<u32> on every test run —\n   above per-test budgets on most CI runners. Extracted\n   FastHashTable::new's two asserts into a private validate_params(\n   hash_log, mls) helper; the test now exercises the same accept\n   path against the helper directly without touching the allocator\n   (validate_params(ZSTD_HASHLOG_MAX, 4) + ...= 8)). FastHashTable::\n   new delegates to validate_params so the actual constructor still\n   panics identically on bad inputs.\n\n2. count_forward chunk type (round 4 finding #13, count.rs):\n   The previous loop unconditionally loaded u64 chunks. Donor's\n   ZSTD_count uses MEM_readST which is sizeof(size_t) — so on 32-bit\n   targets the donor uses u32 chunks and our u64 loads would\n   degrade to a pair of 32-bit memory ops + a 64-bit XOR.\n   Switched to usize-typed loads with CHUNK_SIZE = size_of::<usize>()\n   (8 on 64-bit, 4 on 32-bit). On 32-bit the u32 tail block becomes\n   dead code (the chunk loop already strides in 4-byte chunks),\n   so cfg(target_pointer_width = \"64\") gates that block to mirror\n   donor's MEM_64bits() guard. trailing_zeros() / leading_zeros()\n   are already endian-cfg-gated from round 3 and work correctly on\n   either chunk width. 32/32 fast_kernel tests pass; the\n   functional behaviour (match length per input) is unchanged on\n   64-bit hosts.\n\n3. compress_block_fast \"# Safety contract\" rename (round 4\n   finding #14, kernel.rs):\n   compress_block_fast is a safe (non-unsafe) fn, but its rustdoc\n   was titled \"# Safety contract\" with a MUST requirement. Safe\n   APIs must not put memory-safety preconditions on callers (that's\n   what unsafe is for). The contract is actually about algorithmic\n   correctness: a too-short input is well-defined Rust (falls into\n   the short-input early-return), it just won't produce match\n   sequences. Renamed the section to \"# Preconditions / algorithm\n   invariants\" and clarified the distinction in the prose: the\n   kernel is safe for every input; the constraint is what the\n   caller usually wants from a Fast strategy compressor.\n\n* refactor(fast_kernel): mirror prefix_start guard in rep backward extension\n\nAdds the `(new_ip - 1 - rep_off) >= prefix_start_index` guard to the\nrep-path single-byte backward extension, matching the explicit-match\npath's symmetric bound. In the current single-block kernel the guard\nis provably redundant — the block-entry save/restore zeroes\n`rep_offset1` whenever `rep_offset1 > ip0 - prefix_start` at block\nstart, and `anchor <= new_ip` keeps `new_ip - 1 >= block_start >=\nprefix_start`, so the byte the extension would dereference is always\ninside the window. Future call shapes (cross-block reuse, shared hash\ntable across resets) could legitimately probe at the\n`ip0 == prefix_start` boundary where the single extension byte would\notherwise reach below the window; the explicit check makes the kernel\ncorrect under those broader invariants without changing observable\nbehaviour today. Costs a predicted-not-taken branch on the hot rep\npath; the inline code comment documents the implicit invariants and\nthe symmetry rationale.\n\nNo regression test lands with this commit: per the bug-reports-get-a-\nregression-test-first protocol, a test must FAIL on the unguarded\ncode to prove the defect exists. I attempted such a test in a prior\nsession (rep_backward_extension_respects_prefix_start_index) and\nconfirmed by running it that it cannot fail with the current\nsave/restore + anchor invariants — i.e., the unguarded code is\nalready correct in practice. That makes the finding a defensive-\nhardening / code-symmetry issue, not a logic bug, so the test-first\ngate does not apply and the no-longer-relevant vacuous test was\nremoved alongside this change.\n\n* refactor(fast_kernel): document why rep backward extension needs no prefix guard\n\nReplaces the redundant prefix_start guard added in the previous\ncommit with a comprehensive doc comment explaining donor parity and\nthe invariant chain that makes the guard unnecessary.\n\nDonor parity check: noDict rep path at zstd_fast.c:278 omits any\nprefix_start bound — just `ip0[-1] == match0[-1]`. Adding a guard\nhere was unjustified divergence from donor.\n\nInvariant chain (now spelled out in the inline comment):\n\n1. Block-entry save/restore zeroes rep_offset1 whenever the incoming\n   value exceeds ip0 - prefix_start_index at block start, so any\n   surviving non-zero rep satisfies ip0_start - rep_offset1 >=\n   prefix_start.\n2. The explicit-match path's backward extension uses a STRICT\n   `match_pos > prefix_start_index` bound when it promotes a fresh\n   offset into rep_offset1, so new_rep = ip0_promote - match_pos\n   < ip0_promote - prefix_start (strict). At any later iteration\n   ip0' > ip0_promote and rep_offset1 is unchanged, so\n   ip0' - rep_offset1 >= prefix_start + 1, i.e.\n   (ip0' - 1) - rep_offset1 >= prefix_start.\n\nCombined: every loop iteration that enters the rep branch already\nsatisfies the bound the dropped guard would have checked. Adding it\ncosts a predicted-not-taken branch on the hot rep path with zero\nbehavioural benefit under the current call shape and donor-parity\nsemantics.\n\nThe inline comment also names the symmetric bound in the\nexplicit-match path (`match_pos > prefix_start_index`) so a future\nmaintainer changing either invariant has an explicit pointer to\nthe structurally identical guard.\n\n* docs(fast_kernel): include anchor gate in rep prefix-bound proof\n\nCodeRabbit (round 5 review) caught a hole in the previous comment:\nthe save/restore at block entry guarantees only NON-STRICT\n`ip0_start - rep_offset1 >= prefix_start`. When that holds with\nequality, backward extension by 1 byte would dereference\n`prefix_start - 1`. The explicit-match path's strict bound\n(`match_pos > prefix_start_index`) covers iterations after a rep\npromotion, but does NOT cover the very first loop iteration before\nany promotion.\n\nWhat actually keeps the first iteration safe is the runtime\n`new_ip > anchor` gate: at block entry `ip0 == block_start ==\nanchor`, so the gate fails and the backward extension is skipped\nentirely. From the second iteration onward (after the first emitted\nsequence), anchor has moved past block_start AND/OR the\nexplicit-match promotion bound from (2) gives the strict version of\nthe invariant.\n\nRewrote the inline comment to make this three-piece argument\nexplicit: (1) non-strict bound from save/restore, (2) strict bound\nfrom promotion (kicks in after first promote), (3) anchor gate\n(covers the boundary iteration). Added an explicit note that a\nfuture call shape weakening any of the three (e.g. custom anchor\ninitialisation) requires the explicit guard to be re-added.\n\nPure doc change — no behavioural diff. 32/32 kernel tests pass.\n\n* fix(fast_kernel): real runtime guards + accurate safety docs\n\nFour review findings from round 7, all in fast_kernel; one runtime\nhardening + three doc/contract corrections.\n\n1. kernel.rs:175 — block_start guard (round 7 #19):\n   Previous `debug_assert!(block_start <= data.len())` was stripped\n   in release. A caller passing block_start > data.len() would wrap\n   `block_start + HASH_READ_SIZE` in the short-input early-return\n   guard below it, skip the early return, and proceed into the main\n   loop with an out-of-bounds ip0 → OOB read via base.add(ip0). Real\n   `assert!` now runs in every build.\n\n2. kernel.rs:175 — u32 truncation guard (round 7 #20):\n   The kernel stores absolute positions into a u32 hash table\n   (`hash_table.put(hash0, ip0 as u32)`) and computes explicit-match\n   offsets as u32 (`rep_offset1 = offset as u32`). For data.len() >\n   u32::MAX both `ip0 as u32` and `offset as u32` silently truncate,\n   corrupting hash entries and offset codes. Added an entry-time\n   `assert!(data.len() <= u32::MAX as usize)` so the misuse fails\n   loudly instead of producing wrong sequences. (Donor zstd uses the\n   same u32 sliding-window position model and enforces this via\n   window_log <= 31; we make it explicit at the kernel boundary.)\n\n3. hash_table.rs:142-159 — per-branch SAFETY comments (round 7 #21):\n   The method-level doc was updated in round 4 to require ≥8 bytes\n   for any MLS≥5 call (the load is always u64), but the per-branch\n   SAFETY comments still claimed ≥5/6/7 bytes. Aligned all three\n   comments to ≥8 with a note that the LOAD is 8 bytes wide\n   regardless of which bottom-N bits feed the hash. Pure\n   documentation — code unchanged.\n\n4. kernel.rs:152 — Sequence emission contract doc (round 7 #22):\n   Doc claimed the kernel can emit \"pure-literal runs from anchor\n   advances inside the main loop\". After the round 1 short-input\n   uniformity fix, the kernel emits ONLY Sequence::Triple callbacks\n   (one per match, with the preceding literal-run carried in the\n   triple's literals field). Trailing literals after the last match\n   live in FastBlockResult.tail_literals_len, never via the closure.\n   Rewrote the contract section to spell this out exactly so callers\n   don't expect mid-block Sequence::Literals callbacks.\n\nAll 32 fast_kernel tests pass; clippy clean.\n\n* fix(fast_kernel): targeted alloc/doc/test corrections from round 8\n\nSix review findings, all surface-level corrections (one allocation\nguard, four doc rewordings, one test refactor):\n\n1. hash_table.rs:90 — checked allocation guard (round 8 #23):\n   FastHashTable::new accepts hash_log up to ZSTD_HASHLOG_MAX=30,\n   but on 32-bit targets a 2^30 × sizeof(u32) = 4 GiB allocation\n   exceeds the address space and triggers an opaque\n   capacity-overflow panic deep inside Vec. Added checked_shl +\n   checked_mul guards with descriptive panic messages so 32-bit\n   misuse fails loudly at construction. validate_params already\n   pins the band; this is the per-target reachability check.\n\n2. kernel.rs:38 — read32 doc accuracy (round 8 #24):\n   read_unaligned returns a NATIVE-endian u32; the previous doc\n   claimed \"unaligned little-endian\". Rewrote the doc to note the\n   load is native-endian and only used for equality compare (same\n   host means same byte ordering on both operands, so cmp result\n   is endianness-invariant — matches donor's MEM_read32 reasoning).\n\n3. kernel.rs:150 — HASH_READ_SIZE precondition wording\n   (round 8 #25):\n   Previous text implied the trailing 7 bytes are ALWAYS literals.\n   In reality, ilimit caps only where the main loop hashes/probes;\n   an in-progress forward match found at ip0 < ilimit extends\n   through count_forward and can reach all the way to iend, in\n   which case tail_literals_len = 0. Reworded to say\n   tail_literals_len reports the actual remainder and the caller\n   emits a terminal Literals only when it's non-zero.\n\n4. hash_table.rs:13 — mls count (round 8 #26):\n   ZSTD_HASHLOG_MAX comment said \"all four mls instantiations\";\n   the supported range is mls 4..=8, i.e. five. Corrected to\n   \"all five mls instantiations (mls ∈ {4, 5, 6, 7, 8})\".\n\n5. kernel.rs:723 — prefix-filter test robustness (round 8 #27):\n   The test derived ip0 as lits.len() — which only equals ip0 for\n   the FIRST emitted Triple (when anchor=0). For multi-emit\n   scenarios later lits.len() values don't correspond to the\n   match position, making the bound `off <= ip0` unreliable.\n   Refactored to walk emitted tuples in order tracking a running\n    (the start of the current emit's literal-run), then\n   check match_src = anchor + lits.len() - off >= 5 for every\n   Triple. Defensive branch for the never-emitted-today\n   pure-literals callback included so future contract changes\n   don't silently break the test.\n\n6. kernel.rs:185 — runtime guard comment wording (round 8 #28):\n   The u32 truncation guard's comment said it \"prevents UB\".\n   Truncating positions into u32 corrupts match indices and\n   offsets but every downstream pointer dereference still\n   bounds-checks against data.len(), so the failure mode is\n   algorithmic correctness (wrong sequences, wrong decode), not\n   memory unsafety. Reworded to distinguish the two checks:\n   block_start guard prevents UB, data.len() guard prevents\n   silent miscompression.\n\nAll 32 fast_kernel tests pass; clippy clean.\n\n* docs(fast_kernel): tie HASH_READ_SIZE precondition to remaining block, not slice\n\nRound 9 CodeRabbit catch: the round 8 reword still phrased the\n8-byte precondition as 'data.len() SHOULD be at least HASH_READ_SIZE\nbytes long', but the kernel's actual short-input guard is\n'data.len() < block_start + HASH_READ_SIZE', i.e. it checks the\nremaining-block length (data.len() - block_start), not the slice's\ntotal size. With non-zero block_start (when data carries prefix\nhistory before the current block) the slice can be hundreds of KiB\nwhile the actual block remaining is only 3 bytes, and the old\nwording would have suggested the kernel proceeds — wrong.\n\nReworded the precondition to 'data.len() - block_start SHOULD be at\nleast HASH_READ_SIZE (8) bytes', noting explicitly that data itself\nmay be much longer because it holds the prefix history. Pointer to\nthe guard line so the precondition and the runtime check read as one\nmatched pair.\n\n* fix(fast_kernel): enforce MLS contract in release builds\n\nCodeRabbit (outside-diff finding): compress_block_fast is a safe pub\nentry point but only used debug_assert_eq! to check MLS matches the\nhash_table's mls. In release builds debug_assert! is stripped, so a\nmismatched call like:\n\n  compress_block_fast::<5>(..., &mut FastHashTable::new(_, 4), ...)\n\nroutes to the kernel's mls=5 monomorphisation (different hash\nformula, different prime constant, different shift count) but reads\nentries indexed by mls=4 — garbage match candidates, miscompression\ninstead of a clean panic. The const-generic MLS prevents compile-\ntime misuse for nonexistent values but cannot catch this runtime\ntable/kernel mismatch.\n\nReplaced the debug_assert_eq! with two real assert!s:\n\n1. Range check (4..=8).contains(&MLS) — logically redundant with the\n    arm in FastHashTable::hash_ptr, but\n   surfaces the contract at the entry point with a clearer message\n   than the hash-table-internal one.\n2. assert_eq!(MLS, hash_table.mls()) — fails immediately on\n   table/kernel mismatch, with both values in the panic message for\n   diagnostics.\n\nAll 32 fast_kernel tests pass (they instantiate matching MLS/table\npairs in run_block; no test exercised the mismatch path).\n\n* docs(fast_kernel): document panic conditions for entry points\n\nRound 11 Copilot findings — both doc-only:\n\n1. kernel.rs:149 (#30): compress_block_fast docs claimed\n   memory-safety for every input and didn't enumerate the\n   entry-time assert!s introduced in round 7 + round 10.\n   Added a # Panics section listing all four assertions\n   (block_start out of range, data.len() > u32::MAX, MLS out of\n   range, MLS != hash_table.mls()), each with a one-line\n   explanation of what goes wrong without the check. Also\n   reworded the preceding 'SAFE function' paragraph to qualify\n   it with 'for every input that doesn't trigger one of the\n   entry-time asserts'.\n\n2. hash_table.rs:73 (#31): FastHashTable::new's # Panics\n   section listed only the parameter-range failures (hash_log\n   out of band, mls out of band). The round 8 alloc guard\n   added checked_shl + checked_mul that can panic on 32-bit\n   targets, and the underlying allocator can fail too — both\n   undocumented. Restructured the section into two groups:\n   parameter-range failures (deterministic, depend only on\n   inputs) and target-size/allocation failures (depend on host\n   architecture and runtime memory state). Three new bullets\n   cover usize overflow on shift, usize overflow on multiply,\n   and global allocator failure.\n\nPure documentation — no behaviour change. 32/32 tests pass.\nclippy clean.\n\n* docs(fast_kernel): fix Panics-section accuracy for hash_log=30 and block_start\n\nRound 12 CodeRabbit follow-ups on the round 11 Panics sections — both\npure documentation fixes:\n\n1. hash_table.rs #32: round 11 said hash_log=30 was 'borderline' and\n   'would OOM the allocator' on 32-bit. With the checked_mul guard\n   added in round 8, hash_log=30 is now caught deterministically\n   BEFORE vec! is called (1 << 30 entries * 4 bytes = 4 GiB\n   overflows the usize multiply). Rewrote the bullet to spell out\n   the deterministic-failure framing: checked_shl tripwire is\n   unreachable today (validate_params pins hash_log <= 30, so\n   1<<30 fits usize), checked_mul is the actual 32-bit\n   hash_log=30 rejection point, and only allocator failure\n   remains runtime-state-dependent.\n\n2. kernel.rs #33: the block_start>data.len() panic rationale only\n   described the main-loop wrap case (block_start +\n   HASH_READ_SIZE wrap → skipped short-input guard → OOB read).\n   It missed the more common path: when data.len() <\n   block_start + HASH_READ_SIZE the short-input branch IS taken\n   and computes tail_literals_len = data.len() - block_start\n   which underflows. Reworded to cover both paths explicitly.\n\nPure documentation — no behaviour change. 32/32 tests pass.\nclippy clean.\n\n* fix(fast_kernel): close offset_from UB on 32-bit + document hash_ptr MLS contract\n\nTwo new Copilot findings from round 13, both legitimate:\n\n1. count.rs:93 (#34): count_forward's two `offset_from(p_start) as\n   usize` calls return `isize`, which is UB when the byte distance\n   exceeds isize::MAX. On 32-bit hosts isize::MAX = 2 GiB - 1, but\n   the kernel's u32-truncation guard allows data.len() up to\n   u32::MAX (4 GiB). A long match spanning >2 GiB would hit the UB\n   path. Switched both call sites to plain `as usize` pointer\n   arithmetic (`(ip as usize) - (p_start as usize)`) — well-defined\n   integer subtraction regardless of distance, no `isize` round\n   trip. Comment explains the rationale at the in-loop site and\n   refers back from the function-tail site.\n\n2. hash_table.rs:167 (#35): hash_ptr's # Safety section only\n   covered the readable-bytes promise on `ptr` — it didn't mention\n   that the const-generic MLS must equal self.mls() and be in\n   4..=8. Today only debug_assert_eq! checks the equality, so a\n   release-build mismatched call routes to the wrong hash formula\n   (different multiply prime, different shift) and probes a table\n   indexed by a different formula. Extended the # Safety section\n   with the MLS contract, called out that compress_block_fast\n   enforces both invariants with real assert!s before any\n   hash_ptr call (so kernel-mediated callers are safe by\n   construction), and noted that direct callers (tests, future\n   helpers) are responsible for upholding the contract themselves.\n\nAll 32 fast_kernel tests pass; clippy clean. count.rs change is\nbehaviour-preserving (subtraction result identical to offset_from\nwhen distance ≤ isize::MAX, and now also defined for larger\ndistances). hash_table.rs change is doc-only.\n\n* docs(fast_kernel): clarify which # Panics guards run pre-vec vs in vec\n\nRound 13 CodeRabbit follow-up: my previous wording 'All three guards\nfire BEFORE control reaches vec![]' was self-contradictory because\nthe third bullet IS the vec![] allocation itself. Reworded to\ndistinguish the two pre-allocation deterministic guards from the\nin-allocation runtime-state-dependent one.",
+          "timestamp": "2026-05-21T00:25:39+03:00",
+          "tree_id": "47fc2a2ba9d6b6c3fff846d31e8b9b5995007f49",
+          "url": "https://github.com/structured-world/structured-zstd/commit/fc634644ffa72b344bd5ab4fe894caaa3f756431"
+        },
+        "date": 1779315572748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.069,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 243.901,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 159.906,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.151,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.942,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.619,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.939,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.568,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.246,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.246,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.07,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.874,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.966,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.291,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.98,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.093,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.062,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.306,
             "unit": "ms"
           },
           {
