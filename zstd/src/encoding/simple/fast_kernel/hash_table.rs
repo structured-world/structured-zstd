@@ -107,10 +107,19 @@ impl FastHashTable {
     ///
     /// # Safety
     ///
-    /// `ptr` MUST point to at least `mls` readable bytes (`mls <= 8`,
-    /// so at most an 8-byte read). The kernel guarantees this via the
-    /// `ilimit = iend - HASH_READ_SIZE` cap, mirroring donor's same
-    /// invariant.
+    /// `ptr` MUST point to readable bytes covering the load width:
+    /// - `MLS == 4`: at least **4** readable bytes (a `u32` load).
+    /// - `MLS >= 5`: at least **8** readable bytes — every mls ∈ {5,
+    ///   6, 7, 8} path performs an unaligned `u64::read_unaligned`
+    ///   and shifts off the unused top bits, so the underlying load
+    ///   is always 8 bytes wide regardless of `mls`. Promising only
+    ///   `mls` readable bytes for `mls ∈ {5,6,7}` would leave the
+    ///   trailing 8-mls bytes of the u64 read past the caller's
+    ///   range — UB.
+    ///
+    /// The kernel satisfies this uniformly via the
+    /// `ilimit = iend - HASH_READ_SIZE` cap (`HASH_READ_SIZE = 8`),
+    /// mirroring donor's same invariant.
     #[inline(always)]
     pub(crate) unsafe fn hash_ptr<const MLS: u32>(&self, ptr: *const u8) -> u32 {
         debug_assert_eq!(MLS, self.mls, "monomorphised MLS must match table mls");

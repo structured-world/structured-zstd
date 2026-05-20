@@ -39,27 +39,64 @@ unsafe fn read32(ptr: *const u8) -> u32 {
 }
 
 /// Donor's "match probe": does the 4-byte word at `ip` equal the
-/// 4-byte word at `base + match_idx`, AND is `match_idx` in-range?
+/// 4-byte word at `base + match_idx`, AND is `match_idx` an in-range
+/// historic position that the encoder may legitimately match against?
+///
+/// Three independent filters reject invalid candidates BEFORE the
+/// 4-byte raw compare:
+///
+/// 1. `match_idx >= prefix_start_index` — the position is at or
+///    above the encoder's window start; below that it's outside the
+///    addressable history.
+/// 2. `(match_idx as usize) + 4 <= data_len` — the 4-byte probe at
+///    `base + match_idx` stays inside the caller's `data` buffer.
+///    A stale entry from a reused `FastHashTable` (table not cleared
+///    between calls that shrink the `data` slice) could otherwise
+///    point past the current buffer end and produce an
+///    out-of-bounds read.
+/// 3. `(match_idx as usize) < ip_pos` — the match is genuinely
+///    backward in the input, not at or ahead of the current scan
+///    cursor. A stale ≥-ip0 entry would later make
+///    `offset = ip_pos - match_idx` underflow / produce an invalid
+///    forward-pointing offset code.
+///
+/// The kernel's normal usage (single block, hash table populated by
+/// writes during the same scan, indices monotonically below `ip0`)
+/// already satisfies (2) and (3) by construction, but the explicit
+/// checks make the function safe under future cross-block / shared-
+/// table call shapes too. The added branches are strongly biased
+/// "not taken" on the well-behaved path so the predictor amortises
+/// them to zero cost on the hot loop.
 ///
 /// # Safety
 ///
-/// `ip` and `base + match_idx` MUST each have at least 4 readable
-/// bytes. The caller guarantees this via the `ilimit` cap on `ip` and
-/// the `match_idx >= prefix_start_index` filter (which keeps the
-/// referenced suffix inside the input buffer).
+/// `ip` MUST have at least 4 readable bytes. `base` MUST be the start
+/// of a buffer of length `data_len` (so any `base + i` with `i + 4 <=
+/// data_len` is a valid read). The three filters above turn every
+/// other invariant the unchecked read needs into a compile-time-
+/// checkable property of the input slice.
 #[inline(always)]
 unsafe fn match_found(
     ip: *const u8,
     base: *const u8,
     match_idx: u32,
     prefix_start_index: u32,
+    ip_pos: usize,
+    data_len: usize,
 ) -> bool {
     if match_idx < prefix_start_index {
         return false;
     }
-    // SAFETY: ip and (base + match_idx) each have ≥ 4 readable bytes
-    // per the function contract.
-    unsafe { read32(ip) == read32(base.add(match_idx as usize)) }
+    let match_pos = match_idx as usize;
+    if match_pos + 4 > data_len {
+        return false;
+    }
+    if match_pos >= ip_pos {
+        return false;
+    }
+    // SAFETY: ip has ≥ 4 readable bytes per the function contract;
+    // `base + match_pos` has ≥ 4 readable bytes by the filter above.
+    unsafe { read32(ip) == read32(base.add(match_pos)) }
 }
 
 /// Output of [`compress_block_fast`] — the new repcode pair to thread
@@ -260,7 +297,16 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
         }
 
         // Explicit-match probe.
-        if unsafe { match_found(base.add(ip0), base, match_idx, prefix_start_index) } {
+        if unsafe {
+            match_found(
+                base.add(ip0),
+                base,
+                match_idx,
+                prefix_start_index,
+                ip0,
+                iend_addr,
+            )
+        } {
             // Found a 4-byte match. Backward-extend while the byte
             // before each side also matches (donor's `while (ip0 >
             // anchor) & (match0 > prefixStart)` loop).

@@ -7,16 +7,15 @@
 //! wired into [`super::MatchGenerator`] / `MatcherStorage`. The
 //! follow-up commit on the same branch replaces the `SuffixStore`-
 //! based Fast strategy path with a `MatcherStorage::FastKernel`
-//! arm that invokes [`compress_block_fast`] per block. Until then
-//! every item below appears unused — the `#[allow(dead_code)]` on
-//! each sub-module exists solely to keep the baseline `cargo clippy
-//! -D warnings` build green during the staged rollout. It is
-//! removed in the wiring commit.
-#![allow(dead_code, unused_imports)]
+//! arm that invokes [`compress_block_fast`] per block. The narrow
+//! `#![allow(dead_code)]` below is intentionally scoped: it covers
+//! the kernel-internal items that the wiring commit will reach in
+//! one shot, without masking the broader `unused_imports` lint
+//! (which would otherwise hide real unused-import regressions in
+//! sibling code). Re-exports are deferred to the wiring commit
+//! since adding them now would force a wider lint relaxation.
+#![allow(dead_code)]
 
 pub(crate) mod count;
 pub(crate) mod hash_table;
 pub(crate) mod kernel;
-
-pub(crate) use hash_table::FastHashTable;
-pub(crate) use kernel::{FastBlockResult, compress_block_fast};

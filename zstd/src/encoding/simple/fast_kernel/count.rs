@@ -11,14 +11,18 @@
 /// # Safety
 ///
 /// - `ip` MUST point to `ip_len = (iend as usize) - (ip as usize)`
-///   readable bytes.
-/// - `match_ptr` MUST point to at least `ip_len + 7` readable bytes (the
-///   8-byte chunked-load body reads past `ip_len` whenever the match
-///   extends to the limit). The caller's prefix bookkeeping in the
-///   donor encoder ensures this — `prefixStart` is always ≥ 8 bytes
-///   before the first valid match position, and the trailing 7 bytes
-///   of any frame are tagged as literals before this routine is
-///   invoked (the `ilimit = iend - HASH_READ_SIZE` cap upstream).
+///   readable bytes. `iend` is the exclusive upper bound; the function
+///   never reads at or past it.
+/// - `match_ptr` MUST point to at least as many readable bytes as `ip`
+///   does up to `iend`. In practice this is naturally satisfied when
+///   `match_ptr <= ip` and both pointers live inside the same buffer
+///   (a backward match into the encoder's history), since the function
+///   only reads chunks from `match_ptr` for the same byte ranges it
+///   reads from `ip` — `iend` caps both equally. A naive "trailing 7
+///   slack on match_ptr" reading would be overspecified: the 8-byte
+///   chunked-load body bails on the first non-matching byte, so the
+///   read length on `match_ptr` is always `min(ip_len, common_bytes
+///   + chunk_padding)` ≤ what `ip` itself reads.
 /// - Neither pointer's range may overlap the destination of a
 ///   concurrent write — the kernel runs single-threaded over a
 ///   block-local input slice so this holds by construction.
