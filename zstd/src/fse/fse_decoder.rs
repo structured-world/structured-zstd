@@ -35,7 +35,12 @@ impl<'t> FSEDecoder<'t> {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
         let new_state = bits.get_bits(self.table.accuracy_log);
-        self.state = self.table.decode[new_state as usize];
+        // SAFETY: `accuracy_log` bits read from the bitstream produce
+        // `new_state < (1 << accuracy_log) = table_size = decode.len()`.
+        // `build_decoding_table` ensures the table is sized exactly
+        // `1 << accuracy_log` entries. The bounds check that the
+        // checked indexing would emit is provably redundant.
+        self.state = unsafe { *self.table.decode.get_unchecked(new_state as usize) };
 
         Ok(())
     }
@@ -45,7 +50,13 @@ impl<'t> FSEDecoder<'t> {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
-        self.state = self.table.decode[next_state];
+        // SAFETY: same invariant as `update_state_fast` below —
+        // `new_state` and `num_bits` were paired by
+        // `calc_baseline_and_numbits` during table construction such
+        // that `new_state + (1 << num_bits) - 1 < table_size =
+        // decode.len()`. `add < 1 << num_bits` by definition of the
+        // `num_bits`-wide read, so `next_state < decode.len()`.
+        self.state = unsafe { *self.table.decode.get_unchecked(next_state) };
     }
 
     /// Advance the internal state **without** an individual refill check.
