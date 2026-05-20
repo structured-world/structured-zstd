@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779273823917,
+  "lastUpdate": 1779282504717,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -41522,6 +41522,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d68ce5b434a3023e80dfcc64fd2fe93358449d69",
+          "message": "perf(decode): const-generic HUF kernel monomorphisation for SIMD-fallback (#212)\n\n* refactor(decode): HufKernel trait for HUF 4-stream fallback monomorphisation\n\nReplaces the per-call kernel `match self.kernel { ... }` in\n`advance_state_by_bits` and `decode4_symbols_and_num_bits[_for_kernel]`\nwith compile-time trait dispatch over zero-sized kernel marker types.\n`literals_section_decoder::decompress_literals` selects the kernel\nonce via `detect_huffman_decode_kernel()` and dispatches into a\nmonomorphised `run_4stream_decode_loop::<K>` helper. Inside that\nhelper `K::decode4_unchecked` and `K::advance_state` resolve at\ncompile time, eliminating 5 runtime branches per SIMD-fallback\niteration (1 in decode4, 4 in per-stream advance).\n\nThe donor burst tier itself bypasses kernel dispatch entirely (reads\n`packed_decode` directly) so generates identical code across all K.\n\nSix kernel ZSTs implement `HufKernel`: ScalarKernel, Bmi2Kernel,\nAvx2Kernel, Vbmi2Kernel (x86), NeonKernel, SveKernel (aarch64).\n\nDead-after-refactor methods removed: `advance_state_by_bits`,\n`decode4_symbols_and_num_bits`, `decode4_symbols_and_num_bits_unchecked`,\n`decode4_has_shared_table_and_kernel`, `decode4_symbols_and_num_bits_for_kernel`.\n\n* fix(tests): update HUF kernel-comparison tests for HufKernel trait API\n\nTests using the removed dispatch methods (decode4_symbols_and_num_bits,\nadvance_state_by_bits) updated to call the new HufKernel trait impls\ndirectly. Mixed-table / mixed-kernel fallback tests removed: the old\ndefensive fallback shape no longer applies — the trait API requires\nshared table+kernel by precondition, verified at compile-time via\nmonomorphisation in literals_section_decoder.\n\n* docs: clarify kernel-cache mechanism + precondition source in HUF comments\n\n- literals_section_decoder.rs: detect_huffman_decode_kernel is OnceLock-cached\n  only on `std`; on `no_std` it resolves via `cfg!(target_feature)` at\n  compile time. Reword comment to cover both branches.\n- huff0_decoder.rs: shared table+kernel precondition holds by construction\n  at the single dispatch site (all decoders built from the same\n  `&scratch.table`, one kernel picked per call), not by compile-time\n  verification. Trait dispatch is compile-time monomorphisation; the\n  invariant guarantee is structural.\n\n* docs(huff0): refresh HufKernel doc + scalar advance test name post-rename\n\n- Trait doc no longer references the removed advance_state_by_bits /\n  decode4_symbols_and_num_bits dispatcher methods; explains the\n  per-iteration cost (1 decode4 + 4 state advances) and the runtime\n  branches eliminated.\n- Rename scalar advance-state test to scalar_kernel_advance_state_matches_formula\n  so the test name matches what it exercises (ScalarKernel::advance_state).",
+          "timestamp": "2026-05-20T15:19:14+03:00",
+          "tree_id": "157869aeb25a2e1772c0714c6b11180e7cdfe4fd",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d68ce5b434a3023e80dfcc64fd2fe93358449d69"
+        },
+        "date": 1779282501009,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.14,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 293.454,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 231.397,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.4,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.029,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.081,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.97,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.158,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.653,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.962,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.296,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.839,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.989,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.31,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
