@@ -148,7 +148,14 @@ pub(crate) struct FastBlockResult {
 /// kernel falls into the short-input early-return branch and emits no
 /// sequences, which may not be what the caller wanted.
 ///
-/// `data.len()` SHOULD be at least `HASH_READ_SIZE` (8) bytes long.
+/// The remaining-block length `data.len() - block_start` SHOULD be
+/// at least `HASH_READ_SIZE` (8) bytes — `data` itself may be much
+/// longer because it holds the prefix history before `block_start`,
+/// so the slice's total size is not the relevant gate. The kernel's
+/// short-input early-return (line below) compares precisely
+/// `data.len() < block_start + HASH_READ_SIZE`, matching this
+/// remaining-block phrasing.
+///
 /// The `ilimit = data.len() - HASH_READ_SIZE` cap constrains where
 /// the main loop hashes and probes — i.e. it stops emitting new
 /// matches once `ip0 >= ilimit`. It does NOT mean the trailing 7
