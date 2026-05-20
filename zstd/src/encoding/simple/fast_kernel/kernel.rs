@@ -142,11 +142,31 @@ pub(crate) struct FastBlockResult {
 /// # Preconditions / algorithm invariants
 ///
 /// `compress_block_fast` is a SAFE function — memory-safety holds for
-/// every input. The contract below is about algorithmic correctness
-/// (correct output sequences, donor-parity match coverage), not Rust
-/// memory safety. Passing a smaller `data` is well-defined but the
-/// kernel falls into the short-input early-return branch and emits no
-/// sequences, which may not be what the caller wanted.
+/// every input that doesn't trigger one of the entry-time
+/// `assert!`s (see the **Panics** section below for that list). The
+/// contract below is about algorithmic correctness (correct output
+/// sequences, donor-parity match coverage), not Rust memory safety.
+/// Passing a smaller `data` is well-defined but the kernel falls
+/// into the short-input early-return branch and emits no sequences,
+/// which may not be what the caller wanted.
+///
+/// # Panics
+///
+/// Entry-time `assert!`s reject misuse loudly in every build (debug
+/// AND release) rather than silently miscompressing:
+/// - `block_start > data.len()` — would wrap
+///   `block_start + HASH_READ_SIZE` in the short-input guard and
+///   skip the early return.
+/// - `data.len() > u32::MAX as usize` — the kernel stores
+///   absolute positions into a u32 hash table and computes offsets
+///   as u32, so larger inputs would silently truncate match indices.
+/// - `MLS` outside `4..=8` — the donor's Fast strategy supports
+///   only mls 4..=8; out-of-range MLS would route to a
+///   non-existent hash formula.
+/// - `MLS` != `hash_table.mls()` — a mismatched table layout would
+///   cause the kernel to hash with the wrong formula and probe
+///   entries indexed by a different formula, leading to garbage
+///   match candidates.
 ///
 /// The remaining-block length `data.len() - block_start` SHOULD be
 /// at least `HASH_READ_SIZE` (8) bytes — `data` itself may be much
