@@ -193,23 +193,27 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             buffer.prefetch_lookahead((current_seq.of - 3) as usize);
         }
 
-        // Loop runs `num_sequences - 1` times: each iteration decodes
-        // sequence `i+1` ahead, prefetches its match source, then
-        // executes sequence `i`. Branchless inner body (no `i + 1 <
-        // num_sequences` Option<> roundtrip) keeps LLVM scheduling
-        // tight on the critical path between decode and execute. The
-        // last sequence is executed outside the loop (no
-        // decode-ahead needed past the final element).
-        for _ in 1..num_sequences {
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(&mut br);
-            ml_dec.update_state_fast(&mut br);
-            of_dec.update_state_fast(&mut br);
-            let next_seq =
-                decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            if next_seq.of > PREFETCH_GATE {
-                buffer.prefetch_lookahead((next_seq.of - 3) as usize);
-            }
+        for i in 0..num_sequences {
+            // While iter `i` is in flight, pre-decode iter `i+1` and
+            // issue its prefetch. The state-update step is peeled into
+            // this branch because `decode_one_sequence_inline` reads
+            // the CURRENT FSE state — advancing it before the in-flight
+            // execute would corrupt the iter-`i` decoder state, but
+            // here we've already saved iter `i`'s sequence into
+            // `current_seq` before mutating any FSE state.
+            let next_seq = if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+                let s = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+                if s.of > PREFETCH_GATE {
+                    buffer.prefetch_lookahead((s.of - 3) as usize);
+                }
+                Some(s)
+            } else {
+                None
+            };
 
             execute_one_sequence(
                 buffer,
@@ -223,21 +227,10 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                 .wrapping_add(current_seq.ll)
                 .wrapping_add(current_seq.ml);
 
-            current_seq = next_seq;
+            if let Some(s) = next_seq {
+                current_seq = s;
+            }
         }
-
-        // Execute the last sequence (no decode-ahead past it).
-        execute_one_sequence(
-            buffer,
-            literals_buffer,
-            &mut lit_cur,
-            literals_buffer_len,
-            offset_hist,
-            current_seq,
-        )?;
-        seq_sum = seq_sum
-            .wrapping_add(current_seq.ll)
-            .wrapping_add(current_seq.ml);
     }
 
     // Post-loop bitstream validation. On failure roll back the buffer
