@@ -90,7 +90,19 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
             // SAFETY: `common < CHUNK_SIZE` (otherwise `diff == 0`),
             // and the caller's source range covers ≥ `common` more
             // bytes (we already verified the chunk fits).
-            return unsafe { ip.add(common).offset_from(p_start) as usize };
+            //
+            // Length computed via `as usize` arithmetic instead of
+            // `offset_from`: the latter returns `isize` and is UB
+            // when the byte distance exceeds `isize::MAX`. On 32-bit
+            // hosts a buffer spanning >2 GiB would trigger that
+            // exact case (`data.len() <= u32::MAX` is 4 GiB, larger
+            // than `isize::MAX = 2 GiB - 1`). Subtracting raw
+            // addresses as `usize` is well-defined arithmetic with
+            // no UB regardless of distance.
+            // SAFETY: same as above — the pointer arithmetic is
+            // in-bounds, the `usize` cast of a pointer is always
+            // well-defined.
+            return unsafe { (ip.add(common) as usize) - (p_start as usize) };
         }
         // SAFETY: pointer arithmetic stays within `[p_start, iend)`
         // because we just consumed a CHUNK_SIZE chunk that fit in range.
@@ -151,9 +163,10 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
         }
     }
 
-    // SAFETY: ip is bounded by [p_start, iend], so the difference is
-    // a non-negative isize that fits in usize.
-    unsafe { ip.offset_from(p_start) as usize }
+    // Length computed via `as usize` arithmetic (not `offset_from`)
+    // to avoid UB when the byte distance exceeds `isize::MAX` on
+    // 32-bit hosts; see the in-loop return for the full reasoning.
+    (ip as usize) - (p_start as usize)
 }
 
 #[cfg(test)]

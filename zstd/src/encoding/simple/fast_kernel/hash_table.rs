@@ -169,7 +169,7 @@ impl FastHashTable {
     ///
     /// # Safety
     ///
-    /// `ptr` MUST point to readable bytes covering the load width:
+    /// **Readable-bytes contract on `ptr`:**
     /// - `MLS == 4`: at least **4** readable bytes (a `u32` load).
     /// - `MLS >= 5`: at least **8** readable bytes — every mls ∈ {5,
     ///   6, 7, 8} path performs an unaligned `u64::read_unaligned`
@@ -179,9 +179,25 @@ impl FastHashTable {
     ///   trailing 8-mls bytes of the u64 read past the caller's
     ///   range — UB.
     ///
-    /// The kernel satisfies this uniformly via the
-    /// `ilimit = iend - HASH_READ_SIZE` cap (`HASH_READ_SIZE = 8`),
-    /// mirroring donor's same invariant.
+    /// The kernel satisfies the readable-bytes promise uniformly
+    /// via the `ilimit = iend - HASH_READ_SIZE` cap
+    /// (`HASH_READ_SIZE = 8`), mirroring donor's same invariant.
+    ///
+    /// **`MLS` const-generic contract:**
+    /// - `MLS` MUST equal `self.mls()`.
+    /// - `MLS` MUST be in `4..=8`.
+    ///
+    /// Today only `debug_assert_eq!` checks the equality at runtime,
+    /// so in release a mismatch silently routes to the wrong hash
+    /// formula (different multiply prime, different shift width)
+    /// and probes entries indexed by a different formula — garbage
+    /// match candidates. Callers must guarantee both invariants
+    /// before invoking `hash_ptr`. The crate-internal entry point
+    /// [`crate::encoding::simple::fast_kernel::kernel::compress_block_fast`]
+    /// enforces both via real `assert!`s before any `hash_ptr` call,
+    /// so invocation through the kernel is safe by construction;
+    /// direct callers (tests, future helpers) must uphold the
+    /// contract themselves.
     #[inline(always)]
     pub(crate) unsafe fn hash_ptr<const MLS: u32>(&self, ptr: *const u8) -> u32 {
         debug_assert_eq!(MLS, self.mls, "monomorphised MLS must match table mls");
