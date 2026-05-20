@@ -462,12 +462,14 @@ impl<'t> HuffmanDecoder<'t> {
 /// SIMD-fallback decode tier in `literals_section_decoder`.
 ///
 /// The fallback tier fires every post-refill iteration of the 4-stream
-/// burst loop. Without monomorphisation, each call inside the loop
-/// (`decode4_symbols_and_num_bits` + 4× `advance_state_by_bits`) does
-/// its own runtime `match self.kernel` on the same constant choice.
-/// A `HufKernel` ZST + single dispatch at `decompress_literals` entry
-/// lets the inner loop bake in one kernel choice at compile time and
-/// skip the per-call branch.
+/// burst loop. Each iteration needs one 4-symbol decode (kernel-specific
+/// 4-symbol gather: scalar / AVX2 / VBMI2 / NEON / SVE) and four state
+/// advances (BMI2 `_bzhi_u64` on x86, scalar on aarch64). Before this
+/// trait, each of those five calls did its own runtime `match self.kernel`
+/// on the same process-wide constant choice. The `HufKernel` ZST + single
+/// dispatch at `decompress_literals` entry lets the inner loop bake in
+/// one kernel choice at compile time and skip the per-call branch
+/// (5 runtime branches eliminated per fallback iteration).
 ///
 /// Implementors are zero-sized marker types whose associated functions
 /// directly call the kernel-specific helpers on `HuffmanDecoder`. The
@@ -1101,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_state_by_bits_scalar_matches_formula() {
+    fn scalar_kernel_advance_state_matches_formula() {
         let table = test_table();
         let initial_state = 2_u64;
         let num_bits = 2_u8;
