@@ -82,15 +82,22 @@ pub(crate) struct FastKernelMatcher {
     /// after every block.
     rep: [u32; 2],
     /// Encoder-side 3-deep offset history for repcode wire coding.
-    offset_hist: [u32; 3],
+    /// `pub(crate)` so the driver's `prime_with_dictionary` can
+    /// inject a seeded history without going through a setter —
+    /// matches the legacy `MatchGenerator` field-visibility pattern
+    /// the driver was written against.
+    pub(crate) offset_hist: [u32; 3],
     /// Flat hash table indexed by donor `hash_ptr<MLS>`. Persistent
     /// across blocks; only `reset` (or a `(hash_log, mls)` parameter
     /// change) reallocates it.
     hash_table: FastHashTable,
     /// `1 << window_log`. Soft upper bound on `history.len()` — once
     /// the buffer grows past this point the prefix is dropped and
-    /// `prefix_start_index` advances.
-    max_window_size: usize,
+    /// `prefix_start_index` advances. `pub(crate)` for the same
+    /// reason as `offset_hist`: the driver's `prime_with_dictionary`
+    /// path widens this to accommodate retained dictionary bytes,
+    /// matching the legacy MatchGenerator pattern.
+    pub(crate) max_window_size: usize,
     /// Decoder-side window size (in `log` bits). Reported to the
     /// frame header via the `Matcher::window_size` trait method.
     window_log: u8,
@@ -122,7 +129,15 @@ impl FastKernelMatcher {
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32) -> Self {
         Self {
             history: Vec::new(),
-            prefix_start_index: 0,
+            // Donor `prefixStartIndex` starts at 1 (not 0) so the
+            // hash table's empty-slot sentinel `0` can't be confused
+            // with a real position. Position 0 in our `history` is
+            // therefore an unmatchable reserved byte — donor pays
+            // the same one-byte cost via its `ip0 += (ip0 ==
+            // prefixStart)` first-iteration bump. Eviction in
+            // `extend_history_with_pending` walks this value
+            // forward as the prefix advances.
+            prefix_start_index: 1,
             rep: FAST_INITIAL_REP,
             offset_hist: FAST_INITIAL_OFFSET_HIST,
             hash_table: FastHashTable::new(hash_log, mls),
@@ -150,7 +165,9 @@ impl FastKernelMatcher {
             self.hash_table.clear();
         }
         self.history.clear();
-        self.prefix_start_index = 0;
+        // Reset to the same `1` baseline `with_params` uses — see
+        // that ctor for the empty-slot-sentinel rationale.
+        self.prefix_start_index = 1;
         self.rep = FAST_INITIAL_REP;
         self.offset_hist = FAST_INITIAL_OFFSET_HIST;
         self.window_log = window_log;
@@ -382,18 +399,91 @@ impl FastKernelMatcher {
     /// `ZSTD_compressBlock_targetCBlockSize_body` makes the same
     /// trade.
     ///
-    /// The `_incompressible_hint` parameter is accepted for the
-    /// `Matcher::skip_matching_with_hint` trait method's signature
-    /// compatibility; the Fast matcher doesn't make decisions from it
-    /// today (the driver has already decided to skip by the time it
-    /// calls this), but keeping the parameter avoids re-shaping the
-    /// trait when the heuristic moves into the matcher in a future
-    /// commit.
-    pub(crate) fn skip_matching(&mut self, _incompressible_hint: Option<bool>) {
-        let _block_start = self.extend_history_with_pending();
+    /// The `incompressible_hint` parameter accepts the donor's
+    /// `Matcher::skip_matching_with_hint` semantics:
+    ///
+    /// - `Some(true)` or `None` — incompressible / no opinion: append
+    ///   only, no hash entries (cheapest path).
+    /// - `Some(false)` — explicitly "this block IS compressible, but
+    ///   the driver is skipping it for dictionary-priming reasons":
+    ///   the block's bytes need to be matchable in future blocks, so
+    ///   pre-populate the hash table for every position in the newly
+    ///   appended range. This matches the
+    ///   `skip_matching_for_dictionary_priming` flow on the driver.
+    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+        let block_start = self.extend_history_with_pending();
         // Rep state survives unchanged: skip should look idempotent
         // to the next block's matcher (no fake match implies no rep
         // promotion). offset_hist likewise unchanged.
+
+        // Dictionary-priming path: explicit `Some(false)` means the
+        // upstream knows the block is compressible material that the
+        // future matcher should be able to reach. Populate hash
+        // entries for every position in the appended range that has
+        // at least `HASH_READ_SIZE` bytes of forward context — under
+        // that threshold the kernel itself can't read the position
+        // either, so a hash entry there would be unreachable.
+        //
+        // Iteration runs while `pos + HASH_READ_SIZE <= history.len()`;
+        // a saturating subtract gives the loop bound without ever
+        // wrapping for short blocks (history shorter than HASH_READ_SIZE
+        // is a legal post-prime state when the dictionary itself is
+        // very small).
+        if incompressible_hint == Some(false) {
+            self.prime_hash_table_for_range(block_start);
+        }
+    }
+
+    /// Pre-populate the hash table with entries for every position in
+    /// `history[range_start..end_of_history]` that has at least
+    /// `HASH_READ_SIZE` bytes of forward context. Used by the
+    /// dictionary-priming skip path (`skip_matching` with
+    /// `incompressible_hint = Some(false)`).
+    ///
+    /// Dispatches on the matcher's monomorphised `MLS` so the inner
+    /// `hash_ptr<MLS>` call resolves to a single constant-folded body
+    /// per supported mls (4..=8). The unreachable `_` arm guards
+    /// against future MLS-range widening missing this dispatch.
+    fn prime_hash_table_for_range(&mut self, range_start: usize) {
+        let history_len = self.history.len();
+        // HASH_READ_SIZE = 8 is the kernel's load-width invariant
+        // (donor `MEM_readST` cadence). Hashing a position with fewer
+        // forward bytes would compute a hash over uninitialised /
+        // out-of-range memory.
+        const HASH_READ_SIZE: usize = 8;
+        if history_len < HASH_READ_SIZE {
+            return;
+        }
+        let last_hashable = history_len - HASH_READ_SIZE;
+        if range_start > last_hashable {
+            return;
+        }
+
+        let mls = self.hash_table.mls();
+        let base = self.history.as_ptr();
+        for pos in range_start..=last_hashable {
+            // SAFETY: pos < history_len (by loop bound), and the
+            // load width HASH_READ_SIZE is the kernel's contractually
+            // required minimum, so `base.add(pos)` covers
+            // HASH_READ_SIZE readable bytes by `last_hashable`'s
+            // definition. Dispatch on the runtime mls into the
+            // matching const-generic monomorphisation.
+            let ptr = unsafe { base.add(pos) };
+            let hash = unsafe {
+                match mls {
+                    4 => self.hash_table.hash_ptr::<4>(ptr),
+                    5 => self.hash_table.hash_ptr::<5>(ptr),
+                    6 => self.hash_table.hash_ptr::<6>(ptr),
+                    7 => self.hash_table.hash_ptr::<7>(ptr),
+                    8 => self.hash_table.hash_ptr::<8>(ptr),
+                    _ => unreachable!("FastHashTable construction rejects mls outside 4..=8",),
+                }
+            };
+            // SAFETY: hash came from this table's hash_ptr; pos fits
+            // in u32 by the u32::MAX guard the kernel's entry asserts
+            // (data.len() <= u32::MAX, and pos < data.len()).
+            unsafe { self.hash_table.put(hash, pos as u32) };
+        }
     }
 }
 
@@ -411,7 +501,11 @@ mod tests {
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
         assert_eq!(m.max_window_size, 1usize << FAST_LEVEL_1_WINDOW_LOG);
         assert!(m.history.is_empty());
-        assert_eq!(m.prefix_start_index, 0);
+        // Donor initializes prefixStartIndex at 1 so the hash
+        // table's empty-slot sentinel value 0 can't be confused
+        // with a real position — see `with_params` for the full
+        // rationale.
+        assert_eq!(m.prefix_start_index, 1);
         assert!(m.pending.is_none());
     }
 
@@ -464,7 +558,7 @@ mod tests {
         );
 
         assert!(m.history.is_empty());
-        assert_eq!(m.prefix_start_index, 0);
+        assert_eq!(m.prefix_start_index, 1);
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
         assert!(m.pending.is_none());
@@ -644,6 +738,92 @@ mod tests {
             m.history.len(),
             block1.len() + block2.len(),
             "history must hold both blocks after two start_matching calls",
+        );
+    }
+
+    /// Dictionary-priming skip: `skip_matching(Some(false))` MUST
+    /// pre-populate the hash table for the just-appended range so a
+    /// subsequent `start_matching` can find matches against the
+    /// dict-primed bytes. Without that pre-population, a future
+    /// block that copies the dict prefix verbatim would emit only
+    /// literals.
+    #[test]
+    fn skip_matching_with_false_hint_populates_hashes_for_dict_priming() {
+        // Stage: 32 bytes "dict" via skip_matching(Some(false)),
+        // then a second block whose tail copies the dict prefix.
+        // Without the hash pre-population the kernel can't reach
+        // the dict bytes in block 2.
+        let mut dict_block = alloc::vec::Vec::with_capacity(32);
+        for i in 0..32u8 {
+            dict_block.push(i.wrapping_mul(13).wrapping_add(7));
+        }
+
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        m.accept_data(dict_block.clone());
+        m.skip_matching(Some(false)); // dictionary-priming skip
+
+        // Sanity: history grew, prefix_start_index unchanged.
+        assert_eq!(m.history.len(), dict_block.len());
+        assert_eq!(m.prefix_start_index, 1);
+
+        // Block 2: 16 fresh bytes + 16-byte copy of dict_block[0..16]
+        // + 16-byte tail buffer so the kernel can reach the copy.
+        let mut block2 = alloc::vec::Vec::with_capacity(48);
+        block2.extend(100..116u8);
+        block2.extend_from_slice(&dict_block[0..16]);
+        block2.extend(120..136u8);
+        m.accept_data(block2.clone());
+
+        let mut saw_cross_block = false;
+        m.start_matching(|seq| {
+            if let Sequence::Triple { offset, .. } = seq
+                && offset >= block2.len()
+            {
+                saw_cross_block = true;
+            }
+        });
+
+        assert!(
+            saw_cross_block,
+            "skip_matching(Some(false)) must populate hashes so block 2 \
+             can match against the primed bytes",
+        );
+    }
+
+    /// Control case for the prime-path test: same setup but with
+    /// `skip_matching(None)` — the bytes are NOT hashed, so block 2
+    /// must NOT find the cross-block match.
+    #[test]
+    fn skip_matching_with_none_hint_skips_hash_population() {
+        let mut dict_block = alloc::vec::Vec::with_capacity(32);
+        for i in 0..32u8 {
+            dict_block.push(i.wrapping_mul(13).wrapping_add(7));
+        }
+
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        m.accept_data(dict_block.clone());
+        m.skip_matching(None); // plain skip — no hash pre-population
+
+        let mut block2 = alloc::vec::Vec::with_capacity(48);
+        block2.extend(100..116u8);
+        block2.extend_from_slice(&dict_block[0..16]);
+        block2.extend(120..136u8);
+        m.accept_data(block2.clone());
+
+        let mut saw_cross_block = false;
+        m.start_matching(|seq| {
+            if let Sequence::Triple { offset, .. } = seq
+                && offset >= block2.len()
+            {
+                saw_cross_block = true;
+            }
+        });
+
+        assert!(
+            !saw_cross_block,
+            "skip_matching(None) must NOT populate hashes — the legacy \
+             skip cost-savings only hold when future blocks are willing \
+             to miss matches in the skipped region",
         );
     }
 
