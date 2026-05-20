@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779234292501,
+  "lastUpdate": 1779273823917,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -41318,6 +41318,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d29c11c97c35c7036d7dc2623aae9040f05e99e7",
+          "message": "perf(decode): port donor HUF 4-stream burst with sentinel-bit ctz (#201)\n\n* refactor(huff0,bit-io): expose hot-path fields to crate\n\nPre-work for donor-style HUF burst (issue #199, step A): the donor\nloop in huf_decompress.c lifts the bit reader state into local u64\nregisters across a 5-symbol burst, then writes back to memory only\nat the burst boundary. Reaching that shape from outside the\nbit_io/huff0 modules requires direct field access.\n\nPromotes to pub(crate):\n  * BitReaderReversed::bit_container, bits_consumed\n  * HuffmanTable::decode, packed_decode\n  * Entry::symbol, num_bits\n\nNo behaviour change — accessor methods kept; the only consumer\nadding direct reads will be the future literals_section_decoder\nburst rewrite in a follow-up commit.\n\n* perf(decode): port donor HUF 4-stream burst with sentinel-bit ctz\n\nMirrors `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`\n(lines 738-819). Per-stream u64 register `bits[s]` fuses the\ndecoder state (top max_num_bits bits) with the next stream bits\nbelow it. Symbol decode is a single shift to extract the table\nindex, one packed-table load, and `bits[s] <<= num_bits` to step\nstate. Sentinel `1` at the LSB before the burst means\n`trailing_zeros(bits[s])` after the burst recovers total burst-\nconsumed bits without an explicit counter.\n\nLayout of bits[s] (MSB to LSB):\n  [ state (max bits) | next stream bits | zeros + sentinel ]\n\nGating: burst runs only when `bits_consumed >= max_num_bits` and\n`bits_consumed + burst_bits <= 64` on all 4 streams. After\n`BitReaderReversed` refills (which resets bits_consumed to\n[0, 7]) the state's bits are no longer in `bit_container` at the\nexpected position, so the formula falls back to the SIMD\n`decode4_symbols_and_num_bits` loop until enough state bits land\ninside the current window again.\n\nsymbols_per_burst = (63 - max) / max — sized so the sentinel\nstays below the state region after the worst-case T-shift. For\nmax=11: 4 symbols. For max=8: 6 symbols.\n\nThree-tier loop layout:\n  1. donor sentinel burst (fastest, when gate holds)\n  2. SIMD 4-symbol main loop (kept as fallback for when the gate\n     is unsatisfied right after refill)\n  3. single-symbol tail (drains the last few symbols per stream)\n\nBench on M1 aarch64 — perf-neutral vs main (both ~5.25 ms\n`decompress/level_4_greedy/decodecorpus-z000033/rust_stream`).\nThe donor pattern's lighter per-symbol shape is offset on aarch64\nby the SIMD-gather efficiency of `decode4_*_neon`. The win is\nexpected on x86 with BMI2 where the donor's single-shift consume\nbeats `_mm_i32gather_epi32` latency.\n\nPart of #199. Step A + B + D combined into one PR since they\nshare the same ported code path.\n\n* refactor(decode): unified burst+SIMD outer loop, route writeback through consume()\n\nRestructures the HUF 4-stream decode in `literals_section_decoder`\nso the donor sentinel-bit burst can be re-entered after every\npost-refill SIMD iteration, not just once at the start. Outer\nloop now branches between burst (when the gate holds) and a\nsingle SIMD-4-symbol iteration (when it does not). Across a\ntypical decode this lets the burst dominate the work instead of\nrunning once and then falling through to SIMD for the remainder.\n\nSide cleanups:\n* Writeback uses `BitReaderReversed::consume()` instead of\n  direct `bits_consumed += ...` so the bit reader's debug\n  invariant fires on accidental over-consume.\n* Drops the `#[allow(dead_code)]` annotations from the SIMD\n  fallback helpers and the kernel field — they are read from\n  the new SIMD branch of the outer loop.\n* Updates the gate comment to match the actual fallback shape\n  (SIMD-4-symbol while gated out, then single-symbol tail at\n  the end).\n\n* test(decode): burst-gate boundary regression tests for HUF 4-stream\n\nAdds targeted unit tests for the three burst-gate boundary states in\nliterals_section_decoder.rs::decompress_literals: lower boundary\n(bits_consumed == max_num_bits), upper boundary (bits_consumed +\nburst_bits == 64), and SIMD-fallback → refill → burst re-entry. A\nparametric sweep over stream lengths and alphabet shapes provides\nbroad coverage of the surrounding gate-decision matrix.\n\nTests roundtrip through encode4x + decode_literals; a regression in\nthe burst arithmetic surfaces as a BitstreamReadMismatch /\nDecodedLiteralCountMismatch error or a mismatched decoded buffer.\n\nCloses #202\n\n* refactor(huff0,test): narrow visibility and tighten doc accuracy\n\n- Revert `decode: Vec<Entry>` and `Entry::symbol`/`num_bits` to\n  private. They are only read inside `huff0_decoder.rs`; the burst\n  path reads `packed_decode` (kept `pub(crate)`) instead.\n- Rewrite the `packed_decode` rationale to reflect the actual usage\n  (`packed_decode[idx]` from the burst hot path, bypassing kernel\n  dispatch).\n- Soften `burst_gate_tests` module docs: tests exercise gate regimes\n  via input shape and assert end-to-end roundtrip correctness; they\n  do not white-box-assert a specific `(bits_consumed, burst_bits)`.\n  Added a `max_num_bits` range guard against silent encoder drift.\n- Sync `burst_gate_lower_boundary_short_skewed_alphabet` doc with\n  the actual 36-byte fixture and 5..=11 `max_num_bits` band.\n\n* docs(test): correct alphabet size comment in burst SIMD-refill test\n\n* refactor(decode): saturating_sub form for burst-gate cursor bound",
+          "timestamp": "2026-05-20T12:48:54+03:00",
+          "tree_id": "9eef4199c2ee921cd85ce0a92b30038ce7b7682d",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d29c11c97c35c7036d7dc2623aae9040f05e99e7"
+        },
+        "date": 1779273820570,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.096,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 314.985,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 221.221,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.489,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.478,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.576,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.069,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.547,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.016,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.036,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.051,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.667,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.946,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.334,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.99,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.14,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
             "unit": "ms"
           }
         ]
