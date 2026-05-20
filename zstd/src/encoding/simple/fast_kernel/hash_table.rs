@@ -21,6 +21,24 @@ const ZSTD_HASHLOG_MAX: u32 = 30;
 /// Donor multiplicative hash constants — exact bit-for-bit match with
 /// `lib/compress/zstd_compress_internal.h` so the table-keying behaviour
 /// stays identical to the reference encoder.
+/// Non-allocating parameter validation shared by [`FastHashTable::new`] and
+/// the constructor-accept-path tests. Extracted so tests can prove the
+/// `(1..=ZSTD_HASHLOG_MAX, 4..=8)` accept band without forcing a
+/// `1 << ZSTD_HASHLOG_MAX` allocation (≈4 GiB at `ZSTD_HASHLOG_MAX = 30`,
+/// well above per-test memory budgets on CI runners). Panics with the
+/// same messages the [`FastHashTable::new`] doc-comment cites.
+fn validate_params(hash_log: u32, mls: u32) {
+    assert!(
+        (1..=ZSTD_HASHLOG_MAX).contains(&hash_log),
+        "hash_log must be in 1..={ZSTD_HASHLOG_MAX} for donor-compatible Fast hashing (got {hash_log}); \
+         the lower bound prevents a full-word-width shift in hash_ptr, the upper bound is donor's ZSTD_HASHLOG_MAX",
+    );
+    assert!(
+        (4..=8).contains(&mls),
+        "ZSTD Fast strategy only supports mls 4..=8 (got {mls})",
+    );
+}
+
 const PRIME_4_BYTES: u32 = 0x9E3779B1;
 const PRIME_5_BYTES: u64 = 889_523_592_379;
 const PRIME_6_BYTES: u64 = 227_718_039_650_203;
@@ -67,15 +85,7 @@ impl FastHashTable {
     ///
     /// Also panics if `mls` is outside `4..=8`.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
-        assert!(
-            (1..=ZSTD_HASHLOG_MAX).contains(&hash_log),
-            "hash_log must be in 1..={ZSTD_HASHLOG_MAX} for donor-compatible Fast hashing (got {hash_log}); \
-             the lower bound prevents a full-word-width shift in hash_ptr, the upper bound is donor's ZSTD_HASHLOG_MAX",
-        );
-        assert!(
-            (4..=8).contains(&mls),
-            "ZSTD Fast strategy only supports mls 4..=8 (got {mls})",
-        );
+        validate_params(hash_log, mls);
         Self {
             table: vec![0u32; 1usize << hash_log],
             hash_log,
@@ -314,18 +324,16 @@ mod tests {
     }
 
     /// Boundary: `hash_log = ZSTD_HASHLOG_MAX` (30) is the largest
-    /// accepted value. Allocating the full table would burn ~4 GiB;
-    /// instead we instantiate at a smaller log first to prove
-    /// `hash_ptr` honours the bit-width, then verify the constructor
-    /// doesn't reject 30 via a panic-catching probe.
+    /// accepted value. Calling [`FastHashTable::new`] with this value
+    /// would allocate ≈4 GiB (`1 << 30` × `sizeof(u32)`), well over
+    /// per-test memory budgets on CI runners — instead exercise the
+    /// same accept path via the non-allocating [`validate_params`]
+    /// helper. Pairs with the `should_panic` tests below that prove
+    /// rejection of the out-of-band cases.
     #[test]
-    fn hash_log_maximum_thirty_is_accepted_by_constructor() {
-        // Just probe the assertion path: invoking new() with 30
-        // mustn't panic. We don't actually use the giant table — drop
-        // it immediately. (2^30 * 4 bytes is acceptable for a CI host
-        // running a single test; if the host can't allocate it the
-        // test will OOM-skip rather than misreport.)
-        let _table = FastHashTable::new(30, 4);
+    fn hash_log_maximum_thirty_is_accepted_by_validation() {
+        validate_params(ZSTD_HASHLOG_MAX, 4);
+        validate_params(ZSTD_HASHLOG_MAX, 8);
     }
 
     #[test]

@@ -133,12 +133,19 @@ pub(crate) struct FastBlockResult {
 /// - `handle_sequence`: closure that the kernel invokes once per
 ///   emitted `Sequence` — equivalent to donor's `ZSTD_storeSeq`.
 ///
-/// # Safety contract
+/// # Preconditions / algorithm invariants
 ///
-/// `data` MUST be at least `HASH_READ_SIZE` (8) bytes longer than the
-/// caller wants to actually match against. The `ilimit = data.len() -
-/// HASH_READ_SIZE` cap ensures every hash/probe read stays in range;
-/// for the trailing 7 bytes the caller must already have decided to
+/// `compress_block_fast` is a SAFE function — memory-safety holds for
+/// every input. The contract below is about algorithmic correctness
+/// (correct output sequences, donor-parity match coverage), not Rust
+/// memory safety. Passing a smaller `data` is well-defined but the
+/// kernel falls into the short-input early-return branch and emits no
+/// sequences, which may not be what the caller wanted.
+///
+/// `data.len()` SHOULD be at least `HASH_READ_SIZE` (8) bytes longer
+/// than the caller wants to actually match against. The
+/// `ilimit = data.len() - HASH_READ_SIZE` cap ensures every hash/probe
+/// read stays in range; for the trailing 7 bytes the caller must
 /// emit them as literals (this is the kernel's `tail_literals_len`
 /// return value).
 ///
