@@ -1227,8 +1227,8 @@ mod tests {
             },
         ];
 
-        let expected = HuffmanDecoder::decode4_symbols_and_num_bits(&scalar);
-        let actual = HuffmanDecoder::decode4_symbols_and_num_bits(&avx2);
+        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
+        let actual = unsafe { Avx2Kernel::decode4_unchecked(&avx2) };
         assert_eq!(actual, expected);
     }
 
@@ -1290,8 +1290,8 @@ mod tests {
             },
         ];
 
-        let expected = HuffmanDecoder::decode4_symbols_and_num_bits(&scalar);
-        let actual = HuffmanDecoder::decode4_symbols_and_num_bits(&vbmi2);
+        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
+        let actual = unsafe { Vbmi2Kernel::decode4_unchecked(&vbmi2) };
         assert_eq!(actual, expected);
     }
 
@@ -1316,76 +1316,13 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[test]
-    fn decode4_mixed_tables_falls_back_in_release() {
-        let table_a = test_table();
-        let mut table_b = test_table();
-        table_b.decode[0] = Entry {
-            symbol: b'Z',
-            num_bits: 2,
-        };
-        table_b.packed_decode[0] = u32::from(b'Z') | (u32::from(2_u8) << 8);
-
-        let mixed = [
-            HuffmanDecoder {
-                table: &table_a,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table_b,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table_a,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table_b,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 1,
-            },
-        ];
-
-        let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
-        assert_eq!(symbols, [b'A', b'Z', b'B', b'B']);
-        assert_eq!(bits, [1, 2, 2, 2]);
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[test]
-    fn decode4_mixed_kernels_falls_back_in_release() {
-        let table = test_table();
-        let mixed = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 3,
-            },
-        ];
-
-        let (symbols, bits) = HuffmanDecoder::decode4_symbols_and_num_bits(&mixed);
-        assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
-        assert_eq!(bits, [1, 2, 1, 2]);
-    }
+    // Mixed-table and mixed-kernel fallback tests removed: those exercised the
+    // old dispatcher's defensive fallback when callers passed decoders with
+    // different tables or kernels. The `HufKernel` trait API requires shared
+    // table+kernel by precondition (verified at compile-time monomorphisation
+    // in `literals_section_decoder::decompress_literals`'s outer match), so
+    // the mixed-input shape is now a caller-side invariant violation, not a
+    // tested-fallback behaviour.
 
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
