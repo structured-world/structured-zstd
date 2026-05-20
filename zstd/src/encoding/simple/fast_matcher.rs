@@ -129,6 +129,15 @@ pub(crate) struct FastKernelMatcher {
     /// returns. The driver guarantees at most one outstanding pending
     /// space at a time (single-block-per-cycle protocol).
     pending: Option<Vec<u8>>,
+    /// Absolute history position where the MOST RECENTLY appended
+    /// block starts — `extend_history_with_pending` updates this so
+    /// [`Self::last_committed_space`] can return that block's bytes
+    /// AFTER processing (donor / legacy MatchGenerator parity: the
+    /// driver's frame compressor reads `get_last_space` after
+    /// `start_matching` to fetch the raw bytes for raw-block
+    /// emission). Initialised to 0 — overwritten by every
+    /// extend_history_with_pending call.
+    last_block_start: usize,
 }
 
 impl FastKernelMatcher {
@@ -151,6 +160,7 @@ impl FastKernelMatcher {
     /// hint clamped the window). Tests can also call this directly.
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32) -> Self {
         Self {
+            last_block_start: 0,
             history: Vec::new(),
             // Donor `prefixStartIndex` starts at 1 (not 0) so the
             // hash table's empty-slot sentinel `0` can't be confused
@@ -196,6 +206,7 @@ impl FastKernelMatcher {
         self.window_log = window_log;
         self.max_window_size = 1usize << window_log;
         self.pending = None;
+        self.last_block_start = 0;
     }
 
     /// Reported decoder-side window size (bytes).
@@ -206,13 +217,24 @@ impl FastKernelMatcher {
         self.max_window_size as u64
     }
 
-    /// Read-only view of the most recently committed (pending) space.
-    /// Returns the empty slice between `start_matching` calls. Used by
-    /// the driver's `get_last_space` trait method.
+    /// Read-only view of the most recently committed block — donor /
+    /// legacy MatchGenerator's `window.last().data` equivalent.
+    ///
+    /// Three states:
+    /// - Pre-`accept_data` of any block: returns empty slice
+    ///   (`last_block_start = 0`, `history.len() = 0`).
+    /// - Between `accept_data` and `start_matching` /
+    ///   `skip_matching_with_hint`: returns the pending buffer (not
+    ///   yet in history).
+    /// - After `start_matching` / `skip_matching_with_hint`: returns
+    ///   the slice of `history` covering the just-processed block.
+    ///   The frame compressor's raw-block emission path relies on
+    ///   this — it reads `get_last_space()` AFTER `start_matching`
+    ///   to fetch the bytes verbatim.
     pub(crate) fn last_committed_space(&self) -> &[u8] {
         match self.pending.as_deref() {
             Some(slice) => slice,
-            None => &[],
+            None => &self.history[self.last_block_start..],
         }
     }
 
@@ -281,6 +303,10 @@ impl FastKernelMatcher {
 
         let block_start = self.history.len();
         self.history.extend_from_slice(&space);
+        // Record where this newly-appended block starts so
+        // `last_committed_space` can return its bytes AFTER the
+        // kernel call consumes pending.
+        self.last_block_start = block_start;
         block_start
     }
 
@@ -433,7 +459,7 @@ impl FastKernelMatcher {
     ///   pre-populate the hash table for every position in the newly
     ///   appended range. This matches the
     ///   `skip_matching_for_dictionary_priming` flow on the driver.
-    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+    pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         let block_start = self.extend_history_with_pending();
         // Rep state survives unchanged: skip should look idempotent
         // to the next block's matcher (no fake match implies no rep
@@ -455,6 +481,40 @@ impl FastKernelMatcher {
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
         }
+    }
+
+    /// Read-only view of `history.len()` for the driver's eviction
+    /// accounting (`commit_space` → `retire_dictionary_budget` flow).
+    /// The driver compares pre/post values to derive a byte-delta
+    /// when its own bookkeeping doesn't see the matcher's internal
+    /// drain calls.
+    pub(crate) fn history_len_for_eviction_accounting(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Donor's `ZSTD_window_trimWindow` equivalent: drop history
+    /// bytes that no longer fit in `max_window_size`, bumping
+    /// `prefix_start_index` and clearing the hash table (which holds
+    /// absolute positions into the pre-trim history).
+    ///
+    /// Returns the number of bytes evicted — used by the driver's
+    /// `trim_after_budget_retire` loop to drive the dictionary-budget
+    /// reclamation termination condition (`evicted_bytes == 0` →
+    /// done).
+    ///
+    /// Idempotent: when `history.len() <= max_window_size` already,
+    /// returns 0 without touching state.
+    pub(crate) fn trim_to_window(&mut self) -> usize {
+        if self.history.len() <= self.max_window_size {
+            return 0;
+        }
+        let drop_n = self.history.len() - self.max_window_size;
+        self.history.drain(..drop_n);
+        self.prefix_start_index = self.prefix_start_index.saturating_add(drop_n as u32);
+        // Hash table holds absolute positions into the pre-drain
+        // history — clear them as in the in-loop eviction path.
+        self.hash_table.clear();
+        drop_n
     }
 
     /// Pre-populate the hash table with entries for every position in
@@ -658,10 +718,15 @@ mod tests {
             "kernel must emit at least one Triple with match_len >= MIN_MATCH (got {emitted_match_lens:?})",
         );
         // Pending buffer was consumed.
-        assert!(m.last_committed_space().is_empty());
         assert!(m.pending.is_none());
         // History grew by exactly the block size.
         assert_eq!(m.history.len(), data.len());
+        // `last_committed_space` post-processing reads from
+        // history[last_block_start..] (donor / legacy MatchGenerator
+        // parity for the frame compressor's raw-block emission
+        // path) — for a single-block-then-process flow it equals
+        // the input data verbatim.
+        assert_eq!(m.last_committed_space(), data.as_slice());
     }
 
     /// Skip path: `skip_matching` must move the pending buffer into
@@ -678,7 +743,7 @@ mod tests {
         // Take a count of state pre-skip.
         assert_eq!(m.last_committed_space().len(), payload.len());
 
-        m.skip_matching(None);
+        m.skip_matching_with_hint(None);
 
         assert_eq!(
             m.history.len(),
@@ -783,7 +848,7 @@ mod tests {
 
         let mut m = FastKernelMatcher::with_params(12, 8, 4);
         m.accept_data(dict_block.clone());
-        m.skip_matching(Some(false)); // dictionary-priming skip
+        m.skip_matching_with_hint(Some(false)); // dictionary-priming skip
 
         // Sanity: history grew, prefix_start_index unchanged.
         assert_eq!(m.history.len(), dict_block.len());
@@ -825,7 +890,7 @@ mod tests {
 
         let mut m = FastKernelMatcher::with_params(12, 8, 4);
         m.accept_data(dict_block.clone());
-        m.skip_matching(None); // plain skip — no hash pre-population
+        m.skip_matching_with_hint(None); // plain skip — no hash pre-population
 
         let mut block2 = alloc::vec::Vec::with_capacity(48);
         block2.extend(100..116u8);
@@ -874,7 +939,7 @@ mod tests {
                 .map(|i| i.wrapping_add(round as u8 * 17))
                 .collect();
             m.accept_data(block);
-            m.skip_matching(None);
+            m.skip_matching_with_hint(None);
         }
         // Hard bound: post-append history can hold up to
         // `max_window_size + block_size` (retained prefix + the
@@ -913,7 +978,7 @@ mod tests {
         // range = 0..=0 (one position).
         let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
         m.accept_data(payload);
-        m.skip_matching(Some(false));
+        m.skip_matching_with_hint(Some(false));
         assert_eq!(m.history.len(), 8);
         // No assertion on hash entries — the bug we're guarding
         // against is a panic / overrun, not a behavioural one.
@@ -931,7 +996,7 @@ mod tests {
         // history will be 4 bytes after append < HASH_READ_SIZE (8).
         // prime_hash_table_for_range must short-circuit on the
         // `history_len < HASH_READ_SIZE` guard.
-        m.skip_matching(Some(false));
+        m.skip_matching_with_hint(Some(false));
         assert_eq!(m.history.len(), 4);
     }
 
@@ -1006,16 +1071,16 @@ mod tests {
         let mut m = FastKernelMatcher::with_params(8, 6, 4);
         let block1: alloc::vec::Vec<u8> = (0..200u8).collect();
         m.accept_data(block1);
-        m.skip_matching(Some(false));
+        m.skip_matching_with_hint(Some(false));
         let block2: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(50)).collect();
         m.accept_data(block2);
         // Second skip would push total to 400, still under 512 — no
         // eviction yet. Make sure two more rounds trigger it.
-        m.skip_matching(Some(false));
+        m.skip_matching_with_hint(Some(false));
         let block3: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(100)).collect();
         m.accept_data(block3);
         // Now 400+200=600 > 512 → eviction fires inside extend.
-        m.skip_matching(Some(false));
+        m.skip_matching_with_hint(Some(false));
 
         // Post-eviction state: prefix_start_index advanced past 1.
         assert!(
