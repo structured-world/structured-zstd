@@ -37,19 +37,31 @@ impl<'t> FSEDecoder<'t> {
         // Externally-constructible-table guard: when
         // `feature = "fuzz_exports"` is on, `FSETable.decode` /
         // `FSETable.accuracy_log` are settable from outside the crate,
-        // so a fuzz harness can hand the decoder a mis-shaped table.
-        // Validate the table-shape invariant `decode.len() == 1 <<
-        // accuracy_log` before the unchecked reads in `read_entry`
-        // below can hit out-of-bounds memory. `checked_shl` covers the
-        // pathological case where `accuracy_log >= usize::BITS` —
-        // surfaces as `TableIsUninitialized` rather than a shift panic.
+        // so a fuzz harness can hand the decoder a mis-shaped table
+        // that skips `build_decoding_table`'s invariants. Validate the
+        // table-shape invariant `decode.len() == 1 << accuracy_log`
+        // up-front and surface as a typed `InvalidTableShape` error
+        // (distinct from `TableIsUninitialized` to keep fuzz triage
+        // unambiguous) — without this, `read_entry`'s bounds-checked
+        // indexing under the same cfg would panic on a malformed
+        // table, which fuzz harnesses cannot distinguish from a
+        // legitimate decoder failure. `checked_shl` covers the
+        // pathological case where `accuracy_log >= usize::BITS`.
         #[cfg(feature = "fuzz_exports")]
         {
-            let expected = 1usize
-                .checked_shl(self.table.accuracy_log.into())
-                .ok_or(FSEDecoderError::TableIsUninitialized)?;
-            if self.table.decode.len() != expected {
-                return Err(FSEDecoderError::TableIsUninitialized);
+            let accuracy_log = self.table.accuracy_log;
+            let decode_len = self.table.decode.len();
+            let expected = 1usize.checked_shl(accuracy_log.into()).ok_or(
+                FSEDecoderError::InvalidTableShape {
+                    decode_len,
+                    accuracy_log,
+                },
+            )?;
+            if decode_len != expected {
+                return Err(FSEDecoderError::InvalidTableShape {
+                    decode_len,
+                    accuracy_log,
+                });
             }
         }
         let new_state = bits.get_bits(self.table.accuracy_log);
