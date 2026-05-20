@@ -1319,9 +1319,13 @@ mod tests {
     // Mixed-table and mixed-kernel fallback tests removed: those exercised the
     // old dispatcher's defensive fallback when callers passed decoders with
     // different tables or kernels. The `HufKernel` trait API requires shared
-    // table+kernel by precondition (verified at compile-time monomorphisation
-    // in `literals_section_decoder::decompress_literals`'s outer match), so
-    // the mixed-input shape is now a caller-side invariant violation, not a
+    // table+kernel by precondition, established by construction at the
+    // single dispatch site in `literals_section_decoder::decompress_literals`
+    // (all four decoders are built from the same `&scratch.table`, and the
+    // outer `match detect_huffman_decode_kernel()` picks one kernel per
+    // call). The trait dispatch itself is compile-time monomorphisation,
+    // but the precondition guarantee is structural, not statically checked.
+    // The mixed-input shape is now a caller-side invariant violation, not a
     // tested-fallback behaviour.
 
     #[cfg(all(feature = "std", target_arch = "aarch64"))]

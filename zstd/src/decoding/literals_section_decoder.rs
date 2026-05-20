@@ -188,16 +188,17 @@ fn decompress_literals(
 
         // Kernel choice is invariant across this whole call (all four
         // decoders came from the same `HuffmanDecoder::new(&scratch.table)`,
-        // and `detect_huffman_decode_kernel` returns a process-wide constant
-        // via `OnceLock`). Dispatch once on the kernel and run the
-        // monomorphised inner loop — inside the loop, K::decode4_unchecked
-        // / K::advance_state resolve at compile time, eliminating the
-        // per-call enum match that the dynamic API does. The donor burst
-        // body itself bypasses kernel dispatch (reads `packed_decode`
-        // directly), so the burst path is identical across all K — the
-        // generic monomorphisation costs nothing there and removes 5
-        // runtime branches per fallback iteration (1 in decode4_*, 4 in
-        // advance_state_*).
+        // and `detect_huffman_decode_kernel` returns a process-wide
+        // constant — cached via `OnceLock` on `std`, resolved at compile
+        // time via `cfg!(target_feature = …)` on `no_std`). Dispatch once
+        // on the kernel and run the monomorphised inner loop — inside the
+        // loop, K::decode4_unchecked / K::advance_state resolve at compile
+        // time, eliminating the per-call enum match that the dynamic API
+        // does. The donor burst body itself bypasses kernel dispatch
+        // (reads `packed_decode` directly), so the burst path is identical
+        // across all K — the generic monomorphisation costs nothing there
+        // and removes 5 runtime branches per fallback iteration (1 in
+        // decode4_*, 4 in advance_state_*).
         match detect_huffman_decode_kernel() {
             HuffmanDecodeKernel::Scalar => {
                 // SAFETY: ScalarKernel has no SIMD prereqs; always sound to call.
