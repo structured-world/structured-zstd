@@ -104,10 +104,11 @@ impl FastHashTable {
     ///   table backing storage — propagates as the standard
     ///   `Vec::with_capacity` allocation-failure panic.
     ///
-    /// All three guards fire BEFORE control reaches `vec![]`, so
-    /// allocator failure (the third bullet) is the only panic that
-    /// depends on runtime memory state. The first two are
-    /// deterministic given the inputs and target architecture.
+    /// The first two guards fire BEFORE control reaches `vec![]`
+    /// and are deterministic given the inputs and target
+    /// architecture. The third bullet IS the `vec![]` allocation
+    /// itself — it's the only panic that depends on runtime memory
+    /// state.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
         validate_params(hash_log, mls);
         // Per-target allocation feasibility: `1 << hash_log` u32 entries
