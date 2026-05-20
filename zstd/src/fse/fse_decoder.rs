@@ -79,6 +79,23 @@ impl<'t> FSEDecoder<'t> {
 
     /// Advance the internal state to decode the next symbol in the bitstream.
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
+        // Public-API safety guard: `FSEDecoder::new` builds a decoder
+        // with a zero-default `state` (Entry { new_state: 0, num_bits:
+        // 0, symbol: 0 }) regardless of whether the table was actually
+        // populated. A caller that constructs the decoder and then
+        // calls `update_state` BEFORE a successful `init_state` would
+        // hit `read_entry(0)` → `get_unchecked(0)` on an empty
+        // `decode` vec — UB in release mode, since debug_assert is
+        // stripped. The well-behaved decode pipeline always pairs
+        // `new` → `init_state` → `update_state*`, so this branch is
+        // strongly biased "not taken" and the predictor amortises it
+        // to zero cost on the hot path. The corresponding
+        // `update_state_fast` is `pub(crate)` with controlled
+        // callers, so it relies on the documented precondition
+        // instead of paying for a per-call check.
+        if self.table.decode.is_empty() {
+            return;
+        }
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
@@ -120,12 +137,29 @@ impl<'t> FSEDecoder<'t> {
 
     /// Advance the internal state **without** an individual refill check.
     ///
-    /// The caller **must** guarantee that enough bits are available in the bit
-    /// reader (e.g. via [`BitReaderReversed::ensure_bits`] with a budget that
-    /// covers this and any other unchecked reads in the same batch).
+    /// # Preconditions (caller-enforced)
+    ///
+    /// 1. **Bit budget:** enough bits MUST be available in the bit
+    ///    reader (e.g. via [`BitReaderReversed::ensure_bits`] with a
+    ///    budget that covers this and any other unchecked reads in the
+    ///    same batch).
+    /// 2. **State initialisation:** [`init_state`] MUST have returned
+    ///    `Ok` on this decoder before any `update_state_fast` call.
+    ///    Calling `update_state_fast` on a fresh `FSEDecoder::new`
+    ///    output (which holds a zero-default `state` and may reference
+    ///    an empty `decode` vec) would resolve to
+    ///    `read_entry(0).get_unchecked(0)` on an empty slice — UB.
+    ///    The empty-table guard in [`update_state`] is intentionally
+    ///    omitted here to keep the per-sequence fast path branch-free;
+    ///    the only call site (`decode_and_execute_sequences`) always
+    ///    succeeds `init_state` before entering the per-sequence loop,
+    ///    so the precondition holds by construction.
     ///
     /// This is the "fast path" used in the interleaved sequence decode loop
     /// where a single refill check covers all three FSE state updates.
+    ///
+    /// [`init_state`]: Self::init_state
+    /// [`update_state`]: Self::update_state
     #[inline(always)]
     pub(crate) fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
