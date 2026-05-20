@@ -6,6 +6,13 @@ use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::huff0::huff0_decoder::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
+use crate::huff0::huff0_decoder::{
+    HufKernel, HuffmanDecodeKernel, ScalarKernel, detect_huffman_decode_kernel,
+};
+#[cfg(target_arch = "aarch64")]
+use crate::huff0::huff0_decoder::{NeonKernel, SveKernel};
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
@@ -178,124 +185,145 @@ fn decompress_literals(
         let table_shift = (64 - max_num_bits) as u32;
         let state_shift = 64 - max_num_bits;
         let packed = scratch.table.packed_decode.as_slice();
-        let decode4_unchecked = HuffmanDecoder::decode4_has_shared_table_and_kernel(&decoders);
 
-        loop {
-            // Common bound: any stream exhausted or any cursor at end
-            // → exit; the single-symbol tail below handles the drain.
-            if brs[0].bits_remaining() <= -max_bits
-                || brs[1].bits_remaining() <= -max_bits
-                || brs[2].bits_remaining() <= -max_bits
-                || brs[3].bits_remaining() <= -max_bits
-                || cursors[0] >= ends[0]
-                || cursors[1] >= ends[1]
-                || cursors[2] >= ends[2]
-                || cursors[3] >= ends[3]
-            {
-                break;
+        // Kernel choice is invariant across this whole call (all four
+        // decoders came from the same `HuffmanDecoder::new(&scratch.table)`,
+        // and `detect_huffman_decode_kernel` returns a process-wide
+        // constant — cached via `OnceLock` on `std`, resolved at compile
+        // time via `cfg!(target_feature = …)` on `no_std`). Dispatch once
+        // on the kernel and run the monomorphised inner loop — inside the
+        // loop, K::decode4_unchecked / K::advance_state resolve at compile
+        // time, eliminating the per-call enum match that the dynamic API
+        // does. The donor burst body itself bypasses kernel dispatch
+        // (reads `packed_decode` directly), so the burst path is identical
+        // across all K — the generic monomorphisation costs nothing there
+        // and removes 5 runtime branches per fallback iteration (1 in
+        // decode4_*, 4 in advance_state_*).
+        match detect_huffman_decode_kernel() {
+            HuffmanDecodeKernel::Scalar => {
+                // SAFETY: ScalarKernel has no SIMD prereqs; always sound to call.
+                unsafe {
+                    run_4stream_decode_loop::<ScalarKernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
+                }
             }
-
-            let burst_ok = symbols_per_burst >= 1
-                && brs[0].bits_remaining() > burst_bits_isize
-                && brs[1].bits_remaining() > burst_bits_isize
-                && brs[2].bits_remaining() > burst_bits_isize
-                && brs[3].bits_remaining() > burst_bits_isize
-                // Saturating form so the bound holds even when `ends[i]
-                // < symbols_per_burst` near the segment tail (rather
-                // than relying on `cursors[i] + symbols_per_burst` not
-                // wrapping). `regen` is bounded by RFC 8878 block
-                // size ⇒ overflow is unreachable in practice, but the
-                // saturating shape costs the same single subq and
-                // removes the addition entirely.
-                && cursors[0] <= ends[0].saturating_sub(symbols_per_burst)
-                && cursors[1] <= ends[1].saturating_sub(symbols_per_burst)
-                && cursors[2] <= ends[2].saturating_sub(symbols_per_burst)
-                && cursors[3] <= ends[3].saturating_sub(symbols_per_burst)
-                && brs[0].bits_consumed >= max_num_bits
-                && brs[1].bits_consumed >= max_num_bits
-                && brs[2].bits_consumed >= max_num_bits
-                && brs[3].bits_consumed >= max_num_bits
-                // Burst body has no `ensure_bits` — confirm the burst
-                // fits inside the current `bit_container` so the
-                // inner shifts never read past the loaded 8-byte
-                // window.
-                && (brs[0].bits_consumed as usize) + burst_bits as usize <= 64
-                && (brs[1].bits_consumed as usize) + burst_bits as usize <= 64
-                && (brs[2].bits_consumed as usize) + burst_bits as usize <= 64
-                && (brs[3].bits_consumed as usize) + burst_bits as usize <= 64;
-
-            if burst_ok {
-                let mut bits = [
-                    (decoders[0].state << state_shift)
-                        | ((brs[0].bit_container << brs[0].bits_consumed) >> max_num_bits)
-                        | 1,
-                    (decoders[1].state << state_shift)
-                        | ((brs[1].bit_container << brs[1].bits_consumed) >> max_num_bits)
-                        | 1,
-                    (decoders[2].state << state_shift)
-                        | ((brs[2].bit_container << brs[2].bits_consumed) >> max_num_bits)
-                        | 1,
-                    (decoders[3].state << state_shift)
-                        | ((brs[3].bit_container << brs[3].bits_consumed) >> max_num_bits)
-                        | 1,
-                ];
-
-                for _ in 0..symbols_per_burst {
-                    let idx0 = (bits[0] >> table_shift) as usize;
-                    let entry0 = packed[idx0];
-                    target[cursors[0]] = (entry0 & 0xFF) as u8;
-                    cursors[0] += 1;
-                    bits[0] <<= (entry0 >> 8) & 0xFF;
-
-                    let idx1 = (bits[1] >> table_shift) as usize;
-                    let entry1 = packed[idx1];
-                    target[cursors[1]] = (entry1 & 0xFF) as u8;
-                    cursors[1] += 1;
-                    bits[1] <<= (entry1 >> 8) & 0xFF;
-
-                    let idx2 = (bits[2] >> table_shift) as usize;
-                    let entry2 = packed[idx2];
-                    target[cursors[2]] = (entry2 & 0xFF) as u8;
-                    cursors[2] += 1;
-                    bits[2] <<= (entry2 >> 8) & 0xFF;
-
-                    let idx3 = (bits[3] >> table_shift) as usize;
-                    let entry3 = packed[idx3];
-                    target[cursors[3]] = (entry3 & 0xFF) as u8;
-                    cursors[3] += 1;
-                    bits[3] <<= (entry3 >> 8) & 0xFF;
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Bmi2 => {
+                // SAFETY: kernel selector returned X86Bmi2 ⇒ BMI2 detected.
+                unsafe {
+                    run_4stream_decode_loop::<Bmi2Kernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
                 }
-
-                for s in 0..4 {
-                    let consumed = bits[s].trailing_zeros() as u8;
-                    brs[s].consume(consumed);
-                    decoders[s].state = bits[s] >> table_shift;
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Avx2 => {
+                // SAFETY: kernel selector returned X86Avx2 ⇒ AVX2+BMI2 detected.
+                unsafe {
+                    run_4stream_decode_loop::<Avx2Kernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
                 }
-            } else {
-                // SIMD 4-symbol fallback for one outer iteration.
-                // `advance_state_by_bits` triggers a refill inside
-                // `get_bits` when needed; after this iter
-                // `bits_consumed` is back in `[0, 7]+n` and the
-                // burst gate may be satisfied again on the next
-                // outer-loop pass.
-                let (symbols, nbits) = if decode4_unchecked {
-                    // SAFETY: same-table-and-kernel verified above.
-                    unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_unchecked(&decoders) }
-                } else {
-                    HuffmanDecoder::decode4_symbols_and_num_bits(&decoders)
-                };
-                target[cursors[0]] = symbols[0];
-                cursors[0] += 1;
-                target[cursors[1]] = symbols[1];
-                cursors[1] += 1;
-                target[cursors[2]] = symbols[2];
-                cursors[2] += 1;
-                target[cursors[3]] = symbols[3];
-                cursors[3] += 1;
-                decoders[0].advance_state_by_bits(&mut brs[0], nbits[0]);
-                decoders[1].advance_state_by_bits(&mut brs[1], nbits[1]);
-                decoders[2].advance_state_by_bits(&mut brs[2], nbits[2]);
-                decoders[3].advance_state_by_bits(&mut brs[3], nbits[3]);
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HuffmanDecodeKernel::X86Vbmi2 => {
+                // SAFETY: kernel selector returned X86Vbmi2 ⇒ VBMI2+BMI2 detected.
+                unsafe {
+                    run_4stream_decode_loop::<Vbmi2Kernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Neon => {
+                // SAFETY: kernel selector returned Aarch64Neon ⇒ NEON detected.
+                unsafe {
+                    run_4stream_decode_loop::<NeonKernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HuffmanDecodeKernel::Aarch64Sve => {
+                // SAFETY: kernel selector returned Aarch64Sve ⇒ SVE detected.
+                unsafe {
+                    run_4stream_decode_loop::<SveKernel>(
+                        &mut decoders,
+                        &mut brs,
+                        target,
+                        packed,
+                        &mut cursors,
+                        ends,
+                        max_bits,
+                        max_num_bits,
+                        symbols_per_burst,
+                        burst_bits,
+                        burst_bits_isize,
+                        table_shift,
+                        state_shift,
+                    );
+                }
             }
         }
 
@@ -370,6 +398,168 @@ fn decompress_literals(
     }
 
     Ok(bytes_read)
+}
+
+/// Monomorphised 4-stream HUF decode outer loop — burst tier + SIMD
+/// 4-symbol fallback — selected at compile time over `K: HufKernel`.
+///
+/// The kernel choice is dispatched once at `decompress_literals` entry
+/// (see the `match detect_huffman_decode_kernel() { ... }` block
+/// above). Inside this function `K::decode4_unchecked` and
+/// `K::advance_state` resolve at compile time, eliminating the per-call
+/// runtime enum branch that the dynamic API does.
+///
+/// The burst tier itself bypasses kernel dispatch by indexing
+/// `packed_decode` directly, so it generates identical code across all
+/// `K` — the const-generic dispatch costs nothing on the burst path
+/// and removes 5 runtime branches per SIMD-fallback iteration.
+///
+/// # Safety
+///
+/// The caller must have selected `K` based on
+/// [`detect_huffman_decode_kernel`] so the kernel's required CPU
+/// feature set is supported. All four decoders must share the same
+/// table (holds by construction since they are all built from
+/// `&scratch.table`).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_4stream_decode_loop<K: HufKernel>(
+    decoders: &mut [HuffmanDecoder<'_>; 4],
+    brs: &mut [BitReaderReversed<'_>; 4],
+    target: &mut [u8],
+    packed: &[u32],
+    cursors: &mut [usize; 4],
+    ends: [usize; 4],
+    max_bits: isize,
+    max_num_bits: u8,
+    symbols_per_burst: usize,
+    burst_bits: u8,
+    burst_bits_isize: isize,
+    table_shift: u32,
+    state_shift: u8,
+) {
+    loop {
+        // Common bound: any stream exhausted or any cursor at end
+        // → exit; the single-symbol tail below handles the drain.
+        if brs[0].bits_remaining() <= -max_bits
+            || brs[1].bits_remaining() <= -max_bits
+            || brs[2].bits_remaining() <= -max_bits
+            || brs[3].bits_remaining() <= -max_bits
+            || cursors[0] >= ends[0]
+            || cursors[1] >= ends[1]
+            || cursors[2] >= ends[2]
+            || cursors[3] >= ends[3]
+        {
+            break;
+        }
+
+        let burst_ok = symbols_per_burst >= 1
+            && brs[0].bits_remaining() > burst_bits_isize
+            && brs[1].bits_remaining() > burst_bits_isize
+            && brs[2].bits_remaining() > burst_bits_isize
+            && brs[3].bits_remaining() > burst_bits_isize
+            // Saturating form so the bound holds even when `ends[i]
+            // < symbols_per_burst` near the segment tail (rather
+            // than relying on `cursors[i] + symbols_per_burst` not
+            // wrapping). `regen` is bounded by RFC 8878 block
+            // size ⇒ overflow is unreachable in practice, but the
+            // saturating shape costs the same single subq and
+            // removes the addition entirely.
+            && cursors[0] <= ends[0].saturating_sub(symbols_per_burst)
+            && cursors[1] <= ends[1].saturating_sub(symbols_per_burst)
+            && cursors[2] <= ends[2].saturating_sub(symbols_per_burst)
+            && cursors[3] <= ends[3].saturating_sub(symbols_per_burst)
+            && brs[0].bits_consumed >= max_num_bits
+            && brs[1].bits_consumed >= max_num_bits
+            && brs[2].bits_consumed >= max_num_bits
+            && brs[3].bits_consumed >= max_num_bits
+            // Burst body has no `ensure_bits` — confirm the burst
+            // fits inside the current `bit_container` so the
+            // inner shifts never read past the loaded 8-byte
+            // window.
+            && (brs[0].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[1].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[2].bits_consumed as usize) + burst_bits as usize <= 64
+            && (brs[3].bits_consumed as usize) + burst_bits as usize <= 64;
+
+        if burst_ok {
+            let mut bits = [
+                (decoders[0].state << state_shift)
+                    | ((brs[0].bit_container << brs[0].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[1].state << state_shift)
+                    | ((brs[1].bit_container << brs[1].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[2].state << state_shift)
+                    | ((brs[2].bit_container << brs[2].bits_consumed) >> max_num_bits)
+                    | 1,
+                (decoders[3].state << state_shift)
+                    | ((brs[3].bit_container << brs[3].bits_consumed) >> max_num_bits)
+                    | 1,
+            ];
+
+            for _ in 0..symbols_per_burst {
+                let idx0 = (bits[0] >> table_shift) as usize;
+                let entry0 = packed[idx0];
+                target[cursors[0]] = (entry0 & 0xFF) as u8;
+                cursors[0] += 1;
+                bits[0] <<= (entry0 >> 8) & 0xFF;
+
+                let idx1 = (bits[1] >> table_shift) as usize;
+                let entry1 = packed[idx1];
+                target[cursors[1]] = (entry1 & 0xFF) as u8;
+                cursors[1] += 1;
+                bits[1] <<= (entry1 >> 8) & 0xFF;
+
+                let idx2 = (bits[2] >> table_shift) as usize;
+                let entry2 = packed[idx2];
+                target[cursors[2]] = (entry2 & 0xFF) as u8;
+                cursors[2] += 1;
+                bits[2] <<= (entry2 >> 8) & 0xFF;
+
+                let idx3 = (bits[3] >> table_shift) as usize;
+                let entry3 = packed[idx3];
+                target[cursors[3]] = (entry3 & 0xFF) as u8;
+                cursors[3] += 1;
+                bits[3] <<= (entry3 >> 8) & 0xFF;
+            }
+
+            for s in 0..4 {
+                let consumed = bits[s].trailing_zeros() as u8;
+                brs[s].consume(consumed);
+                decoders[s].state = bits[s] >> table_shift;
+            }
+        } else {
+            // SIMD 4-symbol fallback for one outer iteration.
+            // K::advance_state triggers a refill inside `get_bits`
+            // when needed; after this iter `bits_consumed` is back
+            // in `[0, 7]+n` and the burst gate may be satisfied
+            // again on the next outer-loop pass.
+            //
+            // SAFETY: caller has dispatched K based on
+            // `detect_huffman_decode_kernel`, so the kernel's
+            // feature set is available. All four decoders share
+            // `scratch.table` by construction (built from the same
+            // `&scratch.table` reference at `decompress_literals`
+            // entry), satisfying `decode4_unchecked`'s shared-table
+            // contract.
+            let (symbols, nbits) = unsafe { K::decode4_unchecked(decoders) };
+            target[cursors[0]] = symbols[0];
+            cursors[0] += 1;
+            target[cursors[1]] = symbols[1];
+            cursors[1] += 1;
+            target[cursors[2]] = symbols[2];
+            cursors[2] += 1;
+            target[cursors[3]] = symbols[3];
+            cursors[3] += 1;
+            unsafe {
+                K::advance_state(&mut decoders[0], &mut brs[0], nbits[0]);
+                K::advance_state(&mut decoders[1], &mut brs[1], nbits[1]);
+                K::advance_state(&mut decoders[2], &mut brs[2], nbits[2]);
+                K::advance_state(&mut decoders[3], &mut brs[3], nbits[3]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

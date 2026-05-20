@@ -2,7 +2,7 @@
 /// and more commonly used symbols get shorter codes, and less commonly
 /// used symbols get longer codes. Codes are prefix free, meaning no two codes
 /// will start with the same sequence of bits.
-mod huff0_decoder;
+pub(crate) mod huff0_decoder;
 pub use huff0_decoder::*;
 pub mod huff0_encoder;
 
