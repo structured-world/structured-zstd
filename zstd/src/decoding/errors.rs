@@ -1032,14 +1032,18 @@ impl core::fmt::Display for FSEDecoderError {
             FSEDecoderError::InvalidTableShape {
                 decode_len,
                 accuracy_log,
-            } => {
-                write!(
+            } => match 1usize.checked_shl((*accuracy_log).into()) {
+                Some(expected) => write!(
                     f,
                     "FSETable shape invariant violated: decode.len() = {decode_len}, \
                      expected 1 << accuracy_log = {expected} (accuracy_log = {accuracy_log})",
-                    expected = 1usize.checked_shl((*accuracy_log).into()).unwrap_or(0),
-                )
-            }
+                ),
+                None => write!(
+                    f,
+                    "FSETable shape invariant violated: decode.len() = {decode_len}, \
+                     accuracy_log = {accuracy_log} overflows 1 << accuracy_log for usize",
+                ),
+            },
         }
     }
 }
