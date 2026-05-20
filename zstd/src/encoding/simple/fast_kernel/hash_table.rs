@@ -8,6 +8,16 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Donor `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
+/// across all four `mls` instantiations: even though `mls >= 5` widens
+/// the hash to a `u64` reduction, the Fast strategy's per-level
+/// `hashLog` is sourced from the donor's `ZSTD_defaultCParameters`
+/// table where the maximum is `14` (level 1, `srcSize > 256 KB`), and
+/// the user-tunable upper bound is `30`. Enforcing this in the
+/// constructor catches misuse before the first `hash_ptr` would
+/// otherwise panic on the `(32 - hash_log)` / `(64 - hash_log)` shift.
+const ZSTD_HASHLOG_MAX: u32 = 30;
+
 /// Donor multiplicative hash constants — exact bit-for-bit match with
 /// `lib/compress/zstd_compress_internal.h` so the table-keying behaviour
 /// stays identical to the reference encoder.
@@ -43,23 +53,24 @@ impl FastHashTable {
     ///
     /// # Panics
     ///
-    /// Panics if `hash_log` is `0` or `≥ usize::BITS`. `0` would make
-    /// the `hash_ptr` reduction shift by the full word width (`32` for
-    /// mls=4, `64` for mls≥5), which is UB / panic in Rust. `≥
-    /// usize::BITS` makes `1usize << hash_log` overflow — on 32-bit
-    /// targets that's anything ≥ 32, on 64-bit targets anything ≥ 64.
-    /// Donor's `ZSTD_HASHLOG_MAX` is `30` so any sane caller stays in
-    /// `1..=30`; this assertion only catches outright misuse.
+    /// Panics if `hash_log` is outside `1..=ZSTD_HASHLOG_MAX` (donor's
+    /// cap, currently `30`). The lower bound exists because `0` would
+    /// make `hash_ptr` shift by the full word width (`32` for mls=4,
+    /// `64` for mls≥5) — UB / panic in Rust. The upper bound is the
+    /// donor's documented maximum; importantly, even on 64-bit
+    /// targets a `usize::BITS - 1` cap would still admit `hash_log
+    /// ∈ 33..=63` which is invalid for the `mls=4` path that shifts
+    /// by `32 - hash_log` (panics for `hash_log >= 32`). Pinning to
+    /// `ZSTD_HASHLOG_MAX` rejects both invalid bands at construction
+    /// time so every subsequent `hash_ptr::<MLS>` call is safe by
+    /// construction.
+    ///
     /// Also panics if `mls` is outside `4..=8`.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
         assert!(
-            hash_log > 0,
-            "hash_log must be > 0 (a zero log would make hash_ptr shift by the full word width)",
-        );
-        assert!(
-            hash_log < usize::BITS,
-            "hash_log {hash_log} >= usize::BITS {} would overflow `1usize << hash_log`",
-            usize::BITS,
+            (1..=ZSTD_HASHLOG_MAX).contains(&hash_log),
+            "hash_log must be in 1..={ZSTD_HASHLOG_MAX} for donor-compatible Fast hashing (got {hash_log}); \
+             the lower bound prevents a full-word-width shift in hash_ptr, the upper bound is donor's ZSTD_HASHLOG_MAX",
         );
         assert!(
             (4..=8).contains(&mls),
