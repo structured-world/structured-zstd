@@ -25,6 +25,7 @@ use super::match_table::helpers::{
 };
 
 pub(crate) mod fast_kernel;
+pub(crate) mod fast_matcher;
 
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
