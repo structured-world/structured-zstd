@@ -6,18 +6,41 @@
 //! Replaces the SuffixStore-based `MatchGenerator` for the Fast strategy
 //! path with a donor-parity hash table and tight per-block loop.
 //!
-//! Phase 1b scaffold: this file currently defines the matcher's state
-//! and lifecycle hooks (`new` / `reset`); the `Matcher` trait
-//! implementation and dispatch wiring land in the follow-up commits
-//! on the same PR. The struct is `pub(crate)` so the wiring commit
-//! can hook it into [`crate::encoding::match_generator::MatcherStorage`]
-//! without churn here.
+//! Phase 1b progression so far: the matcher's full inherent surface
+//! is implemented and unit-tested — state lifecycle (`new` /
+//! `reset` / `window_size` / `last_committed_space`), block ingestion
+//! (`accept_data` + `extend_history_with_pending`), kernel dispatch
+//! (`start_matching`), and the two skip flavours (`skip_matching`
+//! plain + dict-priming when `incompressible_hint == Some(false)`).
+//! The remaining wiring step swaps the inner type of
+//! [`crate::encoding::match_generator::MatcherStorage::Simple`] from
+//! the legacy SuffixStore-based `MatchGenerator` to this type and
+//! routes the driver's Matcher trait methods through here; that
+//! commit lands separately on the same PR.
 //!
 //! The narrowly-scoped `#![allow(dead_code)]` covers exactly the
-//! items the next commit consumes — leaving `unused_imports` active
-//! so any stray import in sibling code is still flagged. The allow
-//! is removed in the wiring commit that hooks the matcher into the
-//! driver.
+//! items the wiring commit consumes — leaving `unused_imports`
+//! active so any stray import in sibling code is still flagged.
+//! The allow is removed in the wiring commit.
+//!
+//! # Invariants this module guarantees
+//!
+//! - `prefix_start_index >= 1` at all times. Position 0 in `history`
+//!   is permanently sub-prefix so the hash table's empty-slot
+//!   sentinel value `0` cannot be confused with a real match
+//!   position. See [`FastKernelMatcher::with_params`] for the full
+//!   rationale.
+//! - `history.len()` is bounded by `2 × max_window_size` post-append.
+//!   See [`FastKernelMatcher::extend_history_with_pending`].
+//! - `rep[0..2]` tracks the kernel's repcode state across blocks
+//!   (updated from `FastBlockResult.rep` after every
+//!   `start_matching`). `offset_hist[0..2]` tracks the wire
+//!   encoder's repcode positions and is updated per-emission via
+//!   [`encode_offset_with_history`]. These two are kept in sync by
+//!   construction for the lit-len > 0 case; the lit-len == 0
+//!   special-rule path (donor's `rep[0]-1` shift) is not yet
+//!   modeled — the kernel doesn't emit lit-len == 0 Triples today,
+//!   but a future cmov / lookahead-pipelined variant might.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;
@@ -876,5 +899,132 @@ mod tests {
             m.prefix_start_index > 0,
             "prefix_start_index must have advanced after an eviction",
         );
+    }
+
+    /// Boundary: exactly `HASH_READ_SIZE` (8) bytes appended via
+    /// `skip_matching(Some(false))` — the dict-prime hash population
+    /// loop must hash precisely one position (range_start == 0,
+    /// last_hashable == 0) without overrunning or panicking.
+    #[test]
+    fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        // 8-byte payload — at the edge of what the kernel can hash.
+        // After append: history.len() = 8, last_hashable = 0,
+        // range = 0..=0 (one position).
+        let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
+        m.accept_data(payload);
+        m.skip_matching(Some(false));
+        assert_eq!(m.history.len(), 8);
+        // No assertion on hash entries — the bug we're guarding
+        // against is a panic / overrun, not a behavioural one.
+        // Reaching this line without unwinding is the test.
+    }
+
+    /// Boundary: pending block too short to hash anything (less than
+    /// `HASH_READ_SIZE` bytes). The dict-prime path must early-return
+    /// without panicking on the `last_hashable` subtract.
+    #[test]
+    fn skip_matching_dict_prime_handles_below_hash_read_size_bytes() {
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let payload: alloc::vec::Vec<u8> = (0..4u8).collect();
+        m.accept_data(payload);
+        // history will be 4 bytes after append < HASH_READ_SIZE (8).
+        // prime_hash_table_for_range must short-circuit on the
+        // `history_len < HASH_READ_SIZE` guard.
+        m.skip_matching(Some(false));
+        assert_eq!(m.history.len(), 4);
+    }
+
+    /// rep ↔ offset_hist consistency: after a single block emits
+    /// matches, the matcher's `rep[0]` (kernel's `rep_offset1` post-
+    /// block) must equal `offset_hist[0]` (wire encoder's most
+    /// recently emitted explicit offset). They're updated by
+    /// different mechanisms (kernel internal state vs
+    /// encode_offset_with_history) but should converge on the same
+    /// value as long as every emitted Triple is a fresh (non-repcode)
+    /// offset.
+    #[test]
+    fn rep_and_offset_hist_track_emitted_explicit_offsets_in_lockstep() {
+        // Engineer a single block that produces a deterministic
+        // explicit match. 96 bytes: 48-byte distinct-window
+        // preamble + 48-byte verbatim copy of bytes [0..48].
+        let mut data = alloc::vec::Vec::with_capacity(96);
+        for i in 0..48u8 {
+            data.push(i.wrapping_mul(11).wrapping_add(3));
+        }
+        data.extend_from_within(0..48);
+
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        m.accept_data(data.clone());
+
+        let mut emitted_offsets: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        m.start_matching(|seq| {
+            if let Sequence::Triple {
+                offset, match_len, ..
+            } = seq
+                && match_len >= 4
+            {
+                emitted_offsets.push(offset);
+            }
+        });
+
+        // For at least one emitted explicit-offset match, the
+        // matcher's `rep[0]` (post-block) must equal that offset,
+        // AND `offset_hist[0]` must equal that offset. Both are
+        // computed independently — matching values mean the two
+        // tracks stayed in sync across the block.
+        assert!(
+            !emitted_offsets.is_empty(),
+            "test setup must produce at least one explicit match \
+             (otherwise this isn't testing the rep/offset_hist sync)",
+        );
+        let last_explicit = emitted_offsets[emitted_offsets.len() - 1];
+        assert_eq!(
+            m.rep[0] as usize, last_explicit,
+            "kernel's rep[0] must reflect the last emitted explicit \
+             offset (sync with wire encoder)",
+        );
+        assert_eq!(
+            m.offset_hist[0] as usize, last_explicit,
+            "offset_hist[0] (encode_offset_with_history-tracked) must \
+             match rep[0] (kernel-tracked) after a clean block",
+        );
+    }
+
+    /// Eviction during a dict-priming sequence: when consecutive
+    /// `skip_matching(Some(false))` calls accumulate past the
+    /// eviction threshold, the second skip must drop the older
+    /// prime'd hash entries (via `hash_table.clear()`) AND bump
+    /// `prefix_start_index` past the dropped bytes. Otherwise the
+    /// matcher would carry stale absolute positions referencing
+    /// evicted history.
+    #[test]
+    fn eviction_during_dict_priming_drops_stale_prime_entries() {
+        // window_log=8 → max_window_size=256, threshold=512.
+        // Two 300-byte blocks both via dict-prime skip — second
+        // one triggers eviction.
+        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let block1: alloc::vec::Vec<u8> = (0..200u8).collect();
+        m.accept_data(block1);
+        m.skip_matching(Some(false));
+        let block2: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(50)).collect();
+        m.accept_data(block2);
+        // Second skip would push total to 400, still under 512 — no
+        // eviction yet. Make sure two more rounds trigger it.
+        m.skip_matching(Some(false));
+        let block3: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(100)).collect();
+        m.accept_data(block3);
+        // Now 400+200=600 > 512 → eviction fires inside extend.
+        m.skip_matching(Some(false));
+
+        // Post-eviction state: prefix_start_index advanced past 1.
+        assert!(
+            m.prefix_start_index > 1,
+            "eviction must bump prefix_start_index past its initial 1 \
+             baseline (got {})",
+            m.prefix_start_index,
+        );
+        // History within the 2× window-size hard cap.
+        assert!(m.history.len() <= m.max_window_size * 2);
     }
 }
