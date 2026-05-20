@@ -141,32 +141,95 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         Ok(())
     }
 
-    // Single fused loop over all sequences. The state-update step
-    // (`ensure_bits` + per-decoder `update_state_fast`) is skipped on
-    // the final iteration — matching the donor `isLastSeq` template
-    // pattern (no pre-fetch of the next state when there is no next
-    // sequence). Under `#[inline(always)]` the trailing `if i + 1 <
-    // num_sequences` collapses to the same generated code as the
-    // previous split-shape version, but keeps the per-sequence body in
-    // one place so future edits to the hot path stay in sync.
-    let num_sequences = section.num_sequences as usize;
-    for i in 0..num_sequences {
-        let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-        execute_one_sequence(
-            buffer,
-            literals_buffer,
-            &mut lit_cur,
-            literals_buffer_len,
-            offset_hist,
-            seq,
-        )?;
-        seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+    // 1-stage lookahead pipeline: decode sequence `i+1` ahead of
+    // executing sequence `i`, then prefetch its match source line so
+    // the cache miss on the long-distance match copy overlaps with
+    // the current sequence's literal push + match copy. Long-distance
+    // matches (offset > L1 working set) read from buffer regions that
+    // have not been touched in the most recent ~32 KiB of output; the
+    // source line is likely cold, and the load that drives the
+    // `repeat()` memcpy stalls until DRAM/L3 returns.
+    //
+    // The prefetch is gated on the raw decoded offset value, NOT the
+    // resolved one: per Zstandard format §3.1.1.3.2.1.1.3 raw values
+    // 1..=3 are rep-codes that resolve to one of the three most
+    // recently used offsets — those are by definition cache-warm and
+    // a prefetch would just pollute the line and burn front-end
+    // bandwidth. Raw values >= 4 are explicit offsets (`raw - 3`);
+    // gating at `raw > L1_WORKING_SET + 3` keeps the prefetch on the
+    // path where it actually buys cache-miss overlap.
+    //
+    // The pipeline is structured by peeling the first decode in front
+    // of the loop and re-using it as the iter-`i` execute target while
+    // the iter-`i` body decodes `i+1`. The transactional rollback
+    // contract is preserved: bitstream consumption order is unchanged
+    // (decode reads N bits whether peeled or in-loop), and a failed
+    // post-loop `bits_remaining() != 0` check still restores the
+    // pre-loop buffer / offset_hist via the checkpoint.
+    //
+    // No-op fallback for the empty-sequence case below: when
+    // `num_sequences == 0`, the loop body never runs and the tail
+    // literals path below handles the rest.
+    const L1_WORKING_SET: u32 = 32 * 1024;
+    const PREFETCH_GATE: u32 = L1_WORKING_SET + 3;
 
-        if i + 1 < num_sequences {
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(&mut br);
-            ml_dec.update_state_fast(&mut br);
-            of_dec.update_state_fast(&mut br);
+    let num_sequences = section.num_sequences as usize;
+    if num_sequences > 0 {
+        // Pre-decode the first sequence so the in-loop body can
+        // decode-and-prefetch sequence `i+1` while executing
+        // sequence `i`.
+        let mut current_seq =
+            decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+        if current_seq.of > PREFETCH_GATE {
+            // SAFETY of the address: prefetch_match_source clamps to
+            // the visible buffer region and no-ops if the offset
+            // overruns. The resolved offset (after do_offset_history)
+            // can differ slightly from `current_seq.of - 3` for
+            // rep-code branches; for explicit-offset paths (gated
+            // here) it matches exactly. A small address error is
+            // within the cache-line span of the HW prefetcher's
+            // forward-scan so the warming still lands on the right
+            // working set.
+            buffer.prefetch_lookahead((current_seq.of - 3) as usize);
+        }
+
+        for i in 0..num_sequences {
+            // While iter `i` is in flight, pre-decode iter `i+1` and
+            // issue its prefetch. The state-update step is peeled into
+            // this branch because `decode_one_sequence_inline` reads
+            // the CURRENT FSE state — advancing it before the in-flight
+            // execute would corrupt the iter-`i` decoder state, but
+            // here we've already saved iter `i`'s sequence into
+            // `current_seq` before mutating any FSE state.
+            let next_seq = if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+                let s = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+                if s.of > PREFETCH_GATE {
+                    buffer.prefetch_lookahead((s.of - 3) as usize);
+                }
+                Some(s)
+            } else {
+                None
+            };
+
+            execute_one_sequence(
+                buffer,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                offset_hist,
+                current_seq,
+            )?;
+            seq_sum = seq_sum
+                .wrapping_add(current_seq.ll)
+                .wrapping_add(current_seq.ml);
+
+            if let Some(s) = next_seq {
+                current_seq = s;
+            }
         }
     }
 
