@@ -85,7 +85,7 @@ impl<'t> FSEDecoder<'t> {
     /// not been built yet (empty `decode` vec). `FSEDecoder::new`
     /// produces such a decoder with a zero-default `state`; the
     /// well-behaved pipeline is `new` → `init_state` → `update_state*`,
-    /// and `init_state` returns `Err` on an uninitialised table. This
+    /// and `init_state` returns `Err` on an uninitialized table. This
     /// assertion converts what would otherwise be UB (from the
     /// unchecked indexing in `read_entry`) into a clear fail-fast
     /// panic that surfaces the API misuse immediately instead of
@@ -112,8 +112,10 @@ impl<'t> FSEDecoder<'t> {
         // check.
         assert!(
             !self.table.decode.is_empty(),
-            "FSEDecoder::update_state called on an uninitialised table; \
-             call init_state successfully before any update_state* call",
+            concat!(
+                "FSEDecoder::update_state called on an uninitialized table; ",
+                "call init_state successfully before any update_state* call",
+            ),
         );
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);

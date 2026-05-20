@@ -1035,13 +1035,11 @@ impl core::fmt::Display for FSEDecoderError {
             } => match 1usize.checked_shl((*accuracy_log).into()) {
                 Some(expected) => write!(
                     f,
-                    "FSETable shape invariant violated: decode.len() = {decode_len}, \
-                     expected 1 << accuracy_log = {expected} (accuracy_log = {accuracy_log})",
+                    "FSETable shape invariant violated: decode.len() = {decode_len}, expected 1 << accuracy_log = {expected} (accuracy_log = {accuracy_log})",
                 ),
                 None => write!(
                     f,
-                    "FSETable shape invariant violated: decode.len() = {decode_len}, \
-                     accuracy_log = {accuracy_log} overflows 1 << accuracy_log for usize",
+                    "FSETable shape invariant violated: decode.len() = {decode_len}, accuracy_log = {accuracy_log} overflows 1 << accuracy_log for usize",
                 ),
             },
         }
