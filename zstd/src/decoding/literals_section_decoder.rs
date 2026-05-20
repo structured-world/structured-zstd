@@ -200,10 +200,17 @@ fn decompress_literals(
                 && brs[1].bits_remaining() > burst_bits_isize
                 && brs[2].bits_remaining() > burst_bits_isize
                 && brs[3].bits_remaining() > burst_bits_isize
-                && cursors[0] + symbols_per_burst <= ends[0]
-                && cursors[1] + symbols_per_burst <= ends[1]
-                && cursors[2] + symbols_per_burst <= ends[2]
-                && cursors[3] + symbols_per_burst <= ends[3]
+                // Saturating form so the bound holds even when `ends[i]
+                // < symbols_per_burst` near the segment tail (rather
+                // than relying on `cursors[i] + symbols_per_burst` not
+                // wrapping). `regen` is bounded by RFC 8878 block
+                // size ⇒ overflow is unreachable in practice, but the
+                // saturating shape costs the same single subq and
+                // removes the addition entirely.
+                && cursors[0] <= ends[0].saturating_sub(symbols_per_burst)
+                && cursors[1] <= ends[1].saturating_sub(symbols_per_burst)
+                && cursors[2] <= ends[2].saturating_sub(symbols_per_burst)
+                && cursors[3] <= ends[3].saturating_sub(symbols_per_burst)
                 && brs[0].bits_consumed >= max_num_bits
                 && brs[1].bits_consumed >= max_num_bits
                 && brs[2].bits_consumed >= max_num_bits
