@@ -140,20 +140,24 @@ impl FastHashTable {
                 u.wrapping_mul(PRIME_4_BYTES) >> (32 - self.hash_log)
             }
             5 => {
-                // SAFETY: caller guarantees ≥5 readable bytes; the
-                // u64 load reads 8 but only the bottom 40 bits are
-                // hashed (`<< (64-40)` shifts the rest off).
+                // SAFETY: caller guarantees ≥8 readable bytes per the
+                // method-level doc — every MLS≥5 path performs a
+                // wide u64 load and shifts off the unused top bits;
+                // a 5-byte promise would leave 3 bytes of the load
+                // past the caller's range.
                 let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
                 ((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES) >> (64 - self.hash_log)) as u32
             }
             6 => {
-                // SAFETY: caller guarantees ≥6 readable bytes; same
-                // u64-load + top-bit shift pattern as mls=5.
+                // SAFETY: caller guarantees ≥8 readable bytes (u64
+                // load — only the bottom 48 bits feed the hash, but
+                // the LOAD is still 8 bytes wide).
                 let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
                 ((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES) >> (64 - self.hash_log)) as u32
             }
             7 => {
-                // SAFETY: caller guarantees ≥7 readable bytes.
+                // SAFETY: caller guarantees ≥8 readable bytes (u64
+                // load — bottom 56 bits feed the hash; LOAD is 8).
                 let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
                 ((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES) >> (64 - self.hash_log)) as u32
             }

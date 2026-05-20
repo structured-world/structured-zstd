@@ -151,18 +151,20 @@ pub(crate) struct FastBlockResult {
 ///
 /// # Sequence emission contract
 ///
-/// The kernel emits ONLY in-block sequences (literals + match
-/// pairs and pure-literal runs from anchor advances inside the
-/// main loop). It NEVER emits a terminal `Sequence::Literals`
-/// covering the trailing bytes from the last anchor to the end of
-/// `data` — those bytes are accounted for by
-/// `FastBlockResult.tail_literals_len`, and emitting them is the
-/// caller's responsibility. This rule applies UNIFORMLY across
-/// every exit branch, including the early-return short-input
-/// branch below; without this uniformity a caller wrapping the
-/// kernel's output would have to special-case "did the kernel
-/// already emit the tail" per branch, which is exactly the
-/// inconsistency this contract removes.
+/// The kernel emits ONLY `Sequence::Triple` callbacks — one per
+/// emitted match (repcode or explicit). Each `Triple` carries the
+/// literal-run that precedes the match in its `literals` field, so
+/// the kernel never needs a separate `Sequence::Literals` mid-block
+/// call. The trailing bytes from the last anchor to the end of
+/// `data` are NOT emitted via the closure; they are accounted for
+/// by `FastBlockResult.tail_literals_len`, and emitting them as
+/// the terminal `Sequence::Literals` (or absorbing them however
+/// the caller wants) is the caller's responsibility. This rule
+/// applies UNIFORMLY across every exit branch, including the
+/// short-input early-return; without that uniformity a caller
+/// wrapping the kernel's output would have to special-case "did
+/// the kernel already emit the tail" per branch, which is exactly
+/// the inconsistency this contract removes.
 #[inline(always)]
 pub(crate) fn compress_block_fast<const MLS: u32>(
     data: &[u8],
@@ -173,7 +175,27 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
     debug_assert_eq!(MLS, hash_table.mls(), "MLS must match hash_table's mls");
-    debug_assert!(block_start <= data.len(), "block_start past data end",);
+    // Real runtime checks (not debug_assert) — these prevent UB in
+    // release builds. `block_start > data.len()` would wrap
+    // `block_start + HASH_READ_SIZE` in the short-input guard below
+    // and proceed into the main loop with an out-of-bounds ip0.
+    // `data.len() > u32::MAX` would silently truncate position
+    // values when the kernel stores them into the u32 hash table or
+    // computes `offset = ip0 - match_pos` as a u32, corrupting both
+    // match indices and repcode history.
+    assert!(
+        block_start <= data.len(),
+        "block_start ({block_start}) must not exceed data.len() ({})",
+        data.len(),
+    );
+    assert!(
+        data.len() <= u32::MAX as usize,
+        "FastKernel does not support data.len() ({}) > u32::MAX ({}); \
+         the kernel stores absolute positions in a u32 hash table and \
+         u32 offset codes, so larger inputs would silently truncate",
+        data.len(),
+        u32::MAX,
+    );
 
     // Block too short to do any matching — report the whole block
     // as trailing literals without emitting anything. Donor mirrors
