@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779286382336,
+  "lastUpdate": 1779295921052,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -41930,6 +41930,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.202,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "969cf6485fcaf1ebf77ef858508abdf82ae68e75",
+          "message": "perf(fse): elide bounds check on init_state + update_state decode reads (#214)\n\n* perf(decode): 1-stage lookahead prefetch for long-distance match sources\n\nAdds prefetch_lookahead() on DecodeBuffer that issues an L1 prefetch\nhint for the source line a future repeat() will read from. Threaded\ninto decode_and_execute_sequences as a 1-stage decode-ahead pipeline:\neach iteration decodes sequence i+1 and prefetches its match source\nwhile executing sequence i. The cache miss on the long-distance match\ncopy then overlaps with the literal push + match copy of the in-flight\nsequence.\n\nPrefetch is gated on the raw decoded offset value (raw > L1_WORKING_SET\n+ 3 ~ 32 KiB + rep-code adjustment): per Zstandard format\n§3.1.1.3.2.1.1.3 raw values 1..=3 are rep-codes that resolve to one of\nthe three most recently used offsets — those are cache-warm by\ndefinition and a prefetch would burn front-end bandwidth for nothing.\nRaw values >= 4 are explicit offsets (resolved = raw - 3); gating\nabove L1 keeps the hint on the actual long-distance match path.\n\nThe pipeline preserves the transactional rollback contract: bitstream\nconsumption order is unchanged (decode reads N bits whether peeled or\nin-loop), and a failed post-loop bits_remaining() != 0 check still\nrestores the pre-loop buffer / offset_hist via the checkpoint.\n\nExpected perf:\n- decodecorpus-z000033: ~0 % (typical offsets stay in L1/L2, prefetch\n  no-ops above gate; small overhead from added branch + helper).\n- Large-window corpora (offsets > L2 / approaching DRAM): partial\n  hide of cache-miss latency, measurable when bench inputs exercise\n  that regime.\n\n* Revert \"perf(decode): 1-stage lookahead prefetch for long-distance match sources\"\n\nThis reverts commit da61257a12aebd5ad7a5c6ce677a0b5c50ddd082.\n\n* Reapply \"perf(decode): 1-stage lookahead prefetch for long-distance match sources\"\n\nThis reverts commit 988b1f91db0bca55d1d1d5310e822f585667bfe4.\n\n* perf(decode): peel last iter from prefetch lookahead loop for tighter codegen\n\nReplace per-iter `if i + 1 < num_sequences { Some(...) } else { None }`\nOption<> roundtrip with a peeled-tail structure: the inner loop runs\nunconditionally for `num_sequences - 1` iterations (decode-ahead +\nprefetch + execute current), and the final sequence is executed after\nthe loop.\n\nThe previous Option<>-based pipeline added a per-iter conditional\nmaterialise + conditional move (`if let Some(s) = next_seq { current_seq = s; }`),\nwhich on i9-9900K turned out to break LLVM's loop-body scheduling and\nregressed all four measured scenarios by +1.7..+2.5 %. Without the\nOption<> the inner body has a single straight-line shape: update_state\n- decode - maybe_prefetch - execute - assign - jump-back.\n\n* Revert \"perf(decode): peel last iter from prefetch lookahead loop for tighter codegen\"\n\nThis reverts commit 8fbbd0a46a00a52c98a272f7669d0592967cd5eb.\n\n* Revert \"Reapply \"perf(decode): 1-stage lookahead prefetch for long-distance match sources\"\"\n\nThis reverts commit 8a2c21fdffaa97ceacae29bf87fc0a7cad35aa70.\n\n* perf(fse): use get_unchecked on init_state + update_state hot indexing\n\n`init_state` reads `decode[new_state]` where `new_state` is\n`accuracy_log` bits from the bitstream, so `new_state < (1 <<\naccuracy_log) = table_size = decode.len()`. `build_decoding_table`\nallocates the table at exactly `1 << accuracy_log` entries — the bounds\ncheck the checked indexing emits is provably redundant.\n\n`update_state` (the non-fast variant used by the RLE-fallback path)\napplies the same invariant from `calc_baseline_and_numbits`:\n`new_state + (1 << num_bits) - 1 < table_size`, and the bitstream read\nguarantees `add < 1 << num_bits`, so `next_state < decode.len()`.\n\nBrings both functions in line with `update_state_fast` which already\nuses `get_unchecked`; with this commit there are no remaining\nbounds-checked `table.decode[idx]` reads on the decode hot or warm\npaths (init_state fires 3× per block, update_state fires on the\nlegacy RLE-fallback two-pass loop — neither is bandwidth-bound, but\nshaving the bounds check still removes a few cycles per call site\nand keeps the FSE state-transition primitives uniformly unchecked).\n\n* test(fse): add debug_assert tripwires before unchecked decode reads\n\nUnder `feature = \"fuzz_exports\"` the `fse` module and `FSETable` (with\n`pub decode` / `pub accuracy_log`) become externally constructible, so\na fuzz harness can hand the decoder a mis-shaped table whose\n`decode.len()` != `1 << accuracy_log` or whose `Entry.new_state`\npoints past the table end. Before this commit a mis-shaped table would\nturn the `get_unchecked` reads in `init_state` / `update_state` /\n`update_state_fast` into UB instead of the bounds-check panic the\nfuzz target relies on to surface the invariant violation.\n\nAdd `debug_assert!` guards before each unchecked access:\n\n- `init_state`: `decode.len() == 1 << accuracy_log` (table-shape) +\n  `new_state < decode.len()` (per-read).\n- `update_state` / `update_state_fast`: `next_state < decode.len()`\n  (per-read).\n\nZero release-mode overhead, but turn fuzz-injected invalid tables into\npanics rather than UB. The unchecked reads themselves are unchanged —\nthe production path's SAFETY argument is undisturbed.\n\n* fix(fse): cfg-gate unchecked decode reads behind fuzz_exports\n\nThe previous `debug_assert!` tripwires were a no-op under `cargo fuzz\nrun` (which builds in release mode by default), so a fuzz harness\nholding the `fuzz_exports` feature could still feed a mis-shaped\n`FSETable` into the decoder and trigger UB through `get_unchecked`.\n\nSwitch the three FSE state-transition reads (`init_state`,\n`update_state`, `update_state_fast`) to go through a new\n`read_entry` helper that is `#[cfg]`-gated:\n\n- `#[cfg(feature = \"fuzz_exports\")]`: bounds-checked\n  `decode[idx]` — a malformed table panics instead of invoking UB.\n- `#[cfg(not(feature = \"fuzz_exports\"))]`: `get_unchecked` — the\n  production path keeps the no-bounds-check codegen the unchecked path\n  is meant to produce.\n\nAlso add an `init_state` table-shape check (only compiled under\n`fuzz_exports`) that verifies `decode.len() == 1 << accuracy_log`\nbefore any read, using `checked_shl` to handle pathological\n`accuracy_log >= usize::BITS` without a shift panic.\n\n* fix(fse): clarify fuzz-exports guard rationale + typed InvalidTableShape\n\nTwo follow-ups on the fuzz_exports guard added in e3fd1f45:\n\n1. The guard comment in `init_state` previously said it prevents\n   \"unchecked reads in read_entry from hitting OOB\", but under\n   `fuzz_exports` `read_entry` is bounds-checked (panics on OOB), not\n   unchecked. Rewrote to reflect the actual goal: validate the\n   table-shape invariant up-front so a malformed fuzz-supplied table\n   surfaces as a typed decoder error instead of a bounds-check panic\n   that fuzz harnesses cannot distinguish from legitimate failures.\n\n2. The shape-violation path returned `TableIsUninitialized`, which was\n   misleading for fuzz triage — the table may be initialized but\n   invalid (wrong length, oversized accuracy_log). Added a dedicated\n   `FSEDecoderError::InvalidTableShape { decode_len, accuracy_log }`\n   variant (the enum is `#[non_exhaustive]`, so this is a non-breaking\n   addition) with a Display impl that prints both the actual length\n   and the expected `1 << accuracy_log` value for one-glance triage.\n\n* fix(fse): distinguish overflow case in InvalidTableShape Display\n\nPreviously the Display impl computed `expected = 1usize.checked_shl(...).unwrap_or(0)`,\nso an `accuracy_log` value that overflows `usize::BITS` printed\n`expected 1 << accuracy_log = 0` — visually indistinguishable from\n`accuracy_log = 0` (which is a different failure, caught earlier as\nTableIsUninitialized) and an unhelpful triage signal.\n\nFormat the overflow case explicitly via `match` on `checked_shl`:\n\n- `Some(expected)` → \"expected 1 << accuracy_log = {expected}\".\n- `None` → \"accuracy_log = {accuracy_log} overflows 1 << accuracy_log\n  for usize\".\n\nBoth branches still print the actual decode_len and accuracy_log so a\nfuzz harness sees the full state of the malformed table.\n\n* docs(copilot): add 20 no-std-first design rules\n\nDocument the project-wide no-std-first design contract so the Copilot\nreviewer (and human reviewers) apply consistent rules when reviewing\nnew Rust code:\n\n- Primitive selection order: core → alloc → external no_std crate →\n  cfg-gated std → unconditional std (last resort).\n- Public API surface must use only core / alloc types in non-std-only\n  crates; std types restricted to implementation modules behind\n  cfg(feature = \"std\").\n- Specific forbidden patterns: std::collections::HashMap/HashSet,\n  std::sync::Mutex/RwLock in new code, std::sync::OnceLock for\n  fallible init, thread_local!, std::io::Error in public APIs,\n  std::time::Instant/SystemTime in public APIs, std::thread::*.\n- Migration ratchet: adding a new use std::* to a non-std-only crate\n  is one-way and must re-tier the crate explicitly. no-std-check CI\n  error count must be monotonically non-decreasing per PR.\n- Exemptions: tests, benches, and src/bin/* may use std freely.\n\nThese rules are repo-wide and apply to every Rust library crate.\n\n* docs(copilot): drop per-crate tier concept from no-std rules\n\nThe previous draft referenced \"per-crate tier table\" / \"std-only tier\" /\n\"alloc-tier\" — concepts that don't exist in this repo. structured-zstd\nMUST compile and work under no_std + alloc; there is no carve-out for\n\"std-only crates\".\n\nRewrite as a flat contract:\n\n- Drop the dedicated tier-reclassification rule entirely.\n- Strip \"of crates not tiered std-only\" / \"below std-only tier\" /\n  \"per-crate tier table\" phrasing from rules 5/6/9/10/11/12/14/15.\n- State the no_std + alloc requirement up-front as a project-wide\n  invariant, not an aspiration.\n- Rule 16 now references the no-std-check CI job directly instead of an\n  abstract \"migration progress\".\n\nTotal: 19 rules (was 20). Same semantic coverage, applies uniformly to\nevery src/lib.rs and submodule in the repo.\n\n* fix(fse): guard update_state against pre-init UB on empty decode table\n\n`FSEDecoder::new` builds a decoder with a zero-default `Entry` state\nregardless of whether the referenced table was actually populated.\nA caller that constructs the decoder and then invokes the public\n`update_state` BEFORE a successful `init_state` would resolve to\n`read_entry(0)` → `get_unchecked(0)` on an empty `decode` vec — UB\nin release mode (debug_assert is stripped, so the previous fuzz\ntripwire wouldn't catch it).\n\nPublic-API safety guard: branch on `self.table.decode.is_empty()` at\nthe top of `update_state` and return early when the table has not\nbeen populated. Strongly biased \"not taken\" (the well-behaved decode\npipeline always pairs new → init_state → update_state*), so the\nbranch predictor amortises it to zero cost on the hot path.\n\n`update_state_fast` is `pub(crate)` with a controlled call site\n(`decode_and_execute_sequences` always succeeds `init_state` before\nentering the per-sequence loop), so the empty-table check is omitted\nto keep the per-sequence body branch-free. The precondition is now\ndocumented as part of the doc comment instead.\n\n* fix(fse): assert! instead of silent return on uninitialised update_state\n\nThe previous `if decode.is_empty() { return; }` guard avoided the UB\nthat get_unchecked would produce on an empty table, but at the cost\nof converting a clear API misuse (calling update_state before a\nsuccessful init_state) into a silent no-op. The bitstream would have\nadvanced (the caller already read its bits via the surrounding decode\nloop) but the decoder state would stay stuck at the zero-default\nEntry — leaving the rest of the block to decode garbage with no\ndiagnostic surface.\n\nSwitch the guard to an unconditional `assert!` so the misuse fails\nfast in both debug and release: same UB-safety guarantee as before,\nbut the panic clearly identifies the contract violation instead of\nproducing corrupted output. The well-behaved decode pipeline (`new`\n→ `init_state` → `update_state*`) is unchanged — the assertion is\nstrongly biased \"not taken\" and the predictor amortises it on the\nhot path.\n\n* docs(copilot): align no-std rules 3 + 4 with actual crate / CI config\n\nThe previous draft of rules 3 and 4 prescribed structure this crate\ndoesn't follow:\n\n- Rule 3 required `alloc = []` feature in Cargo.toml — this crate\n  uses `extern crate alloc;` unconditionally (alloc is always\n  required for the decoder's Vec<u8> buffers), so an `alloc` feature\n  would be unused machinery. zstd/Cargo.toml has `default = [\"hash\",\n  \"std\"]` + `std = []`, no `alloc` feature, and that is correct.\n- Rule 4 said CI MUST use an embedded target like\n  `thumbv7em-none-eabihf`. The current no-std-check CI job uses the\n  host target with `cargo clippy --no-default-features -- -D warnings`\n  (and a second `--features hash` variant). This catches transitive\n  std leaks via the unused-import lint as long as no dep smuggles\n  std::* re-exports — true for this crate.\n\nRewrite both rules to describe what a no-std-first crate actually\nneeds (std feature in default + cfg_attr in lib.rs + a no-std CI\ngate), document the optional/recommended bits without making them\nbinding, and note the embedded-target variant as the stronger option\nthat future crates SHOULD prefer.\n\n* fix(fse): collapse multi-line panic / Display messages to single literal\n\nThe previous `assert!` message in `update_state` and the two `write!`\narms of `InvalidTableShape` Display used backslash line-continuation\ninside the string literal, which preserves the indentation of the\ncontinuation line and embeds a long run of spaces into the rendered\npanic / error message.\n\nSwitch all three to a single-line string literal so the user-visible\ntext reads cleanly (`...decode.len() = N, expected 1 << ...` instead\nof `...decode.len() = N,                      expected 1 << ...`).\nAlso normalise the assertion spelling from \"uninitialised\" to\n\"uninitialized\" to match the existing `FSEDecoderError::TableIsUninitialized`\nvariant and the surrounding doc-comment wording.\n\n(`concat!()` was the first attempt but breaks Rust's implicit\nnamed-argument capture in `write!` / `assert!` macros — the format\nmachinery only sees the captures when the format string is a string\nliteral directly at the macro call site, so the single-line literal\nis the correct fix.)",
+          "timestamp": "2026-05-20T19:01:00+03:00",
+          "tree_id": "684be4ca3353d63048668c52e13e540e01db3f3d",
+          "url": "https://github.com/structured-world/structured-zstd/commit/969cf6485fcaf1ebf77ef858508abdf82ae68e75"
+        },
+        "date": 1779295916872,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.135,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 319.812,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 205.996,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.72,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.743,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.996,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.015,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.911,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.968,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.277,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.28,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.978,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.657,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.929,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.301,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.991,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.079,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
