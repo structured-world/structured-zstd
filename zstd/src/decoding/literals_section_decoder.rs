@@ -523,8 +523,9 @@ mod burst_gate_tests {
     /// guaranteeing the SIMD→refill→burst transition fires repeatedly.
     #[test]
     fn burst_simd_fallback_refill_reentry_long_streams() {
-        // 64-symbol modulo distribution → max_num_bits ≈ 6..7,
-        // symbols_per_burst ≈ 8..9.
+        // 67-symbol modulo distribution (`i % 67`, prime modulus spreads
+        // the alphabet evenly) → max_num_bits typically 7..8, which gives
+        // `symbols_per_burst = (63 - max) / max ≈ 6..8`.
         let mut data: Vec<u8> = Vec::with_capacity(16 * 1024);
         for i in 0..16 * 1024u32 {
             data.push((i % 67) as u8);
