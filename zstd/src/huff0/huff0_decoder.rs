@@ -128,14 +128,12 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
 
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
-    /// Retained for the x86 `decode_symbol_and_advance` BMI2 dispatch
-    /// in the tail loop. The new 4-stream HUF burst in
-    /// `literals_section_decoder::decode_literals` bypasses kernel
-    /// dispatch entirely by indexing `HuffmanTable::packed_decode`
-    /// directly, so on aarch64 (where the tail also collapses to the
-    /// scalar path) this field is initialised but never read —
-    /// suppressed to keep clippy happy without dropping the x86 dispatch.
-    #[allow(dead_code)]
+    /// Read by `decode_symbol_and_advance` (x86 BMI2 dispatch) and by
+    /// `decode4_symbols_and_num_bits_for_kernel` (SIMD fallback in
+    /// `literals_section_decoder::decode_literals` when the donor
+    /// burst is gated out post-refill). The donor burst itself
+    /// bypasses kernel dispatch by indexing
+    /// `HuffmanTable::packed_decode` directly.
     kernel: HuffmanDecodeKernel,
     /// State is used to index into the table.
     pub state: u64,
@@ -239,14 +237,12 @@ impl<'t> HuffmanDecoder<'t> {
         }
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn decode_symbol_and_num_bits(&self) -> (u8, u8) {
         let entry = self.table.decode[self.state as usize];
         (entry.symbol, entry.num_bits)
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn advance_state_by_bits(&mut self, br: &mut BitReaderReversed<'_>, num_bits: u8) {
         let new_bits = br.get_bits(num_bits);
@@ -266,7 +262,6 @@ impl<'t> HuffmanDecoder<'t> {
         }
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn decode4_symbols_and_num_bits(
         decoders: &[HuffmanDecoder<'_>; 4],
@@ -284,7 +279,6 @@ impl<'t> HuffmanDecoder<'t> {
         Self::decode4_symbols_and_num_bits_for_kernel(decoders, kernel)
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     /// # Safety
     ///
@@ -310,7 +304,6 @@ impl<'t> HuffmanDecoder<'t> {
         Self::decode4_symbols_and_num_bits_for_kernel(decoders, decoders[0].kernel)
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn decode4_has_shared_table_and_kernel(decoders: &[HuffmanDecoder<'_>; 4]) -> bool {
         let kernel = decoders[0].kernel;
@@ -320,7 +313,6 @@ impl<'t> HuffmanDecoder<'t> {
                 .all(|d| core::ptr::eq(d.table, decoders[0].table))
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     fn decode4_symbols_and_num_bits_for_kernel(
         decoders: &[HuffmanDecoder<'_>; 4],
@@ -351,7 +343,6 @@ impl<'t> HuffmanDecoder<'t> {
         }
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     fn decode4_symbols_and_num_bits_scalar(
         decoders: &[HuffmanDecoder<'_>; 4],
