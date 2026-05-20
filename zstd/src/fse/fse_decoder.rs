@@ -35,6 +35,22 @@ impl<'t> FSEDecoder<'t> {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
         let new_state = bits.get_bits(self.table.accuracy_log);
+        // Table-shape invariant from `build_decoding_table`:
+        // `decode.len() == 1 << accuracy_log`. The internal decoder
+        // path always satisfies this by construction. Under
+        // `feature = "fuzz_exports"` the `FSETable` field setters
+        // become reachable from external fuzz harnesses, so this
+        // tripwire catches a mis-shaped table before the unchecked
+        // read below dereferences out of bounds.
+        debug_assert_eq!(
+            self.table.decode.len(),
+            1usize << self.table.accuracy_log,
+            "FSETable.decode must be sized 1 << accuracy_log",
+        );
+        debug_assert!(
+            (new_state as usize) < self.table.decode.len(),
+            "init_state read past decode table",
+        );
         // SAFETY: `accuracy_log` bits read from the bitstream produce
         // `new_state < (1 << accuracy_log) = table_size = decode.len()`.
         // `build_decoding_table` ensures the table is sized exactly
@@ -50,6 +66,14 @@ impl<'t> FSEDecoder<'t> {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
+        // Fuzz-harness tripwire — `fuzz_exports` makes `FSETable.decode`
+        // externally constructible, so a mis-shaped table or an `Entry`
+        // with `new_state` past the table size would turn the unchecked
+        // read below into UB instead of a panic.
+        debug_assert!(
+            next_state < self.table.decode.len(),
+            "update_state read past decode table",
+        );
         // SAFETY: same invariant as `update_state_fast` below —
         // `new_state` and `num_bits` were paired by
         // `calc_baseline_and_numbits` during table construction such
@@ -72,6 +96,14 @@ impl<'t> FSEDecoder<'t> {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
+        // Fuzz-harness tripwire — `fuzz_exports` makes `FSETable.decode`
+        // externally constructible, so a mis-shaped table or an `Entry`
+        // with `new_state` past the table size would turn the unchecked
+        // read below into UB instead of a panic.
+        debug_assert!(
+            next_state < self.table.decode.len(),
+            "update_state_fast read past decode table",
+        );
         // SAFETY: `new_state` and `num_bits` were paired by
         // `calc_baseline_and_numbits` during table construction such that
         // `new_state + (2.pow(num_bits) - 1) < table_size = self.table.decode.len()`.
