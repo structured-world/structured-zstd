@@ -192,7 +192,29 @@ pub(crate) fn compress_block_fast<const MLS: u32>(
     rep: [u32; 2],
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
-    debug_assert_eq!(MLS, hash_table.mls(), "MLS must match hash_table's mls");
+    // Real runtime check (not debug_assert) — MLS is a const-generic
+    // so the wrong value would compile, and a mismatched table at the
+    // call site would silently hash/probe with the wrong layout in
+    // release: `compress_block_fast::<5>(..., &mut
+    // FastHashTable::new(_, 4), ...)` would route to the mls=5 hash
+    // formula but read entries indexed by the mls=4 hash → garbage
+    // match candidates, mis-compression instead of a clean failure.
+    // The `(4..=8).contains(&MLS)` check is logically redundant given
+    // the `_ => debug_assert!(false)` arm in `FastHashTable::hash_ptr`,
+    // but stating it here surfaces the contract at the call site of
+    // the entry point and produces a clearer panic message than the
+    // hash-table-internal one.
+    assert!(
+        (4..=8).contains(&MLS),
+        "Fast kernel only supports MLS in 4..=8 (got {MLS})",
+    );
+    assert_eq!(
+        MLS,
+        hash_table.mls(),
+        "compress_block_fast<{MLS}> called with hash_table whose mls = {}; \
+         the table's hash formula must match the kernel's monomorphised mls",
+        hash_table.mls(),
+    );
     // Real runtime checks (not debug_assert) — both run in every
     // build because they catch distinct failure modes:
     //
