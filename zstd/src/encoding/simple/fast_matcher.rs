@@ -18,11 +18,6 @@
 //! routes the driver's Matcher trait methods through here; that
 //! commit lands separately on the same PR.
 //!
-//! The narrowly-scoped `#![allow(dead_code)]` covers exactly the
-//! items the wiring commit consumes — leaving `unused_imports`
-//! active so any stray import in sibling code is still flagged.
-//! The allow is removed in the wiring commit.
-//!
 //! # Invariants this module guarantees
 //!
 //! - `prefix_start_index >= 1` at all times. Position 0 in `history`
@@ -41,7 +36,6 @@
 //!   special-rule path (donor's `rep[0]-1` shift) is not yet
 //!   modeled — the kernel doesn't emit lit-len == 0 Triples today,
 //!   but a future cmov / lookahead-pipelined variant might.
-#![allow(dead_code)]
 
 use alloc::vec::Vec;
 
@@ -60,6 +54,12 @@ use super::fast_kernel::kernel::compress_block_fast;
 /// (smaller inputs drop `hash_log` proportionally).
 pub(crate) const FAST_LEVEL_1_HASH_LOG: u32 = 14;
 pub(crate) const FAST_LEVEL_1_MLS: u32 = 7;
+/// Donor level-1 Fast `window_log`. Production code reads
+/// `window_log` from the resolved [`crate::encoding::match_generator`]
+/// `LevelParams` directly; this const exists only for the
+/// [`FastKernelMatcher::new`] test-helper constructor and the
+/// invariant assertions in this file's tests.
+#[cfg(test)]
 pub(crate) const FAST_LEVEL_1_WINDOW_LOG: u8 = 19;
 
 /// Donor's initial repcode state — `(rep_offset1 = 1, rep_offset2 = 4)`
@@ -141,11 +141,12 @@ pub(crate) struct FastKernelMatcher {
 }
 
 impl FastKernelMatcher {
-    /// Build a fresh matcher with the donor's level-1 defaults baked
-    /// in. The driver re-invokes [`Self::reset`] on every frame, so
-    /// these defaults are only what the matcher carries until the
-    /// first `reset` call — they exist so `MatchGeneratorDriver::new`
-    /// can construct the matcher without committing to a level yet.
+    /// Test-only zero-arg constructor that bakes in the donor's
+    /// level-1 defaults. Production code goes through
+    /// [`Self::with_params`] directly from the driver, threading the
+    /// resolved LevelParams `window_log` (and the donor `hash_log =
+    /// 14`, `mls = 7` constants) explicitly — no defaults applied.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_params(
             FAST_LEVEL_1_WINDOW_LOG,
@@ -209,10 +210,14 @@ impl FastKernelMatcher {
         self.last_block_start = 0;
     }
 
-    /// Reported decoder-side window size (bytes).
+    /// Reported decoder-side window size (bytes) — test-only.
     ///
-    /// Equals `1 << window_log`. The driver forwards this through the
-    /// `Matcher::window_size` trait method into the frame header.
+    /// Equals `1 << window_log`. Production reads
+    /// `reported_window_size` on [`crate::encoding::match_generator::MatchGeneratorDriver`]
+    /// directly (it sets the field at `reset` time from
+    /// `LevelParams.window_log`); this helper exists so tests can
+    /// assert the matcher's own internal record matches.
+    #[cfg(test)]
     pub(crate) fn window_size(&self) -> u64 {
         self.max_window_size as u64
     }
