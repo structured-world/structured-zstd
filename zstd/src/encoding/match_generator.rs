@@ -553,7 +553,34 @@ impl MatchGeneratorDriver {
     /// time. Effective window sizing is recalculated on every [`reset`](Self::reset)
     /// from the resolved compression level and optional source-size hint.
     pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
-        let max_window_size = max_slices_in_window * slice_size;
+        // Validate inputs before deriving window_log_init. Two
+        // failure modes need explicit guards:
+        //
+        // 1. Zero args → `max_window_size = 0` → `next_power_of_two`
+        //    yields 1 → `trailing_zeros = 0` → `1usize << 0 = 1`
+        //    (degenerate 1-byte window; not a panic but useless).
+        //
+        // 2. Overflow on `slice_size * max_slices_in_window` → the
+        //    wrapped product may have `next_power_of_two()`
+        //    overflow past `usize::MAX` → returns 0 →
+        //    `trailing_zeros(0) = 64` → `1usize << 64` panics in
+        //    debug, UB in release.
+        //
+        // Catch both at construction with a clear panic message,
+        // rather than letting either mode produce a silent
+        // degenerate matcher or a `pow_of_two` panic deep in
+        // `FastKernelMatcher::with_params`.
+        assert!(
+            slice_size > 0,
+            "MatchGeneratorDriver::new requires slice_size > 0 (got 0)",
+        );
+        assert!(
+            max_slices_in_window > 0,
+            "MatchGeneratorDriver::new requires max_slices_in_window > 0 (got 0)",
+        );
+        let max_window_size = max_slices_in_window
+            .checked_mul(slice_size)
+            .expect("MatchGeneratorDriver::new: slice_size * max_slices_in_window overflows usize");
         // Derive an effective window_log for the initial-state matcher.
         // `MatchGeneratorDriver::new` runs BEFORE any reset, so it has
         // no LevelParams to consult — we initialise to whatever
@@ -561,7 +588,13 @@ impl MatchGeneratorDriver {
         // (round up to the next power of two via `next_power_of_two`'s
         // log). Reset() overwrites all three params from the resolved
         // LevelParams.
-        let window_log_init = max_window_size.next_power_of_two().trailing_zeros() as u8;
+        let next_pow2 = max_window_size.next_power_of_two();
+        assert!(
+            next_pow2 > 0,
+            "MatchGeneratorDriver::new: max_window_size = {max_window_size} \
+             too large for next_power_of_two without overflow",
+        );
+        let window_log_init = next_pow2.trailing_zeros() as u8;
         Self {
             vec_pool: Vec::new(),
             storage: MatcherStorage::Simple(FastKernelMatcher::with_params(
