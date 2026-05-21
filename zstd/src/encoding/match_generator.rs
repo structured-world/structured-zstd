@@ -853,6 +853,21 @@ impl Matcher for MatchGeneratorDriver {
                     // LevelParams above (line ~771). Future per-level
                     // table extension (hash_log scaled for small
                     // sources) lands separately.
+                    //
+                    // KNOWN LIMITATION (#216 CodeRabbit review #4):
+                    // all Fast levels (Uncompressed, Fastest,
+                    // CompressionLevel::Level(-7..=1)) currently
+                    // resolve to the same FastKernelMatcher with
+                    // donor level-1 cParams. The public
+                    // acceleration gradient between negative-level
+                    // "faster" modes and Level(1) is lost until
+                    // phase 3 (issue #198 items 2/3/5) ports the
+                    // 4-cursor `ip0/ip1/ip2/ip3` lookahead +
+                    // per-level kSearchStrength dispatch. That work
+                    // is a separate follow-up PR on the same issue
+                    // and on the same branch base — phase 1b is
+                    // deliberately the donor-shape foundation that
+                    // the acceleration gradient builds on top of.
                     MatcherStorage::Simple(FastKernelMatcher::with_params(
                         params.window_log,
                         FAST_LEVEL_1_HASH_LOG,
@@ -1108,14 +1123,16 @@ impl Matcher for MatchGeneratorDriver {
                 let pre = m.history_len_for_eviction_accounting();
                 m.accept_data(space);
                 let post = m.history_len_for_eviction_accounting();
-                // `accept_data` stashes the buffer in `pending`
-                // WITHOUT extending history — the eviction trigger
-                // fires on the actual `start_matching` /
-                // `skip_matching_with_hint` call. For accounting we
-                // therefore see `pre == post` here today; the
-                // budget retire / trim loop downstream queries
-                // `trim_to_window` directly when it needs the
-                // drained-byte delta.
+                // `accept_data` performs eager pre-commit window
+                // eviction (so this `pre - post` delta correctly
+                // feeds the dictionary-budget retire flow). See
+                // `FastKernelMatcher::accept_data` for the
+                // commit-time-visibility rationale (closes #216
+                // CodeRabbit review #5 / Copilot review #1: without
+                // eager eviction, the delta was always 0 and the
+                // dict budget never retired, leaving max_window_size
+                // inflated post-dict-prime → matcher could emit
+                // offsets exceeding the frame header's window).
                 evicted_bytes += pre.saturating_sub(post);
             }
             MatcherStorage::Dfast(m) => {
