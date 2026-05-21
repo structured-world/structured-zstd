@@ -32,11 +32,39 @@
 //!   (updated from `FastBlockResult.rep` after every
 //!   `start_matching`). `offset_hist[0..2]` tracks the wire
 //!   encoder's repcode positions and is updated per-emission via
-//!   [`encode_offset_with_history`]. These two are kept in sync by
-//!   construction for the lit-len > 0 case; the lit-len == 0
-//!   special-rule path (donor's `rep[0]-1` shift) is not yet
-//!   modeled — the kernel doesn't emit lit-len == 0 Triples today,
-//!   but a future cmov / lookahead-pipelined variant might.
+//!   [`encode_offset_with_history`]. The two are in lockstep for
+//!   the lit-len > 0 case (the common path) — both rotate on
+//!   explicit-offset emits and both leave their head untouched on
+//!   repcode-1 emits.
+//!
+//!   **Known divergence on lit-len == 0 emits:** the kernel CAN
+//!   emit `Sequence::Triple { literals: &[], ... }` when a repcode
+//!   match starts exactly at `anchor` — i.e. back-to-back matches
+//!   where the previous emit advanced `anchor` to the start of the
+//!   next match. In that case:
+//!
+//!   - Kernel's `rep_offset1` stays unchanged (repcode-match
+//!     contract).
+//!   - Wire encoder, per RFC 8878 §3.1.2.5, REMAPS the repcode
+//!     codes when `lit_len == 0`: code 1 → `rep[1]`, code 2 →
+//!     `rep[2]`, code 3 → `rep[0] - 1`. So an emit with
+//!     `actual_offset == rep[0]` doesn't hit any of the three
+//!     repcode codes and falls through to absolute encoding
+//!     (`code = actual_offset + 3`), then rotates `offset_hist`
+//!     as a fresh offset.
+//!
+//!   Net effect: marginal compression hit (saved-bytes lost on
+//!   the rare lit_len-0-rep-1 path) AND `rep` / `offset_hist`
+//!   diverge by one slot after such an emit. Both halves are
+//!   still self-consistent — the kernel's next block's matching
+//!   uses `rep`, the wire encoder's next emit uses
+//!   `offset_hist` — so the output is correct, just not
+//!   compression-optimal.
+//!
+//!   Phase 3 (4-cursor + cmov) revisits this with donor's
+//!   match-collapsing logic that merges back-to-back same-offset
+//!   matches into a single longer match, eliminating the
+//!   lit_len-0 emit entirely.
 
 use alloc::vec::Vec;
 
@@ -490,6 +518,17 @@ impl FastKernelMatcher {
                 // from the raw offset; this call only mutates
                 // `offset_hist` so subsequent priming-state reads
                 // see the post-block history.
+                //
+                // Known divergence on `literals.len() == 0` (back-to-
+                // back repcode match): kernel's `rep` is unchanged
+                // but `encode_offset_with_history` per RFC 8878
+                // §3.1.2.5 remaps the codes — `actual == rep[0]`
+                // doesn't match the lit_len-0 repcode set and
+                // rotates offset_hist as a fresh absolute offset.
+                // See the module docstring "Known divergence on
+                // lit-len == 0 emits" section for the full rationale.
+                // Phase 3 collapses these emits at the kernel level
+                // (merge into the preceding match).
                 let _ =
                     encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
                 handle_sequence(Sequence::Triple {
