@@ -1102,6 +1102,56 @@ mod tests {
         assert!(m.history.len() <= m.max_window_size * 2);
     }
 
+    /// Regression for #216 review #1: `accept_data` MUST perform
+    /// window eviction immediately so the driver's `commit_space`
+    /// can observe the byte delta via a pre/post `history.len()`
+    /// comparison. Without commit-time eviction visibility, the
+    /// driver's `retire_dictionary_budget` never runs for this
+    /// backend → `max_window_size` stays inflated post-dict-prime
+    /// → matcher can emit offsets exceeding the frame header's
+    /// reported window (format-correctness risk).
+    #[test]
+    fn accept_data_evicts_eagerly_so_commit_observes_byte_delta() {
+        // window_log = 8 → max_window_size = 256, eviction threshold
+        // = 512. Stage three 200-byte blocks via accept_data + a
+        // start_matching cycle each so history accumulates without
+        // eviction (200, 400 bytes). The THIRD accept_data crosses
+        // the 512-byte threshold; its eviction MUST be visible at
+        // accept_data return-time via the history.len() drop.
+        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+
+        m.accept_data((0..200u8).collect());
+        m.skip_matching_with_hint(None);
+        assert_eq!(m.history.len(), 200);
+        assert_eq!(m.prefix_start_index, 1, "no eviction yet");
+
+        m.accept_data((0..200u8).map(|i| i.wrapping_add(50)).collect());
+        m.skip_matching_with_hint(None);
+        assert_eq!(m.history.len(), 400);
+        assert_eq!(m.prefix_start_index, 1, "still no eviction (400 < 512)");
+
+        // Third commit: history (400) + new space (200) = 600 > 512.
+        // Eviction MUST fire inside accept_data, dropping history
+        // back to max_window_size (256) BEFORE the kernel runs.
+        let pre = m.history_len_for_eviction_accounting();
+        m.accept_data((0..200u8).map(|i| i.wrapping_add(100)).collect());
+        let post = m.history_len_for_eviction_accounting();
+        assert!(
+            pre > post,
+            "accept_data must shrink history at the eviction threshold \
+             (pre={pre}, post={post}) — driver's commit_space relies on \
+             this delta for retire_dictionary_budget accounting",
+        );
+        assert_eq!(
+            post, 256,
+            "post-eviction retained must equal max_window_size"
+        );
+        assert!(
+            m.prefix_start_index > 1,
+            "prefix_start_index must advance to reflect dropped bytes",
+        );
+    }
+
     /// Regression for #216 review #2: `trim_to_window` must update
     /// `last_block_start` to track the drain. Without the update,
     /// the OLD position references pre-drain coordinates and
