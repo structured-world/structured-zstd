@@ -588,11 +588,16 @@ impl MatchGeneratorDriver {
         // (round up to the next power of two via `next_power_of_two`'s
         // log). Reset() overwrites all three params from the resolved
         // LevelParams.
-        let next_pow2 = max_window_size.next_power_of_two();
-        assert!(
-            next_pow2 > 0,
-            "MatchGeneratorDriver::new: max_window_size = {max_window_size} \
-             too large for next_power_of_two without overflow",
+        //
+        // `checked_next_power_of_two` returns `None` if the next power
+        // of two would overflow `usize`. Modern Rust's
+        // `next_power_of_two` PANICS on overflow rather than returning
+        // 0 (the panic message is generic and unhelpful), so use the
+        // checked variant to surface the failure with a clear,
+        // domain-specific error.
+        let next_pow2 = max_window_size.checked_next_power_of_two().expect(
+            "MatchGeneratorDriver::new: max_window_size too large for \
+             next_power_of_two without overflow",
         );
         let window_log_init = next_pow2.trailing_zeros() as u8;
         Self {
