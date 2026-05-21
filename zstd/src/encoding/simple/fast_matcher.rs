@@ -280,9 +280,33 @@ impl FastKernelMatcher {
             let drop_n = self.history.len().saturating_sub(self.max_window_size);
             if drop_n > 0 {
                 self.history.drain(..drop_n);
-                self.prefix_start_index = self.prefix_start_index.saturating_add(drop_n as u32);
+                // Rebase prefix_start_index to 1 (the sentinel-0
+                // baseline from `with_params`) — drain re-indexes
+                // the retained tail from position 0, so a
+                // cumulative `saturating_add(drop_n)` would push
+                // `prefix_start_index` past every valid history
+                // index and the kernel's
+                // `match_idx >= prefix_start_index` filter would
+                // reject ALL match candidates wholesale. Donor uses
+                // an absolute-base-pointer model that survives
+                // drains without re-indexing; the `Vec<u8>` history
+                // here can't mirror that, so we reset and rely on
+                // the `hash_table.clear()` below + subsequent
+                // kernel scans re-populating entries in the new
+                // coordinate space.
+                self.prefix_start_index = 1;
                 self.hash_table.clear();
                 self.last_block_start = self.last_block_start.saturating_sub(drop_n);
+                // Rehash retained tail so block N+1 can still find
+                // matches against the bytes we explicitly kept.
+                // Without this, the retained window becomes "dead
+                // history" — visible in `history` but un-lookupable
+                // (no hash table entries). Donor's absolute-base
+                // pointer model carries hash entries across drains
+                // for free; the Vec<u8> history can't, so we pay an
+                // O(retained_bytes) rehash here. Amortised over
+                // max_window_size of input it's O(1) per byte.
+                self.prime_hash_table_for_range(0);
             }
         }
 
@@ -524,10 +548,19 @@ impl FastKernelMatcher {
         }
         let drop_n = self.history.len() - self.max_window_size;
         self.history.drain(..drop_n);
-        self.prefix_start_index = self.prefix_start_index.saturating_add(drop_n as u32);
+        // Rebase `prefix_start_index` to 1 on every drain — see
+        // `accept_data` for the same rationale (cumulative
+        // `saturating_add(drop_n)` would push the filter past every
+        // valid post-drain history index, dropping all subsequent
+        // matches against the retained tail).
+        self.prefix_start_index = 1;
         // Hash table holds absolute positions into the pre-drain
         // history — clear them as in the in-loop eviction path.
         self.hash_table.clear();
+        // Rehash retained tail (same rationale as the accept_data
+        // drain branch — retained bytes need hash entries to be
+        // matchable in subsequent blocks).
+        let rehash_target = 0;
         // Track the drain in last_block_start so post-trim
         // `last_committed_space()` slices into the NEW history
         // coordinate space. Without this saturating subtract, an
@@ -537,6 +570,7 @@ impl FastKernelMatcher {
         // when the new history happens to be long enough to make
         // the stale index in-bounds).
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
+        self.prime_hash_table_for_range(rehash_target);
         drop_n
     }
 
@@ -983,9 +1017,15 @@ mod tests {
              last block (200 bytes); got {}",
             m.history.len(),
         );
-        assert!(
-            m.prefix_start_index > 0,
-            "prefix_start_index must have advanced after an eviction",
+        // Post-fix: drain RESETS prefix_start_index back to 1 (the
+        // initial sentinel-0 baseline) rather than accumulating
+        // saturating_add — see the `drain_rebases_prefix_start_index`
+        // regression test for the full rationale. Eviction is
+        // proven by post-history shrinking, not by an
+        // index-advancement signal.
+        assert_eq!(
+            m.prefix_start_index, 1,
+            "drain must rebase prefix_start_index to the baseline (1)",
         );
     }
 
@@ -1105,12 +1145,12 @@ mod tests {
         // Now 400+200=600 > 512 → eviction fires inside extend.
         m.skip_matching_with_hint(Some(false));
 
-        // Post-eviction state: prefix_start_index advanced past 1.
-        assert!(
-            m.prefix_start_index > 1,
-            "eviction must bump prefix_start_index past its initial 1 \
-             baseline (got {})",
-            m.prefix_start_index,
+        // Post-fix: drain rebases prefix_start_index to 1 (rather
+        // than cumulative saturating_add); eviction is proven by
+        // bounded history below.
+        assert_eq!(
+            m.prefix_start_index, 1,
+            "drain must rebase prefix_start_index to the baseline (1)",
         );
         // History within the 2× window-size hard cap.
         assert!(m.history.len() <= m.max_window_size * 2);
@@ -1245,9 +1285,10 @@ mod tests {
             post, 256,
             "post-eviction retained must equal max_window_size"
         );
-        assert!(
-            m.prefix_start_index > 1,
-            "prefix_start_index must advance to reflect dropped bytes",
+        assert_eq!(
+            m.prefix_start_index, 1,
+            "drain rebases prefix_start_index to the baseline (1) \
+             — eviction is proven by the history.len() shrink above",
         );
     }
 
