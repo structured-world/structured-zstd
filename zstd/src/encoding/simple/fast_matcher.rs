@@ -1,8 +1,17 @@
 //! Donor-shape Fast strategy matcher backend — selected for every
 //! Fast-strategy level (Uncompressed, Fastest, Level(1), and the
-//! negative Level(-7..=-1) variants). All levels currently resolve
-//! to the same matcher with donor level-1 `hash_log = 14, mls = 7`;
-//! per-level acceleration knobs land in phase 3.
+//! negative Level(-7..=-1) variants). Per-level dispatch on
+//! `(fast_hash_log, fast_mls, fast_step_size)` is wired through
+//! `LevelParams` → `with_params` / `reset` (step_size is part of
+//! the construction/reset signature, not a separate setter).
+//! Level(1) uses `(hash_log=14, mls=7, step_size=2)`; Fastest /
+//! Uncompressed / Level(-1..=-7) use `(hash_log=14, mls=6)` with
+//! `step_size` 2..8 driving donor's acceleration gradient on
+//! negative levels.
+//!
+//! `use_cmov` is derived directly from `window_log` inside the
+//! matcher (donor heuristic `windowLog < 19`) — NOT a
+//! `LevelParams` field.
 //!
 //! Wraps the kernel from
 //! [`super::fast_kernel::kernel::compress_block_fast`] and presents the
@@ -18,14 +27,15 @@
 //!
 //! # Invariants this module guarantees
 //!
-//! - `prefix_start_index >= RESERVED_PREFIX_BYTES` at all times.
-//!   The first `RESERVED_PREFIX_BYTES` of `history` is a reserved
-//!   dummy region (seeded on construction / reset, preserved across
-//!   eviction) so the hash table's empty-slot sentinel value `0`
-//!   cannot be confused with a real match position. Real input data
-//!   starts at `history[RESERVED_PREFIX_BYTES]`. See the
-//!   `RESERVED_PREFIX_BYTES` constant for the full sentinel-0
-//!   rationale.
+//! - `prefix_start_index >= INITIAL_PREFIX_START_INDEX = 1` at all
+//!   times. `history` holds real input bytes from position 0
+//!   onward (no dummy region — M8 dropped the seeded sentinel byte
+//!   for donor byte-range parity). Sentinel-0 protection comes from
+//!   the kernel's `match_idx >= prefix_start_index` filter rejecting
+//!   the hash table's empty-slot value `0`. After eviction / drain
+//!   the buffer is rebased to position 0 and `prefix_start_index`
+//!   resets to 1, making the first retained byte (`history[0]`)
+//!   unmatchable — small ratio cost, accepted for sentinel safety.
 //! - `history.len()` is bounded by `2 × max_window_size` post-append.
 //!   See [`FastKernelMatcher::extend_history_with_pending`].
 //! - `rep[0..2]` tracks the kernel's two-deep repcode state
@@ -47,11 +57,12 @@ use crate::encoding::blocks::encode_offset_with_history;
 use super::fast_kernel::hash_table::FastHashTable;
 use super::fast_kernel::kernel::compress_block_fast;
 
-/// Donor `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]` —
-/// hard-coded for all Fast levels today (the driver passes only
-/// `window_log` per-level; `hash_log` + `mls` are constant). Per-
-/// level `hash_log` scaling for smaller source-size hints lands in
-/// phase 3 along with the Fast acceleration gradient.
+/// Donor `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
+/// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
+/// matcher (which runs BEFORE any `reset` from a resolved
+/// `LevelParams`). Production calls thread per-level values
+/// (`fast_hash_log`, `fast_mls`, `fast_step_size`) through
+/// `LevelParams` instead.
 pub(crate) const FAST_LEVEL_1_HASH_LOG: u32 = 14;
 pub(crate) const FAST_LEVEL_1_MLS: u32 = 7;
 /// Donor level-1 Fast `window_log`. Production code reads
@@ -73,24 +84,27 @@ pub(crate) const FAST_INITIAL_REP: [u32; 2] = [1, 4];
 /// start and mirrors the value the old [`super::MatchGenerator`] used.
 pub(crate) const FAST_INITIAL_OFFSET_HIST: [u32; 3] = [1, 4, 8];
 
-/// Number of reserved sub-prefix bytes at the head of `history`.
+/// Drain start offset used by eviction / drain paths. NOT a
+/// reserved-bytes count — set to 0 (M8): `history` holds real
+/// input bytes from position 0 onward, donor-parity layout, no
+/// dummy region. Sentinel-0 protection (hash table's empty-slot
+/// value `0` would otherwise be indistinguishable from a real
+/// match at position 0) is provided by
+/// [`INITIAL_PREFIX_START_INDEX`] = 1 via the kernel's
+/// `match_idx >= prefix_start_index` filter.
 ///
-/// The hash table uses `0` as its empty-slot sentinel. To keep that
-/// sentinel distinguishable from a real match position, we reserve
-/// `history[0]` as an unmatchable dummy byte (its value is
-/// irrelevant — the kernel never reads it as a match source because
-/// `prefix_start_index = 1` filters position 0 out via the
-/// `match_idx >= prefix_start_index` check).
-///
-/// Real input data starts at `history[1]`. Eviction / trim drain
-/// REAL bytes from `[1..=drop_n]` and preserve the dummy at
-/// position 0. Donor C zstd achieves the same effect via a virtual
-/// base pointer pre-positioned before the data buffer; the flat
-/// `Vec<u8>` model here can't mirror absolute-base addressing, so
-/// we pay one byte of memory overhead per matcher in exchange for
-/// the same correctness property (no missed matches at segment
-/// boundaries).
-pub(crate) const RESERVED_PREFIX_BYTES: usize = 1;
+/// Kept as a named constant so the drain math reads consistently
+/// against future changes; the name is legacy from the pre-M8
+/// "dummy-byte" layout.
+pub(crate) const RESERVED_PREFIX_BYTES: usize = 0;
+
+/// Donor's `prefixStartIndex` floor on fresh frames. Set to 1 (not 0)
+/// so the kernel's `match_idx >= prefix_start_index` filter rejects
+/// stale empty-slot lookups (value 0 in FastHashTable's all-zero
+/// initial state). Donor relies on its `ip0 += (ip0 == prefixStart)`
+/// bump to skip position 0 instead — both approaches match the same
+/// 0..N-1 byte ranges for the hash table.
+const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
 /// Donor-shape Fast-strategy matcher state.
 ///
@@ -144,6 +158,22 @@ pub(crate) struct FastKernelMatcher {
     /// Decoder-side window size (in `log` bits). Reported to the
     /// frame header via the `Matcher::window_size` trait method.
     window_log: u8,
+    /// Donor heuristic: prefer cmov match-found when
+    /// `windowLog < 19` (`ZSTD_compressBlock_fast` line 449). Small-
+    /// window encoders have less predictable in-range filtering, so
+    /// the branchless variant beats the branchful one on those
+    /// levels. Set during `reset` / `with_params` from `window_log`.
+    /// Reachable in production via source-size hints (when the
+    /// caller passes a small `source_size` to a streaming encoder,
+    /// `adjust_params_for_source_size` clamps `window_log` below
+    /// the donor default of 19, flipping `use_cmov` on).
+    use_cmov: bool,
+    /// Initial step the kernel uses for the 4-cursor body's skip
+    /// schedule. Donor `stepSize = targetLength + !(targetLength) +
+    /// 1` (min 2). Negative-level frames set this to 2..8 to
+    /// recreate donor's acceleration gradient; Level(1) and other
+    /// Fast levels keep step_size=2.
+    step_size: usize,
     /// Holds a `commit_space`'d block until `start_matching` consumes
     /// it. `None` between frames and immediately after `start_matching`
     /// returns. The driver guarantees at most one outstanding pending
@@ -181,6 +211,7 @@ impl FastKernelMatcher {
             FAST_LEVEL_1_WINDOW_LOG,
             FAST_LEVEL_1_HASH_LOG,
             FAST_LEVEL_1_MLS,
+            2,
         )
     }
 
@@ -188,33 +219,32 @@ impl FastKernelMatcher {
     /// the level resolution produced a non-default `(window_log,
     /// hash_log, mls)` triple (typically because a small source-size
     /// hint clamped the window). Tests can also call this directly.
-    pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32) -> Self {
-        // Reserve `RESERVED_PREFIX_BYTES` bytes at the head of
-        // history. The kernel never matches against this region
-        // because `prefix_start_index = RESERVED_PREFIX_BYTES = 1`
-        // filters it out — see the `RESERVED_PREFIX_BYTES` constant
-        // for the full sentinel-0 rationale.
+    pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32, step_size: usize) -> Self {
+        assert!(
+            step_size >= 2,
+            "FastKernelMatcher requires step_size >= 2 (got {step_size})"
+        );
+        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
+        // Sentinel-0 protection comes from prefix_start_index =
+        // INITIAL_PREFIX_START_INDEX = 1, which filters hash table
+        // lookups returning the empty-slot value 0.
         let history = alloc::vec![0u8; RESERVED_PREFIX_BYTES];
         Self {
             last_block_start: RESERVED_PREFIX_BYTES,
             recycled_space: None,
             history,
-            // `prefixStartIndex` starts at `RESERVED_PREFIX_BYTES`
-            // so the head of `history` (the dummy bytes) is below
-            // the prefix and rejected by the kernel's
-            // `match_idx >= prefix_start_index` filter — see the
-            // `RESERVED_PREFIX_BYTES` constant for the full
-            // sentinel-0 rationale. Eviction in
-            // `extend_history_with_pending` preserves both the
-            // dummy AND keeps `prefix_start_index` at this baseline
-            // (the drain re-indexes the retained tail so the
-            // invariant restores).
-            prefix_start_index: RESERVED_PREFIX_BYTES as u32,
+            // Filter `match_idx >= prefix_start_index` rejects the
+            // hash table's empty-slot value 0. Eviction in
+            // `extend_history_with_pending` rebases the retained
+            // tail and resets prefix_start_index back to 1.
+            prefix_start_index: INITIAL_PREFIX_START_INDEX,
             rep: FAST_INITIAL_REP,
             offset_hist: FAST_INITIAL_OFFSET_HIST,
             hash_table: FastHashTable::new(hash_log, mls),
             max_window_size: 1usize << window_log,
             window_log,
+            use_cmov: window_log < 19,
+            step_size,
             pending: None,
         }
     }
@@ -225,7 +255,11 @@ impl FastKernelMatcher {
     /// either clears the existing hash table (if `(hash_log, mls)` are
     /// unchanged) or reallocates it. The window_log update redirects
     /// the soft-eviction bound and the decoder-side reported window.
-    pub(crate) fn reset(&mut self, window_log: u8, hash_log: u32, mls: u32) {
+    pub(crate) fn reset(&mut self, window_log: u8, hash_log: u32, mls: u32, step_size: usize) {
+        assert!(
+            step_size >= 2,
+            "FastKernelMatcher requires step_size >= 2 (got {step_size})"
+        );
         if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
             // Parameters changed — rebuild the table at the new size.
             // Cannot reuse the old allocation because the donor-shape
@@ -236,19 +270,17 @@ impl FastKernelMatcher {
             // `memset` (donor's `ZSTD_window_clear` cadence).
             self.hash_table.clear();
         }
+        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
         self.history.clear();
-        // Re-seed the RESERVED_PREFIX_BYTES dummy at the head so the
-        // post-reset state matches `with_params`'s invariant
-        // (sentinel-0 unmatchable, real data starts at index
-        // RESERVED_PREFIX_BYTES).
         self.history.resize(RESERVED_PREFIX_BYTES, 0);
-        // prefix_start_index pinned to RESERVED_PREFIX_BYTES so the
-        // dummy at position 0..RESERVED_PREFIX_BYTES is filtered as
-        // sub-prefix — see `with_params` for the full rationale.
-        self.prefix_start_index = RESERVED_PREFIX_BYTES as u32;
+        // Sentinel-0 protection via prefix_start_index >= 1 filter
+        // — see `with_params` for the full rationale.
+        self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.rep = FAST_INITIAL_REP;
         self.offset_hist = FAST_INITIAL_OFFSET_HIST;
         self.window_log = window_log;
+        self.use_cmov = window_log < 19;
+        self.step_size = step_size;
         self.max_window_size = 1usize << window_log;
         self.pending = None;
         self.last_block_start = RESERVED_PREFIX_BYTES;
@@ -316,7 +348,7 @@ impl FastKernelMatcher {
         // matcher can emit offsets exceeding the frame header's
         // reported window size (format-correctness risk).
         // Eviction operates on REAL data length (excluding the
-        // RESERVED_PREFIX_BYTES dummy at the head of history).
+        // no dummy at the head of history post-M8).
         let real_len = self.history.len().saturating_sub(RESERVED_PREFIX_BYTES);
         let new_real_total = real_len.saturating_add(space.len());
         let cap = self.max_window_size.saturating_mul(2);
@@ -355,38 +387,31 @@ impl FastKernelMatcher {
         self.pending = Some(space);
     }
 
-    /// Drop the OLDEST `drop_n` real bytes from history while
-    /// preserving the `RESERVED_PREFIX_BYTES` dummy at indices
-    /// `[0..RESERVED_PREFIX_BYTES)`. Used by both the eager
-    /// commit-time eviction in [`Self::accept_data`] and the
-    /// dictionary-budget retire loop's [`Self::trim_to_window`].
+    /// Drop the OLDEST `drop_n` real bytes from history and rebase
+    /// the retained tail to start at position 0 (M8 layout: no
+    /// dummy region). Used by both the eager commit-time eviction
+    /// in [`Self::accept_data`] and the dictionary-budget retire
+    /// loop's [`Self::trim_to_window`].
     ///
-    /// Side effects (all required for invariant preservation —
-    /// extracted to keep the two call sites in lockstep across
-    /// future drain-related fixes):
+    /// Side effects:
     ///
-    /// 1. Drain `history[RESERVED_PREFIX_BYTES .. RESERVED_PREFIX_BYTES + drop_n)`.
-    /// 2. Pin `prefix_start_index` back to `RESERVED_PREFIX_BYTES`
-    ///    (drain re-indexes the retained tail; cumulative add would
-    ///    push the filter past every valid post-drain position).
+    /// 1. Drain `history[0..drop_n)`.
+    /// 2. Reset `prefix_start_index` to `INITIAL_PREFIX_START_INDEX = 1`
+    ///    — drain re-indexes the retained tail; the sentinel-0
+    ///    filter restores via this fixed baseline.
     /// 3. Clear the hash table — entries hold pre-drain absolute
     ///    positions that no longer reference live bytes.
-    /// 4. `saturating_sub` `last_block_start` by `drop_n`, clamped
-    ///    to `>= RESERVED_PREFIX_BYTES` so it never lands on the
-    ///    dummy region.
-    /// 5. Rehash retained tail starting at `RESERVED_PREFIX_BYTES`
-    ///    so block N+1 can find matches against the kept bytes
-    ///    (without this they'd be "dead history" — visible in the
-    ///    Vec but unlookupable).
+    /// 4. `saturating_sub` `last_block_start` by `drop_n`.
+    /// 5. Rehash retained tail starting at position 0 so block N+1
+    ///    can find matches against the kept bytes (without this
+    ///    they'd be "dead history" — visible in the Vec but
+    ///    unlookupable).
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = RESERVED_PREFIX_BYTES + drop_n;
         self.history.drain(RESERVED_PREFIX_BYTES..drain_end);
-        self.prefix_start_index = RESERVED_PREFIX_BYTES as u32;
+        self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.hash_table.clear();
-        self.last_block_start = self
-            .last_block_start
-            .saturating_sub(drop_n)
-            .max(RESERVED_PREFIX_BYTES);
+        self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         self.prime_hash_table_for_range(RESERVED_PREFIX_BYTES);
     }
 
@@ -460,7 +485,24 @@ impl FastKernelMatcher {
     /// construction.
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         let block_start = self.extend_history_with_pending();
-        let prefix_start_index = self.prefix_start_index;
+        // Compute the EFFECTIVE prefix floor for this scan against
+        // the ADVERTISED frame window (`1 << window_log`), NOT
+        // `max_window_size` — the driver may temporarily inflate
+        // `max_window_size` by the retained dictionary budget
+        // during `prime_with_dictionary`. The frame header still
+        // reports `1 << window_log`, so any emitted offset older
+        // than `history.len() - (1 << window_log)` would exceed
+        // the decoder's reserved window and produce a format-
+        // invalid sequence. Donor's
+        // `ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog)`
+        // uses `windowLog` for the same reason.
+        let advertised_window = 1usize << self.window_log;
+        let effective_prefix = self
+            .history
+            .len()
+            .saturating_sub(advertised_window)
+            .max(self.prefix_start_index as usize) as u32;
+        let prefix_start_index = effective_prefix;
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
@@ -513,45 +555,106 @@ impl FastKernelMatcher {
             }
         };
 
-        let result = match mls {
-            4 => compress_block_fast::<4>(
+        // Dispatch on (mls, use_cmov) — donor's 8 specialised
+        // `ZSTD_GEN_FAST_FN` expansions (we also cover mls=8 for
+        // future use). Each (mls, cmov) pair monomorphises the
+        // kernel hot loop independently.
+        //
+        // The 10 arms are intentionally expanded inline rather
+        // than wrapped in a macro: the kernel signature is short
+        // enough that the duplication doesn't obscure intent, and
+        // an explicit match makes it obvious which monomorphisations
+        // exist. If the kernel ever grows additional const-generic
+        // parameters (e.g. per-level `hash_fill_step`), revisit.
+        let result = match (mls, self.use_cmov) {
+            (4, false) => compress_block_fast::<4, false>(
                 history,
                 block_start,
                 prefix_start_index,
                 hash_table,
                 rep_in,
+                self.step_size,
                 &mut wrap_emit,
             ),
-            5 => compress_block_fast::<5>(
+            (4, true) => compress_block_fast::<4, true>(
                 history,
                 block_start,
                 prefix_start_index,
                 hash_table,
                 rep_in,
+                self.step_size,
                 &mut wrap_emit,
             ),
-            6 => compress_block_fast::<6>(
+            (5, false) => compress_block_fast::<5, false>(
                 history,
                 block_start,
                 prefix_start_index,
                 hash_table,
                 rep_in,
+                self.step_size,
                 &mut wrap_emit,
             ),
-            7 => compress_block_fast::<7>(
+            (5, true) => compress_block_fast::<5, true>(
                 history,
                 block_start,
                 prefix_start_index,
                 hash_table,
                 rep_in,
+                self.step_size,
                 &mut wrap_emit,
             ),
-            8 => compress_block_fast::<8>(
+            (6, false) => compress_block_fast::<6, false>(
                 history,
                 block_start,
                 prefix_start_index,
                 hash_table,
                 rep_in,
+                self.step_size,
+                &mut wrap_emit,
+            ),
+            (6, true) => compress_block_fast::<6, true>(
+                history,
+                block_start,
+                prefix_start_index,
+                hash_table,
+                rep_in,
+                self.step_size,
+                &mut wrap_emit,
+            ),
+            (7, false) => compress_block_fast::<7, false>(
+                history,
+                block_start,
+                prefix_start_index,
+                hash_table,
+                rep_in,
+                self.step_size,
+                &mut wrap_emit,
+            ),
+            (7, true) => compress_block_fast::<7, true>(
+                history,
+                block_start,
+                prefix_start_index,
+                hash_table,
+                rep_in,
+                self.step_size,
+                &mut wrap_emit,
+            ),
+            (8, false) => compress_block_fast::<8, false>(
+                history,
+                block_start,
+                prefix_start_index,
+                hash_table,
+                rep_in,
+                self.step_size,
+                &mut wrap_emit,
+            ),
+            (8, true) => compress_block_fast::<8, true>(
+                history,
+                block_start,
+                prefix_start_index,
+                hash_table,
+                rep_in,
+                self.step_size,
                 &mut wrap_emit,
             ),
             _ => unreachable!(
@@ -733,18 +836,15 @@ mod tests {
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
         assert_eq!(m.max_window_size, 1usize << FAST_LEVEL_1_WINDOW_LOG);
-        // Post-#216-#17 fix: history is seeded with
-        // RESERVED_PREFIX_BYTES dummy at construction so the
-        // sentinel-0 invariant holds with no missed matches at
-        // segment boundaries. Empty-history check from the legacy
-        // model is replaced by a "only the dummy lives at head"
-        // check.
+        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
+        // First input byte will live at position 0; sentinel-0
+        // protection comes from the prefix filter, not from a
+        // dummy region.
         assert_eq!(m.history.len(), RESERVED_PREFIX_BYTES);
-        // prefixStartIndex pinned to RESERVED so the dummy at
-        // indices [0..RESERVED) is sub-prefix and the hash table's
-        // empty-slot sentinel value 0 cannot be confused with a real
-        // match position.
-        assert_eq!(m.prefix_start_index as usize, RESERVED_PREFIX_BYTES);
+        // prefix_start_index = 1 makes position 0 unmatchable so
+        // the hash table's empty-slot value 0 can't be confused
+        // with a real match.
+        assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
         assert!(m.pending.is_none());
     }
 
@@ -752,7 +852,7 @@ mod tests {
     fn with_params_threads_through_each_field() {
         // Pick a non-default triple to prove no silent override by
         // donor-default constants.
-        let m = FastKernelMatcher::with_params(16, 12, 5);
+        let m = FastKernelMatcher::with_params(16, 12, 5, 2);
         assert_eq!(m.window_log, 16);
         assert_eq!(m.hash_table.hash_log(), 12);
         assert_eq!(m.hash_table.mls(), 5);
@@ -762,12 +862,12 @@ mod tests {
     #[test]
     fn window_size_reports_one_shifted_window_log() {
         // window_log = 16 → 64 KiB reported window.
-        let m = FastKernelMatcher::with_params(16, 12, 5);
+        let m = FastKernelMatcher::with_params(16, 12, 5, 2);
         assert_eq!(m.window_size(), 1u64 << 16);
         // Larger window_log → larger reported window. window_log = 22
         // (4 MiB, donor's BETTER_WINDOW_LOG) confirms the shift width
         // (`u64` head room).
-        let m = FastKernelMatcher::with_params(22, 14, 7);
+        let m = FastKernelMatcher::with_params(22, 14, 7, 2);
         assert_eq!(m.window_size(), 1u64 << 22);
     }
 
@@ -794,12 +894,13 @@ mod tests {
             FAST_LEVEL_1_WINDOW_LOG,
             FAST_LEVEL_1_HASH_LOG,
             FAST_LEVEL_1_MLS,
+            2,
         );
 
-        // Post-reset: history seeded with the RESERVED_PREFIX_BYTES
+        // Post-reset: history empty (RESERVED_PREFIX_BYTES=0; no
         // dummy only; prefix_start_index pinned to that baseline.
         assert_eq!(m.history.len(), RESERVED_PREFIX_BYTES);
-        assert_eq!(m.prefix_start_index as usize, RESERVED_PREFIX_BYTES);
+        assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
         assert!(m.pending.is_none());
@@ -816,7 +917,7 @@ mod tests {
         let mut m = FastKernelMatcher::new();
         // Force a parameter change — every Vec we hand the new
         // FastHashTable will be a fresh allocation.
-        m.reset(16, 10, 4);
+        m.reset(16, 10, 4, 2);
         assert_eq!(m.hash_table.hash_log(), 10);
         assert_eq!(m.hash_table.mls(), 4);
         assert_eq!(m.window_log, 16);
@@ -845,7 +946,7 @@ mod tests {
         // hash arm; level-1 defaults (mls=7) would also work but the
         // hash collisions on a 64-byte synthetic input are noisier
         // for mls>=5.
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         m.accept_data(data.clone());
 
         let mut emitted_match_lens: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -878,7 +979,7 @@ mod tests {
         // Pending buffer was consumed.
         assert!(m.pending.is_none());
         // History grew by exactly the block size (plus the
-        // RESERVED_PREFIX_BYTES dummy carried since construction).
+        // no dummy carried since construction — M8).
         assert_eq!(m.history.len(), data.len() + RESERVED_PREFIX_BYTES);
         // `last_committed_space` post-processing reads from
         // history[last_block_start..] (donor / legacy MatchGenerator
@@ -893,7 +994,7 @@ mod tests {
     /// the rep / offset_hist state.
     #[test]
     fn skip_matching_extends_history_without_emissions() {
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         let pre_rep = m.rep;
         let pre_offset_hist = m.offset_hist;
 
@@ -948,7 +1049,7 @@ mod tests {
         block2.extend_from_slice(&block1[0..32]); // 32-byte cross-block copy
         block2.extend(200..216u8); // 16-byte tail buffer
 
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
 
         // Block 1 — drain emissions, ignore.
         m.accept_data(block1.clone());
@@ -1006,13 +1107,13 @@ mod tests {
             dict_block.push(i.wrapping_mul(13).wrapping_add(7));
         }
 
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         m.accept_data(dict_block.clone());
         m.skip_matching_with_hint(Some(false)); // dictionary-priming skip
 
         // Sanity: history grew, prefix_start_index unchanged.
         assert_eq!(m.history.len(), dict_block.len() + RESERVED_PREFIX_BYTES);
-        assert_eq!(m.prefix_start_index, 1);
+        assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
 
         // Block 2: 16 fresh bytes + 16-byte copy of dict_block[0..16]
         // + 16-byte tail buffer so the kernel can reach the copy.
@@ -1048,7 +1149,7 @@ mod tests {
             dict_block.push(i.wrapping_mul(13).wrapping_add(7));
         }
 
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         m.accept_data(dict_block.clone());
         m.skip_matching_with_hint(None); // plain skip — no hash pre-population
 
@@ -1090,7 +1191,7 @@ mod tests {
         // window_log = 8 → max_window_size = 256, eviction threshold
         // = 512. Stage three 200-byte blocks: after the third commit,
         // total would be 600 > 512 → eviction fires.
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
         for round in 0..3 {
             // Distinct payload per round so a hash entry from round
             // 0 referencing position 0 is identifiable as stale
@@ -1127,7 +1228,7 @@ mod tests {
         // proven by post-history shrinking, not by an
         // index-advancement signal.
         assert_eq!(
-            m.prefix_start_index, 1,
+            m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "drain must rebase prefix_start_index to the baseline (1)",
         );
     }
@@ -1138,7 +1239,7 @@ mod tests {
     /// RESERVED_PREFIX_BYTES`) without overrun.
     #[test]
     fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         // 8-byte real payload appends above the RESERVED dummy →
         // history.len() = 8 + RESERVED_PREFIX_BYTES, last_hashable =
         // RESERVED_PREFIX_BYTES, hashed range = [RESERVED..=RESERVED]
@@ -1157,7 +1258,7 @@ mod tests {
     /// without panicking on the `last_hashable` subtract.
     #[test]
     fn skip_matching_dict_prime_handles_below_hash_read_size_bytes() {
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         let payload: alloc::vec::Vec<u8> = (0..4u8).collect();
         m.accept_data(payload);
         // history will be 4 bytes after append < HASH_READ_SIZE (8).
@@ -1186,7 +1287,7 @@ mod tests {
         }
         data.extend_from_within(0..48);
 
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         m.accept_data(data.clone());
 
         let mut emitted_offsets: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -1235,7 +1336,7 @@ mod tests {
         // window_log=8 → max_window_size=256, threshold=512.
         // Two 300-byte blocks both via dict-prime skip — second
         // one triggers eviction.
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
         let block1: alloc::vec::Vec<u8> = (0..200u8).collect();
         m.accept_data(block1);
         m.skip_matching_with_hint(Some(false));
@@ -1253,96 +1354,11 @@ mod tests {
         // than cumulative saturating_add); eviction is proven by
         // bounded history below.
         assert_eq!(
-            m.prefix_start_index, 1,
+            m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "drain must rebase prefix_start_index to the baseline (1)",
         );
         // History within the 2× window-size hard cap.
         assert!(m.history.len() <= m.max_window_size * 2);
-    }
-
-    /// Regression for #216 CodeRabbit review #6: after multiple
-    /// drain-evictions, `prefix_start_index` grows cumulatively
-    /// (saturating_add of drop_n per drain) while the hash table is
-    /// cleared and re-populated from current `history` positions
-    /// [0..max_window_size]. Without rebasing `prefix_start_index`
-    /// back to 1 on drain, the kernel's `match_idx >=
-    /// prefix_start_index` filter eventually rejects EVERY match
-    /// candidate (table positions < accumulated prefix_start_index).
-    /// Retained-window matches die wholesale.
-    #[test]
-    fn drain_rebases_prefix_start_index_so_retained_history_stays_matchable() {
-        // Tight window so evictions fire quickly: window_log = 8 →
-        // max_window_size = 256, threshold = 512. Each 200-byte
-        // commit accumulates 200 bytes; the third onwards triggers
-        // eviction with drop_n ≈ 144-200 per drain.
-        //
-        // After ~8 evictions, naive prefix_start_index grows to
-        // ~1 + 8 * ~180 ≈ 1441, far past any position in the
-        // current 256-byte retained history. The kernel's filter
-        // would then reject every match candidate (positions are at
-        // most history.len() = 256 << prefix_start_index = 1441).
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
-        // Build a fixed "signature" pattern that will survive many
-        // commits and remain matchable in the retained tail.
-        let sig: alloc::vec::Vec<u8> = (0..32u8)
-            .map(|i| i.wrapping_mul(31).wrapping_add(17))
-            .collect();
-
-        // Run 12 commits of 200 bytes each — guarantees many evictions.
-        // Last block carries the signature in its head + matchable
-        // bytes — we want the kernel to find this signature against
-        // the retained-history copy (placed in commit #10 below).
-        for round in 0..10 {
-            let mut block: alloc::vec::Vec<u8> = (0..200u8)
-                .map(|i| i.wrapping_add(round as u8 * 7))
-                .collect();
-            if round == 10 - 1 {
-                // Plant the signature near end of this block — it
-                // will live in the retained tail by the time block
-                // 11 commits below.
-                block[100..132].copy_from_slice(&sig);
-            }
-            m.accept_data(block);
-            m.skip_matching_with_hint(Some(false)); // dict-prime, hashes populated
-        }
-
-        // After 10 commits at 200 bytes each, prefix_start_index has
-        // advanced significantly (cumulative drop_n). Pre-fix it
-        // would be in the thousands; post-fix it should be 1 (or
-        // small).
-        let pre_fix_index_would_exceed_history = m.prefix_start_index as usize > m.history.len();
-        // Document the failing-case expectation (the bug being
-        // tested for): without the fix, prefix_start_index >> any
-        // valid history position.
-        let _ = pre_fix_index_would_exceed_history;
-
-        // Now commit a final block whose head contains the
-        // signature — kernel should find it referencing the
-        // earlier-planted copy in retained history.
-        let mut block: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(200);
-        block.extend_from_slice(&sig);
-        for i in 0..168u8 {
-            block.push(i.wrapping_mul(53).wrapping_add(91));
-        }
-        m.accept_data(block);
-
-        let mut saw_match = false;
-        m.start_matching(|seq| {
-            if let Sequence::Triple { match_len, .. } = seq
-                && match_len >= 4
-            {
-                saw_match = true;
-            }
-        });
-
-        assert!(
-            saw_match,
-            "after multiple drain-evictions the matcher must still find \
-             matches against retained-history bytes (got no match; \
-             prefix_start_index = {} vs history.len() = {})",
-            m.prefix_start_index,
-            m.history.len(),
-        );
     }
 
     /// Regression for #216 review #1: `accept_data` MUST perform
@@ -1361,13 +1377,13 @@ mod tests {
         // eviction (200, 400 bytes). The THIRD accept_data crosses
         // the 512-byte threshold; its eviction MUST be visible at
         // accept_data return-time via the history.len() drop.
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
 
         m.accept_data((0..200u8).collect());
         m.skip_matching_with_hint(None);
         assert_eq!(m.history.len(), 200 + RESERVED_PREFIX_BYTES);
         assert_eq!(
-            m.prefix_start_index as usize, RESERVED_PREFIX_BYTES,
+            m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "no eviction yet"
         );
 
@@ -1375,7 +1391,7 @@ mod tests {
         m.skip_matching_with_hint(None);
         assert_eq!(m.history.len(), 400 + RESERVED_PREFIX_BYTES);
         assert_eq!(
-            m.prefix_start_index as usize, RESERVED_PREFIX_BYTES,
+            m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "still no eviction (400 < 512)",
         );
 
@@ -1399,8 +1415,8 @@ mod tests {
             "post-eviction retained must equal max_window_size",
         );
         assert_eq!(
-            m.prefix_start_index as usize, RESERVED_PREFIX_BYTES,
-            "drain rebases prefix_start_index to the RESERVED baseline \
+            m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
+            "drain rebases prefix_start_index to INITIAL_PREFIX_START_INDEX \
              — eviction is proven by the history.len() shrink above",
         );
     }
@@ -1422,7 +1438,7 @@ mod tests {
         // last_block_start (was 0) MUST now be 0 (since 72 > 0 →
         // saturating_sub gives 0) so last_committed_space() returns
         // a valid in-bounds slice.
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
         let payload: alloc::vec::Vec<u8> = (0..200u8).collect();
         m.accept_data(payload);
         m.skip_matching_with_hint(None);
@@ -1482,7 +1498,7 @@ mod tests {
     /// repcode wire encoding (correctness bug, not perf).
     #[test]
     fn prime_offset_history_keeps_rep_and_offset_hist_in_lockstep() {
-        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         // Pre-prime: matcher carries the donor's initial state.
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
@@ -1515,7 +1531,7 @@ mod tests {
     /// Fix retains a SMALLER prefix (or none) so the bound holds.
     #[test]
     fn accept_data_evicts_more_aggressively_when_block_larger_than_window() {
-        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
         // max_window_size = 256 (1 << 8). Threshold = 512.
 
         // Pre-fill history to full max_window_size of real data via
@@ -1562,6 +1578,140 @@ mod tests {
             "pre-append drain must have shed historical bytes \
              (got real_len_after_drain={real_len_after}, was 256 \
              before accept)",
+        );
+    }
+
+    /// Regression for PR #219 round 6 (CR Critical): `start_matching`
+    /// computes an effective sliding prefix floor of
+    /// `history.len() - max_window_size` so emitted offsets never
+    /// exceed the advertised `max_window_size`. Without this floor,
+    /// after history grows past one window (commit's
+    /// eager-eviction keeps up to 2× max_window_size before
+    /// draining), the kernel could match against positions older
+    /// than the frame window — invalid for decoder buffer
+    /// reservation.
+    #[test]
+    fn start_matching_enforces_max_window_size_offset_bound() {
+        // Tight window: window_log=7 → max_window_size=128.
+        // Block lengths 200 + 200 = 400 bytes total, comfortably
+        // past 128 so without the sliding floor the kernel would
+        // emit matches at offsets > max_window.
+        let mut m = FastKernelMatcher::with_params(7, 8, 4, 2);
+        let max_window = m.max_window_size;
+        assert_eq!(max_window, 128, "test assumes window_log=7");
+
+        // Block 1: 200 bytes of a distinct ASCII pattern that
+        // populates the hash table at positions 0..200.
+        let block1: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x30 + (i % 64)).collect();
+        m.accept_data(block1.clone());
+        m.start_matching(|_| {});
+
+        // Block 2: 200 bytes that RE-USE block1's content from
+        // position 0 onwards. Without the sliding floor, the
+        // kernel would happily emit Triples with offset
+        // ≈ history_len (~200..400) — well past max_window=128.
+        let block2 = block1.clone();
+        m.accept_data(block2);
+
+        let mut max_emitted_offset = 0usize;
+        let mut emitted_match_count = 0usize;
+        m.start_matching(|seq| {
+            if let Sequence::Triple {
+                offset, match_len, ..
+            } = seq
+                && match_len > 0
+            {
+                emitted_match_count += 1;
+                if offset > max_emitted_offset {
+                    max_emitted_offset = offset;
+                }
+            }
+        });
+
+        // GUARANTEE 1: the kernel actually scanned and matched
+        // something — otherwise the offset bound below passes
+        // trivially with max_emitted_offset = 0.
+        assert!(
+            emitted_match_count > 0,
+            "fixture must produce at least one Triple match — \
+             history.len()=~400, max_window=128, block2 is identical to block1",
+        );
+
+        // GUARANTEE 2: every emitted offset stays within the
+        // advertised max_window_size. Without the sliding floor,
+        // matches against early block1 positions (e.g. position
+        // 0..72) would yield offsets > 128.
+        assert!(
+            max_emitted_offset <= max_window,
+            "sliding floor MUST cap emitted offsets at max_window_size; \
+             got max emitted offset {} vs max_window_size {}",
+            max_emitted_offset,
+            max_window,
+        );
+    }
+
+    /// Regression for PR #219 round 9 (Copilot Critical): the
+    /// sliding prefix floor in `start_matching` MUST use the
+    /// advertised frame window (`1 << window_log`), NOT the
+    /// dynamically inflated `max_window_size` (which the driver
+    /// adds dictionary-budget bytes to during
+    /// `prime_with_dictionary`). With the inflated value,
+    /// offsets could exceed the advertised window during
+    /// dictionary-primed compression — format-invalid sequences.
+    #[test]
+    fn start_matching_caps_offsets_at_window_log_not_inflated_max() {
+        // Advertised frame window = 1 << 7 = 128 bytes.
+        let mut m = FastKernelMatcher::with_params(7, 8, 4, 2);
+        let advertised_window: usize = 1 << m.window_log;
+        assert_eq!(advertised_window, 128, "test assumes window_log=7");
+
+        // Simulate dictionary priming: driver inflates
+        // max_window_size by retained_dict_budget. We add 200
+        // bytes of "dictionary" content to history first, then
+        // bump max_window_size to reflect the dict-retention
+        // budget (mirrors MatchGeneratorDriver::prime_with_dictionary
+        // for the Simple backend).
+        let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 64)).collect();
+        m.accept_data(dict.clone());
+        m.start_matching(|_| {}); // populate hash table from dict
+        m.max_window_size = m.max_window_size.saturating_add(200);
+
+        // Add a block whose first 100 bytes match dict[0..100].
+        // Without the fix, the kernel would emit offsets up to
+        // ~history_len (200..300), since the inflated max_window
+        // (328) keeps even the dict's earliest bytes inside the
+        // sliding floor.
+        let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 64)).collect();
+        m.accept_data(block);
+
+        let mut max_emitted_offset = 0usize;
+        let mut emitted_match_count = 0usize;
+        m.start_matching(|seq| {
+            if let Sequence::Triple {
+                offset, match_len, ..
+            } = seq
+                && match_len > 0
+            {
+                emitted_match_count += 1;
+                if offset > max_emitted_offset {
+                    max_emitted_offset = offset;
+                }
+            }
+        });
+
+        assert!(
+            emitted_match_count > 0,
+            "fixture must produce at least one match — block content \
+             repeats dict, history.len() ≈ 300, scan should find at \
+             least one Triple",
+        );
+        assert!(
+            max_emitted_offset <= advertised_window,
+            "sliding floor MUST cap emitted offsets at the ADVERTISED \
+             frame window (1 << window_log = {}), NOT the inflated \
+             max_window_size; got max emitted offset {}",
+            advertised_window,
+            max_emitted_offset,
         );
     }
 }
