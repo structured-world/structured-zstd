@@ -299,20 +299,12 @@ impl FastKernelMatcher {
     /// legacy MatchGenerator's `window.last().data` equivalent.
     ///
     /// Three states:
-    /// - Pre-`accept_data` of any block: returns empty slice. The
-    ///   matcher is seeded with `RESERVED_PREFIX_BYTES` dummy at
-    ///   the head of `history` (so `last_block_start =
-    ///   RESERVED_PREFIX_BYTES` and `history.len() =
-    ///   RESERVED_PREFIX_BYTES`); the returned `&history[last_block_start..]`
-    ///   slice is therefore empty until the first real block lands.
-    /// - Between `accept_data` and `start_matching` /
-    ///   `skip_matching_with_hint`: returns the pending buffer (not
-    ///   yet in history).
-    /// - After `start_matching` / `skip_matching_with_hint`: returns
-    ///   the slice of `history` covering the just-processed block.
-    ///   The frame compressor's raw-block emission path relies on
-    ///   this — it reads `get_last_space()` AFTER `start_matching`
-    ///   to fetch the bytes verbatim.
+    /// - Pre-`accept_data`: empty slice (the
+    ///   `RESERVED_PREFIX_BYTES`-seeded dummy means
+    ///   `history[last_block_start..]` is empty).
+    /// - Between `accept_data` and processing: the pending buffer.
+    /// - Post-processing: `history` slice of the just-processed
+    ///   block — frame compressor's raw-block emission reads this.
     pub(crate) fn last_committed_space(&self) -> &[u8] {
         match self.pending.as_deref() {
             Some(slice) => slice,
