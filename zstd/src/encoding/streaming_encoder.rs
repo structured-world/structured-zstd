@@ -91,9 +91,18 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     ///
     /// When set to `true`, the frame header serialized by this encoder
     /// omits the 4-byte magic number prefix. Must be called BEFORE the
-    /// first write — has no effect on already-started frames.
-    pub fn set_magicless(&mut self, magicless: bool) {
+    /// first [`write`](Write::write) call; calling it after the frame
+    /// header has already been emitted returns an error so the caller
+    /// can't be misled into thinking they produced a magicless stream.
+    pub fn set_magicless(&mut self, magicless: bool) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "magicless format must be set before the first write",
+            ));
+        }
         self.magicless = magicless;
+        Ok(())
     }
 
     /// Pledge the total uncompressed content size for this frame.

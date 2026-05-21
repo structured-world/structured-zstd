@@ -2338,13 +2338,22 @@ mod tests {
         assert_eq!(decoded, input, "magicless roundtrip must preserve bytes");
 
         // 3. A standard (magicful) decoder MUST fail on a magicless
-        //    frame — the first 4 bytes are the frame-header descriptor
-        //    + window/dictionary/FCS metadata, not the magic.
+        //    frame with the specific `BadMagicNumber` variant — the
+        //    first 4 bytes are the frame-header descriptor + window /
+        //    dictionary / FCS metadata, not the magic. Asserting the
+        //    specific variant prevents regressions from being masked
+        //    by unrelated failures.
+        use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
         let mut std_decoder = crate::decoding::FrameDecoder::new();
         let std_init = std_decoder.init(output.as_slice());
-        assert!(
-            std_init.is_err(),
-            "standard decoder must reject a magicless frame (got Ok)",
-        );
+        match std_init {
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(
+                _,
+            ))) => {}
+            other => panic!(
+                "standard decoder must reject a magicless frame with \
+                 ReadFrameHeaderError::BadMagicNumber, got {other:?}",
+            ),
+        }
     }
 }

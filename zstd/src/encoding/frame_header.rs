@@ -7,7 +7,14 @@ use alloc::vec::Vec;
 /// A header for a single Zstandard frame.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header>
-#[derive(Debug)]
+///
+/// Marked `#[non_exhaustive]`: external constructors MUST use the
+/// functional update syntax (`..FrameHeader::default()`) so future
+/// additions don't break source compatibility for downstream
+/// callers that don't need the new field. Within-crate constructors
+/// continue to provide every field explicitly.
+#[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct FrameHeader {
     /// Optionally, the original (uncompressed) size of the data within the frame in bytes.
     /// If not present, `window_size` must be set.
