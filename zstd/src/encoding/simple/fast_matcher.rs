@@ -1116,6 +1116,91 @@ mod tests {
         assert!(m.history.len() <= m.max_window_size * 2);
     }
 
+    /// Regression for #216 CodeRabbit review #6: after multiple
+    /// drain-evictions, `prefix_start_index` grows cumulatively
+    /// (saturating_add of drop_n per drain) while the hash table is
+    /// cleared and re-populated from current `history` positions
+    /// [0..max_window_size]. Without rebasing `prefix_start_index`
+    /// back to 1 on drain, the kernel's `match_idx >=
+    /// prefix_start_index` filter eventually rejects EVERY match
+    /// candidate (table positions < accumulated prefix_start_index).
+    /// Retained-window matches die wholesale.
+    #[test]
+    fn drain_rebases_prefix_start_index_so_retained_history_stays_matchable() {
+        // Tight window so evictions fire quickly: window_log = 8 →
+        // max_window_size = 256, threshold = 512. Each 200-byte
+        // commit accumulates 200 bytes; the third onwards triggers
+        // eviction with drop_n ≈ 144-200 per drain.
+        //
+        // After ~8 evictions, naive prefix_start_index grows to
+        // ~1 + 8 * ~180 ≈ 1441, far past any position in the
+        // current 256-byte retained history. The kernel's filter
+        // would then reject every match candidate (positions are at
+        // most history.len() = 256 << prefix_start_index = 1441).
+        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        // Build a fixed "signature" pattern that will survive many
+        // commits and remain matchable in the retained tail.
+        let sig: alloc::vec::Vec<u8> = (0..32u8)
+            .map(|i| i.wrapping_mul(31).wrapping_add(17))
+            .collect();
+
+        // Run 12 commits of 200 bytes each — guarantees many evictions.
+        // Last block carries the signature in its head + matchable
+        // bytes — we want the kernel to find this signature against
+        // the retained-history copy (placed in commit #10 below).
+        for round in 0..10 {
+            let mut block: alloc::vec::Vec<u8> = (0..200u8)
+                .map(|i| i.wrapping_add(round as u8 * 7))
+                .collect();
+            if round == 10 - 1 {
+                // Plant the signature near end of this block — it
+                // will live in the retained tail by the time block
+                // 11 commits below.
+                block[100..132].copy_from_slice(&sig);
+            }
+            m.accept_data(block);
+            m.skip_matching_with_hint(Some(false)); // dict-prime, hashes populated
+        }
+
+        // After 10 commits at 200 bytes each, prefix_start_index has
+        // advanced significantly (cumulative drop_n). Pre-fix it
+        // would be in the thousands; post-fix it should be 1 (or
+        // small).
+        let pre_fix_index_would_exceed_history = m.prefix_start_index as usize > m.history.len();
+        // Document the failing-case expectation (the bug being
+        // tested for): without the fix, prefix_start_index >> any
+        // valid history position.
+        let _ = pre_fix_index_would_exceed_history;
+
+        // Now commit a final block whose head contains the
+        // signature — kernel should find it referencing the
+        // earlier-planted copy in retained history.
+        let mut block: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(200);
+        block.extend_from_slice(&sig);
+        for i in 0..168u8 {
+            block.push(i.wrapping_mul(53).wrapping_add(91));
+        }
+        m.accept_data(block);
+
+        let mut saw_match = false;
+        m.start_matching(|seq| {
+            if let Sequence::Triple { match_len, .. } = seq
+                && match_len >= 4
+            {
+                saw_match = true;
+            }
+        });
+
+        assert!(
+            saw_match,
+            "after multiple drain-evictions the matcher must still find \
+             matches against retained-history bytes (got no match; \
+             prefix_start_index = {} vs history.len() = {})",
+            m.prefix_start_index,
+            m.history.len(),
+        );
+    }
+
     /// Regression for #216 review #1: `accept_data` MUST perform
     /// window eviction immediately so the driver's `commit_space`
     /// can observe the byte delta via a pre/post `history.len()`
