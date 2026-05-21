@@ -1092,4 +1092,67 @@ mod tests {
         // History within the 2× window-size hard cap.
         assert!(m.history.len() <= m.max_window_size * 2);
     }
+
+    /// Regression for #216 review #2: `trim_to_window` must update
+    /// `last_block_start` to track the drain. Without the update,
+    /// the OLD position references pre-drain coordinates and
+    /// `last_committed_space()` would either panic with OOB or
+    /// return wrong bytes when `last_block_start > history.len()`
+    /// post-drain.
+    #[test]
+    fn trim_to_window_keeps_last_committed_space_consistent() {
+        // window_log = 8 → max_window_size = 256. Process a 200-byte
+        // block (now in history at positions [0..200], last_block_start
+        // = 0). Then bump the matcher's max_window_size DOWN to 128
+        // (simulating a dictionary-budget retire shrinking the
+        // window) and call trim_to_window — drain_n = 200 - 128 = 72.
+        // Post-drain history is bytes [72..200] = 128 bytes. The
+        // last_block_start (was 0) MUST now be 0 (since 72 > 0 →
+        // saturating_sub gives 0) so last_committed_space() returns
+        // a valid in-bounds slice.
+        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        let payload: alloc::vec::Vec<u8> = (0..200u8).collect();
+        m.accept_data(payload);
+        m.skip_matching_with_hint(None);
+        assert_eq!(m.last_block_start, 0);
+        assert_eq!(m.history.len(), 200);
+
+        // Shrink the window and trim. Without the fix, last_block_start
+        // stays at 0 (which happens to be valid here) — but to make
+        // the bug surface, use a SECOND block so last_block_start is
+        // mid-history.
+        let payload2: alloc::vec::Vec<u8> = (50..150u8).collect();
+        m.accept_data(payload2);
+        m.skip_matching_with_hint(None);
+        // history = [0..200] + [50..150] = 300 bytes. last_block_start
+        // = 200 (start of second block).
+        assert_eq!(m.last_block_start, 200);
+        assert_eq!(m.history.len(), 300);
+
+        // Now force trim_to_window to drain into the middle of the
+        // second block: shrink max_window_size below the second
+        // block's start.
+        m.max_window_size = 64;
+        let drained = m.trim_to_window();
+        assert_eq!(
+            drained,
+            300 - 64,
+            "trim must drain history down to max_window_size = 64",
+        );
+        assert_eq!(m.history.len(), 64);
+
+        // The slice MUST be in bounds — the bug would panic here OR
+        // return a stale slice. After the fix, last_block_start
+        // saturating_sub'd by drained = 236; since drained (236) >
+        // old last_block_start (200), new last_block_start = 0,
+        // pointing at the current head of history (start of what
+        // remains of block 2 after the drain).
+        let last = m.last_committed_space();
+        assert!(
+            last.len() <= 64,
+            "last_committed_space must be in-bounds after trim \
+             (got len {})",
+            last.len(),
+        );
+    }
 }
