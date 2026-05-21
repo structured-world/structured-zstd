@@ -1509,4 +1509,62 @@ mod tests {
              encoder's seeded history)",
         );
     }
+
+    /// Regression for #216 CodeRabbit #19: when a committed block
+    /// is larger than `max_window_size`, the pre-fix eviction math
+    /// always retained a full `max_window_size` of historical real
+    /// data and then appended the (oversized) block, blowing past
+    /// the documented `2 × max_window_size` post-append bound.
+    /// Fix retains a SMALLER prefix (or none) so the bound holds.
+    #[test]
+    fn accept_data_evicts_more_aggressively_when_block_larger_than_window() {
+        let mut m = FastKernelMatcher::with_params(8, 6, 4);
+        // max_window_size = 256 (1 << 8). Threshold = 512.
+
+        // Pre-fill history to full max_window_size of real data via
+        // skip_matching_with_hint (no kernel-side trimming). u8 range
+        // tops at 255, so the 256-byte preamble cycles via modulo.
+        let preamble: alloc::vec::Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        m.accept_data(preamble);
+        m.skip_matching_with_hint(None);
+        assert_eq!(
+            m.history_len_for_eviction_accounting(),
+            256,
+            "history pre-filled to one full window of real bytes",
+        );
+
+        // Commit a block larger than max_window_size but under 2×
+        // (so its append should still be allowed without rejecting
+        // outright). 400 > 256 but < 512.
+        let oversize: alloc::vec::Vec<u8> = (0..400u32)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(11))
+            .collect();
+        m.accept_data(oversize);
+
+        // Post-append real_len + space.len() MUST stay within 2×
+        // max_window_size (the documented invariant). Pre-fix it
+        // jumped to 256 + 400 = 656 = 2.56× — bound violated.
+        let real_len_after = m.history_len_for_eviction_accounting();
+        // accept_data stashes pending without appending, so the
+        // 400-byte block is in pending. real_len reflects post-
+        // drain retained real bytes. To verify the bound, run
+        // start_matching to commit the append.
+        m.start_matching(|_| {});
+        let real_total = m.history_len_for_eviction_accounting();
+        assert!(
+            real_total <= m.max_window_size * 2,
+            "post-append history MUST stay within 2 × max_window_size \
+             (got real_total={real_total}, cap={})",
+            m.max_window_size * 2,
+        );
+        // Sanity: pre-append eviction did drain something (we had
+        // 256 real bytes, can't accept 400 more while staying under
+        // 512 unless we drop at least 144).
+        assert!(
+            real_len_after < 256,
+            "pre-append drain must have shed historical bytes \
+             (got real_len_after_drain={real_len_after}, was 256 \
+             before accept)",
+        );
+    }
 }
