@@ -600,13 +600,14 @@ impl MatchGeneratorDriver {
     ///
     /// `FastKernelMatcher::take_recycled_space` returns the cleared
     /// (capacity-retained) `Vec<u8>` from the last
-    /// `extend_history_with_pending`. We resize it back to the
-    /// driver's `slice_size` and push it onto `vec_pool` so the next
-    /// `get_next_space()` call can reuse the allocation instead of
-    /// allocating fresh. Without this, the Simple backend would
-    /// allocate a new `Vec<u8>` per block — a measurable hot-path
-    /// cost when blocks are small (~128 KiB) and processed at
-    /// hundreds of MiB/s.
+    /// `extend_history_with_pending`. We push it onto `vec_pool`
+    /// as-is (with `len = 0`); `get_next_space()` is responsible for
+    /// resizing the buffer back to `slice_size` on its next pop. The
+    /// pushed length is irrelevant — only the capacity matters, and
+    /// `extend_history_with_pending` preserves it. Without this
+    /// recycle path, the Simple backend would allocate a new
+    /// `Vec<u8>` per block — a measurable hot-path cost when blocks
+    /// are small (~128 KiB) and processed at hundreds of MiB/s.
     fn recycle_simple_space(&mut self) {
         if let Some(space) = self.simple_mut().take_recycled_space() {
             // `space` is already cleared (len = 0) by
