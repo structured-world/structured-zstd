@@ -3,27 +3,48 @@ use crate::decoding::errors::{FrameDescriptorError, FrameHeaderError, ReadFrameH
 use crate::io::Read;
 
 /// Read a single serialized frame from the reader and return a tuple containing the parsed frame and the number of bytes read.
-pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+///
+/// Reads the 4-byte magic number prefix; errors with
+/// `BadMagicNumber` if it doesn't match. For magicless streams
+/// (donor `ZSTD_f_zstd1_magicless`), call
+/// [`read_frame_header_with_format`] with `magicless = true`.
+#[allow(dead_code)] // Public surface used by downstream consumers; internal call sites use the _with_format variant.
+pub fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+    read_frame_header_with_format(r, false)
+}
+
+/// Read a single serialized frame header. When `magicless` is
+/// `true`, the 4-byte magic prefix is NOT consumed and skippable-
+/// frame detection is bypassed — the caller MUST know out-of-band
+/// that the stream is magicless. Donor parity:
+/// `ZSTD_f_zstd1_magicless` via `ZSTD_d_format`.
+pub fn read_frame_header_with_format(
+    mut r: impl Read,
+    magicless: bool,
+) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     use ReadFrameHeaderError as err;
     let mut buf = [0u8; 4];
 
-    r.read_exact(&mut buf).map_err(err::MagicNumberReadError)?;
-    let mut bytes_read = 4;
-    let magic_num = u32::from_le_bytes(buf);
+    let mut bytes_read = 0;
+    if !magicless {
+        r.read_exact(&mut buf).map_err(err::MagicNumberReadError)?;
+        bytes_read = 4;
+        let magic_num = u32::from_le_bytes(buf);
 
-    // Skippable frames have a magic number in this interval
-    if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
-        r.read_exact(&mut buf)
-            .map_err(err::FrameDescriptorReadError)?;
-        let skip_size = u32::from_le_bytes(buf);
-        return Err(ReadFrameHeaderError::SkipFrame {
-            magic_number: magic_num,
-            length: skip_size,
-        });
-    }
+        // Skippable frames have a magic number in this interval
+        if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
+            r.read_exact(&mut buf)
+                .map_err(err::FrameDescriptorReadError)?;
+            let skip_size = u32::from_le_bytes(buf);
+            return Err(ReadFrameHeaderError::SkipFrame {
+                magic_number: magic_num,
+                length: skip_size,
+            });
+        }
 
-    if magic_num != MAGIC_NUM {
-        return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
+        if magic_num != MAGIC_NUM {
+            return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
+        }
     }
 
     r.read_exact(&mut buf[0..1])

@@ -33,6 +33,9 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     frame_started: bool,
     pledged_content_size: Option<u64>,
     bytes_consumed: u64,
+    /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
+    /// Default false. See [`Self::set_magicless`].
+    magicless: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -78,9 +81,19 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             frame_started: false,
             pledged_content_size: None,
             bytes_consumed: 0,
+            magicless: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Enable or disable magicless frame format (`ZSTD_f_zstd1_magicless`).
+    ///
+    /// When set to `true`, the frame header serialized by this encoder
+    /// omits the 4-byte magic number prefix. Must be called BEFORE the
+    /// first write — has no effect on already-started frames.
+    pub fn set_magicless(&mut self, magicless: bool) {
+        self.magicless = magicless;
     }
 
     /// Pledge the total uncompressed content size for this frame.
@@ -275,6 +288,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             } else {
                 Some(window_size)
             },
+            magicless: self.magicless,
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
