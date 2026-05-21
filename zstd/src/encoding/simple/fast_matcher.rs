@@ -551,6 +551,17 @@ impl FastKernelMatcher {
         }
     }
 
+    /// Seed the wire encoder's offset history from a primed
+    /// dictionary load. Currently sets `offset_hist` only; the
+    /// kernel's `rep` is intentionally left out of sync in this
+    /// version so the rep/offset_hist drift is observable by the
+    /// regression test for #216 Copilot review #15. The fix commit
+    /// extends this to update `rep[0..2]` from `offset_hist[0..2]`
+    /// atomically.
+    pub(crate) fn prime_offset_history(&mut self, offset_hist: [u32; 3]) {
+        self.offset_hist = offset_hist;
+    }
+
     /// Read-only view of `history.len()` for the driver's eviction
     /// accounting (`commit_space` → `retire_dictionary_budget` flow).
     /// The driver compares pre/post values to derive a byte-delta
@@ -1382,6 +1393,39 @@ mod tests {
             "last_committed_space must be in-bounds after trim \
              (got len {})",
             last.len(),
+        );
+    }
+
+    /// Regression for #216 Copilot review #15: after
+    /// `prime_offset_history` the kernel's `rep[0..2]` must mirror
+    /// the wire-encoder's `offset_hist[0..2]` — without this the
+    /// kernel makes repcode decisions against stale FAST_INITIAL_REP
+    /// while the wire encoder uses the primed history → wrong
+    /// repcode wire encoding (correctness bug, not perf).
+    #[test]
+    fn prime_offset_history_keeps_rep_and_offset_hist_in_lockstep() {
+        let mut m = FastKernelMatcher::with_params(12, 8, 4);
+        // Pre-prime: matcher carries the donor's initial state.
+        assert_eq!(m.rep, FAST_INITIAL_REP);
+        assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
+
+        // Prime with non-default history (donor's dictionary load
+        // restores explicit rep1/rep2/rep3 values).
+        let primed = [9u32, 4, 8];
+        m.prime_offset_history(primed);
+
+        // BOTH must reflect the primed values; rep[0..2] = the first
+        // two entries of offset_hist.
+        assert_eq!(
+            m.offset_hist, primed,
+            "offset_hist must be updated by prime_offset_history",
+        );
+        assert_eq!(
+            m.rep,
+            [primed[0], primed[1]],
+            "rep[0..2] must mirror offset_hist[0..2] post-prime \
+             (kernel's repcode decisions must match the wire \
+             encoder's seeded history)",
         );
     }
 }
