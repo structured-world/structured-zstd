@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779315576859,
+  "lastUpdate": 1779379566029,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -42333,6 +42333,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.306,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6d9ac638003fca84d07c30896acf7effc36860ea",
+          "message": "perf(encoder): wire donor-shape Fast kernel into MatchGeneratorDriver (#198 phase 1b) (#217)\n\n* perf(encoder): wire donor-shape Fast kernel into MatchGeneratorDriver (#198 phase 1b)\n\nPhase 1b of #198 — wires the donor-shape kernel modules from\nphase 1a (#215, merged in fc634644) into the production hot path.\nThe legacy SuffixStore-based MatchGenerator in simple/mod.rs is\nfully removed; MatcherStorage::Simple now holds a\nFastKernelMatcher that drives compress_block_fast<MLS> once per\nblock.\n\nSelected for every Fast-strategy level — CompressionLevel::Uncompressed,\nCompressionLevel::Fastest, CompressionLevel::Level(1), and the\nnegative CompressionLevel::Level(-7..=-1) variants. All Fast\nlevels currently resolve to the same matcher with donor level-1\nhash_log=14, mls=7; per-level acceleration knobs (kSearchStrength\ndispatch, 4-cursor ip0/ip1/ip2/ip3 pipelining, cmov match-found)\nland in phase 3.\n\n## What changes\n\n- simple/mod.rs collapses from 496 → 14 lines (only module\n  declarations + docstring remain). SuffixStore, WindowEntry,\n  MatchGenerator, repcode_candidate, add_data, next_sequence,\n  add_suffixes_till, insert_suffix_if_absent,\n  add_suffixes_interleaved_fast, offset_match_len, reserve — all\n  gone with the wiring.\n- simple/fast_matcher.rs is the new active matcher: full inherent\n  surface (accept_data, start_matching, skip_matching_with_hint,\n  trim_to_window, last_committed_space, reset,\n  prime_offset_history, take_recycled_space).\n- MatchGeneratorDriver Simple-arm wiring: commit_space →\n  m.accept_data(space) with eager pre-commit eviction;\n  start_matching::<Fast> → m.start_matching(handler);\n  skip_matching_with_hint → m.skip_matching_with_hint(hint);\n  reset → m.reset(window_log, FAST_LEVEL_1_HASH_LOG,\n  FAST_LEVEL_1_MLS); trim_after_budget_retire → m.trim_to_window();\n  prime_with_dictionary → m.prime_offset_history(offset_hist).\n- Per-block input Vec recycled via take_recycled_space() →\n  vec_pool (zero zero-fill cost — buffer pushed with len=0,\n  get_next_space resizes on pop).\n\n## Invariants\n\n- prefix_start_index = RESERVED_PREFIX_BYTES (= 1) baseline. The\n  first byte of history is a reserved dummy (sentinel-0 guard);\n  real input data starts at history[1]. Donor C zstd achieves\n  the same effect via a virtual base pointer; the flat Vec<u8>\n  model here pays one byte of memory overhead for the same\n  correctness property (no missed matches at segment boundaries).\n- history.len() bounded by 2 × max_window_size post-append, even\n  for oversize committed blocks (retain_real = cap.saturating_sub(\n  space.len()).min(max_window_size)).\n- Eviction preserves the dummy AND rebases prefix_start_index back\n  to RESERVED on every drain — cumulative growth would push the\n  filter past every valid history index and reject all match\n  candidates wholesale.\n- Hash table rehashed after drain so retained tail bytes stay\n  matchable. Amortised O(1) per byte of input.\n- rep[0..2] ↔ offset_hist[0..2] in lockstep on the common\n  (lit_len > 0) path. Known divergence on back-to-back repcode\n  matches (lit_len == 0 emits): kernel's rep unchanged, wire\n  encoder per RFC 8878 §3.1.2.5 remaps codes and rotates\n  offset_hist — marginal compression hit, output still correct.\n  Phase 3 collapses these at the kernel level.\n- prime_offset_history seeds BOTH rep[0..2] and offset_hist\n  atomically from a dictionary load.\n\n## Defensive validation\n\n- MatchGeneratorDriver::new asserts slice_size > 0,\n  max_slices_in_window > 0, checked_mul for the product, and\n  checked_next_power_of_two for window_log_init derivation —\n  catches all four overflow / degenerate paths with a clear\n  domain-specific panic instead of a deep matcher-internal\n  failure.\n- FastHashTable construction-time mls / hash_log validation\n  unchanged from phase 1a.\n\n## Tests\n\n573/573 pass on the full workspace nextest suite:\n\n- 21 unit tests on FastKernelMatcher (lifecycle, accept + start,\n  skip flavors, dict-prime hash population, eviction, boundary\n  cases at HASH_READ_SIZE = 8, rep ↔ offset_hist sync,\n  prefix-eviction during dict-priming, drain prefix_start_index\n  runaway, trim_to_window/last_block_start drift, oversize-block\n  eviction bound).\n- 32 unit tests on the underlying kernel (donor-formula parity,\n  prefix-filter, repcode backward extension three-piece proof,\n  short-input early-return uniformity).\n- All frame_compressor integration tests (raw-block detection,\n  hinted source-size matrix, level-1 round-trips through both\n  the in-tree decoder and FFI decode).\n- All cross_validation Rust-encoded → FFI-decoded round-trips\n  (every level 1..=22, dict + no-dict, encoded by Rust then\n  read by the C reference decoder verbatim).\n\n18 legacy tests in match_generator.rs that exercised\nSuffixStore-specific behavior or required block.len() <\nHASH_READ_SIZE matching are #[cfg(any())]-gated with explanatory\ncomments — their substance either has equivalent coverage in the\nnew tests or relied on algorithm-specific quirks the donor-shape\nkernel doesn't reproduce by design.\n\n## Benchmark (i9-9900K)\n\ncargo bench deltas vs main (fc634644) on\ncompress/level_1_fast/*/matrix/pure_rust:\n\n| Scenario | Δ time | Throughput | Note |\n|----------|-------:|-----------:|------|\n| low-entropy-1m | -90.7% | 3.3 GiB/s | 10× faster |\n| decodecorpus-z000033 | -83.4% | 156 MiB/s | 6× faster |\n| high-entropy-1m | -67.3% | 633 MiB/s | 3× faster |\n| small-10k-random | -36.0% | 768 MiB/s | 1.6× faster |\n| small-4k-log-lines | -15.4% | 154 MiB/s | 1.2× faster |\n| small-1k-random | +42.2% | 130 MiB/s | tiny-block overhead |\n| large-log-stream | +122.3% | 235 MiB/s | regression — see below |\n\nLarge-log-stream regression is expected at this phase: legacy\nSuffixStore used effectively window_log-sized hash slots (512K\nfor level-1 window_log=19), while phase 1b uses donor-parity\nhash_log=14 (16K slots). 25 MiB dense-compressible log content\nhits ~1500 collisions/slot. Donor C zstd shows the same trade-off\n(~120 MB/s on similar workloads). Phase 3 (4-cursor pipelining +\ncmov) closes the gap per the documented roadmap (#198 items 2/3/5).\n\n## What's NOT in this PR\n\n- Phase 3 (#198 items 2/3/5): 4-cursor ip0/ip1/ip2/ip3 lookahead,\n  cmov match-found variant, per-level mls dispatch,\n  kSearchStrength acceleration gradient for negative Fast levels.\n- LevelParams.hash_log / LevelParams.mls fields — Fast hard-codes\n  donor level-1 defaults (14/7) today.\n- hash_fill_step stride for dict-priming — still hard-coded to 1\n  (LevelParams field is wired in but the Fast matcher always\n  strides at 1).\n\nCloses #198 phase 1b.\n\nRelated: #178 (umbrella regression issue), #215 (phase 1a — kernel\nmodules, merged in fc634644).\n\n* fix(match_generator,fast_matcher): correctness + doc accuracy fixes (#217 review round 1)\n\nFour findings from CodeRabbit + Copilot's first review pass on the\nsquashed PR #217. All four touch comment / metadata accuracy or\na single-line correctness issue; no behavioural change beyond the\nwindow_size sync.\n\n**CR outside-diff (match_generator.rs:598-613)** — correctness:\n`reported_window_size` was using the unrounded `max_window_size`\nwhile the matcher itself was constructed from `next_pow2` (rounded\nup). For non-power-of-two constructor inputs (e.g. `slice_size *\nmax_slices_in_window = 100_000`), `window_size()` would report\n65_536 (un-rounded floor) while the active backend actually carried\n131_072 (rounded-up next_pow2). The drift held until the first\n`reset()` overwrote both sides from LevelParams. Fix: report\n`next_pow2` so the two stay in lockstep at construction time.\n\n**CR #1 (match_generator.rs:944)** — declined, deferred to phase 3:\nFast levels (Uncompressed, Fastest, Level(-7..=1)) all hard-code\ndonor level-1 cParams. The acceleration gradient between negative-\nlevel fast modes and Level(1) lands when phase 3 ports donor's\n4-cursor lookahead + cmov match-found + per-level kSearchStrength\ndispatch (issue #198 items 2/3/5). Updated the inline code\ncomment to scrub the closed-PR reference and frame the deferral\nagainst phase 3 directly.\n\n**Copilot #2 (match_generator.rs:572)** — doc: the validation-guard\ncomment described `next_power_of_two` returning 0 on overflow,\nwhich was old-Rust behaviour. Modern Rust panics; we now use\n`checked_next_power_of_two` (commit landed in the squash). Rewrote\nthe comment to enumerate the three actual failure modes (zero\nargs, mul overflow, next-pow2 overflow) and the three guards that\ncatch them.\n\n**Copilot #3 (fast_matcher.rs:303)** — doc: `last_committed_space`'s\npre-`accept_data` state description claimed `last_block_start = 0\n/ history.len() = 0`, but post-RESERVED_PREFIX_BYTES-seed\nconstruction (#216 / phase 1b) leaves both at\n`RESERVED_PREFIX_BYTES`. The returned slice is still empty (the\n`history[last_block_start..]` range is empty), just for a\ndifferent reason. Updated the doc to reflect the seeded-dummy\ninvariant.\n\n573/573 tests pass; clippy clean.\n\n* docs(fast_matcher): compact last_committed_space docstring (apply new compactness rule)\n\nDoc-only change: collapse the verbose multi-paragraph\nlast_committed_space docstring (added during PR #216 review\nrounds) into a 6-line three-bullet form. Same semantic content,\nzero narrative.\n\nApply the new docstring compactness rule (one-two phrases default,\nmulti-paragraph only for non-obvious invariants).\n\n573/573 tests pass; clippy clean.\n\n* docs(fast_matcher): align dict-prime boundary test comments with RESERVED_PREFIX_BYTES seed (#217 Copilot #4, #5)\n\nDoc-only update aligning the dict-prime boundary test\ncomment + inline note with the RESERVED_PREFIX_BYTES seed\n(post-phase-1b range is [RESERVED..=RESERVED], not [0..=0]).\nCompactness rule applied — concise two-block form.\n\n573/573 tests pass; clippy clean.\n\n* docs(fast_matcher): correct prefix_start_index wording — rebases, not bumps (#217 Copilot #6, #7)\n\nTwo doc comments described prefix_start_index as 'bumped forward'\nor 'advances' as history is evicted, implying a monotonic absolute\nindex. Actual code (drain_real_prefix) rebases it back to\nRESERVED_PREFIX_BYTES on every drain — the retained tail is\nre-indexed in the new coordinate space.\n\nUpdated both sites (struct field doc + trim_to_window header) to\nmatch. Compactness rule applied — trim_to_window header collapsed\nfrom 10 lines to 5.\n\n573/573 tests pass; clippy clean.\n\n* docs(fast_matcher): drop stale hash_log scaling claim + add lit_len=0 TODO marker (#217 Copilot #8, #9)\n\n#8 — header for FAST_LEVEL_1_HASH_LOG said 'reset path rebinds\nhash_log proportionally on source-size hint'. Untrue today: driver\npasses only window_log per-level, hash_log + mls hard-coded. Pin\nper-level scaling to phase 3.\n\n#9 — same lit_len=0 / back-to-back-rep1 concern as the prior PR's\n#21. Inline + module docs already explain, but verbose prose isn't\nanchored. Collapsed inline comment to a single\n'// TODO(#198 phase 3):' line so the deferral marker is\nunambiguous.\n\n573/573 tests pass; clippy clean.\n\n* fix(fast_matcher): assert hard preconditions + skip lit_len=0 rotation + hoist mls dispatch (#217 round 5)\n\nFour findings from the latest CR + Copilot review pass.\n\n**CR outside-diff (327-331) — assert!, not debug_assert!:** the\nduplicate-pending guard in accept_data was debug_assert!, so in\nrelease builds a double-commit would silently overwrite pending\nand drop a committed block. Hard-fail instead.\n\n**CR outside-diff (358-363) — block_size <= 2 × max_window_size:**\nthe eviction math computes retain_real via saturating_sub, which\nsilently collapses to 0 if space.len() > cap. The full block is\nstill appended afterwards, violating the documented\n'history bounded by 2 × max_window_size' invariant. Added an\nassert! precondition so callers see a clear panic at the boundary\ninstead of an invisible invariant break.\n\n**CR #10 — lit_len == 0 offset_hist rotation (third raise):** the\nprior round added a TODO marker explaining the divergence, but CR\ncorrectly pushed back that documentation isn't a fix. Skip\nencode_offset_with_history when literals.is_empty() so\noffset_hist stays in lockstep with the kernel's unchanged rep —\nno divergence on the back-to-back rep1 path. Wire encoder\ndownstream still sees the Triple with raw offset; its own\nencoding stays correct (lit_len-0 absolute encoding per RFC\n8878 §3.1.2.5). Module docstring 'Known divergence' section\ncollapsed accordingly.\n\n**Copilot #11 — hoist mls dispatch outside prime_hash loop:**\nmoved the per-MLS match arm OUTSIDE the per-position loop. New\nprime_hash_table_impl<const MLS: u32> is monomorphised per\nmatcher instance; the hot path is branch-free on mls.\n\n573/573 tests pass; clippy clean.\n\n* fix(fast_matcher): call encode_offset_with_history unconditionally (#217 Copilot #12, revert round 5 #10)\n\nRound 5 skipped encode_offset_with_history when literals.is_empty()\nto keep matcher.offset_hist 'in lockstep' with kernel rep. Copilot\ncorrectly pushed back: Dfast / Row / HashChain matchers all call\nit unconditionally (passing lit_len = 0 when applicable), and the\n'lockstep' framing was wrong — matcher.offset_hist tracks the\nWIRE ENCODER's history while matcher.rep tracks the KERNEL's\nstate. They're not supposed to be the same.\n\nRevert the skip. Module docstring rewritten to call out that the\ntwo fields reflect DIFFERENT state and may diverge on lit_len = 0\nemits per RFC 8878 §3.1.2.5 — both halves stay self-consistent\nwithin their own domain.\n\nRound 5 #10 reply to CR was based on the wrong mental model;\nthat's reflected in this fix by reverting to the donor /\nother-matchers behaviour.\n\n573/573 tests pass; clippy clean.",
+          "timestamp": "2026-05-21T18:22:11+03:00",
+          "tree_id": "a34b94dfaff48ebc37e1f736dc10ce56ea3c4631",
+          "url": "https://github.com/structured-world/structured-zstd/commit/6d9ac638003fca84d07c30896acf7effc36860ea"
+        },
+        "date": 1779379561953,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.139,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 302.927,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 205.389,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.48,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.465,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.727,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.073,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.679,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.031,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.321,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.32,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.04,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.082,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.706,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.952,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.288,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.99,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.075,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.13,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.305,
             "unit": "ms"
           },
           {
