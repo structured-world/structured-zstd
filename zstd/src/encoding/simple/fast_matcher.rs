@@ -32,39 +32,11 @@
 //!   (updated from `FastBlockResult.rep` after every
 //!   `start_matching`). `offset_hist[0..2]` tracks the wire
 //!   encoder's repcode positions and is updated per-emission via
-//!   [`encode_offset_with_history`]. The two are in lockstep for
-//!   the lit-len > 0 case (the common path) — both rotate on
-//!   explicit-offset emits and both leave their head untouched on
-//!   repcode-1 emits.
-//!
-//!   **Known divergence on lit-len == 0 emits:** the kernel CAN
-//!   emit `Sequence::Triple { literals: &[], ... }` when a repcode
-//!   match starts exactly at `anchor` — i.e. back-to-back matches
-//!   where the previous emit advanced `anchor` to the start of the
-//!   next match. In that case:
-//!
-//!   - Kernel's `rep_offset1` stays unchanged (repcode-match
-//!     contract).
-//!   - Wire encoder, per RFC 8878 §3.1.2.5, REMAPS the repcode
-//!     codes when `lit_len == 0`: code 1 → `rep[1]`, code 2 →
-//!     `rep[2]`, code 3 → `rep[0] - 1`. So an emit with
-//!     `actual_offset == rep[0]` doesn't hit any of the three
-//!     repcode codes and falls through to absolute encoding
-//!     (`code = actual_offset + 3`), then rotates `offset_hist`
-//!     as a fresh offset.
-//!
-//!   Net effect: marginal compression hit (saved-bytes lost on
-//!   the rare lit_len-0-rep-1 path) AND `rep` / `offset_hist`
-//!   diverge by one slot after such an emit. Both halves are
-//!   still self-consistent — the kernel's next block's matching
-//!   uses `rep`, the wire encoder's next emit uses
-//!   `offset_hist` — so the output is correct, just not
-//!   compression-optimal.
-//!
-//!   Phase 3 (4-cursor + cmov) revisits this with donor's
-//!   match-collapsing logic that merges back-to-back same-offset
-//!   matches into a single longer match, eliminating the
-//!   lit_len-0 emit entirely.
+//!   [`encode_offset_with_history`]. Lockstep preserved on the
+//!   common (lit-len > 0) path. On lit-len == 0 emits (back-to-
+//!   back rep1) the wrapper SKIPS the offset_hist rotation — both
+//!   sides stay untouched, matching the kernel's "rep unchanged"
+//!   contract. Phase 3 collapses these emits at the kernel layer.
 
 use alloc::vec::Vec;
 
@@ -324,7 +296,7 @@ impl FastKernelMatcher {
     /// would force the eviction work even when the driver follows up
     /// with `skip_matching` on incompressible data.
     pub(crate) fn accept_data(&mut self, space: Vec<u8>) {
-        debug_assert!(
+        assert!(
             self.pending.is_none(),
             "FastKernelMatcher: accept_data called with a still-pending buffer; \
              the driver must run start_matching / skip_matching between commits",
@@ -347,6 +319,18 @@ impl FastKernelMatcher {
         let real_len = self.history.len().saturating_sub(RESERVED_PREFIX_BYTES);
         let new_real_total = real_len.saturating_add(space.len());
         let cap = self.max_window_size.saturating_mul(2);
+        // Hard precondition: caller must split blocks into pieces no
+        // larger than `2 × max_window_size`. Without this, the
+        // eviction math below can't keep post-append history under
+        // the advertised cap (retain_real saturates to 0 but the
+        // full block still appends, violating the invariant).
+        assert!(
+            space.len() <= cap,
+            "FastKernelMatcher requires block_size <= 2 × max_window_size \
+             (block={}, cap={})",
+            space.len(),
+            cap,
+        );
         if new_real_total > cap {
             // Compute how many real bytes to KEEP, then drop the
             // delta. Pre-fix code naively kept `max_window_size`
@@ -507,20 +491,24 @@ impl FastKernelMatcher {
                 match_len,
             } = seq
             {
-                // Discarded return is the encoded repcode token —
-                // mirrors what the legacy `MatchGenerator` does. The
+                // Skip the offset_hist rotation on lit_len == 0 emits.
+                // The kernel's `rep` state stays unchanged in the
+                // back-to-back rep1 case, so leaving `offset_hist`
+                // unchanged keeps it in lockstep with `rep`. The
+                // discarded return is the encoded repcode token —
                 // wire-encoder downstream computes its own encoding
-                // from the raw offset; this call only mutates
-                // `offset_hist` so subsequent priming-state reads
-                // see the post-block history.
+                // from the raw offset.
                 //
                 // TODO(#198 phase 3): collapse back-to-back rep1
-                // matches at the kernel level to avoid lit_len=0
-                // emits. Today they cause a documented rep ↔
-                // offset_hist divergence — see the module docstring
-                // "Known divergence on lit-len == 0 emits" section.
-                let _ =
-                    encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
+                // matches at the kernel level so this case stops
+                // arising at the wire layer entirely.
+                if !literals.is_empty() {
+                    let _ = encode_offset_with_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        offset_hist,
+                    );
+                }
                 handle_sequence(Sequence::Triple {
                     literals,
                     offset,
@@ -695,10 +683,9 @@ impl FastKernelMatcher {
     /// dictionary-priming skip path (`skip_matching` with
     /// `incompressible_hint = Some(false)`).
     ///
-    /// Dispatches on the matcher's monomorphised `MLS` so the inner
-    /// `hash_ptr<MLS>` call resolves to a single constant-folded body
-    /// per supported mls (4..=8). The unreachable `_` arm guards
-    /// against future MLS-range widening missing this dispatch.
+    /// `mls` dispatch is hoisted OUTSIDE the per-position loop so
+    /// the inner body is monomorphised per matcher instance (no
+    /// branch / mispredict in the hot path).
     fn prime_hash_table_for_range(&mut self, range_start: usize) {
         let history_len = self.history.len();
         // HASH_READ_SIZE = 8 is the kernel's load-width invariant
@@ -714,29 +701,30 @@ impl FastKernelMatcher {
             return;
         }
 
-        let mls = self.hash_table.mls();
+        match self.hash_table.mls() {
+            4 => self.prime_hash_table_impl::<4>(range_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(range_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(range_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(range_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(range_start, last_hashable),
+            _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
+        }
+    }
+
+    /// Monomorphised per-MLS loop body called by
+    /// [`Self::prime_hash_table_for_range`] after the outer dispatch.
+    fn prime_hash_table_impl<const MLS: u32>(&mut self, range_start: usize, last_hashable: usize) {
         let base = self.history.as_ptr();
         for pos in range_start..=last_hashable {
-            // SAFETY: pos < history_len (by loop bound), and the
-            // load width HASH_READ_SIZE is the kernel's contractually
+            // SAFETY: pos < history_len (by loop bound), and the load
+            // width HASH_READ_SIZE is the kernel's contractually
             // required minimum, so `base.add(pos)` covers
             // HASH_READ_SIZE readable bytes by `last_hashable`'s
-            // definition. Dispatch on the runtime mls into the
-            // matching const-generic monomorphisation.
+            // definition. The MLS const-generic is bound at the
+            // caller's match arm — `hash_ptr<MLS>` and `put` are
+            // constant-folded per MLS.
             let ptr = unsafe { base.add(pos) };
-            let hash = unsafe {
-                match mls {
-                    4 => self.hash_table.hash_ptr::<4>(ptr),
-                    5 => self.hash_table.hash_ptr::<5>(ptr),
-                    6 => self.hash_table.hash_ptr::<6>(ptr),
-                    7 => self.hash_table.hash_ptr::<7>(ptr),
-                    8 => self.hash_table.hash_ptr::<8>(ptr),
-                    _ => unreachable!("FastHashTable construction rejects mls outside 4..=8",),
-                }
-            };
-            // SAFETY: hash came from this table's hash_ptr; pos fits
-            // in u32 by the u32::MAX guard the kernel's entry asserts
-            // (data.len() <= u32::MAX, and pos < data.len()).
+            let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
             unsafe { self.hash_table.put(hash, pos as u32) };
         }
     }
