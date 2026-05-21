@@ -131,8 +131,9 @@ pub(crate) const RESERVED_PREFIX_BYTES: usize = 1;
 ///   current block live in this single contiguous buffer; the kernel's
 ///   `block_start` parameter separates the two.
 /// - `prefix_start_index` is donor's `prefixStartIndex` — the lowest
-///   absolute position any match may reference. Bumped forward when
-///   older history is evicted past `max_window_size`.
+///   position any match may reference. Pinned to `RESERVED_PREFIX_BYTES`
+///   at construction and after every drain (drain re-indexes the
+///   retained tail).
 /// - `rep` carries the two-deep repcode state across blocks.
 /// - `offset_hist` is the encoder-side 3-deep offset history used by
 ///   the wire encoder's repcode coding (separate from `rep`, which is
@@ -675,18 +676,11 @@ impl FastKernelMatcher {
         self.history.len().saturating_sub(RESERVED_PREFIX_BYTES)
     }
 
-    /// Donor's `ZSTD_window_trimWindow` equivalent: drop history
-    /// bytes that no longer fit in `max_window_size`, bumping
-    /// `prefix_start_index` and clearing the hash table (which holds
-    /// absolute positions into the pre-trim history).
-    ///
-    /// Returns the number of bytes evicted — used by the driver's
-    /// `trim_after_budget_retire` loop to drive the dictionary-budget
-    /// reclamation termination condition (`evicted_bytes == 0` →
-    /// done).
-    ///
-    /// Idempotent: when `history.len() <= max_window_size` already,
-    /// returns 0 without touching state.
+    /// Drop history bytes past `max_window_size` via
+    /// [`Self::drain_real_prefix`] (rebases `prefix_start_index` to
+    /// `RESERVED_PREFIX_BYTES`, clears + rehashes the table).
+    /// Returns evicted byte count; idempotent when `real_len <=
+    /// max_window_size`.
     pub(crate) fn trim_to_window(&mut self) -> usize {
         let real_len = self.history.len().saturating_sub(RESERVED_PREFIX_BYTES);
         if real_len <= self.max_window_size {
