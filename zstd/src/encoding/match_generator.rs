@@ -553,23 +553,22 @@ impl MatchGeneratorDriver {
     /// time. Effective window sizing is recalculated on every [`reset`](Self::reset)
     /// from the resolved compression level and optional source-size hint.
     pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
-        // Validate inputs before deriving window_log_init. Two
+        // Validate inputs before deriving window_log_init. Three
         // failure modes need explicit guards:
         //
-        // 1. Zero args → `max_window_size = 0` → `next_power_of_two`
-        //    yields 1 → `trailing_zeros = 0` → `1usize << 0 = 1`
-        //    (degenerate 1-byte window; not a panic but useless).
+        // 1. Zero args → `max_window_size = 0` → silent 1-byte
+        //    degenerate window (useless).
+        // 2. Multiplication overflow on `slice_size *
+        //    max_slices_in_window` → wraps silently in release.
+        // 3. `next_power_of_two` overflow when the product is
+        //    above `1 << (usize::BITS - 1)` → modern Rust PANICS
+        //    on overflow (older Rust returned 0).
         //
-        // 2. Overflow on `slice_size * max_slices_in_window` → the
-        //    wrapped product may have `next_power_of_two()`
-        //    overflow past `usize::MAX` → returns 0 →
-        //    `trailing_zeros(0) = 64` → `1usize << 64` panics in
-        //    debug, UB in release.
-        //
-        // Catch both at construction with a clear panic message,
-        // rather than letting either mode produce a silent
-        // degenerate matcher or a `pow_of_two` panic deep in
-        // `FastKernelMatcher::with_params`.
+        // Catch all three at construction with a clear domain-
+        // specific message via `assert!` + `checked_mul` +
+        // `checked_next_power_of_two`, rather than letting either
+        // mode produce a silent degenerate matcher OR a generic
+        // panic deep in `FastKernelMatcher::with_params`.
         assert!(
             slice_size > 0,
             "MatchGeneratorDriver::new requires slice_size > 0 (got 0)",
@@ -610,7 +609,15 @@ impl MatchGeneratorDriver {
             strategy_tag: super::strategy::StrategyTag::Fast,
             slice_size,
             base_slice_size: slice_size,
-            reported_window_size: max_window_size,
+            // Report the ROUNDED-UP window size that the matcher
+            // actually carries (via `window_log_init = log2(next_pow2)`
+            // → matcher's `max_window_size = 1 << window_log_init =
+            // next_pow2`). For non-power-of-two `slice_size *
+            // max_slices_in_window` inputs, the unrounded value
+            // would under-report the active backend's window until
+            // the first `reset()` overwrites both sides from the
+            // resolved LevelParams.
+            reported_window_size: next_pow2,
             dictionary_retained_budget: 0,
             source_size_hint: None,
         }
@@ -917,26 +924,27 @@ impl Matcher for MatchGeneratorDriver {
             // `storage` is dropped here.
             self.storage = match next_backend {
                 super::strategy::BackendTag::Simple => {
-                    // Donor level-1 Fast cParams: hash_log=14, mls=7.
-                    // window_log is derived from the resolved
-                    // LevelParams above (line ~771). Future per-level
-                    // table extension (hash_log scaled for small
-                    // sources) lands separately.
+                    // Donor level-1 Fast cParams hard-coded:
+                    // hash_log = 14, mls = 7. `window_log` is
+                    // threaded from the resolved LevelParams just
+                    // above (the same LevelParams that
+                    // `resolve_level_params` computes per-level).
                     //
-                    // KNOWN LIMITATION (#216 CodeRabbit review #4):
+                    // KNOWN LIMITATION — phase 3 follow-up:
                     // all Fast levels (Uncompressed, Fastest,
                     // CompressionLevel::Level(-7..=1)) currently
-                    // resolve to the same FastKernelMatcher with
-                    // donor level-1 cParams. The public
-                    // acceleration gradient between negative-level
-                    // "faster" modes and Level(1) is lost until
-                    // phase 3 (issue #198 items 2/3/5) ports the
-                    // 4-cursor `ip0/ip1/ip2/ip3` lookahead +
-                    // per-level kSearchStrength dispatch. That work
-                    // is a separate follow-up PR on the same issue
-                    // and on the same branch base — phase 1b is
-                    // deliberately the donor-shape foundation that
-                    // the acceleration gradient builds on top of.
+                    // resolve to the same FastKernelMatcher tuning.
+                    // `resolve_level_params` does compute distinct
+                    // settings, but they aren't wired into the
+                    // matcher today — the public acceleration
+                    // gradient between negative-level "faster"
+                    // modes and Level(1) lands when phase 3
+                    // implements donor's 4-cursor `ip0/ip1/ip2/ip3`
+                    // lookahead pipeline + per-level
+                    // kSearchStrength dispatch + `cmov` match-found
+                    // variant (issue #198 items 2/3/5). Phase 1b
+                    // is the donor-shape foundation those build
+                    // on top of.
                     MatcherStorage::Simple(FastKernelMatcher::with_params(
                         params.window_log,
                         FAST_LEVEL_1_HASH_LOG,

@@ -299,8 +299,12 @@ impl FastKernelMatcher {
     /// legacy MatchGenerator's `window.last().data` equivalent.
     ///
     /// Three states:
-    /// - Pre-`accept_data` of any block: returns empty slice
-    ///   (`last_block_start = 0`, `history.len() = 0`).
+    /// - Pre-`accept_data` of any block: returns empty slice. The
+    ///   matcher is seeded with `RESERVED_PREFIX_BYTES` dummy at
+    ///   the head of `history` (so `last_block_start =
+    ///   RESERVED_PREFIX_BYTES` and `history.len() =
+    ///   RESERVED_PREFIX_BYTES`); the returned `&history[last_block_start..]`
+    ///   slice is therefore empty until the first real block lands.
     /// - Between `accept_data` and `start_matching` /
     ///   `skip_matching_with_hint`: returns the pending buffer (not
     ///   yet in history).
