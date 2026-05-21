@@ -608,9 +608,18 @@ impl MatchGeneratorDriver {
     /// cost when blocks are small (~128 KiB) and processed at
     /// hundreds of MiB/s.
     fn recycle_simple_space(&mut self) {
-        let slice_size = self.slice_size;
-        if let Some(mut space) = self.simple_mut().take_recycled_space() {
-            space.resize(space.capacity().max(slice_size), 0);
+        if let Some(space) = self.simple_mut().take_recycled_space() {
+            // `space` is already cleared (len = 0) by
+            // `extend_history_with_pending`; capacity is retained.
+            // Leaving `len = 0` here avoids the cost of zero-filling
+            // the entire allocation — `get_next_space()` resizes the
+            // popped buffer up to `slice_size` on demand, so the
+            // length the pool holds is irrelevant. This matters most
+            // after a small-source-size hint has shrunk `slice_size`
+            // mid-frame: the recycled buffer can be much larger than
+            // the current `slice_size`, and zero-filling 128 KiB+ on
+            // every block would erase the perf win the recycle path
+            // is meant to deliver.
             self.vec_pool.push(space);
         }
     }
