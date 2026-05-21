@@ -984,7 +984,17 @@ impl Matcher for MatchGeneratorDriver {
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         match self.active_backend() {
-            super::strategy::BackendTag::Simple => self.simple_mut().offset_hist = offset_hist,
+            super::strategy::BackendTag::Simple => {
+                // Routes through prime_offset_history so BOTH
+                // offset_hist (wire encoder) and rep[0..2] (kernel)
+                // are updated atomically. Without this, the two
+                // tracks drift after dict priming — kernel emits
+                // repcode matches against stale FAST_INITIAL_REP
+                // while the wire encoder uses the primed history,
+                // producing divergent wire encoding (Copilot review
+                // #15 on #216).
+                self.simple_mut().prime_offset_history(offset_hist);
+            }
             super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().offset_hist = offset_hist
             }

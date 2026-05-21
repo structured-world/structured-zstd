@@ -551,15 +551,22 @@ impl FastKernelMatcher {
         }
     }
 
-    /// Seed the wire encoder's offset history from a primed
-    /// dictionary load. Currently sets `offset_hist` only; the
-    /// kernel's `rep` is intentionally left out of sync in this
-    /// version so the rep/offset_hist drift is observable by the
-    /// regression test for #216 Copilot review #15. The fix commit
-    /// extends this to update `rep[0..2]` from `offset_hist[0..2]`
-    /// atomically.
+    /// Seed both the wire encoder's offset history AND the kernel's
+    /// repcode state from a primed dictionary load. Donor's
+    /// `ZSTD_dictAndWindowLoad` restores `rep[0..2]` to the
+    /// dictionary's stored `repToConfirm[0..2]`; the wire encoder
+    /// uses the same triple as its 3-deep offset history. Setting
+    /// only one side leaves the kernel making repcode decisions
+    /// against stale FAST_INITIAL_REP while the wire encoder uses
+    /// the primed values — divergent wire encoding.
+    ///
+    /// This setter writes both fields atomically. `rep[0..2]`
+    /// mirrors `offset_hist[0..2]`; `offset_hist[2]` (the
+    /// rep3 slot) lives only on the wire encoder side since the
+    /// kernel's `rep` is two-deep.
     pub(crate) fn prime_offset_history(&mut self, offset_hist: [u32; 3]) {
         self.offset_hist = offset_hist;
+        self.rep = [offset_hist[0], offset_hist[1]];
     }
 
     /// Read-only view of `history.len()` for the driver's eviction
