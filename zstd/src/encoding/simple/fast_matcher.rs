@@ -75,12 +75,10 @@ use super::fast_kernel::hash_table::FastHashTable;
 use super::fast_kernel::kernel::compress_block_fast;
 
 /// Donor `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]` —
-/// the parameter set the C reference encoder picks when the caller
-/// asks for level 1 on inputs larger than the small-source cutoff.
-/// Used as the entry-time defaults for [`FastKernelMatcher::new`];
-/// the reset path can rebind to other `(hash_log, mls, window_log)`
-/// triples once the source-size hint resolves a smaller window
-/// (smaller inputs drop `hash_log` proportionally).
+/// hard-coded for all Fast levels today (the driver passes only
+/// `window_log` per-level; `hash_log` + `mls` are constant). Per-
+/// level `hash_log` scaling for smaller source-size hints lands in
+/// phase 3 along with the Fast acceleration gradient.
 pub(crate) const FAST_LEVEL_1_HASH_LOG: u32 = 14;
 pub(crate) const FAST_LEVEL_1_MLS: u32 = 7;
 /// Donor level-1 Fast `window_log`. Production code reads
@@ -516,16 +514,11 @@ impl FastKernelMatcher {
                 // `offset_hist` so subsequent priming-state reads
                 // see the post-block history.
                 //
-                // Known divergence on `literals.len() == 0` (back-to-
-                // back repcode match): kernel's `rep` is unchanged
-                // but `encode_offset_with_history` per RFC 8878
-                // §3.1.2.5 remaps the codes — `actual == rep[0]`
-                // doesn't match the lit_len-0 repcode set and
-                // rotates offset_hist as a fresh absolute offset.
-                // See the module docstring "Known divergence on
-                // lit-len == 0 emits" section for the full rationale.
-                // Phase 3 collapses these emits at the kernel level
-                // (merge into the preceding match).
+                // TODO(#198 phase 3): collapse back-to-back rep1
+                // matches at the kernel level to avoid lit_len=0
+                // emits. Today they cause a documented rep ↔
+                // offset_hist divergence — see the module docstring
+                // "Known divergence on lit-len == 0 emits" section.
                 let _ =
                     encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
                 handle_sequence(Sequence::Triple {
