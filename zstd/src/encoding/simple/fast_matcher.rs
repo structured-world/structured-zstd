@@ -325,43 +325,61 @@ impl FastKernelMatcher {
         let new_real_total = real_len.saturating_add(space.len());
         let cap = self.max_window_size.saturating_mul(2);
         if new_real_total > cap {
-            // Drop the OLDEST `drop_n` real bytes — those live at
-            // indices [RESERVED_PREFIX_BYTES .. RESERVED_PREFIX_BYTES + drop_n).
-            // The dummy at indices [0..RESERVED_PREFIX_BYTES) is
-            // preserved across the drain so the sentinel-0 invariant
-            // survives.
-            let drop_n = real_len.saturating_sub(self.max_window_size);
+            // Compute how many real bytes to KEEP, then drop the
+            // delta. Pre-fix code naively kept `max_window_size`
+            // regardless of incoming block size — for a committed
+            // block larger than `max_window_size` that left
+            // `real_len + space.len() > 2 × max_window_size`,
+            // violating the docstring invariant.
+            //
+            // Post-fix: retained = (cap - space.len()) clamped to
+            // [0, max_window_size]. When the incoming block alone
+            // exceeds cap, retained = 0 (no historical context kept,
+            // but the cap is still as close as we can get without
+            // truncating the caller's block).
+            let retain_real = cap.saturating_sub(space.len()).min(self.max_window_size);
+            let drop_n = real_len.saturating_sub(retain_real);
             if drop_n > 0 {
-                let drain_end = RESERVED_PREFIX_BYTES + drop_n;
-                self.history.drain(RESERVED_PREFIX_BYTES..drain_end);
-                // prefix_start_index stays at the RESERVED baseline:
-                // the dummy is still at indices [0..RESERVED) post-
-                // drain, and real data is re-indexed to start at
-                // RESERVED. A cumulative add would push the filter
-                // past every valid history index and reject ALL
-                // match candidates wholesale — the rebase to the
-                // baseline keeps the retained tail matchable.
-                self.prefix_start_index = RESERVED_PREFIX_BYTES as u32;
-                self.hash_table.clear();
-                // last_block_start tracked an absolute history
-                // position; everything from drain_end onward shifts
-                // left by drop_n. Clamp to RESERVED so the index
-                // never lands on the (now post-drain) dummy region.
-                self.last_block_start = self
-                    .last_block_start
-                    .saturating_sub(drop_n)
-                    .max(RESERVED_PREFIX_BYTES);
-                // Rehash retained tail (starting at the first real
-                // byte) so block N+1 can find matches against the
-                // bytes we explicitly kept. Without this, the
-                // retained window becomes "dead history" — visible
-                // in `history` but un-lookupable. Amortised over
-                // max_window_size of input it's O(1) per byte.
-                self.prime_hash_table_for_range(RESERVED_PREFIX_BYTES);
+                self.drain_real_prefix(drop_n);
             }
         }
 
         self.pending = Some(space);
+    }
+
+    /// Drop the OLDEST `drop_n` real bytes from history while
+    /// preserving the `RESERVED_PREFIX_BYTES` dummy at indices
+    /// `[0..RESERVED_PREFIX_BYTES)`. Used by both the eager
+    /// commit-time eviction in [`Self::accept_data`] and the
+    /// dictionary-budget retire loop's [`Self::trim_to_window`].
+    ///
+    /// Side effects (all required for invariant preservation —
+    /// extracted to keep the two call sites in lockstep across
+    /// future drain-related fixes):
+    ///
+    /// 1. Drain `history[RESERVED_PREFIX_BYTES .. RESERVED_PREFIX_BYTES + drop_n)`.
+    /// 2. Pin `prefix_start_index` back to `RESERVED_PREFIX_BYTES`
+    ///    (drain re-indexes the retained tail; cumulative add would
+    ///    push the filter past every valid post-drain position).
+    /// 3. Clear the hash table — entries hold pre-drain absolute
+    ///    positions that no longer reference live bytes.
+    /// 4. `saturating_sub` `last_block_start` by `drop_n`, clamped
+    ///    to `>= RESERVED_PREFIX_BYTES` so it never lands on the
+    ///    dummy region.
+    /// 5. Rehash retained tail starting at `RESERVED_PREFIX_BYTES`
+    ///    so block N+1 can find matches against the kept bytes
+    ///    (without this they'd be "dead history" — visible in the
+    ///    Vec but unlookupable).
+    fn drain_real_prefix(&mut self, drop_n: usize) {
+        let drain_end = RESERVED_PREFIX_BYTES + drop_n;
+        self.history.drain(RESERVED_PREFIX_BYTES..drain_end);
+        self.prefix_start_index = RESERVED_PREFIX_BYTES as u32;
+        self.hash_table.clear();
+        self.last_block_start = self
+            .last_block_start
+            .saturating_sub(drop_n)
+            .max(RESERVED_PREFIX_BYTES);
+        self.prime_hash_table_for_range(RESERVED_PREFIX_BYTES);
     }
 
     /// Internal: drain `self.pending` into `self.history`, applying
@@ -640,34 +658,12 @@ impl FastKernelMatcher {
             return 0;
         }
         let drop_n = real_len - self.max_window_size;
-        // Drain real bytes [RESERVED..RESERVED+drop_n), preserving
-        // the dummy at indices [0..RESERVED).
-        let drain_end = RESERVED_PREFIX_BYTES + drop_n;
-        self.history.drain(RESERVED_PREFIX_BYTES..drain_end);
-        // prefix_start_index stays pinned to RESERVED (see
-        // `accept_data` for the rebase rationale — drain re-indexes
-        // the retained tail to start at RESERVED).
-        self.prefix_start_index = RESERVED_PREFIX_BYTES as u32;
-        // Hash table holds absolute positions into the pre-drain
-        // history — clear them as in the in-loop eviction path.
-        self.hash_table.clear();
-        // Rehash from the start of REAL data (skipping the dummy).
-        let rehash_target = RESERVED_PREFIX_BYTES;
-        // Track the drain in last_block_start so post-trim
-        // `last_committed_space()` slices into the NEW history
-        // coordinate space. Without this saturating subtract, an
-        // old last_block_start that originally referenced bytes
-        // within the drained prefix would point past the end of
-        // history → OOB panic (or, worse, a valid but wrong slice
-        // when the new history happens to be long enough to make
-        // the stale index in-bounds).
-        // Clamp last_block_start to >= RESERVED so it never lands
-        // on the (post-drain) dummy region.
-        self.last_block_start = self
-            .last_block_start
-            .saturating_sub(drop_n)
-            .max(RESERVED_PREFIX_BYTES);
-        self.prime_hash_table_for_range(rehash_target);
+        // Front-drain bookkeeping shared with `accept_data`'s
+        // eager-eviction branch — see `drain_real_prefix` for the
+        // full invariant list. Keeping the two sites in lockstep
+        // (rather than inlined-and-duplicated) prevents the next
+        // drain-related fix from landing in only one of them.
+        self.drain_real_prefix(drop_n);
         drop_n
     }
 
