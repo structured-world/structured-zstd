@@ -28,15 +28,16 @@
 //!   rationale.
 //! - `history.len()` is bounded by `2 × max_window_size` post-append.
 //!   See [`FastKernelMatcher::extend_history_with_pending`].
-//! - `rep[0..2]` tracks the kernel's repcode state across blocks
-//!   (updated from `FastBlockResult.rep` after every
-//!   `start_matching`). `offset_hist[0..2]` tracks the wire
-//!   encoder's repcode positions and is updated per-emission via
-//!   [`encode_offset_with_history`]. Lockstep preserved on the
-//!   common (lit-len > 0) path. On lit-len == 0 emits (back-to-
-//!   back rep1) the wrapper SKIPS the offset_hist rotation — both
-//!   sides stay untouched, matching the kernel's "rep unchanged"
-//!   contract. Phase 3 collapses these emits at the kernel layer.
+//! - `rep[0..2]` tracks the kernel's two-deep repcode state
+//!   (overwritten from `FastBlockResult.rep` after every
+//!   `start_matching`). `offset_hist[0..3]` tracks the wire
+//!   encoder's three-deep history (rotated per Triple via
+//!   `encode_offset_with_history`). They reflect DIFFERENT state
+//!   and may diverge — e.g. on lit_len == 0 emits the kernel's
+//!   `rep` stays put while `offset_hist` rotates per RFC 8878
+//!   §3.1.2.5. Both halves are self-consistent within their own
+//!   domain (kernel uses `rep` for next-block repcode probes,
+//!   downstream wire encoder uses its own offset_hist).
 
 use alloc::vec::Vec;
 
@@ -491,24 +492,13 @@ impl FastKernelMatcher {
                 match_len,
             } = seq
             {
-                // Skip the offset_hist rotation on lit_len == 0 emits.
-                // The kernel's `rep` state stays unchanged in the
-                // back-to-back rep1 case, so leaving `offset_hist`
-                // unchanged keeps it in lockstep with `rep`. The
-                // discarded return is the encoded repcode token —
-                // wire-encoder downstream computes its own encoding
-                // from the raw offset.
-                //
-                // TODO(#198 phase 3): collapse back-to-back rep1
-                // matches at the kernel level so this case stops
-                // arising at the wire layer entirely.
-                if !literals.is_empty() {
-                    let _ = encode_offset_with_history(
-                        offset as u32,
-                        literals.len() as u32,
-                        offset_hist,
-                    );
-                }
+                // Track wire encoder's offset_hist unconditionally —
+                // matches what Dfast/Row/HashChain matchers do.
+                // `matcher.offset_hist` and `matcher.rep` track
+                // DIFFERENT state (wire encoder vs kernel); they're
+                // not meant to stay in lockstep on lit_len == 0 emits.
+                let _ =
+                    encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
                 handle_sequence(Sequence::Triple {
                     literals,
                     offset,
