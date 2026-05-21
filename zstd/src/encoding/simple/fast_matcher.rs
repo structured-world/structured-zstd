@@ -1,4 +1,8 @@
-//! Donor-shape Fast strategy matcher backend (level 1).
+//! Donor-shape Fast strategy matcher backend — selected for every
+//! Fast-strategy level (Uncompressed, Fastest, Level(1), and the
+//! negative Level(-7..=-1) variants). All levels currently resolve
+//! to the same matcher with donor level-1 `hash_log = 14, mls = 7`;
+//! per-level acceleration knobs land in phase 3.
 //!
 //! Wraps the kernel from
 //! [`super::fast_kernel::kernel::compress_block_fast`] and presents the
@@ -6,17 +10,11 @@
 //! Replaces the SuffixStore-based `MatchGenerator` for the Fast strategy
 //! path with a donor-parity hash table and tight per-block loop.
 //!
-//! Phase 1b progression so far: the matcher's full inherent surface
-//! is implemented and unit-tested — state lifecycle (`new` /
-//! `reset` / `window_size` / `last_committed_space`), block ingestion
-//! (`accept_data` + `extend_history_with_pending`), kernel dispatch
-//! (`start_matching`), and the two skip flavours (`skip_matching`
-//! plain + dict-priming when `incompressible_hint == Some(false)`).
-//! The remaining wiring step swaps the inner type of
-//! [`crate::encoding::match_generator::MatcherStorage::Simple`] from
-//! the legacy SuffixStore-based `MatchGenerator` to this type and
-//! routes the driver's Matcher trait methods through here; that
-//! commit lands separately on the same PR.
+//! Wired into production: [`crate::encoding::match_generator::MatcherStorage::Simple`]
+//! holds `FastKernelMatcher` directly; the driver's Matcher trait
+//! methods (`commit_space` / `start_matching` / `skip_matching_with_hint`
+//! / `reset` / `prime_with_dictionary` / `trim_after_budget_retire`)
+//! all route through this module's inherent API.
 //!
 //! # Invariants this module guarantees
 //!
@@ -138,6 +136,15 @@ pub(crate) struct FastKernelMatcher {
     /// emission). Initialised to 0 — overwritten by every
     /// extend_history_with_pending call.
     last_block_start: usize,
+    /// Per-block input buffer recycle slot. After
+    /// `extend_history_with_pending` copies bytes from the pending
+    /// buffer into `history`, the now-spent `Vec<u8>` allocation is
+    /// stashed here (cleared, capacity retained). The driver pulls
+    /// it via [`Self::take_recycled_space`] after every
+    /// `start_matching` / `skip_matching_with_hint` and returns it
+    /// to its `vec_pool` — avoiding a fresh allocation per block on
+    /// the hot path.
+    recycled_space: Option<Vec<u8>>,
 }
 
 impl FastKernelMatcher {
@@ -162,6 +169,7 @@ impl FastKernelMatcher {
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32) -> Self {
         Self {
             last_block_start: 0,
+            recycled_space: None,
             history: Vec::new(),
             // Donor `prefixStartIndex` starts at 1 (not 0) so the
             // hash table's empty-slot sentinel `0` can't be confused
@@ -208,6 +216,7 @@ impl FastKernelMatcher {
         self.max_window_size = 1usize << window_log;
         self.pending = None;
         self.last_block_start = 0;
+        self.recycled_space = None;
     }
 
     /// Reported decoder-side window size (bytes) — test-only.
@@ -329,7 +338,7 @@ impl FastKernelMatcher {
     /// reuse, but pays for it with a one-time eviction every
     /// `max_window_size` worth of input — amortised constant.
     fn extend_history_with_pending(&mut self) -> usize {
-        let space = self
+        let mut space = self
             .pending
             .take()
             .expect("extend_history_with_pending without a pending buffer");
@@ -345,7 +354,28 @@ impl FastKernelMatcher {
         // `last_committed_space` can return its bytes AFTER the
         // kernel call consumes pending.
         self.last_block_start = block_start;
+        // Stash the now-spent space buffer (cleared, capacity
+        // retained) for the driver to pull via
+        // `take_recycled_space()` and return to its vec_pool. Avoids
+        // a fresh per-block allocation on the hot path. If a previous
+        // recycled buffer was never taken (e.g. driver crashed mid-
+        // cycle) we drop it here — only ONE buffer is recycled per
+        // cycle, matching the single-pending-block protocol.
+        space.clear();
+        self.recycled_space = Some(space);
         block_start
+    }
+
+    /// Reclaim the most recently spent input buffer (the `Vec<u8>`
+    /// passed in via `accept_data` after its bytes were copied into
+    /// `history`). The buffer is empty but retains its capacity —
+    /// the driver can resize it back to `slice_size` and push onto
+    /// `vec_pool` to amortise per-block allocation cost.
+    ///
+    /// Returns `None` if no block has been processed since the last
+    /// `take_recycled_space` (or since construction / reset).
+    pub(crate) fn take_recycled_space(&mut self) -> Option<Vec<u8>> {
+        self.recycled_space.take()
     }
 
     /// Process the pending block with the donor-shape kernel,

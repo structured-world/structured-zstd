@@ -1,5 +1,11 @@
-//! "Simple" (donor `ZSTD_fast`) match-finder backend used by the
-//! `Fastest` / `CompressionLevel::Level(1)` path.
+//! "Simple" (donor `ZSTD_fast`) match-finder backend selected for
+//! every Fast-strategy level — `CompressionLevel::Uncompressed`,
+//! `CompressionLevel::Fastest`, `CompressionLevel::Level(1)`, and
+//! the negative `CompressionLevel::Level(-7..=-1)` "faster"
+//! variants. All Fast levels currently resolve to the same
+//! `FastKernelMatcher` with donor level-1 `hash_log = 14, mls = 7`;
+//! per-level acceleration knobs (kSearchStrength dispatch,
+//! 4-cursor pipelining) land in the phase 3 follow-up.
 //!
 //! Donor parity: the active matcher is the donor-shape
 //! [`fast_kernel`] + [`fast_matcher`] pair — a single-pass kernel

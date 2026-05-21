@@ -595,6 +595,26 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Reclaim the per-block input buffer that the Simple backend
+    /// just spent inside `start_matching` / `skip_matching_with_hint`.
+    ///
+    /// `FastKernelMatcher::take_recycled_space` returns the cleared
+    /// (capacity-retained) `Vec<u8>` from the last
+    /// `extend_history_with_pending`. We resize it back to the
+    /// driver's `slice_size` and push it onto `vec_pool` so the next
+    /// `get_next_space()` call can reuse the allocation instead of
+    /// allocating fresh. Without this, the Simple backend would
+    /// allocate a new `Vec<u8>` per block — a measurable hot-path
+    /// cost when blocks are small (~128 KiB) and processed at
+    /// hundreds of MiB/s.
+    fn recycle_simple_space(&mut self) {
+        let slice_size = self.slice_size;
+        if let Some(mut space) = self.simple_mut().take_recycled_space() {
+            space.resize(space.capacity().max(slice_size), 0);
+            self.vec_pool.push(space);
+        }
+    }
+
     #[cfg(test)]
     fn dfast_matcher(&self) -> &DfastMatchGenerator {
         match &self.storage {
@@ -755,7 +775,8 @@ impl MatchGeneratorDriver {
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                self.simple_mut().skip_matching_with_hint(Some(false))
+                self.simple_mut().skip_matching_with_hint(Some(false));
+                self.recycle_simple_space();
             }
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
             super::strategy::BackendTag::Row => {
@@ -1116,10 +1137,12 @@ impl Matcher for MatchGeneratorDriver {
                 // FastKernelMatcher owns its history as a single
                 // flat Vec<u8> and the hash table as a Vec<u32> —
                 // neither recycles into the driver-side pools. The
-                // pre-accept eviction inside
-                // `extend_history_with_pending` drops bytes when
-                // history would exceed 2× max_window_size; that
-                // delta is what feeds `evicted_bytes` here.
+                // eager pre-commit eviction inside
+                // `FastKernelMatcher::accept_data` drops bytes when
+                // accepting this block would push history past 2×
+                // max_window_size; that delta is what feeds
+                // `evicted_bytes` here via the `pre / post`
+                // history-length comparison.
                 let pre = m.history_len_for_eviction_accounting();
                 m.accept_data(space);
                 let post = m.history_len_for_eviction_accounting();
@@ -1223,9 +1246,11 @@ impl Matcher for MatchGeneratorDriver {
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend() {
-            super::strategy::BackendTag::Simple => self
-                .simple_mut()
-                .skip_matching_with_hint(incompressible_hint),
+            super::strategy::BackendTag::Simple => {
+                self.simple_mut()
+                    .skip_matching_with_hint(incompressible_hint);
+                self.recycle_simple_space();
+            }
             super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().skip_matching(incompressible_hint)
             }
@@ -1266,6 +1291,7 @@ impl MatchGeneratorDriver {
                 // `Sequence::Literals` (from `tail_literals_len`)
                 // also flows through this same handler invocation.
                 self.simple_mut().start_matching(&mut *handle_sequence);
+                self.recycle_simple_space();
             }
             BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
             BackendTag::Row => {
