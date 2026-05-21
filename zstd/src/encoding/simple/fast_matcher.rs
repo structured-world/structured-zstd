@@ -1167,16 +1167,17 @@ mod tests {
         );
     }
 
-    /// Boundary: exactly `HASH_READ_SIZE` (8) bytes appended via
-    /// `skip_matching(Some(false))` — the dict-prime hash population
-    /// loop must hash precisely one position (range_start == 0,
-    /// last_hashable == 0) without overrunning or panicking.
+    /// Boundary: exactly `HASH_READ_SIZE` (8) real bytes appended
+    /// via `skip_matching(Some(false))` — must hash one position
+    /// (`range_start == RESERVED_PREFIX_BYTES`, `last_hashable ==
+    /// RESERVED_PREFIX_BYTES`) without overrun.
     #[test]
     fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
         let mut m = FastKernelMatcher::with_params(12, 8, 4);
-        // 8-byte payload — at the edge of what the kernel can hash.
-        // After append: history.len() = 8, last_hashable = 0,
-        // range = 0..=0 (one position).
+        // 8-byte real payload appends above the RESERVED dummy →
+        // history.len() = 8 + RESERVED_PREFIX_BYTES, last_hashable =
+        // RESERVED_PREFIX_BYTES, hashed range = [RESERVED..=RESERVED]
+        // (one position).
         let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
         m.accept_data(payload);
         m.skip_matching_with_hint(Some(false));
