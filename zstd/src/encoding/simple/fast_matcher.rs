@@ -256,6 +256,31 @@ impl FastKernelMatcher {
             "FastKernelMatcher: accept_data called with a still-pending buffer; \
              the driver must run start_matching / skip_matching between commits",
         );
+
+        // Eager window eviction: drop oldest history bytes NOW if
+        // accepting this block would push the total past donor's
+        // `2 × max_window_size` soft cap. This fires at commit time
+        // (not at append time inside `extend_history_with_pending`)
+        // so the driver's `commit_space` can observe the byte delta
+        // via a `pre/post history.len()` comparison — that delta
+        // feeds `retire_dictionary_budget` which shrinks
+        // `max_window_size` back to the frame's contracted window
+        // after dictionary priming inflated it. Without commit-time
+        // visibility the dict-budget retire never runs and the
+        // matcher can emit offsets exceeding the frame header's
+        // reported window size (format-correctness risk).
+        let new_total = self.history.len().saturating_add(space.len());
+        let cap = self.max_window_size.saturating_mul(2);
+        if new_total > cap {
+            let drop_n = self.history.len().saturating_sub(self.max_window_size);
+            if drop_n > 0 {
+                self.history.drain(..drop_n);
+                self.prefix_start_index = self.prefix_start_index.saturating_add(drop_n as u32);
+                self.hash_table.clear();
+                self.last_block_start = self.last_block_start.saturating_sub(drop_n);
+            }
+        }
+
         self.pending = Some(space);
     }
 
@@ -280,27 +305,11 @@ impl FastKernelMatcher {
             .take()
             .expect("extend_history_with_pending without a pending buffer");
 
-        // Lazy eviction: only fires when retained bytes would actually
-        // exceed the donor's 2× soft cap. For typical inputs that fit
-        // in a single window the branch is cold.
-        let new_total = self.history.len().saturating_add(space.len());
-        let cap = self.max_window_size.saturating_mul(2);
-        if new_total > cap {
-            let target_retained = self.max_window_size;
-            let drop_n = self.history.len().saturating_sub(target_retained);
-            if drop_n > 0 {
-                self.history.drain(..drop_n);
-                self.prefix_start_index = self.prefix_start_index.saturating_add(drop_n as u32);
-                // The hash table holds ABSOLUTE positions into the
-                // pre-drain history; after draining, those positions
-                // point at evicted bytes. Clearing forces a fresh
-                // population from the new block onward — donor pays
-                // the same cost on `ZSTD_window_clear` after a stale
-                // reset.
-                self.hash_table.clear();
-            }
-        }
-
+        // Eviction was already applied during `accept_data` (eager
+        // pre-commit drain so the driver's `commit_space` accounting
+        // sees the byte delta). At this point the matcher's
+        // invariant `history.len() + space.len() <= 2 *
+        // max_window_size` already holds — just append.
         let block_start = self.history.len();
         self.history.extend_from_slice(&space);
         // Record where this newly-appended block starts so
