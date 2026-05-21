@@ -514,6 +514,15 @@ impl FastKernelMatcher {
         // Hash table holds absolute positions into the pre-drain
         // history — clear them as in the in-loop eviction path.
         self.hash_table.clear();
+        // Track the drain in last_block_start so post-trim
+        // `last_committed_space()` slices into the NEW history
+        // coordinate space. Without this saturating subtract, an
+        // old last_block_start that originally referenced bytes
+        // within the drained prefix would point past the end of
+        // history → OOB panic (or, worse, a valid but wrong slice
+        // when the new history happens to be long enough to make
+        // the stale index in-bounds).
+        self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         drop_n
     }
 
