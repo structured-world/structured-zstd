@@ -440,6 +440,7 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
 mod tests {
     use super::*;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn copy_bytes_overshooting_zero_len_is_noop() {
