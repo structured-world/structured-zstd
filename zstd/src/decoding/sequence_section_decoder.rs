@@ -157,10 +157,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     /// Pipelined-path variant: takes the offset already resolved by
     /// the decode-ahead `shadow_hist` walk, so `do_offset_history` is
     /// NOT called here (caller mutated only the shadow). Routes the
-    /// match copy through `repeat_lookahead_prefetched` to skip the
-    /// in-loop `prefetch_match_source` + redundant `reserve` that the
-    /// upfront `reserve(MAX_BLOCK_SIZE)` plus the lookahead pipeline's
-    /// PREFETCH_L1 already covered.
+    /// match copy through `repeat_lookahead_prefetched`, which skips
+    /// only the in-loop `prefetch_match_source` (redundant because
+    /// the lookahead pipeline already issued a PREFETCH_L1 ADVANCE
+    /// iterations earlier). The per-call `buffer.reserve(match_length)`
+    /// is preserved by that variant — required for memory safety
+    /// against malformed inputs whose `match_length` exceeds the
+    /// upfront `reserve(MAX_BLOCK_SIZE)` headroom.
     #[inline(always)]
     fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,
@@ -208,8 +211,10 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // prefetch issued at iteration `i` resolve through L1/L2 by the
     // time iteration `i + 8` consumes it, whereas 4-deep often
     // wasn't enough gap on the long-distance workloads we target.
-    // The on-stack ring is `[Sequence; 8]` = 96 bytes; well within
-    // register-pressure budget.
+    // The on-stack ring is `[(Sequence, u32); 8]` = 128 bytes (the
+    // u32 carries the resolved offset from the decode-ahead shadow
+    // walk so the execute side can skip do_offset_history); still
+    // well within register-pressure budget.
     const ADVANCE: usize = 8;
     const ADVANCE_MASK: usize = ADVANCE - 1;
     // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
@@ -920,4 +925,94 @@ fn test_ll_default() {
     assert!(table.decode[59].symbol == 24);
     assert!(table.decode[59].num_bits == 5);
     assert!(table.decode[59].new_state == 32);
+}
+
+#[cfg(test)]
+mod offsets_long_share_tests {
+    use super::compute_offsets_long_share;
+    use crate::fse::{Entry, FSETable};
+
+    /// Construct a synthetic FSETable with the given symbol per entry
+    /// at the requested accuracy_log. Bypasses `build_from_probabilities`
+    /// — we only need `decode[*].symbol` and `accuracy_log` populated;
+    /// the long-share helper reads exactly those.
+    fn synthetic_offsets_table(accuracy_log: u8, symbols: &[u8]) -> FSETable {
+        let size = 1usize << accuracy_log;
+        assert_eq!(
+            symbols.len(),
+            size,
+            "symbols.len() must equal 1 << accuracy_log"
+        );
+        let mut t = FSETable::new(31);
+        t.accuracy_log = accuracy_log;
+        t.decode = symbols
+            .iter()
+            .map(|&s| Entry {
+                new_state: 0,
+                symbol: s,
+                num_bits: 0,
+            })
+            .collect();
+        t
+    }
+
+    #[test]
+    fn zero_long_codes_returns_zero_share() {
+        // A table with only short offset codes (all symbols <= 22).
+        // Donor parity: share is the count of symbols > 22, scaled to
+        // OffFSELog = 8 — with zero such symbols, share is 0
+        // regardless of accuracy_log.
+        for log in [3u8, 5, 6, 8] {
+            let size = 1usize << log;
+            let symbols: alloc::vec::Vec<u8> = (0..size).map(|i| (i as u8) % 22).collect();
+            let table = synthetic_offsets_table(log, &symbols);
+            assert_eq!(
+                compute_offsets_long_share(&table),
+                0,
+                "log={log}: pure short-offset table must score 0"
+            );
+        }
+    }
+
+    #[test]
+    fn long_codes_scale_to_offset_fse_log_reference() {
+        // accuracy_log = 5 → 32-entry table. One symbol at code 23
+        // (just above the threshold of 22), the rest at 0. Donor
+        // scales the raw count by `OffFSELog - accuracy_log` =
+        // `8 - 5 = 3`, so 1 << 3 = 8 should land at the 64-bit
+        // `MIN_LONG_OFFSET_SHARE = 7` threshold (just over).
+        let mut symbols = [0u8; 32];
+        symbols[7] = 23;
+        let table = synthetic_offsets_table(5, &symbols);
+        assert_eq!(compute_offsets_long_share(&table), 8);
+    }
+
+    #[test]
+    fn raw_count_at_offset_fse_log_passes_through_unscaled() {
+        // accuracy_log = OffFSELog = 8 → 256-entry table. No scaling
+        // applied (shift by zero), so the share equals the raw count
+        // of symbols > 22.
+        let mut symbols = [0u8; 256];
+        for sym in symbols.iter_mut().take(15) {
+            *sym = 25;
+        }
+        let table = synthetic_offsets_table(8, &symbols);
+        assert_eq!(compute_offsets_long_share(&table), 15);
+    }
+
+    #[test]
+    fn threshold_is_strict_greater_than() {
+        // Symbol == LONG_OFFSET_CODE_THRESHOLD (22) does NOT count —
+        // matches donor `> 22` strict-greater predicate. Only
+        // symbols 23..MAX raise the share.
+        let mut symbols = [0u8; 256];
+        for sym in symbols.iter_mut().take(50) {
+            *sym = 22;
+        }
+        let table = synthetic_offsets_table(8, &symbols);
+        assert_eq!(compute_offsets_long_share(&table), 0);
+        symbols[0] = 23;
+        let table = synthetic_offsets_table(8, &symbols);
+        assert_eq!(compute_offsets_long_share(&table), 1);
+    }
 }
