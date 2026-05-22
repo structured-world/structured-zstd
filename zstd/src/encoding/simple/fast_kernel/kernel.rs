@@ -378,7 +378,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     // `next_step` is the absolute position where step doubles next;
     // donor increments by `kStepIncr = 1 << (kSearchStrength - 1)`.
     let mut step: usize = step_size;
-    let mut next_step: usize = ip0 + K_STEP_INCR;
+    let mut next_step: usize = ip0.saturating_add(K_STEP_INCR);
 
     // 4-cursor donor port. Outer `'restart` loop matches donor's
     // `_start:` reentry: every emitted match `goto _start`s back
@@ -390,10 +390,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
         // can't make forward progress on this iteration — drain to
-        // the cleanup path below.
+        // the cleanup path below. `checked_add` here defends against
+        // a wild `step_size` (or a runaway `step` from the doubling
+        // cadence) wrapping past `ilimit` and turning the
+        // out-of-range guard below into a false-pass; on overflow we
+        // take the same break path as a normal ip3-past-ilimit miss.
         let mut ip1 = ip0 + 1;
-        let mut ip2 = ip0 + step;
-        let mut ip3 = ip2 + 1;
+        let Some(mut ip2) = ip0.checked_add(step) else {
+            break;
+        };
+        let Some(mut ip3) = ip2.checked_add(1) else {
+            break;
+        };
         if ip3 > ilimit {
             break;
         }
@@ -564,15 +572,27 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip2)) };
             ip0 = ip1;
             ip1 = ip2;
-            ip2 = ip0 + step;
-            ip3 = ip1 + step;
+            // Same overflow defence as the loop-head setup: a wild
+            // `step` (e.g. after enough step-doubling cycles) could
+            // otherwise wrap `ip0 + step` past `usize::MAX` and bypass
+            // the `ip3 > ilimit` guard. On overflow we drain to the
+            // post-loop cleanup, identical to the normal "ran out of
+            // room" exit.
+            let Some(new_ip2) = ip0.checked_add(step) else {
+                break None;
+            };
+            let Some(new_ip3) = ip1.checked_add(step) else {
+                break None;
+            };
+            ip2 = new_ip2;
+            ip3 = new_ip3;
 
             // Step-doubling: donor lines 342-347. Drives the
             // kSearchStrength-based acceleration on incompressible
             // regions.
             if ip2 >= next_step {
                 step += 1;
-                next_step += K_STEP_INCR;
+                next_step = next_step.saturating_add(K_STEP_INCR);
             }
 
             // do-while termination: if ip3 walks past ilimit, drain.
@@ -725,9 +745,14 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         }
 
         // `goto _start` — restart the outer loop with fresh step
-        // (reset to the level-resolved initial step_size).
+        // (reset to the level-resolved initial step_size). The
+        // `saturating_add` here is symmetric with the inner loop's
+        // step-doubling site: ip0 is already < ilimit < data.len()
+        // <= u32::MAX, so the wrap would require an unrepresentable
+        // `K_STEP_INCR`, but staying defensive keeps the cursor math
+        // wrap-free on every cold reset of the outer state.
         step = step_size;
-        next_step = ip0 + K_STEP_INCR;
+        next_step = ip0.saturating_add(K_STEP_INCR);
         continue 'restart;
     }
 

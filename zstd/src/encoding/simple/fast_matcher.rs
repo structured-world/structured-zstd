@@ -246,6 +246,14 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
+        // Kernel indices are `u32`; `1 << window_log` larger than
+        // `u32::MAX` is unrepresentable in the hash table and would
+        // overflow on 32-bit hosts. Cap at 31 so `1u32 << window_log`
+        // stays defined and `max_window_size <= u32::MAX`.
+        assert!(
+            window_log <= 31,
+            "FastKernelMatcher requires window_log <= 31 (got {window_log})"
+        );
         // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         // Sentinel-0 protection comes from prefix_start_index =
         // INITIAL_PREFIX_START_INDEX = 1, which filters hash table
@@ -281,6 +289,12 @@ impl FastKernelMatcher {
         assert!(
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
+        );
+        // Same window_log cap as `with_params` — see there for why
+        // values above 31 are unrepresentable.
+        assert!(
+            window_log <= 31,
+            "FastKernelMatcher requires window_log <= 31 (got {window_log})"
         );
         if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
             // Parameters changed — rebuild the table at the new size.
