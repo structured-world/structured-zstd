@@ -761,22 +761,23 @@ impl FastKernelMatcher {
         self.rep = [offset_hist[0], offset_hist[1]];
     }
 
-    /// Read-only view of REAL data length (excluding the
-    /// `HISTORY_DRAIN_BASE` dummy at history's head) for the
-    /// driver's eviction accounting (`commit_space` →
-    /// `retire_dictionary_budget` flow). The driver compares
-    /// pre/post values to derive a byte-delta. Returning REAL
-    /// length keeps the delta meaningful (drain-of-N-real-bytes
-    /// shows up as a clean N drop, not N±constant).
+    /// Read-only view of history's real-data length for the driver's
+    /// eviction accounting (`commit_space` →
+    /// `retire_dictionary_budget` flow). The driver compares pre/post
+    /// values to derive a byte-delta; under M8 history holds only
+    /// real bytes from position 0 onward (HISTORY_DRAIN_BASE is 0),
+    /// so this is just the history length — the `saturating_sub` is
+    /// kept symmetric with `trim_to_window` below in case the drain
+    /// base ever moves off 0.
     pub(crate) fn history_len_for_eviction_accounting(&self) -> usize {
         self.history.len().saturating_sub(HISTORY_DRAIN_BASE)
     }
 
     /// Drop history bytes past `max_window_size` via
-    /// [`Self::drain_real_prefix`] (rebases `prefix_start_index` to
-    /// `HISTORY_DRAIN_BASE`, clears + rehashes the table).
-    /// Returns evicted byte count; idempotent when `real_len <=
-    /// max_window_size`.
+    /// [`Self::drain_real_prefix`] (resets `prefix_start_index` to
+    /// `INITIAL_PREFIX_START_INDEX` = 1 — the sentinel-0 floor — and
+    /// clears + rehashes the table). Returns evicted byte count;
+    /// idempotent when `real_len <= max_window_size`.
     pub(crate) fn trim_to_window(&mut self) -> usize {
         let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
         if real_len <= self.max_window_size {
