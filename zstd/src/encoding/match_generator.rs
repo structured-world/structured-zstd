@@ -1098,7 +1098,11 @@ impl Matcher for MatchGeneratorDriver {
         // track only the granted portion — otherwise
         // `retire_dictionary_budget()` would later reclaim more than
         // was actually added and shrink the matcher below its real
-        // base window.
+        // base window (and `cap = 2 * max_window_size` would shrink
+        // with it, risking under-allocation on subsequent commits).
+        // The `granted_retained_budget` calculation further below is
+        // the load-bearing piece — see its block-level comment for
+        // the post-clip / post-uncommitted-tail math.
         let requested_dict_budget = dict_content.len();
         let base_max_window_size = match self.active_backend() {
             super::strategy::BackendTag::Simple => self.simple_mut().max_window_size,
