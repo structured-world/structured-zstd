@@ -402,29 +402,36 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// match_start (e.g. a stale or malformed sequence), and
     /// dictionary-sourced matches whose logical position predates
     /// the buffer's current frame. The donor (`PREFETCH_L1` in
-    /// `ZSTD_prefetchMatch`) tolerates invalid addresses by spec,
-    /// but in safe Rust the cheapest equivalent is to bound-check
-    /// the logical position before chasing the slice.
+    /// `ZSTD_prefetchMatch` — note: we route to L2 instead, see the
+    /// body comment) tolerates invalid addresses by spec, but in
+    /// safe Rust the cheapest equivalent is to bound-check the
+    /// logical position before chasing the slice.
     #[inline(always)]
     pub(crate) fn prefetch_lookahead_match_source(&self, start_idx: usize) {
         if start_idx >= self.buffer.len() {
             return;
         }
-        // Donor parity: `ZSTD_prefetchMatch` issues up to two
-        // `PREFETCH_L1` hints per match — one at `match`, one at
-        // `match + CACHELINE_SIZE`. Capping the slice extent at
-        // 2 × 64 B holds `prefetch_slice_t1` to AT MOST two
-        // prefetch lines (it can issue fewer when the source
+        // Donor's `ZSTD_prefetchMatch` issues up to two `PREFETCH_L1`
+        // hints per match — one at `match`, one at
+        // `match + CACHELINE_SIZE`. We use the same two-line cadence
+        // but route through `prefetch_slice_t1` (`_MM_HINT_T1` on
+        // x86 — L2 destination instead of L1). The deliberate
+        // deviation: ADVANCE iterations of decode work sit between
+        // the prefetch issue and the matching `repeat()` load, so
+        // an L1-bound line would likely be evicted by intervening
+        // accesses before the consumer reaches it — L2 has the
+        // capacity to keep the line resident across that window.
+        // The pre-existing in-loop `prefetch_match_source` makes the
+        // same T1 choice for the same reason. Capping the slice
+        // extent at 2 × 64 B holds `prefetch_slice_t1` to AT MOST
+        // two prefetch lines (it can issue fewer when the source
         // straddles the ring buffer's `as_slices()` boundary and
         // only the head fragment is reachable here, or when the
         // remaining slice tail is shorter than 64 B) instead of the
-        // 4 its `MAX_LINES` cap would otherwise allow. Either way
-        // we don't burn prefetch-queue slots that the steady-state
-        // ADVANCE-deep pipeline already reserves for upcoming
-        // sources. No `match_length < 64` gate — with several
-        // sequences of lookahead the prefetch overlaps work the
-        // CPU has to do anyway, so even sub-cache-line matches
-        // benefit.
+        // 4 its `MAX_LINES` cap would otherwise allow. No
+        // `match_length < 64` gate — with several sequences of
+        // lookahead the prefetch overlaps work the CPU has to do
+        // anyway, so even sub-cache-line matches benefit.
         const PREFETCH_EXTENT: usize = 128;
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {

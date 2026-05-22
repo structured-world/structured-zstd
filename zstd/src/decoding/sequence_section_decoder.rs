@@ -109,11 +109,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     let saved_offset_hist = *offset_hist;
 
     // `offset_hist` mutates here (via do_offset_history) and only
-    // here. The pipeline above intentionally defers all repcode
-    // resolution to this call site so a mid-loop error keeps the
-    // caller's `offset_hist` consistent with the sequences that
-    // actually executed — preserving the legacy two-pass
-    // 'partial output, no rewound history' contract on early exits.
+    // here. The pipelined decode loop below intentionally defers all
+    // repcode resolution to this call site so a mid-loop error keeps
+    // the caller's `offset_hist` consistent with the sequences that
+    // actually executed — preserving the legacy two-pass 'partial
+    // output, no rewound history' contract on early exits.
     #[inline(always)]
     fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,
