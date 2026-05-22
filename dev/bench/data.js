@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779426455402,
+  "lastUpdate": 1779436394463,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -42741,6 +42741,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "70cb3e4114e31153c70bf2c0cb0376c485a6d043",
+          "message": "feat(frame): magicless frame format support (#26) (#222)\n\n* feat(frame): magicless frame format support (#26)\n\nImplements donor's `ZSTD_f_zstd1_magicless` format variant —\nframes emitted/parsed without the 4-byte magic number prefix.\nUsed by embedded protocols where the frame boundary is known\nfrom context, saving 4 bytes per frame.\n\n## Encoder side\n\n- New `magicless: bool` field on `FrameHeader` (default false).\n  When true, `FrameHeader::serialize` skips the magic write.\n- New `FrameCompressor::set_magicless(bool)` setter.\n- New `StreamingEncoder::set_magicless(bool)` setter (must be\n  called before first write).\n\n## Decoder side\n\n- New `read_frame_header_with_format(r, magicless)` in\n  decoding/frame.rs — existing `read_frame_header` is a\n  zero-cost wrapper (`magicless = false`).\n- `FrameDecoderState::new_with_format` /\n  `reset_with_format` thread the flag through.\n- `FrameDecoder::set_magicless(bool)` setter; existing\n  `init` / `reset` / `reset_with_dict_handle` paths consult\n  the stored flag, so call `set_magicless(true)` once before\n  the first init.\n- Standard (magicful) decoder still rejects magicless frames\n  with `BadMagicNumber` — the format is unambiguous only when\n  the caller knows it out-of-band, matching donor semantics.\n\n## Test (new — `magicless_frame_omits_magic_and_roundtrips`)\n\n1. Encode 512 bytes with `set_magicless(true)`.\n2. Assert the output does NOT begin with the 4-byte zstd\n   magic number.\n3. Magicless-aware decoder round-trips the payload byte-for-byte.\n4. Standard decoder MUST fail on a magicless frame\n   (`BadMagicNumber` from descriptor + window bytes).\n\n574/574 tests pass; clippy clean.\n\nCloses #26.\n\n* fix(frame_header,streaming_encoder,frame_decoder): address PR #222 review round 1\n\n6 review threads (1 CR Major + 5 Copilot):\n\n- frame_header.rs:32 (CR Major): adding a required pub field to\n  FrameHeader was a source-breaking change for downstream\n  literal constructors. Marked the struct #[non_exhaustive] and\n  added a Default impl so external callers can use\n  ..FrameHeader::default() and survive future field additions\n  without further breakage.\n\n- streaming_encoder.rs:94 (CR Minor + Copilot): set_magicless now\n  returns Result<(), Error> and rejects late calls after the\n  frame header has been emitted (matches set_pledged_content_size\n  / set_source_size_hint patterns). Prevents silent misuse where\n  the caller thinks they produced a magicless stream but didn't.\n\n- frame_decoder.rs:266, 306 (Copilot): FrameDecoderState is a\n  private type — its inherent methods were inconsistently marked\n  pub with 'Public API' comments. Demoted new() / reset() to\n  pub(crate) and clarified the comment that they're reached via\n  FrameDecoder::init / reset, not directly.\n\n- frame_compressor.rs:2347 (Copilot): magicless roundtrip test\n  now asserts the SPECIFIC error variant\n  (ReadFrameHeaderError::BadMagicNumber) when a standard decoder\n  encounters a magicless frame, instead of just any error.\n  Prevents regressions from being masked by unrelated failures.\n\n574/574 tests pass; clippy clean.\n\nPart of #26.\n\n* fix(frame_header,frame,frame_decoder,streaming_encoder): address PR #222 round 2 (3 Copilot)\n\nThree Copilot threads — visibility / dead-code claims that didn't\nmatch actual module scope, plus a missing test:\n\n- frame_header.rs:15 — removed misleading prose about\n  #[non_exhaustive] enabling external functional-update syntax.\n  The containing module is pub(crate), so the struct isn't\n  externally constructible at all. Removed the #[non_exhaustive]\n  attribute (does nothing for pub(crate) struct) and rewrote the\n  comment to describe the actual visibility / Default purpose.\n\n- decoding/frame.rs:11 — read_frame_header was annotated\n  #[allow(dead_code)] with a 'used by downstream consumers'\n  justification, but the containing module is pub(crate). It IS\n  used by in-crate tests (tests/roundtrip_integrity.rs,\n  tests/mod.rs) but not in production code. Switched to a clean\n  #[cfg(test)] gate; in non-test builds the wrapper doesn't\n  compile, so no dead-code warning needed.\n\n- frame_decoder.rs FrameDecoderState — removed the dead\n  new() / reset() wrappers entirely. The pub(crate) type is\n  reached only via FrameDecoder::init / reset, which already\n  thread the magicless flag through new_with_format /\n  reset_with_format. The non-format-aware wrappers had no\n  callers, so the misleading 'Public API' comments are gone.\n\n- streaming_encoder.rs:101 — added two missing tests for\n  set_magicless: (1) pre-write call emits a magicless frame\n  that round-trips through a magicless-aware decoder;\n  (2) post-write call returns an InvalidInput error so callers\n  can't be misled into thinking they produced a magicless\n  stream.\n\n576/576 tests pass (+2 new); clippy clean.\n\nPart of #26.\n\n* docs(frame): clarify read_frame_header is test-only + dedupe new_with_format docstring\n\n- frame.rs: tighten doc comment on the read_frame_header wrapper —\n  it is #[cfg(test)] only; production callers route through\n  read_frame_header_with_format. PR body updated to match.\n- frame_decoder.rs: consolidate the duplicated/unfinished first\n  sentence in FrameDecoderState::new_with_format's docstring.\n\n* docs(frame_decoder): document magicless mode disables skippable-frame detection\n\nset_magicless(true) routes through read_frame_header_with_format with\nmagicless=true, which bypasses the 0x184D2A50..=0x184D2A5F skippable-\nframe check. Calling that out at the set_magicless docstring prevents\nsurprises on mixed-format streams: callers must pre-split skippable\nframes out before feeding the decoder when running in magicless mode.\n\n* test(frame_compressor): accept SkipFrame alongside BadMagicNumber in magicless rejection assert\n\nThe first 4 bytes of a magicless frame are the frame-header\ndescriptor + window/dictionary/FCS metadata — pseudo-random from the\nparser's perspective. They almost always miss the standard MAGIC_NUM,\nbut they can rarely land in the skippable-frame magic range\n(0x184D2A50..=0x184D2A5F), in which case the standard decoder\nreturns ReadFrameHeaderError::SkipFrame instead of BadMagicNumber.\nBoth outcomes prove rejection — the assertion now matches either.",
+          "timestamp": "2026-05-22T09:56:20+03:00",
+          "tree_id": "56b54a30e5ac7166dcd4add87452d432e5af935e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/70cb3e4114e31153c70bf2c0cb0376c485a6d043"
+        },
+        "date": 1779436389197,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 240.706,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 161.498,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.132,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.154,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.052,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.609,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.018,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.566,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.246,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.246,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.283,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.872,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.164,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.37,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.071,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.456,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.103,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.312,
             "unit": "ms"
           },
           {
