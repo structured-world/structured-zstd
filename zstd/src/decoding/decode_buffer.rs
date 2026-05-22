@@ -435,9 +435,22 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         const PREFETCH_EXTENT: usize = 128;
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {
-            let tail = &s1[start_idx..];
-            let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
-            prefetch::prefetch_slice_t1(&tail[..bound]);
+            let s1_tail = &s1[start_idx..];
+            let s1_bound = core::cmp::min(s1_tail.len(), PREFETCH_EXTENT);
+            prefetch::prefetch_slice_t1(&s1_tail[..s1_bound]);
+            // Wrap continuation: when the match source straddles the
+            // s1/s2 boundary and the s1 tail is shorter than the
+            // PREFETCH_EXTENT we asked for, top up the rest from
+            // s2[0..]. Without this the donor's "up to two cache
+            // lines" intent silently collapses to one (or zero if
+            // s1_tail is the last sub-line of s1).
+            if s1_bound < PREFETCH_EXTENT {
+                let remaining = PREFETCH_EXTENT - s1_bound;
+                let s2_bound = core::cmp::min(s2.len(), remaining);
+                if s2_bound > 0 {
+                    prefetch::prefetch_slice_t1(&s2[..s2_bound]);
+                }
+            }
         } else {
             // `start_idx < self.buffer.len()` from the early return,
             // `buffer.len() == s1.len() + s2.len()`, and the else
