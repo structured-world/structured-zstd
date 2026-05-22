@@ -395,8 +395,10 @@ impl FastKernelMatcher {
         // visibility the dict-budget retire never runs and the
         // matcher can emit offsets exceeding the frame header's
         // reported window size (format-correctness risk).
-        // Eviction operates on REAL data length (excluding the
-        // no dummy at the head of history post-M8).
+        // Eviction operates on REAL data length. Post-M8 there is
+        // no dummy prefix at the head of `history`, so `real_len` is
+        // just `history.len()` minus the `HISTORY_DRAIN_BASE`
+        // sentinel-slot offset — not a placeholder block subtraction.
         let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
         let new_real_total = real_len.saturating_add(space.len());
         let cap = self.max_window_size.saturating_mul(2);
