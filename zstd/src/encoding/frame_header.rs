@@ -7,7 +7,12 @@ use alloc::vec::Vec;
 /// A header for a single Zstandard frame.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header>
-#[derive(Debug)]
+///
+/// The containing module is `pub(crate)`, so this struct is not
+/// externally constructible. The `Default` derive is kept as a
+/// convenience for tests and for internal callers that only need
+/// to override specific fields.
+#[derive(Debug, Default)]
 pub struct FrameHeader {
     /// Optionally, the original (uncompressed) size of the data within the frame in bytes.
     /// If not present, `window_size` must be set.
@@ -25,6 +30,11 @@ pub struct FrameHeader {
     /// and less than 3.75TB. Encoders should not generate a frame that requires a window size larger than
     /// 8mb.
     pub window_size: Option<u64>,
+    /// If true, the 4-byte magic number prefix is omitted from the
+    /// serialized output. The caller MUST know out-of-band that the
+    /// stream is magicless and use a magicless-aware decoder.
+    /// Donor parity: `ZSTD_f_zstd1_magicless` (see `ZSTD_d_format`).
+    pub magicless: bool,
 }
 
 impl FrameHeader {
@@ -34,8 +44,10 @@ impl FrameHeader {
     pub fn serialize(self, output: &mut Vec<u8>) {
         vprintln!("Serializing frame with header: {self:?}");
         // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header
-        // Magic Number:
-        output.extend_from_slice(&MAGIC_NUM.to_le_bytes());
+        // Magic Number (omitted in magicless mode — `ZSTD_f_zstd1_magicless`):
+        if !self.magicless {
+            output.extend_from_slice(&MAGIC_NUM.to_le_bytes());
+        }
 
         // `Frame_Header_Descriptor`:
         output.push(self.descriptor());
@@ -182,6 +194,7 @@ mod tests {
             content_checksum: false,
             dictionary_id: None,
             window_size: None,
+            magicless: false,
         };
         let descriptor = header.descriptor();
         let decoded_descriptor = FrameDescriptor(descriptor);
@@ -198,6 +211,7 @@ mod tests {
             content_checksum: false,
             dictionary_id: None,
             window_size: None,
+            magicless: false,
         };
 
         let mut serialized_header = Vec::new();
@@ -216,6 +230,7 @@ mod tests {
             content_checksum: false,
             dictionary_id: None,
             window_size: Some(1),
+            magicless: false,
         };
 
         let mut serialized_header = Vec::new();
@@ -231,6 +246,7 @@ mod tests {
             content_checksum: false,
             dictionary_id: None,
             window_size: None,
+            magicless: false,
         };
 
         let mut serialized_header = Vec::new();

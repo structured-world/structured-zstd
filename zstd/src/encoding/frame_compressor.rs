@@ -44,6 +44,12 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     source_size_hint: Option<u64>,
     state: CompressState<M>,
+    /// When true, emitted frames omit the 4-byte magic number prefix
+    /// (`ZSTD_f_zstd1_magicless`). Default false. The caller is
+    /// responsible for ensuring the decoder is configured for the
+    /// matching format — wire-format only round-trips with a
+    /// magicless-aware decoder.
+    magicless: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -430,6 +436,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                     compression_level,
                 ),
             },
+            magicless: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
@@ -456,9 +463,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 ),
             },
             compression_level,
+            magicless: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Enable or disable magicless frame format (`ZSTD_f_zstd1_magicless`).
+    ///
+    /// When set to `true`, emitted frames omit the 4-byte magic number
+    /// prefix. The matching decoder must be configured to expect a
+    /// magicless stream — wire-format only round-trips with a
+    /// magicless-aware decoder.
+    pub fn set_magicless(&mut self, magicless: bool) {
+        self.magicless = magicless;
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.
@@ -756,6 +774,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             } else {
                 Some(window_size)
             },
+            magicless: self.magicless,
         };
         // Write the frame header and compressed blocks separately to avoid
         // shifting the entire `all_blocks` buffer to prepend the header.
@@ -2280,5 +2299,65 @@ mod tests {
             "test fixture invariant: chosen levels must resolve to \
              different StrategyTag variants",
         );
+    }
+
+    /// Magicless mode (`ZSTD_f_zstd1_magicless`): encoded frame
+    /// MUST NOT start with the 4-byte magic prefix, AND must
+    /// round-trip through a magicless-aware decoder.
+    #[test]
+    fn magicless_frame_omits_magic_and_roundtrips() {
+        use crate::common::MAGIC_NUM;
+        let input: alloc::vec::Vec<u8> = (0..512u32).map(|i| (i ^ 0xA5) as u8).collect();
+
+        // Encode with magicless = true.
+        let mut output: Vec<u8> = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+        compressor.set_magicless(true);
+        compressor.set_source(input.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        // 1. Encoded output must NOT begin with the zstd magic number.
+        assert!(
+            !output.starts_with(&MAGIC_NUM.to_le_bytes()),
+            "magicless frame must omit the 4-byte magic prefix",
+        );
+
+        // 2. A magicless-aware decoder must round-trip the payload.
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        decoder.set_magicless(true);
+        let mut cursor: &[u8] = output.as_slice();
+        decoder.init(&mut cursor).expect("magicless init");
+        decoder
+            .decode_blocks(&mut cursor, crate::decoding::BlockDecodingStrategy::All)
+            .expect("decode_blocks");
+        let mut decoded: Vec<u8> = Vec::new();
+        decoder
+            .collect_to_writer(&mut decoded)
+            .expect("collect_to_writer");
+        assert_eq!(decoded, input, "magicless roundtrip must preserve bytes");
+
+        // 3. A standard (magicful) decoder MUST reject a magicless
+        //    frame at the header-read step — the first 4 bytes are
+        //    the frame-header descriptor + window / dictionary / FCS
+        //    metadata, not the magic. We accept either
+        //    `BadMagicNumber` (typical case: first 4 bytes don't
+        //    match `MAGIC_NUM` and don't fall in the skippable-frame
+        //    magic range) or `SkipFrame` (rare: the first 4 bytes
+        //    coincidentally land in `0x184D2A50..=0x184D2A5F`). Both
+        //    prove the standard decoder did not treat the bytes as a
+        //    real magicful frame.
+        use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+        let mut std_decoder = crate::decoding::FrameDecoder::new();
+        let std_init = std_decoder.init(output.as_slice());
+        match std_init {
+            Err(FrameDecoderError::ReadFrameHeaderError(
+                ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. },
+            )) => {}
+            other => panic!(
+                "standard decoder must reject a magicless frame with \
+                 ReadFrameHeaderError::BadMagicNumber or SkipFrame, got {other:?}",
+            ),
+        }
     }
 }
