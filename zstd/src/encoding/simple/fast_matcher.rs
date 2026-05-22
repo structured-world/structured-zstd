@@ -238,8 +238,9 @@ impl FastKernelMatcher {
 
     /// Explicit-parameter constructor used by the wiring commit when
     /// the level resolution produced a non-default `(window_log,
-    /// hash_log, mls)` triple (typically because a small source-size
-    /// hint clamped the window). Tests can also call this directly.
+    /// hash_log, mls, step_size)` tuple (typically because a small
+    /// source-size hint clamped the window). Tests can also call this
+    /// directly.
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32, step_size: usize) -> Self {
         assert!(
             step_size >= 2,
