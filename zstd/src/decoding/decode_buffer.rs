@@ -411,33 +411,21 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         if start_idx >= self.buffer.len() {
             return;
         }
-        // Donor's `ZSTD_prefetchMatch` issues up to two `PREFETCH_L1`
-        // hints per match — one at `match`, one at
-        // `match + CACHELINE_SIZE`. We use the same two-line cadence
-        // but route through `prefetch_slice_t1` (`_MM_HINT_T1` on
-        // x86 — L2 destination instead of L1). The deliberate
-        // deviation: ADVANCE iterations of decode work sit between
-        // the prefetch issue and the matching `repeat()` load, so
-        // an L1-bound line would likely be evicted by intervening
-        // accesses before the consumer reaches it — L2 has the
-        // capacity to keep the line resident across that window.
-        // The pre-existing in-loop `prefetch_match_source` makes the
-        // same T1 choice for the same reason. Capping the slice
-        // extent at 2 × 64 B holds `prefetch_slice_t1` to AT MOST
-        // two prefetch lines (it can issue fewer when the source
-        // straddles the ring buffer's `as_slices()` boundary and
-        // only the head fragment is reachable here, or when the
-        // remaining slice tail is shorter than 64 B) instead of the
-        // 4 its `MAX_LINES` cap would otherwise allow. No
-        // `match_length < 64` gate — with several sequences of
-        // lookahead the prefetch overlaps work the CPU has to do
-        // anyway, so even sub-cache-line matches benefit.
+        // Donor's `ZSTD_prefetchMatch` issues two `PREFETCH_L1` hints
+        // per match — one at `match`, one at `match + CACHELINE_SIZE`.
+        // We mirror that exactly: route through `prefetch_slice`
+        // (`_MM_HINT_T0` on x86 → L1 destination), cap extent at
+        // 2 × 64 B = 128 B so the helper stays at AT MOST two
+        // prefetch issues per match (donor parity). The lookahead
+        // depth (ADVANCE) is small enough that L1 should hold the
+        // line across the gap; if profiling later shows L1 eviction
+        // pressure we can revisit T1/L2.
         const PREFETCH_EXTENT: usize = 128;
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {
             let s1_tail = &s1[start_idx..];
             let s1_bound = core::cmp::min(s1_tail.len(), PREFETCH_EXTENT);
-            prefetch::prefetch_slice_t1(&s1_tail[..s1_bound]);
+            prefetch::prefetch_slice(&s1_tail[..s1_bound]);
             // Wrap continuation: when the match source straddles the
             // s1/s2 boundary and the s1 tail is shorter than the
             // PREFETCH_EXTENT we asked for, top up the rest from
@@ -448,7 +436,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 let remaining = PREFETCH_EXTENT - s1_bound;
                 let s2_bound = core::cmp::min(s2.len(), remaining);
                 if s2_bound > 0 {
-                    prefetch::prefetch_slice_t1(&s2[..s2_bound]);
+                    prefetch::prefetch_slice(&s2[..s2_bound]);
                 }
             }
         } else {
@@ -460,7 +448,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let idx = start_idx - s1.len();
             let tail = &s2[idx..];
             let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
-            prefetch::prefetch_slice_t1(&tail[..bound]);
+            prefetch::prefetch_slice(&tail[..bound]);
         }
     }
 

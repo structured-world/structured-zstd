@@ -159,9 +159,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // line(s) into L1/L2 — hiding DRAM latency for long-distance
     // matches whose source is beyond cache residency.
     //
-    // Donor uses STORED_SEQS = 8; we start at 4 to keep the ring on
-    // the stack within register pressure.
-    const ADVANCE: usize = 4;
+    // Donor parity: `STORED_SEQS = 8`. 8-deep lookahead lets the
+    // prefetch issued at iteration `i` resolve through L1/L2 by the
+    // time iteration `i + 8` consumes it, whereas 4-deep often
+    // wasn't enough gap on the long-distance workloads we target.
+    // The on-stack ring is `[Sequence; 8]` = 96 bytes; well within
+    // register-pressure budget.
+    const ADVANCE: usize = 8;
     const ADVANCE_MASK: usize = ADVANCE - 1;
     // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
     // power of two. Compile-time guard so a future tweak (e.g.
