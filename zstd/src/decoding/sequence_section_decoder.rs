@@ -168,10 +168,9 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     const ADVANCE: usize = 8;
     const ADVANCE_MASK: usize = ADVANCE - 1;
     // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
-    // power of two. Compile-time guard so a future tweak (e.g.
-    // bumping to donor's STORED_SEQS = 8, also a power of two) can't
-    // silently corrupt the ring index if someone picks a non-power-
-    // of-two value.
+    // power of two. Compile-time guard so a future ADVANCE tweak
+    // can't silently corrupt the ring index if someone picks a
+    // non-power-of-two value.
     const _: () = assert!(
         ADVANCE.is_power_of_two(),
         "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
