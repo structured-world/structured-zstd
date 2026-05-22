@@ -8202,3 +8202,61 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
         (17, 14, 6, 2),
     );
 }
+
+/// Exercise the actual driver wiring: for every Fast level, reset a
+/// `MatchGeneratorDriver` and assert the inner `FastKernelMatcher`
+/// observed the same `(hash_log, mls, step_size)` tuple that
+/// `resolve_level_params` reports. Catches plumbing bugs — argument
+/// reordering, stale step_size carried from a prior frame,
+/// stuck-on-default values — that the parameter-only test above
+/// would miss.
+#[test]
+fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
+    let mut driver = MatchGeneratorDriver::new(64 * 1024, 1);
+
+    let fast_levels = [
+        CompressionLevel::Level(1),
+        CompressionLevel::Fastest,
+        CompressionLevel::Uncompressed,
+        CompressionLevel::Level(-1),
+        CompressionLevel::Level(-2),
+        CompressionLevel::Level(-3),
+        CompressionLevel::Level(-4),
+        CompressionLevel::Level(-5),
+        CompressionLevel::Level(-6),
+        CompressionLevel::Level(-7),
+    ];
+
+    for &level in &fast_levels {
+        let p = resolve_level_params(level, None);
+        // Sanity: every level in the table above must resolve to a
+        // Fast-strategy row — otherwise this test isn't testing what
+        // it claims to test.
+        assert_eq!(
+            p.strategy_tag,
+            super::strategy::StrategyTag::Fast,
+            "{level:?} must resolve to Fast strategy",
+        );
+
+        // Drive the production reset path (same code paths exercised
+        // by FrameCompressor / StreamingEncoder).
+        crate::encoding::Matcher::reset(&mut driver, level);
+
+        let m = driver.simple_mut();
+        assert_eq!(
+            m.hash_log(),
+            p.fast_hash_log,
+            "{level:?}: inner matcher hash_log mismatch — argument swap?",
+        );
+        assert_eq!(
+            m.mls(),
+            p.fast_mls,
+            "{level:?}: inner matcher mls mismatch — argument swap?",
+        );
+        assert_eq!(
+            m.step_size(),
+            p.fast_step_size,
+            "{level:?}: inner matcher step_size mismatch — stale value carried from prior reset?",
+        );
+    }
+}

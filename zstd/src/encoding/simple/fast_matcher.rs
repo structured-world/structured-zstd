@@ -215,6 +215,27 @@ impl FastKernelMatcher {
         )
     }
 
+    /// Current per-frame `step_size` (set at construction / reset).
+    /// Test-only crate helper for verifying driver wiring.
+    #[cfg(test)]
+    pub(crate) fn step_size(&self) -> usize {
+        self.step_size
+    }
+
+    /// Hash table `hash_log` (delegates to the inner table). Test-only
+    /// crate helper for verifying driver wiring.
+    #[cfg(test)]
+    pub(crate) fn hash_log(&self) -> u32 {
+        self.hash_table.hash_log()
+    }
+
+    /// Hash table `mls` (delegates to the inner table). Test-only
+    /// crate helper for verifying driver wiring.
+    #[cfg(test)]
+    pub(crate) fn mls(&self) -> u32 {
+        self.hash_table.mls()
+    }
+
     /// Explicit-parameter constructor used by the wiring commit when
     /// the level resolution produced a non-default `(window_log,
     /// hash_log, mls)` triple (typically because a small source-size
