@@ -187,46 +187,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
     );
 
-    // Read-only estimate for the prefetch's match-source position.
-    // The TRUE `actual_offset` requires mutating `offset_hist` via
-    // `do_offset_history`, which we deliberately defer to execute
-    // time so a mid-loop error preserves the legacy 'no partial
-    // history mutation' semantics. For the `seq.of >= 4` case
-    // (every fresh non-repcode offset, dominant on the long-distance
-    // workloads this pipeline targets) the estimate is exact and
-    // matches do_offset_history's output bit-for-bit. For the
-    // repcode 1..=3 cases the estimate reads the current `hist`
-    // without mutating it — this can lag by up to ADVANCE
-    // sequences vs the post-execute state, but the lag only
-    // mis-points the prefetch by a few cache lines on close-range
-    // matches whose source is already L1-warm; the cost of a
-    // mis-targeted PREFETCH_L1 on warm data is negligible.
-    #[inline(always)]
-    fn estimate_actual_offset(of: u32, ll: u32, hist: &[u32; 3]) -> u32 {
-        if of >= 4 {
-            return of - 3;
-        }
-        // Mirrors the read-only halves of do_offset_history_repcode's
-        // selection table: the lit-zero edge cases that pull from a
-        // different hist slot are kept consistent so the estimate
-        // tracks execute-time resolution as closely as possible.
-        match (of, ll == 0) {
-            (1, false) => hist[0],
-            (1, true) => hist[1],
-            (2, false) => hist[1],
-            (2, true) => hist[2],
-            (3, false) => hist[2],
-            // Mirror `do_offset_history_repcode`'s `wrapping_sub(1)` —
-            // not `saturating_sub` — so even on corrupted/0 history
-            // the estimate matches the real resolver. The result is
-            // only consumed by prefetch addressing, where a wild
-            // wrap just lands the hint on an out-of-range slot the
-            // helper drops.
-            (3, true) => hist[0].wrapping_sub(1),
-            _ => 0,
-        }
-    }
-
     if num_sequences >= ADVANCE * 2 {
         // `prefetch_pos` is the logical buffer index (same frame as
         // `buffer.len()`) at which the NEXT not-yet-decoded sequence
@@ -234,11 +194,21 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // accumulate (ll + ml) per decoded seq to keep this position
         // synchronised with where execute will eventually be.
         let mut prefetch_pos: usize = old_buffer_size;
-        // Stack ring of raw sequences. `do_offset_history` is NOT
-        // run here — execute calls it later, so `offset_hist`
-        // mutations stay in lockstep with successful execute calls
-        // (matching the legacy 'no rollback on mid-loop error'
-        // contract).
+        // Shadow copy of `offset_hist`, advanced by
+        // `do_offset_history` for every decoded-ahead sequence. The
+        // REAL `offset_hist` is only mutated inside
+        // `execute_one_sequence` (preserving the legacy 'partial
+        // output, no rewound history' rollback contract), but the
+        // prefetch needs the exact post-resolution offset for repcode
+        // 1..=3 cases that read history — a stale read would skip
+        // the long-distance prefetch precisely when a fresh huge
+        // offset is followed by a repcode that aliases it. The
+        // shadow is a local 12 B usize-triple so the simulation cost
+        // is negligible.
+        let mut shadow_hist: [u32; 3] = *offset_hist;
+        // Stack ring of raw sequences. The execute path calls
+        // `do_offset_history` again on the real `offset_hist` for
+        // each drained slot — that's the single committing site.
         let mut ring: [Sequence; ADVANCE] = [Sequence {
             ll: 0,
             ml: 0,
@@ -251,11 +221,21 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // implies k + 1 <= ADVANCE < num_sequences) — no `isLastSeq`
         // guard required here, only in the steady-state loop where
         // `i + 1 == num_sequences` is reachable.
+        //
+        // `saw_prefetch_needed` flips to true the moment any prefilled
+        // sequence resolves to an offset above the prefetch threshold.
+        // If it stays false through all ADVANCE prefills, the block
+        // is dominated by short-offset matches whose source is
+        // already L1-warm; we drop into a single-pass fallback for
+        // the remainder so ring/prefill/drain overhead doesn't
+        // weigh on the short-offset hot path.
+        let mut saw_prefetch_needed = false;
         for slot in ring.iter_mut() {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            // Estimated offset for prefetch only — see
-            // `estimate_actual_offset` for the accuracy contract.
-            let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
+            // EXACT actual_offset via shadow history — repcode
+            // 1..=3 lookups see the same post-update values execute
+            // will see when it later commits to the real hist.
+            let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             // wrapping_add: prefetch_pos / seq.ll / seq.ml are
             // derived from the bitstream, so a malformed frame can
             // present values that would overflow usize and panic
@@ -265,9 +245,10 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             // wrap-derived garbage indices, so the wrap is harmless
             // here while keeping the decoder fuzz-stable.
             let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-            let source_idx = match_start.wrapping_sub(est_offset as usize);
-            if est_offset >= PREFETCH_OFFSET_THRESHOLD {
+            let source_idx = match_start.wrapping_sub(actual_offset as usize);
+            if actual_offset >= PREFETCH_OFFSET_THRESHOLD {
                 buffer.prefetch_lookahead_match_source(source_idx);
+                saw_prefetch_needed = true;
             }
             prefetch_pos = match_start.wrapping_add(seq.ml as usize);
             *slot = seq;
@@ -277,67 +258,100 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             of_dec.update_state_fast(&mut br);
         }
 
-        // Steady state: decode next, prefetch its source, execute the
-        // oldest slot in the ring. `i & ADVANCE_MASK` is both the
-        // oldest slot (currently holding seq at logical index i -
-        // ADVANCE) and the slot we overwrite with the newly-decoded
-        // seq[i] — donor pattern.
-        for i in ADVANCE..num_sequences {
-            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
-            // wrapping_add: prefetch_pos / seq.ll / seq.ml are
-            // derived from the bitstream, so a malformed frame can
-            // present values that would overflow usize and panic
-            // under debug. The result feeds only the prefetch
-            // hint — `prefetch_lookahead_match_source` bound-checks
-            // the logical position against `buffer.len()` and drops
-            // wrap-derived garbage indices, so the wrap is harmless
-            // here while keeping the decoder fuzz-stable.
-            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-            let source_idx = match_start.wrapping_sub(est_offset as usize);
-            if est_offset >= PREFETCH_OFFSET_THRESHOLD {
-                buffer.prefetch_lookahead_match_source(source_idx);
+        if !saw_prefetch_needed {
+            // All-short-offset prefill — the pipeline would pay
+            // ring/drain overhead for zero prefetches. Drain the
+            // queued ADVANCE sequences in order, then continue
+            // single-pass for the rest of the block. The ring slots
+            // are still in logical index order (k == prefill index)
+            // because the steady-state loop hasn't started rotating
+            // yet.
+            for slot in &ring {
+                execute_one_sequence(
+                    buffer,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    offset_hist,
+                    *slot,
+                )?;
+                seq_sum = seq_sum.wrapping_add(slot.ll).wrapping_add(slot.ml);
             }
-            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-
-            let slot = i & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            ring[slot] = seq;
-
-            execute_one_sequence(
-                buffer,
-                literals_buffer,
-                &mut lit_cur,
-                literals_buffer_len,
-                offset_hist,
-                exec_seq,
-            )?;
-            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-
-            if i + 1 < num_sequences {
-                br.ensure_bits(max_update_bits);
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
+            for i in ADVANCE..num_sequences {
+                let seq =
+                    decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+                execute_one_sequence(
+                    buffer,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    offset_hist,
+                    seq,
+                )?;
+                seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+                if i + 1 < num_sequences {
+                    br.ensure_bits(max_update_bits);
+                    ll_dec.update_state_fast(&mut br);
+                    ml_dec.update_state_fast(&mut br);
+                    of_dec.update_state_fast(&mut br);
+                }
             }
-        }
+        } else {
+            // Steady state: decode next, prefetch its source, execute
+            // the oldest slot in the ring. `i & ADVANCE_MASK` is both
+            // the oldest slot (currently holding seq at logical index
+            // i - ADVANCE) and the slot we overwrite with the newly-
+            // decoded seq[i] — donor pattern.
+            for i in ADVANCE..num_sequences {
+                let seq =
+                    decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+                let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+                let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+                let source_idx = match_start.wrapping_sub(actual_offset as usize);
+                if actual_offset >= PREFETCH_OFFSET_THRESHOLD {
+                    buffer.prefetch_lookahead_match_source(source_idx);
+                }
+                prefetch_pos = match_start.wrapping_add(seq.ml as usize);
 
-        // Drain: execute remaining ADVANCE sequences. Iteration order
-        // matches the ring slot they occupy from the steady-state
-        // loop's final write — start from `num_sequences & MASK` to
-        // preserve sequence order.
-        for k in 0..ADVANCE {
-            let slot = (num_sequences + k) & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            execute_one_sequence(
-                buffer,
-                literals_buffer,
-                &mut lit_cur,
-                literals_buffer_len,
-                offset_hist,
-                exec_seq,
-            )?;
-            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+                let slot = i & ADVANCE_MASK;
+                let exec_seq = ring[slot];
+                ring[slot] = seq;
+
+                execute_one_sequence(
+                    buffer,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    offset_hist,
+                    exec_seq,
+                )?;
+                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+
+                if i + 1 < num_sequences {
+                    br.ensure_bits(max_update_bits);
+                    ll_dec.update_state_fast(&mut br);
+                    ml_dec.update_state_fast(&mut br);
+                    of_dec.update_state_fast(&mut br);
+                }
+            }
+
+            // Drain: execute remaining ADVANCE sequences. Iteration
+            // order matches the ring slot they occupy from the
+            // steady-state loop's final write — start from
+            // `num_sequences & MASK` to preserve sequence order.
+            for k in 0..ADVANCE {
+                let slot = (num_sequences + k) & ADVANCE_MASK;
+                let exec_seq = ring[slot];
+                execute_one_sequence(
+                    buffer,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    offset_hist,
+                    exec_seq,
+                )?;
+                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+            }
         }
     } else {
         // Short-block fallback: the single-pass fused loop. For
