@@ -114,9 +114,11 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 ///   current block live in this single contiguous buffer; the kernel's
 ///   `block_start` parameter separates the two.
 /// - `prefix_start_index` is donor's `prefixStartIndex` — the lowest
-///   position any match may reference. Pinned to `HISTORY_DRAIN_BASE`
-///   at construction and after every drain (drain re-indexes the
-///   retained tail).
+///   position any match may reference. Pinned to
+///   `INITIAL_PREFIX_START_INDEX` (= 1) at construction and after every
+///   drain (drain re-indexes the retained tail; the `1` floor rejects
+///   the hash table's all-zero empty-slot value from being read as a
+///   valid match at position 0).
 /// - `rep` carries the two-deep repcode state across blocks.
 /// - `offset_hist` is the encoder-side 3-deep offset history used by
 ///   the wire encoder's repcode coding (separate from `rep`, which is
@@ -323,9 +325,9 @@ impl FastKernelMatcher {
     /// legacy MatchGenerator's `window.last().data` equivalent.
     ///
     /// Three states:
-    /// - Pre-`accept_data`: empty slice (the
-    ///   `HISTORY_DRAIN_BASE`-seeded dummy means
-    ///   `history[last_block_start..]` is empty).
+    /// - Pre-`accept_data`: empty slice — `history` is empty and
+    ///   `last_block_start` is 0, so `history[last_block_start..]`
+    ///   degenerates to a zero-length slice.
     /// - Between `accept_data` and processing: the pending buffer.
     /// - Post-processing: `history` slice of the just-processed
     ///   block — frame compressor's raw-block emission reads this.
