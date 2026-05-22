@@ -1448,16 +1448,22 @@
 
         // Pre-aggregate per (snapshot, lm, cohort) so each cohort
         // contributes one MEAN per snapshot before being folded into
-        // the snapshot-level mean. Without this stratification, a
-        // (level, scenario) combo that has more source variants would
-        // weigh more than one with fewer — biasing the aggregate
-        // toward whichever cohort happened to enumerate more rows.
+        // the snapshot-level mean. The cohort INTENTIONALLY excludes
+        // `source`: for decompress, `rust_stream` and `c_stream` are
+        // two measurements of the same logical (level, scenario,
+        // target) cell, so collapsing them into the inner mean keeps
+        // every (level, scenario, target) at equal weight in the
+        // outer mean. Including `source` would let a decompress
+        // (level, scenario, target) contribute 2× the rows of a
+        // compress one and skew the snapshot aggregate toward
+        // decompress-heavy levels.
         const cohortKey = (row) => {
-          // Cohort = (level, scenario, target, source). All of these
-          // are present in the row regardless of which top filters
-          // are on `__all__`, so the mean stays comparable across
-          // filter shapes.
-          return `${row.level}|${row.scenario}|${row.target || "?"}|${row.source || "none"}`;
+          // Use "unknown-target" for missing target — matches the
+          // sentinel `matchesCoreFilters` / `repopulateSnapshotOptions`
+          // use, so a missing-target row never splits into its own
+          // singleton cohort that would later mismatch with filter
+          // dropdown values.
+          return `${row.level}|${row.scenario}|${row.target || "unknown-target"}`;
         };
 
         // Two-level aggregation:
@@ -1673,7 +1679,13 @@
         // `bindFilters()` below, which fans every top-filter change
         // out to both `rerender()` (delta chart) and the profile.
         profileSelectors.snapshot.addEventListener("change", renderProfileChart);
-        for (const cb of document.querySelectorAll(".profile-toggles input[type=checkbox]")) {
+        // Scope to inputs that actually carry a profile series id —
+        // the aggregate-toggles container reuses `.profile-toggles`
+        // for styling, so a bare `.profile-toggles input` selector
+        // would attach this handler to aggregate checkboxes too
+        // (it'd be a no-op because `dataset.series` is missing, but
+        // the redundant listener couples JS to a styling class).
+        for (const cb of document.querySelectorAll(".profile-toggles input[type=checkbox][data-series]")) {
           cb.addEventListener("change", (e) => {
             const key = e.currentTarget.dataset.series;
             if (!key) return;
