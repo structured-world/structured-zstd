@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779445693166,
+  "lastUpdate": 1779465362737,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -43154,6 +43154,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.202,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7070d9b0e154fb72e0c7e6b8c47850ef465b2f64",
+          "message": "perf(encoder): port donor ZSTD_compressBlock_fast — 4-cursor + per-level cParams + cmov + window-correctness (#198 phase 3) (#229)\n\n* perf(encoder): port donor ZSTD_compressBlock_fast — 4-cursor + per-level cParams + cmov + window-correctness\n\nPhase 3 of the Fast strategy port. Brings the encoder up to donor\nparity on the hot path while keeping the public API and ratio\nbehaviour unchanged.\n\nKernel (`zstd/src/encoding/simple/fast_kernel/kernel.rs`):\n\n- Full 4-cursor pipeline (`ip0`/`ip1`/`ip2`/`ip3`) ported from\n  `ZSTD_compressBlock_fast_noDict_generic`, with `kSearchStrength`\n  step-doubling, repcode-at-ip2 probe, two explicit-match probes\n  per do-while iter, immediate-rep2 inner loop after match emit.\n- Both donor variants of the 4-byte match test\n  (`ZSTD_match4Found_branch` + `ZSTD_match4Found_cmov`) selected per\n  call via a `USE_CMOV` const generic, derived from `window_log`\n  (cmov for narrow windows where the branch is unpredictable).\n- 32-bit overflow guard on the bounds check (`match_pos + 4 > data_len`\n  was wrap-prone; switched to `checked_add(4).is_none_or(...)`).\n- Cursor math uses `checked_add` / `saturating_add` so wild\n  `step_size` / accumulated `step` doublings cannot wrap past\n  `usize::MAX` and bypass the `ip3 > ilimit` guard.\n- `step_size >= 2` validated in release too — `compress_block_fast`\n  is a safe `pub(crate)` boundary, so a misuse must panic loudly\n  rather than silently mis-iterate.\n\nMatcher (`zstd/src/encoding/simple/fast_matcher.rs`):\n\n- Per-level `LevelParams.fast_step_size` threaded into\n  `with_params(window_log, hash_log, mls, step_size)` and matching\n  `reset(...)`. Driver fans the resolved tuple into both code paths\n  (initial construction and frame reset) so wiring stays in\n  lockstep.\n- `window_log` capped at 30 in both `with_params` and `reset`\n  (donor's `ZSTD_WINDOWLOG_MAX_64`). The eviction band lets history\n  grow to `2 * max_window_size` before draining, so a 31 cap could\n  push `history.len()` to `2^32` and trip the kernel's\n  `data.len() > u32::MAX` panic — 30 keeps the band below\n  `u32::MAX` with headroom for the pending block.\n- `accept_data` now drives window-budget eviction EAGERLY (was lazy\n  inside `extend_history_with_pending`) so the driver's\n  `commit_space` can read the pre/post `history.len()` delta and\n  retire the dictionary-priming budget on every frame; docstring\n  updated to match the new ordering.\n- `drain_real_prefix`'s rehash starts at\n  `INITIAL_PREFIX_START_INDEX` (= 1) instead of `HISTORY_DRAIN_BASE`\n  (= 0). The kernel's `match_idx >= prefix_start_index` filter\n  rejects index 0 anyway, so populating that slot would only\n  pollute the freshly-cleared table.\n- HISTORY_DRAIN_BASE replaces RESERVED_PREFIX_BYTES (post-M8: the\n  dummy-prefix region is gone — the constant is now strictly a\n  drain start offset, with sentinel-0 protection living in\n  INITIAL_PREFIX_START_INDEX).\n\nTest wiring (`zstd/src/encoding/match_generator.rs`):\n\n- Bounce through `CompressionLevel::Default` (Dfast) before each\n  Fast reset in `fast_levels_driver_wiring_threads_cparams_into_inner_matcher`\n  so the loop exercises the backend-switch path\n  (`MatchGeneratorDriver::new` / `simple_mut` recreating the Fast\n  variant via `FastKernelMatcher::with_params`) on top of the\n  reset-only path it was already covering — both wiring sites stay\n  tested per level now.\n\n* fix(fast): non-overflowing post-match hash-refill bound + cap dict-primed window\n\nTwo Copilot findings:\n\n- compress_block_fast post-match hash refill computed\n  `current0_plus_2 + HASH_READ_SIZE <= iend_addr` with plain `+`.\n  On 32-bit targets the addition can wrap past `usize::MAX` and\n  silently pass the bounds check, then `hash_ptr` reads 8 bytes\n  past `iend_addr` under `unsafe` — out-of-bounds. Switch to\n  `checked_add(HASH_READ_SIZE)` and treat overflow as out-of-range\n  (skip the refill), same pattern the kernel's other 32-bit\n  overflow guards use.\n\n- `MatchGeneratorDriver::prime_with_dictionary` did\n  `max_window_size.saturating_add(dict_content.len())` for every\n  backend, which silently re-introduced the `window_log <= 30` cap\n  the matcher's construction-time assertion was designed to enforce:\n  a large dictionary could push `max_window_size` past the safe\n  ceiling and the doubled eviction band would then exceed\n  `u32::MAX`, tripping the kernel's `data.len() <= u32::MAX` panic\n  the cap claimed to prevent.\n\n  Cap the post-priming `max_window_size` at\n  `(u32::MAX - MAX_BLOCK_SIZE) / 2` so the doubled-band-plus-block\n  invariant holds regardless of dictionary size. Applied across all\n  four backends (Simple / Dfast / Row / HashChain) since the\n  saturating_add pattern was identical in each.\n\n* fix(fast_kernel): chain checked_add for post-match hash refill bounds\n\nThe previous guard computed `current0_plus_2 = current0 + 2` BEFORE\nthe `checked_add(HASH_READ_SIZE)` predicate. On 32-bit targets where\n`current0` approaches `usize::MAX`, the raw `+ 2` step itself wraps\nand produces a small value that would pass the subsequent bounds\ncheck, then `hash_ptr` would read at a position lacking\nHASH_READ_SIZE readable bytes — out-of-bounds under the surrounding\n`unsafe`.\n\nChain both additions through `checked_add` so a wrap at either step\nskips the refill. Compute the materialised `current0_plus_2` only\ninside the `if in_range_fwd` branch, where the chained predicate\nalready proves the addition is wrap-free.\n\n* fix(match_generator): track granted dict budget, not requested, when MAX_PRIMED_WINDOW_SIZE clips\n\n`prime_with_dictionary` saturating-added `dict_content.len()` to\n`max_window_size` then clipped at `MAX_PRIMED_WINDOW_SIZE`, but the\ndownstream `dictionary_retained_budget += committed_dict_budget`\nbookkeeping used the REQUESTED budget. When the cap clipped the\ngrowth (large dictionary), the retained-budget tracker over-counted\nby `requested - granted`. Later `retire_dictionary_budget()` reclaims\nthat inflated value from `max_window_size` and shrinks the matcher\nbelow its real base window, breaking match coverage for the rest\nof the frame.\n\nSnapshot `base_max_window_size` BEFORE the cap is applied (per\nbackend), then compute `granted_retained_budget = new_max - base_max`\nafter the cap and the uncommitted-tail subtraction. Track the\ngranted value in `dictionary_retained_budget` so retire reclaims\nexactly what was added — no more, no less.\n\nApplies to all four backends (Simple / Dfast / Row / HashChain)\nsince each shared the same saturating_add + clip pattern.\n\n* docs(match_generator): annotate cap-clip protection at the requested_dict_budget site\n\nRestate the granted-vs-requested-budget invariant inline at the\n`let requested_dict_budget` line so the protection against\n`retire_dictionary_budget()` over-reclaiming after a clip is\nvisible at the read site, not only at the granted_retained_budget\ncomputation block further down. Also call out the secondary\nconsequence (`cap = 2 * max_window_size` shrinking with the\nmatcher) the original comment glossed over.\n\n* fix(match_generator): avoid double-discount when MAX_PRIMED cap and uncommitted tail both apply\n\nThe previous shape:\n1. pre-priming clip: `max_window_size = (base + requested).min(cap)`\n2. post-priming subtract: `max_window_size -= (requested - committed)`\n\ndouble-discounted when the cap clipped. The clip already discarded\n`requested - allowed` bytes; subtracting another `requested -\ncommitted` then took ALSO bytes that the cap had granted and the\nprime loop had actually committed. Concrete failure: cap allows\n900, committed = 998, uncommitted_tail = 2 → granted = 898, but\nthe matcher actually retained 900 bytes of dictionary, so retiring\njust 898 leaves `max_window_size` 2 bytes shy of reality and forces\na premature eviction on the next commit.\n\nDrop the post-priming subtract entirely and derive\n`granted_retained_budget` directly from the two real bounds:\n\n  capped_retained_budget = MAX_PRIMED - base\n  granted_retained_budget = committed.min(capped_retained_budget)\n  final_max_window_size   = base + granted_retained_budget\n\nThis is the minimum of (what the prime loop actually committed)\nand (what the cap allowed to grow). Set `max_window_size` directly\nto that final value per backend; no two-step add+subtract dance,\nno over- or under-discount.\n\n* docs(fast_matcher): rephrase real_len eviction comment (no dummy prefix post-M8)",
+          "timestamp": "2026-05-22T18:07:49+03:00",
+          "tree_id": "53e354f8d1014cebb1d4d2a6afafc7b654a893d7",
+          "url": "https://github.com/structured-world/structured-zstd/commit/7070d9b0e154fb72e0c7e6b8c47850ef465b2f64"
+        },
+        "date": 1779465359229,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 278.385,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 225.116,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.433,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.204,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.162,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.977,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.306,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.881,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.739,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.897,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.321,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.097,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.168,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.132,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
