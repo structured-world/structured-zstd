@@ -439,12 +439,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
             prefetch::prefetch_slice_t1(&tail[..bound]);
         } else {
+            // `start_idx < self.buffer.len()` from the early return,
+            // `buffer.len() == s1.len() + s2.len()`, and the else
+            // branch establishes `start_idx >= s1.len()`. So
+            // `idx = start_idx - s1.len() < s2.len()` by construction
+            // — no explicit `idx < s2.len()` guard needed.
             let idx = start_idx - s1.len();
-            if idx < s2.len() {
-                let tail = &s2[idx..];
-                let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
-                prefetch::prefetch_slice_t1(&tail[..bound]);
-            }
+            let tail = &s2[idx..];
+            let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
+            prefetch::prefetch_slice_t1(&tail[..bound]);
         }
     }
 

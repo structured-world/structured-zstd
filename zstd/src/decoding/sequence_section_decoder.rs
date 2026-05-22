@@ -172,10 +172,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // residency proxy (PREFETCH_AREA) for `ZSTD_decompressSequencesLong`
     // — short-offset matches reuse cache lines the buffer write just
     // touched, so a prefetch there is pure issue-port pressure. The
-    // gate is on the read-only `est_offset` (which is exact for
-    // `seq.of >= 4`, the dominant long-distance case) so the
-    // threshold check costs one branch on a strongly-predicted
-    // path.
+    // gate is on the resolved `actual_offset` (computed via
+    // `do_offset_history` on the decode-ahead `shadow_hist`, so it
+    // matches what execute will commit — repcode 1..=3 cases
+    // included), so the threshold check costs one branch on a
+    // strongly-predicted path.
     const PREFETCH_OFFSET_THRESHOLD: u32 = 32 * 1024;
     // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
     // power of two. Compile-time guard so a future tweak (e.g.
@@ -203,7 +204,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // 1..=3 cases that read history — a stale read would skip
         // the long-distance prefetch precisely when a fresh huge
         // offset is followed by a repcode that aliases it. The
-        // shadow is a local 12 B usize-triple so the simulation cost
+        // shadow is a local `[u32; 3]` (12 bytes) so the simulation cost
         // is negligible.
         let mut shadow_hist: [u32; 3] = *offset_hist;
         // Stack ring of raw sequences. The execute path calls
