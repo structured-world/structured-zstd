@@ -80,7 +80,13 @@ unsafe fn match_found<const USE_CMOV: bool>(
     // stay as explicit branches — these protect against stale entries
     // pointing past the buffer end and forward-pointing matches.
     let match_pos = match_idx as usize;
-    if match_pos + 4 > data_len {
+    // `match_pos + 4` would wrap on 32-bit targets when `match_idx`
+    // approaches `u32::MAX`, allowing an OOB `read32` through.
+    // `checked_add` keeps the unsafe read fully guarded: `None` means
+    // overflow → reject; `Some(end)` mirrors the original predicate
+    // (`end > data_len` rejects). On 64-bit the optimizer collapses
+    // this to the same codegen as the previous form.
+    if match_pos.checked_add(4).is_none_or(|end| end > data_len) {
         return false;
     }
     if match_pos >= ip_pos {
