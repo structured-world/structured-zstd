@@ -153,7 +153,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // `ZSTD_decompressSequencesLong_body`. Pre-decode `ADVANCE`
     // sequences ahead, prefetch each match source as we go, then
     // execute the oldest in-flight sequence per iteration while
-    // decoding the next one. By the time `execute_resolved_sequence`
+    // decoding the next one. By the time `execute_one_sequence`
     // reaches `buffer.repeat()` for slot k, the prefetch issued
     // `ADVANCE` iterations earlier has had time to pull the source
     // line(s) into L1/L2 — hiding DRAM latency for long-distance
