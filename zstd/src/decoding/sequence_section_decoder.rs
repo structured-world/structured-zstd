@@ -108,12 +108,15 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
-    // `offset_hist` mutates here (via do_offset_history) and only
-    // here. The pipelined decode loop below intentionally defers all
-    // repcode resolution to this call site so a mid-loop error keeps
-    // the caller's `offset_hist` consistent with the sequences that
-    // actually executed — preserving the legacy two-pass 'partial
-    // output, no rewound history' contract on early exits.
+    // `offset_hist` mutates here (via do_offset_history) during normal
+    // sequence execution and ONLY here on the in-band success path —
+    // the pipelined decode loop below resolves repcodes against a
+    // local `shadow_hist`, never the caller's real `offset_hist`.
+    // (The post-loop rollback path also assigns to `*offset_hist`,
+    // but only to restore `saved_offset_hist` snapshot on a malformed
+    // block; that's recovery, not normal execution.) This preserves
+    // the legacy two-pass 'partial output, no rewound history'
+    // contract on early exits.
     #[inline(always)]
     fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,

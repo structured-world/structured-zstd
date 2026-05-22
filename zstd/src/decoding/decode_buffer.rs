@@ -414,12 +414,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
         // Donor's `ZSTD_prefetchMatch` issues two `PREFETCH_L1` hints
         // per match — one at `match`, one at `match + CACHELINE_SIZE`.
-        // We mirror that exactly: route through `prefetch_slice`
-        // (`_MM_HINT_T0` on x86 → L1 destination), cap extent at
-        // 2 × 64 B = 128 B so the helper stays at AT MOST two
-        // prefetch issues per match (donor parity). The lookahead
-        // depth (ADVANCE) is small enough that L1 should hold the
-        // line across the gap; if profiling later shows L1 eviction
+        // We mirror that intent via `prefetch_slice` (`_MM_HINT_T0` on
+        // x86 / `pldl1keep` on aarch64 → L1 destination) with extent
+        // capped at 2 × 64 B = 128 B. In the contiguous case the helper
+        // emits at most two prefetch instructions, matching donor
+        // exactly. In the wrap-boundary case the same 128 B budget is
+        // split across `s1_tail` and `s2[0..]`, which can emit up to
+        // four cache-line prefetches total (two per slice when each
+        // side covers a full 64 B) — still bounded, still L1, still
+        // less than the helper's MAX_LINES = 4 ceiling. The lookahead
+        // depth (ADVANCE) is small enough that L1 should hold the line
+        // across the gap; if profiling later shows L1 eviction
         // pressure we can revisit T1/L2.
         const PREFETCH_EXTENT: usize = 128;
         const CACHE_LINE: usize = 64;
@@ -1026,6 +1031,65 @@ mod tests {
                     "mismatch at offset={offset} match_length={match_length}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prefetch_lookahead_in_range_does_not_panic() {
+        // Plain in-range lookup: start_idx well within `buffer.len()`.
+        // The helper should issue prefetch hints and return cleanly.
+        // Prefetch hints are unobservable from Rust — the assertion is
+        // simply that the call completes without panic / UB.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
+        buf.reserve(512);
+        buf.push(&[0xAA; 256]);
+        buf.prefetch_lookahead_match_source(0);
+        buf.prefetch_lookahead_match_source(128);
+        buf.prefetch_lookahead_match_source(buf.len() - 1);
+    }
+
+    #[test]
+    fn prefetch_lookahead_out_of_range_returns_without_panic() {
+        // Wrap-derived garbage / dictionary-sourced match / intra-block
+        // self-overlap all produce `start_idx >= buffer.len()` here.
+        // The helper must early-return (bound check) and never touch a
+        // slice past the live region.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
+        buf.reserve(64);
+        buf.push(&[0x55; 32]);
+        buf.prefetch_lookahead_match_source(buf.len());
+        buf.prefetch_lookahead_match_source(buf.len() + 1);
+        buf.prefetch_lookahead_match_source(usize::MAX);
+        // Empty buffer — every start_idx is out-of-range.
+        let empty: DecodeBuffer<RingBuffer> = DecodeBuffer::new(1024);
+        empty.prefetch_lookahead_match_source(0);
+        empty.prefetch_lookahead_match_source(7);
+    }
+
+    #[test]
+    fn prefetch_lookahead_at_wrap_boundary() {
+        // Force the RingBuffer into a wrapped layout where
+        // `as_slices()` returns two non-empty halves: push, drain past
+        // window, push again so the write cursor wraps. Then exercise
+        // start_idx values at the boundary (last byte of s1, first
+        // byte of s2, short s1 tail < CACHE_LINE) so the
+        // `prefetch_first_line_l1` fallback path is touched too.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(256);
+        // Fill with two passes so the underlying ringbuffer wraps.
+        let payload = [0xCD_u8; 320];
+        buf.push(&payload);
+        // Drain to free read cursor capacity (write side can then wrap).
+        let _ = buf.drain_to_window_size();
+        buf.push(&payload);
+        // Probe a handful of indices inside and across the wrap.
+        let n = buf.len();
+        if n > 0 {
+            buf.prefetch_lookahead_match_source(0);
+            buf.prefetch_lookahead_match_source(n / 2);
+            buf.prefetch_lookahead_match_source(n - 1);
+            // Out-of-range probe to exercise the early-return path on
+            // a wrapped buffer.
+            buf.prefetch_lookahead_match_source(n);
         }
     }
 }
