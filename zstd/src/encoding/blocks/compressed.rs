@@ -346,6 +346,55 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state.block_scratch = scratch;
 }
 
+/// Append `lits` to `dst` using inline byte / u64 ops for short
+/// slices, avoiding the libc memmove call overhead that
+/// `Vec::extend_from_slice` lowers to for runtime-sized
+/// `ptr::copy_nonoverlapping`. Fast L1 emits literal runs of 1-10
+/// bytes typically — at thousands of sequences per block, the per-
+/// emit libc call dominated the hot path (flamegraph: 60 % of CPU
+/// in `__memmove_avx_unaligned_erms` chain).
+///
+/// Route through `simd_copy::copy_bytes_overshooting` with src.1 ==
+/// dst.1 == lit_len (no overshoot READ; we don't know how much
+/// readable slack the caller's slice has). For lit_len ≤ 32 that
+/// drops into the byte-by-byte / overlapping-u64 path, fully
+/// inlineable. Larger runs fall through `extend_from_slice` —
+/// they're rare and libc memmove amortises across the longer copy.
+#[inline]
+fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
+    let lit_len = lits.len();
+    if lit_len == 0 {
+        return;
+    }
+    if lit_len <= 32 {
+        // Caller pre-reserved `src_len` (the whole block); the sum
+        // of all literal runs is ≤ src_len, so the unused tail
+        // always has ≥ `lit_len` capacity.
+        debug_assert!(
+            dst.capacity() - dst.len() >= lit_len,
+            "append_literals requires `dst` to have at least `lit_len` reserved capacity \
+             past `dst.len()` — caller failed to reserve before the emit loop",
+        );
+        let cur_len = dst.len();
+        let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
+        // SAFETY: `lits` is a valid slice (so reading `lit_len`
+        // bytes from `lits.as_ptr()` is in-bounds); `dst_ptr` has
+        // `lit_len` bytes of reserved capacity (debug_assert above).
+        // copy_bytes_overshooting writes EXACTLY `lit_len` bytes when
+        // `min(src.1, dst.1) == lit_len`.
+        unsafe {
+            crate::decoding::simd_copy::copy_bytes_overshooting(
+                (lits.as_ptr(), lit_len),
+                (dst_ptr, lit_len),
+                lit_len,
+            );
+            dst.set_len(cur_len + lit_len);
+        }
+    } else {
+        dst.extend_from_slice(lits);
+    }
+}
+
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
     let src_len = state.matcher.get_last_space().len();
     parts.literals.clear();
@@ -365,14 +414,14 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             .reserve_exact(sequence_capacity - parts.sequences.len());
     }
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => parts.literals.extend_from_slice(literals),
+        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            parts.literals.extend_from_slice(literals);
+            append_literals(&mut parts.literals, literals);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
