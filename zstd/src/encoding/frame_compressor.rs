@@ -2337,22 +2337,26 @@ mod tests {
             .expect("collect_to_writer");
         assert_eq!(decoded, input, "magicless roundtrip must preserve bytes");
 
-        // 3. A standard (magicful) decoder MUST fail on a magicless
-        //    frame with the specific `BadMagicNumber` variant — the
-        //    first 4 bytes are the frame-header descriptor + window /
-        //    dictionary / FCS metadata, not the magic. Asserting the
-        //    specific variant prevents regressions from being masked
-        //    by unrelated failures.
+        // 3. A standard (magicful) decoder MUST reject a magicless
+        //    frame at the header-read step — the first 4 bytes are
+        //    the frame-header descriptor + window / dictionary / FCS
+        //    metadata, not the magic. We accept either
+        //    `BadMagicNumber` (typical case: first 4 bytes don't
+        //    match `MAGIC_NUM` and don't fall in the skippable-frame
+        //    magic range) or `SkipFrame` (rare: the first 4 bytes
+        //    coincidentally land in `0x184D2A50..=0x184D2A5F`). Both
+        //    prove the standard decoder did not treat the bytes as a
+        //    real magicful frame.
         use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
         let mut std_decoder = crate::decoding::FrameDecoder::new();
         let std_init = std_decoder.init(output.as_slice());
         match std_init {
-            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(
-                _,
-            ))) => {}
+            Err(FrameDecoderError::ReadFrameHeaderError(
+                ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. },
+            )) => {}
             other => panic!(
                 "standard decoder must reject a magicless frame with \
-                 ReadFrameHeaderError::BadMagicNumber, got {other:?}",
+                 ReadFrameHeaderError::BadMagicNumber or SkipFrame, got {other:?}",
             ),
         }
     }
