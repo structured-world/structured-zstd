@@ -357,6 +357,16 @@ impl FrameDecoder {
     /// number prefix. Default false. Must match the encoder's
     /// magicless setting; the format is unambiguous only when the
     /// caller knows it out-of-band.
+    ///
+    /// Note: magicless mode also disables skippable-frame detection.
+    /// The `0x184D2A50..=0x184D2A5F` skippable-frame magic range is
+    /// only recognised when the 4-byte magic prefix is consumed, so
+    /// `decode_all` / `init` / `reset` will treat a skippable frame
+    /// at the head of a magicless stream as a malformed frame header
+    /// (bad descriptor / window-size error) instead of skipping it.
+    /// Mixed-format streams that interleave skippable frames must be
+    /// pre-split by the caller; `set_magicless(true)` is only safe
+    /// when the entire stream is known to be magicless zstd frames.
     pub fn set_magicless(&mut self, magicless: bool) {
         self.magicless = magicless;
     }
