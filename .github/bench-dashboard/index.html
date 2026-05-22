@@ -302,8 +302,11 @@
         <p style="font-size: 0.9rem">
           Same six series as Level Profile, but plotted against
           <strong>snapshot / commit time</strong> on the X-axis and
-          averaged across <strong>every</strong> (level, scenario, target,
-          source) cohort for that snapshot. Each point answers
+          averaged across <strong>every</strong> (level, scenario,
+          target) cohort for that snapshot — within each cohort the
+          decompress source variants (<code>rust_stream</code> +
+          <code>c_stream</code>) collapse into the inner mean so they
+          don't outweigh compress rows. Each point answers
           “across the whole bench matrix, where are we right now vs
           FFI?” — useful for spotting aggregate dynamics across commits
           regardless of which level or corpus drove the change. The top
@@ -1344,7 +1347,10 @@
             state.profileChart.update("none");
           }
           el("legend-profile").replaceChildren();
-          el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
+          // History mode plots snapshots, not levels, so the empty
+          // message describes the axis the user is actually looking at.
+          const emptyAxisDesc = historyMode ? "snapshot points" : "level points";
+          el("profile-status").textContent = `No ${emptyAxisDesc} for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
           return;
         }
         const snapshotNote = historyMode
@@ -1434,7 +1440,8 @@
 
       // Aggregate-over-levels chart: same six series as Level Profile,
       // but X = snapshot/commit time, Y = mean across **every** matching
-      // (level, scenario, target, source) cohort for that snapshot.
+      // (level, scenario, target) cohort for that snapshot (decompress
+      // source variants collapse into the inner mean — see cohortKey).
       // Respects the top Target / Scenario / Level filters — pinning
       // any one of them narrows the aggregate to that slice while the
       // other dimensions are still averaged across.
@@ -1597,7 +1604,7 @@
           filter.level === ALWAYS ? "level=all" : `level=${filter.level}`,
         ].join(", ");
         el("aggregate-status").textContent =
-          `Showing ${snapshotCount} snapshot point(s) — ${filterDesc} (per-snapshot mean across every matching (level, scenario, target, source) cohort).`;
+          `Showing ${snapshotCount} snapshot point(s) — ${filterDesc} (per-snapshot mean across every matching (level, scenario, target) cohort; decompress source variants collapse into the inner mean).`;
 
         const chartDatasets = buildAggregateDatasets(datasets);
 
