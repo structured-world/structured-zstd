@@ -47,6 +47,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 ll_rle: None,
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
+                offsets_long_share: 0,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -71,6 +72,13 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.fse.ll_rle = None;
         self.fse.ml_rle = None;
         self.fse.of_rle = None;
+        // Reset the cached pipeline-gate signal alongside the FSE
+        // table reset — otherwise scratch reuse across frames could
+        // engage the long pipeline on a new frame's Repeat-mode
+        // header based on the previous frame's offset distribution
+        // (or vice versa: skip the pipeline when the new frame
+        // actually has long offsets).
+        self.fse.offsets_long_share = 0;
 
         self.huf.table.reset();
     }
@@ -111,6 +119,16 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: AlignedFSETable,
     pub ml_rle: Option<u8>,
+    /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
+    /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to donor's
+    /// `OffFSELog = 8` (256-entry reference).
+    /// Updated by [`crate::decoding::sequence_section_decoder`] when
+    /// the offsets FSE table is rebuilt (FSE / Predefined modes);
+    /// stale-but-correct on Repeat-mode blocks where the table was
+    /// not touched — the share is identical to the previous block's.
+    /// The sequence-section pipeline gate reads this directly instead
+    /// of re-walking `offsets.decode` per block.
+    pub offsets_long_share: u32,
 }
 
 impl FSEScratch {
@@ -122,6 +140,7 @@ impl FSEScratch {
             ll_rle: None,
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
+            offsets_long_share: 0,
         }
     }
 
@@ -132,6 +151,18 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
+        // Recompute the share from the just-copied offsets table
+        // rather than trusting `other.offsets_long_share`. Two source
+        // shapes produce a populated `offsets` table but a still-zero
+        // cached share: (a) `Dictionary::decode_dict` rebuilds the
+        // offsets FSE table from the dictionary's entropy section
+        // without ever calling the sequence-decoder path that updates
+        // the cache, and (b) any future caller that mutates the table
+        // directly. Recomputing here keeps the pipeline gate aligned
+        // with the actual table shape regardless of how the table got
+        // there.
+        self.offsets_long_share =
+            super::sequence_section_decoder::compute_offsets_long_share(&self.offsets);
     }
 }
 

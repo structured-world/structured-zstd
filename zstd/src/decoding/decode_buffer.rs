@@ -197,6 +197,38 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<false>(offset, match_length)
+    }
+
+    /// Same as [`repeat`] but the caller asserts a lookahead
+    /// prefetch was already issued for this match source ADVANCE
+    /// iterations ago, so the in-loop `prefetch_match_source` would
+    /// be redundant issue-port pressure on top of the L1 line that's
+    /// by now warm. Per-call `reserve` is KEPT — on malformed input
+    /// the `extend_from_within_unchecked*` writes assume the buffer
+    /// has the required free capacity (only `debug_assert` checks in
+    /// release), and a single missing reserve here would turn a
+    /// fuzz-corrupt block into out-of-bounds UB. The reserve is
+    /// already amortised by the caller's upfront
+    /// `reserve(MAX_BLOCK_SIZE)`, so this is a cheap capacity-check
+    /// branch, not a real allocation. Used exclusively by the
+    /// pipelined sequence executor in
+    /// [`crate::decoding::sequence_section_decoder`].
+    #[inline(always)]
+    pub(crate) fn repeat_lookahead_prefetched(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<true>(offset, match_length)
+    }
+
+    #[inline(always)]
+    fn repeat_inner<const SKIP_PREFETCH: bool>(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
         if offset == 0 {
             return Err(DecodeBufferError::ZeroOffset);
         }
@@ -212,21 +244,25 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
+            // Reserve unconditionally — `extend_from_within_unchecked*`
+            // assumes the required free capacity exists; skipping it
+            // would turn a malformed block (match_length past the
+            // upfront `reserve(MAX_BLOCK_SIZE)`) into release-build
+            // UB. The pipelined caller already reserved MAX_BLOCK_SIZE
+            // up front, so this is a cheap no-op branch in the hot
+            // path.
             self.buffer.reserve(match_length);
-            self.prefetch_match_source(start_idx, match_length);
+            if !SKIP_PREFETCH {
+                self.prefetch_match_source(start_idx, match_length);
+            }
             if end_idx > buf_len {
                 self.repeat_overlapping(offset, match_length, start_idx);
             } else {
-                // can just copy parts of the existing buffer
-                // SAFETY: Requirements checked:
-                // 1. start_idx + match_length must be <= self.buffer.len()
-                //      We know that:
-                //      1. start_idx = self.buffer.len() - offset
-                //      2. end_idx = start_idx + match_length
-                //      3. end_idx <= self.buffer.len()
-                //      Thus follows: start_idx + match_length <= self.buffer.len()
-                //
-                // 2. explicitly reserved enough memory for the whole match_length
+                // SAFETY: start_idx + match_length <= self.buffer.len()
+                // (start_idx = buf_len - offset, end_idx = start_idx +
+                // match_length, end_idx <= buf_len). The `reserve`
+                // above guarantees the destination has enough free
+                // capacity for `match_length` more bytes.
                 unsafe {
                     if offset >= 16 && use_branchless_wildcopy() {
                         self.buffer
@@ -381,6 +417,97 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let idx = start_idx - s1.len();
             if idx < s2.len() {
                 prefetch::prefetch_slice_t1(&s2[idx..]);
+            }
+        }
+    }
+
+    /// Lookahead-friendly prefetch issued ahead of execute. The
+    /// in-loop `prefetch_match_source` above fires at the moment of
+    /// the copy, so it can't hide DRAM latency for cold long-distance
+    /// match sources. Pipelined callers compute the match source
+    /// logical index 3-4 sequences in advance and call this helper —
+    /// by the time the corresponding `repeat()` reaches the actual
+    /// load, the line is already in-flight.
+    ///
+    /// `start_idx` is a logical index into the current buffer (same
+    /// frame as `buffer.len()`). Indices outside `[0, buffer.len())`
+    /// are silently dropped — the cases this guards against include
+    /// intra-block self-overlap (source falls past the not-yet-
+    /// written cursor), `wrapping_sub` underflow on a caller that
+    /// computed `match_start - offset` with an offset larger than
+    /// match_start (e.g. a stale or malformed sequence), and
+    /// dictionary-sourced matches whose logical position predates
+    /// the buffer's current frame. The donor (`PREFETCH_L1` in
+    /// `ZSTD_prefetchMatch` — we mirror that with `prefetch_slice`
+    /// → `_MM_HINT_T0` / `pldl1keep`, see the body comment) tolerates
+    /// invalid addresses by spec, but in
+    /// safe Rust the cheapest equivalent is to bound-check the
+    /// logical position before chasing the slice.
+    #[inline(always)]
+    pub(crate) fn prefetch_lookahead_match_source(&self, start_idx: usize) {
+        if start_idx >= self.buffer.len() {
+            return;
+        }
+        // Donor's `ZSTD_prefetchMatch` issues two `PREFETCH_L1` hints
+        // per match — one at `match`, one at `match + CACHELINE_SIZE`.
+        // We mirror that intent via `prefetch_slice` (`_MM_HINT_T0` on
+        // x86 / `pldl1keep` on aarch64 → L1 destination) with extent
+        // capped at 2 × 64 B = 128 B. In the contiguous case the helper
+        // emits at most two prefetch instructions, matching donor
+        // exactly. In the wrap-boundary case the same 128 B budget is
+        // split across `s1_tail` and `s2[0..]`, which can emit up to
+        // four cache-line prefetches total (two per slice when each
+        // side covers a full 64 B) — still bounded, still L1, still
+        // less than the helper's MAX_LINES = 4 ceiling. The lookahead
+        // depth (ADVANCE) is small enough that L1 should hold the line
+        // across the gap; if profiling later shows L1 eviction
+        // pressure we can revisit T1/L2.
+        const PREFETCH_EXTENT: usize = 128;
+        const CACHE_LINE: usize = 64;
+        let (s1, s2) = self.buffer.as_slices();
+        if start_idx < s1.len() {
+            let s1_tail = &s1[start_idx..];
+            let s1_bound = core::cmp::min(s1_tail.len(), PREFETCH_EXTENT);
+            // `prefetch_slice` no-ops on slices shorter than one cache
+            // line — sensible for bulk prefetch, but wrong for the
+            // wrap-boundary case where the cache line containing
+            // `start_idx` IS the line we need warmed even if the
+            // remaining contiguous extent is < 64 B. Fall back to the
+            // single-line variant in that case so the match-start
+            // line is always hinted.
+            if s1_bound >= CACHE_LINE {
+                prefetch::prefetch_slice(&s1_tail[..s1_bound]);
+            } else {
+                prefetch::prefetch_first_line_l1(&s1_tail[..s1_bound]);
+            }
+            // Wrap continuation: when the match source straddles the
+            // s1/s2 boundary and the s1 tail is shorter than the
+            // PREFETCH_EXTENT we asked for, top up the rest from
+            // s2[0..]. Without this the donor's "up to two cache
+            // lines" intent silently collapses to one (or zero if
+            // s1_tail is the last sub-line of s1).
+            if s1_bound < PREFETCH_EXTENT {
+                let remaining = PREFETCH_EXTENT - s1_bound;
+                let s2_bound = core::cmp::min(s2.len(), remaining);
+                if s2_bound >= CACHE_LINE {
+                    prefetch::prefetch_slice(&s2[..s2_bound]);
+                } else if s2_bound > 0 {
+                    prefetch::prefetch_first_line_l1(&s2[..s2_bound]);
+                }
+            }
+        } else {
+            // `start_idx < self.buffer.len()` from the early return,
+            // `buffer.len() == s1.len() + s2.len()`, and the else
+            // branch establishes `start_idx >= s1.len()`. So
+            // `idx = start_idx - s1.len() < s2.len()` by construction
+            // — no explicit `idx < s2.len()` guard needed.
+            let idx = start_idx - s1.len();
+            let tail = &s2[idx..];
+            let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
+            if bound >= CACHE_LINE {
+                prefetch::prefetch_slice(&tail[..bound]);
+            } else {
+                prefetch::prefetch_first_line_l1(&tail[..bound]);
             }
         }
     }
@@ -940,6 +1067,65 @@ mod tests {
                     "mismatch at offset={offset} match_length={match_length}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prefetch_lookahead_in_range_does_not_panic() {
+        // Plain in-range lookup: start_idx well within `buffer.len()`.
+        // The helper should issue prefetch hints and return cleanly.
+        // Prefetch hints are unobservable from Rust — the assertion is
+        // simply that the call completes without panic / UB.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
+        buf.reserve(512);
+        buf.push(&[0xAA; 256]);
+        buf.prefetch_lookahead_match_source(0);
+        buf.prefetch_lookahead_match_source(128);
+        buf.prefetch_lookahead_match_source(buf.len() - 1);
+    }
+
+    #[test]
+    fn prefetch_lookahead_out_of_range_returns_without_panic() {
+        // Wrap-derived garbage / dictionary-sourced match / intra-block
+        // self-overlap all produce `start_idx >= buffer.len()` here.
+        // The helper must early-return (bound check) and never touch a
+        // slice past the live region.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
+        buf.reserve(64);
+        buf.push(&[0x55; 32]);
+        buf.prefetch_lookahead_match_source(buf.len());
+        buf.prefetch_lookahead_match_source(buf.len() + 1);
+        buf.prefetch_lookahead_match_source(usize::MAX);
+        // Empty buffer — every start_idx is out-of-range.
+        let empty: DecodeBuffer<RingBuffer> = DecodeBuffer::new(1024);
+        empty.prefetch_lookahead_match_source(0);
+        empty.prefetch_lookahead_match_source(7);
+    }
+
+    #[test]
+    fn prefetch_lookahead_at_wrap_boundary() {
+        // Force the RingBuffer into a wrapped layout where
+        // `as_slices()` returns two non-empty halves: push, drain past
+        // window, push again so the write cursor wraps. Then exercise
+        // start_idx values at the boundary (last byte of s1, first
+        // byte of s2, short s1 tail < CACHE_LINE) so the
+        // `prefetch_first_line_l1` fallback path is touched too.
+        let mut buf = DecodeBuffer::<RingBuffer>::new(256);
+        // Fill with two passes so the underlying ringbuffer wraps.
+        let payload = [0xCD_u8; 320];
+        buf.push(&payload);
+        // Drain to free read cursor capacity (write side can then wrap).
+        let _ = buf.drain_to_window_size();
+        buf.push(&payload);
+        // Probe a handful of indices inside and across the wrap.
+        let n = buf.len();
+        if n > 0 {
+            buf.prefetch_lookahead_match_source(0);
+            buf.prefetch_lookahead_match_source(n / 2);
+            buf.prefetch_lookahead_match_source(n - 1);
+            // Out-of-range probe to exercise the early-return path on
+            // a wrapped buffer.
+            buf.prefetch_lookahead_match_source(n);
         }
     }
 }
