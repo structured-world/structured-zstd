@@ -257,20 +257,14 @@ pub enum BlockDecodingStrategy {
 
 impl FrameDecoderState {
     /// Read the frame header from `source` and create a new decoder
-    /// state. Crate-internal — `FrameDecoderState` itself is not
-    /// re-exported; downstream reaches this only through
-    /// `FrameDecoder::init`.
+    /// Construct a new frame decoder state, reading the frame header
+    /// from `source`. When `magicless` is `true`, the 4-byte magic
+    /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
+    /// Crate-internal — reached only via `FrameDecoder::init` /
+    /// `FrameDecoder::init_with_dict_handle`.
     ///
     /// Pre-allocates the decode buffer to `window_size` so the first
     /// block does not trigger incremental growth from zero capacity.
-    #[allow(dead_code)] // Crate-internal; reached via new_with_format from FrameDecoder.
-    pub(crate) fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
-        Self::new_with_format(source, false)
-    }
-
-    /// Same as [`Self::new`] but with explicit magicless setting.
-    /// When `magicless` is `true`, the frame header is read WITHOUT
-    /// expecting a magic-number prefix (donor `ZSTD_f_zstd1_magicless`).
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
@@ -301,20 +295,15 @@ impl FrameDecoderState {
     }
 
     /// Reset this state for a new frame read from `source`, reusing
-    /// existing allocations. Crate-internal — reached via
-    /// `FrameDecoder::reset`.
+    /// existing allocations. When `magicless` is `true`, the frame
+    /// header is read WITHOUT expecting a magic-number prefix
+    /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
+    /// only via `FrameDecoder::reset`.
     ///
-    /// `DecodeBuffer::reset` reserves `window_size` internally, so no
-    /// additional frame-level reservation is needed here. Further buffer
-    /// growth during decoding is performed on demand by the active block path.
-    #[allow(dead_code)] // Crate-internal; reached via reset_with_format from FrameDecoder.
-    pub(crate) fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
-        self.reset_with_format(source, false)
-    }
-
-    /// Same as [`Self::reset`] but with explicit magicless setting
-    /// (donor `ZSTD_f_zstd1_magicless`). The caller plumbs the
-    /// matcher's `magicless` flag through here.
+    /// `DecodeBuffer::reset` reserves `window_size` internally, so
+    /// no additional frame-level reservation is needed here.
+    /// Further buffer growth during decoding is performed on demand
+    /// by the active block path.
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,

@@ -8,8 +8,12 @@ use crate::io::Read;
 /// `BadMagicNumber` if it doesn't match. For magicless streams
 /// (donor `ZSTD_f_zstd1_magicless`), call
 /// [`read_frame_header_with_format`] with `magicless = true`.
-#[allow(dead_code)] // Public surface used by downstream consumers; internal call sites use the _with_format variant.
-pub fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+// Test-only convenience wrapper: production decoder paths now
+// route through `read_frame_header_with_format`. Used by the
+// in-crate `tests/` modules to keep their existing call sites
+// simple.
+#[cfg(test)]
+pub(crate) fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     read_frame_header_with_format(r, false)
 }
 

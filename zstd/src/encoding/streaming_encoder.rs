@@ -784,6 +784,58 @@ mod tests {
         }
     }
 
+    /// Pre-write `set_magicless(true)` → emitted frame omits the
+    /// magic prefix AND round-trips through a magicless-aware
+    /// decoder.
+    #[test]
+    fn streaming_encoder_set_magicless_before_write_omits_magic_and_roundtrips() {
+        use crate::common::MAGIC_NUM;
+        let payload = b"streaming-magicless-roundtrip-".repeat(64);
+
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder
+            .set_magicless(true)
+            .expect("set_magicless pre-write");
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            !compressed.starts_with(&MAGIC_NUM.to_le_bytes()),
+            "magicless frame must omit the 4-byte magic prefix",
+        );
+
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        decoder.set_magicless(true);
+        let mut cursor: &[u8] = compressed.as_slice();
+        decoder.init(&mut cursor).expect("magicless init");
+        decoder
+            .decode_blocks(&mut cursor, crate::decoding::BlockDecodingStrategy::All)
+            .expect("decode_blocks");
+        let mut decoded: Vec<u8> = Vec::new();
+        decoder
+            .collect_to_writer(&mut decoded)
+            .expect("collect_to_writer");
+        assert_eq!(decoded, payload);
+    }
+
+    /// `set_magicless` after the first write MUST return an error
+    /// (the frame header has already been emitted, flipping the flag
+    /// can't affect the current frame). Mirrors
+    /// `set_pledged_content_size` / `set_source_size_hint` semantics.
+    #[test]
+    fn streaming_encoder_set_magicless_after_first_write_errors() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.write_all(b"first-block").unwrap();
+        let err = encoder
+            .set_magicless(true)
+            .expect_err("set_magicless after first write must error");
+        assert_eq!(
+            err.kind(),
+            crate::io::ErrorKind::InvalidInput,
+            "expected InvalidInput when setting magicless after frame_started, got {err:?}",
+        );
+    }
+
     #[test]
     fn streaming_encoder_roundtrip_multiple_writes() {
         let payload = b"streaming-encoder-roundtrip-".repeat(1024);
