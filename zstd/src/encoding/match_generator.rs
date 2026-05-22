@@ -8238,6 +8238,15 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
             "{level:?} must resolve to Fast strategy",
         );
 
+        // Bounce through a non-Fast strategy first so the next
+        // reset actually goes through the backend-switch path
+        // (`MatchGeneratorDriver::new` / `simple_mut` recreate the
+        // Fast variant via `FastKernelMatcher::with_params`). Without
+        // this hop the loop would only ever stay in `BackendTag::Simple`
+        // and exercise `FastKernelMatcher::reset` — leaving the
+        // `with_params` wiring untested on the production path.
+        crate::encoding::Matcher::reset(&mut driver, CompressionLevel::Level(9));
+
         // Drive the production reset path (same code paths exercised
         // by FrameCompressor / StreamingEncoder).
         crate::encoding::Matcher::reset(&mut driver, level);
