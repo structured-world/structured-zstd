@@ -270,8 +270,8 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
         // round up to `path.chunk`. The wildcopy contract leaves
         // overshoot bytes unspecified, so comparing them produces
         // spurious mismatches at lengths < chunk (e.g. len=17 vs
-        // baseline chunk=16 yields check_len=32 and production
-        // never wrote dst[17..32]).
+        // baseline chunk=16 rounds the comparison length up to 32,
+        // but production never writes dst[17..32]).
         assert_eq!(
             &dst_baseline[..len],
             &dst_production[..len],
