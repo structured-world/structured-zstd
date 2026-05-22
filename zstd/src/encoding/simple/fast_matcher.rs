@@ -366,10 +366,16 @@ impl FastKernelMatcher {
     /// driver-side `get_last_space` peek at the still-pending buffer
     /// without committing it to the matcher's hot path.
     ///
-    /// History budget is enforced lazily on the actual append (inside
-    /// [`Self::extend_history_with_pending`]) — checking it here
-    /// would force the eviction work even when the driver follows up
-    /// with `skip_matching` on incompressible data.
+    /// History budget is enforced EAGERLY in this function (not lazily
+    /// inside [`Self::extend_history_with_pending`]) so the driver's
+    /// `commit_space` can observe the eviction delta via a pre/post
+    /// `history.len()` comparison. That delta feeds
+    /// `retire_dictionary_budget`, which shrinks `max_window_size`
+    /// back to the frame's contracted window after dictionary priming
+    /// inflated it. Without commit-time visibility the dict-budget
+    /// retire never runs and the matcher can emit offsets exceeding
+    /// the frame header's reported window size (format-correctness
+    /// risk).
     pub(crate) fn accept_data(&mut self, space: Vec<u8>) {
         assert!(
             self.pending.is_none(),
@@ -444,17 +450,23 @@ impl FastKernelMatcher {
     /// 3. Clear the hash table — entries hold pre-drain absolute
     ///    positions that no longer reference live bytes.
     /// 4. `saturating_sub` `last_block_start` by `drop_n`.
-    /// 5. Rehash retained tail starting at position 0 so block N+1
-    ///    can find matches against the kept bytes (without this
-    ///    they'd be "dead history" — visible in the Vec but
-    ///    unlookupable).
+    /// 5. Rehash retained tail starting at the sentinel-0 floor
+    ///    ([`INITIAL_PREFIX_START_INDEX`] = 1) so block N+1 can find
+    ///    matches against the kept bytes (without this they'd be
+    ///    "dead history" — visible in the Vec but unlookupable).
+    ///    Starting from index 1 instead of 0 avoids hashing a position
+    ///    that the kernel's `match_idx >= prefix_start_index` filter
+    ///    would reject anyway.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
-        self.prime_hash_table_for_range(HISTORY_DRAIN_BASE);
+        // Skip position 0 — `prefix_start_index = 1` means the kernel
+        // rejects any match resolving to index 0, so populating that
+        // slot would just pollute the table with an unreachable entry.
+        self.prime_hash_table_for_range(INITIAL_PREFIX_START_INDEX as usize);
     }
 
     /// Internal: drain `self.pending` into `self.history`, applying
