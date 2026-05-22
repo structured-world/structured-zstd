@@ -176,18 +176,16 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
     );
 
-    // Donor `ZSTD_getOffsetInfo` parity: when the block has enough
-    // sequences to amortise the pipeline's prefill + drain, walk
-    // the FSE offsets table and count entries that decode to offset
-    // codes > 22 (i.e. raw offsets >= 2^23 = 8 MiB). Scale up to
-    // donor's `OffFSELog = 8` (256-entry reference) so the share
-    // compares to `minShare = 7` (~2.73 % of the offsets table).
-    // The walk is gated by the sequence-count check FIRST so that
-    // short / no-sequence blocks (typical of high-entropy / random
-    // payloads where the kernel emits literal-only blocks) don't
-    // pay the table-walk cost.
-    const OFFSET_FSE_LOG: u32 = 8;
-    const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
+    // Donor `ZSTD_getOffsetInfo` parity. The share of FSE offset
+    // codes > LONG_OFFSET_CODE_THRESHOLD (scaled to donor's
+    // OffFSELog = 8 reference) is computed once per table refresh
+    // and cached in `fse.offsets_long_share` — see
+    // `compute_offsets_long_share` and the `maybe_update_fse_tables`
+    // call sites. Repeat-mode blocks (the table didn't change)
+    // re-use the cached value without re-walking 32–256 table
+    // entries per block. Gate stays sequence-count-first so short /
+    // no-sequence blocks don't even read the cache.
+    //
     // Donor `minShare = MEM_64bits() ? 7 : 20`: the 32-bit
     // threshold is higher because the prefetch pipeline needs a
     // stronger long-offset signal to outpace the narrower load
@@ -196,22 +194,8 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     const MIN_LONG_OFFSET_SHARE: u32 = 7;
     #[cfg(not(target_pointer_width = "64"))]
     const MIN_LONG_OFFSET_SHARE: u32 = 20;
-    let use_long_pipeline = num_sequences >= ADVANCE * 2 && {
-        let table = &fse.offsets.decode;
-        let table_log = fse.offsets.accuracy_log as u32;
-        let raw = table
-            .iter()
-            .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
-            .count() as u32;
-        // Donor scales `raw` to OffFSELog so a small/fine-grained
-        // table still registers meaningful share. The format-spec
-        // bound `OF_MAX_LOG = 8` (passed as the `max_log` arg to
-        // `build_decoder` for the offsets table) keeps `table_log
-        // <= OFFSET_FSE_LOG` for every valid stream, so the shift
-        // is wrap-free.
-        let long_offset_share = raw << OFFSET_FSE_LOG.saturating_sub(table_log);
-        long_offset_share >= MIN_LONG_OFFSET_SHARE
-    };
+    let use_long_pipeline =
+        num_sequences >= ADVANCE * 2 && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE;
     // Donor also engages the prefetch decoder when the dictionary is
     // cold or when the format-level `isLongOffset` flag is set. We
     // don't track dictionary-coldness on this decode path and the
@@ -678,6 +662,32 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
+/// Walk the offsets FSE decode table and return the donor-shaped
+/// "share of long offsets" signal: count entries whose symbol (offset
+/// code) is > 22 (raw offset ≥ 2²³ = 8 MiB), then scale up to the
+/// donor `OffFSELog = 8` reference so a fine-grained table still
+/// registers comparable share. Output compares directly against
+/// `MIN_LONG_OFFSET_SHARE` (7 on 64-bit, 20 on 32-bit) in the
+/// pipeline-gate decision.
+///
+/// Called only when the offsets table is actually rebuilt (FSE /
+/// Predefined modes in `maybe_update_fse_tables`). Repeat-mode
+/// blocks reuse the cached value in `FSEScratch::offsets_long_share`.
+fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 {
+    const OFFSET_FSE_LOG: u32 = 8;
+    const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
+    let table_log = offsets.accuracy_log as u32;
+    let raw = offsets
+        .decode
+        .iter()
+        .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
+        .count() as u32;
+    // Format-spec bound `OF_MAX_LOG = 8` keeps `table_log <=
+    // OFFSET_FSE_LOG` for every valid offsets stream, so the shift
+    // is wrap-free.
+    raw << OFFSET_FSE_LOG.saturating_sub(table_log)
+}
+
 fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
@@ -732,6 +742,7 @@ fn maybe_update_fse_tables(
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
             scratch.of_rle = None;
+            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::RLE => {
             vprintln!("Use RLE of table");
@@ -751,10 +762,11 @@ fn maybe_update_fse_tables(
                 &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
             )?;
             scratch.of_rle = None;
+            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::Repeat => {
             vprintln!("Repeat of table");
-            /* Nothing to do */
+            /* Nothing to do — cached `offsets_long_share` stays valid. */
         }
     };
 

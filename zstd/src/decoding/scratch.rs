@@ -47,6 +47,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 ll_rle: None,
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
+                offsets_long_share: 0,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -111,6 +112,15 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: AlignedFSETable,
     pub ml_rle: Option<u8>,
+    /// Cached "share of offset codes ≥ LONG_OFFSET_CODE_THRESHOLD"
+    /// scaled to donor's `OffFSELog = 8` (256-entry reference).
+    /// Updated by [`crate::decoding::sequence_section_decoder`] when
+    /// the offsets FSE table is rebuilt (FSE / Predefined modes);
+    /// stale-but-correct on Repeat-mode blocks where the table was
+    /// not touched — the share is identical to the previous block's.
+    /// The sequence-section pipeline gate reads this directly instead
+    /// of re-walking `offsets.decode` per block.
+    pub offsets_long_share: u32,
 }
 
 impl FSEScratch {
@@ -122,6 +132,7 @@ impl FSEScratch {
             ll_rle: None,
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
+            offsets_long_share: 0,
         }
     }
 
@@ -132,6 +143,7 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
+        self.offsets_long_share = other.offsets_long_share;
     }
 }
 
