@@ -263,18 +263,26 @@ fn bench_wildcopy_candidates(c: &mut Criterion) {
                 );
             }
         }
-        let check_len = len.next_multiple_of(baseline_path.chunk);
+        // Compare only the contractual `len` bytes. Past `len` is
+        // wildcopy overshoot — the production path may take a
+        // small-copy fast path (no overshoot for sub-chunk
+        // lengths), while the in-bench baseline/candidate always
+        // round up to `path.chunk`. The wildcopy contract leaves
+        // overshoot bytes unspecified, so comparing them produces
+        // spurious mismatches at lengths < chunk (e.g. len=17 vs
+        // baseline chunk=16 yields check_len=32 and production
+        // never wrote dst[17..32]).
         assert_eq!(
-            &dst_baseline[..check_len],
-            &dst_production[..check_len],
+            &dst_baseline[..len],
+            &dst_production[..len],
             "baseline path must match production wildcopy for len={len}"
         );
         if candidate_path.is_none() {
             continue;
         }
         assert_eq!(
-            &dst_candidate[..check_len],
-            &dst_production[..check_len],
+            &dst_candidate[..len],
+            &dst_production[..len],
             "candidate path must match production wildcopy for len={len}"
         );
 

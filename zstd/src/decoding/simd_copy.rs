@@ -371,10 +371,10 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 // here is always a multiple of 32 — the loop body handles
 // `len & !63` bytes, the tail handles the remaining 0 or 32.
 //
-// Unroll-2 cuts AVX2 wildcopy throughput by ~30-50 % across all
-// length classes (64 B → 64 KiB) by issuing two independent load /
-// store pairs per iteration, increasing OoO ILP and amortising the
-// loop branch.
+// Unroll-2 cuts AVX2 wildcopy LATENCY (and so lifts throughput)
+// by ~30-50 % across all length classes (64 B → 64 KiB) by issuing
+// two independent load / store pairs per iteration, increasing OoO
+// ILP and amortising the loop branch.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
@@ -511,10 +511,43 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
+        // Single 32-byte vector (no unrolled body, tail-only path).
         let src = [8_u8; 32];
         let mut dst = [0_u8; 32];
         unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 32) };
         assert_eq!(dst, src);
+    }
+
+    /// Exercises one full iteration of the 64-byte unrolled body
+    /// (`v0` + `v1` load/store pair) with no residual tail.
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn copy_avx2_copies_full_unroll2_iteration() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..64u8).collect();
+        let mut dst = [0_u8; 64];
+        unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 64) };
+        assert_eq!(&dst[..], &src[..]);
+    }
+
+    /// Exercises ONE unrolled 64-byte iteration PLUS the single-
+    /// vector 32-byte residual tail (96 = 64 + 32). Validates that
+    /// the tail branch doesn't overwrite preceding bytes and copies
+    /// the correct source offset.
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn copy_avx2_copies_unroll2_loop_plus_residual_tail() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..96u8).collect();
+        let mut dst = [0_u8; 96];
+        unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 96) };
+        assert_eq!(&dst[..], &src[..]);
+        // Spot-check tail boundary: bytes 60..68 span the unroll/tail seam.
+        assert_eq!(&dst[60..68], &[60, 61, 62, 63, 64, 65, 66, 67]);
     }
 
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
