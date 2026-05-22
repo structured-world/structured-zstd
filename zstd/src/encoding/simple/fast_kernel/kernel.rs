@@ -260,6 +260,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
     block_start: usize,
     prefix_start_index: u32,
+    window_low: u32,
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
@@ -370,7 +371,17 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     let mut offset_saved1: u32 = 0;
     let mut offset_saved2: u32 = 0;
     {
-        let max_rep = (ip0 as u32).saturating_sub(prefix_start_index);
+        // Donor (`zstd_fast.c:240-244`): `maxRep = curr - windowLow`.
+        // `windowLow` is the absolute floor of in-window positions
+        // (= 0 at block 0). It is NOT `prefixStartIndex` — donor's
+        // `prefixStartIndex == windowLow` in the canonical fast path,
+        // but our `prefix_start_index` carries the sentinel-1 floor
+        // for hash-filter purposes. Using `prefix_start_index` here
+        // would zero `rep_offset1 = 1` at block 0 (ip0=1 →
+        // max_rep=0; 1>0), disabling rep-at-ip2 for the entire first
+        // block — see the `block_zero_prologue_preserves_default_rep_offset_one`
+        // regression test in `fast_matcher.rs`.
+        let max_rep = (ip0 as u32).saturating_sub(window_low);
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;
             rep_offset2 = 0;
@@ -486,8 +497,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 let mut new_ip = ip2;
                 let mut match0 = new_ip - rep_offset1 as usize;
                 let mut m_len: usize = 4;
+                // Donor bound: `match0 > prefixStart` ≡
+                // `match_pos > windowLow` (donor's prefixStart and
+                // windowLow are the same pointer in the no-dict
+                // fast path). We use `window_low` here rather than
+                // the sentinel-aware `prefix_start_index` so the
+                // backward step can reach position 1 (impossible
+                // under the sentinel) at block 0.
                 if new_ip > anchor
-                    && match0 > prefix_start_index as usize
+                    && match0 > window_low as usize
                     && data[new_ip - 1] == data[match0 - 1]
                 {
                     new_ip -= 1;
@@ -651,10 +669,14 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         };
 
         // Backward extension — only for explicit matches; rep path
-        // already handled the 1-byte backward step above.
+        // already handled the 1-byte backward step above. Donor's
+        // bound is `match0 > prefixStart` ≡ `match_pos > windowLow`;
+        // we mirror it via `window_low` (NOT `prefix_start_index`,
+        // which is sentinel-floored at 1 for hash-filter purposes
+        // only).
         if !is_rep {
             while match_ip > anchor
-                && match_pos > prefix_start_index as usize
+                && match_pos > window_low as usize
                 && data[match_ip - 1] == data[match_pos - 1]
             {
                 match_ip -= 1;
@@ -839,8 +861,8 @@ mod tests {
             }
         };
         let result = match mls {
-            4 => compress_block_fast::<4, false>(data, 0, 0, &mut table, [0, 0], 2, &mut handle),
-            5 => compress_block_fast::<5, false>(data, 0, 0, &mut table, [0, 0], 2, &mut handle),
+            4 => compress_block_fast::<4, false>(data, 0, 0, 0, &mut table, [0, 0], 2, &mut handle),
+            5 => compress_block_fast::<5, false>(data, 0, 0, 0, &mut table, [0, 0], 2, &mut handle),
             _ => panic!("test helper only supports mls=4 and mls=5"),
         };
         // Accounting invariant: literals + matches + tail == input.
@@ -920,7 +942,8 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let result = compress_block_fast::<4, false>(data, 0, 0, &mut table, rep, 2, &mut handle);
+        let result =
+            compress_block_fast::<4, false>(data, 0, 0, 0, &mut table, rep, 2, &mut handle);
         let acct: usize = tuples
             .iter()
             .map(|(lits, _off, mlen)| lits.len() + mlen)
@@ -1051,7 +1074,7 @@ mod tests {
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
         // prefix_start_index=5 blocks index 0.
-        let _ = compress_block_fast::<4, false>(&data, 0, 5, &mut table, [0, 0], 2, &mut handle);
+        let _ = compress_block_fast::<4, false>(&data, 0, 5, 5, &mut table, [0, 0], 2, &mut handle);
 
         // Walk emitted sequences in order, tracking the running
         // `anchor` cursor (which equals the start of the current
@@ -1130,7 +1153,8 @@ mod tests {
         // prefix_start_index = 50 — match_idx=5 is below the floor and
         // must be rejected by the donor-parity prefix filter in
         // `match_found`.
-        let _ = compress_block_fast::<4, false>(&data, 50, 50, &mut table, [0, 0], 2, &mut handle);
+        let _ =
+            compress_block_fast::<4, false>(&data, 50, 50, 50, &mut table, [0, 0], 2, &mut handle);
 
         // Either zero emissions (stale rejected, no other match found
         // in the limited scan window) or a Triple whose offset
@@ -1209,7 +1233,7 @@ mod tests {
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
         let result =
-            compress_block_fast::<4, false>(&data, 0, 0, &mut table, [huge, 7], 2, &mut handle);
+            compress_block_fast::<4, false>(&data, 0, 0, 0, &mut table, [huge, 7], 2, &mut handle);
         assert_eq!(
             result.rep[0], huge,
             "out-of-range rep_offset1 must be restored verbatim across the block",
@@ -1252,11 +1276,20 @@ mod tests {
                 }
             };
             if use_cmov {
-                let _ =
-                    compress_block_fast::<4, true>(&data, 0, 0, &mut table, [0, 0], 2, &mut handle);
+                let _ = compress_block_fast::<4, true>(
+                    &data,
+                    0,
+                    0,
+                    0,
+                    &mut table,
+                    [0, 0],
+                    2,
+                    &mut handle,
+                );
             } else {
                 let _ = compress_block_fast::<4, false>(
                     &data,
+                    0,
                     0,
                     0,
                     &mut table,
