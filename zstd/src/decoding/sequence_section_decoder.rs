@@ -256,12 +256,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             // Estimated offset for prefetch only — see
             // `estimate_actual_offset` for the accuracy contract.
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
-            let match_start = prefetch_pos + seq.ll as usize;
+            // wrapping_add: prefetch_pos / seq.ll / seq.ml are
+            // derived from the bitstream, so a malformed frame can
+            // present values that would overflow usize and panic
+            // under debug. The result feeds only the prefetch
+            // hint — `prefetch_lookahead_match_source` bound-checks
+            // the logical position against `buffer.len()` and drops
+            // wrap-derived garbage indices, so the wrap is harmless
+            // here while keeping the decoder fuzz-stable.
+            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(est_offset as usize);
             if est_offset >= PREFETCH_OFFSET_THRESHOLD {
                 buffer.prefetch_lookahead_match_source(source_idx);
             }
-            prefetch_pos = match_start + seq.ml as usize;
+            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
             *slot = seq;
             br.ensure_bits(max_update_bits);
             ll_dec.update_state_fast(&mut br);
@@ -277,12 +285,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         for i in ADVANCE..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
-            let match_start = prefetch_pos + seq.ll as usize;
+            // wrapping_add: prefetch_pos / seq.ll / seq.ml are
+            // derived from the bitstream, so a malformed frame can
+            // present values that would overflow usize and panic
+            // under debug. The result feeds only the prefetch
+            // hint — `prefetch_lookahead_match_source` bound-checks
+            // the logical position against `buffer.len()` and drops
+            // wrap-derived garbage indices, so the wrap is harmless
+            // here while keeping the decoder fuzz-stable.
+            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(est_offset as usize);
             if est_offset >= PREFETCH_OFFSET_THRESHOLD {
                 buffer.prefetch_lookahead_match_source(source_idx);
             }
-            prefetch_pos = match_start + seq.ml as usize;
+            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
 
             let slot = i & ADVANCE_MASK;
             let exec_seq = ring[slot];
