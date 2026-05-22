@@ -189,7 +189,14 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // pay the table-walk cost.
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
-    const MIN_LONG_OFFSET_SHARE_64BIT: u32 = 7;
+    // Donor `minShare = MEM_64bits() ? 7 : 20`: the 32-bit
+    // threshold is higher because the prefetch pipeline needs a
+    // stronger long-offset signal to outpace the narrower load
+    // window on those targets.
+    #[cfg(target_pointer_width = "64")]
+    const MIN_LONG_OFFSET_SHARE: u32 = 7;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_LONG_OFFSET_SHARE: u32 = 20;
     let use_long_pipeline = num_sequences >= ADVANCE * 2 && {
         let table = &fse.offsets.decode;
         let table_log = fse.offsets.accuracy_log as u32;
@@ -198,11 +205,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
             .count() as u32;
         // Donor scales `raw` to OffFSELog so a small/fine-grained
-        // table still registers meaningful share. `table_log <=
-        // OffFSELog` for every valid offsets table (MAX_OFFSET_CODE
-        // = 31 keeps accuracy_log <= 8), so the shift is wrap-free.
+        // table still registers meaningful share. The format-spec
+        // bound `OF_MAX_LOG = 8` (passed as the `max_log` arg to
+        // `build_decoder` for the offsets table) keeps `table_log
+        // <= OFFSET_FSE_LOG` for every valid stream, so the shift
+        // is wrap-free.
         let long_offset_share = raw << OFFSET_FSE_LOG.saturating_sub(table_log);
-        long_offset_share >= MIN_LONG_OFFSET_SHARE_64BIT
+        long_offset_share >= MIN_LONG_OFFSET_SHARE
     };
     // Donor also engages the prefetch decoder when the dictionary is
     // cold or when the format-level `isLongOffset` flag is set. We
