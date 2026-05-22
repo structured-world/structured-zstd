@@ -167,6 +167,16 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // existing fused single-pass path stays in charge there.
     const ADVANCE: usize = 4;
     const ADVANCE_MASK: usize = ADVANCE - 1;
+    // Prefetch only when the match offset is large enough that the
+    // source line is plausibly cold in L1/L2. 32 KiB = donor's L1
+    // residency proxy (PREFETCH_AREA) for `ZSTD_decompressSequencesLong`
+    // — short-offset matches reuse cache lines the buffer write just
+    // touched, so a prefetch there is pure issue-port pressure. The
+    // gate is on the read-only `est_offset` (which is exact for
+    // `seq.of >= 4`, the dominant long-distance case) so the
+    // threshold check costs one branch on a strongly-predicted
+    // path.
+    const PREFETCH_OFFSET_THRESHOLD: u32 = 32 * 1024;
     // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
     // power of two. Compile-time guard so a future tweak (e.g.
     // bumping to donor's STORED_SEQS = 8, also a power of two) can't
@@ -235,25 +245,28 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             of: 0,
         }; ADVANCE];
 
-        // Pre-fill the ring. The FSE state-update guard mirrors the
-        // single-pass loop: skip update after the very last decode
-        // (when k+1 == num_sequences) since there is no next decode.
-        for (k, slot) in ring.iter_mut().enumerate() {
+        // Pre-fill the ring. The outer `num_sequences >= ADVANCE * 2`
+        // guard ensures `num_sequences > ADVANCE`, so the FSE state
+        // update is needed after every prefill decode (k < ADVANCE
+        // implies k + 1 <= ADVANCE < num_sequences) — no `isLastSeq`
+        // guard required here, only in the steady-state loop where
+        // `i + 1 == num_sequences` is reachable.
+        for slot in ring.iter_mut() {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             // Estimated offset for prefetch only — see
             // `estimate_actual_offset` for the accuracy contract.
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
             let source_idx = match_start.wrapping_sub(est_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx);
+            if est_offset >= PREFETCH_OFFSET_THRESHOLD {
+                buffer.prefetch_lookahead_match_source(source_idx);
+            }
             prefetch_pos = match_start + seq.ml as usize;
             *slot = seq;
-            if k + 1 < num_sequences {
-                br.ensure_bits(max_update_bits);
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
-            }
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(&mut br);
+            ml_dec.update_state_fast(&mut br);
+            of_dec.update_state_fast(&mut br);
         }
 
         // Steady state: decode next, prefetch its source, execute the
@@ -266,7 +279,9 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
             let source_idx = match_start.wrapping_sub(est_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx);
+            if est_offset >= PREFETCH_OFFSET_THRESHOLD {
+                buffer.prefetch_lookahead_match_source(source_idx);
+            }
             prefetch_pos = match_start + seq.ml as usize;
 
             let slot = i & ADVANCE_MASK;
