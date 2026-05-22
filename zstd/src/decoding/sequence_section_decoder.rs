@@ -726,7 +726,7 @@ pub const OF_MAX_LOG: u8 = 8;
 /// Called only when the offsets table is actually rebuilt (FSE /
 /// Predefined modes in `maybe_update_fse_tables`). Repeat-mode
 /// blocks reuse the cached value in `FSEScratch::offsets_long_share`.
-fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 {
+pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 {
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
     let table_log = offsets.accuracy_log as u32;

@@ -151,7 +151,18 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
-        self.offsets_long_share = other.offsets_long_share;
+        // Recompute the share from the just-copied offsets table
+        // rather than trusting `other.offsets_long_share`. Two source
+        // shapes produce a populated `offsets` table but a still-zero
+        // cached share: (a) `Dictionary::decode_dict` rebuilds the
+        // offsets FSE table from the dictionary's entropy section
+        // without ever calling the sequence-decoder path that updates
+        // the cache, and (b) any future caller that mutates the table
+        // directly. Recomputing here keeps the pipeline gate aligned
+        // with the actual table shape regardless of how the table got
+        // there.
+        self.offsets_long_share =
+            super::sequence_section_decoder::compute_offsets_long_share(&self.offsets);
     }
 }
 
