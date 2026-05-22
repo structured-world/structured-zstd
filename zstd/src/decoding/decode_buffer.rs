@@ -406,20 +406,29 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         if start_idx >= self.buffer.len() {
             return;
         }
-        // No `match_length < 64` gate here — the in-loop helper skips
-        // tiny matches because the prefetch issue cost is comparable
-        // to the load. With 3-4 sequences of lookahead the prefetch
-        // overlaps work the CPU has to do anyway, so even sub-cache-
-        // line matches benefit. We always prefetch a single cache line
-        // (prefetch_slice_t1 caps at 4 lines internally; passing the
-        // sub-slice extent ≤ 1 line keeps it to one issue).
+        // Donor parity: `ZSTD_prefetchMatch` issues exactly two
+        // `PREFETCH_L1` hints per match — one at `match`, one at
+        // `match + CACHELINE_SIZE`. Capping the slice extent at
+        // 2 × 64 B holds `prefetch_slice_t1` to two prefetch lines
+        // instead of the 4 its `MAX_LINES` cap would allow, so we
+        // don't burn prefetch-queue slots that the steady-state
+        // ADVANCE-deep pipeline already reserves for upcoming
+        // sources. No `match_length < 64` gate — with several
+        // sequences of lookahead the prefetch overlaps work the
+        // CPU has to do anyway, so even sub-cache-line matches
+        // benefit.
+        const PREFETCH_EXTENT: usize = 128;
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {
-            prefetch::prefetch_slice_t1(&s1[start_idx..]);
+            let tail = &s1[start_idx..];
+            let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
+            prefetch::prefetch_slice_t1(&tail[..bound]);
         } else {
             let idx = start_idx - s1.len();
             if idx < s2.len() {
-                prefetch::prefetch_slice_t1(&s2[idx..]);
+                let tail = &s2[idx..];
+                let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
+                prefetch::prefetch_slice_t1(&tail[..bound]);
             }
         }
     }

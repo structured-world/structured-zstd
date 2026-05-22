@@ -108,14 +108,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
+    // `offset_hist` mutates here (via do_offset_history) and only
+    // here. The pipeline above intentionally defers all repcode
+    // resolution to this call site so a mid-loop error keeps the
+    // caller's `offset_hist` consistent with the sequences that
+    // actually executed — preserving the legacy two-pass
+    // 'partial output, no rewound history' contract on early exits.
     #[inline(always)]
-    fn execute_resolved_sequence<B: super::buffer_backend::BufferBackend>(
+    fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,
         literals: &[u8],
         lit_cur: &mut usize,
         lit_len: usize,
+        offset_hist: &mut [u32; 3],
         seq: Sequence,
-        actual_offset: u32,
     ) -> Result<(), DecompressBlockError> {
         let high = *lit_cur + seq.ll as usize;
         if high > lit_len {
@@ -131,11 +137,12 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         *lit_cur = high;
         buffer.push(lits);
 
-        if actual_offset == 0 {
+        let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+        if actual == 0 {
             return Err(ExecuteSequencesError::ZeroOffset.into());
         }
         buffer
-            .repeat(actual_offset as usize, seq.ml as usize)
+            .repeat(actual as usize, seq.ml as usize)
             .map_err(ExecuteSequencesError::from)?;
         Ok(())
     }
@@ -161,41 +168,71 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     const ADVANCE: usize = 4;
     const ADVANCE_MASK: usize = ADVANCE - 1;
 
+    // Read-only estimate for the prefetch's match-source position.
+    // The TRUE `actual_offset` requires mutating `offset_hist` via
+    // `do_offset_history`, which we deliberately defer to execute
+    // time so a mid-loop error preserves the legacy 'no partial
+    // history mutation' semantics. For the `seq.of >= 4` case
+    // (every fresh non-repcode offset, dominant on the long-distance
+    // workloads this pipeline targets) the estimate is exact and
+    // matches do_offset_history's output bit-for-bit. For the
+    // repcode 1..=3 cases the estimate reads the current `hist`
+    // without mutating it — this can lag by up to ADVANCE
+    // sequences vs the post-execute state, but the lag only
+    // mis-points the prefetch by a few cache lines on close-range
+    // matches whose source is already L1-warm; the cost of a
+    // mis-targeted PREFETCH_L1 on warm data is negligible.
+    #[inline(always)]
+    fn estimate_actual_offset(of: u32, ll: u32, hist: &[u32; 3]) -> u32 {
+        if of >= 4 {
+            return of - 3;
+        }
+        // Mirrors the read-only halves of do_offset_history_repcode's
+        // selection table: the lit-zero edge cases that pull from a
+        // different hist slot are kept consistent so the estimate
+        // tracks execute-time resolution as closely as possible.
+        match (of, ll == 0) {
+            (1, false) => hist[0],
+            (1, true) => hist[1],
+            (2, false) => hist[1],
+            (2, true) => hist[2],
+            (3, false) => hist[2],
+            (3, true) => hist[0].saturating_sub(1),
+            _ => 0,
+        }
+    }
+
     if num_sequences >= ADVANCE * 2 {
         // `prefetch_pos` is the logical buffer index (same frame as
         // `buffer.len()`) at which the NEXT not-yet-decoded sequence
         // will start pushing literals. We pre-decode 4 ahead, so we
-        // accumulate (ll + ml) per resolved seq to keep this position
+        // accumulate (ll + ml) per decoded seq to keep this position
         // synchronised with where execute will eventually be.
         let mut prefetch_pos: usize = old_buffer_size;
-        // Stack ring of (raw seq, resolved actual_offset). Storing
-        // `actual_offset` up front lets execute skip
-        // `do_offset_history` — the resolution already mutated
-        // `offset_hist` at decode-ahead time.
-        let mut ring: [(Sequence, u32); ADVANCE] = [(
-            Sequence {
-                ll: 0,
-                ml: 0,
-                of: 0,
-            },
-            0,
-        ); ADVANCE];
+        // Stack ring of raw sequences. `do_offset_history` is NOT
+        // run here — execute calls it later, so `offset_hist`
+        // mutations stay in lockstep with successful execute calls
+        // (matching the legacy 'no rollback on mid-loop error'
+        // contract).
+        let mut ring: [Sequence; ADVANCE] = [Sequence {
+            ll: 0,
+            ml: 0,
+            of: 0,
+        }; ADVANCE];
 
         // Pre-fill the ring. The FSE state-update guard mirrors the
         // single-pass loop: skip update after the very last decode
         // (when k+1 == num_sequences) since there is no next decode.
         for (k, slot) in ring.iter_mut().enumerate() {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
-            // Issue lookahead prefetch even when actual == 0; the
-            // helper short-circuits invalid positions, and we want
-            // the same control flow on the malformed-input path so
-            // the deferred ZeroOffset check fires from execute.
+            // Estimated offset for prefetch only — see
+            // `estimate_actual_offset` for the accuracy contract.
+            let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
-            let source_idx = match_start.wrapping_sub(actual as usize);
+            let source_idx = match_start.wrapping_sub(est_offset as usize);
             buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
             prefetch_pos = match_start + seq.ml as usize;
-            *slot = (seq, actual);
+            *slot = seq;
             if k + 1 < num_sequences {
                 br.ensure_bits(max_update_bits);
                 ll_dec.update_state_fast(&mut br);
@@ -211,23 +248,23 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // seq[i] — donor pattern.
         for i in ADVANCE..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+            let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
-            let source_idx = match_start.wrapping_sub(actual as usize);
+            let source_idx = match_start.wrapping_sub(est_offset as usize);
             buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
             prefetch_pos = match_start + seq.ml as usize;
 
             let slot = i & ADVANCE_MASK;
-            let (exec_seq, exec_actual) = ring[slot];
-            ring[slot] = (seq, actual);
+            let exec_seq = ring[slot];
+            ring[slot] = seq;
 
-            execute_resolved_sequence(
+            execute_one_sequence(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
+                offset_hist,
                 exec_seq,
-                exec_actual,
             )?;
             seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
@@ -245,14 +282,14 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // preserve sequence order.
         for k in 0..ADVANCE {
             let slot = (num_sequences + k) & ADVANCE_MASK;
-            let (exec_seq, exec_actual) = ring[slot];
-            execute_resolved_sequence(
+            let exec_seq = ring[slot];
+            execute_one_sequence(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
+                offset_hist,
                 exec_seq,
-                exec_actual,
             )?;
             seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
         }
@@ -265,14 +302,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // mid-block stays at zero.
         for i in 0..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
-            execute_resolved_sequence(
+            execute_one_sequence(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
+                offset_hist,
                 seq,
-                actual,
             )?;
             seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
 
