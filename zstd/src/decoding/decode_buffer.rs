@@ -200,13 +200,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.repeat_inner::<false>(offset, match_length)
     }
 
-    /// Same as [`repeat`] but the caller asserts (1) the buffer was
-    /// pre-reserved for the whole block (so the per-call `reserve` is
-    /// redundant) and (2) a lookahead prefetch was already issued for
-    /// this match source ADVANCE iterations ago (so the in-loop
-    /// `prefetch_match_source` would be redundant issue-port pressure
-    /// on top of the L1 line that's by now warm). Used exclusively by
-    /// the pipelined sequence executor in
+    /// Same as [`repeat`] but the caller asserts a lookahead
+    /// prefetch was already issued for this match source ADVANCE
+    /// iterations ago, so the in-loop `prefetch_match_source` would
+    /// be redundant issue-port pressure on top of the L1 line that's
+    /// by now warm. Per-call `reserve` is KEPT — on malformed input
+    /// the `extend_from_within_unchecked*` writes assume the buffer
+    /// has the required free capacity (only `debug_assert` checks in
+    /// release), and a single missing reserve here would turn a
+    /// fuzz-corrupt block into out-of-bounds UB. The reserve is
+    /// already amortised by the caller's upfront
+    /// `reserve(MAX_BLOCK_SIZE)`, so this is a cheap capacity-check
+    /// branch, not a real allocation. Used exclusively by the
+    /// pipelined sequence executor in
     /// [`crate::decoding::sequence_section_decoder`].
     #[inline(always)]
     pub(crate) fn repeat_lookahead_prefetched(
@@ -218,7 +224,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     #[inline(always)]
-    fn repeat_inner<const PIPELINED: bool>(
+    fn repeat_inner<const SKIP_PREFETCH: bool>(
         &mut self,
         offset: usize,
         match_length: usize,
@@ -238,25 +244,25 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
-            if !PIPELINED {
-                self.buffer.reserve(match_length);
+            // Reserve unconditionally — `extend_from_within_unchecked*`
+            // assumes the required free capacity exists; skipping it
+            // would turn a malformed block (match_length past the
+            // upfront `reserve(MAX_BLOCK_SIZE)`) into release-build
+            // UB. The pipelined caller already reserved MAX_BLOCK_SIZE
+            // up front, so this is a cheap no-op branch in the hot
+            // path.
+            self.buffer.reserve(match_length);
+            if !SKIP_PREFETCH {
                 self.prefetch_match_source(start_idx, match_length);
             }
             if end_idx > buf_len {
                 self.repeat_overlapping(offset, match_length, start_idx);
             } else {
-                // can just copy parts of the existing buffer
-                // SAFETY: Requirements checked:
-                // 1. start_idx + match_length must be <= self.buffer.len()
-                //      We know that:
-                //      1. start_idx = self.buffer.len() - offset
-                //      2. end_idx = start_idx + match_length
-                //      3. end_idx <= self.buffer.len()
-                //      Thus follows: start_idx + match_length <= self.buffer.len()
-                //
-                // 2. PIPELINED path relies on caller's upfront
-                //    `reserve(MAX_BLOCK_SIZE)` covering the whole block;
-                //    non-PIPELINED path just reserved `match_length`.
+                // SAFETY: start_idx + match_length <= self.buffer.len()
+                // (start_idx = buf_len - offset, end_idx = start_idx +
+                // match_length, end_idx <= buf_len). The `reserve`
+                // above guarantees the destination has enough free
+                // capacity for `match_length` more bytes.
                 unsafe {
                     if offset >= 16 && use_branchless_wildcopy() {
                         self.buffer

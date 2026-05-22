@@ -72,6 +72,13 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.fse.ll_rle = None;
         self.fse.ml_rle = None;
         self.fse.of_rle = None;
+        // Reset the cached pipeline-gate signal alongside the FSE
+        // table reset — otherwise scratch reuse across frames could
+        // engage the long pipeline on a new frame's Repeat-mode
+        // header based on the previous frame's offset distribution
+        // (or vice versa: skip the pipeline when the new frame
+        // actually has long offsets).
+        self.fse.offsets_long_share = 0;
 
         self.huf.table.reset();
     }
@@ -112,8 +119,9 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: AlignedFSETable,
     pub ml_rle: Option<u8>,
-    /// Cached "share of offset codes ≥ LONG_OFFSET_CODE_THRESHOLD"
-    /// scaled to donor's `OffFSELog = 8` (256-entry reference).
+    /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
+    /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to donor's
+    /// `OffFSELog = 8` (256-entry reference).
     /// Updated by [`crate::decoding::sequence_section_decoder`] when
     /// the offsets FSE table is rebuilt (FSE / Predefined modes);
     /// stale-but-correct on Repeat-mode blocks where the table was
