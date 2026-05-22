@@ -246,13 +246,19 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
-        // Kernel indices are `u32`; `1 << window_log` larger than
-        // `u32::MAX` is unrepresentable in the hash table and would
-        // overflow on 32-bit hosts. Cap at 31 so `1u32 << window_log`
-        // stays defined and `max_window_size <= u32::MAX`.
+        // Kernel indices are `u32`. `accept_data` lets history grow
+        // up to `2 * max_window_size` before draining (donor parity
+        // for the eager-eviction band), so `max_window_size` is
+        // capped at 2^30 to keep that band ≤ 2^31 < `u32::MAX` and
+        // prevent any `history.len()` from tripping the kernel's
+        // `data.len() > u32::MAX` panic. Donor's
+        // `ZSTD_WINDOWLOG_MAX_64` is 30 for the same reason — we
+        // mirror it.
         assert!(
-            window_log <= 31,
-            "FastKernelMatcher requires window_log <= 31 (got {window_log})"
+            window_log <= 30,
+            "FastKernelMatcher requires window_log <= 30 (got {window_log}); \
+             2 * (1 << 30) is the eviction-band ceiling that keeps history \
+             length below the kernel's u32::MAX input bound"
         );
         // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         // Sentinel-0 protection comes from prefix_start_index =
@@ -291,10 +297,10 @@ impl FastKernelMatcher {
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
         // Same window_log cap as `with_params` — see there for why
-        // values above 31 are unrepresentable.
+        // the ceiling is 30, not 31.
         assert!(
-            window_log <= 31,
-            "FastKernelMatcher requires window_log <= 31 (got {window_log})"
+            window_log <= 30,
+            "FastKernelMatcher requires window_log <= 30 (got {window_log})"
         );
         if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
             // Parameters changed — rebuild the table at the new size.
