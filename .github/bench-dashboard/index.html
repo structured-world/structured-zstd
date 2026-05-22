@@ -297,6 +297,34 @@
         <div id="profile-status" style="margin-top: 8px; font-size: 0.88rem"></div>
       </section>
 
+      <section class="card" style="margin-top: 14px">
+        <h2 style="margin: 0 0 8px; font-size: 1.2rem">Aggregate over all levels (commit timeline)</h2>
+        <p style="font-size: 0.9rem">
+          Same six series as Level Profile, but plotted against
+          <strong>snapshot / commit time</strong> on the X-axis and
+          averaged across <strong>every</strong> (level, scenario, target,
+          source) cohort for that snapshot. Each point answers
+          “across the whole bench matrix, where are we right now vs
+          FFI?” — useful for spotting aggregate dynamics across commits
+          regardless of which level or corpus drove the change. The top
+          Target / Scenario / Level filters still apply: setting any of
+          them to a specific value narrows the average to that slice.
+        </p>
+        <div class="aggregate-toggles profile-toggles">
+          <label><input type="checkbox" data-agg-series="rust_compress_speed" checked /> Rust compress</label>
+          <label><input type="checkbox" data-agg-series="ffi_compress_speed" checked /> FFI compress</label>
+          <label><input type="checkbox" data-agg-series="rust_decompress_speed" checked /> Rust decompress</label>
+          <label><input type="checkbox" data-agg-series="ffi_decompress_speed" checked /> FFI decompress</label>
+          <label><input type="checkbox" data-agg-series="rust_ratio" checked /> Rust ratio</label>
+          <label><input type="checkbox" data-agg-series="ffi_ratio" checked /> FFI ratio</label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart-aggregate"></canvas>
+        </div>
+        <div id="legend-aggregate" class="html-legend"></div>
+        <div id="aggregate-status" style="margin-top: 8px; font-size: 0.88rem"></div>
+      </section>
+
       <details class="card">
         <summary><strong>Raw timings (secondary view)</strong></summary>
         <p style="margin-top: 8px">
@@ -341,6 +369,15 @@
         chart: null,
         profileChart: null,
         profileSeriesVisibility: {
+          rust_compress_speed: true,
+          ffi_compress_speed: true,
+          rust_decompress_speed: true,
+          ffi_decompress_speed: true,
+          rust_ratio: true,
+          ffi_ratio: true,
+        },
+        aggregateChart: null,
+        aggregateSeriesVisibility: {
           rust_compress_speed: true,
           ffi_compress_speed: true,
           rust_decompress_speed: true,
@@ -936,6 +973,86 @@
       // the snapshot/target/scenario filter — this collapses the source
       // dimension for decompress (rust_stream vs c_stream) because the
       // Rust/FFI comparison already lives inside each row.
+      // When the user picks a specific level (filter.level !== ALWAYS)
+      // the original "X = level" chart collapses to a single point —
+      // not useful. In that case we swap the X-axis to snapshot/commit
+      // time so the chart still plots multiple points: one per
+      // snapshot, each value = mean across the remaining cohorts
+      // (target × scenario × source) for that snapshot at the locked
+      // level. The output shape matches the level-mode call site so
+      // `renderProfileChart` can use the same Chart.js datasets array.
+      function buildProfileLevelHistoryData(filter) {
+        const matchesFilter = (r) => {
+          if (filter.target !== ALWAYS && (r.target || "unknown-target") !== filter.target) return false;
+          if (filter.scenario !== ALWAYS && r.scenario !== filter.scenario) return false;
+          if (r.level !== filter.level) return false;
+          // PROFILE_LATEST in level-history mode means "all snapshots";
+          // the user is already pinned to a single level, so showing
+          // every snapshot as a point on the X-axis is the whole point.
+          if (filter.snapshot !== PROFILE_LATEST) {
+            const label = r.generated_at || r.commit_sha || "local-run";
+            if (label !== filter.snapshot) return false;
+          }
+          return true;
+        };
+
+        const logicalMetric = (row) => {
+          if (row.metric === "compression_ratio" && isCompressStage(row.stage)) return "ratio";
+          if (row.metric === "throughput_bytes_per_sec") {
+            if (isCompressStage(row.stage)) return "compress_speed";
+            if (isDecompressStage(row.stage)) return "decompress_speed";
+          }
+          return null;
+        };
+
+        // Group by (snapshot, logical-metric): each cell averages the
+        // remaining cohort dimensions (target × scenario × source). For
+        // a fully-pinned filter (target/scenario both specific too)
+        // each cell is exactly one (or two — rust_stream + c_stream for
+        // decompress) row, so the mean is degenerate but correct.
+        const bySnapshotLogical = new Map();
+        for (const row of state.records) {
+          if (!matchesFilter(row)) continue;
+          if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
+          const lm = logicalMetric(row);
+          if (!lm) continue;
+          const snap = row.generated_at || row.commit_sha || "local-run";
+          const key = `${snap}|${lm}`;
+          let agg = bySnapshotLogical.get(key);
+          if (!agg) {
+            agg = { snap, rust_sum: 0, ffi_sum: 0, count: 0 };
+            bySnapshotLogical.set(key, agg);
+          }
+          agg.rust_sum += row.rust_value;
+          agg.ffi_sum += row.ffi_value;
+          agg.count += 1;
+        }
+
+        const snapshotSet = new Set();
+        for (const agg of bySnapshotLogical.values()) snapshotSet.add(agg.snap);
+        const snapshots = Array.from(snapshotSet).sort((a, b) => {
+          const at = parseTimestamp(a);
+          const bt = parseTimestamp(b);
+          if (at !== null && bt !== null) return at - bt;
+          return String(a).localeCompare(String(b));
+        });
+
+        const lookup = (snap, lm, side) => {
+          const agg = bySnapshotLogical.get(`${snap}|${lm}`);
+          if (!agg || agg.count === 0) return null;
+          const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
+          const mean = sum / agg.count;
+          if (lm === "compress_speed" || lm === "decompress_speed") {
+            return mean / (1024 * 1024);
+          }
+          return mean;
+        };
+
+        const series = (lm, side) => snapshots.map((s) => lookup(s, lm, side));
+
+        return { snapshots, snapshotCount: snapshots.length, lookup, series };
+      }
+
       function buildProfileData(filter) {
         // Top filters use the `ALWAYS` sentinel ("__all__") to mean
         // "don't filter on this dimension". When that's set on target /
@@ -1075,68 +1192,78 @@
         return {
           levels: levelLabels,
           levelCount: levels.length,
-          datasets: [
-            {
-              seriesKey: "rust_compress_speed",
-              label: "Rust compress (MiB/s)",
-              data: series("compress_speed", "rust"),
-              yAxisID: "y",
-              borderColor: "hsl(150 65% 38%)",
-              backgroundColor: "hsla(150 65% 38% / 0.25)",
-            },
-            {
-              seriesKey: "ffi_compress_speed",
-              label: "FFI compress (MiB/s)",
-              data: series("compress_speed", "ffi"),
-              yAxisID: "y",
-              borderColor: "hsl(205 65% 45%)",
-              backgroundColor: "hsla(205 65% 45% / 0.25)",
-            },
-            {
-              seriesKey: "rust_decompress_speed",
-              label: "Rust decompress (MiB/s)",
-              data: series("decompress_speed", "rust"),
-              yAxisID: "y",
-              borderColor: "hsl(170 65% 28%)",
-              backgroundColor: "hsla(170 65% 28% / 0.25)",
-              borderDash: [2, 3],
-            },
-            {
-              seriesKey: "ffi_decompress_speed",
-              label: "FFI decompress (MiB/s)",
-              data: series("decompress_speed", "ffi"),
-              yAxisID: "y",
-              borderColor: "hsl(225 65% 35%)",
-              backgroundColor: "hsla(225 65% 35% / 0.25)",
-              borderDash: [2, 3],
-            },
-            // "ratio" here is the bench emitter's compression_ratio
-            // value, which is compressed_size / input_size — i.e. the
-            // output fraction, where LOWER means BETTER compression
-            // (a 0.30 value compresses to 30% of input). The axis and
-            // dataset labels say so explicitly to keep readers from
-            // assuming the conventional input/output definition where
-            // larger is better.
-            {
-              seriesKey: "rust_ratio",
-              label: "Rust output ratio (lower=better)",
-              data: series("ratio", "rust"),
-              yAxisID: "y1",
-              borderColor: "hsl(30 75% 45%)",
-              backgroundColor: "hsla(30 75% 45% / 0.25)",
-              borderDash: [6, 4],
-            },
-            {
-              seriesKey: "ffi_ratio",
-              label: "FFI output ratio (lower=better)",
-              data: series("ratio", "ffi"),
-              yAxisID: "y1",
-              borderColor: "hsl(340 65% 50%)",
-              backgroundColor: "hsla(340 65% 50% / 0.25)",
-              borderDash: [6, 4],
-            },
-          ],
+          datasets: buildProfileSeriesDatasets(series),
         };
+      }
+
+      // Shared dataset palette / shape — reused by:
+      //   - level-axis Level Profile (buildProfileData)
+      //   - snapshot-axis level history (buildProfileLevelHistoryData)
+      //   - the aggregate-over-levels chart (buildAggregateOverTimeData)
+      // Each caller supplies a `series(lm, side)` closure that returns
+      // the Y-values for its own X-axis labels.
+      function buildProfileSeriesDatasets(series) {
+        return [
+          {
+            seriesKey: "rust_compress_speed",
+            label: "Rust compress (MiB/s)",
+            data: series("compress_speed", "rust"),
+            yAxisID: "y",
+            borderColor: "hsl(150 65% 38%)",
+            backgroundColor: "hsla(150 65% 38% / 0.25)",
+          },
+          {
+            seriesKey: "ffi_compress_speed",
+            label: "FFI compress (MiB/s)",
+            data: series("compress_speed", "ffi"),
+            yAxisID: "y",
+            borderColor: "hsl(205 65% 45%)",
+            backgroundColor: "hsla(205 65% 45% / 0.25)",
+          },
+          {
+            seriesKey: "rust_decompress_speed",
+            label: "Rust decompress (MiB/s)",
+            data: series("decompress_speed", "rust"),
+            yAxisID: "y",
+            borderColor: "hsl(170 65% 28%)",
+            backgroundColor: "hsla(170 65% 28% / 0.25)",
+            borderDash: [2, 3],
+          },
+          {
+            seriesKey: "ffi_decompress_speed",
+            label: "FFI decompress (MiB/s)",
+            data: series("decompress_speed", "ffi"),
+            yAxisID: "y",
+            borderColor: "hsl(225 65% 35%)",
+            backgroundColor: "hsla(225 65% 35% / 0.25)",
+            borderDash: [2, 3],
+          },
+          // "ratio" here is the bench emitter's compression_ratio
+          // value, which is compressed_size / input_size — i.e. the
+          // output fraction, where LOWER means BETTER compression
+          // (a 0.30 value compresses to 30% of input). The axis and
+          // dataset labels say so explicitly to keep readers from
+          // assuming the conventional input/output definition where
+          // larger is better.
+          {
+            seriesKey: "rust_ratio",
+            label: "Rust output ratio (lower=better)",
+            data: series("ratio", "rust"),
+            yAxisID: "y1",
+            borderColor: "hsl(30 75% 45%)",
+            backgroundColor: "hsla(30 75% 45% / 0.25)",
+            borderDash: [6, 4],
+          },
+          {
+            seriesKey: "ffi_ratio",
+            label: "FFI output ratio (lower=better)",
+            data: series("ratio", "ffi"),
+            yAxisID: "y1",
+            borderColor: "hsl(340 65% 50%)",
+            backgroundColor: "hsla(340 65% 50% / 0.25)",
+            borderDash: [6, 4],
+          },
+        ];
       }
 
       // Single source of truth for the chart instance: created once on
@@ -1193,7 +1320,22 @@
           el("profile-status").textContent = "Pick Target and Scenario (or leave them on 'all') to render the level profile.";
           return;
         }
-        const { levels, levelCount, datasets } = buildProfileData(filter);
+
+        // History mode: when the user pins a specific level, swap the
+        // X-axis from "compression level" (which would degenerate to a
+        // single column) to "snapshot / commit time" so the chart shows
+        // how that one level evolves across runs.
+        const historyMode = filter.level !== ALWAYS;
+        const built = historyMode ? buildProfileLevelHistoryData(filter) : buildProfileData(filter);
+        const labels = historyMode ? built.snapshots : built.levels;
+        const labelCount = historyMode ? built.snapshotCount : built.levelCount;
+        const baseDatasets = historyMode
+          ? buildProfileSeriesDatasets(built.series)
+          : built.datasets;
+        const xAxisTitle = historyMode ? "Snapshot (generated_at / commit)" : "Compression level";
+        const datasets = baseDatasets;
+        const levelCount = labelCount;
+        const levels = labels;
         if (!levelCount) {
           if (state.profileChart) {
             // No data for the chosen filter — clear the chart in place
@@ -1207,11 +1349,14 @@
           el("profile-status").textContent = `No level points for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
           return;
         }
-        const snapshotNote = filter.snapshot === PROFILE_LATEST
-          ? "latest per (level, metric, cohort) — points may come from different snapshots"
-          : `snapshot=${filter.snapshot} (all points from this single run)`;
+        const snapshotNote = historyMode
+          ? `history across ${labelCount} snapshot(s) for level=${filter.level}`
+          : (filter.snapshot === PROFILE_LATEST
+            ? "latest per (level, metric, cohort) — points may come from different snapshots"
+            : `snapshot=${filter.snapshot} (all points from this single run)`);
+        const axisDesc = historyMode ? "snapshot" : "level";
         el("profile-status").textContent =
-          `Showing ${levelCount} level point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
+          `Showing ${labelCount} ${axisDesc} point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
 
         const chartDatasets = buildProfileDatasets(datasets);
 
@@ -1220,6 +1365,7 @@
           // Chart.js to redraw without animation. This preserves the
           // chart instance (tooltips, scales, animation state) across
           // every target/scenario/stage switch.
+          state.profileChart.options.scales.x.title.text = xAxisTitle;
           state.profileChart.data.labels = levels;
           state.profileChart.data.datasets = chartDatasets;
           state.profileChart.update("none");
@@ -1233,7 +1379,7 @@
               interaction: { mode: "index", intersect: false },
               scales: {
                 x: {
-                  title: { display: true, text: "Compression level" },
+                  title: { display: true, text: xAxisTitle },
                   ticks: { autoSkip: false, maxRotation: 60, minRotation: 30 },
                 },
                 y: {
@@ -1277,6 +1423,249 @@
           el("legend-profile"),
           onProfileLegendToggle,
         );
+      }
+
+      // Aggregate-over-levels chart: same six series as Level Profile,
+      // but X = snapshot/commit time, Y = mean across **every** matching
+      // (level, scenario, target, source) cohort for that snapshot.
+      // Respects the top Target / Scenario / Level filters — pinning
+      // any one of them narrows the aggregate to that slice while the
+      // other dimensions are still averaged across.
+      function buildAggregateOverTimeData(filter) {
+        const matchesFilter = (r) => {
+          if (filter.target !== ALWAYS && (r.target || "unknown-target") !== filter.target) return false;
+          if (filter.scenario !== ALWAYS && r.scenario !== filter.scenario) return false;
+          if (filter.level !== ALWAYS && r.level !== filter.level) return false;
+          return true;
+        };
+
+        const logicalMetric = (row) => {
+          if (row.metric === "compression_ratio" && isCompressStage(row.stage)) return "ratio";
+          if (row.metric === "throughput_bytes_per_sec") {
+            if (isCompressStage(row.stage)) return "compress_speed";
+            if (isDecompressStage(row.stage)) return "decompress_speed";
+          }
+          return null;
+        };
+
+        // Pre-aggregate per (snapshot, lm, cohort) so each cohort
+        // contributes one MEAN per snapshot before being folded into
+        // the snapshot-level mean. Without this stratification, a
+        // (level, scenario) combo that has more source variants would
+        // weigh more than one with fewer — biasing the aggregate
+        // toward whichever cohort happened to enumerate more rows.
+        const cohortKey = (row) => {
+          // Cohort = (level, scenario, target, source). All of these
+          // are present in the row regardless of which top filters
+          // are on `__all__`, so the mean stays comparable across
+          // filter shapes.
+          return `${row.level}|${row.scenario}|${row.target || "?"}|${row.source || "none"}`;
+        };
+
+        // Two-level aggregation:
+        //   inner: per (snapshot, lm, cohort) — accumulate raw rows
+        //          (handles same-cohort runs being averaged together,
+        //          rare but happens with retries)
+        //   outer: per (snapshot, lm) — average the inner means
+        const innerAgg = new Map();
+        for (const row of state.records) {
+          if (!matchesFilter(row)) continue;
+          if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
+          const lm = logicalMetric(row);
+          if (!lm) continue;
+          const snap = row.generated_at || row.commit_sha || "local-run";
+          const inner = `${snap}|${lm}|${cohortKey(row)}`;
+          let agg = innerAgg.get(inner);
+          if (!agg) {
+            agg = { snap, lm, rust_sum: 0, ffi_sum: 0, count: 0 };
+            innerAgg.set(inner, agg);
+          }
+          agg.rust_sum += row.rust_value;
+          agg.ffi_sum += row.ffi_value;
+          agg.count += 1;
+        }
+
+        const outerAgg = new Map();
+        for (const inner of innerAgg.values()) {
+          if (inner.count === 0) continue;
+          const key = `${inner.snap}|${inner.lm}`;
+          let agg = outerAgg.get(key);
+          if (!agg) {
+            agg = { snap: inner.snap, lm: inner.lm, rust_sum: 0, ffi_sum: 0, count: 0 };
+            outerAgg.set(key, agg);
+          }
+          agg.rust_sum += inner.rust_sum / inner.count;
+          agg.ffi_sum += inner.ffi_sum / inner.count;
+          agg.count += 1;
+        }
+
+        const snapshotSet = new Set();
+        for (const a of outerAgg.values()) snapshotSet.add(a.snap);
+        const snapshots = Array.from(snapshotSet).sort((a, b) => {
+          const at = parseTimestamp(a);
+          const bt = parseTimestamp(b);
+          if (at !== null && bt !== null) return at - bt;
+          return String(a).localeCompare(String(b));
+        });
+
+        const lookup = (snap, lm, side) => {
+          const agg = outerAgg.get(`${snap}|${lm}`);
+          if (!agg || agg.count === 0) return null;
+          const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
+          const mean = sum / agg.count;
+          if (lm === "compress_speed" || lm === "decompress_speed") {
+            return mean / (1024 * 1024);
+          }
+          return mean;
+        };
+
+        const series = (lm, side) => snapshots.map((s) => lookup(s, lm, side));
+
+        return {
+          snapshots,
+          snapshotCount: snapshots.length,
+          datasets: buildProfileSeriesDatasets(series),
+        };
+      }
+
+      function buildAggregateDatasets(rawDatasets) {
+        return rawDatasets.map((ds) => ({
+          label: ds.label,
+          data: ds.data,
+          yAxisID: ds.yAxisID,
+          borderColor: ds.borderColor,
+          backgroundColor: ds.backgroundColor,
+          borderDash: ds.borderDash,
+          borderWidth: 2,
+          pointRadius: 3,
+          spanGaps: true,
+          tension: 0.25,
+          fill: false,
+          hidden: !state.aggregateSeriesVisibility[ds.seriesKey],
+          _seriesKey: ds.seriesKey,
+        }));
+      }
+
+      function onAggregateLegendToggle(index, ds, nextVisible) {
+        const key = ds._seriesKey;
+        if (key) {
+          state.aggregateSeriesVisibility[key] = nextVisible;
+          const checkbox = document.querySelector(
+            `.aggregate-toggles input[type=checkbox][data-agg-series="${key}"]`,
+          );
+          if (checkbox) checkbox.checked = nextVisible;
+        }
+        if (state.aggregateChart) {
+          state.aggregateChart.setDatasetVisibility(index, nextVisible);
+          state.aggregateChart.update("none");
+          renderHtmlLegend(
+            state.aggregateChart,
+            el("legend-aggregate"),
+            onAggregateLegendToggle,
+          );
+        }
+      }
+
+      function renderAggregateChart() {
+        const filter = {
+          target: selectors.target.value,
+          scenario: selectors.scenario.value,
+          level: selectors.level.value,
+        };
+        if (!filter.target || !filter.scenario) {
+          el("aggregate-status").textContent = "Pick Target and Scenario (or leave them on 'all') to render the aggregate chart.";
+          return;
+        }
+        const { snapshots, snapshotCount, datasets } = buildAggregateOverTimeData(filter);
+        if (!snapshotCount) {
+          if (state.aggregateChart) {
+            state.aggregateChart.data.labels = [];
+            state.aggregateChart.data.datasets = [];
+            state.aggregateChart.update("none");
+          }
+          el("legend-aggregate").replaceChildren();
+          el("aggregate-status").textContent = `No aggregate points for target=${filter.target}, scenario=${filter.scenario}, level=${filter.level}.`;
+          return;
+        }
+        const filterDesc = [
+          filter.target === ALWAYS ? "target=all" : `target=${filter.target}`,
+          filter.scenario === ALWAYS ? "scenario=all" : `scenario=${filter.scenario}`,
+          filter.level === ALWAYS ? "level=all" : `level=${filter.level}`,
+        ].join(", ");
+        el("aggregate-status").textContent =
+          `Showing ${snapshotCount} snapshot point(s) — ${filterDesc} (per-snapshot mean across every matching (level, scenario, target, source) cohort).`;
+
+        const chartDatasets = buildAggregateDatasets(datasets);
+
+        if (state.aggregateChart) {
+          state.aggregateChart.data.labels = snapshots;
+          state.aggregateChart.data.datasets = chartDatasets;
+          state.aggregateChart.update("none");
+        } else {
+          state.aggregateChart = new Chart(el("chart-aggregate"), {
+            type: "line",
+            data: { labels: snapshots, datasets: chartDatasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              scales: {
+                x: {
+                  title: { display: true, text: "Snapshot (generated_at / commit)" },
+                  ticks: { autoSkip: true, maxRotation: 60, minRotation: 30 },
+                },
+                y: {
+                  type: "linear",
+                  position: "left",
+                  title: { display: true, text: "Throughput (MiB/s)" },
+                  beginAtZero: true,
+                },
+                y1: {
+                  type: "linear",
+                  position: "right",
+                  title: { display: true, text: "Output size ratio (compressed/input, lower=better)" },
+                  grid: { drawOnChartArea: false },
+                },
+              },
+              plugins: {
+                legend: { display: false },
+                tooltip: { mode: "index", intersect: false },
+              },
+            },
+          });
+        }
+        renderHtmlLegend(
+          state.aggregateChart,
+          el("legend-aggregate"),
+          onAggregateLegendToggle,
+        );
+      }
+
+      function applyAggregateToggles() {
+        if (!state.aggregateChart) return;
+        const datasets = state.aggregateChart.data.datasets || [];
+        for (let i = 0; i < datasets.length; i++) {
+          const key = datasets[i]._seriesKey;
+          if (!key) continue;
+          state.aggregateChart.setDatasetVisibility(i, !!state.aggregateSeriesVisibility[key]);
+        }
+        state.aggregateChart.update("none");
+        renderHtmlLegend(
+          state.aggregateChart,
+          el("legend-aggregate"),
+          onAggregateLegendToggle,
+        );
+      }
+
+      function bindAggregateControls() {
+        for (const cb of document.querySelectorAll(".aggregate-toggles input[type=checkbox]")) {
+          cb.addEventListener("change", (e) => {
+            const key = e.currentTarget.dataset.aggSeries;
+            if (!key) return;
+            state.aggregateSeriesVisibility[key] = e.currentTarget.checked;
+            applyAggregateToggles();
+          });
+        }
       }
 
       function bindProfileControls() {
@@ -1387,6 +1776,7 @@
             if (profileDimensions.has(name)) {
               repopulateSnapshotOptions();
               renderProfileChart();
+              renderAggregateChart();
             }
           });
         }
@@ -1485,6 +1875,8 @@
         renderProfileSelectors();
         bindProfileControls();
         renderProfileChart();
+        bindAggregateControls();
+        renderAggregateChart();
         renderRawSummary();
       }
 
