@@ -78,7 +78,7 @@
         margin-top: 14px;
         min-height: 460px;
       }
-      #chart, #chart-profile {
+      #chart, #chart-profile, #chart-aggregate {
         width: 100% !important;
         height: 440px !important;
       }
@@ -1629,7 +1629,7 @@
               scales: {
                 x: {
                   title: { display: true, text: "Snapshot (generated_at / commit)" },
-                  ticks: { autoSkip: true, maxRotation: 60, minRotation: 30 },
+                  ticks: { autoSkip: true, maxTicksLimit: 12, maxRotation: 60, minRotation: 30 },
                 },
                 y: {
                   type: "linear",
