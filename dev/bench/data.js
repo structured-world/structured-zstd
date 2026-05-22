@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779465362737,
+  "lastUpdate": 1779476555394,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -43358,6 +43358,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d7bb5666dc3934af867615695d3f9b49acad5fc2",
+          "message": "perf(decode): 8-slot software prefetch pipeline for sequence execution (#208) (#227)\n\n* perf(decode): 4-slot software prefetch pipeline for sequence execution\n\nPort the donor ZSTD_decompressSequencesLong_body shape to the fused\ndecode+execute path: 4-slot software pipeline that decodes 4\nsequences ahead of execute, prefetching each match source line at\ndecode time. By the time buffer.repeat() reaches the actual load for\nseq[i], the prefetch issued 4 iterations earlier has had time to\npull the line into L1/L2 — hiding DRAM latency on long-distance\nmatches whose source is beyond cache residency.\n\ndecode_buffer.rs:\n\n- New prefetch_lookahead_match_source(start_idx): issues the\n  prefetch hint at a logical buffer position, bound-checks against\n  buffer.len() so out-of-range indices (intra-block self-overlap,\n  wrapping_sub underflow on a malformed sequence, dictionary-sourced\n  matches predating the current frame) silently drop the hint.\n  Prefetches up to two 64 B cache lines per call (donor PREFETCH\n  parity), bounded by PREFETCH_EXTENT = 128.\n\nsequence_section_decoder.rs:\n\n- 4-slot software pipeline: prefill 4 → steady (decode N, prefetch\n  using a read-only offset estimate, execute N−4) → drain 4.\n- Ring stores raw [Sequence; 4]. do_offset_history stays in\n  execute_one_sequence so a mid-loop error preserves the legacy\n  'partial output, no history rewind' semantics — the in-flight\n  ring slots haven't mutated offset_hist yet.\n- For prefetch addressing only, a separate estimate_actual_offset\n  resolves the seq's actual_offset against the current offset_hist\n  WITHOUT mutating it. The estimate is exact for seq.of >= 4 (every\n  fresh non-repcode offset — the dominant case on long-distance\n  workloads); for repcode 1..=3 it mirrors do_offset_history_repcode's\n  selection table read-only, lagging by at most ADVANCE sequences\n  on close-range matches whose source is already L1-warm.\n- Opt-in by num_sequences >= 2 * ADVANCE. Short blocks fall back to\n  the fused single-pass loop (existing in-loop prefetch retained).\n- Compile-time guard on ADVANCE.is_power_of_two() so the\n  i & ADVANCE_MASK ring indexing stays equivalent to i % ADVANCE.\n\nDonor uses STORED_SEQS = 8; this PR starts at 4 to keep ring on the\nstack within register pressure. Future iterations can dial up after\nprofiling confirms headroom.\n\nCloses #208.\n\n* docs(decode): clarify prefetch L2 deviation + comment direction\n\nTwo doc consistency findings from the pre-squash review:\n\n- execute_one_sequence comment said 'the pipeline above intentionally\n  defers...' but the pipelined decode loop is BELOW this helper\n  (execute_one_sequence is a nested fn defined at the top of the\n  outer function; the loop using it comes after). Reword as\n  'pipelined decode loop below' so the directional reference\n  matches the file layout.\n\n- prefetch_lookahead_match_source's body comment claimed 'donor\n  PREFETCH_L1 parity' but the implementation calls\n  prefetch_slice_t1, which uses _MM_HINT_T1 (L2 destination) on\n  x86. Document the deviation explicitly: ADVANCE iterations of\n  decode sit between prefetch issue and the matching repeat()\n  load, so an L1-bound line risks eviction before consumption —\n  L2 has the capacity to keep the line resident across that\n  window. The pre-existing in-loop prefetch_match_source makes\n  the same T1 choice for the same reason; surfacing it here\n  prevents the same review comment next iteration.\n\n* perf(decode): gate prefetch on offset >= 32 KiB + drop dead prefill guard\n\nTwo findings from the post-squash review:\n\n- Issue #208 explicitly calls for the prefetch pipeline to be\n  triggered only when the match offset exceeds an L1/L2 residency\n  proxy (~32 KiB), so short-offset matches whose source is already\n  warm don't burn issue-port pressure. The pipeline was prefetching\n  every sequence unconditionally — add a PREFETCH_OFFSET_THRESHOLD\n  (32 KiB) gate to both the prefill and steady-state loops, using\n  the existing read-only est_offset (exact for seq.of >= 4 which\n  covers every fresh long-distance match the gate targets).\n\n- The prefill loop's \"if k + 1 < num_sequences\" FSE-state-update\n  guard was dead under the outer \"num_sequences >= ADVANCE * 2\"\n  precondition (k < ADVANCE implies k + 1 <= ADVANCE < num_sequences),\n  so the update fires every iteration regardless. Drop the guard\n  and update the comment so the redundancy doesn't read as a\n  pending edge case to a future maintainer; the steady-state loop\n  keeps its conditional because i + 1 == num_sequences is reachable\n  there.\n\n* fix(decode): use wrapping_add for prefetch position math to stay fuzz-stable\n\nprefetch_pos / match_start derived `seq.ll`, `seq.ml` straight from\nthe bitstream. On a malformed/corrupt frame those values can be\nhuge enough to overflow usize when added, panicking debug builds\n(fuzz, CI). The result feeds only the prefetch hint — and\nprefetch_lookahead_match_source bound-checks the logical position\nagainst buffer.len() so a wrap-derived garbage index is silently\ndropped. Switch the two cursor increments (prefill loop +\nsteady-state loop, four sites in total) to wrapping_add so a\nmalformed input becomes a bogus-but-dropped prefetch instead of a\npanic.\n\n* perf(decode): exact actual_offset via shadow_hist + short-offset fast path\n\nTwo CR Major findings on the prefetch pipeline:\n\n1. Stale repcode history could suppress the long-distance prefetch.\n   The previous estimate read the live offset_hist but never advanced\n   it for the ADVANCE-queued sequences, so a fresh huge offset\n   immediately followed by a repcode (1..=3) would see pre-update\n   history and resolve to the OLD value — exactly the scenario the\n   threshold gate then refused to prefetch, killing the gain on the\n   workloads this pipeline targets.\n\n   Replace estimate_actual_offset() with a local shadow_hist:[u32;3]\n   advanced by do_offset_history() per decode-ahead. The real\n   offset_hist still only mutates inside execute_one_sequence (the\n   single committing site, preserving rollback semantics), but the\n   shadow gives the prefetch path the exact post-resolution value\n   for every repcode case. estimate_actual_offset is now removed.\n\n2. Pipelined path ran on large all-short-offset blocks too.\n   num_sequences >= ADVANCE * 2 was the only gate, so a long block\n   of close-range matches paid ring/prefill/drain overhead while\n   issuing zero prefetches.\n\n   Track saw_prefetch_needed during prefill — flips true on the first\n   actual_offset >= PREFETCH_OFFSET_THRESHOLD. If it stays false\n   through all ADVANCE prefills (the block is dominated by warm\n   short-offset matches), drain the queued ring sequences in order\n   and continue with the single-pass loop for the rest, skipping\n   the ring overhead entirely. If even one prefill sequence crosses\n   the threshold, stay on the pipelined steady-state path.\n\n* refactor(decode): align prefetch pipeline comments + drop redundant tail-slice guard\n\nThree Copilot consistency findings on the previous shadow_hist patch:\n\n- The PREFETCH_OFFSET_THRESHOLD comment still described the gate as\n  reading the `est_offset` variable that no longer exists — the\n  current code computes `actual_offset` via do_offset_history on the\n  shadow hist. Reword to match.\n- The shadow_hist allocation note called it a \"usize-triple\" but it\n  is actually `[u32; 3]` (12 bytes, not 24). Fix the size claim so\n  cost reasoning is accurate.\n- prefetch_lookahead_match_source's else branch had an explicit\n  `if idx < s2.len()` guard around the s2 prefetch path. With the\n  top-of-function `start_idx >= self.buffer.len()` early-return and\n  `buffer.len() == s1.len() + s2.len()`, the else branch (entered\n  only when start_idx >= s1.len()) guarantees idx < s2.len() by\n  construction — the explicit guard was a dead branch in a hot\n  helper. Drop it, add a comment explaining the invariant.\n\n* perf(decode): gate prefetch pipeline by FSE-table long-offset share (donor parity)\n\nBench against main showed the pipeline as it stood (gated only by\nnum_sequences >= 8 + per-seq actual_offset >= 32 KiB) regressed\nhigh-entropy / random-data decode by 2-5% while the target\nlong-window workload (decodecorpus) was essentially zero. Reading\ndonor `ZSTD_decompressBlock_internal` revealed we'd missed the\nfront-of-block selector entirely: donor decides Long-vs-Short\npipeline ONCE per block from the offsets FSE table shape, not\nper-sequence.\n\nImplement the donor `ZSTD_getOffsetInfo` equivalent:\n\n- Walk fse.offsets.decode up-front; count entries whose offset code\n  is > 22 (raw offset >= 2^23 = 8 MiB).\n- Scale the count to donor's OffFSELog = 8 (256-entry reference)\n  via `raw << (OFFSET_FSE_LOG - table_log)` so a finely-tuned table\n  still registers meaningful share.\n- Engage the Long pipeline only when `num_sequences >= ADVANCE * 2`\n  AND `scaled_share >= 7` (~2.73 % of the table — donor's 64-bit\n  `minShare`). Otherwise drop to the single-pass loop.\n\nSide cleanups the new gate makes redundant:\n\n- The mid-block `saw_prefetch_needed` opt-out is gone — the FSE-table\n  decision is taken before any sequence decode and applies to the\n  whole block, addressing the CR Major (the previous opt-out\n  couldn't engage the pipeline for blocks whose long-distance\n  offsets only appeared past the first ADVANCE prefills).\n- The per-sequence `PREFETCH_OFFSET_THRESHOLD` constant is gone —\n  donor `ZSTD_decompressSequencesLong_body` prefetches every queued\n  slot unconditionally inside the Long pipeline. Per-seq gating\n  risked skipping the prefetch for the slot whose source was the\n  actual cache miss; gone for donor parity + simpler control flow.\n\n* fix(decode): prefetch across s1/s2 boundary when match source spans the ring wrap\n\nPreviously `prefetch_lookahead_match_source` issued the prefetch\nhint from exactly one of the wrap-aware ring buffer's two slices.\nWhen the match source landed near the end of `s1` and the tail\nin `s1` was shorter than `PREFETCH_EXTENT` (128 B), the helper\nprefetched only what fit in s1 and the rest of the line silently\nwent unfetched — the donor \"up to two cache lines per match\"\nintent collapsed to one or even zero useful prefetch hints at\nexactly the wrap boundary.\n\nTop up from `s2[0..]` when the s1 tail is shorter than the\ntarget extent, so the wrap case ends up with the same total\nprefetch coverage as a non-wrap case.\n\n* perf(decode): bump prefetch ADVANCE 4→8 + switch lookahead hint T1→T0 (donor parity)\n\nTwo donor-parity moves on top of the FSE-gated pipeline:\n\n- ADVANCE = 8 to match donor STORED_SEQS. The 4-deep ring left too\n  small a gap between prefetch issue and consume — many lookahead\n  prefetches landed in the load-store pipeline before the line had\n  cleared DRAM, defeating the latency-hiding intent. 8-deep is the\n  proven donor depth for `ZSTD_decompressSequencesLong_body`. Ring\n  is now `[Sequence; 8]` = 96 B on the stack, still register-friendly.\n- Lookahead prefetch routes through `prefetch_slice` (PREFETCH_T0 →\n  L1 destination on x86), matching donor `PREFETCH_L1` exactly.\n  Previously we routed through `prefetch_slice_t1` (T1 → L2) on the\n  theory that L2 would survive the lookahead gap better; the 4-deep\n  shape that drove that reasoning is gone now and the L1 hint is\n  what donor actually ships.\n\n* perf(decode): short-circuit FSE offsets walk by num_sequences first\n\nThe FSE offsets table walk costs ~50-100 ns per block (up to 256\nentry iterations). Blocks that can't engage the pipeline anyway —\neither because num_sequences < ADVANCE * 2 or because the kernel\nemitted a literal-only block — were paying that cost for nothing.\nOn high-entropy / random payloads (typically many small blocks\nwith few sequences each) the accumulated walk overhead was visible\nas a 2-5 % decode regression even though the pipeline never\nengaged.\n\nReorder the gate so the `num_sequences >= ADVANCE * 2` check\nshort-circuits the FSE walk. Block decode for short / no-sequence\nblocks now lands directly on the single-pass path with zero extra\ntable-iteration cost.\n\n* refactor(decode): pointer-width-aware long-offset gate + accurate format-spec note\n\nThree Copilot findings on the FSE-table gate:\n\n- `MIN_LONG_OFFSET_SHARE_64BIT` was used unconditionally on 32-bit\n  too. Donor's `minShare = MEM_64bits() ? 7 : 20`. Split into a\n  cfg-gated `MIN_LONG_OFFSET_SHARE` so the 32-bit threshold (20,\n  ~7.8 % of the table) actually applies on 32-bit builds — donor\n  raises the bar there because the prefetch pipeline needs a\n  stronger long-offset signal to outrun the narrower load window\n  on 32-bit targets.\n- The bound `table_log <= OFFSET_FSE_LOG` was attributed to\n  `MAX_OFFSET_CODE = 31`, but the real source is `OF_MAX_LOG = 8`\n  passed as the `max_log` argument to `build_decoder` for the\n  offsets table. Reword the comment so future readers see the\n  format-spec invariant, not a misleading chain of inference.\n- The early-exit on `num_sequences < ADVANCE * 2` (added in the\n  previous commit) already short-circuits the FSE walk before it\n  is computed — restating the protocol explicitly in the comment\n  so the deferred-walk intent stays obvious.\n\n* docs(decode): align prefetch pipeline comments with ADVANCE=8 + T0/L1 hint\n\nThree Copilot doc-consistency findings on stale comments from\nearlier ADVANCE=4 / T1 iterations of this PR:\n\n- The opening pipeline header said \"4-slot software pipeline\"\n  while ADVANCE is 8 — update to 8-slot.\n- The prefetch_pos init comment said \"We pre-decode 4 ahead\"\n  with a literal 4 — replace with \"ADVANCE ahead\" so the comment\n  tracks the constant.\n- The prefetch_lookahead_match_source doc comment claimed \"we\n  route to L2 instead\" but the helper now calls prefetch_slice\n  (_MM_HINT_T0 / pldl1keep — both L1). Reword to match the actual\n  cache level.\n\n* fix(decode): prefetch the match-start cache line even when s1/s2 tail < 64B\n\nprefetch_slice is by design a no-op when the slice is shorter than\none cache line, which is the right call for bulk prefetch but wrong\nfor the wrap-boundary match-source case in\nprefetch_lookahead_match_source: a 16-byte s1 tail still has the\nexact line containing the match start, and that line is what the\nconsumer is about to read.\n\nAdd a new prefetch_first_line_l1 helper that issues exactly one L1\nprefetch hint at the first byte of the supplied slice regardless of\nslice length (x86_64 / x86 / aarch64 implementations; no-op on\nother targets). prefetch_lookahead_match_source now falls back to\nthis helper whenever the s1 tail or the s2 continuation is shorter\nthan CACHE_LINE, so the match-start line is hinted in every\nboundary case — including the configurations where prefetch_slice\nwould have silently dropped both halves of the lookahead.\n\n* docs(decode): drop redundant 'STORED_SEQS = 8' echo in ADVANCE power-of-two guard comment\n\nThe earlier '4-slot' / '8-deep' confusion was already resolved by\nlanding ADVANCE = 8 and updating the surrounding comments. The\npower-of-two guard comment still mentioned the legacy donor value\nparenthetically; trim it so the file no longer has any stale\n4-vs-8 references and the PR title alignment is unambiguous.\n\n* perf(decode): cache offsets-long-share in FSEScratch, recompute only on table rebuild\n\nThe per-block walk of the offsets FSE decode table (counting entries\nwhose symbol > 22) was paid even on Repeat-mode blocks where the\ntable didn't change between blocks. On a corpus where REPEAT\ndominates after the first non-trivial block (typical for compressed\nstreams that lock onto an FSE distribution and stick with it), this\nwas 32–256 entry comparisons per block for zero new information.\n\nMove the share computation to a `compute_offsets_long_share` helper\ncalled from `maybe_update_fse_tables` ONLY when the FSE / Predefined\nbranches actually rebuild the offsets table. Cache the result in a\nnew `FSEScratch::offsets_long_share` field; Repeat-mode blocks read\nthe cached value as-is — donor parity (donor's ddict-cold path also\ncaches the share signal) plus removal of the per-block O(table_size)\noverhead from the pipeline-gate decision.\n\nThe pipeline gate becomes `num_sequences >= ADVANCE*2 && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE`\n— one branch + one load, no table walk.\n\n* docs+test(decode): align review comments + add prefetch_lookahead_match_source coverage\n\nThree doc / scope updates plus one new test module section in response\nto CR notes on the prefetch pipeline:\n\n- Reword the 'offset_hist mutates here and only here' comment to\n  acknowledge that the post-loop rollback path also assigns to it\n  (recovery, not the normal mutation site that the comment was\n  about).\n- Reword the 'AT MOST two prefetch issues per match' comment to\n  acknowledge the wrap-boundary case where the 128 B budget is\n  split across s1_tail + s2[0..], emitting up to four cache-line\n  prefetches total (still bounded, still L1, still under the\n  helper's MAX_LINES = 4 ceiling).\n- Add three unit tests for prefetch_lookahead_match_source covering\n  in-range probes, out-of-range / empty-buffer probes (early-return\n  bound check), and the wrap-boundary layout where as_slices()\n  returns two non-empty halves (exercises the prefetch_first_line_l1\n  short-tail fallback path).\n\n* perf(decode): pipeline-aware repeat variant + pre-resolved offset in ring (A+B+C)\n\nThree donor-vs-ours overhead trims in the pipelined decode hot path,\neach gated by the existing FSE-long-share pipeline-engage decision so\nthe short-block fused path keeps its existing repeat() semantics\nunchanged.\n\nA. New `DecodeBuffer::repeat_lookahead_prefetched` variant.\n   The regular `repeat` issues an in-loop `prefetch_match_source`\n   (T1 hint) at the match source — sensible for the no-pipeline path\n   that has no other prefetch source. When the long pipeline is\n   active, the lookahead PREFETCH_L1 was already issued ADVANCE\n   iterations earlier; the second in-loop prefetch is pure\n   issue-port pressure on top of a now-warm L1 line. The pipelined\n   variant drops that second prefetch.\n\nB. Pre-resolved offset stored in the ring slot.\n   Ring goes from `[Sequence; 8]` to `[(Sequence, u32); 8]`. The\n   decode-ahead phase already walks `shadow_hist` via\n   `do_offset_history` to resolve the prefetch's source offset\n   exactly; we now store that resolved offset alongside the raw\n   sequence. The execute phase consumes the pre-resolved value via\n   a new `execute_one_sequence_pipelined` helper and skips\n   `do_offset_history` entirely — saves one function call and one\n   cache write on the real `offset_hist` per sequence (real hist\n   was the only mutable shared state in the execute path; pipelined\n   now leaves it strictly local until the single end-of-block sync).\n   The committing point becomes `*offset_hist = shadow_hist` ONCE\n   after a successful drain. Rollback on post-loop bitstream failure\n   still restores from `saved_offset_hist` — the new shape just\n   makes that restore a no-op on the pipelined path (real hist was\n   never mutated mid-loop) while preserving correctness on the\n   non-pipelined fallback.\n\nC. `repeat_lookahead_prefetched` also drops the per-call\n   `self.buffer.reserve(match_length)`. The pipelined caller\n   already reserved `MAX_BLOCK_SIZE` upfront before entering the\n   pipeline, so each per-sequence reserve was a redundant\n   capacity-check branch. The variant relies on that upfront reserve\n   exclusively — saves one branch per executed sequence.\n\n* fix(decode): keep buffer.reserve in pipelined repeat + scratch reset of offsets_long_share\n\nThree CR findings on the A+B+C pipelined-repeat patch:\n\n- repeat_lookahead_prefetched skipped buffer.reserve(match_length).\n  On malformed input where match_length expands past the upfront\n  reserve(MAX_BLOCK_SIZE), extend_from_within_unchecked* assumes\n  the destination capacity and only debug_assert checks it —\n  release builds would have written out of bounds. The reserve is\n  amortised by the caller's upfront reservation anyway, so this is\n  just a cheap capacity-check branch on the hot path, not an\n  allocation. Restore it; only the in-loop prefetch_match_source\n  stays skipped (that's the actual win).\n- Rename the SKIP_PREFETCH const param to match what it actually\n  controls now that reserve is unconditional.\n- offsets_long_share doc said the cached value counts codes\n  '≥ LONG_OFFSET_CODE_THRESHOLD' but the helper uses strictly '>'\n  (donor parity — '> 22' means codes 23..MAX, i.e. raw offsets ≥\n  2^23). Fix the doc string.\n- DecoderScratch::reset() reset every FSE-related field except\n  offsets_long_share, leaving a stale gate signal across scratch\n  reuse. A new frame opening with Repeat-mode tables would inherit\n  the previous frame's pipeline-engage decision. Reset alongside\n  ll_rle / ml_rle / of_rle.\n\n* docs+test(decode): align pipeline comments with actual ring/reserve shape + offsets_long_share tests\n\nThree doc + test additions in response to CR notes on the A+B+C\npipelined-repeat patch:\n\n- The execute_one_sequence_pipelined doc claimed it skipped both\n  prefetch and reserve, but repeat_lookahead_prefetched keeps the\n  reserve (memory-safety against malformed match_length). Rewrite\n  the doc so only the in-loop prefetch is described as skipped.\n- The on-stack ring comment still said '[Sequence; 8] = 96 bytes'\n  after the A+B+C refactor stored '(Sequence, u32)' pairs (128 B\n  on a 64-bit target). Update the size + element type description.\n- Add four unit tests for compute_offsets_long_share covering:\n  pure short-offset tables resolve to zero share; symbols at the\n  threshold (=22) don't count (strict-greater predicate, donor\n  parity); raw count scales by (OFFSET_FSE_LOG - table_log) so a\n  single long-code entry in a 32-entry table lands at share 8;\n  raw count passes through unscaled when table is already at\n  OFFSET_FSE_LOG = 8. Uses a synthetic_offsets_table helper that\n  bypasses build_from_probabilities — the share helper only reads\n  decode[*].symbol + accuracy_log, so we can construct the table\n  by hand without a full bitstream.\n\n* fix(decode): recompute offsets_long_share in FSEScratch::reinit_from\n\nDictionary-init flow (`Dictionary::decode_dict` → `DecoderScratch::init_from_dict` → `FSEScratch::reinit_from`) builds the offsets FSE table from the dictionary's entropy section without ever calling the sequence-decoder path that updates the cache, so `other.offsets_long_share` was the default 0. Verbatim-copying that into `self.offsets_long_share` left Repeat-mode blocks (which reuse the dictionary's offsets table) gated out of the long-pipeline path regardless of the table's actual offset distribution.\n\nRecompute the share inside `reinit_from` from the just-copied offsets table via the existing `compute_offsets_long_share` helper (bumped from private to `pub(crate)`). The walk is bounded by `OF_MAX_LOG = 8` (≤ 256 entries) and runs once per scratch reinit — negligible vs the rest of the per-frame setup.\n\n* fix(decode): rollback offset_hist + buffer on mid-loop pipelined Err\n\nThe pipelined branch deferred the real-`offset_hist` commit to a\nsingle `*offset_hist = shadow_hist` at the end of a successful\ndrain. On an `execute_one_sequence_pipelined` Err propagated via\n`?` (NotEnoughBytesForSequence, ZeroOffset, OOB match copy) that\ncommit never ran — the function exited with `*offset_hist` still\nat its pre-block value while the buffer had N-1 partial writes.\n\nThat diverged from the non-pipelined path: `execute_one_sequence`\nmutates real hist in lockstep per executed sequence, so on\nmid-loop Err the caller sees N-1 hist updates + N-1 buffer writes\n(in lockstep, internally consistent). The pipelined path left the\ntwo out of sync, breaking scratch reuse after any Err.\n\nWrap the entire pipelined work in an IIFE that returns Result, so\na single `if let Err(e) = pipeline_result` site at the end\ncatches mid-loop Errs uniformly and routes them through the same\nbuffer-checkpoint-rollback path the post-loop bitstream validation\nalready used. `*offset_hist = saved_offset_hist` after the\nrollback is a no-op on the pipelined path (real hist was never\ntouched mid-loop) but stays explicit so future refactors that\nmove the commit earlier remain safe.",
+          "timestamp": "2026-05-22T21:04:18+03:00",
+          "tree_id": "1d27e2144eb04eba9ed3a3b66a462b13b33e6180",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d7bb5666dc3934af867615695d3f9b49acad5fc2"
+        },
+        "date": 1779476551169,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.147,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 294.649,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 237.728,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.526,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.368,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.708,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.039,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.655,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.979,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.354,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.349,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.154,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.063,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.245,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
