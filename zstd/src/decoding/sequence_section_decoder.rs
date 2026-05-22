@@ -177,21 +177,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
     );
 
-    // Donor `ZSTD_getOffsetInfo` parity: walk the FSE offsets table
-    // up-front and count how many entries decode to offset codes
-    // > 22 (i.e. raw offsets ≥ 2^23 = 8 MiB). Scale the count up to
-    // the donor's `OffFSELog = 8` (256-entry) reference so the
-    // share is comparable to the donor's `minShare = 7` threshold
-    // (≈ 2.73 % of the offsets table). The gate decision is taken
-    // ONCE per block from the FSE table shape, not per-sequence —
-    // donor's principle: blocks whose offset code distribution
-    // doesn't favour long-distance matches stay on the single-pass
-    // (no-prefetch) path where the ring/prefill/drain overhead
-    // would only cost cycles.
+    // Donor `ZSTD_getOffsetInfo` parity: when the block has enough
+    // sequences to amortise the pipeline's prefill + drain, walk
+    // the FSE offsets table and count entries that decode to offset
+    // codes > 22 (i.e. raw offsets >= 2^23 = 8 MiB). Scale up to
+    // donor's `OffFSELog = 8` (256-entry reference) so the share
+    // compares to `minShare = 7` (~2.73 % of the offsets table).
+    // The walk is gated by the sequence-count check FIRST so that
+    // short / no-sequence blocks (typical of high-entropy / random
+    // payloads where the kernel emits literal-only blocks) don't
+    // pay the table-walk cost.
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
     const MIN_LONG_OFFSET_SHARE_64BIT: u32 = 7;
-    let long_offset_share = {
+    let use_long_pipeline = num_sequences >= ADVANCE * 2 && {
         let table = &fse.offsets.decode;
         let table_log = fse.offsets.accuracy_log as u32;
         let raw = table
@@ -199,11 +198,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
             .count() as u32;
         // Donor scales `raw` to OffFSELog so a small/fine-grained
-        // table can still register a meaningful share. With
-        // `table_log <= OffFSELog` (true for every valid offsets
-        // table — `MAX_OFFSET_CODE = 31` enforces `accuracy_log <=
-        // 8`), the shift is wrap-free.
-        raw << OFFSET_FSE_LOG.saturating_sub(table_log)
+        // table still registers meaningful share. `table_log <=
+        // OffFSELog` for every valid offsets table (MAX_OFFSET_CODE
+        // = 31 keeps accuracy_log <= 8), so the shift is wrap-free.
+        let long_offset_share = raw << OFFSET_FSE_LOG.saturating_sub(table_log);
+        long_offset_share >= MIN_LONG_OFFSET_SHARE_64BIT
     };
     // Donor also engages the prefetch decoder when the dictionary is
     // cold or when the format-level `isLongOffset` flag is set. We
@@ -211,8 +210,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // 32-bit `isLongOffset` shortcut is irrelevant on the
     // u32-indexed decoder, so the FSE-share signal carries the
     // whole decision.
-    let use_long_pipeline =
-        num_sequences >= ADVANCE * 2 && long_offset_share >= MIN_LONG_OFFSET_SHARE_64BIT;
 
     if use_long_pipeline {
         // `prefetch_pos` is the logical buffer index (same frame as
