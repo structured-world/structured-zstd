@@ -422,11 +422,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // line across the gap; if profiling later shows L1 eviction
         // pressure we can revisit T1/L2.
         const PREFETCH_EXTENT: usize = 128;
+        const CACHE_LINE: usize = 64;
         let (s1, s2) = self.buffer.as_slices();
         if start_idx < s1.len() {
             let s1_tail = &s1[start_idx..];
             let s1_bound = core::cmp::min(s1_tail.len(), PREFETCH_EXTENT);
-            prefetch::prefetch_slice(&s1_tail[..s1_bound]);
+            // `prefetch_slice` no-ops on slices shorter than one cache
+            // line — sensible for bulk prefetch, but wrong for the
+            // wrap-boundary case where the cache line containing
+            // `start_idx` IS the line we need warmed even if the
+            // remaining contiguous extent is < 64 B. Fall back to the
+            // single-line variant in that case so the match-start
+            // line is always hinted.
+            if s1_bound >= CACHE_LINE {
+                prefetch::prefetch_slice(&s1_tail[..s1_bound]);
+            } else {
+                prefetch::prefetch_first_line_l1(&s1_tail[..s1_bound]);
+            }
             // Wrap continuation: when the match source straddles the
             // s1/s2 boundary and the s1 tail is shorter than the
             // PREFETCH_EXTENT we asked for, top up the rest from
@@ -436,8 +448,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             if s1_bound < PREFETCH_EXTENT {
                 let remaining = PREFETCH_EXTENT - s1_bound;
                 let s2_bound = core::cmp::min(s2.len(), remaining);
-                if s2_bound > 0 {
+                if s2_bound >= CACHE_LINE {
                     prefetch::prefetch_slice(&s2[..s2_bound]);
+                } else if s2_bound > 0 {
+                    prefetch::prefetch_first_line_l1(&s2[..s2_bound]);
                 }
             }
         } else {
@@ -449,7 +463,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let idx = start_idx - s1.len();
             let tail = &s2[idx..];
             let bound = core::cmp::min(tail.len(), PREFETCH_EXTENT);
-            prefetch::prefetch_slice(&tail[..bound]);
+            if bound >= CACHE_LINE {
+                prefetch::prefetch_slice(&tail[..bound]);
+            } else {
+                prefetch::prefetch_first_line_l1(&tail[..bound]);
+            }
         }
     }
 

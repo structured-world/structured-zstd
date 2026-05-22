@@ -3,6 +3,25 @@ pub(crate) fn prefetch_slice(slice: &[u8]) {
     prefetch_slice_impl_l1(slice);
 }
 
+/// Issue exactly one L1 prefetch hint at the first byte of `slice`,
+/// regardless of `slice.len()`. Use when the caller knows the slice
+/// is short (< CACHE_LINE) but the cache line containing
+/// `slice.as_ptr()` is still the one the consumer is about to read.
+///
+/// The standard `prefetch_slice` early-returns on slices below one
+/// cache line, which is the right call for bulk prefetch (no point
+/// hinting a partial buffer) but the wrong call for the wrap-boundary
+/// match-source case in `prefetch_lookahead_match_source`: there a
+/// 16-byte s1 tail is the EXACT line we need warmed even though it
+/// sits below the bulk threshold.
+#[inline(always)]
+pub(crate) fn prefetch_first_line_l1(slice: &[u8]) {
+    if slice.is_empty() {
+        return;
+    }
+    prefetch_first_line_l1_impl(slice.as_ptr());
+}
+
 #[inline(always)]
 pub(crate) fn prefetch_slice_t1(slice: &[u8]) {
     prefetch_slice_impl_t1(slice);
@@ -13,6 +32,15 @@ pub(crate) fn prefetch_slice_t1(slice: &[u8]) {
 fn prefetch_slice_impl_l1(slice: &[u8]) {
     use core::arch::x86_64::_MM_HINT_T0;
     prefetch_stride_x86_64::<{ _MM_HINT_T0 }>(slice);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_first_line_l1_impl(ptr: *const u8) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: `_mm_prefetch` accepts any address — prefetching an
+    // invalid pointer is a no-op by the ISA spec, not UB.
+    unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -50,6 +78,13 @@ fn prefetch_slice_impl_l1(slice: &[u8]) {
 
 #[cfg(all(target_arch = "x86", target_feature = "sse"))]
 #[inline(always)]
+fn prefetch_first_line_l1_impl(ptr: *const u8) {
+    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+    unsafe { _mm_prefetch(ptr.cast(), _MM_HINT_T0) };
+}
+
+#[cfg(all(target_arch = "x86", target_feature = "sse"))]
+#[inline(always)]
 fn prefetch_slice_impl_t1(slice: &[u8]) {
     use core::arch::x86::_MM_HINT_T1;
     prefetch_stride_x86::<{ _MM_HINT_T1 }>(slice);
@@ -78,6 +113,19 @@ fn prefetch_stride_x86<const HINT: i32>(slice: &[u8]) {
 #[inline(always)]
 fn prefetch_slice_impl_l1(slice: &[u8]) {
     prefetch_stride_aarch64::<true>(slice);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn prefetch_first_line_l1_impl(ptr: *const u8) {
+    use core::arch::asm;
+    unsafe {
+        asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -128,6 +176,14 @@ fn prefetch_stride_aarch64<const L1: bool>(slice: &[u8]) {
 )))]
 #[inline(always)]
 fn prefetch_slice_impl_l1(_slice: &[u8]) {}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "x86", target_feature = "sse"),
+    target_arch = "aarch64",
+)))]
+#[inline(always)]
+fn prefetch_first_line_l1_impl(_ptr: *const u8) {}
 
 #[cfg(not(any(
     target_arch = "x86_64",
