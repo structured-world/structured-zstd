@@ -385,6 +385,45 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Lookahead-friendly prefetch issued ahead of execute. The
+    /// in-loop `prefetch_match_source` above fires at the moment of
+    /// the copy, so it can't hide DRAM latency for cold long-distance
+    /// match sources. Pipelined callers compute the match source
+    /// logical index 3-4 sequences in advance and call this helper —
+    /// by the time the corresponding `repeat()` reaches the actual
+    /// load, the line is already in-flight.
+    ///
+    /// `start_idx` is a logical index into the current buffer (same
+    /// frame as `buffer.len()`). Indices past `buffer.len()` mean the
+    /// match source refers to bytes this block hasn't written yet
+    /// (intra-block self-overlap) — those don't exist in memory yet
+    /// and the prefetch is silently dropped. The donor (`PREFETCH_L1`
+    /// in `ZSTD_prefetchMatch`) tolerates invalid addresses by spec,
+    /// but in safe Rust the cheapest equivalent is to bound-check the
+    /// logical position before chasing the slice.
+    #[inline(always)]
+    pub(crate) fn prefetch_lookahead_match_source(&self, start_idx: usize, _match_length: usize) {
+        if start_idx >= self.buffer.len() {
+            return;
+        }
+        // No `match_length < 64` gate here — the in-loop helper skips
+        // tiny matches because the prefetch issue cost is comparable
+        // to the load. With 3-4 sequences of lookahead the prefetch
+        // overlaps work the CPU has to do anyway, so even sub-cache-
+        // line matches benefit. We always prefetch a single cache line
+        // (prefetch_slice_t1 caps at 4 lines internally; passing the
+        // sub-slice extent ≤ 1 line keeps it to one issue).
+        let (s1, s2) = self.buffer.as_slices();
+        if start_idx < s1.len() {
+            prefetch::prefetch_slice_t1(&s1[start_idx..]);
+        } else {
+            let idx = start_idx - s1.len();
+            if idx < s2.len() {
+                prefetch::prefetch_slice_t1(&s2[idx..]);
+            }
+        }
+    }
+
     #[cold]
     fn repeat_from_dict(
         &mut self,

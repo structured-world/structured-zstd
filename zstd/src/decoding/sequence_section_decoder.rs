@@ -109,13 +109,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     let saved_offset_hist = *offset_hist;
 
     #[inline(always)]
-    fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
+    fn execute_resolved_sequence<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,
         literals: &[u8],
         lit_cur: &mut usize,
         lit_len: usize,
-        offset_hist: &mut [u32; 3],
         seq: Sequence,
+        actual_offset: u32,
     ) -> Result<(), DecompressBlockError> {
         let high = *lit_cur + seq.ll as usize;
         if high > lit_len {
@@ -131,42 +131,157 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         *lit_cur = high;
         buffer.push(lits);
 
-        let actual = do_offset_history(seq.of, seq.ll, offset_hist);
-        if actual == 0 {
+        if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset.into());
         }
         buffer
-            .repeat(actual as usize, seq.ml as usize)
+            .repeat(actual_offset as usize, seq.ml as usize)
             .map_err(ExecuteSequencesError::from)?;
         Ok(())
     }
 
-    // Single fused loop over all sequences. The state-update step
-    // (`ensure_bits` + per-decoder `update_state_fast`) is skipped on
-    // the final iteration — matching the donor `isLastSeq` template
-    // pattern (no pre-fetch of the next state when there is no next
-    // sequence). Under `#[inline(always)]` the trailing `if i + 1 <
-    // num_sequences` collapses to the same generated code as the
-    // previous split-shape version, but keeps the per-sequence body in
-    // one place so future edits to the hot path stay in sync.
     let num_sequences = section.num_sequences as usize;
-    for i in 0..num_sequences {
-        let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-        execute_one_sequence(
-            buffer,
-            literals_buffer,
-            &mut lit_cur,
-            literals_buffer_len,
-            offset_hist,
-            seq,
-        )?;
-        seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
 
-        if i + 1 < num_sequences {
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(&mut br);
-            ml_dec.update_state_fast(&mut br);
-            of_dec.update_state_fast(&mut br);
+    // 4-slot software pipeline mirroring donor
+    // `ZSTD_decompressSequencesLong_body`. Pre-decode `ADVANCE`
+    // sequences ahead, prefetch each match source as we go, then
+    // execute the oldest in-flight sequence per iteration while
+    // decoding the next one. By the time `execute_resolved_sequence`
+    // reaches `buffer.repeat()` for slot k, the prefetch issued
+    // `ADVANCE` iterations earlier has had time to pull the source
+    // line(s) into L1/L2 — hiding DRAM latency for long-distance
+    // matches whose source is beyond cache residency.
+    //
+    // Donor uses STORED_SEQS = 8; we start at 4 to keep the ring on
+    // the stack within register pressure and reuse later iterations
+    // to dial up if profiling shows headroom. The pipeline is opt-in
+    // by `num_sequences >= ADVANCE * 2` — for short blocks the
+    // prefill + drain overhead dominates the prefetch gain, so the
+    // existing fused single-pass path stays in charge there.
+    const ADVANCE: usize = 4;
+    const ADVANCE_MASK: usize = ADVANCE - 1;
+
+    if num_sequences >= ADVANCE * 2 {
+        // `prefetch_pos` is the logical buffer index (same frame as
+        // `buffer.len()`) at which the NEXT not-yet-decoded sequence
+        // will start pushing literals. We pre-decode 4 ahead, so we
+        // accumulate (ll + ml) per resolved seq to keep this position
+        // synchronised with where execute will eventually be.
+        let mut prefetch_pos: usize = old_buffer_size;
+        // Stack ring of (raw seq, resolved actual_offset). Storing
+        // `actual_offset` up front lets execute skip
+        // `do_offset_history` — the resolution already mutated
+        // `offset_hist` at decode-ahead time.
+        let mut ring: [(Sequence, u32); ADVANCE] = [(
+            Sequence {
+                ll: 0,
+                ml: 0,
+                of: 0,
+            },
+            0,
+        ); ADVANCE];
+
+        // Pre-fill the ring. The FSE state-update guard mirrors the
+        // single-pass loop: skip update after the very last decode
+        // (when k+1 == num_sequences) since there is no next decode.
+        for (k, slot) in ring.iter_mut().enumerate() {
+            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+            // Issue lookahead prefetch even when actual == 0; the
+            // helper short-circuits invalid positions, and we want
+            // the same control flow on the malformed-input path so
+            // the deferred ZeroOffset check fires from execute.
+            let match_start = prefetch_pos + seq.ll as usize;
+            let source_idx = match_start.wrapping_sub(actual as usize);
+            buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
+            prefetch_pos = match_start + seq.ml as usize;
+            *slot = (seq, actual);
+            if k + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+            }
+        }
+
+        // Steady state: decode next, prefetch its source, execute the
+        // oldest slot in the ring. `i & ADVANCE_MASK` is both the
+        // oldest slot (currently holding seq at logical index i -
+        // ADVANCE) and the slot we overwrite with the newly-decoded
+        // seq[i] — donor pattern.
+        for i in ADVANCE..num_sequences {
+            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+            let match_start = prefetch_pos + seq.ll as usize;
+            let source_idx = match_start.wrapping_sub(actual as usize);
+            buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
+            prefetch_pos = match_start + seq.ml as usize;
+
+            let slot = i & ADVANCE_MASK;
+            let (exec_seq, exec_actual) = ring[slot];
+            ring[slot] = (seq, actual);
+
+            execute_resolved_sequence(
+                buffer,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                exec_seq,
+                exec_actual,
+            )?;
+            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+
+            if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+            }
+        }
+
+        // Drain: execute remaining ADVANCE sequences. Iteration order
+        // matches the ring slot they occupy from the steady-state
+        // loop's final write — start from `num_sequences & MASK` to
+        // preserve sequence order.
+        for k in 0..ADVANCE {
+            let slot = (num_sequences + k) & ADVANCE_MASK;
+            let (exec_seq, exec_actual) = ring[slot];
+            execute_resolved_sequence(
+                buffer,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                exec_seq,
+                exec_actual,
+            )?;
+            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+        }
+    } else {
+        // Short-block fallback: the single-pass fused loop. For
+        // num_sequences < ADVANCE * 2 the pipeline's prefill + drain
+        // dominates the cycles saved by prefetch lookahead, so the
+        // simpler shape wins. Inlined here (rather than a separate
+        // function) so the cold tail-call cost of swapping decoders
+        // mid-block stays at zero.
+        for i in 0..num_sequences {
+            let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+            execute_resolved_sequence(
+                buffer,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                seq,
+                actual,
+            )?;
+            seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+
+            if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+            }
         }
     }
 
