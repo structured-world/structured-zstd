@@ -363,17 +363,45 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 // without `RUSTFLAGS="-C target-feature=+avx2"` the dispatcher cfg-gates
 // out every call site (runtime detection lives behind `feature = "std"`).
 // In std builds and target_feature=+avx2 builds the function is live.
+//
+// Inner loop is unrolled to 2× 32-byte AVX2 vectors per iteration (64
+// bytes / iter), with a single-vector tail handling the residual 32
+// bytes when `len` is a non-multiple of 64. The dispatcher rounds
+// `copy_at_least` up to a multiple of 32 before calling, so `len`
+// here is always a multiple of 32 — the loop body handles
+// `len & !63` bytes, the tail handles the remaining 0 or 32.
+//
+// The two independent load / store pairs per iteration expose more
+// instruction-level parallelism to the out-of-order core and amortise
+// the loop branch, shortening AVX2 wildcopy latency. Actual speed-up
+// is workload-dependent — measured in `benches/wildcopy_candidates.rs`
+// (criterion micro) and end-to-end via `benches/compare_ffi.rs`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
 unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
-    let end = unsafe { src.add(len) };
-    while src < end {
+    debug_assert!(
+        len.is_multiple_of(32),
+        "copy_avx2 expects len to be a multiple of 32 (dispatcher rounds up)",
+    );
+    let end_unrolled = len & !63;
+    let mut copied = 0usize;
+    while copied < end_unrolled {
+        unsafe {
+            let v0: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
+            let v1: __m256i = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
+            _mm256_storeu_si256(dst.cast::<__m256i>(), v0);
+            _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), v1);
+            src = src.add(64);
+            dst = dst.add(64);
+        }
+        copied += 64;
+    }
+    // Residual 32-byte vector when `len` is 32 mod 64.
+    if copied < len {
         unsafe {
             let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
             _mm256_storeu_si256(dst.cast::<__m256i>(), v);
-            src = src.add(32);
-            dst = dst.add(32);
         }
     }
 }
@@ -484,10 +512,45 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
+        // Single 32-byte vector (no unrolled body, tail-only path).
         let src = [8_u8; 32];
         let mut dst = [0_u8; 32];
         unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 32) };
         assert_eq!(dst, src);
+    }
+
+    /// Exercises one full iteration of the 64-byte unrolled body
+    /// (`v0` + `v1` load/store pair) with no residual tail.
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn copy_avx2_copies_full_unroll2_iteration() {
+        use alloc::vec::Vec;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..64u8).collect();
+        let mut dst = [0_u8; 64];
+        unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 64) };
+        assert_eq!(&dst[..], &src[..]);
+    }
+
+    /// Exercises ONE unrolled 64-byte iteration PLUS the single-
+    /// vector 32-byte residual tail (96 = 64 + 32). Validates that
+    /// the tail branch doesn't overwrite preceding bytes and copies
+    /// the correct source offset.
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn copy_avx2_copies_unroll2_loop_plus_residual_tail() {
+        use alloc::vec::Vec;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..96u8).collect();
+        let mut dst = [0_u8; 96];
+        unsafe { copy_avx2(src.as_ptr(), dst.as_mut_ptr(), 96) };
+        assert_eq!(&dst[..], &src[..]);
+        // Spot-check tail boundary: bytes 60..68 span the unroll/tail seam.
+        assert_eq!(&dst[60..68], &[60, 61, 62, 63, 64, 65, 66, 67]);
     }
 
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
