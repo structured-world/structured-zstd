@@ -197,6 +197,32 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<false>(offset, match_length)
+    }
+
+    /// Same as [`repeat`] but the caller asserts (1) the buffer was
+    /// pre-reserved for the whole block (so the per-call `reserve` is
+    /// redundant) and (2) a lookahead prefetch was already issued for
+    /// this match source ADVANCE iterations ago (so the in-loop
+    /// `prefetch_match_source` would be redundant issue-port pressure
+    /// on top of the L1 line that's by now warm). Used exclusively by
+    /// the pipelined sequence executor in
+    /// [`crate::decoding::sequence_section_decoder`].
+    #[inline(always)]
+    pub(crate) fn repeat_lookahead_prefetched(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<true>(offset, match_length)
+    }
+
+    #[inline(always)]
+    fn repeat_inner<const PIPELINED: bool>(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
         if offset == 0 {
             return Err(DecodeBufferError::ZeroOffset);
         }
@@ -212,8 +238,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
-            self.buffer.reserve(match_length);
-            self.prefetch_match_source(start_idx, match_length);
+            if !PIPELINED {
+                self.buffer.reserve(match_length);
+                self.prefetch_match_source(start_idx, match_length);
+            }
             if end_idx > buf_len {
                 self.repeat_overlapping(offset, match_length, start_idx);
             } else {
@@ -226,7 +254,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 //      3. end_idx <= self.buffer.len()
                 //      Thus follows: start_idx + match_length <= self.buffer.len()
                 //
-                // 2. explicitly reserved enough memory for the whole match_length
+                // 2. PIPELINED path relies on caller's upfront
+                //    `reserve(MAX_BLOCK_SIZE)` covering the whole block;
+                //    non-PIPELINED path just reserved `match_length`.
                 unsafe {
                     if offset >= 16 && use_branchless_wildcopy() {
                         self.buffer

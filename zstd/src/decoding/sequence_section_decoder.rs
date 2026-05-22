@@ -108,15 +108,19 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
-    // `offset_hist` mutates here (via do_offset_history) during normal
-    // sequence execution and ONLY here on the in-band success path —
-    // the pipelined decode loop below resolves repcodes against a
-    // local `shadow_hist`, never the caller's real `offset_hist`.
-    // (The post-loop rollback path also assigns to `*offset_hist`,
-    // but only to restore `saved_offset_hist` snapshot on a malformed
-    // block; that's recovery, not normal execution.) This preserves
-    // the legacy two-pass 'partial output, no rewound history'
-    // contract on early exits.
+    // `offset_hist` mutation on the in-band success path:
+    //   * Pipelined branch (long pipeline): real `offset_hist` is NOT
+    //     touched per-sequence — repcodes are resolved against the
+    //     local `shadow_hist`, and the resolved offset is stored in
+    //     the ring alongside the decoded sequence. After successful
+    //     drain we copy `shadow_hist` back into `*offset_hist` once.
+    //   * Non-pipelined branch (short-block fallback): real
+    //     `offset_hist` IS mutated inline via `do_offset_history` in
+    //     `execute_one_sequence`.
+    //   * Rollback path (post-loop bitstream check fails): restore
+    //     `*offset_hist = saved_offset_hist`. Cheap no-op on the
+    //     pipelined branch (real hist was never touched mid-loop),
+    //     correct rewind on the non-pipelined branch.
     #[inline(always)]
     fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
         buffer: &mut super::decode_buffer::DecodeBuffer<B>,
@@ -146,6 +150,44 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         }
         buffer
             .repeat(actual as usize, seq.ml as usize)
+            .map_err(ExecuteSequencesError::from)?;
+        Ok(())
+    }
+
+    /// Pipelined-path variant: takes the offset already resolved by
+    /// the decode-ahead `shadow_hist` walk, so `do_offset_history` is
+    /// NOT called here (caller mutated only the shadow). Routes the
+    /// match copy through `repeat_lookahead_prefetched` to skip the
+    /// in-loop `prefetch_match_source` + redundant `reserve` that the
+    /// upfront `reserve(MAX_BLOCK_SIZE)` plus the lookahead pipeline's
+    /// PREFETCH_L1 already covered.
+    #[inline(always)]
+    fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
+        buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+        literals: &[u8],
+        lit_cur: &mut usize,
+        lit_len: usize,
+        seq: Sequence,
+        resolved_offset: u32,
+    ) -> Result<(), DecompressBlockError> {
+        let high = *lit_cur + seq.ll as usize;
+        if high > lit_len {
+            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                wanted: high,
+                have: lit_len,
+            }
+            .into());
+        }
+        // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
+        let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+        *lit_cur = high;
+        buffer.push(lits);
+
+        if resolved_offset == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset.into());
+        }
+        buffer
+            .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
             .map_err(ExecuteSequencesError::from)?;
         Ok(())
     }
@@ -225,34 +267,33 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         // shadow is a local `[u32; 3]` (12 bytes) so the simulation cost
         // is negligible.
         let mut shadow_hist: [u32; 3] = *offset_hist;
-        // Stack ring of raw sequences. The execute path calls
-        // `do_offset_history` again on the real `offset_hist` for
-        // each drained slot — that's the single committing site.
-        let mut ring: [Sequence; ADVANCE] = [Sequence {
-            ll: 0,
-            ml: 0,
-            of: 0,
-        }; ADVANCE];
+        // Stack ring of `(decoded_seq, resolved_offset)` pairs. The
+        // decode-ahead phase resolves repcodes against `shadow_hist`
+        // and stores the resolved offset alongside the raw sequence,
+        // so the execute phase consumes a pre-resolved offset and
+        // skips `do_offset_history` entirely — saves one function
+        // call + one cache write on real `offset_hist` per sequence.
+        // The real `offset_hist` is updated ONCE from `shadow_hist`
+        // after a successful drain (below); on a malformed-block
+        // rollback the saved snapshot is restored, so real hist is
+        // never observed in a partial mid-pipeline state.
+        let mut ring: [(Sequence, u32); ADVANCE] = [(
+            Sequence {
+                ll: 0,
+                ml: 0,
+                of: 0,
+            },
+            0u32,
+        ); ADVANCE];
 
         // Pre-fill the ring. The outer `num_sequences >= ADVANCE * 2`
         // gate guarantees `num_sequences > ADVANCE`, so the FSE
-        // state update is needed after every prefill decode (k <
-        // ADVANCE implies k + 1 <= ADVANCE < num_sequences) — no
+        // state update is needed after every prefill decode — no
         // `isLastSeq` guard required here, only in the steady-state
         // loop where `i + 1 == num_sequences` is reachable.
-        //
-        // Unconditional prefetch per slot — the FSE-table share check
-        // above already committed to long-distance dominance, so a
-        // mid-block dynamic opt-out would just split control flow
-        // for no win. Per-sequence gating runs the risk of skipping
-        // the prefetch for the slot whose source LATER becomes the
-        // cache miss; donor stays unconditional inside the Long
-        // pipeline for the same reason.
         for slot in ring.iter_mut() {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            // EXACT actual_offset via shadow history — repcode
-            // 1..=3 lookups see the same post-update values execute
-            // will see when it later commits to the real hist.
+            // EXACT actual_offset via shadow history.
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             // wrapping_add: prefetch_pos / seq.ll / seq.ml are
             // derived from the bitstream, so a malformed frame can
@@ -266,7 +307,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             let source_idx = match_start.wrapping_sub(actual_offset as usize);
             buffer.prefetch_lookahead_match_source(source_idx);
             prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-            *slot = seq;
+            *slot = (seq, actual_offset);
             br.ensure_bits(max_update_bits);
             ll_dec.update_state_fast(&mut br);
             ml_dec.update_state_fast(&mut br);
@@ -274,10 +315,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         }
 
         // Steady state: decode next, prefetch its source, execute
-        // the oldest slot in the ring. `i & ADVANCE_MASK` is both
-        // the oldest slot (currently holding seq at logical index
-        // i - ADVANCE) and the slot we overwrite with the newly-
-        // decoded seq[i] — donor pattern.
+        // the oldest slot in the ring (with its pre-resolved offset).
         for i in ADVANCE..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
@@ -287,16 +325,16 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             prefetch_pos = match_start.wrapping_add(seq.ml as usize);
 
             let slot = i & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            ring[slot] = seq;
+            let (exec_seq, exec_offset) = ring[slot];
+            ring[slot] = (seq, actual_offset);
 
-            execute_one_sequence(
+            execute_one_sequence_pipelined(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                offset_hist,
                 exec_seq,
+                exec_offset,
             )?;
             seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
@@ -308,23 +346,30 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             }
         }
 
-        // Drain: execute remaining ADVANCE sequences. Iteration
-        // order matches the ring slot they occupy from the
-        // steady-state loop's final write — start from
-        // `num_sequences & MASK` to preserve sequence order.
+        // Drain: execute remaining ADVANCE sequences with their
+        // pre-resolved offsets. Iteration order matches the ring
+        // slot they occupy from the steady-state loop's final write.
         for k in 0..ADVANCE {
             let slot = (num_sequences + k) & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            execute_one_sequence(
+            let (exec_seq, exec_offset) = ring[slot];
+            execute_one_sequence_pipelined(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                offset_hist,
                 exec_seq,
+                exec_offset,
             )?;
             seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
         }
+
+        // Single committing point for real offset history on the
+        // pipelined success path. Shadow walked every queued sequence
+        // already; copy that state back so the next block sees the
+        // post-block repcodes. Rollback on a later bitstream-failure
+        // overwrites this with `saved_offset_hist`, undoing the
+        // commit.
+        *offset_hist = shadow_hist;
     } else {
         // Short-block fallback: the single-pass fused loop. For
         // num_sequences < ADVANCE * 2 the pipeline's prefill + drain
