@@ -80,6 +80,10 @@ pub struct FrameDecoder {
     shared_dicts: BTreeMap<u32, DictionaryHandle>,
     #[cfg(not(target_has_atomic = "ptr"))]
     shared_dicts: (),
+    /// `ZSTD_f_zstd1_magicless` — when true, [`init`] / [`reset`]
+    /// expect frames without the 4-byte magic number prefix.
+    /// Default false (standard zstd format).
+    magicless: bool,
 }
 
 /// Backend-tagged decode scratch — chosen at frame-reset time based
@@ -252,12 +256,18 @@ pub enum BlockDecodingStrategy {
 }
 
 impl FrameDecoderState {
-    /// Read the frame header from `source` and create a new decoder state.
-    ///
-    /// Pre-allocates the decode buffer to `window_size` so the first block
-    /// does not trigger incremental growth from zero capacity.
-    pub fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
-        let (frame, header_size) = frame::read_frame_header(source)?;
+    /// Construct a new frame decoder state, reading the frame header
+    /// from `source`. When `magicless` is `true`, the 4-byte magic
+    /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
+    /// Crate-internal — reached only via `FrameDecoder::init` /
+    /// `FrameDecoder::init_with_dict_handle`. Pre-allocates the
+    /// decode buffer to `window_size` so the first block does not
+    /// trigger incremental growth from zero capacity.
+    pub(crate) fn new_with_format(
+        source: impl Read,
+        magicless: bool,
+    ) -> Result<FrameDecoderState, FrameDecoderError> {
+        let (frame, header_size) = frame::read_frame_header_with_format(source, magicless)?;
         let window_size = frame.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -282,13 +292,22 @@ impl FrameDecoderState {
         })
     }
 
-    /// Reset this state for a new frame read from `source`, reusing existing allocations.
+    /// Reset this state for a new frame read from `source`, reusing
+    /// existing allocations. When `magicless` is `true`, the frame
+    /// header is read WITHOUT expecting a magic-number prefix
+    /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
+    /// only via `FrameDecoder::reset`.
     ///
-    /// `DecodeBuffer::reset` reserves `window_size` internally, so no
-    /// additional frame-level reservation is needed here. Further buffer
-    /// growth during decoding is performed on demand by the active block path.
-    pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
-        let (frame_header, header_size) = frame::read_frame_header(source)?;
+    /// `DecodeBuffer::reset` reserves `window_size` internally, so
+    /// no additional frame-level reservation is needed here.
+    /// Further buffer growth during decoding is performed on demand
+    /// by the active block path.
+    pub(crate) fn reset_with_format(
+        &mut self,
+        source: impl Read,
+        magicless: bool,
+    ) -> Result<(), FrameDecoderError> {
+        let (frame_header, header_size) = frame::read_frame_header_with_format(source, magicless)?;
         let window_size = frame_header.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -327,7 +346,29 @@ impl FrameDecoder {
             shared_dicts: BTreeMap::new(),
             #[cfg(not(target_has_atomic = "ptr"))]
             shared_dicts: (),
+            magicless: false,
         }
+    }
+
+    /// Enable or disable magicless frame format
+    /// (`ZSTD_f_zstd1_magicless`). When set to `true`, subsequent
+    /// [`init`] / [`reset`] calls expect the frame header to begin
+    /// directly with the frame-header descriptor — no 4-byte magic
+    /// number prefix. Default false. Must match the encoder's
+    /// magicless setting; the format is unambiguous only when the
+    /// caller knows it out-of-band.
+    ///
+    /// Note: magicless mode also disables skippable-frame detection.
+    /// The `0x184D2A50..=0x184D2A5F` skippable-frame magic range is
+    /// only recognised when the 4-byte magic prefix is consumed, so
+    /// `decode_all` / `init` / `reset` will treat a skippable frame
+    /// at the head of a magicless stream as a malformed frame header
+    /// (bad descriptor / window-size error) instead of skipping it.
+    /// Mixed-format streams that interleave skippable frames must be
+    /// pre-split by the caller; `set_magicless(true)` is only safe
+    /// when the entire stream is known to be magicless zstd frames.
+    pub fn set_magicless(&mut self, magicless: bool) {
+        self.magicless = magicless;
     }
 
     #[cfg(target_has_atomic = "ptr")]
@@ -398,13 +439,14 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        let magicless = self.magicless;
         let dict_id = match &mut self.state {
             Some(s) => {
-                s.reset(source)?;
+                s.reset_with_format(source, magicless)?;
                 s.frame_header.dictionary_id()
             }
             None => {
-                self.state = Some(FrameDecoderState::new(source)?);
+                self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
                 self.state
                     .as_ref()
                     .and_then(|state| state.frame_header.dictionary_id())
@@ -459,13 +501,14 @@ impl FrameDecoder {
     ) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
         Self::validate_registered_dictionary(dict.as_dict())?;
+        let magicless = self.magicless;
         let state = match &mut self.state {
             Some(s) => {
-                s.reset(source)?;
+                s.reset_with_format(source, magicless)?;
                 s
             }
             None => {
-                self.state = Some(FrameDecoderState::new(source)?);
+                self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
                 self.state.as_mut().unwrap()
             }
         };
