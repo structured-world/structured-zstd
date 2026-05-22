@@ -303,10 +303,14 @@
           Same six series as Level Profile, but plotted against
           <strong>snapshot / commit time</strong> on the X-axis and
           averaged across <strong>every</strong> (level, scenario,
-          target) cohort for that snapshot — within each cohort the
-          decompress source variants (<code>rust_stream</code> +
-          <code>c_stream</code>) collapse into the inner mean so they
-          don't outweigh compress rows. Each point answers
+          target) cohort for that snapshot — each row's logical metric
+          (compress speed / decompress speed / ratio) is bucketed
+          separately, and within each <code>decompress_speed</code>
+          cohort the two source variants (<code>rust_stream</code> +
+          <code>c_stream</code>) collapse into the inner mean so a
+          (level, scenario, target) with two sources contributes the
+          same weight to the snapshot average as a (level, scenario,
+          target) with one. Each point answers
           “across the whole bench matrix, where are we right now vs
           FFI?” — useful for spotting aggregate dynamics across commits
           regardless of which level or corpus drove the change. The top
@@ -1328,16 +1332,18 @@
         // how that one level evolves across runs.
         const historyMode = filter.level !== ALWAYS;
         const built = historyMode ? buildProfileLevelHistoryData(filter) : buildProfileData(filter);
-        const labels = historyMode ? built.snapshots : built.levels;
-        const labelCount = historyMode ? built.snapshotCount : built.levelCount;
-        const baseDatasets = historyMode
+        // X-axis labels: in level-axis mode these are the per-level
+        // tick labels; in history mode they are snapshot identifiers
+        // (generated_at / commit_sha). Kept under a neutral name so
+        // the rest of the render flow doesn't pretend they're always
+        // levels.
+        const xLabels = historyMode ? built.snapshots : built.levels;
+        const xLabelCount = historyMode ? built.snapshotCount : built.levelCount;
+        const datasets = historyMode
           ? buildProfileSeriesDatasets(built.series)
           : built.datasets;
         const xAxisTitle = historyMode ? "Snapshot (generated_at / commit)" : "Compression level";
-        const datasets = baseDatasets;
-        const levelCount = labelCount;
-        const levels = labels;
-        if (!levelCount) {
+        if (!xLabelCount) {
           if (state.profileChart) {
             // No data for the chosen filter — clear the chart in place
             // rather than destroying it, so the next non-empty selection
@@ -1354,13 +1360,13 @@
           return;
         }
         const snapshotNote = historyMode
-          ? `history across ${labelCount} snapshot(s) for level=${filter.level}`
+          ? `history across ${xLabelCount} snapshot(s) for level=${filter.level}`
           : (filter.snapshot === PROFILE_LATEST
             ? "latest per (level, metric, cohort) — points may come from different snapshots"
             : `snapshot=${filter.snapshot} (all points from this single run)`);
         const axisDesc = historyMode ? "snapshot" : "level";
         el("profile-status").textContent =
-          `Showing ${labelCount} ${axisDesc} point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
+          `Showing ${xLabelCount} ${axisDesc} point(s) — target=${filter.target}, scenario=${filter.scenario}, level=${filter.level} (${snapshotNote}).`;
 
         const chartDatasets = buildProfileDatasets(datasets);
 
@@ -1379,13 +1385,13 @@
           // every target/scenario/stage switch.
           state.profileChart.options.scales.x.title.text = xAxisTitle;
           state.profileChart.options.scales.x.ticks = xTicks;
-          state.profileChart.data.labels = levels;
+          state.profileChart.data.labels = xLabels;
           state.profileChart.data.datasets = chartDatasets;
           state.profileChart.update("none");
         } else {
           state.profileChart = new Chart(el("chart-profile"), {
             type: "line",
-            data: { labels: levels, datasets: chartDatasets },
+            data: { labels: xLabels, datasets: chartDatasets },
             options: {
               responsive: true,
               maintainAspectRatio: false,
