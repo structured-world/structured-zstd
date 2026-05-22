@@ -371,10 +371,11 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 // here is always a multiple of 32 — the loop body handles
 // `len & !63` bytes, the tail handles the remaining 0 or 32.
 //
-// Unroll-2 cuts AVX2 wildcopy LATENCY (and so lifts throughput)
-// by ~30-50 % across all length classes (64 B → 64 KiB) by issuing
-// two independent load / store pairs per iteration, increasing OoO
-// ILP and amortising the loop branch.
+// The two independent load / store pairs per iteration expose more
+// instruction-level parallelism to the out-of-order core and amortise
+// the loop branch, shortening AVX2 wildcopy latency. Actual speed-up
+// is workload-dependent — measured in `benches/wildcopy_candidates.rs`
+// (criterion micro) and end-to-end via `benches/compare_ffi.rs`.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
@@ -440,7 +441,6 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
 mod tests {
     use super::*;
     use alloc::vec;
-    use alloc::vec::Vec;
 
     #[test]
     fn copy_bytes_overshooting_zero_len_is_noop() {
@@ -524,6 +524,7 @@ mod tests {
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx2_copies_full_unroll2_iteration() {
+        use alloc::vec::Vec;
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
@@ -540,6 +541,7 @@ mod tests {
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx2_copies_unroll2_loop_plus_residual_tail() {
+        use alloc::vec::Vec;
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
