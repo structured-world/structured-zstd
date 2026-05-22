@@ -1760,7 +1760,19 @@ mod tests {
         // bump max_window_size to reflect the dict-retention
         // budget (mirrors MatchGeneratorDriver::prime_with_dictionary
         // for the Simple backend).
-        let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 64)).collect();
+        //
+        // Pattern period 4 (`(i % 4)`) — dense enough that the donor-
+        // parity `kSearchStrength = 8` (K_STEP_INCR = 128) step
+        // doubling, which skips positions under step=3 in dict scan,
+        // still leaves matches hittable from block2: every position
+        // divisible by 4 inside the [in-window, hashed] subset writes
+        // the same hash slot, so the slot at block2's first probe
+        // contains a recent in-window dict position. Period 64 (the
+        // original fixture) only had matches at positions {0, 64,
+        // 128, 192} — positions 0, 64, 128 are below the sliding
+        // floor and 192 falls in the step-skip gap, leaving the test
+        // with zero emittable matches.
+        let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 4)).collect();
         m.accept_data(dict.clone());
         m.start_matching(|_| {}); // populate hash table from dict
         m.max_window_size = m.max_window_size.saturating_add(200);
@@ -1770,7 +1782,7 @@ mod tests {
         // ~history_len (200..300), since the inflated max_window
         // (328) keeps even the dict's earliest bytes inside the
         // sliding floor.
-        let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 64)).collect();
+        let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 4)).collect();
         m.accept_data(block);
 
         let mut max_emitted_offset = 0usize;

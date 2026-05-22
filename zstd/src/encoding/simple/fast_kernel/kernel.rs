@@ -53,15 +53,23 @@ pub(crate) fn kernel_trace_enabled() -> bool {
     }
 }
 
-/// Donor `kSearchStrength` — the step-skip accelerator advances the
-/// per-iteration step every `1 << (kSearchStrength - 1) = 32` bytes
-/// when no matches are found, so incompressible regions skip ahead
-/// faster than the linear 1-byte advance.
-const SEARCH_STRENGTH: usize = 6;
+/// Donor `kSearchStrength` — defined in `zstd_compress_internal.h:32`
+/// as `#define kSearchStrength 8`. The step-skip accelerator advances
+/// the per-iteration step every `1 << (kSearchStrength - 1) = 128`
+/// bytes when no matches are found, so incompressible regions skip
+/// ahead faster than the linear 1-byte advance.
+///
+/// Issue #220 fix: previously had `SEARCH_STRENGTH = 6` (`K_STEP_INCR
+/// = 32`), causing our step doubling to fire 4× more frequently than
+/// donor — by ip0=1280 our step was ~40 while donor's was 12. This
+/// drove the +7.43% ratio gap on decodecorpus-z000033 at Level(1)
+/// Fast: cursor skipped too many positions, missing matches donor
+/// found via finer-grained probing.
+const SEARCH_STRENGTH: usize = 8;
 
-/// Donor `kStepIncr = 1 << (kSearchStrength - 1)` — every this-many
-/// bytes of no-match scanning, the per-iteration `step` is bumped
-/// by 1 (donor's `step++` at `zstd_fast.c:343`). Drives the
+/// Donor `kStepIncr = 1 << (kSearchStrength - 1) = 128` — every this-
+/// many bytes of no-match scanning, the per-iteration `step` is
+/// bumped by 1 (donor's `step++` at `zstd_fast.c:343`). Drives the
 /// incompressible-region step acceleration.
 const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 
