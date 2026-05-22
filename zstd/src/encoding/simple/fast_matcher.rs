@@ -102,6 +102,14 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// initial state). Donor relies on its `ip0 += (ip0 == prefixStart)`
 /// bump to skip position 0 instead — both approaches match the same
 /// 0..N-1 byte ranges for the hash table.
+///
+/// Tradeoff: this rejects legitimate position-0 matches donor would
+/// emit (rare — requires `read32(ip0)` to coincidentally equal
+/// `read32(base)`), but cross-block isolation under
+/// `skip_matching_with_hint(None)` depends on the sentinel — the
+/// `skip_matching_with_none_hint_skips_hash_population` test
+/// exercises that contract. Lowering to 0 breaks the test; the
+/// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
 /// Donor-shape Fast-strategy matcher state.
