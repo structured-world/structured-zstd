@@ -12,6 +12,47 @@ use super::count::count_forward;
 use super::hash_table::FastHashTable;
 use crate::encoding::Sequence;
 
+/// Per-iteration diagnostic tracing of the Fast kernel inner loop.
+///
+/// Compile-time gated by `--features kernel_trace`; runtime-gated by
+/// `STRUCTURED_ZSTD_KERNEL_TRACE` env var (any non-empty value).
+/// Production builds carry ZERO cost — the macro expands to a no-op
+/// when the feature is off, so the hot loop never even sees the
+/// `if std::env::var(..)` check.
+///
+/// Used by `examples/trace_fast_kernel.rs` to diff our kernel's
+/// state against donor `zstd_fast.c:266-348` reasoning at every iter
+/// in the first block of decodecorpus-z000033 (issue #220 ratio gap).
+#[cfg(feature = "kernel_trace")]
+macro_rules! ktrace {
+    ($($arg:tt)*) => {
+        if crate::encoding::simple::fast_kernel::kernel::kernel_trace_enabled() {
+            ::std::eprintln!($($arg)*);
+        }
+    };
+}
+#[cfg(not(feature = "kernel_trace"))]
+macro_rules! ktrace {
+    ($($arg:tt)*) => {};
+}
+
+#[cfg(feature = "kernel_trace")]
+pub(crate) fn kernel_trace_enabled() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("STRUCTURED_ZSTD_KERNEL_TRACE")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Donor `kSearchStrength` — the step-skip accelerator advances the
 /// per-iteration step every `1 << (kSearchStrength - 1) = 32` bytes
 /// when no matches are found, so incompressible regions skip ahead
@@ -406,6 +447,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     // with hash precomputation, repcode-at-ip2 probe, two explicit-
     // match probes (at ip0 then at the shifted ip0), and a step-
     // doubling cadence.
+    ktrace!(
+        "ENTER block_start={} ip0_initial={} ilimit={} window_low={} prefix={} rep1={} rep2={} step={} mls={}",
+        block_start,
+        ip0,
+        ilimit,
+        window_low,
+        prefix_start_index,
+        rep_offset1,
+        rep_offset2,
+        step_size,
+        MLS,
+    );
     'restart: while ip0 < ilimit {
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
@@ -433,6 +486,19 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         let mut hash0 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip0)) };
         let mut hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip1)) };
         let mut match_idx = unsafe { hash_table.get(hash0) };
+        ktrace!(
+            "OUTER ip0={} ip1={} ip2={} ip3={} step={} hash0={} hash1={} match_idx={} rep1={} rep2={}",
+            ip0,
+            ip1,
+            ip2,
+            ip3,
+            step,
+            hash0,
+            hash1,
+            match_idx,
+            rep_offset1,
+            rep_offset2
+        );
 
         // Inner do-while body. On any match, break out with the
         // `MatchFound` enum carrying the match coordinates; the
@@ -484,6 +550,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // even if the iteration's match comes from rep at ip2.
             // SAFETY: hash0 from hash_ptr ⇒ in-bounds; ip0 ≤ u32::MAX
             // by the entry-point cap.
+            ktrace!("PUT hash0={} pos={} (iter-start)", hash0, ip0);
             unsafe { hash_table.put(hash0, ip0 as u32) };
 
             // Repcode-at-ip2 check.
@@ -515,7 +582,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // Safe writeback for hash1 — ip1 is BEFORE ip2 (the
                 // match site), so its position won't conflict with
                 // the match's forward extension. Donor lines 286-287.
+                ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
                 unsafe { hash_table.put(hash1, ip1 as u32) };
+                ktrace!(
+                    "MATCH rep new_ip={} match0={} m_len={} offset={}",
+                    new_ip,
+                    match0,
+                    m_len,
+                    rep_offset1
+                );
                 break Some(MatchFound::Rep {
                     new_ip,
                     match0,
@@ -527,12 +602,20 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // First explicit-match probe at ip0 (donor line 292).
+            ktrace!("PROBE1 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
                 match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
                 // search resumption). Donor line 296.
+                ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
                 unsafe { hash_table.put(hash1, ip1 as u32) };
+                ktrace!(
+                    "MATCH explicit1 ip0={} match_idx={} offset={}",
+                    ip0,
+                    match_idx,
+                    ip0 as i64 - match_idx as i64
+                );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
                     match_idx,
@@ -553,10 +636,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             ip2 = ip3;
 
             // Writeback for new ip0. Donor lines 314-315.
+            ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
             unsafe { hash_table.put(hash0, ip0 as u32) };
 
             // Second explicit-match probe at the shifted ip0
             // (donor line 317).
+            ktrace!("PROBE2 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
                 match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
@@ -564,13 +649,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // (donor lines 319-324) — otherwise ip1 might fall
                 // past the match start when we resume scanning.
                 if step <= 4 {
+                    ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
                     unsafe { hash_table.put(hash1, ip1 as u32) };
                 }
+                ktrace!(
+                    "MATCH explicit2 ip0={} match_idx={} offset={}",
+                    ip0,
+                    match_idx,
+                    ip0 as i64 - match_idx as i64
+                );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
                     match_idx,
-                    // After the shift + writeback at line 488,
-                    // current0 == shifted ip0.
                     current0: ip0,
                 });
             }

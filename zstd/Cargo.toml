@@ -70,6 +70,11 @@ critical-section = ["dep:critical-section"]
 bench_internals = []
 fuzz_exports = []
 std = []
+# Diagnostic tracing of the Fast kernel's inner loop — per-iteration state
+# dumps gated at compile time so production builds carry zero cost. Runtime
+# activation via `STRUCTURED_ZSTD_KERNEL_TRACE=1` env var. Used by the
+# `trace_fast_kernel` example for #220 ratio-divergence investigation.
+kernel_trace = ["std"]
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
