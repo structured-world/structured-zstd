@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779436394463,
+  "lastUpdate": 1779445693166,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -42950,6 +42950,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "47c0e811158f4cbfe02cc2368b65fb2f7a5e7131",
+          "message": "perf(decoding): integrate AVX2 unroll-2 wildcopy candidate (#108) (#223)\n\n* perf(decoding): integrate AVX2 unroll-2 wildcopy candidate (#108)\n\nReplace single-vector AVX2 wildcopy inner loop with the 2x-unrolled\ncandidate from PR #87's research. The new loop issues two\nindependent 32-byte AVX2 load/store pairs per iteration (64 bytes\nper cycle) and handles a residual 32-byte vector for the\nnon-multiple-of-64 tail. The dispatcher contract is unchanged —\n`copy_at_least` is still rounded up to a multiple of 32 before\nthe call, so the tail branch fires at most once per call.\n\nThe unroll exposes more out-of-order instruction-level parallelism\n(two independent load/store pairs in flight) and amortises the\nloop branch over 64 bytes instead of 32. From the bench evidence\nin #87 (zstd/benches/wildcopy_candidates.rs):\n\n| Size  | AVX2 single | AVX2 unroll-2 | Δ     |\n|-------|------------:|--------------:|------:|\n|   64B |       3 ns  |        2 ns   | -33% |\n|  256B |       7 ns  |        4 ns   | -43% |\n| 1024B |      28 ns  |       14 ns   | -50% |\n| 4096B |      94 ns  |       58 ns   | -38% |\n| 16 KB |     347 ns  |      268 ns   | -23% |\n| 64 KB |    1368 ns  |     1121 ns   | -18% |\n\nProduction bench validation (compare_ffi on i9-9900K AVX2 host)\nfollows in a separate run; this commit lands the code so the\nbench picks up the change automatically.\n\n573/573 tests pass; clippy clean (M1 host — fallback path).\n\nCloses #108.\n\n* address PR #223 review round 1: bench self-check + comment wording + AVX2 unroll2 test coverage\n\n3 review threads + 1 pre-existing bench bug:\n\n- (bench) wildcopy_candidates.rs:267 — pre-existing self-check\n  panic at len=17/33/63: assertion compared dst[..rounded] but\n  production small-copy path writes only dst[..len] (no overshoot\n  for sub-chunk lengths). Restricted assert to dst[..len], the\n  contractual region. Bench can now actually run.\n\n- CR + Copilot — simd_copy.rs:374 comment said 'cuts AVX2\n  wildcopy throughput by ~30-50%' which reads as a regression.\n  Reworded to 'cuts AVX2 wildcopy LATENCY (and so lifts\n  throughput)' to make the direction unambiguous.\n\n- Copilot — simd_copy.rs:403 missing test coverage for the\n  unrolled body and tail. Added two tests:\n  * copy_avx2_copies_full_unroll2_iteration (len=64)\n  * copy_avx2_copies_unroll2_loop_plus_residual_tail (len=96)\n  with seam spot-check at bytes 60..68.\n\n573/573 tests pass; clippy clean.\n\n* test(simd_copy): import alloc::vec::Vec for no-std build (#223 CR critical)\n\nThe new AVX2 unroll-2 tests use Vec<u8>; std builds get it via\nprelude but no-std builds require explicit import. CR caught\nE0425 on the no-std CI lane.\n\n* docs(bench): drop stale 'check_len' reference in wildcopy comment (#223 Copilot)\n\nComment referred to the removed `check_len` variable; rephrased\nto describe the rounded comparison length generically.\n\n* docs(simd_copy): qualify AVX2 unroll-2 perf claim + scope Vec import to AVX2 tests\n\n- Reword the copy_avx2 comment so it stops promising a quantified\n  ~30-50 % gain 'across all length classes'. The actual delta is\n  workload-dependent — point readers at the two bench files that\n  measure it instead of carrying a stale headline number.\n- Move 'use alloc::vec::Vec;' from the tests-mod header into the two\n  AVX2 tests that actually need it. On non-x86 / non-std test builds\n  the top-level import was unused (the AVX2 tests are cfg-gated out)\n  and could emit a dead-import warning.",
+          "timestamp": "2026-05-22T12:38:37+03:00",
+          "tree_id": "17fce0eaa39972870bc3634c7ad9ab328ed97bf4",
+          "url": "https://github.com/structured-world/structured-zstd/commit/47c0e811158f4cbfe02cc2368b65fb2f7a5e7131"
+        },
+        "date": 1779445688772,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.144,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 290.24,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 248.16,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.466,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.245,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.212,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.971,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.306,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.306,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.555,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.32,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.673,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.243,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.823,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.262,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.854,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.245,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.245,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
             "unit": "ms"
           }
         ]
