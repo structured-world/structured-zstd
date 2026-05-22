@@ -294,7 +294,7 @@ jobs:
           done
       - name: Upload new crash artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: zstd/fuzz/artifacts/
@@ -495,7 +495,7 @@ jobs:
             echo "$name size: $(wc -c < bench-binary/$name) bytes"
           done
       - name: Upload bench binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-binary-${{ matrix.bench.id }}
           path: bench-binary/
@@ -585,7 +585,7 @@ jobs:
           mv benchmark-relative.json benchmark-relative.${{ matrix.bench.id }}.${{ matrix.shard.id }}.json
 
       - name: Upload benchmark shard artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-shard-${{ matrix.bench.id }}-${{ matrix.shard.id }}
           path: |
@@ -631,7 +631,7 @@ jobs:
         # files. `merge-benchmarks.py` rglob's the download root so
         # it picks them up regardless of subdir layout; this lets
         # bench-pages download one artifact instead of one per target.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-aggregated
           path: |
