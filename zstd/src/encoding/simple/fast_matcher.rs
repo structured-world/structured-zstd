@@ -318,7 +318,7 @@ impl FastKernelMatcher {
     /// assert the matcher's own internal record matches.
     #[cfg(test)]
     pub(crate) fn window_size(&self) -> u64 {
-        self.max_window_size as u64
+        1u64 << self.window_log
     }
 
     /// Read-only view of the most recently committed block — donor /
