@@ -84,19 +84,17 @@ pub(crate) const FAST_INITIAL_REP: [u32; 2] = [1, 4];
 /// start and mirrors the value the old [`super::MatchGenerator`] used.
 pub(crate) const FAST_INITIAL_OFFSET_HIST: [u32; 3] = [1, 4, 8];
 
-/// Drain start offset used by eviction / drain paths. NOT a
-/// reserved-bytes count — set to 0 (M8): `history` holds real
-/// input bytes from position 0 onward, donor-parity layout, no
-/// dummy region. Sentinel-0 protection (hash table's empty-slot
-/// value `0` would otherwise be indistinguishable from a real
-/// match at position 0) is provided by
-/// [`INITIAL_PREFIX_START_INDEX`] = 1 via the kernel's
+/// Drain start offset used by eviction / drain paths. Set to 0:
+/// `history` holds real input bytes from position 0 onward,
+/// donor-parity layout, no dummy region. Sentinel-0 protection
+/// (hash table's empty-slot value `0` would otherwise be
+/// indistinguishable from a real match at position 0) is provided
+/// by [`INITIAL_PREFIX_START_INDEX`] = 1 via the kernel's
 /// `match_idx >= prefix_start_index` filter.
 ///
 /// Kept as a named constant so the drain math reads consistently
-/// against future changes; the name is legacy from the pre-M8
-/// "dummy-byte" layout.
-pub(crate) const RESERVED_PREFIX_BYTES: usize = 0;
+/// against future changes.
+pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 
 /// Donor's `prefixStartIndex` floor on fresh frames. Set to 1 (not 0)
 /// so the kernel's `match_idx >= prefix_start_index` filter rejects
@@ -116,7 +114,7 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 ///   current block live in this single contiguous buffer; the kernel's
 ///   `block_start` parameter separates the two.
 /// - `prefix_start_index` is donor's `prefixStartIndex` — the lowest
-///   position any match may reference. Pinned to `RESERVED_PREFIX_BYTES`
+///   position any match may reference. Pinned to `HISTORY_DRAIN_BASE`
 ///   at construction and after every drain (drain re-indexes the
 ///   retained tail).
 /// - `rep` carries the two-deep repcode state across blocks.
@@ -246,13 +244,13 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
-        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
+        // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         // Sentinel-0 protection comes from prefix_start_index =
         // INITIAL_PREFIX_START_INDEX = 1, which filters hash table
         // lookups returning the empty-slot value 0.
-        let history = alloc::vec![0u8; RESERVED_PREFIX_BYTES];
+        let history = alloc::vec![0u8; HISTORY_DRAIN_BASE];
         Self {
-            last_block_start: RESERVED_PREFIX_BYTES,
+            last_block_start: HISTORY_DRAIN_BASE,
             recycled_space: None,
             history,
             // Filter `match_idx >= prefix_start_index` rejects the
@@ -292,9 +290,9 @@ impl FastKernelMatcher {
             // `memset` (donor's `ZSTD_window_clear` cadence).
             self.hash_table.clear();
         }
-        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
+        // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         self.history.clear();
-        self.history.resize(RESERVED_PREFIX_BYTES, 0);
+        self.history.resize(HISTORY_DRAIN_BASE, 0);
         // Sentinel-0 protection via prefix_start_index >= 1 filter
         // — see `with_params` for the full rationale.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
@@ -305,7 +303,7 @@ impl FastKernelMatcher {
         self.step_size = step_size;
         self.max_window_size = 1usize << window_log;
         self.pending = None;
-        self.last_block_start = RESERVED_PREFIX_BYTES;
+        self.last_block_start = HISTORY_DRAIN_BASE;
         self.recycled_space = None;
     }
 
@@ -326,7 +324,7 @@ impl FastKernelMatcher {
     ///
     /// Three states:
     /// - Pre-`accept_data`: empty slice (the
-    ///   `RESERVED_PREFIX_BYTES`-seeded dummy means
+    ///   `HISTORY_DRAIN_BASE`-seeded dummy means
     ///   `history[last_block_start..]` is empty).
     /// - Between `accept_data` and processing: the pending buffer.
     /// - Post-processing: `history` slice of the just-processed
@@ -371,7 +369,7 @@ impl FastKernelMatcher {
         // reported window size (format-correctness risk).
         // Eviction operates on REAL data length (excluding the
         // no dummy at the head of history post-M8).
-        let real_len = self.history.len().saturating_sub(RESERVED_PREFIX_BYTES);
+        let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
         let new_real_total = real_len.saturating_add(space.len());
         let cap = self.max_window_size.saturating_mul(2);
         // Hard precondition: caller must split blocks into pieces no
@@ -429,12 +427,12 @@ impl FastKernelMatcher {
     ///    they'd be "dead history" — visible in the Vec but
     ///    unlookupable).
     fn drain_real_prefix(&mut self, drop_n: usize) {
-        let drain_end = RESERVED_PREFIX_BYTES + drop_n;
-        self.history.drain(RESERVED_PREFIX_BYTES..drain_end);
+        let drain_end = HISTORY_DRAIN_BASE + drop_n;
+        self.history.drain(HISTORY_DRAIN_BASE..drain_end);
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
-        self.prime_hash_table_for_range(RESERVED_PREFIX_BYTES);
+        self.prime_hash_table_for_range(HISTORY_DRAIN_BASE);
     }
 
     /// Internal: drain `self.pending` into `self.history`, applying
@@ -762,23 +760,23 @@ impl FastKernelMatcher {
     }
 
     /// Read-only view of REAL data length (excluding the
-    /// `RESERVED_PREFIX_BYTES` dummy at history's head) for the
+    /// `HISTORY_DRAIN_BASE` dummy at history's head) for the
     /// driver's eviction accounting (`commit_space` →
     /// `retire_dictionary_budget` flow). The driver compares
     /// pre/post values to derive a byte-delta. Returning REAL
     /// length keeps the delta meaningful (drain-of-N-real-bytes
     /// shows up as a clean N drop, not N±constant).
     pub(crate) fn history_len_for_eviction_accounting(&self) -> usize {
-        self.history.len().saturating_sub(RESERVED_PREFIX_BYTES)
+        self.history.len().saturating_sub(HISTORY_DRAIN_BASE)
     }
 
     /// Drop history bytes past `max_window_size` via
     /// [`Self::drain_real_prefix`] (rebases `prefix_start_index` to
-    /// `RESERVED_PREFIX_BYTES`, clears + rehashes the table).
+    /// `HISTORY_DRAIN_BASE`, clears + rehashes the table).
     /// Returns evicted byte count; idempotent when `real_len <=
     /// max_window_size`.
     pub(crate) fn trim_to_window(&mut self) -> usize {
-        let real_len = self.history.len().saturating_sub(RESERVED_PREFIX_BYTES);
+        let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
         if real_len <= self.max_window_size {
             return 0;
         }
@@ -858,11 +856,11 @@ mod tests {
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
         assert_eq!(m.max_window_size, 1usize << FAST_LEVEL_1_WINDOW_LOG);
-        // M8: history starts empty (RESERVED_PREFIX_BYTES = 0).
+        // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         // First input byte will live at position 0; sentinel-0
         // protection comes from the prefix filter, not from a
         // dummy region.
-        assert_eq!(m.history.len(), RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), HISTORY_DRAIN_BASE);
         // prefix_start_index = 1 makes position 0 unmatchable so
         // the hash table's empty-slot value 0 can't be confused
         // with a real match.
@@ -919,9 +917,9 @@ mod tests {
             2,
         );
 
-        // Post-reset: history empty (RESERVED_PREFIX_BYTES=0; no
+        // Post-reset: history empty (HISTORY_DRAIN_BASE=0; no
         // dummy only; prefix_start_index pinned to that baseline.
-        assert_eq!(m.history.len(), RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), HISTORY_DRAIN_BASE);
         assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
@@ -1002,7 +1000,7 @@ mod tests {
         assert!(m.pending.is_none());
         // History grew by exactly the block size (plus the
         // no dummy carried since construction — M8).
-        assert_eq!(m.history.len(), data.len() + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), data.len() + HISTORY_DRAIN_BASE);
         // `last_committed_space` post-processing reads from
         // history[last_block_start..] (donor / legacy MatchGenerator
         // parity for the frame compressor's raw-block emission
@@ -1029,9 +1027,9 @@ mod tests {
 
         assert_eq!(
             m.history.len(),
-            payload.len() + RESERVED_PREFIX_BYTES,
+            payload.len() + HISTORY_DRAIN_BASE,
             "skip_matching must append the pending buffer to history \
-             (above the RESERVED_PREFIX_BYTES dummy)",
+             (above the HISTORY_DRAIN_BASE dummy)",
         );
         assert_eq!(m.rep, pre_rep, "skip must not touch rep state");
         assert_eq!(
@@ -1107,7 +1105,7 @@ mod tests {
         );
         assert_eq!(
             m.history.len(),
-            block1.len() + block2.len() + RESERVED_PREFIX_BYTES,
+            block1.len() + block2.len() + HISTORY_DRAIN_BASE,
             "history must hold both blocks after two start_matching calls",
         );
     }
@@ -1134,7 +1132,7 @@ mod tests {
         m.skip_matching_with_hint(Some(false)); // dictionary-priming skip
 
         // Sanity: history grew, prefix_start_index unchanged.
-        assert_eq!(m.history.len(), dict_block.len() + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), dict_block.len() + HISTORY_DRAIN_BASE);
         assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
 
         // Block 2: 16 fresh bytes + 16-byte copy of dict_block[0..16]
@@ -1231,14 +1229,14 @@ mod tests {
         // accept_data call, so the invariant we assert here is the
         // post-append upper bound.
         assert!(
-            m.history.len() <= m.max_window_size * 2 + RESERVED_PREFIX_BYTES,
+            m.history.len() <= m.max_window_size * 2 + HISTORY_DRAIN_BASE,
             "after eviction, REAL history must be bounded by 2× \
              max_window_size (got history.len()={}, max_window_size={})",
             m.history.len(),
             m.max_window_size,
         );
         assert!(
-            m.history.len() <= m.max_window_size + 200 + RESERVED_PREFIX_BYTES,
+            m.history.len() <= m.max_window_size + 200 + HISTORY_DRAIN_BASE,
             "post-append history = RESERVED dummy + retained prefix \
              (≤ max_window_size) + last block (200 bytes); got {}",
             m.history.len(),
@@ -1257,19 +1255,19 @@ mod tests {
 
     /// Boundary: exactly `HASH_READ_SIZE` (8) real bytes appended
     /// via `skip_matching(Some(false))` — must hash one position
-    /// (`range_start == RESERVED_PREFIX_BYTES`, `last_hashable ==
-    /// RESERVED_PREFIX_BYTES`) without overrun.
+    /// (`range_start == HISTORY_DRAIN_BASE`, `last_hashable ==
+    /// HISTORY_DRAIN_BASE`) without overrun.
     #[test]
     fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
         let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
         // 8-byte real payload appends above the RESERVED dummy →
-        // history.len() = 8 + RESERVED_PREFIX_BYTES, last_hashable =
-        // RESERVED_PREFIX_BYTES, hashed range = [RESERVED..=RESERVED]
+        // history.len() = 8 + HISTORY_DRAIN_BASE, last_hashable =
+        // HISTORY_DRAIN_BASE, hashed range = [RESERVED..=RESERVED]
         // (one position).
         let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
         m.accept_data(payload);
         m.skip_matching_with_hint(Some(false));
-        assert_eq!(m.history.len(), 8 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), 8 + HISTORY_DRAIN_BASE);
         // No assertion on hash entries — the bug we're guarding
         // against is a panic / overrun, not a behavioural one.
         // Reaching this line without unwinding is the test.
@@ -1287,7 +1285,7 @@ mod tests {
         // prime_hash_table_for_range must short-circuit on the
         // `history_len < HASH_READ_SIZE` guard.
         m.skip_matching_with_hint(Some(false));
-        assert_eq!(m.history.len(), 4 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), 4 + HISTORY_DRAIN_BASE);
     }
 
     /// rep ↔ offset_hist consistency: after a single block emits
@@ -1403,7 +1401,7 @@ mod tests {
 
         m.accept_data((0..200u8).collect());
         m.skip_matching_with_hint(None);
-        assert_eq!(m.history.len(), 200 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), 200 + HISTORY_DRAIN_BASE);
         assert_eq!(
             m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "no eviction yet"
@@ -1411,7 +1409,7 @@ mod tests {
 
         m.accept_data((0..200u8).map(|i| i.wrapping_add(50)).collect());
         m.skip_matching_with_hint(None);
-        assert_eq!(m.history.len(), 400 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), 400 + HISTORY_DRAIN_BASE);
         assert_eq!(
             m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
             "still no eviction (400 < 512)",
@@ -1467,8 +1465,8 @@ mod tests {
         // First block lands at history[RESERVED..RESERVED+200] after
         // the seed dummy at [0..RESERVED). last_block_start tracks
         // that absolute index.
-        assert_eq!(m.last_block_start, RESERVED_PREFIX_BYTES);
-        assert_eq!(m.history.len(), 200 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.last_block_start, HISTORY_DRAIN_BASE);
+        assert_eq!(m.history.len(), 200 + HISTORY_DRAIN_BASE);
 
         // Shrink the window and trim. Without the fix, last_block_start
         // stays mid-history past the post-drain end — to make the
@@ -1479,8 +1477,8 @@ mod tests {
         m.skip_matching_with_hint(None);
         // history = [dummy] + [0..200] + [50..150] = 1 + 200 + 100 = 301.
         // last_block_start = RESERVED + 200 = start of second block.
-        assert_eq!(m.last_block_start, RESERVED_PREFIX_BYTES + 200);
-        assert_eq!(m.history.len(), 300 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.last_block_start, HISTORY_DRAIN_BASE + 200);
+        assert_eq!(m.history.len(), 300 + HISTORY_DRAIN_BASE);
 
         // Now force trim_to_window to drain into the middle of the
         // second block: shrink max_window_size below the second
@@ -1494,7 +1492,7 @@ mod tests {
             "trim must drain REAL history down to max_window_size = 64",
         );
         // history.len() = RESERVED (dummy preserved) + 64.
-        assert_eq!(m.history.len(), 64 + RESERVED_PREFIX_BYTES);
+        assert_eq!(m.history.len(), 64 + HISTORY_DRAIN_BASE);
 
         // The slice MUST be in bounds — the bug would panic here OR
         // return a stale slice. After the fix, last_block_start is

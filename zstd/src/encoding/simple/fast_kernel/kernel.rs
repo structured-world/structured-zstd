@@ -253,7 +253,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     // Donor's `stepSize = targetLength + !(targetLength) + 1`
     // (min 2). Callers must pass >= 2; values larger than 2 drive
     // the kernel's acceleration gradient on negative levels.
-    assert!(
+    // `with_params` / `reset` already enforce this on the matcher
+    // side, so a debug-only check is sufficient here — the release
+    // hot path skips the branch and the formatting machinery.
+    debug_assert!(
         step_size >= 2,
         "Fast kernel requires step_size >= 2 (got {step_size}); \
          the donor formula clamps to a min of 2",
