@@ -2,16 +2,12 @@ use crate::common::{MAGIC_NUM, MAX_WINDOW_SIZE, MIN_WINDOW_SIZE};
 use crate::decoding::errors::{FrameDescriptorError, FrameHeaderError, ReadFrameHeaderError};
 use crate::io::Read;
 
-/// Read a single serialized frame from the reader and return a tuple containing the parsed frame and the number of bytes read.
-///
-/// Reads the 4-byte magic number prefix; errors with
-/// `BadMagicNumber` if it doesn't match. For magicless streams
-/// (donor `ZSTD_f_zstd1_magicless`), call
-/// [`read_frame_header_with_format`] with `magicless = true`.
-// Test-only convenience wrapper: production decoder paths now
-// route through `read_frame_header_with_format`. Used by the
-// in-crate `tests/` modules to keep their existing call sites
-// simple.
+/// Test-only convenience wrapper around
+/// [`read_frame_header_with_format`] with `magicless = false`.
+/// Production decoder paths route through
+/// `read_frame_header_with_format` directly so that the magicless
+/// bit is threaded explicitly; this wrapper keeps the existing
+/// in-crate `tests/` call sites simple.
 #[cfg(test)]
 pub(crate) fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     read_frame_header_with_format(r, false)

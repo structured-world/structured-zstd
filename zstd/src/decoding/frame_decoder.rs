@@ -256,15 +256,13 @@ pub enum BlockDecodingStrategy {
 }
 
 impl FrameDecoderState {
-    /// Read the frame header from `source` and create a new decoder
     /// Construct a new frame decoder state, reading the frame header
     /// from `source`. When `magicless` is `true`, the 4-byte magic
     /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
     /// Crate-internal — reached only via `FrameDecoder::init` /
-    /// `FrameDecoder::init_with_dict_handle`.
-    ///
-    /// Pre-allocates the decode buffer to `window_size` so the first
-    /// block does not trigger incremental growth from zero capacity.
+    /// `FrameDecoder::init_with_dict_handle`. Pre-allocates the
+    /// decode buffer to `window_size` so the first block does not
+    /// trigger incremental growth from zero capacity.
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
