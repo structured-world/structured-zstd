@@ -1074,30 +1074,52 @@ impl Matcher for MatchGeneratorDriver {
         }
 
         // Dictionary bytes should stay addressable until produced frame output
-        // itself exceeds the live window size.
+        // itself exceeds the live window size. We bump `max_window_size`
+        // by the dictionary length so the eviction band keeps the
+        // primed bytes in `history`.
+        //
+        // Cap: `with_params`/`reset` enforce `window_log <= 30` so the
+        // eviction band `2 * max_window_size` stays below `u32::MAX`
+        // with headroom for one MAX_BLOCK_SIZE pending block — the
+        // kernel asserts `data.len() <= u32::MAX`. A large enough
+        // dictionary could otherwise push `max_window_size` past
+        // that ceiling via the `saturating_add` below and silently
+        // re-introduce the same overflow the `window_log` cap was
+        // designed to prevent. Clamp the post-priming size so the
+        // doubled-band-plus-block invariant survives.
+        const MAX_PRIMED_WINDOW_SIZE: usize =
+            (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
+
         let retained_dict_budget = dict_content.len();
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 let matcher = self.simple_mut();
-                matcher.max_window_size =
-                    matcher.max_window_size.saturating_add(retained_dict_budget);
+                matcher.max_window_size = matcher
+                    .max_window_size
+                    .saturating_add(retained_dict_budget)
+                    .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
-                matcher.max_window_size =
-                    matcher.max_window_size.saturating_add(retained_dict_budget);
+                matcher.max_window_size = matcher
+                    .max_window_size
+                    .saturating_add(retained_dict_budget)
+                    .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::Row => {
                 let matcher = self.row_matcher_mut();
-                matcher.max_window_size =
-                    matcher.max_window_size.saturating_add(retained_dict_budget);
+                matcher.max_window_size = matcher
+                    .max_window_size
+                    .saturating_add(retained_dict_budget)
+                    .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
                 matcher.table.max_window_size = matcher
                     .table
                     .max_window_size
-                    .saturating_add(retained_dict_budget);
+                    .saturating_add(retained_dict_budget)
+                    .min(MAX_PRIMED_WINDOW_SIZE);
             }
         }
 

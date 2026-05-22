@@ -696,7 +696,19 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // SAFETY: each `base.add(N - 2)` covers ≥ 8 readable
             // bytes when N - 2 ≤ ilimit (ilimit = iend - 8).
             let current0_plus_2 = current0 + 2;
-            if current0_plus_2 + HASH_READ_SIZE <= iend_addr {
+            // Non-overflowing bounds check: on 32-bit targets the
+            // raw `current0_plus_2 + HASH_READ_SIZE` can wrap when
+            // `current0` approaches `usize::MAX`, silently passing
+            // the check and then calling `hash_ptr` on a position
+            // that doesn't have HASH_READ_SIZE bytes of readable
+            // tail — an out-of-bounds read under the surrounding
+            // `unsafe`. Compute the wrap-free predicate via
+            // `checked_add`; on overflow we treat the slot as
+            // out-of-range and skip the forward hash refill.
+            let in_range_fwd = current0_plus_2
+                .checked_add(HASH_READ_SIZE)
+                .is_some_and(|end| end <= iend_addr);
+            if in_range_fwd {
                 let h_fwd = unsafe { hash_table.hash_ptr::<MLS>(base.add(current0_plus_2)) };
                 unsafe { hash_table.put(h_fwd, current0_plus_2 as u32) };
             }
