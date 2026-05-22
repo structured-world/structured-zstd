@@ -1167,62 +1167,32 @@ impl Matcher for MatchGeneratorDriver {
             start = end;
         }
 
-        let uncommitted_tail_budget = requested_dict_budget.saturating_sub(committed_dict_budget);
-        if uncommitted_tail_budget > 0 {
-            match self.active_backend() {
-                super::strategy::BackendTag::Simple => {
-                    let matcher = self.simple_mut();
-                    matcher.max_window_size = matcher
-                        .max_window_size
-                        .saturating_sub(uncommitted_tail_budget);
-                }
-                super::strategy::BackendTag::Dfast => {
-                    let matcher = self.dfast_matcher_mut();
-                    matcher.max_window_size = matcher
-                        .max_window_size
-                        .saturating_sub(uncommitted_tail_budget);
-                }
-                super::strategy::BackendTag::Row => {
-                    let matcher = self.row_matcher_mut();
-                    matcher.max_window_size = matcher
-                        .max_window_size
-                        .saturating_sub(uncommitted_tail_budget);
-                }
-                super::strategy::BackendTag::HashChain => {
-                    let matcher = self.hc_matcher_mut();
-                    matcher.table.max_window_size = matcher
-                        .table
-                        .max_window_size
-                        .saturating_sub(uncommitted_tail_budget);
-                }
+        // Derive `granted_retained_budget` directly from the two real
+        // bounds — bytes actually committed and bytes the cap allows
+        // — instead of doing a cap-clip pass followed by an
+        // uncommitted-tail subtract. Previous shape double-discounted
+        // when the cap clipped: clip lost `(requested - allowed)`,
+        // then tail-subtract lost ANOTHER `(requested - committed)`,
+        // leaving `max_window_size` shy of the dictionary that was
+        // actually retained (e.g. cap=900, committed=998, uncommitted=2
+        // landed at granted=898 instead of the correct 900).
+        let capped_retained_budget = MAX_PRIMED_WINDOW_SIZE.saturating_sub(base_max_window_size);
+        let granted_retained_budget = committed_dict_budget.min(capped_retained_budget);
+        let final_max_window_size = base_max_window_size.saturating_add(granted_retained_budget);
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => {
+                self.simple_mut().max_window_size = final_max_window_size;
+            }
+            super::strategy::BackendTag::Dfast => {
+                self.dfast_matcher_mut().max_window_size = final_max_window_size;
+            }
+            super::strategy::BackendTag::Row => {
+                self.row_matcher_mut().max_window_size = final_max_window_size;
+            }
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().table.max_window_size = final_max_window_size;
             }
         }
-        // Compute how much window the cap actually granted (post-cap,
-        // post-uncommitted-tail-subtraction). If `requested_dict_budget`
-        // exceeded `MAX_PRIMED_WINDOW_SIZE`, `granted_retained_budget`
-        // is smaller than `committed_dict_budget` — tracking
-        // `committed_dict_budget` would over-count and force
-        // `retire_dictionary_budget()` to later shrink the matcher
-        // below its base window.
-        let granted_retained_budget = match self.active_backend() {
-            super::strategy::BackendTag::Simple => self
-                .simple_mut()
-                .max_window_size
-                .saturating_sub(base_max_window_size),
-            super::strategy::BackendTag::Dfast => self
-                .dfast_matcher_mut()
-                .max_window_size
-                .saturating_sub(base_max_window_size),
-            super::strategy::BackendTag::Row => self
-                .row_matcher_mut()
-                .max_window_size
-                .saturating_sub(base_max_window_size),
-            super::strategy::BackendTag::HashChain => self
-                .hc_matcher_mut()
-                .table
-                .max_window_size
-                .saturating_sub(base_max_window_size),
-        };
         if granted_retained_budget > 0 {
             self.dictionary_retained_budget = self
                 .dictionary_retained_budget
