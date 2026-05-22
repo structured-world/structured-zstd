@@ -247,17 +247,19 @@ const ROW_CONFIG: RowConfig = RowConfig {
 struct LevelParams {
     strategy_tag: super::strategy::StrategyTag,
     window_log: u8,
-    /// Donor `hashLog3` / hash-fill stride. Was consumed by the
-    /// legacy SuffixStore MatchGenerator's interleaved hash-fill
-    /// loop; the donor-shape Fast kernel walks ip0 with
-    /// kSearchStrength step-skip acceleration instead, and the
-    /// Fast-strategy dict-priming path in FastKernelMatcher
-    /// currently strides at 1 unconditionally. Field retained on
-    /// LEVEL_TABLE so the Fast matcher's eventual hash_fill_step
-    /// setter (planned follow-up) can read it without re-shaping
-    /// the table.
-    #[allow(dead_code)]
-    hash_fill_step: usize,
+    /// Donor `cParams.hashLog` — only consumed by the Fast strategy
+    /// backend (`FastKernelMatcher`). Other backends ignore.
+    fast_hash_log: u32,
+    /// Donor `cParams.minMatch` (mls) — only consumed by the Fast
+    /// strategy backend. Range 4..=8 per donor's mml dispatch.
+    fast_mls: u32,
+    /// Donor's `stepSize = targetLength + !(targetLength) + 1`
+    /// (min 2). For Fast strategy, negative levels use
+    /// `targetLength = -level` (1..7), giving step_size 2..8.
+    /// L1 / L2 / Uncompressed use targetLength=0 → step_size=2.
+    /// Drives the kernel's initial `step` for the 4-cursor body's
+    /// skip schedule.
+    fast_step_size: usize,
     lazy_depth: u8,
     hc: HcConfig,
     row: RowConfig,
@@ -291,30 +293,30 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
 const LEVEL_TABLE: [LevelParams; 22] = [
-    // Lvl  Strategy       wlog  step  lazy  HC config                                   row config
-    // ---  -------------- ----  ----  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 19, hash_fill_step: 3, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, hash_fill_step: 1, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, hash_fill_step: 1, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, hash_fill_step: 1, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
+    // Lvl  Strategy       wlog  fast_hlog  fast_mls  fast_step  lazy  HC config                                   row config
+    // ---  -------------- ----  ---------  --------  ---------  ----  ------------------------------------------  ----------
+    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -396,7 +398,9 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
     LevelParams {
         strategy_tag: super::strategy::StrategyTag::BtUltra2,
         window_log,
-        hash_fill_step: 1,
+        fast_hash_log: 14,
+        fast_mls: 7,
+        fast_step_size: 2,
         lazy_depth: 2,
         hc,
         row: ROW_CONFIG,
@@ -412,13 +416,34 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
             strategy_tag: super::strategy::StrategyTag::Fast,
+            // Uncompressed frames emit raw blocks and never reference
+            // history; advertising a larger window only inflates
+            // decoder-side buffer reservation. Stay at 17 (128 KiB).
             window_log: 17,
-            hash_fill_step: 1,
+            // Beyond-donor: hash_log=14 (vs donor's 13) for 2× fewer
+            // collisions on structured corpora.
+            fast_hash_log: 14,
+            fast_mls: 6,
+            // Donor's "base for negative" row has targetLength=1,
+            // which gives step_size = 1 + 0 + 1 = 2.
+            fast_step_size: 2,
             lazy_depth: 0,
             hc: HC_CONFIG,
             row: ROW_CONFIG,
         },
-        CompressionLevel::Fastest => LEVEL_TABLE[0],
+        CompressionLevel::Fastest => {
+            // Only the Fast-specific cParams
+            // (fast_hash_log / fast_mls / fast_step_size) align
+            // with Uncompressed / negative-base row. window_log
+            // stays at LEVEL_TABLE[0]'s value (19) — Fastest still
+            // does real compression on a full window, unlike
+            // Uncompressed which clamps to 17.
+            let mut p = LEVEL_TABLE[0];
+            p.fast_hash_log = 14;
+            p.fast_mls = 6;
+            p.fast_step_size = 2;
+            p
+        }
         CompressionLevel::Default => LEVEL_TABLE[2],
         CompressionLevel::Better => LEVEL_TABLE[6],
         CompressionLevel::Best => LEVEL_TABLE[10],
@@ -430,20 +455,24 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 // Level 0 = default, matching C zstd semantics.
                 LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
             } else {
-                // Negative levels: ultra-fast with the Simple backend.
-                // Acceleration grows with magnitude, expressed as larger
-                // hash_fill_step (fewer positions indexed).
-                // `window_log = 19` matches donor's "base for negative
-                // levels" row in `clevels.h`, so the SuffixStore-per-
-                // WindowEntry has enough span to recall periodic
-                // patterns across `MAX_BLOCK_SIZE` boundaries.
-                let acceleration =
-                    (n.saturating_abs() as usize).min((-CompressionLevel::MIN_LEVEL) as usize);
-                let step = (acceleration + 3).min(128);
+                // Negative levels — donor sets
+                // targetLength = -level (clampedCompressionLevel),
+                // yielding step_size = (-level) + 1 since
+                // !(targetLength) = 0 when targetLength > 0.
+                // So L-1..L-7 get step_size 2..8. Acceleration
+                // gradient comes from larger step skipping more
+                // positions per iter (faster, worse ratio).
+                // Clamp to donor's MIN_LEVEL before negating so
+                // i32::MIN can't overflow on `-n`.
+                let clamped = n.max(CompressionLevel::MIN_LEVEL);
+                let target_length = (-clamped) as usize;
+                let step_size = target_length + 1;
                 LevelParams {
                     strategy_tag: super::strategy::StrategyTag::Fast,
                     window_log: 19,
-                    hash_fill_step: step,
+                    fast_hash_log: 14,
+                    fast_mls: 6,
+                    fast_step_size: step_size,
                     lazy_depth: 0,
                     hc: HC_CONFIG,
                     row: ROW_CONFIG,
@@ -605,6 +634,7 @@ impl MatchGeneratorDriver {
                 window_log_init,
                 FAST_LEVEL_1_HASH_LOG,
                 FAST_LEVEL_1_MLS,
+                2, // donor default step_size (targetLength=0 → step=2)
             )),
             strategy_tag: super::strategy::StrategyTag::Fast,
             slice_size,
@@ -924,31 +954,17 @@ impl Matcher for MatchGeneratorDriver {
             // `storage` is dropped here.
             self.storage = match next_backend {
                 super::strategy::BackendTag::Simple => {
-                    // Donor level-1 Fast cParams hard-coded:
-                    // hash_log = 14, mls = 7. `window_log` is
-                    // threaded from the resolved LevelParams just
-                    // above (the same LevelParams that
-                    // `resolve_level_params` computes per-level).
-                    //
-                    // KNOWN LIMITATION — phase 3 follow-up:
-                    // all Fast levels (Uncompressed, Fastest,
-                    // CompressionLevel::Level(-7..=1)) currently
-                    // resolve to the same FastKernelMatcher tuning.
-                    // `resolve_level_params` does compute distinct
-                    // settings, but they aren't wired into the
-                    // matcher today — the public acceleration
-                    // gradient between negative-level "faster"
-                    // modes and Level(1) lands when phase 3
-                    // implements donor's 4-cursor `ip0/ip1/ip2/ip3`
-                    // lookahead pipeline + per-level
-                    // kSearchStrength dispatch + `cmov` match-found
-                    // variant (issue #198 items 2/3/5). Phase 1b
-                    // is the donor-shape foundation those build
-                    // on top of.
+                    // Per-level Fast cParams from resolve_level_params:
+                    // Level(1) gets (hash_log=14, mls=7); Fastest /
+                    // Uncompressed / Level(-7..=-1) get (hash_log=14,
+                    // mls=6) — beyond-donor on hash_log (donor's row
+                    // is hash_log=13, see resolve_level_params for
+                    // rationale).
                     MatcherStorage::Simple(FastKernelMatcher::with_params(
                         params.window_log,
-                        FAST_LEVEL_1_HASH_LOG,
-                        FAST_LEVEL_1_MLS,
+                        params.fast_hash_log,
+                        params.fast_mls,
+                        params.fast_step_size,
                     ))
                 }
                 super::strategy::BackendTag::Dfast => {
@@ -974,14 +990,15 @@ impl Matcher for MatchGeneratorDriver {
         let strategy_tag = self.strategy_tag;
         match &mut self.storage {
             MatcherStorage::Simple(m) => {
-                // Donor level-1 Fast cParams are fixed (hash_log=14,
-                // mls=7). hash_fill_step from LevelParams isn't
-                // wired in yet — the FastKernelMatcher's
-                // skip-with-dict-prime path walks every position
-                // (stride=1) rather than the donor's `hash_fill_step`
-                // stride. Future per-level stride tuning lands as a
-                // separate inherent setter.
-                m.reset(params.window_log, FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS);
+                // Per-level Fast cParams threaded from
+                // resolve_level_params (see Simple-backend swap
+                // arm above for the (level → params) mapping).
+                m.reset(
+                    params.window_log,
+                    params.fast_hash_log,
+                    params.fast_mls,
+                    params.fast_step_size,
+                );
             }
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
@@ -8135,4 +8152,122 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
     // tuning preference, not a correctness invariant.
     let _ = saw_triple;
     assert_eq!(rebuilt, data);
+}
+
+#[test]
+fn fast_levels_dispatch_per_level_hash_log_and_mls() {
+    // Level 1 — donor `{ 19, 13, 14, 1, 7, 0, ZSTD_fast }` row:
+    // window_log=19, hash_log=14, mls=7.
+    let p1 = resolve_level_params(CompressionLevel::Level(1), None);
+    assert_eq!(p1.fast_hash_log, 14);
+    assert_eq!(p1.fast_mls, 7);
+    assert_eq!(p1.fast_step_size, 2);
+
+    // Negative levels — beyond-donor tuning: donor's "base for
+    // negative" row is (hash_log=13, mls=6); we use hash_log=14
+    // (+32 KB memory, 2× fewer collisions on structured corpora)
+    // while keeping mls=6 for fast-path speed on random data.
+    // step_size follows donor's formula: targetLength = -level,
+    // step_size = (-level) + 1, giving 2..8 for L-1..L-7.
+    for n in -7..=-1 {
+        let p = resolve_level_params(CompressionLevel::Level(n), None);
+        assert_eq!(p.fast_hash_log, 14, "Level({n}) fast_hash_log");
+        assert_eq!(p.fast_mls, 6, "Level({n}) fast_mls");
+        let expected_step = ((-n) as usize) + 1;
+        assert_eq!(p.fast_step_size, expected_step, "Level({n}) fast_step_size");
+    }
+
+    // Fastest + Uncompressed share the negative-base tuning
+    // (window_log=19, hash_log=14 [beyond-donor], mls=6).
+    let pf = resolve_level_params(CompressionLevel::Fastest, None);
+    assert_eq!(
+        (
+            pf.window_log,
+            pf.fast_hash_log,
+            pf.fast_mls,
+            pf.fast_step_size
+        ),
+        (19, 14, 6, 2),
+    );
+    // Uncompressed keeps window_log=17 (no history references, smaller
+    // decoder reservation); fast cParams same as negative-base row.
+    let pu = resolve_level_params(CompressionLevel::Uncompressed, None);
+    assert_eq!(
+        (
+            pu.window_log,
+            pu.fast_hash_log,
+            pu.fast_mls,
+            pu.fast_step_size
+        ),
+        (17, 14, 6, 2),
+    );
+}
+
+/// Exercise the actual driver wiring: for every Fast level, reset a
+/// `MatchGeneratorDriver` and assert the inner `FastKernelMatcher`
+/// observed the same `(hash_log, mls, step_size)` tuple that
+/// `resolve_level_params` reports. Catches plumbing bugs — argument
+/// reordering, stale step_size carried from a prior frame,
+/// stuck-on-default values — that the parameter-only test above
+/// would miss.
+#[test]
+fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
+    let mut driver = MatchGeneratorDriver::new(64 * 1024, 1);
+
+    let fast_levels = [
+        CompressionLevel::Level(1),
+        CompressionLevel::Fastest,
+        CompressionLevel::Uncompressed,
+        CompressionLevel::Level(-1),
+        CompressionLevel::Level(-2),
+        CompressionLevel::Level(-3),
+        CompressionLevel::Level(-4),
+        CompressionLevel::Level(-5),
+        CompressionLevel::Level(-6),
+        CompressionLevel::Level(-7),
+    ];
+
+    for &level in &fast_levels {
+        let p = resolve_level_params(level, None);
+        // Sanity: every level in the table above must resolve to a
+        // Fast-strategy row — otherwise this test isn't testing what
+        // it claims to test.
+        assert_eq!(
+            p.strategy_tag,
+            super::strategy::StrategyTag::Fast,
+            "{level:?} must resolve to Fast strategy",
+        );
+
+        // Bounce through a non-Fast strategy first so the next
+        // reset actually goes through the backend-switch path
+        // (`MatchGeneratorDriver::new` / `simple_mut` recreate the
+        // Fast variant via `FastKernelMatcher::with_params`). Without
+        // this hop the loop would only ever stay in `BackendTag::Simple`
+        // and exercise `FastKernelMatcher::reset` — leaving the
+        // `with_params` wiring untested on the production path.
+        // `Default` resolves to Dfast strategy (a non-Fast row),
+        // which is enough to force the swap.
+        crate::encoding::Matcher::reset(&mut driver, CompressionLevel::Default);
+
+        // Drive the production reset path (same code paths exercised
+        // by FrameCompressor / StreamingEncoder).
+        crate::encoding::Matcher::reset(&mut driver, level);
+
+        let m = driver.simple_mut();
+        assert_eq!(
+            m.hash_log(),
+            p.fast_hash_log,
+            "{level:?}: inner matcher hash_log mismatch — argument swap?",
+        );
+        assert_eq!(
+            m.mls(),
+            p.fast_mls,
+            "{level:?}: inner matcher mls mismatch — argument swap?",
+        );
+        assert_eq!(
+            m.step_size(),
+            p.fast_step_size,
+            "{level:?}: inner matcher step_size mismatch — stale value carried from prior reset?",
+        );
+    }
 }
