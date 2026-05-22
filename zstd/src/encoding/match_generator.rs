@@ -1090,27 +1090,42 @@ impl Matcher for MatchGeneratorDriver {
         const MAX_PRIMED_WINDOW_SIZE: usize =
             (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
 
-        let retained_dict_budget = dict_content.len();
+        // `requested_dict_budget` is what the caller asked for;
+        // `base_max_window_size` snapshots the pre-priming cap so we
+        // can compute how much window the cap actually GRANTED below.
+        // The cap may clip the requested growth, in which case the
+        // bookkeeping (`dictionary_retained_budget` retire path) must
+        // track only the granted portion — otherwise
+        // `retire_dictionary_budget()` would later reclaim more than
+        // was actually added and shrink the matcher below its real
+        // base window.
+        let requested_dict_budget = dict_content.len();
+        let base_max_window_size = match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().max_window_size,
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().max_window_size,
+            super::strategy::BackendTag::Row => self.row_matcher_mut().max_window_size,
+            super::strategy::BackendTag::HashChain => self.hc_matcher_mut().table.max_window_size,
+        };
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 let matcher = self.simple_mut();
                 matcher.max_window_size = matcher
                     .max_window_size
-                    .saturating_add(retained_dict_budget)
+                    .saturating_add(requested_dict_budget)
                     .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
                 matcher.max_window_size = matcher
                     .max_window_size
-                    .saturating_add(retained_dict_budget)
+                    .saturating_add(requested_dict_budget)
                     .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::Row => {
                 let matcher = self.row_matcher_mut();
                 matcher.max_window_size = matcher
                     .max_window_size
-                    .saturating_add(retained_dict_budget)
+                    .saturating_add(requested_dict_budget)
                     .min(MAX_PRIMED_WINDOW_SIZE);
             }
             super::strategy::BackendTag::HashChain => {
@@ -1118,7 +1133,7 @@ impl Matcher for MatchGeneratorDriver {
                 matcher.table.max_window_size = matcher
                     .table
                     .max_window_size
-                    .saturating_add(retained_dict_budget)
+                    .saturating_add(requested_dict_budget)
                     .min(MAX_PRIMED_WINDOW_SIZE);
             }
         }
@@ -1148,7 +1163,7 @@ impl Matcher for MatchGeneratorDriver {
             start = end;
         }
 
-        let uncommitted_tail_budget = retained_dict_budget.saturating_sub(committed_dict_budget);
+        let uncommitted_tail_budget = requested_dict_budget.saturating_sub(committed_dict_budget);
         if uncommitted_tail_budget > 0 {
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
@@ -1178,10 +1193,36 @@ impl Matcher for MatchGeneratorDriver {
                 }
             }
         }
-        if committed_dict_budget > 0 {
+        // Compute how much window the cap actually granted (post-cap,
+        // post-uncommitted-tail-subtraction). If `requested_dict_budget`
+        // exceeded `MAX_PRIMED_WINDOW_SIZE`, `granted_retained_budget`
+        // is smaller than `committed_dict_budget` — tracking
+        // `committed_dict_budget` would over-count and force
+        // `retire_dictionary_budget()` to later shrink the matcher
+        // below its base window.
+        let granted_retained_budget = match self.active_backend() {
+            super::strategy::BackendTag::Simple => self
+                .simple_mut()
+                .max_window_size
+                .saturating_sub(base_max_window_size),
+            super::strategy::BackendTag::Dfast => self
+                .dfast_matcher_mut()
+                .max_window_size
+                .saturating_sub(base_max_window_size),
+            super::strategy::BackendTag::Row => self
+                .row_matcher_mut()
+                .max_window_size
+                .saturating_sub(base_max_window_size),
+            super::strategy::BackendTag::HashChain => self
+                .hc_matcher_mut()
+                .table
+                .max_window_size
+                .saturating_sub(base_max_window_size),
+        };
+        if granted_retained_budget > 0 {
             self.dictionary_retained_budget = self
                 .dictionary_retained_budget
-                .saturating_add(committed_dict_budget);
+                .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::strategy::BackendTag::HashChain {
             self.hc_matcher_mut()
