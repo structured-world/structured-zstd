@@ -1031,8 +1031,7 @@ mod tests {
         assert_eq!(
             m.history.len(),
             payload.len() + HISTORY_DRAIN_BASE,
-            "skip_matching must append the pending buffer to history \
-             (above the HISTORY_DRAIN_BASE dummy)",
+            "skip_matching must append the pending buffer to history",
         );
         assert_eq!(m.rep, pre_rep, "skip must not touch rep state");
         assert_eq!(
@@ -1240,8 +1239,8 @@ mod tests {
         );
         assert!(
             m.history.len() <= m.max_window_size + 200 + HISTORY_DRAIN_BASE,
-            "post-append history = RESERVED dummy + retained prefix \
-             (≤ max_window_size) + last block (200 bytes); got {}",
+            "post-append history = retained prefix (≤ max_window_size) \
+             + last block (200 bytes); got {}",
             m.history.len(),
         );
         // Post-fix: drain RESETS prefix_start_index back to 1 (the
@@ -1263,10 +1262,10 @@ mod tests {
     #[test]
     fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
         let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-        // 8-byte real payload appends above the RESERVED dummy →
-        // history.len() = 8 + HISTORY_DRAIN_BASE, last_hashable =
-        // HISTORY_DRAIN_BASE, hashed range = [RESERVED..=RESERVED]
-        // (one position).
+        // 8-byte real payload appended to history → history.len() =
+        // 8 + HISTORY_DRAIN_BASE (= 8 under M8), last_hashable =
+        // HISTORY_DRAIN_BASE (= 0), hashed range = [0..=0] (one
+        // position).
         let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
         m.accept_data(payload);
         m.skip_matching_with_hint(Some(false));
@@ -1421,9 +1420,9 @@ mod tests {
         // Third commit: real history (400) + new space (200) = 600 > 512.
         // Eviction MUST fire inside accept_data, dropping history
         // back to max_window_size (256) BEFORE the kernel runs.
-        // `history_len_for_eviction_accounting` returns REAL data
-        // length (excluding the RESERVED dummy), so pre/post compare
-        // cleanly in real-byte units.
+        // `history_len_for_eviction_accounting` returns the real-data
+        // length (history.len() minus HISTORY_DRAIN_BASE, which is 0
+        // under M8), so pre/post compare cleanly in real-byte units.
         let pre = m.history_len_for_eviction_accounting();
         m.accept_data((0..200u8).map(|i| i.wrapping_add(100)).collect());
         let post = m.history_len_for_eviction_accounting();
