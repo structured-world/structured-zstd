@@ -167,6 +167,15 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // existing fused single-pass path stays in charge there.
     const ADVANCE: usize = 4;
     const ADVANCE_MASK: usize = ADVANCE - 1;
+    // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
+    // power of two. Compile-time guard so a future tweak (e.g.
+    // bumping to donor's STORED_SEQS = 8, also a power of two) can't
+    // silently corrupt the ring index if someone picks a non-power-
+    // of-two value.
+    const _: () = assert!(
+        ADVANCE.is_power_of_two(),
+        "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
+    );
 
     // Read-only estimate for the prefetch's match-source position.
     // The TRUE `actual_offset` requires mutating `offset_hist` via
@@ -197,7 +206,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             (2, false) => hist[1],
             (2, true) => hist[2],
             (3, false) => hist[2],
-            (3, true) => hist[0].saturating_sub(1),
+            // Mirror `do_offset_history_repcode`'s `wrapping_sub(1)` —
+            // not `saturating_sub` — so even on corrupted/0 history
+            // the estimate matches the real resolver. The result is
+            // only consumed by prefetch addressing, where a wild
+            // wrap just lands the hint on an out-of-range slot the
+            // helper drops.
+            (3, true) => hist[0].wrapping_sub(1),
             _ => 0,
         }
     }
@@ -230,7 +245,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
             let source_idx = match_start.wrapping_sub(est_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
+            buffer.prefetch_lookahead_match_source(source_idx);
             prefetch_pos = match_start + seq.ml as usize;
             *slot = seq;
             if k + 1 < num_sequences {
@@ -251,7 +266,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             let est_offset = estimate_actual_offset(seq.of, seq.ll, offset_hist);
             let match_start = prefetch_pos + seq.ll as usize;
             let source_idx = match_start.wrapping_sub(est_offset as usize);
-            buffer.prefetch_lookahead_match_source(source_idx, seq.ml as usize);
+            buffer.prefetch_lookahead_match_source(source_idx);
             prefetch_pos = match_start + seq.ml as usize;
 
             let slot = i & ADVANCE_MASK;

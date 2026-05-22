@@ -406,7 +406,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// but in safe Rust the cheapest equivalent is to bound-check
     /// the logical position before chasing the slice.
     #[inline(always)]
-    pub(crate) fn prefetch_lookahead_match_source(&self, start_idx: usize, _match_length: usize) {
+    pub(crate) fn prefetch_lookahead_match_source(&self, start_idx: usize) {
         if start_idx >= self.buffer.len() {
             return;
         }
