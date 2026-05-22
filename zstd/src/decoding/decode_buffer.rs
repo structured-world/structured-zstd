@@ -402,8 +402,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// match_start (e.g. a stale or malformed sequence), and
     /// dictionary-sourced matches whose logical position predates
     /// the buffer's current frame. The donor (`PREFETCH_L1` in
-    /// `ZSTD_prefetchMatch` — note: we route to L2 instead, see the
-    /// body comment) tolerates invalid addresses by spec, but in
+    /// `ZSTD_prefetchMatch` — we mirror that with `prefetch_slice`
+    /// → `_MM_HINT_T0` / `pldl1keep`, see the body comment) tolerates
+    /// invalid addresses by spec, but in
     /// safe Rust the cheapest equivalent is to bound-check the
     /// logical position before chasing the slice.
     #[inline(always)]

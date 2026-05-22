@@ -149,7 +149,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 
     let num_sequences = section.num_sequences as usize;
 
-    // 4-slot software pipeline mirroring donor
+    // 8-slot software pipeline mirroring donor
     // `ZSTD_decompressSequencesLong_body`. Pre-decode `ADVANCE`
     // sequences ahead, prefetch each match source as we go, then
     // execute the oldest in-flight sequence per iteration while
@@ -223,7 +223,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     if use_long_pipeline {
         // `prefetch_pos` is the logical buffer index (same frame as
         // `buffer.len()`) at which the NEXT not-yet-decoded sequence
-        // will start pushing literals. We pre-decode 4 ahead, so we
+        // will start pushing literals. We pre-decode `ADVANCE` ahead, so we
         // accumulate (ll + ml) per decoded seq to keep this position
         // synchronised with where execute will eventually be.
         let mut prefetch_pos: usize = old_buffer_size;
