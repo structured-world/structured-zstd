@@ -32,6 +32,11 @@ use zstd::zstd_safe::zstd_sys as _;
 /// Donor preSplit workspace size constant from `zstd_preSplit.h`.
 const ZSTD_SLIPBLOCK_WORKSPACESIZE: usize = 8208;
 
+// `non_snake_case` is allowed on the extern block so the donor symbol
+// keeps its exact upstream spelling — the linker resolves by name, and
+// renaming would force a `#[link_name = ...]` shim with no readability
+// gain.
+#[allow(non_snake_case)]
 unsafe extern "C" {
     /// Donor `ZSTD_splitBlock` (internal, not in `zstd.h` public API
     /// but exported by libzstd). Returns the split position within
@@ -142,8 +147,15 @@ fn synthetic_transition_chunk(transition_at: usize) -> Vec<u8> {
 /// Call donor `ZSTD_splitBlock` with a fresh stack-aligned workspace.
 fn donor_decision(block: &[u8], level: i32) -> usize {
     assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
-    // `ZSTD_SLIPBLOCK_WORKSPACESIZE / size_of::<usize>()` u64 slots so
-    // the buffer is naturally `size_t`-aligned per the donor contract.
+    // `ZSTD_SLIPBLOCK_WORKSPACESIZE` is in bytes; we allocate `u64`
+    // slots so the buffer is naturally 8-byte aligned (satisfies the
+    // donor's `size_t` alignment requirement on all supported targets,
+    // where `size_t` is at most 8 bytes). `/ 8 + 1` rounds the byte
+    // budget up to whole u64 slots — the `+ 1` covers the case where
+    // the workspace size is not a multiple of 8 (8208 is, so we get
+    // 8208/8 + 1 = 1026 slots = 8208 bytes of usable storage + one
+    // slot of slack). The actual byte count passed to donor below is
+    // `workspace.len() * 8`.
     let mut workspace = vec![0u64; ZSTD_SLIPBLOCK_WORKSPACESIZE / 8 + 1];
     // SAFETY: block.len() == 128 KB (asserted above), level ∈ 0..=4
     // (caller-enforced in test bodies below), workspace size ≥
