@@ -367,6 +367,24 @@ impl HcMatcher {
                         if best.is_some_and(|b| b.match_len >= self.target_len) {
                             return best;
                         }
+                        // Donor `ZSTD_HcFindBestMatch` `zstd_lazy.c:727`:
+                        // `if (ip + currentMl == iLimit) break;` — when
+                        // the forward match consumed every remaining
+                        // byte of the live window, no further chain
+                        // candidate at this `current_idx` can extend
+                        // FORWARD longer. Subsequent walks could only
+                        // win via backward extension (≤ lit_len bytes)
+                        // AND a smaller offset, but the per-iteration
+                        // `new_offset >= best_ref.offset` monotonicity
+                        // gate above would already skip them. Bail
+                        // immediately and save the rest of the chain
+                        // walk. `match_len` here is the freshly
+                        // computed forward `common_prefix_len`, not
+                        // the extend_backwards-augmented total — so
+                        // the equality check mirrors donor exactly.
+                        if current_idx + match_len >= history_tail {
+                            return best;
+                        }
                     }
                 }
             }
