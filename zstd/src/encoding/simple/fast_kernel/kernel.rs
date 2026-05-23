@@ -112,10 +112,15 @@ const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 ///
 /// - `ip` MUST point to ≥ 4 readable bytes (the kernel only calls
 ///   this when ip0..ip3 stay within `iend - HASH_READ_SIZE`).
-/// - `base` MUST be the start of the same buffer that `data_len`
-///   describes, i.e. `base[0..data_len]` is a valid byte range.
-/// - `ip_pos` MUST equal the byte offset of `ip` within the buffer
-///   `base` points at: `ip == base.add(ip_pos)`.
+/// - `base` MUST be the start of the same buffer the kernel scans.
+///   For an in-window `match_idx >= prefix_start_index`,
+///   `base.add(match_idx as usize)` MUST yield ≥ 4 readable bytes
+///   (i.e. `match_idx + 4 <= data_len`). The kernel maintains this
+///   invariant by only inserting hash-table entries for positions
+///   strictly below `ilimit = data_len - HASH_READ_SIZE`, so every
+///   in-range `match_idx` returned by the table is automatically
+///   ≥ 4 bytes from the buffer end. See the comment block inside
+///   the function body for the full derivation.
 #[inline(always)]
 unsafe fn match_found<const USE_CMOV: bool>(
     ip: *const u8,
@@ -223,15 +228,22 @@ pub(crate) struct FastBlockResult {
 /// - `block_start`: byte offset of the current block's first byte
 ///   within `data`. The kernel hashes/searches only positions in
 ///   `[block_start, data.len())`, but matches may reach back into the
-///   prefix all the way to `prefix_start_index`.
-/// - `prefix_start_index`: lowest position that match candidates may
-///   reference. Donor computes this from `windowLog`; for a flat
-///   single-block kernel this is typically `0` or `block_start -
-///   window_size`, clamped to ≥ 0.
+///   prefix all the way to `bounds.prefix_start_index`.
+/// - `bounds: PrefixBounds`: bundle of two donor-derived absolute
+///   floors (kept together so the kernel signature stays inside the
+///   clippy 7-argument cap). See [`PrefixBounds`] field docs for the
+///   exact semantics:
+///   - `prefix_start_index`: sentinel-aware match-table filter (rejects
+///     the all-zero empty-slot value at position 0).
+///   - `window_low`: donor `windowLow`-equivalent absolute floor used
+///     by the prologue's `max_rep` computation and the backward-extension
+///     `match_pos > window_low` bound.
 /// - `hash_table`: the encoder's `FastHashTable`. Mutated in place;
 ///   entries are absolute indices into `data`.
 /// - `rep`: incoming `[rep_offset1, rep_offset2]` from the previous
 ///   block. Returned updated in `FastBlockResult.rep`.
+/// - `step_size`: donor `stepSize = targetLength + !(targetLength) + 1`
+///   (min 2). Drives the initial step in the 4-cursor skip schedule.
 /// - `handle_sequence`: closure that the kernel invokes once per
 ///   emitted `Sequence` — equivalent to donor's `ZSTD_storeSeq`.
 ///

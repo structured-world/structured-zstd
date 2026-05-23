@@ -283,9 +283,24 @@ mod tests {
         // = 0xB8 (after the closing flush, the partial 5 bits become the
         // single tail byte; close() pads to full byte).
         assert_eq!(out.len(), 1);
-        // The exact byte value depends on the bit packing order. Donor
-        // emits the same byte as we will — the test is mainly a
-        // smoke test that close() doesn't OOB.
+        // Donor `HUF_addBits` + `HUF_flushBits` layout (top-down
+        // packing in the 64-bit container, then `flushBits` shifts
+        // the buffered bits down to the bottom of a 0-padded word
+        // and `MEM_writeLE` stores 8 bytes little-endian — emitted
+        // byte 0 is the LOW byte of that word):
+        //
+        // After `add_bits(pack_huf_celt(0b1011, 4), 0)`:
+        //   container top 4 bits = 0b1011, bit_pos = 4
+        // After `close()` prepends end-mark `(value=1, nb_bits=1)`:
+        //   container top 5 bits = [1, 1, 0, 1, 1] (high → low),
+        //   bit_pos = 5
+        // `flush_bits` then `container >> (64 - 5)` produces 0b11011
+        // = 27 = 0x1B, which lands in `out[0]`.
+        assert_eq!(
+            out[0], 0x1B,
+            "first emitted byte must mirror donor's HUF_addBits + \
+             HUF_endMark packing collapsed to a 5-bit prefix 0b11011",
+        );
     }
 
     /// Encode multiple symbols summing to > 64 bits; expect the

@@ -369,13 +369,15 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
     if lit_len <= 32 {
         // Production callers (`collect_block_parts`) pre-reserve
         // `src_len` of spare capacity, so the sum of all literal
-        // runs across a block fits without grow. But this function
-        // is `pub(crate)` and stays a SAFE fn, so we must enforce
-        // the precondition in release too — otherwise a future
-        // caller skipping the pre-reserve would get an immediate
-        // 32-byte OOB write into whatever follows the `Vec`'s
-        // allocation. The branch is cold on the production hot
-        // path (debug_assert in tests confirms it stays untaken).
+        // runs across a block fits without grow. But this is a SAFE
+        // fn (module-private; callers in this same file are the
+        // only ones today, but the safety net still must hold), so
+        // we enforce the precondition in release too — otherwise a
+        // future caller skipping the pre-reserve would get an
+        // immediate 32-byte OOB write into whatever follows the
+        // `Vec`'s allocation. The branch is cold on the production
+        // hot path (debug_assert in tests confirms it stays
+        // untaken).
         let cur_len = dst.len();
         if dst.capacity() - cur_len < lit_len {
             dst.reserve(lit_len);
