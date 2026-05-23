@@ -396,6 +396,12 @@ fn decompress_literals(
 /// cursor invariant — every outer iteration advances all 4 cursors by
 /// the same amount, so a single comparison against `cursors[0]`
 /// suffices in place of 4 per-stream cursor checks.
+///
+/// All fields are scalar (Copy). `Copy` is derived so the inner
+/// `run_4stream_decode_loop` can destructure `*bounds` without
+/// per-field copy ceremony — the struct is tiny (~56 bytes) and
+/// copying-by-value at the call site is cheap.
+#[derive(Copy, Clone)]
 struct LoopBounds {
     max_bits: isize,
     max_num_bits: u8,
