@@ -111,6 +111,37 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
+    /// Bridge for the donor-faithful Huffman encoder (`HufCStream`) so
+    /// it can write bytes directly into our backing `Vec<u8>` without
+    /// going through the `BitWriter`'s partial-bit accumulator. The
+    /// closure receives full mutable access to the underlying `Vec`;
+    /// any bytes it appends are integrated into `bit_idx` afterward.
+    ///
+    /// MUST be called only when the writer is byte-aligned
+    /// (`bits_in_partial` a multiple of 8); the assertion mirrors
+    /// `append_bytes`. Internally calls `flush()` first so the
+    /// closure sees a Vec whose `len()` reflects every bit written so
+    /// far.
+    pub fn with_aligned_output_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<u8>) -> R,
+    {
+        assert!(
+            self.bits_in_partial.is_multiple_of(8),
+            "with_aligned_output_mut requires byte-aligned writer state",
+        );
+        self.flush();
+        let prev_len = self.output.as_mut().len();
+        let result = f(self.output.as_mut());
+        let new_len = self.output.as_mut().len();
+        // Closure may only APPEND bytes (HufCStream's contract).
+        // Detect accidental truncation early — that would corrupt
+        // bit_idx into a phantom future bit.
+        debug_assert!(new_len >= prev_len, "closure must not shrink output");
+        self.bit_idx += (new_len - prev_len) * 8;
+        result
+    }
+
     /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte aligned
     pub fn flush(&mut self) {
         assert!(self.bits_in_partial.is_multiple_of(8));

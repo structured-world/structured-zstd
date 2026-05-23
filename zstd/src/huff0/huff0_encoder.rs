@@ -46,56 +46,219 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         Self::encode_stream(self.table, self.writer, data);
     }
 
-    /// Encodes the data using the provided table in 4 concatenated streams
-    /// Writes
-    /// * Table description
-    /// * Jumptable
-    /// * Encoded data in 4 streams, each padded to fill the last byte
+    /// Encodes the data using the provided table in 4 concatenated streams.
+    ///
+    /// Donor-faithful port of `HUF_compress4X_usingCTable_internal_body`
+    /// (`huf_compress.c:1169-1216`): emits the table description (if
+    /// requested), a 6-byte jump-table placeholder, then four
+    /// independent 1X Huffman bitstreams via the unrolled
+    /// dual-container loop in [`Self::encode_one_stream`]. Stream
+    /// sizes are patched back into the jump table after encoding.
+    ///
+    /// Donor's `HUF_compress1X_usingCTable_internal_body_loop` (lines
+    /// 991-1043) extracts ILP by encoding `kUnroll` symbols into
+    /// `bitContainer[0]` and another `kUnroll` symbols into
+    /// `bitContainer[1]` in parallel, then merging — breaking the
+    /// data dependency that a single accumulator would impose. We
+    /// mirror that here via `HufCStream::add_bits<FAST=true>` +
+    /// `zero_index1` / `merge_index1`.
+    ///
+    /// `kUnroll` choice mirrors donor's `tableLog`-driven dispatch
+    /// (`huf_compress.c:1077-1108`) so each instantiation keeps the
+    /// container's per-symbol nb_bits sum below 64 - 4 (the donor "≥
+    /// 4 free bits" precondition for `kFast=1`).
     pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
-        assert!(data.len() >= 4);
+        assert!(
+            data.len() >= 12,
+            "donor HUF_compress4X requires srcSize >= 12"
+        );
 
-        // Split data in 4 equally sized parts (the last one might be a bit smaller than the rest)
-        let split_size = data.len().div_ceil(4);
-        let src1 = &data[..split_size];
-        let src2 = &data[split_size..split_size * 2];
-        let src3 = &data[split_size * 2..split_size * 3];
-        let src4 = &data[split_size * 3..];
-
-        // Write table description
         if with_table {
             self.write_table();
         }
 
-        // Reserve space for the jump table, will be changed later
-        let size_idx = self.writer.index();
+        // Donor's jump table: 3 × u16 LE sizes (size1, size2, size3);
+        // size4 is implicit from total - sum. Reserve 6 bytes here,
+        // patch in after each stream finishes.
+        let jt_bit_idx = self.writer.index();
         self.writer.write_bits(0u16, 16);
         self.writer.write_bits(0u16, 16);
         self.writer.write_bits(0u16, 16);
 
-        // Write the 4 streams, noting the sizes of the encoded streams
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src1);
-        let size1 = (self.writer.index() - index_before) / 8;
+        // Donor: `segmentSize = (srcSize + 3) / 4` for the first 3
+        // segments; last segment takes whatever remains.
+        let segment_size = data.len().div_ceil(4);
+        let segments = [
+            &data[..segment_size],
+            &data[segment_size..segment_size * 2],
+            &data[segment_size * 2..segment_size * 3],
+            &data[segment_size * 3..],
+        ];
 
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src2);
-        let size2 = (self.writer.index() - index_before) / 8;
+        let table_log = self.table.table_log();
+        let packed_codes = self.table.packed_codes();
+        let mut stream_sizes = [0u16; 3];
 
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src3);
-        let size3 = (self.writer.index() - index_before) / 8;
+        for (i, segment) in segments.iter().enumerate() {
+            let bytes_written = self.writer.with_aligned_output_mut(|output| {
+                let dst_capacity = Self::huf_tight_compress_bound(segment.len(), table_log);
+                let mut bit_c = super::huf_cstream::HufCStream::new(output, dst_capacity)
+                    .expect("output buffer is too small to fit Huffman stream");
+                Self::encode_one_stream(packed_codes, &mut bit_c, segment, table_log);
+                bit_c.close()
+            });
+            if i < 3 {
+                assert!(
+                    bytes_written <= u16::MAX as usize,
+                    "Huffman stream exceeded 64 KiB jump-table limit",
+                );
+                stream_sizes[i] = bytes_written as u16;
+            }
+        }
 
-        Self::encode_stream(self.table, self.writer, src4);
+        self.writer.change_bits(jt_bit_idx, stream_sizes[0], 16);
+        self.writer
+            .change_bits(jt_bit_idx + 16, stream_sizes[1], 16);
+        self.writer
+            .change_bits(jt_bit_idx + 32, stream_sizes[2], 16);
+    }
 
-        // Sanity check, if this doesn't hold we produce a broken stream
-        assert!(size1 <= u16::MAX as usize);
-        assert!(size2 <= u16::MAX as usize);
-        assert!(size3 <= u16::MAX as usize);
+    /// Donor `HUF_tightCompressBound(srcSize, tableLog)` from
+    /// `huf_compress.c:1050-1053`: an upper bound on encoded bytes
+    /// that lets the hot path skip per-symbol bounds checks. We add
+    /// 16 extra slack for the trailing end-mark byte + close-flush
+    /// overshoot.
+    #[inline(always)]
+    fn huf_tight_compress_bound(src_size: usize, table_log: u32) -> usize {
+        ((src_size * table_log as usize) >> 3) + 8 + 16
+    }
 
-        // Update the jumptable with the real sizes
-        self.writer.change_bits(size_idx, size1 as u16, 16);
-        self.writer.change_bits(size_idx + 16, size2 as u16, 16);
-        self.writer.change_bits(size_idx + 32, size3 as u16, 16);
+    /// Dispatch on table_log to pick `kUnroll`, `kFastFlush`,
+    /// `kLastFast` matching donor's 64-bit branch in
+    /// `huf_compress.c:1092-1110`.
+    fn encode_one_stream(
+        table: &[u64],
+        bit_c: &mut super::huf_cstream::HufCStream<'_>,
+        data: &[u8],
+        table_log: u32,
+    ) {
+        // Donor's fallback for tableLog > 11 OR insufficient dst
+        // capacity: kUnroll=4 (on 64-bit), kFast=0, kLastFast=0.
+        // We always reserve `huf_tight_compress_bound` worth of dst,
+        // so the dst-capacity branch never fires; only tableLog > 11
+        // routes here, which clevels.h does not produce for L1-L22
+        // Fast/DFast workloads but is correct to handle defensively.
+        match table_log {
+            11 => Self::encode_one_stream_unrolled::<5, true, false>(table, bit_c, data),
+            10 => Self::encode_one_stream_unrolled::<5, true, true>(table, bit_c, data),
+            9 => Self::encode_one_stream_unrolled::<6, true, false>(table, bit_c, data),
+            8 => Self::encode_one_stream_unrolled::<7, true, false>(table, bit_c, data),
+            7 => Self::encode_one_stream_unrolled::<8, true, false>(table, bit_c, data),
+            // tableLog ∈ {1..=6, 12} — donor's "default" branch falls
+            // here too. kUnroll=4 keeps per-flush bit budget safe.
+            _ => Self::encode_one_stream_unrolled::<4, false, false>(table, bit_c, data),
+        }
+    }
+
+    /// Donor `HUF_compress1X_usingCTable_internal_body_loop`
+    /// (`huf_compress.c:991-1043`). Three phases:
+    ///
+    /// 1. Encode `n % K_UNROLL` symbols (slow / `FAST=false`) to
+    ///    align to a `K_UNROLL` boundary, then flush.
+    /// 2. If still not aligned to `2 * K_UNROLL`, encode another
+    ///    `K_UNROLL` symbols (with the last using `K_LAST_FAST`),
+    ///    then flush.
+    /// 3. Main loop: encode `K_UNROLL` symbols into stream 0, flush;
+    ///    `zero_index1`, encode `K_UNROLL` symbols into stream 1,
+    ///    merge into stream 0, flush. Loop processes `2 * K_UNROLL`
+    ///    input symbols per iteration with the two parallel
+    ///    sub-streams breaking the dependency chain.
+    ///
+    /// Symbols are consumed in REVERSE (`data[n-1]` then `data[n-2]`
+    /// …) matching donor's `ip[--n]` cadence — the resulting
+    /// bitstream is decoded forward, but encoding right-to-left lets
+    /// donor pack high-frequency low-bit codes against the top of
+    /// the container.
+    ///
+    /// `K_FAST_FLUSH`: skip the post-write overflow clamp in
+    /// `flush_bits`. Safe whenever the output buffer was sized via
+    /// `huf_tight_compress_bound`.
+    /// `K_LAST_FAST`: use `FAST=true` for the final `add_bits` of
+    /// each unroll group. Safe when `K_UNROLL * max_nb_bits + 4 <=
+    /// 64`, i.e. `K_UNROLL <= (60 / table_log)`.
+    fn encode_one_stream_unrolled<
+        const K_UNROLL: usize,
+        const K_FAST_FLUSH: bool,
+        const K_LAST_FAST: bool,
+    >(
+        table: &[u64],
+        bit_c: &mut super::huf_cstream::HufCStream<'_>,
+        data: &[u8],
+    ) {
+        let mut n = data.len();
+        let rem = n % K_UNROLL;
+
+        // Phase 1: tail symbols (< K_UNROLL) on the SLOW path.
+        if rem > 0 {
+            for _ in 0..rem {
+                n -= 1;
+                let elt = table[data[n] as usize];
+                bit_c.add_bits::<false>(elt, 0);
+            }
+            bit_c.flush_bits::<K_FAST_FLUSH>();
+        }
+        debug_assert!(n.is_multiple_of(K_UNROLL));
+
+        // Phase 2: bring n down to a multiple of 2 * K_UNROLL.
+        if !n.is_multiple_of(2 * K_UNROLL) {
+            for u in 1..K_UNROLL {
+                let elt = table[data[n - u] as usize];
+                bit_c.add_bits::<true>(elt, 0);
+            }
+            let last_elt = table[data[n - K_UNROLL] as usize];
+            if K_LAST_FAST {
+                bit_c.add_bits::<true>(last_elt, 0);
+            } else {
+                bit_c.add_bits::<false>(last_elt, 0);
+            }
+            bit_c.flush_bits::<K_FAST_FLUSH>();
+            n -= K_UNROLL;
+        }
+        debug_assert!(n.is_multiple_of(2 * K_UNROLL));
+
+        // Phase 3: dual-container main loop.
+        while n > 0 {
+            // K_UNROLL symbols into stream 0.
+            for u in 1..K_UNROLL {
+                let elt = table[data[n - u] as usize];
+                bit_c.add_bits::<true>(elt, 0);
+            }
+            let last_elt_0 = table[data[n - K_UNROLL] as usize];
+            if K_LAST_FAST {
+                bit_c.add_bits::<true>(last_elt_0, 0);
+            } else {
+                bit_c.add_bits::<false>(last_elt_0, 0);
+            }
+            bit_c.flush_bits::<K_FAST_FLUSH>();
+
+            // K_UNROLL symbols into stream 1 (independent of 0).
+            bit_c.zero_index1();
+            for u in 1..K_UNROLL {
+                let elt = table[data[n - K_UNROLL - u] as usize];
+                bit_c.add_bits::<true>(elt, 1);
+            }
+            let last_elt_1 = table[data[n - K_UNROLL - K_UNROLL] as usize];
+            if K_LAST_FAST {
+                bit_c.add_bits::<true>(last_elt_1, 1);
+            } else {
+                bit_c.add_bits::<false>(last_elt_1, 1);
+            }
+            bit_c.merge_index1();
+            bit_c.flush_bits::<K_FAST_FLUSH>();
+
+            n -= 2 * K_UNROLL;
+        }
+        debug_assert_eq!(n, 0);
     }
 
     /// Encode one stream and pad it to fill the last byte
@@ -264,6 +427,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
+    /// Donor-format packed Huffman codes (`HUF_CElt`): one `u64` per
+    /// symbol where the bottom 8 bits hold `nb_bits` and the top
+    /// `(64 - nb_bits)` bits hold `value` left-shifted to the high
+    /// end. Built in lockstep with `codes` so the donor-style
+    /// dual-container [`super::huf_cstream::HufCStream`] can index
+    /// symbols with a single u64 load (no per-symbol shift+combine).
+    /// See `huf_compress.c:208-221` for the donor format.
+    packed_codes: Vec<u64>,
+    /// Active Huffman table-log (1..=12). Stored explicitly so
+    /// `encode4x_donor` can dispatch to the correct `kUnroll`
+    /// template instantiation without re-scanning `codes`.
+    table_log: u32,
     /// Lazy cache of the FSE-encoded weight description. Avoids re-running
     /// `encode_weight_description` across `try_table_description_size` and
     /// `write_table` for the same table instance. **std-only** —
@@ -464,6 +639,8 @@ impl HuffmanTable {
         let table_log = highest_bit_set(weight_sum) - 1;
         let mut table = HuffmanTable {
             codes: alloc::vec![(0, 0); weights.len()],
+            packed_codes: alloc::vec![0u64; weights.len()],
+            table_log: table_log as u32,
             #[cfg(feature = "std")]
             cached_encoded_weight_description: CachedDescription::new(),
         };
@@ -488,9 +665,26 @@ impl HuffmanTable {
             let value = val_per_rank[nb_bits];
             val_per_rank[nb_bits] += 1;
             table.codes[symbol] = (value as u32, nb_bits as u8);
+            table.packed_codes[symbol] =
+                super::huf_cstream::pack_huf_celt(value as u32, nb_bits as u8);
         }
 
         table
+    }
+
+    /// Donor-format packed code table for the hot encode loop.
+    /// One `HUF_CElt` (`u64`) per symbol — see
+    /// `huf_compress.c:208-221` for the layout.
+    #[inline(always)]
+    pub(crate) fn packed_codes(&self) -> &[u64] {
+        &self.packed_codes
+    }
+
+    /// Active Huffman table-log (1..=12) — drives the `kUnroll`
+    /// dispatch in `encode4x_donor`.
+    #[inline(always)]
+    pub(crate) fn table_log(&self) -> u32 {
+        self.table_log
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
