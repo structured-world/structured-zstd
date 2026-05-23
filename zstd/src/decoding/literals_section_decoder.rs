@@ -462,7 +462,7 @@ unsafe fn run_4stream_decode_loop<K: HufKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
     brs: &mut [BitReaderReversed<'_>; 4],
     target: &mut [u8],
-    packed: &[u32],
+    packed: &[u16],
     cursors: &mut [usize; 4],
     bounds: &LoopBounds,
 ) {

@@ -4,10 +4,6 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
-#[cfg(target_arch = "aarch64")]
-use core::arch::asm;
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{
     _bzhi_u32, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
@@ -273,11 +269,25 @@ impl<'t> HuffmanDecoder<'t> {
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
         let table = decoders[0].table;
+        // Pack four u16 entries into a single u64. `compress_epi8`
+        // below operates on bytes regardless of element width, so a
+        // 64-bit register holding 4 × {symbol, nbBits} byte pairs is
+        // enough. No SIMD gather — scalar u16 loads through OOO load
+        // ports beat any small-batch gather on consumer x86.
+        let lane0 = u64::from(table.packed_decode[decoders[0].state as usize]);
+        let lane1 = u64::from(table.packed_decode[decoders[1].state as usize]);
+        let lane2 = u64::from(table.packed_decode[decoders[2].state as usize]);
+        let lane3 = u64::from(table.packed_decode[decoders[3].state as usize]);
+        let packed_u64 = lane0 | (lane1 << 16) | (lane2 << 32) | (lane3 << 48);
+        // Move the u64 into the low 64 bits of an xmm reg.
+        // Re-using `_mm_set_epi32` keeps the byte order identical to
+        // the historical u32-laned shape so the mask-compress patterns
+        // below stay correct.
         let packed = _mm_set_epi32(
-            table.packed_decode[decoders[3].state as usize] as i32,
-            table.packed_decode[decoders[2].state as usize] as i32,
-            table.packed_decode[decoders[1].state as usize] as i32,
-            table.packed_decode[decoders[0].state as usize] as i32,
+            (packed_u64 >> 48) as i32 & 0xFFFF,
+            ((packed_u64 >> 32) & 0xFFFF) as i32,
+            ((packed_u64 >> 16) & 0xFFFF) as i32,
+            (packed_u64 & 0xFFFF) as i32,
         );
 
         // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
@@ -299,33 +309,34 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode4_symbols_and_num_bits_avx2(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
+        // Donor parity: scalar u16 lookups, no SIMD gather. Upstream
+        // `huf_decompress.c` decodes via `dtable[index]` scalar loads
+        // in `HUF_4X1_DECODE_SYMBOL`, never a gather instruction.
+        // Modern CPUs execute 4 scalar u16 loads in parallel through
+        // multiple load ports (3-5 cycles via OOO) — strictly faster
+        // than any 4-element SIMD gather. The pre-fix AVX2 path
+        // additionally chose a 4-byte gather stride against the
+        // `Vec<u32>` table layout; the table is now `Vec<u16>` and
+        // there is no advantage in introducing a 2-byte gather.
         let table = decoders[0].table;
-        let states = _mm_set_epi32(
-            decoders[3].state as i32,
-            decoders[2].state as i32,
-            decoders[1].state as i32,
-            decoders[0].state as i32,
-        );
-        let gathered =
-            unsafe { _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4) };
-
-        let packed = [
-            _mm_cvtsi128_si32(gathered) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<4>(gathered)) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<8>(gathered)) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<12>(gathered)) as u32,
-        ];
-
-        let mut symbols = [0_u8; 4];
-        let mut num_bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            let v = packed[i];
-            symbols[i] = (v & 0xFF) as u8;
-            num_bits[i] = ((v >> 8) & 0xFF) as u8;
-            i += 1;
-        }
-        (symbols, num_bits)
+        let entry0 = table.packed_decode[decoders[0].state as usize];
+        let entry1 = table.packed_decode[decoders[1].state as usize];
+        let entry2 = table.packed_decode[decoders[2].state as usize];
+        let entry3 = table.packed_decode[decoders[3].state as usize];
+        (
+            [
+                (entry0 & 0xFF) as u8,
+                (entry1 & 0xFF) as u8,
+                (entry2 & 0xFF) as u8,
+                (entry3 & 0xFF) as u8,
+            ],
+            [
+                ((entry0 >> 8) & 0xFF) as u8,
+                ((entry1 >> 8) & 0xFF) as u8,
+                ((entry2 >> 8) & 0xFF) as u8,
+                ((entry3 >> 8) & 0xFF) as u8,
+            ],
+        )
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -333,35 +344,32 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode4_symbols_and_num_bits_neon(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
+        // Donor parity: scalar u16 loads + byte split. The previous
+        // NEON shape loaded four `u32` entries with `vld1q_u32`, then
+        // applied `vandq_u32` / `vshrq_n_u32` to extract the symbol /
+        // num_bits byte from each lane. With `packed_decode: Vec<u16>`
+        // the source no longer holds u32 lanes — and even if it did,
+        // four scalar loads through M1's 4-way load pipeline beat the
+        // SIMD round-trip on a 4-element batch.
         let table = decoders[0].table;
-        let packed_scalar = [
-            table.packed_decode[decoders[0].state as usize],
-            table.packed_decode[decoders[1].state as usize],
-            table.packed_decode[decoders[2].state as usize],
-            table.packed_decode[decoders[3].state as usize],
-        ];
-
-        let packed = unsafe { vld1q_u32(packed_scalar.as_ptr()) };
-        let mask = vdupq_n_u32(0xFF);
-        let symbols_v = vandq_u32(packed, mask);
-        let bits_v = vandq_u32(vshrq_n_u32::<8>(packed), mask);
-
-        let mut symbols_u32 = [0_u32; 4];
-        let mut bits_u32 = [0_u32; 4];
-        unsafe {
-            vst1q_u32(symbols_u32.as_mut_ptr(), symbols_v);
-            vst1q_u32(bits_u32.as_mut_ptr(), bits_v);
-        }
-
-        let mut symbols = [0_u8; 4];
-        let mut bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            symbols[i] = symbols_u32[i] as u8;
-            bits[i] = bits_u32[i] as u8;
-            i += 1;
-        }
-        (symbols, bits)
+        let entry0 = table.packed_decode[decoders[0].state as usize];
+        let entry1 = table.packed_decode[decoders[1].state as usize];
+        let entry2 = table.packed_decode[decoders[2].state as usize];
+        let entry3 = table.packed_decode[decoders[3].state as usize];
+        (
+            [
+                (entry0 & 0xFF) as u8,
+                (entry1 & 0xFF) as u8,
+                (entry2 & 0xFF) as u8,
+                (entry3 & 0xFF) as u8,
+            ],
+            [
+                ((entry0 >> 8) & 0xFF) as u8,
+                ((entry1 >> 8) & 0xFF) as u8,
+                ((entry2 >> 8) & 0xFF) as u8,
+                ((entry3 >> 8) & 0xFF) as u8,
+            ],
+        )
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -369,52 +377,31 @@ impl<'t> HuffmanDecoder<'t> {
     unsafe fn decode4_symbols_and_num_bits_sve(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
+        // Donor parity: scalar u16 loads. See `decode4_symbols_and_num_bits_avx2`
+        // for the rationale — the SVE inline-asm 4-lane unpack here
+        // round-trips through a u32 buffer and gains nothing over
+        // four 16-bit scalar loads. The `packed_decode` table is now
+        // `Vec<u16>`, so the prior `ld1w` (32-bit lane load) wouldn't
+        // even be type-correct.
         let table = decoders[0].table;
-        let packed_scalar = [
-            table.packed_decode[decoders[0].state as usize],
-            table.packed_decode[decoders[1].state as usize],
-            table.packed_decode[decoders[2].state as usize],
-            table.packed_decode[decoders[3].state as usize],
-        ];
-
-        let mut symbols_u32 = [0_u32; 4];
-        let mut bits_u32 = [0_u32; 4];
-        let lanes = 4_usize;
-
-        // Stable Rust does not yet expose SVE intrinsics in core::arch.
-        // Use SVE inline asm for 4-lane packed-entry unpack:
-        // symbol = packed & 0xff; bits = (packed >> 8) & 0xff.
-        unsafe {
-            asm!(
-                "whilelt p0.s, xzr, {lanes}",
-                "ld1w z0.s, p0/z, [{inptr}]",
-                "mov z1.d, z0.d",
-                "lsr z2.s, z0.s, #8",
-                "and z1.s, z1.s, #0xff",
-                "and z2.s, z2.s, #0xff",
-                "st1w z1.s, p0, [{symptr}]",
-                "st1w z2.s, p0, [{bitptr}]",
-                inptr = in(reg) packed_scalar.as_ptr(),
-                symptr = in(reg) symbols_u32.as_mut_ptr(),
-                bitptr = in(reg) bits_u32.as_mut_ptr(),
-                lanes = in(reg) lanes,
-                lateout("z0") _,
-                lateout("z1") _,
-                lateout("z2") _,
-                lateout("p0") _,
-                options(nostack),
-            );
-        }
-
-        let mut symbols = [0_u8; 4];
-        let mut bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            symbols[i] = symbols_u32[i] as u8;
-            bits[i] = bits_u32[i] as u8;
-            i += 1;
-        }
-        (symbols, bits)
+        let entry0 = table.packed_decode[decoders[0].state as usize];
+        let entry1 = table.packed_decode[decoders[1].state as usize];
+        let entry2 = table.packed_decode[decoders[2].state as usize];
+        let entry3 = table.packed_decode[decoders[3].state as usize];
+        (
+            [
+                (entry0 & 0xFF) as u8,
+                (entry1 & 0xFF) as u8,
+                (entry2 & 0xFF) as u8,
+                (entry3 & 0xFF) as u8,
+            ],
+            [
+                ((entry0 >> 8) & 0xFF) as u8,
+                ((entry1 >> 8) & 0xFF) as u8,
+                ((entry2 >> 8) & 0xFF) as u8,
+                ((entry3 >> 8) & 0xFF) as u8,
+            ],
+        )
     }
 
     #[inline(always)]
@@ -659,7 +646,18 @@ pub struct HuffmanTable {
     /// directly (`packed_decode[idx]`) for a single-load table lookup
     /// matching donor `huf_decompress.c:dtable[index]` — bypassing the
     /// kernel-dispatch path used by SIMD fallback.
-    pub(crate) packed_decode: Vec<u32>,
+    ///
+    /// **`u16` (matches donor `HUF_DEltX1` layout exactly).** Donor's
+    /// `dtable[index]` returns a 2-byte entry — low byte is `symbol`,
+    /// high byte is `nbBits`. We mirror that representation so the
+    /// table size is `2 × (1 << max_num_bits)` bytes instead of `4 ×`.
+    /// At `max_num_bits = 11` (zstd spec ceiling) that's 4 KiB vs the
+    /// older 8 KiB representation — halves L1d footprint on the hot
+    /// HUF decode path. Worth the change because the L-7 Fast workload
+    /// (and any small-alphabet poorly-compressed input) decodes most
+    /// output bytes through this table; literal-buffer pressure on
+    /// L1d makes the cache hit rate sensitive to table footprint.
+    pub(crate) packed_decode: Vec<u16>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
@@ -1006,7 +1004,10 @@ impl HuffmanTable {
                     num_bits: bits_for_symbol,
                 };
                 self.decode[base_idx..base_idx + len].fill(entry);
-                let packed = u32::from(entry.symbol) | (u32::from(entry.num_bits) << 8);
+                // Donor `HUF_DEltX1` packing: low byte = symbol, high
+                // byte = nbBits. `num_bits ≤ 11` always fits in the
+                // upper byte alongside an 8-bit symbol.
+                let packed = u16::from(entry.symbol) | (u16::from(entry.num_bits) << 8);
                 self.packed_decode[base_idx..base_idx + len].fill(packed);
             }
         }
@@ -1064,7 +1065,7 @@ mod tests {
         ];
         let packed_decode = decode
             .iter()
-            .map(|e| u32::from(e.symbol) | (u32::from(e.num_bits) << 8))
+            .map(|e| u16::from(e.symbol) | (u16::from(e.num_bits) << 8))
             .collect::<Vec<_>>();
 
         HuffmanTable {
