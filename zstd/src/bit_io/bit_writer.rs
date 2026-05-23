@@ -280,7 +280,17 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.output
             .as_mut()
             .extend_from_slice(&self.partial.to_le_bytes()[..full_bytes]);
-        self.partial >>= full_bytes * 8;
+        // `full_bytes == 8` (full accumulator) means a raw
+        // `partial >>= 64` would be UB on `u64`. This SAFE function is
+        // reachable indirectly via `with_aligned_output_mut`,
+        // `change_bits`, and `append_bytes`, so the state IS reachable
+        // — zero explicitly when the whole word is consumed instead of
+        // shifting.
+        if full_bytes == 8 {
+            self.partial = 0;
+        } else {
+            self.partial >>= full_bytes * 8;
+        }
         self.bits_in_partial -= full_bytes * 8;
         self.bit_idx += full_bytes * 8;
     }
