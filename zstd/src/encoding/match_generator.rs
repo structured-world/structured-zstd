@@ -296,12 +296,12 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // Lvl  Strategy       wlog  fast_hlog  fast_mls  fast_step  lazy  HC config                                   row config
     // ---  -------------- ----  ---------  --------  ---------  ----  ------------------------------------------  ----------
     /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 20, fast_hash_log: 16, fast_mls: 6, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
     /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
     /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
     /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
@@ -4183,9 +4183,9 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
 }
 
 #[test]
-fn driver_level4_selects_row_backend() {
+fn driver_level5_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
     // Greedy-specific routing assertion: the `BackendTag::Row` arm of
     // `MatchGeneratorDriver::compress_block` has a
@@ -4406,7 +4406,7 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
 /// repcode lookup fails the test instead of being masked by
 /// first-slice matches.
 #[test]
-fn driver_level4_greedy_tail_rep_only_reachable() {
+fn driver_level5_greedy_tail_rep_only_reachable() {
     // Period-4 first slice locks rep1 = 4 into `offset_hist` by the
     // time the parse reaches the slice tail. Second slice is exactly
     // 5 bytes ( = `GREEDY_MIN_LOOKAHEAD`) so the outer loop runs
@@ -4422,7 +4422,7 @@ fn driver_level4_greedy_tail_rep_only_reachable() {
     let first: &[u8] = b"ABCDABCDABCDABCD"; // 16 bytes — strict period 4
     let second: &[u8] = b"ABCDA"; // 5 bytes — exact GREEDY_MIN_LOOKAHEAD
     let mut driver = MatchGeneratorDriver::new(16, 2);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
 
     let mut first_space = driver.get_next_space();
     first_space[..first.len()].copy_from_slice(first);
@@ -4588,9 +4588,10 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     }
 
     check(CompressionLevel::Level(1), StrategyTag::Fast);
-    check(CompressionLevel::Level(2), StrategyTag::Dfast);
+    check(CompressionLevel::Level(2), StrategyTag::Fast);
     check(CompressionLevel::Level(3), StrategyTag::Dfast);
-    check(CompressionLevel::Level(4), StrategyTag::Greedy);
+    check(CompressionLevel::Level(4), StrategyTag::Dfast);
+    check(CompressionLevel::Level(5), StrategyTag::Greedy);
     check(CompressionLevel::Level(7), StrategyTag::Lazy);
     check(CompressionLevel::Level(15), StrategyTag::Lazy);
     check(CompressionLevel::Level(16), StrategyTag::BtOpt);
@@ -5515,7 +5516,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
 fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
@@ -5532,7 +5533,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     );
 
     driver.set_source_size_hint(1024);
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
@@ -5569,7 +5570,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
 fn driver_small_source_hint_shrinks_row_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
@@ -5579,7 +5580,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_LOG));
 
     driver.set_source_size_hint(1024);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
@@ -5785,7 +5786,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
 fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
@@ -6064,7 +6065,11 @@ fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
 #[test]
 fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(2));
+    // Use Level(4) — Dfast with `use_fast_loop=false`. Level(3) is
+    // also Dfast but flips `use_fast_loop=true`, which routes through
+    // a different scan path that bails early on the tiny 8-byte
+    // dict + 8-byte block scenario this test exercises.
+    driver.reset(CompressionLevel::Level(4));
 
     driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
 
@@ -6148,7 +6153,7 @@ fn prime_with_dictionary_counts_only_committed_tail_budget() {
 #[test]
 fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
 
     let before = driver.dfast_matcher().max_window_size;
     // One full slice plus a 4-byte tail. Dfast can still use this tail through
@@ -6198,7 +6203,7 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
 #[test]
 fn row_prime_with_dictionary_subtracts_uncommitted_tail_budget() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
 
     let base_window = driver.row_matcher().max_window_size;
     // Slice size is 8. The trailing byte cannot be committed (<4 tail),
@@ -6215,7 +6220,7 @@ fn row_prime_with_dictionary_subtracts_uncommitted_tail_budget() {
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     // Keep live window tiny so dictionary-primed slices are evicted quickly.
     driver.row_matcher_mut().max_window_size = 8;
     driver.reported_window_size = 8;
@@ -6255,7 +6260,7 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
 #[test]
 fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
     let mut space = driver.get_next_space();
@@ -6282,7 +6287,7 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
 #[test]
 fn driver_reset_from_row_backend_recycles_row_buffers_into_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(4));
+    driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
     let mut space = driver.get_next_space();
@@ -7100,7 +7105,7 @@ fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
     // Use a small live window in this regression so dictionary-primed slices are
     // evicted quickly and budget retirement can be asserted deterministically.
     driver.dfast_matcher_mut().max_window_size = 8;
@@ -7677,7 +7682,7 @@ fn dfast_commit_space_eviction_uses_window_size_delta() {
     use crate::encoding::CompressionLevel;
 
     let mut driver = MatchGeneratorDriver::new(10, 1);
-    driver.reset(CompressionLevel::Level(2));
+    driver.reset(CompressionLevel::Level(3));
     assert!(matches!(driver.storage, MatcherStorage::Dfast(_)));
 
     // Override the level-derived window with a tiny one so the
