@@ -199,6 +199,21 @@ fn decompress_literals(
             .min(ends[2] - starts[2])
             .min(ends[3] - starts[3]);
         let cursor_exit_olimit = starts[0] + min_seg_len;
+        // `burst_eligible` is the load-bearing safety gate against
+        // adversarial frame headers. If `min_seg_len < symbols_per_burst`
+        // (small `regenerated_size` paired with large compressed streams,
+        // forging a 4-stream HUF block where `seg = div_ceil(regen, 4) <
+        // symbols_per_burst`) then `cursor_burst_ceil` saturates to 0
+        // and `cursors[0] <= 0` is trivially true on entry — admitting
+        // the burst path, whose inner loop would then advance
+        // `cursors[i]` past `ends[i]` and panic on the `target[cursors[i]]`
+        // write. Requiring `min_seg_len >= symbols_per_burst` up front
+        // means the burst path only runs when a full burst fits inside
+        // EVERY segment, so the inner loop's cursor advance is sound by
+        // construction. The non-burst SIMD-fallback path advances each
+        // cursor by 1 per outer iteration and is naturally guarded by
+        // the existing per-iteration top-of-loop exit check.
+        let burst_eligible = symbols_per_burst >= 1 && min_seg_len >= symbols_per_burst;
         let cursor_burst_ceil = cursor_exit_olimit.saturating_sub(symbols_per_burst);
 
         // Kernel choice is invariant across this whole call (all four
@@ -224,6 +239,7 @@ fn decompress_literals(
             state_shift,
             cursor_exit_olimit,
             cursor_burst_ceil,
+            burst_eligible,
         };
 
         match detect_huffman_decode_kernel() {
@@ -412,6 +428,12 @@ struct LoopBounds {
     state_shift: u8,
     cursor_exit_olimit: usize,
     cursor_burst_ceil: usize,
+    /// Set iff a full burst (`symbols_per_burst` symbols per stream)
+    /// can fit in the lagging segment. When false the burst gate is
+    /// hard-disabled regardless of per-iteration bits state — the
+    /// SIMD-fallback path runs the loop instead. See setup site for
+    /// the safety rationale (adversarial / small-regen DoS guard).
+    burst_eligible: bool,
 }
 
 /// Monomorphised 4-stream HUF decode outer loop — burst tier + SIMD
@@ -454,6 +476,7 @@ unsafe fn run_4stream_decode_loop<K: HufKernel>(
         state_shift,
         cursor_exit_olimit,
         cursor_burst_ceil,
+        burst_eligible,
     } = *bounds;
 
     loop {
@@ -495,7 +518,7 @@ unsafe fn run_4stream_decode_loop<K: HufKernel>(
         // is a no-op on the well-typed path but defensive against future drift.
         let max_consumed_ceil = 64u8.saturating_sub(burst_bits);
 
-        let burst_ok = symbols_per_burst >= 1
+        let burst_ok = burst_eligible
             && brs[0].bits_remaining() > burst_bits_isize
             && brs[1].bits_remaining() > burst_bits_isize
             && brs[2].bits_remaining() > burst_bits_isize
