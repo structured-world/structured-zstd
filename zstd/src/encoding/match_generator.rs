@@ -8481,3 +8481,42 @@ fn lazy_band_target_len_matches_donor_default_table() {
         );
     }
 }
+
+/// Pins lazy-band `hc.search_depth` to donor `1 << cParams.searchLog`
+/// for the levels where ours currently EXCEEDS donor's chain budget
+/// (L8 / L9 / L13). Walking deeper than donor at these levels burns
+/// chain-walk cycles without measurable ratio benefit — we already
+/// beat donor on ratio across the lazy band (see #184 Phase 1).
+///
+/// "Under-donor" levels (L5, L10, L11, L12, L15) are intentionally
+/// NOT pinned by this test — raising them to donor would increase
+/// chain-walk work and may not be net positive without per-level
+/// bench validation. Those revisits are deferred to a separate
+/// subtask once L4 + this PR's bench results stabilize.
+///
+/// Test queries donor via `ZSTD_getCParams(level, 0, 0)` so any
+/// future donor-table tweak in upstream zstd is reflected
+/// automatically.
+#[test]
+fn lazy_band_over_donor_search_depth_aligned() {
+    use zstd::zstd_safe::zstd_sys;
+
+    // Levels where ours strictly exceeded donor's `1 << searchLog`
+    // before this fix — pinning these prevents accidental drift
+    // back above the donor budget.
+    let over_levels = [8i32, 9, 13];
+    for level in over_levels {
+        // SAFETY: `ZSTD_getCParams` reads from a static table; safe
+        // to call with any (level, srcSize, dictSize) combination.
+        let donor = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let params = resolve_level_params(CompressionLevel::Level(level), None);
+        let donor_depth = 1u32 << donor.searchLog;
+        assert_eq!(
+            params.hc.search_depth as u32, donor_depth,
+            "L{level}: hc.search_depth ({}) must equal donor `1<<searchLog` ({}) — \
+             walking deeper than donor on this level burns chain-walk cycles \
+             without measurable ratio benefit",
+            params.hc.search_depth, donor_depth
+        );
+    }
+}
