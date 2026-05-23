@@ -514,15 +514,26 @@ fn bench_dictionary(c: &mut Criterion) {
             // the fixed input on both branches so the throughput
             // metric is apples-to-apples (Rust and FFI decode the SAME
             // bytes — what differs is the decoder implementation).
+            //
+            // CRITICAL: `with_dict_bytes` was compressed using
+            // `ffi_dictionary` (`Compressor::with_dictionary(level,
+            // &ffi_dictionary)` above), so the decoder MUST hold the
+            // SAME dictionary bytes — the inner zstd frame's `dict_id`
+            // header is derived from those bytes. Parsing the handle
+            // from `rust_dictionary` (different bytes, different
+            // `dict_id`) would cause `decode_all_with_dict_handle` to
+            // fail with `DictNotProvided` and the FFI side to operate
+            // on the wrong dictionary, both measuring the wrong path.
             let Ok(rust_dict_handle) =
-                structured_zstd::decoding::DictionaryHandle::decode_dict(&rust_dictionary)
+                structured_zstd::decoding::DictionaryHandle::decode_dict(ffi_dictionary.as_slice())
             else {
                 eprintln!(
-                    "BENCH_WARN skipping decompress-dict for {} level={} (failed to parse Rust dict handle)",
+                    "BENCH_WARN skipping decompress-dict for {} level={} (failed to parse FFI dict bytes into a Rust DictionaryHandle)",
                     scenario.id, level.name
                 );
                 continue;
             };
+            let expected_len = scenario.bytes.len();
             let decompress_dict_name = format!(
                 "decompress-dict/{}/{}/{}",
                 level.name, scenario.id, "matrix"
@@ -533,7 +544,7 @@ fn bench_dictionary(c: &mut Criterion) {
 
             group.bench_function("pure_rust_with_dict", |b| {
                 let mut decoder = FrameDecoder::new();
-                let mut output = vec![0u8; scenario.bytes.len()];
+                let mut output = vec![0u8; expected_len];
                 b.iter(|| {
                     let n = decoder
                         .decode_all_with_dict_handle(
@@ -542,19 +553,21 @@ fn bench_dictionary(c: &mut Criterion) {
                             &rust_dict_handle,
                         )
                         .expect("rust decode-with-dict must succeed");
-                    black_box(n);
+                    assert_eq!(n, expected_len, "rust decode wrote a partial output");
+                    black_box(&output[..n]);
                 })
             });
 
             group.bench_function("c_ffi_with_dict", |b| {
                 let mut decompressor =
                     zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
-                let mut output = vec![0u8; scenario.bytes.len()];
+                let mut output = vec![0u8; expected_len];
                 b.iter(|| {
                     let n = decompressor
                         .decompress_to_buffer(with_dict_bytes.as_slice(), output.as_mut_slice())
                         .expect("ffi decode-with-dict must succeed");
-                    black_box(n);
+                    assert_eq!(n, expected_len, "ffi decode wrote a partial output");
+                    black_box(&output[..n]);
                 })
             });
 
