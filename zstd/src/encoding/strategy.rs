@@ -257,19 +257,24 @@ impl StrategyTag {
     ///
     /// Matches `LEVEL_TABLE` in `match_generator.rs` and the donor
     /// `clevels.h` table:
-    /// * 1 → `Fast`
-    /// * 2-3 → `Dfast`
-    /// * 4 → `Greedy`
-    /// * 5-15 → `Lazy`
+    /// Mirrors donor `ZSTD_defaultCParameters[0]` (srcSize > 256 KiB
+    /// tier) strategy column at `zstd/lib/compress/clevels.h:25-50`:
+    ///
+    /// * 1-2 → `Fast`
+    /// * 3-4 → `Dfast`
+    /// * 5 → `Greedy`
+    /// * 6-15 → `Lazy` (donor splits 6/7=lazy, 8-12=lazy2,
+    ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
+    ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
     /// * 16-17 → `BtOpt`
     /// * 18-19 → `BtUltra`
     /// * 20-22 → `BtUltra2`
     pub(crate) const fn for_level(level: u8) -> Self {
         match level {
-            1 => Self::Fast,
-            2 | 3 => Self::Dfast,
-            4 => Self::Greedy,
-            5..=15 => Self::Lazy,
+            1 | 2 => Self::Fast,
+            3 | 4 => Self::Dfast,
+            5 => Self::Greedy,
+            6..=15 => Self::Lazy,
             16 | 17 => Self::BtOpt,
             18 | 19 => Self::BtUltra,
             _ => Self::BtUltra2,
@@ -367,10 +372,10 @@ mod tests {
     fn level_to_tag_matches_donor_table() {
         // Spot-check every band boundary and one mid-band level.
         assert_eq!(StrategyTag::for_level(1), StrategyTag::Fast);
-        assert_eq!(StrategyTag::for_level(2), StrategyTag::Dfast);
+        assert_eq!(StrategyTag::for_level(2), StrategyTag::Fast);
         assert_eq!(StrategyTag::for_level(3), StrategyTag::Dfast);
-        assert_eq!(StrategyTag::for_level(4), StrategyTag::Greedy);
-        assert_eq!(StrategyTag::for_level(5), StrategyTag::Lazy);
+        assert_eq!(StrategyTag::for_level(4), StrategyTag::Dfast);
+        assert_eq!(StrategyTag::for_level(5), StrategyTag::Greedy);
         assert_eq!(StrategyTag::for_level(9), StrategyTag::Lazy);
         assert_eq!(StrategyTag::for_level(15), StrategyTag::Lazy);
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);

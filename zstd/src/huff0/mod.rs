@@ -4,6 +4,7 @@
 /// will start with the same sequence of bits.
 pub(crate) mod huff0_decoder;
 pub use huff0_decoder::*;
+pub(crate) mod huf_cstream;
 pub mod huff0_encoder;
 
 /// Only needed for testing.

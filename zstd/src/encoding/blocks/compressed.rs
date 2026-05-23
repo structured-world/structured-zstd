@@ -346,6 +346,62 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state.block_scratch = scratch;
 }
 
+/// Append `lits` to `dst` using inline byte / u64 ops for short
+/// slices, avoiding the libc memmove call overhead that
+/// `Vec::extend_from_slice` lowers to for runtime-sized
+/// `ptr::copy_nonoverlapping`. Fast L1 emits literal runs of 1-10
+/// bytes typically — at thousands of sequences per block, the per-
+/// emit libc call dominated the hot path (flamegraph: 60 % of CPU
+/// in `__memmove_avx_unaligned_erms` chain).
+///
+/// Route through `simd_copy::copy_bytes_overshooting` with src.1 ==
+/// dst.1 == lit_len (no overshoot READ; we don't know how much
+/// readable slack the caller's slice has). For lit_len ≤ 32 that
+/// drops into the byte-by-byte / overlapping-u64 path, fully
+/// inlineable. Larger runs fall through `extend_from_slice` —
+/// they're rare and libc memmove amortises across the longer copy.
+#[inline]
+fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
+    let lit_len = lits.len();
+    if lit_len == 0 {
+        return;
+    }
+    if lit_len <= 32 {
+        // Production callers (`collect_block_parts`) pre-reserve
+        // `src_len` of spare capacity, so the sum of all literal
+        // runs across a block fits without grow. But this is a SAFE
+        // fn (module-private; callers in this same file are the
+        // only ones today, but the safety net still must hold), so
+        // we enforce the precondition in release too — otherwise a
+        // future caller skipping the pre-reserve would get an
+        // immediate 32-byte OOB write into whatever follows the
+        // `Vec`'s allocation. The branch is cold on the production
+        // hot path (debug_assert in tests confirms it stays
+        // untaken).
+        let cur_len = dst.len();
+        if dst.capacity() - cur_len < lit_len {
+            dst.reserve(lit_len);
+        }
+        let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
+        // SAFETY: `lits` is a valid slice (so reading `lit_len`
+        // bytes from `lits.as_ptr()` is in-bounds); the
+        // `dst.reserve(lit_len)` above guarantees `dst_ptr` has
+        // `lit_len` bytes of spare capacity. copy_bytes_overshooting
+        // writes EXACTLY `lit_len` bytes when
+        // `min(src.1, dst.1) == lit_len`.
+        unsafe {
+            crate::decoding::simd_copy::copy_bytes_overshooting(
+                (lits.as_ptr(), lit_len),
+                (dst_ptr, lit_len),
+                lit_len,
+            );
+            dst.set_len(cur_len + lit_len);
+        }
+    } else {
+        dst.extend_from_slice(lits);
+    }
+}
+
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
     let src_len = state.matcher.get_last_space().len();
     parts.literals.clear();
@@ -365,14 +421,14 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             .reserve_exact(sequence_capacity - parts.sequences.len());
     }
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => parts.literals.extend_from_slice(literals),
+        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            parts.literals.extend_from_slice(literals);
+            append_literals(&mut parts.literals, literals);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
@@ -450,23 +506,40 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        let ll_mode = choose_table(
+        // Single-pass histogram of ll/ml/of codes across all sequences.
+        // Previously did three separate `sequences.iter().map(...)`
+        // passes; folded into one loop here saves the per-element
+        // closure overhead (profile #220 round 3: `Map::fold` +
+        // `call_mut` accounted for ~5% of total bench CPU).
+        let mut ll_counts = [0usize; 256];
+        let mut ml_counts = [0usize; 256];
+        let mut of_counts = [0usize; 256];
+        for seq in sequences.iter() {
+            ll_counts[encode_literal_length(seq.ll).0 as usize] += 1;
+            ml_counts[encode_match_len(seq.ml).0 as usize] += 1;
+            of_counts[encode_offset(seq.of).0 as usize] += 1;
+        }
+        let total = sequences.len();
+
+        let ll_mode = choose_table_from_counts(
             state.fse_tables.ll_previous.as_ref(),
             state.fse_tables.ll_default_ref(),
-            sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
+            &ll_counts,
+            total,
             9,
         );
-        let ml_mode = choose_table(
+        let ml_mode = choose_table_from_counts(
             state.fse_tables.ml_previous.as_ref(),
             state.fse_tables.ml_default_ref(),
-            sequences.iter().map(|seq| encode_match_len(seq.ml).0),
+            &ml_counts,
+            total,
             9,
         );
-        let of_mode = choose_table(
+        let of_mode = choose_table_from_counts(
             state.fse_tables.of_previous.as_ref(),
             state.fse_tables.of_default_ref(),
-            sequences.iter().map(|seq| encode_offset(seq.of).0),
+            &of_counts,
+            total,
             8,
         );
 
@@ -1302,7 +1375,23 @@ fn choose_table<'a>(
         counts[symbol as usize] += 1;
         total += 1;
     }
+    choose_table_from_counts(previous, default_table, &counts, total, max_log)
+}
 
+/// Same decision logic as [`choose_table`] but takes pre-computed
+/// symbol counts and total directly. Hot-path callers in
+/// `compress_literals_and_sequences` use this overload to avoid
+/// re-iterating the sequence vec three times (one pass per
+/// ll/ml/of stream); the iterator form is kept for the cost
+/// estimator's call sites where the data is already in iterator
+/// form.
+fn choose_table_from_counts<'a>(
+    previous: Option<&'a PreviousFseTable>,
+    default_table: &'a FSETable,
+    counts: &[usize; 256],
+    total: usize,
+    max_log: u8,
+) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
     }
@@ -1337,15 +1426,15 @@ fn choose_table<'a>(
     let new_total_cost = new_table.as_ref().map(|table| {
         table
             .table_header_bits()
-            .saturating_add(entropy_cost(&counts, max_symbol, total))
+            .saturating_add(entropy_cost(counts, max_symbol, total))
     });
 
-    let predefined_cost = cross_entropy_cost(&counts, max_symbol, default_table);
+    let predefined_cost = cross_entropy_cost(counts, max_symbol, default_table);
 
     let previous_cost = previous.and_then(|previous| {
         previous
             .as_table(default_table)
-            .and_then(|table| fse_bit_cost(&counts, max_symbol, table))
+            .and_then(|table| fse_bit_cost(counts, max_symbol, table))
     });
 
     enum Choice {
@@ -1482,36 +1571,115 @@ fn encode_sequences(
     writer.write_bits(ml_add_bits, ml_num_bits);
     writer.write_bits(of_add_bits, of_num_bits);
 
-    // encode backwards so the decoder reads the first sequence first
+    // Donor-faithful sequence loop: write state diffs + extras via
+    // unchecked fast-path adds with explicit `flush_bulk` calls at
+    // safe burst boundaries. Per-sequence bit budget:
+    //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits → one
+    //                burst between flushes.
+    //   extras:      ll (<=16) + ml (<=16) + of (<=24) = 56 bits →
+    //                one burst between flushes.
+    //
+    // Total per sequence: 82 bits ⇒ at least 2 flushes (one per burst).
+    // Mirrors donor `ZSTD_encodeSequences_body`
+    // (`zstd_compress_sequences.c:303-360`) which uses BIT_addBitsFast
+    // + BIT_flushBitsFast at the same burst boundaries.
+    //
+    // Pre-reserve output capacity for the worst-case sequence section
+    // size (~10 bytes/sequence + 32 byte slack) so the per-flush
+    // `extend_from_slice` never triggers a Vec realloc.
     if sequences.len() > 1 {
+        writer.reserve_output(sequences.len() * 12 + 64);
+        // Pre-loop flush: the safe `write_bits` calls above for the
+        // final sequence's add_bits leave `bits_in_partial` in
+        // 0..=63. Before the first unchecked-add burst we drain to
+        // < 8 leftover so the per-burst budget math (state diffs ≤
+        // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
+        // SAFETY: `reserve_output` above guarantees capacity ≥
+        // current_len + sequences.len() * 12 + 64 ≥ current_len + 8.
+        unsafe {
+            writer.flush_bulk();
+        }
         for sequence in (0..=sequences.len() - 2).rev() {
             let sequence = sequences[sequence];
             let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
             let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
+            // State diffs burst: max 30 bits (10+10+9 worst case for
+            // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
+            // prior flush = ≤ 37 bits total — well under 64.
+            //
+            // SAFETY (for every `write_bits_64_no_check` below):
+            // - the prior `flush_bulk` left `bits_in_partial ≤ 7`;
+            // - each FSE state diff has `next.num_bits ≤ acc_log ≤ 10`;
+            //   three diffs back-to-back add ≤ 30 bits → total ≤ 37,
+            //   well below the 64-bit accumulator cap.
+            // - `diff = state.index - next.baseline` cannot exceed
+            //   `(1 << num_bits) - 1`, so `diff >> num_bits == 0`.
+            // `reserve_output(sequences.len() * 12 + 64)` above
+            // pre-allocated enough spare capacity to cover every
+            // per-sequence flush in this loop (≤ 16 bytes per
+            // sequence, plus the 32-byte slack on top of the 64-byte
+            // header reserve).
             if let (Some(table), Some(state)) = (of_table, of_state) {
                 let next = table.next_state(of_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 of_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ml_table, ml_state) {
                 let next = table.next_state(ml_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 ml_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ll_table, ll_state) {
                 let next = table.next_state(ll_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 ll_state = Some(next);
             }
+            unsafe {
+                writer.flush_bulk();
+            }
 
-            writer.write_bits(ll_add_bits, ll_num_bits);
-            writer.write_bits(ml_add_bits, ml_num_bits);
-            writer.write_bits(of_add_bits, of_num_bits);
+            // Extras burst: ll (≤16) + ml (≤16) + of (≤ window_log,
+            // up to 30 for our max window_log). With ≤ 7 leftover from
+            // the prior flush_bulk, total ll+ml+of+partial can exceed
+            // 64 once of_num_bits > 25. Donor handles this via
+            // `longOffsets` mode that splits high offsets across two
+            // BIT_addBits calls; we instead drain the partial after ml
+            // and write of into a fresh container. The branch matches
+            // donor's `MEM_32bits()` flush-between-each-component
+            // shape on the 32-bit build (which has the same 64-bit
+            // container constraint).
+            //
+            // SAFETY: `encode_literal_length` / `encode_match_len`
+            // bound `*_num_bits ≤ 16` and return a clean `*_add_bits`
+            // (low `num_bits` bits only). `encode_offset` bounds
+            // `of_num_bits ≤ ilog2(of)`, capped at the encoder's
+            // `window_log` ≤ 30; the conditional flush_bulk above
+            // drains the partial when of_num_bits crosses the 24-bit
+            // threshold where the sum could exceed 64.
+            unsafe {
+                writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
+                writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+            }
+            if of_num_bits > 24 {
+                unsafe {
+                    writer.flush_bulk();
+                }
+            }
+            unsafe {
+                writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
+                writer.flush_bulk();
+            }
         }
     }
     if let (Some(state), Some(table)) = (ml_state, ml_table) {

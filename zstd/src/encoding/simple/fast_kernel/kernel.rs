@@ -12,15 +12,64 @@ use super::count::count_forward;
 use super::hash_table::FastHashTable;
 use crate::encoding::Sequence;
 
-/// Donor `kSearchStrength` — the step-skip accelerator advances the
-/// per-iteration step every `1 << (kSearchStrength - 1) = 32` bytes
-/// when no matches are found, so incompressible regions skip ahead
-/// faster than the linear 1-byte advance.
-const SEARCH_STRENGTH: usize = 6;
+/// Per-iteration diagnostic tracing of the Fast kernel inner loop.
+///
+/// Compile-time gated by `--features kernel_trace`; runtime-gated by
+/// `STRUCTURED_ZSTD_KERNEL_TRACE` env var (any non-empty value).
+/// Production builds carry ZERO cost — the macro expands to a no-op
+/// when the feature is off, so the hot loop never even sees the
+/// `if std::env::var(..)` check.
+///
+/// Used by `examples/trace_fast_kernel.rs` to diff our kernel's
+/// state against donor `zstd_fast.c:266-348` reasoning at every iter
+/// in the first block of decodecorpus-z000033 (issue #220 ratio gap).
+#[cfg(feature = "kernel_trace")]
+macro_rules! ktrace {
+    ($($arg:tt)*) => {
+        if crate::encoding::simple::fast_kernel::kernel::kernel_trace_enabled() {
+            ::std::eprintln!($($arg)*);
+        }
+    };
+}
+#[cfg(not(feature = "kernel_trace"))]
+macro_rules! ktrace {
+    ($($arg:tt)*) => {};
+}
 
-/// Donor `kStepIncr = 1 << (kSearchStrength - 1)` — every this-many
-/// bytes of no-match scanning, the per-iteration `step` is bumped
-/// by 1 (donor's `step++` at `zstd_fast.c:343`). Drives the
+#[cfg(feature = "kernel_trace")]
+pub(crate) fn kernel_trace_enabled() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("STRUCTURED_ZSTD_KERNEL_TRACE")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Donor `kSearchStrength` — defined in `zstd_compress_internal.h:32`
+/// as `#define kSearchStrength 8`. The step-skip accelerator advances
+/// the per-iteration step every `1 << (kSearchStrength - 1) = 128`
+/// bytes when no matches are found, so incompressible regions skip
+/// ahead faster than the linear 1-byte advance.
+///
+/// Issue #220 fix: previously had `SEARCH_STRENGTH = 6` (`K_STEP_INCR
+/// = 32`), causing our step doubling to fire 4× more frequently than
+/// donor — by ip0=1280 our step was ~40 while donor's was 12. This
+/// drove the +7.43% ratio gap on decodecorpus-z000033 at Level(1)
+/// Fast: cursor skipped too many positions, missing matches donor
+/// found via finer-grained probing.
+const SEARCH_STRENGTH: usize = 8;
+
+/// Donor `kStepIncr = 1 << (kSearchStrength - 1) = 128` — every this-
+/// many bytes of no-match scanning, the per-iteration `step` is
+/// bumped by 1 (donor's `step++` at `zstd_fast.c:343`). Drives the
 /// incompressible-region step acceleration.
 const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 
@@ -63,35 +112,49 @@ const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 ///
 /// - `ip` MUST point to ≥ 4 readable bytes (the kernel only calls
 ///   this when ip0..ip3 stay within `iend - HASH_READ_SIZE`).
-/// - `base` MUST be the start of the same buffer that `data_len`
-///   describes, i.e. `base[0..data_len]` is a valid byte range.
-/// - `ip_pos` MUST equal the byte offset of `ip` within the buffer
-///   `base` points at: `ip == base.add(ip_pos)`.
+/// - `base` MUST be the start of the same buffer the kernel scans.
+///   For an in-window `match_idx >= prefix_start_index`,
+///   `base.add(match_idx as usize)` MUST yield ≥ 4 readable bytes
+///   (i.e. `match_idx + 4 <= data_len`). The kernel maintains this
+///   invariant by only inserting hash-table entries for positions
+///   strictly below `ilimit = data_len - HASH_READ_SIZE`, so every
+///   in-range `match_idx` returned by the table is automatically
+///   ≥ 4 bytes from the buffer end. See the comment block inside
+///   the function body for the full derivation.
 #[inline(always)]
 unsafe fn match_found<const USE_CMOV: bool>(
     ip: *const u8,
     base: *const u8,
     match_idx: u32,
     prefix_start_index: u32,
-    ip_pos: usize,
-    data_len: usize,
 ) -> bool {
-    // Bounds filters (well-predicted "not taken" on the hot path)
-    // stay as explicit branches — these protect against stale entries
-    // pointing past the buffer end and forward-pointing matches.
+    // Donor-parity hot-path: the ONLY filter on the branch variant is
+    // `match_idx < prefix_start_index` (rejects stale entries below
+    // the current window). Two safety invariants make additional
+    // bounds checks redundant:
+    //
+    // 1. `match_pos + 4 <= data_len`: hash table entries are only
+    //    written for positions visited by the scan, which by
+    //    construction stay strictly below `ilimit = data_len -
+    //    HASH_READ_SIZE = data_len - 8`. So any in-window
+    //    `match_idx >= prefix_start_index` satisfies `match_pos + 4
+    //    < data_len`. The `prefix_start_index >= INITIAL_PREFIX_START_INDEX
+    //    = 1` rule at the matcher boundary rejects the stale-zero
+    //    initial entry that would otherwise alias to position 0.
+    //
+    // 2. `match_pos < ip_pos`: hash writes precede probes in donor's
+    //    flow (writeback `hashTable[hash0] = current0` happens before
+    //    `matchFound(...)` reads matchIdx). Since `current0 < ip0` at
+    //    every shift step, `matchIdx <= current0_prev < ip0_now`.
+    //
+    // Donor `ZSTD_match4Found_branch` (`zstd_fast.c:128-141`) takes
+    // the same invariants and emits exactly one prefix filter + one
+    // 4-byte equality compare. The previous defensive bounds checks
+    // we carried here added two extra branches per match probe —
+    // and the kernel invokes `match_found` TWICE per inner-loop
+    // iteration, so the savings compound to ~4 branches/iter
+    // dropped on the hot path.
     let match_pos = match_idx as usize;
-    // `match_pos + 4` would wrap on 32-bit targets when `match_idx`
-    // approaches `u32::MAX`, allowing an OOB `read32` through.
-    // `checked_add` keeps the unsafe read fully guarded: `None` means
-    // overflow → reject; `Some(end)` mirrors the original predicate
-    // (`end > data_len` rejects). On 64-bit the optimizer collapses
-    // this to the same codegen as the previous form.
-    if match_pos.checked_add(4).is_none_or(|end| end > data_len) {
-        return false;
-    }
-    if match_pos >= ip_pos {
-        return false;
-    }
 
     if USE_CMOV {
         // Donor cmov variant (`ZSTD_match4Found_cmov`): pick either
@@ -165,15 +228,22 @@ pub(crate) struct FastBlockResult {
 /// - `block_start`: byte offset of the current block's first byte
 ///   within `data`. The kernel hashes/searches only positions in
 ///   `[block_start, data.len())`, but matches may reach back into the
-///   prefix all the way to `prefix_start_index`.
-/// - `prefix_start_index`: lowest position that match candidates may
-///   reference. Donor computes this from `windowLog`; for a flat
-///   single-block kernel this is typically `0` or `block_start -
-///   window_size`, clamped to ≥ 0.
+///   prefix all the way to `bounds.prefix_start_index`.
+/// - `bounds: PrefixBounds`: bundle of two donor-derived absolute
+///   floors (kept together so the kernel signature stays inside the
+///   clippy 7-argument cap). See [`PrefixBounds`] field docs for the
+///   exact semantics:
+///   - `prefix_start_index`: sentinel-aware match-table filter (rejects
+///     the all-zero empty-slot value at position 0).
+///   - `window_low`: donor `windowLow`-equivalent absolute floor used
+///     by the prologue's `max_rep` computation and the backward-extension
+///     `match_pos > window_low` bound.
 /// - `hash_table`: the encoder's `FastHashTable`. Mutated in place;
 ///   entries are absolute indices into `data`.
 /// - `rep`: incoming `[rep_offset1, rep_offset2]` from the previous
 ///   block. Returned updated in `FastBlockResult.rep`.
+/// - `step_size`: donor `stepSize = targetLength + !(targetLength) + 1`
+///   (min 2). Drives the initial step in the 4-cursor skip schedule.
 /// - `handle_sequence`: closure that the kernel invokes once per
 ///   emitted `Sequence` — equivalent to donor's `ZSTD_storeSeq`.
 ///
@@ -246,16 +316,41 @@ pub(crate) struct FastBlockResult {
 /// wrapping the kernel's output would have to special-case "did
 /// the kernel already emit the tail" per branch, which is exactly
 /// the inconsistency this contract removes.
+/// Donor `prefixStartIndex` + `windowLow` bundled into a single
+/// argument so the kernel signature stays within the 7-arg clippy
+/// budget. Both fields are u32 absolute positions in the flat
+/// history buffer; see [`compress_block_fast`] doc for which path
+/// uses which.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefixBounds {
+    /// Sentinel-aware floor for the hash-table `match_idx` filter
+    /// (`match_found::<USE_CMOV>` rejects `match_idx <
+    /// prefix_start_index`). Caller is expected to maintain
+    /// `prefix_start_index >= 1` so the all-zero empty-slot value
+    /// can't be confused with a valid match at position 0.
+    pub prefix_start_index: u32,
+    /// Donor `windowLow` analogue — the absolute floor of in-window
+    /// positions, equals 0 at block 0 / pre-eviction blocks and
+    /// advances as the window slides. Drives the prologue's
+    /// `max_rep = ip0 - window_low` computation AND the backward-
+    /// extension `match_pos > window_low` bound (both paths donor
+    /// expresses against `prefixStart` directly, NOT against a
+    /// sentinel-1 floor).
+    pub window_low: u32,
+}
+
 #[inline(always)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
     block_start: usize,
-    prefix_start_index: u32,
+    bounds: PrefixBounds,
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
+    let prefix_start_index = bounds.prefix_start_index;
+    let window_low = bounds.window_low;
     // Donor's `stepSize = targetLength + !(targetLength) + 1`
     // (min 2). Callers must pass >= 2; values larger than 2 drive
     // the kernel's acceleration gradient on negative levels.
@@ -361,7 +456,17 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     let mut offset_saved1: u32 = 0;
     let mut offset_saved2: u32 = 0;
     {
-        let max_rep = (ip0 as u32).saturating_sub(prefix_start_index);
+        // Donor (`zstd_fast.c:240-244`): `maxRep = curr - windowLow`.
+        // `windowLow` is the absolute floor of in-window positions
+        // (= 0 at block 0). It is NOT `prefixStartIndex` — donor's
+        // `prefixStartIndex == windowLow` in the canonical fast path,
+        // but our `prefix_start_index` carries the sentinel-1 floor
+        // for hash-filter purposes. Using `prefix_start_index` here
+        // would zero `rep_offset1 = 1` at block 0 (ip0=1 →
+        // max_rep=0; 1>0), disabling rep-at-ip2 for the entire first
+        // block — see the `block_zero_prologue_preserves_default_rep_offset_one`
+        // regression test in `fast_matcher.rs`.
+        let max_rep = (ip0 as u32).saturating_sub(window_low);
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;
             rep_offset2 = 0;
@@ -386,6 +491,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     // with hash precomputation, repcode-at-ip2 probe, two explicit-
     // match probes (at ip0 then at the shifted ip0), and a step-
     // doubling cadence.
+    ktrace!(
+        "ENTER block_start={} ip0_initial={} ilimit={} window_low={} prefix={} rep1={} rep2={} step={} mls={}",
+        block_start,
+        ip0,
+        ilimit,
+        window_low,
+        prefix_start_index,
+        rep_offset1,
+        rep_offset2,
+        step_size,
+        MLS,
+    );
     'restart: while ip0 < ilimit {
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
@@ -413,6 +530,19 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         let mut hash0 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip0)) };
         let mut hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip1)) };
         let mut match_idx = unsafe { hash_table.get(hash0) };
+        ktrace!(
+            "OUTER ip0={} ip1={} ip2={} ip3={} step={} hash0={} hash1={} match_idx={} rep1={} rep2={}",
+            ip0,
+            ip1,
+            ip2,
+            ip3,
+            step,
+            hash0,
+            hash1,
+            match_idx,
+            rep_offset1,
+            rep_offset2
+        );
 
         // Inner do-while body. On any match, break out with the
         // `MatchFound` enum carrying the match coordinates; the
@@ -445,26 +575,26 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             },
         }
         let found: Option<MatchFound> = loop {
-            // Repcode probe at ip2 (donor line 268). Load rval
-            // first so it stays consistent even if writeback below
-            // races. SAFETY: ip2 < ilimit ⇒ ≥ 4 readable bytes at
-            // ip2; ip2 ≥ rep_offset1 when rep_offset1 is non-zero
-            // because the save/restore prologue zeroed any
-            // rep_offset that exceeded the prefix-distance.
-            let rval = if rep_offset1 > 0 {
-                unsafe { read32(base.add(ip2 - rep_offset1 as usize)) }
-            } else {
-                // Sentinel — the equality check below can't pass
-                // when rep_offset1 == 0 anyway because the
-                // `rep_offset1 > 0` guard short-circuits.
-                0
-            };
+            // Repcode probe at ip2 (donor line 268). Unconditional
+            // load — donor `MEM_read32(ip2 - rep_offset1)` always
+            // reads, no `rep_offset1 > 0` short-circuit. Safe even
+            // when rep_offset1 == 0 because `ip2 - 0 = ip2`, which
+            // reads the same 4 bytes as the equality target below
+            // (so the comparison degrades to `read32(ip2) ==
+            // read32(ip2)` and the rep branch is correctly suppressed
+            // by the `rep_offset1 > 0` guard inside the `if`).
+            // SAFETY: ip2 < ilimit ⇒ ≥ 4 readable bytes at ip2; if
+            // rep_offset1 > 0 the save/restore prologue ensures
+            // `ip2 - rep_offset1 >= prefix_start_index >= 1`, so the
+            // backward read stays in-bounds.
+            let rval = unsafe { read32(base.add(ip2 - rep_offset1 as usize)) };
 
             // Writeback hash for ip0 (donor line 272). Donor writes
             // BEFORE the rep probe so the hash table reflects ip0
             // even if the iteration's match comes from rep at ip2.
             // SAFETY: hash0 from hash_ptr ⇒ in-bounds; ip0 ≤ u32::MAX
             // by the entry-point cap.
+            ktrace!("PUT hash0={} pos={} (iter-start)", hash0, ip0);
             unsafe { hash_table.put(hash0, ip0 as u32) };
 
             // Repcode-at-ip2 check.
@@ -478,8 +608,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 let mut new_ip = ip2;
                 let mut match0 = new_ip - rep_offset1 as usize;
                 let mut m_len: usize = 4;
+                // Donor bound: `match0 > prefixStart` ≡
+                // `match_pos > windowLow` (donor's prefixStart and
+                // windowLow are the same pointer in the no-dict
+                // fast path). We use `window_low` here rather than
+                // the sentinel-aware `prefix_start_index` so the
+                // backward step can reach position 1 (impossible
+                // under the sentinel) at block 0.
                 if new_ip > anchor
-                    && match0 > prefix_start_index as usize
+                    && match0 > window_low as usize
                     && data[new_ip - 1] == data[match0 - 1]
                 {
                     new_ip -= 1;
@@ -489,7 +626,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // Safe writeback for hash1 — ip1 is BEFORE ip2 (the
                 // match site), so its position won't conflict with
                 // the match's forward extension. Donor lines 286-287.
+                ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
                 unsafe { hash_table.put(hash1, ip1 as u32) };
+                ktrace!(
+                    "MATCH rep new_ip={} match0={} m_len={} offset={}",
+                    new_ip,
+                    match0,
+                    m_len,
+                    rep_offset1
+                );
                 break Some(MatchFound::Rep {
                     new_ip,
                     match0,
@@ -501,19 +646,20 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // First explicit-match probe at ip0 (donor line 292).
+            ktrace!("PROBE1 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(
-                    base.add(ip0),
-                    base,
-                    match_idx,
-                    prefix_start_index,
-                    ip0,
-                    iend_addr,
-                )
+                match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
                 // search resumption). Donor line 296.
+                ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
                 unsafe { hash_table.put(hash1, ip1 as u32) };
+                ktrace!(
+                    "MATCH explicit1 ip0={} match_idx={} offset={}",
+                    ip0,
+                    match_idx,
+                    ip0 as i64 - match_idx as i64
+                );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
                     match_idx,
@@ -534,31 +680,31 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             ip2 = ip3;
 
             // Writeback for new ip0. Donor lines 314-315.
+            ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
             unsafe { hash_table.put(hash0, ip0 as u32) };
 
             // Second explicit-match probe at the shifted ip0
             // (donor line 317).
+            ktrace!("PROBE2 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(
-                    base.add(ip0),
-                    base,
-                    match_idx,
-                    prefix_start_index,
-                    ip0,
-                    iend_addr,
-                )
+                match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
                 // Conditional writeback: only safe if `step <= 4`
                 // (donor lines 319-324) — otherwise ip1 might fall
                 // past the match start when we resume scanning.
                 if step <= 4 {
+                    ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
                     unsafe { hash_table.put(hash1, ip1 as u32) };
                 }
+                ktrace!(
+                    "MATCH explicit2 ip0={} match_idx={} offset={}",
+                    ip0,
+                    match_idx,
+                    ip0 as i64 - match_idx as i64
+                );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
                     match_idx,
-                    // After the shift + writeback at line 488,
-                    // current0 == shifted ip0.
                     current0: ip0,
                 });
             }
@@ -630,6 +776,19 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 current0: _,
             } => {
                 let match_pos = match_idx as usize;
+                // Donor invariant: hash table writes for ip_pos
+                // happen BEFORE the probe reads `match_idx` (see the
+                // writeback at the top of the do-while body), so the
+                // returned `match_idx` is always strictly less than
+                // `new_ip` (it was a hash slot occupant from a prior
+                // shift step where `current0_prev < ip0_now`).
+                // Donor `ZSTD_match4Found_branch` relies on the same
+                // invariant — neither side adds a release-time check.
+                debug_assert!(
+                    match_pos < new_ip,
+                    "kernel invariant violated: match_pos ({match_pos}) >= new_ip ({new_ip}); \
+                     hash table holds forward-pointing entry — driver/test broke writeback ordering"
+                );
                 let offset = new_ip - match_pos;
                 // Rotate the rep stack ahead of backward extension
                 // — donor stores the offset BEFORE the backward
@@ -644,10 +803,14 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         };
 
         // Backward extension — only for explicit matches; rep path
-        // already handled the 1-byte backward step above.
+        // already handled the 1-byte backward step above. Donor's
+        // bound is `match0 > prefixStart` ≡ `match_pos > windowLow`;
+        // we mirror it via `window_low` (NOT `prefix_start_index`,
+        // which is sentinel-floored at 1 for hash-filter purposes
+        // only).
         if !is_rep {
             while match_ip > anchor
-                && match_pos > prefix_start_index as usize
+                && match_pos > window_low as usize
                 && data[match_ip - 1] == data[match_pos - 1]
             {
                 match_ip -= 1;
@@ -832,8 +995,40 @@ mod tests {
             }
         };
         let result = match mls {
-            4 => compress_block_fast::<4, false>(data, 0, 0, &mut table, [0, 0], 2, &mut handle),
-            5 => compress_block_fast::<5, false>(data, 0, 0, &mut table, [0, 0], 2, &mut handle),
+            4 => compress_block_fast::<4, false>(
+                data,
+                0,
+                PrefixBounds {
+                    // Match production contract:
+                    // `prefix_start_index >= 1` rejects the hash table
+                    // empty-slot value `0` so a fresh-table probe
+                    // cannot be mistaken for a position-0 match (the
+                    // sentinel-1 floor documented on FastKernelMatcher).
+                    prefix_start_index: 1,
+                    window_low: 0,
+                },
+                &mut table,
+                [0, 0],
+                2,
+                &mut handle,
+            ),
+            5 => compress_block_fast::<5, false>(
+                data,
+                0,
+                PrefixBounds {
+                    // Match production contract:
+                    // `prefix_start_index >= 1` rejects the hash table
+                    // empty-slot value `0` so a fresh-table probe
+                    // cannot be mistaken for a position-0 match (the
+                    // sentinel-1 floor documented on FastKernelMatcher).
+                    prefix_start_index: 1,
+                    window_low: 0,
+                },
+                &mut table,
+                [0, 0],
+                2,
+                &mut handle,
+            ),
             _ => panic!("test helper only supports mls=4 and mls=5"),
         };
         // Accounting invariant: literals + matches + tail == input.
@@ -913,7 +1108,21 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let result = compress_block_fast::<4, false>(data, 0, 0, &mut table, rep, 2, &mut handle);
+        let result = compress_block_fast::<4, false>(
+            data,
+            0,
+            PrefixBounds {
+                // Match production contract:
+                // `prefix_start_index >= 1` rejects the hash table
+                // empty-slot value `0`.
+                prefix_start_index: 1,
+                window_low: 0,
+            },
+            &mut table,
+            rep,
+            2,
+            &mut handle,
+        );
         let acct: usize = tuples
             .iter()
             .map(|(lits, _off, mlen)| lits.len() + mlen)
@@ -1044,7 +1253,18 @@ mod tests {
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
         // prefix_start_index=5 blocks index 0.
-        let _ = compress_block_fast::<4, false>(&data, 0, 5, &mut table, [0, 0], 2, &mut handle);
+        let _ = compress_block_fast::<4, false>(
+            &data,
+            0,
+            PrefixBounds {
+                prefix_start_index: 5,
+                window_low: 5,
+            },
+            &mut table,
+            [0, 0],
+            2,
+            &mut handle,
+        );
 
         // Walk emitted sequences in order, tracking the running
         // `anchor` cursor (which equals the start of the current
@@ -1090,21 +1310,26 @@ mod tests {
     /// gigantic offset → emit a Triple with a meaningless backward
     /// reference.
     ///
-    /// Engineered scenario: uniform data so the raw-cmp at any two
-    /// positions always succeeds; pre-populate the hash slot that
-    /// ip0=1 will probe with a forward-pointing stale index (150);
-    /// without the `match_pos < ip_pos` filter the very first
-    /// iteration would emit `Triple { offset = 1 - 150 = u_wrap, ... }`.
-    /// Test asserts every emitted Triple has an offset ≤ data.len()
-    /// — only achievable when the stale forward index is rejected.
+    /// Stale hash entries below `prefix_start_index` must be rejected
+    /// by the donor-parity prefix filter in `match_found`. Engineered
+    /// scenario: pre-populate the hash slot for ip0 with a low stale
+    /// index (5) that points into the supposedly-out-of-window region;
+    /// run with `prefix_start_index = 50` so the kernel must skip
+    /// that candidate. The kernel's own writeback at the iteration
+    /// start would still leave the stale value usable if the prefix
+    /// filter didn't fire — uniform data ensures any survived
+    /// candidate would emit a non-zero match.
     #[test]
-    fn match_found_rejects_stale_forward_entry() {
+    fn match_found_rejects_stale_entry_below_prefix_floor() {
         let data = vec![0u8; 200];
         let mut table = FastHashTable::new(8, 4);
-        // SAFETY: data has ≥ 4 readable bytes at index 1.
-        let h = unsafe { table.hash_ptr::<4>(data.as_ptr().add(1)) };
+        // Force the explicit-match probe at ip0=50 (first iter once
+        // ip0 is bumped from prefix_start_index=50) to see the stale
+        // index 5.
+        // SAFETY: data has ≥ 4 readable bytes at index 50.
+        let h = unsafe { table.hash_ptr::<4>(data.as_ptr().add(50)) };
         // SAFETY: h came from hash_ptr on this same table.
-        unsafe { table.put(h, 150) };
+        unsafe { table.put(h, 5) };
 
         let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
         let mut handle = |seq: Sequence<'_>| match seq {
@@ -1115,8 +1340,26 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let _ = compress_block_fast::<4, false>(&data, 0, 0, &mut table, [0, 0], 2, &mut handle);
+        // prefix_start_index = 50 — match_idx=5 is below the floor and
+        // must be rejected by the donor-parity prefix filter in
+        // `match_found`.
+        let _ = compress_block_fast::<4, false>(
+            &data,
+            50,
+            PrefixBounds {
+                prefix_start_index: 50,
+                window_low: 50,
+            },
+            &mut table,
+            [0, 0],
+            2,
+            &mut handle,
+        );
 
+        // Either zero emissions (stale rejected, no other match found
+        // in the limited scan window) or a Triple whose offset
+        // references a position >= prefix_start_index = 50, never a
+        // 1-byte-from-stale-5 offset.
         for (_, off, m) in &tuples {
             if *m > 0 {
                 assert!(
@@ -1189,8 +1432,21 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let result =
-            compress_block_fast::<4, false>(&data, 0, 0, &mut table, [huge, 7], 2, &mut handle);
+        let result = compress_block_fast::<4, false>(
+            &data,
+            0,
+            PrefixBounds {
+                // Match production contract:
+                // `prefix_start_index >= 1` rejects the hash table
+                // empty-slot value `0`.
+                prefix_start_index: 1,
+                window_low: 0,
+            },
+            &mut table,
+            [huge, 7],
+            2,
+            &mut handle,
+        );
         assert_eq!(
             result.rep[0], huge,
             "out-of-range rep_offset1 must be restored verbatim across the block",
@@ -1233,13 +1489,32 @@ mod tests {
                 }
             };
             if use_cmov {
-                let _ =
-                    compress_block_fast::<4, true>(&data, 0, 0, &mut table, [0, 0], 2, &mut handle);
+                let _ = compress_block_fast::<4, true>(
+                    &data,
+                    0,
+                    PrefixBounds {
+                        // Match production contract:
+                        // `prefix_start_index >= 1` rejects the hash
+                        // table empty-slot value `0`.
+                        prefix_start_index: 1,
+                        window_low: 0,
+                    },
+                    &mut table,
+                    [0, 0],
+                    2,
+                    &mut handle,
+                );
             } else {
                 let _ = compress_block_fast::<4, false>(
                     &data,
                     0,
-                    0,
+                    PrefixBounds {
+                        // Match production contract:
+                        // `prefix_start_index >= 1` rejects the hash
+                        // table empty-slot value `0`.
+                        prefix_start_index: 1,
+                        window_low: 0,
+                    },
                     &mut table,
                     [0, 0],
                     2,
@@ -1284,12 +1559,12 @@ mod tests {
         let base = data.as_ptr();
         let ip_pos = 16usize;
         let ip = unsafe { base.add(ip_pos) };
-        let branch_result = unsafe { match_found::<false>(ip, base, 4, 10, ip_pos, data.len()) };
+        let branch_result = unsafe { match_found::<false>(ip, base, 4, 10) };
         assert!(
             !branch_result,
             "branch variant must reject out-of-window match_idx"
         );
-        let cmov_result = unsafe { match_found::<true>(ip, base, 4, 10, ip_pos, data.len()) };
+        let cmov_result = unsafe { match_found::<true>(ip, base, 4, 10) };
         assert!(
             !cmov_result,
             "cmov variant must reject out-of-window match_idx even when \

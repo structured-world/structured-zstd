@@ -111,6 +111,168 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
+    /// Pre-reserve additional capacity in the output buffer so the
+    /// donor-faithful FSE fast path can do `flush_bulk` writes without
+    /// triggering `Vec::extend_from_slice`'s grow-on-realloc branch.
+    /// `additional` is the number of bytes the upcoming bursts will
+    /// emit (caller's bit budget / 8, rounded up).
+    #[inline]
+    pub fn reserve_output(&mut self, additional: usize) {
+        self.output.as_mut().reserve(additional);
+    }
+
+    /// Donor `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
+    /// `bits` into the bottom of `partial`, no overflow check.
+    ///
+    /// # Safety
+    ///
+    /// Caller MUST guarantee BOTH preconditions BEFORE calling:
+    ///
+    /// 1. `num_bits + bits_in_partial <= 64` AND **not both 64**, i.e.
+    ///    if `bits_in_partial == 64` then `num_bits` MUST be 0 — and
+    ///    the explicit `num_bits == 0` early-return below handles that
+    ///    case without ever evaluating `bits << bits_in_partial`. The
+    ///    point of the precondition: any other combination would either
+    ///    shift-by-64 (undefined for `u64 << 64` in Rust) or overflow
+    ///    `bits_in_partial` past 64.
+    /// 2. `num_bits == 64 || bits >> num_bits == 0` — value must be
+    ///    clean of high junk past `num_bits`. Dirty high bits leak
+    ///    into the packed stream at the next OR.
+    ///
+    /// The `debug_assert!`s below catch both in test/debug builds but
+    /// do NOT survive `cargo build --release`, hence the `unsafe`
+    /// signature. The function does not perform any memory-unsafe
+    /// operation, but a violation produces a silently-corrupted
+    /// output stream that decoders cannot recover — equivalent in
+    /// blast radius to undefined behaviour for the consumer.
+    ///
+    /// Used by the donor-faithful FSE sequence encoder which knows its
+    /// per-sequence bit budget at compile time and inserts explicit
+    /// [`Self::flush_bulk`] calls between bursts — saving the
+    /// per-call branch + spill that `write_bits_64`'s overflow check
+    /// pays.
+    #[inline(always)]
+    pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
+        // num_bits == 0 short-circuit: matches donor `BIT_addBits` no-op
+        // semantics AND guards the `bits << self.bits_in_partial` below
+        // from a `<< 64` undefined-behaviour evaluation when the
+        // accumulator is already full (`bits_in_partial == 64`). Callers
+        // that legitimately drain a full container (e.g. the FSE encoder
+        // hitting a state-diff burst boundary) can call this with
+        // `num_bits = 0` as a no-op without tripping UB.
+        if num_bits == 0 {
+            return;
+        }
+        debug_assert!(
+            num_bits + self.bits_in_partial <= 64,
+            "write_bits_64_no_check would overflow partial: would push to {} bits",
+            num_bits + self.bits_in_partial,
+        );
+        debug_assert!(
+            self.bits_in_partial < 64,
+            "write_bits_64_no_check called with full accumulator and num_bits>0; \
+             caller must flush_bulk before adding more bits",
+        );
+        debug_assert!(
+            num_bits == 64 || bits >> num_bits == 0,
+            "value has dirty high bits beyond num_bits={num_bits}",
+        );
+        self.partial |= bits << self.bits_in_partial;
+        self.bits_in_partial += num_bits;
+    }
+
+    /// Donor `BIT_flushBitsFast` (`bitstream.h:202-214`): write the
+    /// full 8 bytes of `partial` directly to the output buffer via a
+    /// single `MEM_writeLEST` (unaligned 8-byte LE store), then
+    /// advance the Vec's `len` by only `nb_bytes` so the scratch
+    /// bytes past the commit point get overwritten by the next
+    /// flush. No overflow check — caller must have pre-reserved at
+    /// least 8 bytes of spare capacity via [`Self::reserve_output`].
+    ///
+    /// `extend_from_slice` for tiny (0..=7-byte) tails was previously
+    /// hot — its per-call capacity check + memcpy dispatch cost
+    /// dwarfs the actual byte write at FSE flush cadence (~54K
+    /// flushes per compress on the L1 fast path). The direct
+    /// unaligned store path matches donor's hot loop cycle-for-cycle.
+    ///
+    /// # Safety
+    ///
+    /// Caller MUST guarantee that `output.capacity() >= output.len() +
+    /// 8` BEFORE calling this method (typically via a prior
+    /// [`Self::reserve_output`]). Violating the precondition produces a
+    /// 8-byte out-of-bounds write to whatever memory follows the
+    /// `Vec`'s allocation — undefined behaviour. The accompanying
+    /// `debug_assert!` catches misuse in test/debug builds but does
+    /// NOT survive `cargo build --release`, hence the `unsafe`
+    /// signature.
+    #[inline(always)]
+    pub unsafe fn flush_bulk(&mut self) {
+        let nb_bytes = self.bits_in_partial >> 3;
+        let bytes = self.partial.to_le_bytes();
+        let output = self.output.as_mut();
+        let len = output.len();
+        debug_assert!(
+            output.capacity() >= len + 8,
+            "flush_bulk requires 8 bytes of spare capacity; caller forgot reserve_output",
+        );
+        // SAFETY: the function-level Safety contract requires
+        // `output.capacity() >= len + 8`. We write 8 bytes starting at
+        // `len`, then commit only `nb_bytes` — the remaining `8 -
+        // nb_bytes` bytes stay within capacity but past `len`, and
+        // the next flush_bulk overwrites them.
+        unsafe {
+            let dst = output.as_mut_ptr().add(len);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
+            output.set_len(len + nb_bytes);
+        }
+        // `nb_bytes == 8` means the accumulator was full (64 bits). A
+        // raw `partial >>= 64` is UB on `u64`, so we zero explicitly.
+        // Donor's `BIT_flushBitsFast` writes a fresh 8 bytes the next
+        // round so the post-flush state must be clean either way.
+        if nb_bytes == 8 {
+            self.partial = 0;
+        } else {
+            self.partial >>= nb_bytes * 8;
+        }
+        self.bits_in_partial &= 7;
+        self.bit_idx += nb_bytes * 8;
+    }
+
+    /// Bridge for the donor-faithful Huffman encoder (`HufCStream`) so
+    /// it can write bytes directly into our backing `Vec<u8>` without
+    /// going through the `BitWriter`'s partial-bit accumulator. The
+    /// closure receives full mutable access to the underlying `Vec`;
+    /// any bytes it appends are integrated into `bit_idx` afterward.
+    ///
+    /// MUST be called only when the writer is byte-aligned
+    /// (`bits_in_partial` a multiple of 8); the assertion mirrors
+    /// `append_bytes`. Internally calls `flush()` first so the
+    /// closure sees a Vec whose `len()` reflects every bit written so
+    /// far.
+    pub fn with_aligned_output_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<u8>) -> R,
+    {
+        assert!(
+            self.bits_in_partial.is_multiple_of(8),
+            "with_aligned_output_mut requires byte-aligned writer state",
+        );
+        self.flush();
+        let prev_len = self.output.as_mut().len();
+        let result = f(self.output.as_mut());
+        let new_len = self.output.as_mut().len();
+        // Closure may only APPEND bytes (HufCStream's contract).
+        // Promoted to `assert!` (release-active) — a shrink here
+        // would underflow `(new_len - prev_len) * 8` in release
+        // and corrupt `bit_idx` into a phantom future bit, which
+        // propagates silently through downstream `change_bits`
+        // callers. This is a correctness invariant, not a debug
+        // aid.
+        assert!(new_len >= prev_len, "closure must not shrink output");
+        self.bit_idx += (new_len - prev_len) * 8;
+        result
+    }
+
     /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte aligned
     pub fn flush(&mut self) {
         assert!(self.bits_in_partial.is_multiple_of(8));
@@ -118,7 +280,17 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.output
             .as_mut()
             .extend_from_slice(&self.partial.to_le_bytes()[..full_bytes]);
-        self.partial >>= full_bytes * 8;
+        // `full_bytes == 8` (full accumulator) means a raw
+        // `partial >>= 64` would be UB on `u64`. This SAFE function is
+        // reachable indirectly via `with_aligned_output_mut`,
+        // `change_bits`, and `append_bytes`, so the state IS reachable
+        // — zero explicitly when the whole word is consumed instead of
+        // shifting.
+        if full_bytes == 8 {
+            self.partial = 0;
+        } else {
+            self.partial >>= full_bytes * 8;
+        }
         self.bits_in_partial -= full_bytes * 8;
         self.bit_idx += full_bytes * 8;
     }

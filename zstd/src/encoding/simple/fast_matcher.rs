@@ -102,6 +102,14 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// initial state). Donor relies on its `ip0 += (ip0 == prefixStart)`
 /// bump to skip position 0 instead — both approaches match the same
 /// 0..N-1 byte ranges for the hash table.
+///
+/// Tradeoff: this rejects legitimate position-0 matches donor would
+/// emit (rare — requires `read32(ip0)` to coincidentally equal
+/// `read32(base)`), but cross-block isolation under
+/// `skip_matching_with_hint(None)` depends on the sentinel — the
+/// `skip_matching_with_none_hint_skips_hash_population` test
+/// exercises that contract. Lowering to 0 breaks the test; the
+/// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
 /// Donor-shape Fast-strategy matcher state.
@@ -553,12 +561,27 @@ impl FastKernelMatcher {
         // `ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog)`
         // uses `windowLog` for the same reason.
         let advertised_window = 1usize << self.window_log;
-        let effective_prefix = self
-            .history
-            .len()
-            .saturating_sub(advertised_window)
-            .max(self.prefix_start_index as usize) as u32;
-        let prefix_start_index = effective_prefix;
+        // Donor's `windowLow` analogue: the absolute floor of in-window
+        // positions. Equals 0 at block 0 (no prior input retained) and
+        // advances as the window slides. Drives the prologue's
+        // `max_rep = ip0 - window_low` computation AND the backward-
+        // extension `match_pos > window_low` bound — both paths that
+        // donor expresses against `prefixStart` directly (NOT against
+        // a sentinel-1 floor).
+        let window_low = self.history.len().saturating_sub(advertised_window) as u32;
+        // Sentinel-aware prefix for the hash-table filter — match_idx
+        // == 0 (an uninitialized FastHashTable slot) must be rejected
+        // by `match_found`, so we floor at `INITIAL_PREFIX_START_INDEX
+        // = 1` when window_low is 0 (block 0 / pre-eviction blocks).
+        // For later blocks (window_low >= 1) the two values coincide.
+        //
+        // This SPLIT is the donor-parity fix for issue #220: using
+        // `prefix_start_index = 1` for the prologue's max_rep gave
+        // `max_rep = 0` at ip0=1, zeroing donor's default
+        // `rep_offset1 = 1` and disabling rep-at-ip2 for the entire
+        // first block. With `window_low = 0` we match donor exactly
+        // (`max_rep = 1`, rep_offset1 survives).
+        let prefix_start_index = window_low.max(self.prefix_start_index);
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
@@ -626,7 +649,10 @@ impl FastKernelMatcher {
             (4, false) => compress_block_fast::<4, false>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -635,7 +661,10 @@ impl FastKernelMatcher {
             (4, true) => compress_block_fast::<4, true>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -644,7 +673,10 @@ impl FastKernelMatcher {
             (5, false) => compress_block_fast::<5, false>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -653,7 +685,10 @@ impl FastKernelMatcher {
             (5, true) => compress_block_fast::<5, true>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -662,7 +697,10 @@ impl FastKernelMatcher {
             (6, false) => compress_block_fast::<6, false>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -671,7 +709,10 @@ impl FastKernelMatcher {
             (6, true) => compress_block_fast::<6, true>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -680,7 +721,10 @@ impl FastKernelMatcher {
             (7, false) => compress_block_fast::<7, false>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -689,7 +733,10 @@ impl FastKernelMatcher {
             (7, true) => compress_block_fast::<7, true>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -698,7 +745,10 @@ impl FastKernelMatcher {
             (8, false) => compress_block_fast::<8, false>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -707,7 +757,10 @@ impl FastKernelMatcher {
             (8, true) => compress_block_fast::<8, true>(
                 history,
                 block_start,
-                prefix_start_index,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -1727,7 +1780,19 @@ mod tests {
         // bump max_window_size to reflect the dict-retention
         // budget (mirrors MatchGeneratorDriver::prime_with_dictionary
         // for the Simple backend).
-        let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 64)).collect();
+        //
+        // Pattern period 4 (`(i % 4)`) — dense enough that the donor-
+        // parity `kSearchStrength = 8` (K_STEP_INCR = 128) step
+        // doubling, which skips positions under step=3 in dict scan,
+        // still leaves matches hittable from block2: every position
+        // divisible by 4 inside the [in-window, hashed] subset writes
+        // the same hash slot, so the slot at block2's first probe
+        // contains a recent in-window dict position. Period 64 (the
+        // original fixture) only had matches at positions {0, 64,
+        // 128, 192} — positions 0, 64, 128 are below the sliding
+        // floor and 192 falls in the step-skip gap, leaving the test
+        // with zero emittable matches.
+        let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 4)).collect();
         m.accept_data(dict.clone());
         m.start_matching(|_| {}); // populate hash table from dict
         m.max_window_size = m.max_window_size.saturating_add(200);
@@ -1737,7 +1802,7 @@ mod tests {
         // ~history_len (200..300), since the inflated max_window
         // (328) keeps even the dict's earliest bytes inside the
         // sliding floor.
-        let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 64)).collect();
+        let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 4)).collect();
         m.accept_data(block);
 
         let mut max_emitted_offset = 0usize;
@@ -1768,6 +1833,91 @@ mod tests {
              max_window_size; got max emitted offset {}",
             advertised_window,
             max_emitted_offset,
+        );
+    }
+
+    /// Regression: at block 0 the kernel's prologue must NOT zero
+    /// `rep_offset1 = 1` (donor's default initial rep state). Donor
+    /// computes `max_rep = ip0 - windowLow` where `windowLow = 0` at
+    /// block 0, giving `max_rep = 1` at ip0=1 → `rep_offset1 = 1`
+    /// survives (`1 > 1` is false).
+    ///
+    /// Buggy prologue uses `max_rep = ip0 - prefix_start_index` with
+    /// `prefix_start_index = 1` (sentinel-0 floor for hash-table
+    /// filtering), giving `max_rep = 0` at ip0=1 → `rep_offset1 = 1 >
+    /// 0` → stashed → rep-at-ip2 probe disabled for the ENTIRE first
+    /// block.
+    ///
+    /// Symptom assertion: on a `[0x01, 0x42 × 199]` fixture, donor's
+    /// rep-at-ip2 fires at iter 1 (ip2=3, both `read32` reads see
+    /// `[42,42,42,42]`). The donor emit sequence is:
+    /// `new_ip = ip2 = 3`, `match0 = ip2 - rep_offset1 = 2`, then the
+    /// one-byte backward extension absorbs `data[2] == data[1]`
+    /// (both `0x42`), giving `new_ip = 2, match_len ≈ 198`. Literal
+    /// prefix is `data[0..new_ip] = [0x01, 0x42]` → length 2.
+    ///
+    /// The buggy path skips rep, walks the cursor via explicit-match
+    /// shifts until matchIdx coincides further into the run, and
+    /// emits a different literal prefix length. Asserting both
+    /// `offset == 1` AND `literals.len() == 2` pins down the
+    /// rep-at-ip2 path exactly — the explicit-match catch-up on
+    /// uniform-byte data also finds offset=1 via slot collision, so
+    /// an offset-only check passes both fixed and buggy paths.
+    #[test]
+    fn block_zero_prologue_preserves_default_rep_offset_one() {
+        let mut data = alloc::vec::Vec::with_capacity(200);
+        data.push(0x01);
+        data.resize(200, 0x42);
+
+        let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
+        m.accept_data(data.clone());
+
+        let mut first_literals_len: Option<usize> = None;
+        let mut first_offset: Option<usize> = None;
+        m.start_matching(|seq| {
+            if first_literals_len.is_some() {
+                return;
+            }
+            if let Sequence::Triple {
+                literals, offset, ..
+            } = seq
+            {
+                first_literals_len = Some(literals.len());
+                first_offset = Some(offset);
+            }
+        });
+
+        // Both `offset` AND `literals.len()` are asserted — together
+        // they pin down EXACTLY which inner-loop path emitted the
+        // first match. With the prologue bug (rep-at-ip2 disabled
+        // because `max_rep` was computed against `prefix_start_index`
+        // instead of `window_low`), the explicit-match path catches
+        // up via hash-slot collision at ip0=3 and STILL emits
+        // offset=1 — so an offset-only check would pass both fixed
+        // and buggy paths on this uniform-byte fixture. The literal
+        // prefix length is the actual discriminator: the rep-at-ip2
+        // path consumes only the leading `0x01` literal (1 byte),
+        // while the explicit-match catch-up walks past two more
+        // `0x42` bytes before firing (3 bytes total). Asserting both
+        // values keeps the regression locked to the exact path the
+        // fix was meant to preserve.
+        assert_eq!(
+            first_offset,
+            Some(1),
+            "first emit must reference offset=1 — donor's default \
+             rep_offset1=1 fires on rep-at-ip2 at iter 1, and the \
+             prologue MUST NOT zero it (max_rep computed against \
+             window_low=0 at block 0, NOT against the sentinel \
+             prefix=1)",
+        );
+        assert_eq!(
+            first_literals_len,
+            Some(2),
+            "first emit must have a 2-byte literal prefix \
+             ([0x01, 0x42]) — the rep-at-ip2 probe lands at ip2=3, \
+             then the one-byte backward extension drops new_ip to 2, \
+             so literals = data[0..2]. A different prefix length \
+             would indicate the explicit-match catch-up fired instead",
         );
     }
 }
