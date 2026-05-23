@@ -471,6 +471,29 @@ fn bench_dictionary(c: &mut Criterion) {
 
         group.finish();
 
+        // Pre-parse the `DictionaryHandle` once per scenario. The
+        // handle depends only on `ffi_dictionary` (which is fixed
+        // across levels), so parsing it inside the per-level loop
+        // below would redo the same work N times AND emit the same
+        // BENCH_WARN per level if it ever failed. If parsing fails
+        // we still want the existing `compress-dict/...` groups to
+        // run, so we skip ONLY the `decompress-dict/...` groups
+        // (handle stays `None` and the per-level decompress
+        // branch falls through).
+        let rust_dict_handle = match structured_zstd::decoding::DictionaryHandle::decode_dict(
+            ffi_dictionary.as_slice(),
+        ) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                eprintln!(
+                    "BENCH_WARN skipping decompress-dict for scenario {} \
+                         (failed to parse FFI dict bytes into a Rust DictionaryHandle: {err:?})",
+                    scenario.id
+                );
+                None
+            }
+        };
+
         for level in supported_levels_filtered() {
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
             let mut with_dict =
@@ -508,12 +531,18 @@ fn bench_dictionary(c: &mut Criterion) {
 
             group.finish();
 
-            // decompress-dict: measure end-to-end decompress throughput
+            // decompress-dict: measure steady-state decode throughput
             // for a dictionary-driven .zst payload, both sides. Uses
             // `with_dict_bytes` (the FFI dict-encoded payload above) as
             // the fixed input on both branches so the throughput
             // metric is apples-to-apples (Rust and FFI decode the SAME
             // bytes — what differs is the decoder implementation).
+            // Dictionary parsing AND `FrameDecoder` / FFI `Decompressor`
+            // construction are hoisted out of `b.iter` (the
+            // per-scenario `rust_dict_handle` parse above, and the
+            // per-bench-function `decoder` / `decompressor` set up once
+            // before the timing loop) so the numbers reflect the
+            // hot-path decode kernel rather than per-frame setup.
             //
             // CRITICAL: `with_dict_bytes` was compressed using
             // `ffi_dictionary` (`Compressor::with_dictionary(level,
@@ -532,13 +561,7 @@ fn bench_dictionary(c: &mut Criterion) {
             //     mirror with `decompress_to_buffer` quietly producing
             //     garbage — even worse than a clean error.
             // Either way the bench would measure the wrong path.
-            let Ok(rust_dict_handle) =
-                structured_zstd::decoding::DictionaryHandle::decode_dict(ffi_dictionary.as_slice())
-            else {
-                eprintln!(
-                    "BENCH_WARN skipping decompress-dict for {} level={} (failed to parse FFI dict bytes into a Rust DictionaryHandle)",
-                    scenario.id, level.name
-                );
+            let Some(rust_dict_handle) = rust_dict_handle.as_ref() else {
                 continue;
             };
             let expected_len = scenario.bytes.len();
@@ -558,7 +581,7 @@ fn bench_dictionary(c: &mut Criterion) {
                         .decode_all_with_dict_handle(
                             with_dict_bytes.as_slice(),
                             output.as_mut_slice(),
-                            &rust_dict_handle,
+                            rust_dict_handle,
                         )
                         .expect("rust decode-with-dict must succeed");
                     assert_eq!(n, expected_len, "rust decode wrote a partial output");
