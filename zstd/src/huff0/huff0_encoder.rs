@@ -107,6 +107,20 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                 Self::encode_one_stream(packed_codes, &mut bit_c, segment, table_log);
                 bit_c.close()
             });
+            // Donor `HUF_CStream_close` returns 0 on overflow (the
+            // dst_capacity was exhausted before close completed) and
+            // truncates the output back to the segment start. Our
+            // `huf_tight_compress_bound` is sized exactly per donor's
+            // spec, so this branch is unreachable under a correctly
+            // sized buffer — but if a future change ever mis-sizes
+            // the bound, silently emitting a 0-length stream would
+            // produce an invalid jump table that decompresses to
+            // garbage. Panic loudly instead.
+            assert!(
+                bytes_written > 0,
+                "HufCStream::close overflowed dst_capacity for segment {i}; \
+                 huf_tight_compress_bound is undersized for table_log={table_log}",
+            );
             if i < 3 {
                 assert!(
                     bytes_written <= u16::MAX as usize,

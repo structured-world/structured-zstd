@@ -102,12 +102,13 @@ impl<'a> HufCStream<'a> {
         }
         let start_idx = output.len();
         // Reserve capacity for the worst-case write + 8 byte flush slack.
-        // The Vec must have `start_idx + dst_capacity` bytes addressable
-        // for our raw pointer writes.
+        // We DO NOT pre-zero (`resize`) the spare capacity — the hot
+        // path writes via raw pointers into the spare slots and
+        // `close()` calls `set_len` only after committing the actual
+        // byte count. For large literal sections (table_log=11 → up
+        // to 2.7 MiB per stream), the eager memset was a measurable
+        // regression on the worker hot path.
         output.reserve(dst_capacity);
-        // Zero-extend so the bytes are valid (Vec invariant: `len`
-        // bytes are initialized). We'll truncate back in `finalize`.
-        output.resize(start_idx + dst_capacity, 0);
         Some(Self {
             bit_container: [0, 0],
             bit_pos: [0, 0],
@@ -187,10 +188,15 @@ impl<'a> HufCStream<'a> {
         // 8-byte LE write at `cursor`. Bytes at [cursor+nb_bytes..cursor+8]
         // are overwritten by the next flush; we don't care about them.
         let bytes = bit_container.to_le_bytes();
-        // SAFETY: `cursor + 8 <= output.capacity()` (and `<= output.len()`
-        // by the resize at construction); the slice is valid for write.
-        let dst = &mut self.output[self.cursor..self.cursor + 8];
-        dst.copy_from_slice(&bytes);
+        // SAFETY: `new()` reserved `dst_capacity` bytes via
+        // `Vec::reserve` (without zeroing), so `cursor + 8 <=
+        // start_idx + dst_capacity <= output.capacity()`. The write
+        // targets uninitialised spare capacity; `close()` reconciles
+        // `len` afterwards.
+        unsafe {
+            let dst = self.output.as_mut_ptr().add(self.cursor);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
+        }
         self.cursor += nb_bytes;
         if !FAST && self.cursor > self.end_ptr {
             self.cursor = self.end_ptr;
@@ -216,14 +222,22 @@ impl<'a> HufCStream<'a> {
         self.flush_bits::<false>();
         let nb_bits = self.pending_bits();
         if self.cursor >= self.end_ptr + 8 {
-            // Overflow — donor returns 0.
-            self.output.truncate(self.start_idx);
+            // Overflow — donor returns 0. `start_idx == output.len()`
+            // pre-construction (no `resize` was done; we wrote into
+            // spare capacity), so no truncate is needed — the Vec's
+            // logical length is already correct.
             return 0;
         }
         // Total bytes: full bytes flushed + (1 byte for trailing partial bits).
         let bytes_written = (self.cursor - self.start_idx) + usize::from(nb_bits > 0);
-        // Truncate output to the actual bytes used.
-        self.output.truncate(self.start_idx + bytes_written);
+        // Commit the previously-uninitialised spare-capacity writes
+        // by advancing `len`. SAFETY: `flush_bits` wrote exactly
+        // `bytes_written` bytes into spare capacity at positions
+        // [start_idx, start_idx + bytes_written), all within
+        // `output.capacity()` per the reserve in `new()`.
+        unsafe {
+            self.output.set_len(self.start_idx + bytes_written);
+        }
         bytes_written
     }
 }

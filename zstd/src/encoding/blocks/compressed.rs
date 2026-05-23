@@ -1587,7 +1587,11 @@ fn encode_sequences(
         // 0..=63. Before the first unchecked-add burst we drain to
         // < 8 leftover so the per-burst budget math (state diffs ≤
         // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
-        writer.flush_bulk();
+        // SAFETY: `reserve_output` above guarantees capacity ≥
+        // current_len + sequences.len() * 12 + 64 ≥ current_len + 8.
+        unsafe {
+            writer.flush_bulk();
+        }
         for sequence in (0..=sequences.len() - 2).rev() {
             let sequence = sequences[sequence];
             let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
@@ -1615,15 +1619,46 @@ fn encode_sequences(
                 writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 ll_state = Some(next);
             }
-            writer.flush_bulk();
+            // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
+            // pre-allocated enough spare capacity to cover every
+            // per-sequence flush in this loop (≤ 16 bytes per
+            // sequence, plus the 32-byte slack on top of the 64-byte
+            // header reserve).
+            unsafe {
+                writer.flush_bulk();
+            }
 
-            // Extras burst: max 16+16+24 = 56 bits + ≤ 7 leftover =
-            // 63 bits, just under 64. Order matches donor's
-            // ZSTD_encodeSequences_body: ll first, ml second, of last.
+            // Extras burst: ll (≤16) + ml (≤16) + of (≤ window_log,
+            // up to 30 for our max window_log). With ≤ 7 leftover from
+            // the prior flush_bulk, total ll+ml+of+partial can exceed
+            // 64 once of_num_bits > 25. Donor handles this via
+            // `longOffsets` mode that splits high offsets across two
+            // BIT_addBits calls; we instead drain the partial after ml
+            // and write of into a fresh container. The branch matches
+            // donor's `MEM_32bits()` flush-between-each-component
+            // shape on the 32-bit build (which has the same 64-bit
+            // container constraint).
             writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
             writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+            if of_num_bits > 24 {
+                // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
+                // pre-allocated enough spare capacity to cover every
+                // per-sequence flush in this loop (≤ 16 bytes per
+                // sequence, plus the 32-byte slack on top of the 64-byte
+                // header reserve).
+                unsafe {
+                    writer.flush_bulk();
+                }
+            }
             writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
-            writer.flush_bulk();
+            // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
+            // pre-allocated enough spare capacity to cover every
+            // per-sequence flush in this loop (≤ 16 bytes per
+            // sequence, plus the 32-byte slack on top of the 64-byte
+            // header reserve).
+            unsafe {
+                writer.flush_bulk();
+            }
         }
     }
     if let (Some(state), Some(table)) = (ml_state, ml_table) {

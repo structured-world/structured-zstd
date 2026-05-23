@@ -160,22 +160,32 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// dwarfs the actual byte write at FSE flush cadence (~54K
     /// flushes per compress on the L1 fast path). The direct
     /// unaligned store path matches donor's hot loop cycle-for-cycle.
+    ///
+    /// # Safety
+    ///
+    /// Caller MUST guarantee that `output.capacity() >= output.len() +
+    /// 8` BEFORE calling this method (typically via a prior
+    /// [`Self::reserve_output`]). Violating the precondition produces a
+    /// 8-byte out-of-bounds write to whatever memory follows the
+    /// `Vec`'s allocation — undefined behaviour. The accompanying
+    /// `debug_assert!` catches misuse in test/debug builds but does
+    /// NOT survive `cargo build --release`, hence the `unsafe`
+    /// signature.
     #[inline(always)]
-    pub fn flush_bulk(&mut self) {
+    pub unsafe fn flush_bulk(&mut self) {
         let nb_bytes = self.bits_in_partial >> 3;
         let bytes = self.partial.to_le_bytes();
-        // SAFETY: caller's `reserve_output` guarantees `capacity >=
-        // len + 8` (the per-burst budget bound documented on the
-        // FSE encoder side). We write 8 bytes starting at `len`,
-        // then commit only `nb_bytes` — the remaining `8 - nb_bytes`
-        // bytes stay within capacity but past `len`, and the next
-        // flush_bulk overwrites them.
         let output = self.output.as_mut();
         let len = output.len();
         debug_assert!(
             output.capacity() >= len + 8,
             "flush_bulk requires 8 bytes of spare capacity; caller forgot reserve_output",
         );
+        // SAFETY: the function-level Safety contract requires
+        // `output.capacity() >= len + 8`. We write 8 bytes starting at
+        // `len`, then commit only `nb_bytes` — the remaining `8 -
+        // nb_bytes` bytes stay within capacity but past `len`, and
+        // the next flush_bulk overwrites them.
         unsafe {
             let dst = output.as_mut_ptr().add(len);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
