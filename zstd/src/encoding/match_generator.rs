@@ -137,7 +137,7 @@ use super::match_table::storage::{HC_CHAIN_LOG, HC_HASH_LOG, HC3_HASH_LOG};
 const HC_SEARCH_DEPTH: usize = 16;
 // HC_MIN_MATCH_LEN moved to encoding::hc; re-imported here so
 // existing references compile unchanged.
-use super::hc::HC_MIN_MATCH_LEN;
+use super::hc::{HC_MIN_MATCH_LEN, LazyLookaheadCache};
 const HC_OPT_MIN_MATCH_LEN: usize = HC_FORMAT_MINMATCH;
 const HC_TARGET_LEN: usize = 48;
 
@@ -3178,12 +3178,32 @@ impl HcMatchGenerator {
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
+        // Per-iteration cache for the lazy lookahead's pos / pos+1 /
+        // pos+2 chain-walk results. On a defer the cache rotates so
+        // the next iter's pos / pos+1 lookups hit the previous iter's
+        // pos+1 / pos+2 results — saving up to 2 chain walks per
+        // deferred position at lazy_depth=2 (1 at lazy_depth=1). On a
+        // commit the cache is invalidated because the new lookahead
+        // window is disjoint from the old one. See
+        // `LazyLookaheadCache` doc for soundness rationale.
+        let mut lookahead_cache = LazyLookaheadCache::default();
         while pos + HC_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
-            if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
+            let best = self.hc.find_best_match_current_cached(
+                &self.table,
+                abs_pos,
+                lit_len,
+                &mut lookahead_cache,
+            );
+            if let Some(candidate) = self.hc.pick_lazy_match_cached(
+                &self.table,
+                abs_pos,
+                lit_len,
+                best,
+                &mut lookahead_cache,
+            ) {
                 self.table
                     .insert_positions(abs_pos, candidate.start + candidate.match_len);
                 let current = self.table.window.back().unwrap().as_slice();
@@ -3201,9 +3221,11 @@ impl HcMatchGenerator {
                 );
                 pos = start + candidate.match_len;
                 literals_start = pos;
+                lookahead_cache.invalidate();
             } else {
                 self.table.insert_position(abs_pos);
                 pos += 1;
+                lookahead_cache.rotate_for_defer();
             }
         }
 
