@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779577688569,
+  "lastUpdate": 1779580183078,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -44786,6 +44786,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "56339f18522464d463e0b3fcedba2a1f81d9f952",
+          "message": "test(encoding): donor-parity comparator for block splitter port (#240)\n\n* test(encoding): donor-parity comparator for block splitter port\n\nVerify that our donor-port functions in frame_compressor.rs\n(donor_split_block_from_borders, donor_split_block_by_chunks) produce\nbyte-identical split decisions to the upstream donor C function\nZSTD_splitBlock across the entire decode corpus + a synthetic\ntransition-position matrix.\n\nZSTD_splitBlock is exported by libzstd but not part of the public\nzstd.h API; zstd-sys does not bind it. The comparator declares the\nextern \"C\" signature manually using the contract documented in\nzstd_preSplit.h (block_size == 128 KB, level ∈ 0..=4, workspace\naligned for size_t with size ≥ ZSTD_SLIPBLOCK_WORKSPACESIZE = 8208).\nA no-op `use zstd::zstd_safe::zstd_sys as _` forces the linker to\npull in the static libzstd archive so the manual extern resolves.\n\n7 tests, gated under the `bench_internals` feature:\n\n- corpus_borders_heuristic_matches_donor — every 128 KB chunk in\n  decodecorpus_files/ at split_level=0\n- corpus_by_chunks_matches_donor_at_each_sampling_level — same\n  chunks across split_level=1..=4\n- 4 synthetic transition fixtures (32 KB, 64 KB, 96 KB, none) at\n  the borders heuristic\n- synthetic_transitions_by_chunks_all_levels — 5 transition\n  positions × 4 sampling levels\n\nAll 7 tests PASS today, confirming the port is exact. Per issue\nacceptance criteria, divergences correlating with ratio loss would\nhave justified porting more donor split logic; zero divergences ⇒\nthe harness becomes a regression guard against future drift.\n\nTo wire the harness, `pub(crate) mod frame_compressor` (was `mod`)\nso the testing facade in lib.rs can route to the donor-port\nfunctions, and added `block_splitter_decision_for_bench` gated on\n`#[cfg(any(test, feature = \"bench_internals\"))]` so the dispatcher\nis visible only to tests/benches.\n\nCloses #206.\n\n* style(test): allow non_snake_case on donor extern + clarify workspace sizing\n\n- Add `#[allow(non_snake_case)]` to the `extern \"C\"` block so the\n  `ZSTD_splitBlock` symbol keeps its exact upstream spelling without\n  tripping `non_snake_case` under `-D warnings`. The linker resolves\n  by name; a `#[link_name = ...]` snake_case wrapper would add a\n  layer without readability benefit since the C symbol IS\n  PascalCase by upstream convention.\n\n- Rewrite the workspace-sizing inline doc so the explanation matches\n  the actual allocation. Was claiming\n  `ZSTD_SLIPBLOCK_WORKSPACESIZE / size_of::<usize>()` slots; code\n  uses `/ 8 + 1` u64 slots. New text explains the byte-to-u64\n  conversion (always 8 bytes per u64 — donor `size_t` is at most\n  8 bytes on supported targets), the `+ 1` slack, and that the byte\n  count handed to donor is `workspace.len() * 8`.\n\nNo semantic change.\n\n* test(splitter): CARGO_MANIFEST_DIR fixture path + correct workspace sizing\n\n- Resolve the corpus fixture from CARGO_MANIFEST_DIR rather than a\n  list of relative-path guesses. Deterministic across runners\n  (nextest, IDE runners, in-tree cargo test, out-of-tree invocations)\n  with no dependency on the current working directory.\n\n- Rewrite the workspace-sizing math. Previous form\n  `ZSTD_SLIPBLOCK_WORKSPACESIZE / 8 + 1` is 1027 u64s (8216 bytes);\n  earlier inline doc inaccurately described it as 1026 slots /\n  8208 bytes. Switch to `div_ceil(size_of::<u64>())` so the\n  byte-to-slot-count formula stays correct if\n  ZSTD_SLIPBLOCK_WORKSPACESIZE ever changes to a non-multiple of 8,\n  and pass `workspace.len() * size_of::<u64>()` to donor.\n\n7/7 donor-parity tests still pass; clippy clean.\n\n* docs(test): clarify decodecorpus_files is repo-only, not in crates.io package\n\nThe doc comment and the assertion failure message on `corpus_dir()`\nboth said the fixture is \"shipped with the crate\", but the manifest\nexcludes `decodecorpus_files/*` from the published package (see\n`[package].exclude`). Reword to say the fixture comes from a\nrepository checkout and is intentionally not in the crates.io\ntarball — so anyone debugging a test failure from a source download\ngets pointed at the right cause instead of looking for a missing\nfile in the wrong place.\n\n7/7 donor-parity tests still pass; clippy clean.\n\n* test(splitter): is_file gate on corpus loader + non-empty assert on by_chunks\n\n- Filter `entry.file_type()?.is_file()` before `fs::read(path)` in\n  `load_corpus_chunks()`. The previous form would panic on\n  directories, symlinks-to-directories, or device nodes if the\n  fixture tree ever grew beyond plain files — turning a fixture\n  layout extension into a parity-harness failure.\n\n- Mirror the non-empty guard from `corpus_borders_heuristic_matches_donor`\n  onto `corpus_by_chunks_matches_donor_at_each_sampling_level`.\n  Without it the test passes vacuously when the corpus directory is\n  empty or all files are < 128 KB (trimmed checkout, missing\n  fixtures, future fixture rename).\n\n7/7 donor-parity tests still pass; clippy clean.",
+          "timestamp": "2026-05-24T01:55:53+03:00",
+          "tree_id": "82fe64f83c3ed53b2229a4328419969e2fbb75e4",
+          "url": "https://github.com/structured-world/structured-zstd/commit/56339f18522464d463e0b3fcedba2a1f81d9f952"
+        },
+        "date": 1779580179115,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.146,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 287.923,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 233.067,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.505,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.346,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.72,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.029,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.675,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.972,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.467,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.779,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.995,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.287,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.673,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.705,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
