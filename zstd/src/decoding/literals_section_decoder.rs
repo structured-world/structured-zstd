@@ -186,6 +186,36 @@ fn decompress_literals(
         let state_shift = 64 - max_num_bits;
         let packed = scratch.table.packed_decode.as_slice();
 
+        // Lockstep cursor invariant: every outer-loop iteration advances
+        // ALL four cursors by the same amount (1 in the SIMD-fallback
+        // path, `symbols_per_burst` in the burst path), so
+        // `cursors[i] - starts[i]` stays identical across `i`. The
+        // first stream to hit its end is the one with the smallest
+        // segment length, and `cursors[0] - starts[0]` tracks the
+        // progress of all four. Donor parity with `huf_decompress.c`
+        // `olimit`-style single-pointer bound.
+        let min_seg_len = (ends[0] - starts[0])
+            .min(ends[1] - starts[1])
+            .min(ends[2] - starts[2])
+            .min(ends[3] - starts[3]);
+        let cursor_exit_olimit = starts[0] + min_seg_len;
+        // `burst_eligible` is the load-bearing safety gate against
+        // adversarial frame headers. If `min_seg_len < symbols_per_burst`
+        // (small `regenerated_size` paired with large compressed streams,
+        // forging a 4-stream HUF block where `seg = div_ceil(regen, 4) <
+        // symbols_per_burst`) then `cursor_burst_ceil` saturates to 0
+        // and `cursors[0] <= 0` is trivially true on entry — admitting
+        // the burst path, whose inner loop would then advance
+        // `cursors[i]` past `ends[i]` and panic on the `target[cursors[i]]`
+        // write. Requiring `min_seg_len >= symbols_per_burst` up front
+        // means the burst path only runs when a full burst fits inside
+        // EVERY segment, so the inner loop's cursor advance is sound by
+        // construction. The non-burst SIMD-fallback path advances each
+        // cursor by 1 per outer iteration and is naturally guarded by
+        // the existing per-iteration top-of-loop exit check.
+        let burst_eligible = symbols_per_burst >= 1 && min_seg_len >= symbols_per_burst;
+        let cursor_burst_ceil = cursor_exit_olimit.saturating_sub(symbols_per_burst);
+
         // Kernel choice is invariant across this whole call (all four
         // decoders came from the same `HuffmanDecoder::new(&scratch.table)`,
         // and `detect_huffman_decode_kernel` returns a process-wide
@@ -199,6 +229,19 @@ fn decompress_literals(
         // across all K — the generic monomorphisation costs nothing there
         // and removes 5 runtime branches per fallback iteration (1 in
         // decode4_*, 4 in advance_state_*).
+        let bounds = LoopBounds {
+            max_bits,
+            max_num_bits,
+            symbols_per_burst,
+            burst_bits,
+            burst_bits_isize,
+            table_shift,
+            state_shift,
+            cursor_exit_olimit,
+            cursor_burst_ceil,
+            burst_eligible,
+        };
+
         match detect_huffman_decode_kernel() {
             HuffmanDecodeKernel::Scalar => {
                 // SAFETY: ScalarKernel has no SIMD prereqs; always sound to call.
@@ -209,14 +252,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -230,14 +266,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -251,14 +280,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -272,14 +294,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -293,14 +308,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -314,14 +322,7 @@ fn decompress_literals(
                         target,
                         packed,
                         &mut cursors,
-                        ends,
-                        max_bits,
-                        max_num_bits,
-                        symbols_per_burst,
-                        burst_bits,
-                        burst_bits_isize,
-                        table_shift,
-                        state_shift,
+                        &bounds,
                     );
                 }
             }
@@ -400,6 +401,41 @@ fn decompress_literals(
     Ok(bytes_read)
 }
 
+/// Loop-invariant constants for [`run_4stream_decode_loop`].
+///
+/// All fields are derived once per `decompress_literals` call and stay
+/// constant across the outer loop. Bundling them keeps the function
+/// signature short and lets the compiler hoist their loads outside the
+/// loop body.
+///
+/// `cursor_exit_olimit` / `cursor_burst_ceil` rely on the lockstep
+/// cursor invariant — every outer iteration advances all 4 cursors by
+/// the same amount, so a single comparison against `cursors[0]`
+/// suffices in place of 4 per-stream cursor checks.
+///
+/// All fields are scalar (Copy). `Copy` is derived so the inner
+/// `run_4stream_decode_loop` can destructure `*bounds` without
+/// per-field copy ceremony — every field is a register-sized
+/// integer, so copying-by-value at the call site is cheap.
+#[derive(Copy, Clone)]
+struct LoopBounds {
+    max_bits: isize,
+    max_num_bits: u8,
+    symbols_per_burst: usize,
+    burst_bits: u8,
+    burst_bits_isize: isize,
+    table_shift: u32,
+    state_shift: u8,
+    cursor_exit_olimit: usize,
+    cursor_burst_ceil: usize,
+    /// Set iff a full burst (`symbols_per_burst` symbols per stream)
+    /// can fit in the lagging segment. When false the burst gate is
+    /// hard-disabled regardless of per-iteration bits state — the
+    /// SIMD-fallback path runs the loop instead. See setup site for
+    /// the safety rationale (adversarial / small-regen DoS guard).
+    burst_eligible: bool,
+}
+
 /// Monomorphised 4-stream HUF decode outer loop — burst tier + SIMD
 /// 4-symbol fallback — selected at compile time over `K: HufKernel`.
 ///
@@ -422,65 +458,90 @@ fn decompress_literals(
 /// table (holds by construction since they are all built from
 /// `&scratch.table`).
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 unsafe fn run_4stream_decode_loop<K: HufKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
     brs: &mut [BitReaderReversed<'_>; 4],
     target: &mut [u8],
     packed: &[u32],
     cursors: &mut [usize; 4],
-    ends: [usize; 4],
-    max_bits: isize,
-    max_num_bits: u8,
-    symbols_per_burst: usize,
-    burst_bits: u8,
-    burst_bits_isize: isize,
-    table_shift: u32,
-    state_shift: u8,
+    bounds: &LoopBounds,
 ) {
+    let LoopBounds {
+        max_bits,
+        max_num_bits,
+        symbols_per_burst,
+        burst_bits,
+        burst_bits_isize,
+        table_shift,
+        state_shift,
+        cursor_exit_olimit,
+        cursor_burst_ceil,
+        burst_eligible,
+    } = *bounds;
+
     loop {
-        // Common bound: any stream exhausted or any cursor at end
-        // → exit; the single-symbol tail below handles the drain.
-        if brs[0].bits_remaining() <= -max_bits
+        // Combined exit: every iteration advances all 4 cursors in
+        // lockstep, so `cursors[0]` tracks progress for all four
+        // streams. `cursor_exit_olimit = starts[0] + min(seg_len[i])`
+        // is the cursor value at which the lagging segment runs out
+        // of room — collapsing 4 per-stream cursor checks into 1.
+        // The bits_remaining checks stay per-stream because each
+        // stream's bit budget burns down at its own (code-length-
+        // dependent) rate.
+        if cursors[0] >= cursor_exit_olimit
+            || brs[0].bits_remaining() <= -max_bits
             || brs[1].bits_remaining() <= -max_bits
             || brs[2].bits_remaining() <= -max_bits
             || brs[3].bits_remaining() <= -max_bits
-            || cursors[0] >= ends[0]
-            || cursors[1] >= ends[1]
-            || cursors[2] >= ends[2]
-            || cursors[3] >= ends[3]
         {
             break;
         }
 
-        let burst_ok = symbols_per_burst >= 1
+        // Branchless min/max chain over the 4 `bits_consumed` values
+        // (u8 → cmov). Then the per-stream interval check
+        // `bits_consumed ∈ [max_num_bits, 64 - burst_bits]` for all 4
+        // streams collapses to two comparisons: the minimum is the
+        // tightest lower bound, the maximum is the tightest upper
+        // bound. Replaces 8 per-stream checks with 2.
+        let min_consumed = brs[0]
+            .bits_consumed
+            .min(brs[1].bits_consumed)
+            .min(brs[2].bits_consumed)
+            .min(brs[3].bits_consumed);
+        let max_consumed = brs[0]
+            .bits_consumed
+            .max(brs[1].bits_consumed)
+            .max(brs[2].bits_consumed)
+            .max(brs[3].bits_consumed);
+        // 64 - burst_bits would underflow if burst_bits > 64; symbols_per_burst
+        // is sized so `burst_bits < 63` (sentinel constraint), so saturating_sub
+        // is a no-op on the well-typed path but defensive against future drift.
+        let max_consumed_ceil = 64u8.saturating_sub(burst_bits);
+
+        let burst_ok = burst_eligible
             && brs[0].bits_remaining() > burst_bits_isize
             && brs[1].bits_remaining() > burst_bits_isize
             && brs[2].bits_remaining() > burst_bits_isize
             && brs[3].bits_remaining() > burst_bits_isize
-            // Saturating form so the bound holds even when `ends[i]
-            // < symbols_per_burst` near the segment tail (rather
-            // than relying on `cursors[i] + symbols_per_burst` not
-            // wrapping). `regen` is bounded by RFC 8878 block
-            // size ⇒ overflow is unreachable in practice, but the
-            // saturating shape costs the same single subq and
-            // removes the addition entirely.
-            && cursors[0] <= ends[0].saturating_sub(symbols_per_burst)
-            && cursors[1] <= ends[1].saturating_sub(symbols_per_burst)
-            && cursors[2] <= ends[2].saturating_sub(symbols_per_burst)
-            && cursors[3] <= ends[3].saturating_sub(symbols_per_burst)
-            && brs[0].bits_consumed >= max_num_bits
-            && brs[1].bits_consumed >= max_num_bits
-            && brs[2].bits_consumed >= max_num_bits
-            && brs[3].bits_consumed >= max_num_bits
-            // Burst body has no `ensure_bits` — confirm the burst
-            // fits inside the current `bit_container` so the
-            // inner shifts never read past the loaded 8-byte
-            // window.
-            && (brs[0].bits_consumed as usize) + burst_bits as usize <= 64
-            && (brs[1].bits_consumed as usize) + burst_bits as usize <= 64
-            && (brs[2].bits_consumed as usize) + burst_bits as usize <= 64
-            && (brs[3].bits_consumed as usize) + burst_bits as usize <= 64;
+            // Lockstep cursor → single bound. `cursor_burst_ceil =
+            // cursor_exit_olimit.saturating_sub(symbols_per_burst)`
+            // is the largest cursor value at which a full burst of
+            // `symbols_per_burst` symbols still fits inside the
+            // lagging segment (which, by lockstep, fits inside ALL
+            // four segments). Replaces 4 per-stream
+            // `cursors[i] <= ends[i].saturating_sub(symbols_per_burst)`
+            // checks with one.
+            && cursors[0] <= cursor_burst_ceil
+            // Each stream needs `bits_consumed ∈ [max_num_bits,
+            // 64 - burst_bits]`: the lower bound ensures the
+            // burst-entry state shift is sound, the upper bound
+            // ensures the burst body's shifts stay inside the
+            // current 8-byte `bit_container` window. Folded into
+            // min/max across the 4 streams — 2 comparisons + 6
+            // branchless cmovs replace the previous 8 dependent
+            // conditional branches.
+            && min_consumed >= max_num_bits
+            && max_consumed <= max_consumed_ceil;
 
         if burst_ok {
             let mut bits = [
@@ -769,5 +830,53 @@ mod burst_gate_tests {
                 roundtrip_assert(&wide);
             }
         }
+    }
+
+    /// Adversarial regression for the `burst_eligible` safety gate.
+    ///
+    /// Builds a valid 4-stream HUF block, then forges a `LiteralsSection`
+    /// header that claims `regenerated_size = 1` while the encoded
+    /// streams still contain a full block worth of symbols. The shrunk
+    /// `regenerated_size` collapses `min_seg_len` below
+    /// `symbols_per_burst`, the exact precondition `burst_eligible`
+    /// guards against. Without that gate, the burst inner loop would
+    /// advance `cursors[i]` past `ends[i]` and panic on the
+    /// `target[cursors[i]]` write — a DoS surface on malformed input.
+    ///
+    /// With the gate, the decoder either:
+    ///   - falls through to the SIMD-fallback path which immediately
+    ///     hits the top-of-loop `cursor_exit_olimit` exit and returns
+    ///     a count-mismatch / bitstream-mismatch error, or
+    ///   - returns an error before the loop ever runs.
+    ///
+    /// Either way the test asserts `Err(_)` — the contract is "no
+    /// panic, return an error".
+    #[test]
+    fn burst_gate_malformed_small_regen_returns_error() {
+        // 256 bytes is well above MIN_LITERALS_FOR_4_STREAMS so the
+        // encoder will happily emit a 4-stream HUF block. The modulo
+        // alphabet keeps `max_num_bits` small (≤ 8), maximising
+        // `symbols_per_burst` so the small forged `regenerated_size`
+        // sits well below it.
+        let mut data: Vec<u8> = Vec::with_capacity(256);
+        for i in 0..256u32 {
+            data.push((i % 67) as u8);
+        }
+        let (mut section, source) = build_huf4x_block(&data);
+
+        // Forge: claim only 1 regenerated byte. Streams in `source`
+        // are still encoded for the full 256-byte input.
+        section.regenerated_size = 1;
+
+        let mut scratch = HuffmanScratch::new();
+        let mut target = Vec::new();
+        let result = decode_literals(&section, &mut scratch, &source, &mut target);
+
+        assert!(
+            result.is_err(),
+            "decoder must reject the malformed header instead of panicking; \
+             got Ok({})",
+            result.unwrap_or(0)
+        );
     }
 }
