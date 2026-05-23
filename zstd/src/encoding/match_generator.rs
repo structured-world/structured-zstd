@@ -5782,6 +5782,61 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     );
 }
 
+/// Regression for the `None` arm of `skip_matching_with_hint`: the
+/// row table must NOT receive dense inserts across the skipped range.
+/// Donor parity (`ZSTD_row_fillHashCache` only pre-fills the next-scan
+/// cache, not the skipped block's interior) trades cross-block
+/// matches into the skipped interior for the per-block O(block_size)
+/// insert cost.
+///
+/// At input < 1 block (4096 B with default 128 KiB block boundary),
+/// the only positions in the row table after the call should be those
+/// produced by the `backfill_start` lookback at the block's start
+/// (≤ `ROW_HASH_KEY_LEN - 1` positions when block_start <
+/// ROW_HASH_KEY_LEN). For `current_abs_start == 0`, even that backfill
+/// is empty — so the table stays fully empty.
+#[test]
+fn row_skip_matching_with_none_hint_leaves_interior_empty() {
+    let data = deterministic_high_entropy_bytes(0x9B47_F2A1_8C5E_3306, 4096);
+
+    let mut none_hint = RowMatchGenerator::new(1 << 22);
+    none_hint.configure(ROW_CONFIG);
+    none_hint.add_data(data.clone(), |_| {});
+    none_hint.skip_matching_with_hint(None);
+    let none_slots = none_hint
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    // Dense (Some(false), dict-priming path) for comparison — that
+    // path inserts every position in the skipped range.
+    let mut dense = RowMatchGenerator::new(1 << 22);
+    dense.configure(ROW_CONFIG);
+    dense.add_data(data, |_| {});
+    dense.skip_matching_with_hint(Some(false));
+    let dense_slots = dense
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    // Two assertions pin the contract:
+    // 1) None hint is dramatically sparser than dense (the whole point).
+    // 2) None hint at block-start==0 inserts ZERO positions (no
+    //    backfill possible before position 0).
+    assert_eq!(
+        none_slots, 0,
+        "None hint at block_start=0 must leave row table fully empty \
+         (donor parity — interior NOT inserted, no pre-block backfill possible)",
+    );
+    assert!(
+        dense_slots > 0,
+        "Some(false) dict-priming path must still insert densely \
+         (sanity check: control case for the `none_slots == 0` assertion)",
+    );
+}
+
 #[test]
 fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
@@ -7813,6 +7868,92 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
         "expected tail-anchored cross-block match"
     );
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
+}
+
+/// Regression for #49 — locks down `MatchTable::backfill_boundary_positions`
+/// for the [`HcMatchGenerator`] lazy path. `backfill_boundary_positions`
+/// seeds ONLY the last `< 4` bytes of the previous slice (positions in
+/// `[current_abs_start - 3, current_abs_start)`) — the bytes that
+/// `insert_position` could not hash at the time because hashing needs
+/// 4 bytes of lookahead. The existing 8 MiB window roundtrip test
+/// exercises cross-slice behaviour end-to-end, but does not isolate
+/// the backfill of those final 1-3 unhashable bytes.
+///
+/// Fixture is built so the cross-block match's candidate position
+/// MUST lie in `[block_1_end - 3, block_1_end)`:
+///
+/// - Block 1 = `b"PQRSTBCD"` (8 bytes). Block 1's `start_matching`
+///   hashes positions 0..=4 (each has 4 bytes of forward context);
+///   positions 5/6/7 are the unhashable tail.
+/// - Block 2 = `b"BCDBCDBCDB"` (10 bytes). At absolute position 8
+///   (block 2 start) the 4-byte window is `b"BCDB"`. The ONLY place
+///   `b"BCDB"` was inserted in the hash + chain tables is position 5
+///   — via `backfill_boundary_positions` on the next-slice entry
+///   (the 4-byte window at position 5 is `data[5..9] = b"BCD" +
+///   block_2[0] = b"BCDB"`).
+///
+/// If `backfill_boundary_positions` regresses, position 5 is never
+/// hashed, position 8's lookup misses, and the lazy parser falls
+/// through to a leading literals run — `offset == 3, match_len >= 4`
+/// would no longer hold.
+#[test]
+fn hashchain_inserts_tail_positions_for_next_block_matching() {
+    let mut matcher = HcMatchGenerator::new(1 << 22);
+    matcher.configure(HC_CONFIG, super::strategy::StrategyTag::Lazy, 22);
+
+    matcher.table.add_data(b"PQRSTBCD".to_vec(), |_| {});
+    let mut history = alloc::vec::Vec::new();
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => history.extend_from_slice(literals),
+        Sequence::Triple { .. } => unreachable!("first block has no internal repeats"),
+    });
+    assert_eq!(history, b"PQRSTBCD");
+
+    matcher.table.add_data(b"BCDBCDBCDB".to_vec(), |_| {});
+    let mut first_sequence_offset: Option<usize> = None;
+    let mut first_sequence_match_len: Option<usize> = None;
+    matcher.start_matching(|seq| {
+        if first_sequence_offset.is_some() {
+            return;
+        }
+        match seq {
+            Sequence::Literals { .. } => {
+                panic!(
+                    "expected tail-anchored cross-block match before any literals — \
+                     backfill_boundary_positions did not seed positions 5/6/7"
+                )
+            }
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                assert_eq!(literals, b"", "no leading literals on the boundary match");
+                first_sequence_offset = Some(offset);
+                first_sequence_match_len = Some(match_len);
+            }
+        }
+    });
+
+    let offset = first_sequence_offset.expect(
+        "expected tail-anchored cross-block match emitted from backfill_boundary_positions",
+    );
+    assert!(
+        (1..=3).contains(&offset),
+        "boundary match offset {offset} must point into the unhashable tail \
+         (positions 5/6/7 of an 8-byte block 1) so the test specifically \
+         locks down backfill_boundary_positions",
+    );
+    assert_eq!(
+        offset, 3,
+        "candidate position must land at 5 (= block_1_len - 3) so the 4-byte \
+         window `data[5..9] = b\"BCDB\"` matches block 2's first hash lookup",
+    );
+    let match_len = first_sequence_match_len.unwrap();
+    assert!(
+        match_len >= HC_MIN_MATCH_LEN,
+        "match_len {match_len} must clear the HC min-match floor",
+    );
 }
 
 #[test]
