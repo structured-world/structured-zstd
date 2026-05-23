@@ -56,24 +56,18 @@ unsafe extern "C" {
 }
 
 /// Resolve the decode-corpus directory. The repo ships
-/// `zstd/decodecorpus_files/` as a checked-in fixture; tests run
-/// from the workspace root or from `zstd/`, so try both.
+/// `zstd/decodecorpus_files/` as a checked-in fixture; resolve
+/// from `CARGO_MANIFEST_DIR` so the path is deterministic across
+/// runners (nextest, IDE test runners, in-tree `cargo test`,
+/// out-of-tree invocations).
 fn corpus_dir() -> PathBuf {
-    let candidates = [
-        "zstd/decodecorpus_files",
-        "decodecorpus_files",
-        "../zstd/decodecorpus_files",
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_dir() {
-            return path;
-        }
-    }
-    panic!(
-        "could not locate decodecorpus_files under any of {:?}",
-        candidates
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("decodecorpus_files");
+    assert!(
+        path.is_dir(),
+        "expected corpus directory at {}; this fixture is shipped with the crate",
+        path.display()
     );
+    path
 }
 
 /// Load every fixture file from the decode corpus into a flat byte buffer.
@@ -150,13 +144,14 @@ fn donor_decision(block: &[u8], level: i32) -> usize {
     // `ZSTD_SLIPBLOCK_WORKSPACESIZE` is in bytes; we allocate `u64`
     // slots so the buffer is naturally 8-byte aligned (satisfies the
     // donor's `size_t` alignment requirement on all supported targets,
-    // where `size_t` is at most 8 bytes). `/ 8 + 1` rounds the byte
-    // budget up to whole u64 slots — the `+ 1` covers the case where
-    // the workspace size is not a multiple of 8 (8208 is, so we get
-    // 8208/8 + 1 = 1026 slots = 8208 bytes of usable storage + one
-    // slot of slack). The actual byte count passed to donor below is
-    // `workspace.len() * 8`.
-    let mut workspace = vec![0u64; ZSTD_SLIPBLOCK_WORKSPACESIZE / 8 + 1];
+    // where `size_t` is at most 8 bytes). Slot count is the ceiling
+    // of `ZSTD_SLIPBLOCK_WORKSPACESIZE / size_of::<u64>()` so the
+    // byte budget never under-shoots the donor minimum even if the
+    // constant is later raised to a non-multiple of 8. The actual
+    // byte count passed to donor below is `workspace.len() * size_of::<u64>()`.
+    const U64_SIZE: usize = core::mem::size_of::<u64>();
+    let workspace_slots = ZSTD_SLIPBLOCK_WORKSPACESIZE.div_ceil(U64_SIZE);
+    let mut workspace = vec![0u64; workspace_slots];
     // SAFETY: block.len() == 128 KB (asserted above), level ∈ 0..=4
     // (caller-enforced in test bodies below), workspace size ≥
     // ZSTD_SLIPBLOCK_WORKSPACESIZE bytes, workspace aligned for size_t
@@ -167,7 +162,7 @@ fn donor_decision(block: &[u8], level: i32) -> usize {
             block.len(),
             level,
             workspace.as_mut_ptr() as *mut c_void,
-            workspace.len() * 8,
+            workspace.len() * U64_SIZE,
         )
     }
 }
