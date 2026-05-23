@@ -573,13 +573,55 @@ fn bench_dictionary(c: &mut Criterion) {
             configure_group(&mut group, scenario);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
+            // One-time byte-equality verification BEFORE the bench loops.
+            // `decode_all_with_dict_handle` explicitly warns that decoding
+            // with the wrong dictionary produces silently-corrupt output
+            // (no error), so verifying once against `scenario.bytes`
+            // outside the timing sample catches a desynced
+            // (rust_dict_handle, with_dict_bytes) pairing before it would
+            // silently inflate or deflate throughput numbers. FFI side
+            // gets the same treatment for parity. Matches the donor shape
+            // used by `bench_decompress_source` →
+            // `assert_decompress_matches_reference`.
+            {
+                let mut verify_decoder = FrameDecoder::new();
+                let mut verify_out = vec![0u8; expected_len];
+                let n = verify_decoder
+                    .decode_all_with_dict_handle(
+                        with_dict_bytes.as_slice(),
+                        verify_out.as_mut_slice(),
+                        rust_dict_handle,
+                    )
+                    .expect("rust decode-with-dict verification must succeed");
+                assert_eq!(n, expected_len, "rust dict decode wrote a partial output");
+                assert_eq!(
+                    &verify_out[..n],
+                    scenario.bytes.as_slice(),
+                    "rust dict decode bytes diverge from scenario reference",
+                );
+
+                let mut verify_decompressor =
+                    zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary)
+                        .expect("ffi dict verification: with_dictionary");
+                let mut verify_out_ffi = vec![0u8; expected_len];
+                let nf = verify_decompressor
+                    .decompress_to_buffer(with_dict_bytes.as_slice(), verify_out_ffi.as_mut_slice())
+                    .expect("ffi decode-with-dict verification must succeed");
+                assert_eq!(nf, expected_len, "ffi dict decode wrote a partial output");
+                assert_eq!(
+                    &verify_out_ffi[..nf],
+                    scenario.bytes.as_slice(),
+                    "ffi dict decode bytes diverge from scenario reference",
+                );
+            }
+
             group.bench_function("pure_rust_with_dict", |b| {
                 let mut decoder = FrameDecoder::new();
                 let mut output = vec![0u8; expected_len];
                 b.iter(|| {
                     let n = decoder
                         .decode_all_with_dict_handle(
-                            with_dict_bytes.as_slice(),
+                            black_box(with_dict_bytes.as_slice()),
                             output.as_mut_slice(),
                             rust_dict_handle,
                         )
@@ -595,7 +637,10 @@ fn bench_dictionary(c: &mut Criterion) {
                 let mut output = vec![0u8; expected_len];
                 b.iter(|| {
                     let n = decompressor
-                        .decompress_to_buffer(with_dict_bytes.as_slice(), output.as_mut_slice())
+                        .decompress_to_buffer(
+                            black_box(with_dict_bytes.as_slice()),
+                            output.as_mut_slice(),
+                        )
                         .expect("ffi decode-with-dict must succeed");
                     assert_eq!(n, expected_len, "ffi decode wrote a partial output");
                     black_box(&output[..n]);
