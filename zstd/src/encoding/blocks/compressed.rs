@@ -499,23 +499,40 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        let ll_mode = choose_table(
+        // Single-pass histogram of ll/ml/of codes across all sequences.
+        // Previously did three separate `sequences.iter().map(...)`
+        // passes; folded into one loop here saves the per-element
+        // closure overhead (profile #220 round 3: `Map::fold` +
+        // `call_mut` accounted for ~5% of total bench CPU).
+        let mut ll_counts = [0usize; 256];
+        let mut ml_counts = [0usize; 256];
+        let mut of_counts = [0usize; 256];
+        for seq in sequences.iter() {
+            ll_counts[encode_literal_length(seq.ll).0 as usize] += 1;
+            ml_counts[encode_match_len(seq.ml).0 as usize] += 1;
+            of_counts[encode_offset(seq.of).0 as usize] += 1;
+        }
+        let total = sequences.len();
+
+        let ll_mode = choose_table_from_counts(
             state.fse_tables.ll_previous.as_ref(),
             state.fse_tables.ll_default_ref(),
-            sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
+            &ll_counts,
+            total,
             9,
         );
-        let ml_mode = choose_table(
+        let ml_mode = choose_table_from_counts(
             state.fse_tables.ml_previous.as_ref(),
             state.fse_tables.ml_default_ref(),
-            sequences.iter().map(|seq| encode_match_len(seq.ml).0),
+            &ml_counts,
+            total,
             9,
         );
-        let of_mode = choose_table(
+        let of_mode = choose_table_from_counts(
             state.fse_tables.of_previous.as_ref(),
             state.fse_tables.of_default_ref(),
-            sequences.iter().map(|seq| encode_offset(seq.of).0),
+            &of_counts,
+            total,
             8,
         );
 
@@ -1351,7 +1368,23 @@ fn choose_table<'a>(
         counts[symbol as usize] += 1;
         total += 1;
     }
+    choose_table_from_counts(previous, default_table, &counts, total, max_log)
+}
 
+/// Same decision logic as [`choose_table`] but takes pre-computed
+/// symbol counts and total directly. Hot-path callers in
+/// `compress_literals_and_sequences` use this overload to avoid
+/// re-iterating the sequence vec three times (one pass per
+/// ll/ml/of stream); the iterator form is kept for the cost
+/// estimator's call sites where the data is already in iterator
+/// form.
+fn choose_table_from_counts<'a>(
+    previous: Option<&'a PreviousFseTable>,
+    default_table: &'a FSETable,
+    counts: &[usize; 256],
+    total: usize,
+    max_log: u8,
+) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
     }
