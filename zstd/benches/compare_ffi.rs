@@ -521,9 +521,17 @@ fn bench_dictionary(c: &mut Criterion) {
             // SAME dictionary bytes — the inner zstd frame's `dict_id`
             // header is derived from those bytes. Parsing the handle
             // from `rust_dictionary` (different bytes, different
-            // `dict_id`) would cause `decode_all_with_dict_handle` to
-            // fail with `DictNotProvided` and the FFI side to operate
-            // on the wrong dictionary, both measuring the wrong path.
+            // `dict_id`) would fail one of two ways:
+            //   - if the frame header carries a `dict_id`,
+            //     `decode_all_with_dict_handle` returns
+            //     `DictIdMismatch { expected, got }` (see
+            //     `frame_decoder.rs::reset_with_dict_handle`);
+            //   - if the encoder omitted the `dict_id` (some configs do),
+            //     decode would SILENTLY corrupt the output by applying
+            //     the wrong reference bytes, which the FFI side would
+            //     mirror with `decompress_to_buffer` quietly producing
+            //     garbage — even worse than a clean error.
+            // Either way the bench would measure the wrong path.
             let Ok(rust_dict_handle) =
                 structured_zstd::decoding::DictionaryHandle::decode_dict(ffi_dictionary.as_slice())
             else {
