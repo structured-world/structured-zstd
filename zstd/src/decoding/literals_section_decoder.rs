@@ -559,28 +559,54 @@ unsafe fn run_4stream_decode_loop<K: HufKernel>(
                     | 1,
             ];
 
+            // Donor parity: `huf_decompress.c` writes via raw pointer
+            // `op[stream][symbol]`. Our equivalent uses `unsafe`
+            // unchecked indexing because Rust's slice bounds check
+            // dominates the inner loop on poorly-compressed (literal-
+            // heavy) inputs like L-7 Fast.
+            //
+            // SAFETY (inlined per-line for clarity since this is
+            // load-bearing for the burst's per-byte cost):
+            //   * `idx{0..=3}` is `(bits[s] >> table_shift) as usize`
+            //     with `table_shift = 64 - max_num_bits`; the right
+            //     shift produces a value in `[0, 1 << max_num_bits)`.
+            //     `packed.len() == 1 << max_num_bits` by construction
+            //     in `HuffmanTable::build_decoder` (`packed_decode.resize`
+            //     at line ~976), so `packed.get_unchecked(idx)` is
+            //     always in-bounds.
+            //   * `cursors[s] < ends[s]` is the lockstep cursor
+            //     invariant guarded by the `burst_eligible` /
+            //     `cursor_burst_ceil` precondition at the outer-loop
+            //     entry: `cursor_burst_ceil =
+            //     cursor_exit_olimit.saturating_sub(symbols_per_burst)`
+            //     means a full burst of `symbols_per_burst` writes
+            //     advances cursors at most up to `cursor_exit_olimit
+            //     = starts[0] + min_seg_len`, which is `<= ends[s]`
+            //     for every `s` (by the `min_seg_len` definition).
+            //     `target.len() = base + regen` covers all `ends[s]`
+            //     (by the upfront `target.resize(base + regen, 0)`).
             for _ in 0..symbols_per_burst {
                 let idx0 = (bits[0] >> table_shift) as usize;
-                let entry0 = packed[idx0];
-                target[cursors[0]] = (entry0 & 0xFF) as u8;
+                let entry0 = unsafe { *packed.get_unchecked(idx0) };
+                unsafe { *target.get_unchecked_mut(cursors[0]) = (entry0 & 0xFF) as u8 };
                 cursors[0] += 1;
                 bits[0] <<= (entry0 >> 8) & 0xFF;
 
                 let idx1 = (bits[1] >> table_shift) as usize;
-                let entry1 = packed[idx1];
-                target[cursors[1]] = (entry1 & 0xFF) as u8;
+                let entry1 = unsafe { *packed.get_unchecked(idx1) };
+                unsafe { *target.get_unchecked_mut(cursors[1]) = (entry1 & 0xFF) as u8 };
                 cursors[1] += 1;
                 bits[1] <<= (entry1 >> 8) & 0xFF;
 
                 let idx2 = (bits[2] >> table_shift) as usize;
-                let entry2 = packed[idx2];
-                target[cursors[2]] = (entry2 & 0xFF) as u8;
+                let entry2 = unsafe { *packed.get_unchecked(idx2) };
+                unsafe { *target.get_unchecked_mut(cursors[2]) = (entry2 & 0xFF) as u8 };
                 cursors[2] += 1;
                 bits[2] <<= (entry2 >> 8) & 0xFF;
 
                 let idx3 = (bits[3] >> table_shift) as usize;
-                let entry3 = packed[idx3];
-                target[cursors[3]] = (entry3 & 0xFF) as u8;
+                let entry3 = unsafe { *packed.get_unchecked(idx3) };
+                unsafe { *target.get_unchecked_mut(cursors[3]) = (entry3 & 0xFF) as u8 };
                 cursors[3] += 1;
                 bits[3] <<= (entry3 >> 8) & 0xFF;
             }

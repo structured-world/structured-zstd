@@ -5,15 +5,9 @@ use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    _bzhi_u32, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
-    _mm_srli_si128,
-};
+use core::arch::x86::{_bzhi_u32, _mm_cvtsi128_si32, _mm_maskz_compress_epi8, _mm_set_epi32};
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    _bzhi_u64, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
-    _mm_srli_si128,
-};
+use core::arch::x86_64::{_bzhi_u64, _mm_cvtsi128_si32, _mm_maskz_compress_epi8, _mm_set_epi32};
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -265,6 +259,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw")]
+    #[inline]
     unsafe fn decode4_symbols_and_num_bits_vbmi2(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
@@ -279,10 +274,13 @@ impl<'t> HuffmanDecoder<'t> {
         let lane2 = u64::from(table.packed_decode[decoders[2].state as usize]);
         let lane3 = u64::from(table.packed_decode[decoders[3].state as usize]);
         let packed_u64 = lane0 | (lane1 << 16) | (lane2 << 32) | (lane3 << 48);
-        // Move the u64 into the low 64 bits of an xmm reg.
-        // Re-using `_mm_set_epi32` keeps the byte order identical to
-        // the historical u32-laned shape so the mask-compress patterns
-        // below stay correct.
+        // Unpack the four u16 entries into four 32-bit lanes of an
+        // xmm reg. Each lane holds `{symbol, nbBits}` in its low two
+        // bytes — the upper two bytes of each lane are zero. This
+        // preserves the per-lane byte layout the `_mm_maskz_compress_epi8`
+        // masks below depend on (one symbol byte and one nbBits byte
+        // per 32-bit lane); a packed u64-in-low-64-bits shape would
+        // collapse the lanes and break the mask patterns.
         let packed = _mm_set_epi32(
             (packed_u64 >> 48) as i32 & 0xFFFF,
             ((packed_u64 >> 32) & 0xFFFF) as i32,
@@ -306,6 +304,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn decode4_symbols_and_num_bits_avx2(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
@@ -341,6 +340,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
+    #[inline]
     unsafe fn decode4_symbols_and_num_bits_neon(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
@@ -374,6 +374,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "sve")]
+    #[inline]
     unsafe fn decode4_symbols_and_num_bits_sve(
         decoders: &[HuffmanDecoder<'_>; 4],
     ) -> ([u8; 4], [u8; 4]) {
@@ -658,7 +659,7 @@ pub struct HuffmanTable {
     /// output bytes through this table; literal-buffer pressure on
     /// L1d makes the cache hit rate sensitive to table footprint.
     pub(crate) packed_decode: Vec<u16>,
-    /// The weight of a symbol is the number of occurences in a table.
+    /// The weight of a symbol is the number of occurrences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
     /// lookup table
