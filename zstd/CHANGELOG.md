@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.23](https://github.com/structured-world/structured-zstd/compare/v0.0.22...v0.0.23) - 2026-05-23
+
+### Added
+
+- *(frame)* magicless frame format support ([#26](https://github.com/structured-world/structured-zstd/pull/26)) ([#222](https://github.com/structured-world/structured-zstd/pull/222))
+
+### Performance
+
+- *(row)* drop eager block-boundary inserts ([#180](https://github.com/structured-world/structured-zstd/pull/180)) ([#232](https://github.com/structured-world/structured-zstd/pull/232))
+- *(decode)* 8-slot software prefetch pipeline for sequence execution ([#208](https://github.com/structured-world/structured-zstd/pull/208)) ([#227](https://github.com/structured-world/structured-zstd/pull/227))
+- *(encoder)* port donor ZSTD_compressBlock_fast — 4-cursor + per-level cParams + cmov + window-correctness (#198 phase 3) ([#229](https://github.com/structured-world/structured-zstd/pull/229))
+- *(decoding)* integrate AVX2 unroll-2 wildcopy candidate ([#108](https://github.com/structured-world/structured-zstd/pull/108)) ([#223](https://github.com/structured-world/structured-zstd/pull/223))
+- *(encoder)* wire donor-shape Fast kernel into MatchGeneratorDriver (#198 phase 1b) ([#217](https://github.com/structured-world/structured-zstd/pull/217))
+- *(encoder)* donor-shape Fast kernel modules (#198 phase 1a) ([#215](https://github.com/structured-world/structured-zstd/pull/215))
+- *(fse)* elide bounds check on init_state + update_state decode reads ([#214](https://github.com/structured-world/structured-zstd/pull/214))
+- *(decode)* SIMD-16 fast path for short offsets {1, 2, 4} ([#213](https://github.com/structured-world/structured-zstd/pull/213))
+- *(decode)* const-generic HUF kernel monomorphisation for SIMD-fallback ([#212](https://github.com/structured-world/structured-zstd/pull/212))
+- *(decode)* port donor HUF 4-stream burst with sentinel-bit ctz ([#201](https://github.com/structured-world/structured-zstd/pull/201))
+
+### Testing
+
+- *(hc)* cross-slice boundary position seeding regression test ([#235](https://github.com/structured-world/structured-zstd/pull/235))
+
 ## [0.0.22](https://github.com/structured-world/structured-zstd/compare/v0.0.21...v0.0.22) - 2026-05-19
 
 ### Added
