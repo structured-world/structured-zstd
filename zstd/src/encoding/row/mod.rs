@@ -181,8 +181,20 @@ impl RowMatchGenerator {
                 // `ZSTD_row_fillHashCache` only pre-fills the next-scan
                 // cache (8 positions of lookahead for SIMD prefetch); it
                 // does NOT retroactively insert every byte of a skipped
-                // block. Subsequent blocks can only cross-match into the
-                // ROW_HASH_KEY_LEN-1 byte tail backfilled above.
+                // block.
+                //
+                // Boundary handling: the `backfill_start` insert above
+                // covers the `ROW_HASH_KEY_LEN - 1` bytes immediately
+                // BEFORE `current_abs_start` (i.e. the previous block's
+                // tail), keeping the current block's start hashable as
+                // a cross-block match target. The CURRENT skipped
+                // block's tail (the `ROW_HASH_KEY_LEN - 1` bytes ending
+                // at `current_abs_end`) is itself backfilled lazily —
+                // by the NEXT call's own `backfill_start` insert when
+                // that call's `current_abs_start` lands at
+                // `current_abs_end`. So a parse of block N+1 sees
+                // block N's tail in the row table but not its
+                // interior, matching donor.
                 //
                 // Trade: cross-block matches into a skipped block's
                 // interior are lost (rare in practice — `skip_matching`

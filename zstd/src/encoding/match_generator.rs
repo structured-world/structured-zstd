@@ -5781,6 +5781,61 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     );
 }
 
+/// Regression for the `None` arm of `skip_matching_with_hint`: the
+/// row table must NOT receive dense inserts across the skipped range.
+/// Donor parity (`ZSTD_row_fillHashCache` only pre-fills the next-scan
+/// cache, not the skipped block's interior) trades cross-block
+/// matches into the skipped interior for the per-block O(block_size)
+/// insert cost.
+///
+/// At input < 1 block (4096 B with default 128 KiB block boundary),
+/// the only positions in the row table after the call should be those
+/// produced by the `backfill_start` lookback at the block's start
+/// (≤ `ROW_HASH_KEY_LEN - 1` positions when block_start <
+/// ROW_HASH_KEY_LEN). For `current_abs_start == 0`, even that backfill
+/// is empty — so the table stays fully empty.
+#[test]
+fn row_skip_matching_with_none_hint_leaves_interior_empty() {
+    let data = deterministic_high_entropy_bytes(0x9B47_F2A1_8C5E_3306, 4096);
+
+    let mut none_hint = RowMatchGenerator::new(1 << 22);
+    none_hint.configure(ROW_CONFIG);
+    none_hint.add_data(data.clone(), |_| {});
+    none_hint.skip_matching_with_hint(None);
+    let none_slots = none_hint
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    // Dense (Some(false), dict-priming path) for comparison — that
+    // path inserts every position in the skipped range.
+    let mut dense = RowMatchGenerator::new(1 << 22);
+    dense.configure(ROW_CONFIG);
+    dense.add_data(data, |_| {});
+    dense.skip_matching_with_hint(Some(false));
+    let dense_slots = dense
+        .row_positions
+        .iter()
+        .filter(|&&pos| pos != ROW_EMPTY_SLOT)
+        .count();
+
+    // Two assertions pin the contract:
+    // 1) None hint is dramatically sparser than dense (the whole point).
+    // 2) None hint at block-start==0 inserts ZERO positions (no
+    //    backfill possible before position 0).
+    assert_eq!(
+        none_slots, 0,
+        "None hint at block_start=0 must leave row table fully empty \
+         (donor parity — interior NOT inserted, no pre-block backfill possible)",
+    );
+    assert!(
+        dense_slots > 0,
+        "Some(false) dict-priming path must still insert densely \
+         (sanity check: control case for the `none_slots == 0` assertion)",
+    );
+}
+
 #[test]
 fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
