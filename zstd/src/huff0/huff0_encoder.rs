@@ -102,8 +102,19 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         for (i, segment) in segments.iter().enumerate() {
             let bytes_written = self.writer.with_aligned_output_mut(|output| {
                 let dst_capacity = Self::huf_tight_compress_bound(segment.len(), table_log);
-                let mut bit_c = super::huf_cstream::HufCStream::new(output, dst_capacity)
-                    .expect("output buffer is too small to fit Huffman stream");
+                // `HufCStream::new` returns `None` only when
+                // `dst_capacity <= 8` (8-byte flush slack would have
+                // nowhere to go). Capacity itself is reserved
+                // inside `new` via `Vec::reserve(dst_capacity)`, so
+                // there is no "output buffer too small" failure mode
+                // — the only way to trip this is the upstream
+                // `huf_tight_compress_bound` returning ≤ 8 bytes,
+                // which it never does for a non-empty segment under
+                // `table_log >= 1` (formula: src*table_log/8 + 24).
+                let mut bit_c = super::huf_cstream::HufCStream::new(output, dst_capacity).expect(
+                    "HufCStream::new returned None — dst_capacity (from \
+                         huf_tight_compress_bound) must be > 8 for a non-empty segment",
+                );
                 Self::encode_one_stream(packed_codes, &mut bit_c, segment, table_log);
                 bit_c.close()
             });

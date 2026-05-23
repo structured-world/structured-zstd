@@ -1850,17 +1850,19 @@ mod tests {
     ///
     /// Symptom assertion: on a `[0x01, 0x42 × 199]` fixture, donor's
     /// rep-at-ip2 fires at iter 1 (ip2=3, both `read32` reads see
-    /// `[42,42,42,42]`), emitting `Triple{literals=[0x01], offset=1,
-    /// match_len=~198}`. The buggy path skips rep, walks the cursor
-    /// via explicit-match shifts until matchIdx coincides at ip0=3
-    /// (iter 2 of inner loop, slot for `h([42,42,42,42])` was written
-    /// at ip0=2 in iter 1), then emits `Triple{literals=[0x01,
-    /// 0x42, 0x42], offset=1, ...}` — TWO extra literal bytes.
+    /// `[42,42,42,42]`). The donor emit sequence is:
+    /// `new_ip = ip2 = 3`, `match0 = ip2 - rep_offset1 = 2`, then the
+    /// one-byte backward extension absorbs `data[2] == data[1]`
+    /// (both `0x42`), giving `new_ip = 2, match_len ≈ 198`. Literal
+    /// prefix is `data[0..new_ip] = [0x01, 0x42]` → length 2.
     ///
-    /// The `literals.len() == 1` assertion is the bug discriminator:
-    /// uniform-byte data lets the explicit-match path eventually find
-    /// offset=1 too, so a check on offset alone passes both paths;
-    /// only the LITERAL PREFIX LENGTH reveals which path fired first.
+    /// The buggy path skips rep, walks the cursor via explicit-match
+    /// shifts until matchIdx coincides further into the run, and
+    /// emits a different literal prefix length. Asserting both
+    /// `offset == 1` AND `literals.len() == 2` pins down the
+    /// rep-at-ip2 path exactly — the explicit-match catch-up on
+    /// uniform-byte data also finds offset=1 via slot collision, so
+    /// an offset-only check passes both fixed and buggy paths.
     #[test]
     fn block_zero_prologue_preserves_default_rep_offset_one() {
         let mut data = alloc::vec::Vec::with_capacity(200);
@@ -1885,15 +1887,20 @@ mod tests {
             }
         });
 
-        // The narrowest assertion that's stable under hash-slot
-        // collisions on uniform-byte inputs: the first emit MUST
-        // reference offset=1. With the prologue bug, the explicit-
-        // match path catches up via slot collision and still emits
-        // offset=1 (matching this assertion on simple fixtures), so
-        // the unit test only documents the contract — the real
-        // ratio-regression discriminator is the compare_ffi run on
-        // decodecorpus, where the cascade from the disabled rep
-        // probe shows up as ~36 missing matches in block 0.
+        // Both `offset` AND `literals.len()` are asserted — together
+        // they pin down EXACTLY which inner-loop path emitted the
+        // first match. With the prologue bug (rep-at-ip2 disabled
+        // because `max_rep` was computed against `prefix_start_index`
+        // instead of `window_low`), the explicit-match path catches
+        // up via hash-slot collision at ip0=3 and STILL emits
+        // offset=1 — so an offset-only check would pass both fixed
+        // and buggy paths on this uniform-byte fixture. The literal
+        // prefix length is the actual discriminator: the rep-at-ip2
+        // path consumes only the leading `0x01` literal (1 byte),
+        // while the explicit-match catch-up walks past two more
+        // `0x42` bytes before firing (3 bytes total). Asserting both
+        // values keeps the regression locked to the exact path the
+        // fix was meant to preserve.
         assert_eq!(
             first_offset,
             Some(1),
@@ -1903,6 +1910,14 @@ mod tests {
              window_low=0 at block 0, NOT against the sentinel \
              prefix=1)",
         );
-        let _ = first_literals_len;
+        assert_eq!(
+            first_literals_len,
+            Some(2),
+            "first emit must have a 2-byte literal prefix \
+             ([0x01, 0x42]) — the rep-at-ip2 probe lands at ip2=3, \
+             then the one-byte backward extension drops new_ip to 2, \
+             so literals = data[0..2]. A different prefix length \
+             would indicate the explicit-match catch-up fired instead",
+        );
     }
 }

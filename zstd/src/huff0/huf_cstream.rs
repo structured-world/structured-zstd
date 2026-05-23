@@ -59,8 +59,12 @@ pub(crate) fn pack_huf_celt(value: u32, nb_bits: u8) -> u64 {
 ///
 /// Operates directly on a borrowed `Vec<u8>` — the caller pre-reserves
 /// enough capacity so the hot path can do unchecked 8-byte writes via
-/// raw pointer without growing the Vec. `finalize` truncates back to
-/// the exact `bytes_written` count.
+/// raw pointer without growing the Vec. [`Self::close`] is the
+/// finalization API: it bumps `Vec::len()` once to the exact
+/// `bytes_written` count (from the construction-time `start_idx`),
+/// surfacing the committed bytes to safe Rust readers. Until `close`
+/// runs, `Vec::len()` stays at its construction-time value and all
+/// raw-pointer writes target spare capacity past `len`.
 ///
 /// Lifetime / borrow rules: holds `output: &mut Vec<u8>` for its
 /// lifetime; caller must finish all encoding work via this stream
@@ -74,18 +78,23 @@ pub(crate) struct HufCStream<'a> {
     /// carry "dirty" noise from donor's `nbBitsFast` trick and must
     /// be masked with `0xFF` on read.
     bit_pos: [u64; 2],
-    /// Output buffer. `cursor` indexes into this Vec; we keep
-    /// `Vec::len()` in sync after every flush so the buffer always
-    /// reflects bytes actually written.
+    /// Output buffer. `cursor` indexes into this Vec; `Vec::len()`
+    /// stays at the construction-time value through the entire
+    /// add/flush cycle and is advanced ONCE by [`Self::close`] via
+    /// `set_len(start_idx + bytes_written)`. In-flight bytes live
+    /// in spare capacity past `len`.
     output: &'a mut Vec<u8>,
     /// Byte index of the first byte this stream writes (= `output.len()`
-    /// at construction). Used to compute `bytes_written` in `finalize`.
+    /// at construction). Used to compute `bytes_written` in `close`.
     start_idx: usize,
     /// Current write cursor. Always satisfies
     /// `start_idx <= cursor <= output.capacity()`. Bytes in
-    /// `output[start_idx..cursor]` are committed; bytes in
-    /// `output[cursor..cursor+8]` are scratch the next flush will
-    /// overwrite.
+    /// `output[start_idx..cursor]` ARE committed by raw-pointer
+    /// writes but NOT yet reflected in `output.len()` (which still
+    /// points at `start_idx`); bytes in `output[cursor..cursor+8]`
+    /// are scratch the next flush will overwrite. `close` is the
+    /// only call that bumps `len` and surfaces the committed bytes
+    /// to safe Rust readers of the `Vec`.
     cursor: usize,
     /// `cursor` must never reach this value — beyond it the 8-byte
     /// flush write would overrun the reserved capacity. `FAST=true`
@@ -277,11 +286,6 @@ mod tests {
         s.add_bits::<false>(elt, 0);
         let n = s.close();
         assert!(n > 0);
-        // Value 0b1011 (4 bits) + end-mark 1 (1 bit) = 5 bits used in container.
-        // After flush: container top-5 bits = [1011, 1] (high→low), written
-        // to output as low byte: bits packed top-down → low byte = 0b1011_1000
-        // = 0xB8 (after the closing flush, the partial 5 bits become the
-        // single tail byte; close() pads to full byte).
         assert_eq!(out.len(), 1);
         // Donor `HUF_addBits` + `HUF_flushBits` layout (top-down
         // packing in the 64-bit container, then `flushBits` shifts
