@@ -55,16 +55,21 @@ unsafe extern "C" {
     ) -> usize;
 }
 
-/// Resolve the decode-corpus directory. The repo ships
-/// `zstd/decodecorpus_files/` as a checked-in fixture; resolve
-/// from `CARGO_MANIFEST_DIR` so the path is deterministic across
+/// Resolve the decode-corpus directory. The repository checks in
+/// `zstd/decodecorpus_files/` as a fixture for integration tests;
+/// the directory is intentionally excluded from the published
+/// crates.io package (see `[package].exclude` in `Cargo.toml`), so
+/// this test only runs against a repository checkout. Resolving
+/// from `CARGO_MANIFEST_DIR` makes the path deterministic across
 /// runners (nextest, IDE test runners, in-tree `cargo test`,
-/// out-of-tree invocations).
+/// out-of-tree invocations) when the fixture is present.
 fn corpus_dir() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("decodecorpus_files");
     assert!(
         path.is_dir(),
-        "expected corpus directory at {}; this fixture is shipped with the crate",
+        "expected corpus directory at {} — this test needs the \
+         decodecorpus_files/ fixture from the repository checkout; \
+         it is not shipped in the crates.io package",
         path.display()
     );
     path
