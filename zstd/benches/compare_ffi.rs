@@ -486,8 +486,7 @@ fn bench_dictionary(c: &mut Criterion) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 eprintln!(
-                    "BENCH_WARN skipping decompress-dict for scenario {} \
-                         (failed to parse FFI dict bytes into a Rust DictionaryHandle: {err:?})",
+                    "BENCH_WARN skipping decompress-dict for scenario {} (failed to parse FFI dict bytes into a Rust DictionaryHandle: {err:?})",
                     scenario.id
                 );
                 None
