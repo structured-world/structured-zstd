@@ -507,6 +507,58 @@ fn bench_dictionary(c: &mut Criterion) {
             });
 
             group.finish();
+
+            // decompress-dict: measure end-to-end decompress throughput
+            // for a dictionary-driven .zst payload, both sides. Uses
+            // `with_dict_bytes` (the FFI dict-encoded payload above) as
+            // the fixed input on both branches so the throughput
+            // metric is apples-to-apples (Rust and FFI decode the SAME
+            // bytes — what differs is the decoder implementation).
+            let Ok(rust_dict_handle) =
+                structured_zstd::decoding::DictionaryHandle::decode_dict(&rust_dictionary)
+            else {
+                eprintln!(
+                    "BENCH_WARN skipping decompress-dict for {} level={} (failed to parse Rust dict handle)",
+                    scenario.id, level.name
+                );
+                continue;
+            };
+            let decompress_dict_name = format!(
+                "decompress-dict/{}/{}/{}",
+                level.name, scenario.id, "matrix"
+            );
+            let mut group = c.benchmark_group(decompress_dict_name);
+            configure_group(&mut group, scenario);
+            group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
+
+            group.bench_function("pure_rust_with_dict", |b| {
+                let mut decoder = FrameDecoder::new();
+                let mut output = vec![0u8; scenario.bytes.len()];
+                b.iter(|| {
+                    let n = decoder
+                        .decode_all_with_dict_handle(
+                            with_dict_bytes.as_slice(),
+                            output.as_mut_slice(),
+                            &rust_dict_handle,
+                        )
+                        .expect("rust decode-with-dict must succeed");
+                    black_box(n);
+                })
+            });
+
+            group.bench_function("c_ffi_with_dict", |b| {
+                let mut decompressor =
+                    zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
+                let mut output = vec![0u8; scenario.bytes.len()];
+                b.iter(|| {
+                    let n = decompressor
+                        .decompress_to_buffer(with_dict_bytes.as_slice(), output.as_mut_slice())
+                        .expect("ffi decode-with-dict must succeed");
+                    black_box(n);
+                })
+            });
+
+            group.finish();
         }
     }
 }
