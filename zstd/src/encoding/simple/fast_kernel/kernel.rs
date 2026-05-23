@@ -304,17 +304,41 @@ pub(crate) struct FastBlockResult {
 /// wrapping the kernel's output would have to special-case "did
 /// the kernel already emit the tail" per branch, which is exactly
 /// the inconsistency this contract removes.
+/// Donor `prefixStartIndex` + `windowLow` bundled into a single
+/// argument so the kernel signature stays within the 7-arg clippy
+/// budget. Both fields are u32 absolute positions in the flat
+/// history buffer; see [`compress_block_fast`] doc for which path
+/// uses which.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefixBounds {
+    /// Sentinel-aware floor for the hash-table `match_idx` filter
+    /// (`match_found::<USE_CMOV>` rejects `match_idx <
+    /// prefix_start_index`). Caller is expected to maintain
+    /// `prefix_start_index >= 1` so the all-zero empty-slot value
+    /// can't be confused with a valid match at position 0.
+    pub prefix_start_index: u32,
+    /// Donor `windowLow` analogue — the absolute floor of in-window
+    /// positions, equals 0 at block 0 / pre-eviction blocks and
+    /// advances as the window slides. Drives the prologue's
+    /// `max_rep = ip0 - window_low` computation AND the backward-
+    /// extension `match_pos > window_low` bound (both paths donor
+    /// expresses against `prefixStart` directly, NOT against a
+    /// sentinel-1 floor).
+    pub window_low: u32,
+}
+
 #[inline(always)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
     block_start: usize,
-    prefix_start_index: u32,
-    window_low: u32,
+    bounds: PrefixBounds,
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
+    let prefix_start_index = bounds.prefix_start_index;
+    let window_low = bounds.window_low;
     // Donor's `stepSize = targetLength + !(targetLength) + 1`
     // (min 2). Callers must pass >= 2; values larger than 2 drive
     // the kernel's acceleration gradient on negative levels.
@@ -959,8 +983,30 @@ mod tests {
             }
         };
         let result = match mls {
-            4 => compress_block_fast::<4, false>(data, 0, 0, 0, &mut table, [0, 0], 2, &mut handle),
-            5 => compress_block_fast::<5, false>(data, 0, 0, 0, &mut table, [0, 0], 2, &mut handle),
+            4 => compress_block_fast::<4, false>(
+                data,
+                0,
+                PrefixBounds {
+                    prefix_start_index: 0,
+                    window_low: 0,
+                },
+                &mut table,
+                [0, 0],
+                2,
+                &mut handle,
+            ),
+            5 => compress_block_fast::<5, false>(
+                data,
+                0,
+                PrefixBounds {
+                    prefix_start_index: 0,
+                    window_low: 0,
+                },
+                &mut table,
+                [0, 0],
+                2,
+                &mut handle,
+            ),
             _ => panic!("test helper only supports mls=4 and mls=5"),
         };
         // Accounting invariant: literals + matches + tail == input.
@@ -1040,8 +1086,18 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let result =
-            compress_block_fast::<4, false>(data, 0, 0, 0, &mut table, rep, 2, &mut handle);
+        let result = compress_block_fast::<4, false>(
+            data,
+            0,
+            PrefixBounds {
+                prefix_start_index: 0,
+                window_low: 0,
+            },
+            &mut table,
+            rep,
+            2,
+            &mut handle,
+        );
         let acct: usize = tuples
             .iter()
             .map(|(lits, _off, mlen)| lits.len() + mlen)
@@ -1172,7 +1228,18 @@ mod tests {
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
         // prefix_start_index=5 blocks index 0.
-        let _ = compress_block_fast::<4, false>(&data, 0, 5, 5, &mut table, [0, 0], 2, &mut handle);
+        let _ = compress_block_fast::<4, false>(
+            &data,
+            0,
+            PrefixBounds {
+                prefix_start_index: 5,
+                window_low: 5,
+            },
+            &mut table,
+            [0, 0],
+            2,
+            &mut handle,
+        );
 
         // Walk emitted sequences in order, tracking the running
         // `anchor` cursor (which equals the start of the current
@@ -1251,8 +1318,18 @@ mod tests {
         // prefix_start_index = 50 — match_idx=5 is below the floor and
         // must be rejected by the donor-parity prefix filter in
         // `match_found`.
-        let _ =
-            compress_block_fast::<4, false>(&data, 50, 50, 50, &mut table, [0, 0], 2, &mut handle);
+        let _ = compress_block_fast::<4, false>(
+            &data,
+            50,
+            PrefixBounds {
+                prefix_start_index: 50,
+                window_low: 50,
+            },
+            &mut table,
+            [0, 0],
+            2,
+            &mut handle,
+        );
 
         // Either zero emissions (stale rejected, no other match found
         // in the limited scan window) or a Triple whose offset
@@ -1330,8 +1407,18 @@ mod tests {
             } => tuples.push((literals.to_vec(), offset, match_len)),
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
-        let result =
-            compress_block_fast::<4, false>(&data, 0, 0, 0, &mut table, [huge, 7], 2, &mut handle);
+        let result = compress_block_fast::<4, false>(
+            &data,
+            0,
+            PrefixBounds {
+                prefix_start_index: 0,
+                window_low: 0,
+            },
+            &mut table,
+            [huge, 7],
+            2,
+            &mut handle,
+        );
         assert_eq!(
             result.rep[0], huge,
             "out-of-range rep_offset1 must be restored verbatim across the block",
@@ -1377,8 +1464,10 @@ mod tests {
                 let _ = compress_block_fast::<4, true>(
                     &data,
                     0,
-                    0,
-                    0,
+                    PrefixBounds {
+                        prefix_start_index: 0,
+                        window_low: 0,
+                    },
                     &mut table,
                     [0, 0],
                     2,
@@ -1388,8 +1477,10 @@ mod tests {
                 let _ = compress_block_fast::<4, false>(
                     &data,
                     0,
-                    0,
-                    0,
+                    PrefixBounds {
+                        prefix_start_index: 0,
+                        window_low: 0,
+                    },
                     &mut table,
                     [0, 0],
                     2,

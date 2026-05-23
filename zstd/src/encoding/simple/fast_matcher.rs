@@ -649,8 +649,10 @@ impl FastKernelMatcher {
             (4, false) => compress_block_fast::<4, false>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -659,8 +661,10 @@ impl FastKernelMatcher {
             (4, true) => compress_block_fast::<4, true>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -669,8 +673,10 @@ impl FastKernelMatcher {
             (5, false) => compress_block_fast::<5, false>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -679,8 +685,10 @@ impl FastKernelMatcher {
             (5, true) => compress_block_fast::<5, true>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -689,8 +697,10 @@ impl FastKernelMatcher {
             (6, false) => compress_block_fast::<6, false>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -699,8 +709,10 @@ impl FastKernelMatcher {
             (6, true) => compress_block_fast::<6, true>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -709,8 +721,10 @@ impl FastKernelMatcher {
             (7, false) => compress_block_fast::<7, false>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -719,8 +733,10 @@ impl FastKernelMatcher {
             (7, true) => compress_block_fast::<7, true>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -729,8 +745,10 @@ impl FastKernelMatcher {
             (8, false) => compress_block_fast::<8, false>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,
@@ -739,8 +757,10 @@ impl FastKernelMatcher {
             (8, true) => compress_block_fast::<8, true>(
                 history,
                 block_start,
-                prefix_start_index,
-                window_low,
+                super::fast_kernel::kernel::PrefixBounds {
+                    prefix_start_index,
+                    window_low,
+                },
                 hash_table,
                 rep_in,
                 self.step_size,

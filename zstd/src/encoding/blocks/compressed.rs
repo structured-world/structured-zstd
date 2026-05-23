@@ -1419,15 +1419,15 @@ fn choose_table_from_counts<'a>(
     let new_total_cost = new_table.as_ref().map(|table| {
         table
             .table_header_bits()
-            .saturating_add(entropy_cost(&counts, max_symbol, total))
+            .saturating_add(entropy_cost(counts, max_symbol, total))
     });
 
-    let predefined_cost = cross_entropy_cost(&counts, max_symbol, default_table);
+    let predefined_cost = cross_entropy_cost(counts, max_symbol, default_table);
 
     let previous_cost = previous.and_then(|previous| {
         previous
             .as_table(default_table)
-            .and_then(|table| fse_bit_cost(&counts, max_symbol, table))
+            .and_then(|table| fse_bit_cost(counts, max_symbol, table))
     });
 
     enum Choice {
