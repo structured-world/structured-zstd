@@ -111,6 +111,68 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
+    /// Pre-reserve additional capacity in the output buffer so the
+    /// donor-faithful FSE fast path can do `flush_bulk` writes without
+    /// triggering `Vec::extend_from_slice`'s grow-on-realloc branch.
+    /// `additional` is the number of bytes the upcoming bursts will
+    /// emit (caller's bit budget / 8, rounded up).
+    #[inline]
+    pub fn reserve_output(&mut self, additional: usize) {
+        self.output.as_mut().reserve(additional);
+    }
+
+    /// Donor `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
+    /// `bits` into the bottom of `partial`, no overflow check. Caller
+    /// guarantees `num_bits + bits_in_partial <= 64` (no overflow) AND
+    /// `bits >> num_bits == 0` (value is "clean" — no junk in high
+    /// bits that would corrupt the packed stream).
+    ///
+    /// Used by the donor-faithful FSE sequence encoder which knows its
+    /// per-sequence bit budget at compile time and inserts explicit
+    /// [`Self::flush_bulk`] calls between bursts — saving the
+    /// per-call branch + spill that `write_bits_64`'s overflow check
+    /// pays.
+    #[inline(always)]
+    pub fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
+        debug_assert!(
+            num_bits + self.bits_in_partial <= 64,
+            "write_bits_64_no_check would overflow partial: would push to {} bits",
+            num_bits + self.bits_in_partial,
+        );
+        debug_assert!(
+            num_bits == 64 || bits >> num_bits == 0,
+            "value has dirty high bits beyond num_bits={num_bits}",
+        );
+        self.partial |= bits << self.bits_in_partial;
+        self.bits_in_partial += num_bits;
+    }
+
+    /// Donor `BIT_flushBitsFast` (`bitstream.h:202-214`): write full
+    /// bytes from `partial` to output, shift container down to keep
+    /// the leftover `< 8` bits at the bottom for the next add. No
+    /// overflow check on the output buffer — caller pre-reserves
+    /// sufficient capacity.
+    ///
+    /// Pairs with [`Self::write_bits_64_no_check`] in the FSE
+    /// sequence encoder's hot loop: a single flush_bulk after each
+    /// sequence keeps the budget under 64 bits + 7-bit tail.
+    #[inline(always)]
+    pub fn flush_bulk(&mut self) {
+        let nb_bytes = self.bits_in_partial >> 3;
+        // Donor `MEM_writeLEST` analogue. We can't do an unconditional
+        // 8-byte unaligned write without `Vec::reserve`; instead push
+        // the exact `nb_bytes` to extend the Vec by that much. LLVM
+        // typically lowers `extend_from_slice` of a fixed-size byte
+        // slice to a single store + len bump when capacity is large
+        // enough (the caller's pre-reserve guarantees this on the
+        // hot path).
+        let bytes = self.partial.to_le_bytes();
+        self.output.as_mut().extend_from_slice(&bytes[..nb_bytes]);
+        self.partial >>= nb_bytes * 8;
+        self.bits_in_partial &= 7;
+        self.bit_idx += nb_bytes * 8;
+    }
+
     /// Bridge for the donor-faithful Huffman encoder (`HufCStream`) so
     /// it can write bytes directly into our backing `Vec<u8>` without
     /// going through the `BitWriter`'s partial-bit accumulator. The

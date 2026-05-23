@@ -1564,36 +1564,66 @@ fn encode_sequences(
     writer.write_bits(ml_add_bits, ml_num_bits);
     writer.write_bits(of_add_bits, of_num_bits);
 
-    // encode backwards so the decoder reads the first sequence first
+    // Donor-faithful sequence loop: write state diffs + extras via
+    // unchecked fast-path adds with explicit `flush_bulk` calls at
+    // safe burst boundaries. Per-sequence bit budget:
+    //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits → one
+    //                burst between flushes.
+    //   extras:      ll (<=16) + ml (<=16) + of (<=24) = 56 bits →
+    //                one burst between flushes.
+    //
+    // Total per sequence: 82 bits ⇒ at least 2 flushes (one per burst).
+    // Mirrors donor `ZSTD_encodeSequences_body`
+    // (`zstd_compress_sequences.c:303-360`) which uses BIT_addBitsFast
+    // + BIT_flushBitsFast at the same burst boundaries.
+    //
+    // Pre-reserve output capacity for the worst-case sequence section
+    // size (~10 bytes/sequence + 32 byte slack) so the per-flush
+    // `extend_from_slice` never triggers a Vec realloc.
     if sequences.len() > 1 {
+        writer.reserve_output(sequences.len() * 12 + 64);
+        // Pre-loop flush: the safe `write_bits` calls above for the
+        // final sequence's add_bits leave `bits_in_partial` in
+        // 0..=63. Before the first unchecked-add burst we drain to
+        // < 8 leftover so the per-burst budget math (state diffs ≤
+        // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
+        writer.flush_bulk();
         for sequence in (0..=sequences.len() - 2).rev() {
             let sequence = sequences[sequence];
             let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
             let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
+            // State diffs burst: max 30 bits (10+10+9 worst case for
+            // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
+            // prior flush = ≤ 37 bits total — well under 64.
             if let (Some(table), Some(state)) = (of_table, of_state) {
                 let next = table.next_state(of_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 of_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ml_table, ml_state) {
                 let next = table.next_state(ml_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 ml_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ll_table, ll_state) {
                 let next = table.next_state(ll_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
+                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 ll_state = Some(next);
             }
+            writer.flush_bulk();
 
-            writer.write_bits(ll_add_bits, ll_num_bits);
-            writer.write_bits(ml_add_bits, ml_num_bits);
-            writer.write_bits(of_add_bits, of_num_bits);
+            // Extras burst: max 16+16+24 = 56 bits + ≤ 7 leftover =
+            // 63 bits, just under 64. Order matches donor's
+            // ZSTD_encodeSequences_body: ll first, ml second, of last.
+            writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
+            writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+            writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
+            writer.flush_bulk();
         }
     }
     if let (Some(state), Some(table)) = (ml_state, ml_table) {
