@@ -87,6 +87,14 @@ pub(crate) struct HufCStream<'a> {
     /// flushes skip the check; `FAST=false` clamps `cursor = end_ptr`
     /// on overflow (donor's `if (!kFast && ptr > endPtr) ptr = endPtr`).
     end_ptr: usize,
+    /// Set to `true` by `flush_bits::<false>` when the clamp at
+    /// `cursor > end_ptr` actually fires. `close()` uses this flag to
+    /// emit donor's overflow result (return 0). Without it, the clamp
+    /// would mask overflow: post-clamp `cursor == end_ptr`, so a
+    /// `cursor >= end_ptr + 8` post-flush check could never fire, and
+    /// an undersized `dst_capacity` would silently succeed with a
+    /// truncated stream.
+    overflow: bool,
 }
 
 impl<'a> HufCStream<'a> {
@@ -116,6 +124,7 @@ impl<'a> HufCStream<'a> {
             start_idx,
             cursor: start_idx,
             end_ptr: start_idx + dst_capacity - 8,
+            overflow: false,
         })
     }
 
@@ -200,6 +209,7 @@ impl<'a> HufCStream<'a> {
         self.cursor += nb_bytes;
         if !FAST && self.cursor > self.end_ptr {
             self.cursor = self.end_ptr;
+            self.overflow = true;
         }
     }
 
@@ -221,11 +231,16 @@ impl<'a> HufCStream<'a> {
         self.add_bits::<false>(end_mark, 0);
         self.flush_bits::<false>();
         let nb_bits = self.pending_bits();
-        if self.cursor >= self.end_ptr + 8 {
-            // Overflow — donor returns 0. `start_idx == output.len()`
-            // pre-construction (no `resize` was done; we wrote into
-            // spare capacity), so no truncate is needed — the Vec's
-            // logical length is already correct.
+        if self.overflow {
+            // Overflow — donor returns 0. The clamp in
+            // `flush_bits::<false>` already capped `cursor` at
+            // `end_ptr`, so a post-flush `cursor >= end_ptr + 8`
+            // check would never fire — we rely on the explicit
+            // `overflow` flag set at the moment of the clamp.
+            // `start_idx == output.len()` pre-construction (no
+            // `resize` was done; we wrote into spare capacity), so
+            // no truncate is needed — the Vec's logical length is
+            // already correct.
             return 0;
         }
         // Total bytes: full bytes flushed + (1 byte for trailing partial bits).

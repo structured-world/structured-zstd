@@ -1601,29 +1601,43 @@ fn encode_sequences(
             // State diffs burst: max 30 bits (10+10+9 worst case for
             // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
             // prior flush = ≤ 37 bits total — well under 64.
+            //
+            // SAFETY (for every `write_bits_64_no_check` below):
+            // - the prior `flush_bulk` left `bits_in_partial ≤ 7`;
+            // - each FSE state diff has `next.num_bits ≤ acc_log ≤ 10`;
+            //   three diffs back-to-back add ≤ 30 bits → total ≤ 37,
+            //   well below the 64-bit accumulator cap.
+            // - `diff = state.index - next.baseline` cannot exceed
+            //   `(1 << num_bits) - 1`, so `diff >> num_bits == 0`.
+            // `reserve_output(sequences.len() * 12 + 64)` above
+            // pre-allocated enough spare capacity to cover every
+            // per-sequence flush in this loop (≤ 16 bytes per
+            // sequence, plus the 32-byte slack on top of the 64-byte
+            // header reserve).
             if let (Some(table), Some(state)) = (of_table, of_state) {
                 let next = table.next_state(of_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 of_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ml_table, ml_state) {
                 let next = table.next_state(ml_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 ml_state = Some(next);
             }
             if let (Some(table), Some(state)) = (ll_table, ll_state) {
                 let next = table.next_state(ll_code, state.index);
                 let diff = state.index - next.baseline;
-                writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                unsafe {
+                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
                 ll_state = Some(next);
             }
-            // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
-            // pre-allocated enough spare capacity to cover every
-            // per-sequence flush in this loop (≤ 16 bytes per
-            // sequence, plus the 32-byte slack on top of the 64-byte
-            // header reserve).
             unsafe {
                 writer.flush_bulk();
             }
@@ -1638,25 +1652,25 @@ fn encode_sequences(
             // donor's `MEM_32bits()` flush-between-each-component
             // shape on the 32-bit build (which has the same 64-bit
             // container constraint).
-            writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
-            writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+            //
+            // SAFETY: `encode_literal_length` / `encode_match_len`
+            // bound `*_num_bits ≤ 16` and return a clean `*_add_bits`
+            // (low `num_bits` bits only). `encode_offset` bounds
+            // `of_num_bits ≤ ilog2(of)`, capped at the encoder's
+            // `window_log` ≤ 30; the conditional flush_bulk above
+            // drains the partial when of_num_bits crosses the 24-bit
+            // threshold where the sum could exceed 64.
+            unsafe {
+                writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
+                writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+            }
             if of_num_bits > 24 {
-                // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
-                // pre-allocated enough spare capacity to cover every
-                // per-sequence flush in this loop (≤ 16 bytes per
-                // sequence, plus the 32-byte slack on top of the 64-byte
-                // header reserve).
                 unsafe {
                     writer.flush_bulk();
                 }
             }
-            writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
-            // SAFETY: `reserve_output(sequences.len() * 12 + 64)` above
-            // pre-allocated enough spare capacity to cover every
-            // per-sequence flush in this loop (≤ 16 bytes per
-            // sequence, plus the 32-byte slack on top of the 64-byte
-            // header reserve).
             unsafe {
+                writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
                 writer.flush_bulk();
             }
         }

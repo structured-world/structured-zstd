@@ -987,7 +987,12 @@ mod tests {
                 data,
                 0,
                 PrefixBounds {
-                    prefix_start_index: 0,
+                    // Match production contract:
+                    // `prefix_start_index >= 1` rejects the hash table
+                    // empty-slot value `0` so a fresh-table probe
+                    // cannot be mistaken for a position-0 match (the
+                    // sentinel-1 floor documented on FastKernelMatcher).
+                    prefix_start_index: 1,
                     window_low: 0,
                 },
                 &mut table,
@@ -999,7 +1004,12 @@ mod tests {
                 data,
                 0,
                 PrefixBounds {
-                    prefix_start_index: 0,
+                    // Match production contract:
+                    // `prefix_start_index >= 1` rejects the hash table
+                    // empty-slot value `0` so a fresh-table probe
+                    // cannot be mistaken for a position-0 match (the
+                    // sentinel-1 floor documented on FastKernelMatcher).
+                    prefix_start_index: 1,
                     window_low: 0,
                 },
                 &mut table,
@@ -1090,7 +1100,10 @@ mod tests {
             data,
             0,
             PrefixBounds {
-                prefix_start_index: 0,
+                // Match production contract:
+                // `prefix_start_index >= 1` rejects the hash table
+                // empty-slot value `0`.
+                prefix_start_index: 1,
                 window_low: 0,
             },
             &mut table,
@@ -1411,7 +1424,10 @@ mod tests {
             &data,
             0,
             PrefixBounds {
-                prefix_start_index: 0,
+                // Match production contract:
+                // `prefix_start_index >= 1` rejects the hash table
+                // empty-slot value `0`.
+                prefix_start_index: 1,
                 window_low: 0,
             },
             &mut table,
@@ -1465,7 +1481,10 @@ mod tests {
                     &data,
                     0,
                     PrefixBounds {
-                        prefix_start_index: 0,
+                        // Match production contract:
+                        // `prefix_start_index >= 1` rejects the hash
+                        // table empty-slot value `0`.
+                        prefix_start_index: 1,
                         window_low: 0,
                     },
                     &mut table,
@@ -1478,7 +1497,10 @@ mod tests {
                     &data,
                     0,
                     PrefixBounds {
-                        prefix_start_index: 0,
+                        // Match production contract:
+                        // `prefix_start_index >= 1` rejects the hash
+                        // table empty-slot value `0`.
+                        prefix_start_index: 1,
                         window_low: 0,
                     },
                     &mut table,

@@ -122,10 +122,26 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     }
 
     /// Donor `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
-    /// `bits` into the bottom of `partial`, no overflow check. Caller
-    /// guarantees `num_bits + bits_in_partial <= 64` (no overflow) AND
-    /// `bits >> num_bits == 0` (value is "clean" — no junk in high
-    /// bits that would corrupt the packed stream).
+    /// `bits` into the bottom of `partial`, no overflow check.
+    ///
+    /// # Safety
+    ///
+    /// Caller MUST guarantee BOTH preconditions BEFORE calling:
+    ///
+    /// 1. `num_bits + bits_in_partial <= 64` — accumulator must not
+    ///    overflow. A violation triggers `<< num_bits` shift overflow
+    ///    (undefined in Rust for shift ≥ 64) and corrupts the bit
+    ///    stream silently.
+    /// 2. `num_bits == 64 || bits >> num_bits == 0` — value must be
+    ///    clean of high junk past `num_bits`. Dirty high bits leak
+    ///    into the packed stream at the next OR.
+    ///
+    /// The `debug_assert!`s below catch both in test/debug builds but
+    /// do NOT survive `cargo build --release`, hence the `unsafe`
+    /// signature. The function does not perform any memory-unsafe
+    /// operation, but a violation produces a silently-corrupted
+    /// output stream that decoders cannot recover — equivalent in
+    /// blast radius to undefined behaviour for the consumer.
     ///
     /// Used by the donor-faithful FSE sequence encoder which knows its
     /// per-sequence bit budget at compile time and inserts explicit
@@ -133,7 +149,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// per-call branch + spill that `write_bits_64`'s overflow check
     /// pays.
     #[inline(always)]
-    pub fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
+    pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
         debug_assert!(
             num_bits + self.bits_in_partial <= 64,
             "write_bits_64_no_check would overflow partial: would push to {} bits",
@@ -220,9 +236,13 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let result = f(self.output.as_mut());
         let new_len = self.output.as_mut().len();
         // Closure may only APPEND bytes (HufCStream's contract).
-        // Detect accidental truncation early — that would corrupt
-        // bit_idx into a phantom future bit.
-        debug_assert!(new_len >= prev_len, "closure must not shrink output");
+        // Promoted to `assert!` (release-active) — a shrink here
+        // would underflow `(new_len - prev_len) * 8` in release
+        // and corrupt `bit_idx` into a phantom future bit, which
+        // propagates silently through downstream `change_bits`
+        // callers. This is a correctness invariant, not a debug
+        // aid.
+        assert!(new_len >= prev_len, "closure must not shrink output");
         self.bit_idx += (new_len - prev_len) * 8;
         result
     }
