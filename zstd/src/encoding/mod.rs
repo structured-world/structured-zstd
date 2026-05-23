@@ -80,7 +80,7 @@ pub(crate) mod row;
 pub(crate) mod simple;
 pub(crate) mod strategy;
 
-mod frame_compressor;
+pub(crate) mod frame_compressor;
 mod levels;
 #[cfg(feature = "bench_internals")]
 pub mod sequence_capture;

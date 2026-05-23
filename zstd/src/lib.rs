@@ -102,4 +102,23 @@ pub mod testing {
         // Keep decoder internals crate-private and expose only this bench shim.
         unsafe { crate::decoding::copy_bytes_overshooting_for_bench(src, dst, copy_at_least) };
     }
+
+    /// Maximum block size per RFC 8878 §3.1.1.2.3 (128 KiB).
+    /// Exposed for parity tests that feed exactly-one-block chunks
+    /// into the donor splitter comparator.
+    pub const MAX_BLOCK_SIZE: u32 = crate::common::MAX_BLOCK_SIZE;
+
+    /// Run our donor-port block splitter on a 128 KB chunk.
+    ///
+    /// `split_level` mirrors donor `ZSTD_splitBlock(level)`: `0` selects
+    /// the borders heuristic (`ZSTD_splitBlock_fromBorders`), `1..=4`
+    /// select `ZSTD_splitBlock_byChunks` at the corresponding sampling
+    /// level. Returns the split position (or `block.len()` if no split).
+    ///
+    /// Crate-internal facade for the donor-parity comparator test —
+    /// the underlying functions stay `fn` so they don't widen the
+    /// stable API surface.
+    pub fn block_splitter_decision(block: &[u8], split_level: usize) -> usize {
+        crate::encoding::frame_compressor::block_splitter_decision_for_bench(block, split_level)
+    }
 }

@@ -121,3 +121,7 @@ harness = false
 name = "wildcopy_candidates"
 harness = false
 required-features = ["bench_internals"]
+
+[[test]]
+name = "block_splitter_donor_parity"
+required-features = ["bench_internals"]
