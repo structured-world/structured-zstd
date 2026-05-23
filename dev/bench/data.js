@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779566757359,
+  "lastUpdate": 1779574899182,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -44373,6 +44373,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.321,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a33a201ab39a0ce3b9b1a3334276b7150f5a5791",
+          "message": "perf(encoder): align lazy-band target_len with donor clevels.h table[0] (#239)\n\n* test(encoder): add regression test pinning lazy-band target_len to donor\n\nDonor cParams.targetLength is the lazy outer loop's sufficient_len\nthreshold — the \"nice match\" length that breaks the chain walk as\nsoon as a candidate reaches it. Our LEVEL_TABLE assigns target_len\nvalues 3-16x larger than donor's clevels.h table[0] across the lazy\nband (L5..=L15):\n\n  Level | Donor TL | Ours\n  ------|----------|-----\n  L5    | 2        | 32   (16x)\n  L6    | 4        | 48   (12x)\n  L7    | 8        | 48   (6x)\n  L8    | 16       | 64   (4x)\n  L9    | 16       | 64   (4x)\n  L10   | 16       | 96   (6x)\n  L11   | 16       | 128  (8x — via BEST_HC_CONFIG)\n  L12   | 32       | 128  (4x)\n  L13   | 32       | 160  (5x)\n  L14   | 32       | 192  (6x)\n  L15   | 32       | 192  (6x)\n\nThe chain walk burns through search_depth steps because the\nmatch_len >= target_len early-exit fires far less often than donor's\nequivalent gate. This is one of the documented Phase 2 root causes\nof the 5-9x speed regression vs FFI on the lazy band (see #184 L4\nsubtask).\n\nTest queries donor cParams via ZSTD_getCParams(level, 0, 0) — using\nsrcSize=0 selects donor's table[0] (default for srcSize > 256 KB),\nmatching our single-table LEVEL_TABLE shape. Any future donor-table\ntweak in upstream zstd will surface here automatically.\n\nCurrently FAILS at L5 (first iteration). Fix in the next commit.\n\nPart of #184 (L4 subtask — nice_match early-exit parity).\n\n* perf(encoder): align lazy-band target_len with donor clevels.h table[0]\n\nDrop the inflated target_len column for L5..=L15 so the chain walk's\nmatch_len >= target_len early-exit fires at donor-equivalent depth.\nDonor cParams.targetLength is the lazy outer loop's sufficient_len\n(nice-match) threshold — once a candidate reaches it, donor breaks\nthe chain walk and commits. We were running through search_depth\niterations on inputs that would have committed early under donor,\nwhich is the dominant cost of the L5..=L15 speed regression.\n\nChanges (matching donor clevels.h table[0] — default for\nsrcSize > 256 KB, matching our single-table LEVEL_TABLE shape):\n\n  Level | Was  | Now\n  ------|------|----\n  L5    | 32   | 2\n  L6    | 48   | 4\n  L7    | 48   | 8\n  L8    | 64   | 16\n  L9    | 64   | 16\n  L10   | 96   | 16\n  L11   | 128  | 16   (was via BEST_HC_CONFIG; inlined)\n  L12   | 128  | 32\n  L13   | 160  | 32\n  L14   | 192  | 32\n  L15   | 192  | 32\n\nL11 was the only consumer of BEST_HC_CONFIG; inline at the call site\nand drop the now-unused const. Other lazy-band entries already had\nexplicit HcConfig literals — only the target_len column changed,\nsearch_depth/hash_log/chain_log untouched (search_depth alignment\nis a follow-up subtask).\n\nRatio gates: no test failures across the 576-test suite, including\nthe ratio-validating cross-corpus proxies\n(level22_sequences_match_donor_on_corpus_proxy and the L0..=22\nroundtrip suites). Lazy band's pre-fix ratio advantage came from\nmatching past donor's targetLength; with the threshold now aligned\nwe will track donor more closely (still strictly correct and\nwire-compatible — drop-in semantics preserved).\n\nSpeed: target restored to donor parity envelope (L8 lazy ×\ndecodecorpus-z000033 was 0.11× of FFI under the inflated thresholds\nper #184 Phase 1 numbers); follow-up bench on i9-9900K will pin the\nexact uplift.\n\nPart of #184 (L4 subtask — nice_match early-exit parity).",
+          "timestamp": "2026-05-24T00:15:20+03:00",
+          "tree_id": "05d9aa93bb6909505266706f04d15b3b8aeabd8f",
+          "url": "https://github.com/structured-world/structured-zstd/commit/a33a201ab39a0ce3b9b1a3334276b7150f5a5791"
+        },
+        "date": 1779574892512,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.141,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 289.025,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 244.34,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.54,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.382,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.695,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.039,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.667,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.981,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.819,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.286,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.094,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.171,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.059,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.317,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.317,
             "unit": "ms"
           },
           {
