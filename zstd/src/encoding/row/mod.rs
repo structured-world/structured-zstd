@@ -145,23 +145,70 @@ impl RowMatchGenerator {
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
         }
-        if incompressible_hint == Some(true) {
-            self.insert_positions_with_step(
-                current_abs_start,
-                current_abs_end,
-                INCOMPRESSIBLE_SKIP_STEP,
-            );
-            let dense_tail = ROW_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
-            let tail_start = current_abs_end
-                .saturating_sub(dense_tail)
-                .max(current_abs_start);
-            for pos in tail_start..current_abs_end {
-                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                    self.insert_position(pos);
+        match incompressible_hint {
+            Some(true) => {
+                // Sparse step + dense tail: caller declared the block
+                // unlikely to compress, so we seed only every
+                // `INCOMPRESSIBLE_SKIP_STEP` position plus a small tail to
+                // keep cross-block continuity at the boundary.
+                self.insert_positions_with_step(
+                    current_abs_start,
+                    current_abs_end,
+                    INCOMPRESSIBLE_SKIP_STEP,
+                );
+                let dense_tail = ROW_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
+                let tail_start = current_abs_end
+                    .saturating_sub(dense_tail)
+                    .max(current_abs_start);
+                for pos in tail_start..current_abs_end {
+                    if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
+                        self.insert_position(pos);
+                    }
                 }
             }
-        } else {
-            self.insert_positions(current_abs_start, current_abs_end);
+            Some(false) => {
+                // Dense seeding requested by the caller: the entire
+                // skipped range must remain queryable so subsequent
+                // blocks can match into it. Currently only used by the
+                // dictionary-priming path (donor's
+                // `ZSTD_loadDictionaryContent` does the same dense fill
+                // via `ZSTD_row_update_internalImpl` over every dict
+                // byte), but the semantic is "dense fill on demand" and
+                // future fast-paths (e.g. an RLE / raw-block emitter
+                // that still wants cross-block matches into the skipped
+                // bytes) can reuse it without rewording the contract.
+                self.insert_positions(current_abs_start, current_abs_end);
+            }
+            None => {
+                // Donor parity: a plain `skip_matching` (no hint) leaves
+                // the row table untouched for the skipped range. Donor's
+                // `ZSTD_row_fillHashCache` only pre-fills the next-scan
+                // cache (8 positions of lookahead for SIMD prefetch); it
+                // does NOT retroactively insert every byte of a skipped
+                // block.
+                //
+                // Boundary handling: the `backfill_start` insert above
+                // covers the `ROW_HASH_KEY_LEN - 1` bytes immediately
+                // BEFORE `current_abs_start` (i.e. the previous block's
+                // tail), keeping the current block's start hashable as
+                // a cross-block match target. The CURRENT skipped
+                // block's tail (the `ROW_HASH_KEY_LEN - 1` bytes ending
+                // at `current_abs_end`) is itself backfilled lazily —
+                // by the NEXT call's own `backfill_start` insert when
+                // that call's `current_abs_start` lands at
+                // `current_abs_end`. So a parse of block N+1 sees
+                // block N's tail in the row table but not its
+                // interior, matching donor.
+                //
+                // Trade: cross-block matches into a skipped block's
+                // interior are lost (rare in practice — `skip_matching`
+                // is called on blocks the driver upstream identified as
+                // not worth scanning), but the per-block O(block_size)
+                // `insert_position` storm is gone. On the L4 large-log-
+                // stream bench (~104 MB / 800 blocks) the prior dense
+                // fill dominated ~25% of Rust self-time at 131K inserts
+                // per block × 800 = ~104M inserts.
+            }
         }
     }
 
