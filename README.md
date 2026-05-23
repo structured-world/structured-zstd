@@ -58,17 +58,17 @@ Behind the `dict_builder` feature flag, the `dictionary` module can:
 <details>
 <summary>Internal: compression strategy backends</summary>
 
-| Level range | Backend |
-|-------------|---------|
-| 1           | `Simple` matcher |
-| 2-3         | `Dfast` |
-| 4           | `Row` matcher |
-| 5-15        | `HashChain` with lazy / lazy2 tuning |
+| Level range | Strategy | Backend |
+|-------------|----------|---------|
+| 1-2         | `Fast`   | `Simple` matcher |
+| 3-4         | `Dfast`  | `Dfast` two-tier hash |
+| 5           | `Greedy` | `Row` matcher (`lazy_depth=0`) |
+| 6-15        | `Lazy` / `Lazy2` | `HashChain` with `lazy_depth=1` or `2` |
 | 16-17       | `btopt`-style price parser on top of hash-chain candidates |
 | 18-19       | `btultra`-style price parser profile |
 | 20-22       | `btultra2`-style dual-profile pass (choose lower-cost parse) |
 
-The `greedy` family is not implemented as a dedicated strategy yet — its target ratios are covered by adjacent levels.
+The level → strategy column matches donor `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier). Donor routes `greedy`/`lazy`/`lazy2` through its row-based matchfinder when `windowLog > 14`; we route `Greedy` through the row matcher (matches donor) but `Lazy`/`Lazy2` through the hash-chain matcher — an intentional architectural difference, not an oversight.
 
 </details>
 
