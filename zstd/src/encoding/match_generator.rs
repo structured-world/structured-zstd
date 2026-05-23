@@ -7810,6 +7810,72 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
 }
 
+/// Mirror of [`dfast_inserts_tail_positions_for_next_block_matching`] for
+/// the [`HcMatchGenerator`]: feed two consecutive blocks where the
+/// second block's prefix repeats the first block's tail and assert the
+/// first sequence emitted on the second block is a tail-anchored
+/// cross-block match (no leading literals). Drives the
+/// `start_matching_lazy` arm via the default `Lazy`
+/// `strategy_tag`. The cross-block match is only reachable when
+/// `MatchTable::backfill_boundary_positions` correctly seeded the
+/// previous block's `[chain_log .. block_end)` tail into the hash +
+/// chain tables — without that seeding the `HcMatchGenerator` would
+/// hash only the new block's positions and miss the tail-anchored
+/// match, falling back to a leading literals run.
+///
+/// Regression for #49 — the existing 8 MiB window roundtrip test
+/// exercises cross-slice behaviour end-to-end, but a targeted unit
+/// test more precisely catches boundary-anchor losses in
+/// `HcMatchGenerator`.
+#[test]
+fn hashchain_inserts_tail_positions_for_next_block_matching() {
+    let mut matcher = HcMatchGenerator::new(1 << 22);
+    matcher.configure(HC_CONFIG, super::strategy::StrategyTag::Lazy, 22);
+
+    matcher.table.add_data(b"012345bcdea".to_vec(), |_| {});
+    let mut history = alloc::vec::Vec::new();
+    matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => history.extend_from_slice(literals),
+        Sequence::Triple { .. } => unreachable!("first block should not match history"),
+    });
+    assert_eq!(history, b"012345bcdea");
+
+    matcher.table.add_data(b"bcdeabcdeab".to_vec(), |_| {});
+    let mut saw_first_sequence = false;
+    matcher.start_matching(|seq| {
+        if saw_first_sequence {
+            return;
+        }
+        saw_first_sequence = true;
+        match seq {
+            Sequence::Literals { .. } => {
+                panic!("expected tail-anchored cross-block match before any literals")
+            }
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                assert_eq!(literals, b"", "no leading literals on the boundary match");
+                assert_eq!(
+                    offset, 5,
+                    "boundary match must reach back into the previous block's `bcdea` tail \
+                     (5 bytes back from block-2 start)"
+                );
+                assert!(
+                    match_len >= HC_MIN_MATCH_LEN,
+                    "match_len {match_len} must clear the HC min-match floor"
+                );
+            }
+        }
+    });
+
+    assert!(
+        saw_first_sequence,
+        "expected tail-anchored cross-block match emitted from `backfill_boundary_positions`"
+    );
+}
+
 #[test]
 fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
     let mut matcher = DfastMatchGenerator::new(1 << 22);
