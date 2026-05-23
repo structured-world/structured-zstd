@@ -355,6 +355,31 @@ fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
     }
 }
 
+/// Bench-only entry point for the donor-parity comparator test in
+/// `tests/block_splitter_donor_parity.rs`. Dispatches to the same
+/// `_from_borders` (split_level == 0) / `_by_chunks` (split_level ∈
+/// 1..=4) ports that `donor_optimal_block_size` itself routes
+/// through. Caller is responsible for passing exactly
+/// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
+/// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
+#[cfg(any(test, feature = "bench_internals"))]
+pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
+    assert_eq!(
+        block.len(),
+        MAX_BLOCK_SIZE as usize,
+        "block_splitter_decision_for_bench expects exactly MAX_BLOCK_SIZE bytes"
+    );
+    assert!(
+        split_level <= 4,
+        "block_splitter_decision_for_bench: split_level must be in 0..=4, got {split_level}"
+    );
+    if split_level == 0 {
+        donor_split_block_from_borders(block)
+    } else {
+        donor_split_block_by_chunks(block, split_level)
+    }
+}
+
 pub(crate) fn donor_optimal_block_size(
     level: CompressionLevel,
     block: &[u8],
