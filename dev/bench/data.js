@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779563972121,
+  "lastUpdate": 1779566757359,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -44174,6 +44174,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "34ae28bb3586257a66f1459023cedc2c3ed4bc41",
+          "message": "perf(fast): donor-parity hot-path cleanups in Fast kernel + inline short-literal append (#220 follow-up) (#231)\n\n* perf(fast_kernel): strip defensive bounds checks from match_found hot path (donor parity)\n\nL1 Fast on decodecorpus-z000033 throughput was ~153 MiB/s vs donor's\n~351 MiB/s (2.3× slower) — far beyond cParams/algorithm differences\ncould explain. Root cause: `match_found` carried TWO defensive\nbounds checks the donor doesn't have:\n\n  if match_pos + 4 > data_len { return false; }\n  if match_pos >= ip_pos     { return false; }\n\nBoth are redundant under the kernel's own invariants:\n\n1. Hash table entries are only written for positions VISITED by the\n   scan, which by construction stay strictly below `ilimit =\n   data_len - HASH_READ_SIZE = data_len - 8`. So any in-window\n   `match_idx >= prefix_start_index` satisfies `match_pos + 4 <\n   data_len` automatically. The `prefix_start_index >= 1` rule at\n   the matcher boundary handles the stale-zero initial entry.\n\n2. Hash writes happen BEFORE probes inside the do-while body (line\n   `hashTable[hash0] = current0` precedes `matchFound(...)`), and\n   `current0 < ip0_now` by induction across shift steps. So\n   `matchIdx` is always < `ip_pos` for entries written by this\n   scan.\n\n`match_found` is invoked TWICE per inner-loop iteration (probe at\nip0, probe at shifted ip0), so the savings compound: ~4 branches\nper iter dropped on a 1MB scan = millions of mispredict-prone\nbranches eliminated.\n\nBonus side change: pre-load `rval` unconditionally — donor's\n`MEM_read32(ip2 - rep_offset1)` always reads (with rep_offset1=0\n`ip2 - 0 = ip2` is safe), no `rep_offset1 > 0` guard around the\nload. Removes one more branch from the inner loop.\n\nAdded a `debug_assert!(match_pos < new_ip)` at the explicit-match\nemit site to surface invariant violations in test/fuzz builds\nwithout paying for them in release.\n\nThe previous engineered test `match_found_rejects_stale_forward_entry`\nmanually constructed a forward-pointing stale entry that the\ndefensive check rejected; that test exercised behaviour we're now\ndefining as caller responsibility. Replaced with\n`match_found_rejects_stale_entry_below_prefix_floor` covering the\nremaining prefix-floor filter, which IS still active and IS the\ndonor-parity defensive contract.\n\n* perf(encode): inline short-literal append in collect_block_parts (bypass libc memmove)\n\nFlamegraph on `compress/level_1_fast/decodecorpus.*pure_rust`\nshowed `__memmove_avx_unaligned_erms` at 60 % of bench CPU, with\nthe actual `compress_block_fast` body at only 0.07 %. The chain:\n\n  start_matching → handle_sequence (collect_block_parts closure)\n    → parts.literals.extend_from_slice(literals)\n    → ptr::copy_nonoverlapping (runtime size)\n    → libc memmove\n\nEach emitted Sequence::Triple from the Fast kernel triggered one\nlibc memcpy of 1-10 bytes (typical Fast L1 literal run). With\nthousands of sequences per block × 8 blocks per bench iter, the\nper-call libc overhead dominated the hot path. Donor C zstd uses\ninline `ZSTD_copy16` (single SIMD store, ~5 cycles) for the same\noperation in `ZSTD_storeSeq → ZSTD_safecopyLiterals`.\n\nRoute literal appends through a new `append_literals` helper that\nforwards to `simd_copy::copy_bytes_overshooting` for slices ≤ 32\nbytes. That function has a byte-by-byte / overlapping-u64 exact-\nlength tail path that LLVM fully inlines for short runtime sizes —\nno libc call. Longer runs (> 32 bytes, rare on Fast L1) keep\n`extend_from_slice`; libc memmove amortises across the longer\ncopy.\n\n`simd_copy` module visibility bumped from `mod` to `pub(crate) mod`\nso the encode side can reach it (same crate, no external surface\nchange).\n\n* docs(fast_matcher): expand INITIAL_PREFIX_START_INDEX rationale with prefix=0 ablation\n\nTested lowering the sentinel to 0 (donor-parity move — donor uses\nprefixStartIndex=0 plus the kernel's ip0+=(ip0==prefixStart) bump\nto skip position 0). The test\n`skip_matching_with_none_hint_skips_hash_population` enforces a\ncross-block-isolation contract that depends on the sentinel-0\nfilter — lowering it to 0 lets stale empty-slot lookups (match_idx\n= 0 in the all-zero hash table) probe position 0 and emit\nspurious cross-block matches.\n\nThe position-0 emit rate is too small to be worth breaking that\ncontract — the L1 ratio gap on decodecorpus is dominated by\nsomething else (5716 ffi_only sequences in block 0 alone — far\nmore than the few position-0 emits a donor-parity prefix would\nadd).\n\nDocument the tested-and-rejected lower bound so future hands don't\nrepeat the ablation without checking the skip_matching contract\ntest first.\n\n* perf(fast_kernel): preserve default rep_offset1 at block 0 via window_low\n\nDonor `ZSTD_compressBlock_fast_noDict_generic` computes the prologue\n`maxRep` against `windowLow` (the absolute floor of in-window positions,\n= 0 at block 0). Our prologue used `prefix_start_index` (the sentinel-1\nfloor for FastHashTable's all-zero empty-slot filter), giving `max_rep\n= ip0 - 1 = 0` at the first iteration with ip0=1 — so the default\n`rep_offset1 = 1` was stashed into `offset_saved1` and the rep-at-ip2\nprobe was DISABLED for the entire first block.\n\nCascade on real corpora: every iteration in block 0 missed the donor's\n1-byte rep probe (`read32(ip2) == read32(ip2 - 1)`), which fires on any\nlocal 5-byte run. The kernel's cursor advanced via explicit-match\nshifts only, populating the hash table at different positions than\ndonor; later explicit matches in the same block then ALSO diverged.\n\nOn decodecorpus-z000033 Level(1) `compare_ffi_sequences` reported\ndonor finding 36 short-distance matches (offsets 50-1800 bytes) in\nthe first ~5 KB of block 0 that we missed entirely. Code reading on\nall other hot-path divergence candidates (hash primes, step doubling,\nprobe order, cmov vs branch, min_gain) showed bit-for-bit donor\nparity. The prologue divergence was the root cause.\n\nFix: thread `window_low` (= `history.len().saturating_sub(advertised_\nwindow)`) into `compress_block_fast` alongside `prefix_start_index`.\nThe two coincide for all blocks where `window_low >= 1`; they differ\nonly at block 0 / pre-eviction blocks where the sentinel-1 floor\ninflates the hash-filter bound without donor justification.\n\n- `prefix_start_index` continues to drive `match_found`'s hash-filter\n  predicate (`match_idx >= prefix_start_index`), sentinel-aware so\n  uninitialized FastHashTable slots holding 0 are rejected.\n- `window_low` drives the prologue `max_rep` AND the backward-\n  extension `match_pos > X` bound for both rep and explicit paths\n  (donor expresses these against `prefixStart` directly).\n\nIncludes regression test `block_zero_prologue_preserves_default_rep_\noffset_one` documenting the contract via a uniform-byte fixture (the\nemit's offset must be 1, matching donor's rep-at-ip2 hit at iter 1).\nThe first-emit literal-prefix length is NOT asserted — slot\ncollisions on uniform-byte data let the explicit-match path catch up\nto the same offset=1 emit, so the unit test only documents the\ndirection; the ratio-regression discriminator is the `compare_ffi`\nrun on decodecorpus.\n\nAll 589 structured-zstd tests pass.\n\n* feat(fast_kernel): add kernel_trace feature for #220 ratio-gap investigation\n\nAdds the `kernel_trace` Cargo feature plus two example binaries to\ndiagnose the Level(1) Fast strategy ratio divergence on\ndecodecorpus-z000033 (issue #220, +7.43% vs C zstd).\n\nFeature is compile-time gated (production builds carry ZERO cost — the\nktrace! macro expands to a no-op when feature is off). Runtime activation\nvia `STRUCTURED_ZSTD_KERNEL_TRACE=1`.\n\nTraces emitted at each inner-loop decision point in\n`compress_block_fast`:\n- OUTER state on outer-loop entry (ip0/ip1/ip2/ip3/step/hashes/match_idx/rep)\n- PUT events for every hash-table writeback with (slot, position, site tag)\n- PROBE1 / PROBE2 events with match_idx at each explicit-match probe\n- MATCH events on every found match (path, ip0, match_idx, offset)\n\nExample `trace_fast_kernel` runs Level(1) on z000033 and dumps trace to\nstderr. Example `donor_cparams_check` queries donor's\n`ZSTD_getCParams(L1, 1MB, 0)` to confirm cParams parity.\n\nFindings from this instrumentation:\n- Our cursor visits positions {1, 3, ..., 33, 36, 39, ..., 1174, 1175,\n  1212, 1213, 1251, 1252, 1291, 1292} in block 0 before the first emit\n- Python simulator using donor's exact `ZSTD_compressBlock_fast_noDict_\n  generic` formula reproduces the same set bit-for-bit\n- Donor cParams query confirms identical `{windowLog=19, mls=7, TL=0}`\n- Yet the FFI comparator reports donor's first block-0 emit at\n  literal_length=1280 — requiring a probe at ip0 ∈ [1280, 1284] which\n  neither our cursor nor the simulator reaches\n\nThis is an open mystery — donor's published source + cParams + step\nformula all predict identical cursor traversal to ours, but the actual\ncompressed output diverges. Resolution requires physically instrumenting\ndonor's `zstd_fast.c` (printf in the inner loop) and re-running with\nidentical input. Captured as a follow-up; the trace machinery here will\nremain in place to speed up that next session.\n\n`compare_ffi_sequences` output stays unchanged (sequence-level diff\nidentical to pre-instrumentation): rust_seqs=23783 ffi_seqs=27763\nmatch=19461 (66.0%) — the ratio gap is unresolved.\n\n* fix(fast_kernel): set kSearchStrength to 8 (donor value)\n\nDonor `kSearchStrength` is defined in `zstd_compress_internal.h:32` as\n`#define kSearchStrength 8`, yielding `kStepIncr = 1 << 7 = 128`. Our\nkernel had `SEARCH_STRENGTH = 6` (K_STEP_INCR = 32), making step\ndoubling fire 4× more often than donor.\n\nTest fixture `start_matching_caps_offsets_at_window_log_not_inflated_max`\nswitched to period-4 dict pattern. The previous period-64 pattern's\nmatch positions {0, 64, 128, 192} all fall below the sliding floor or\nin step-skip gaps under the donor-parity K_STEP_INCR=128, producing\nzero emittable matches.\n\nAdds `donor_compress_z000033` example as a one-shot diagnostic that\ncalls the FFI ZSTD_compress on the same corpus at Level(1), used in\nconjunction with kernel_trace to diff cursor traversal.\n\n* perf(huff0): port donor HUF_CStream dual-container unrolled encoder\n\nDonor's HUF_compress1X uses three optimizations our previous encoder\nmissed entirely (`huf_compress.c:824-1043`):\n\n1. Dual indexed bit container (bitC[0], bitC[1]) — encodes K_UNROLL\n   symbols into stream 0 and another K_UNROLL into stream 1 in\n   parallel, breaking the data dependency chain that a single\n   accumulator imposes. Merges before flush.\n\n2. Top-down bit packing — new bits go into the high bits of the\n   container (`container >>= nb_bits; container |= value_at_top`)\n   instead of bottom-up. Lets `flush_bits` write 8 LE bytes via a\n   single `to_le_bytes` and advance by whole-byte count, keeping\n   leftover < 8 bits at the top for the next flush.\n\n3. Packed HUF_CElt format — one u64 per symbol with nb_bits in the\n   low 8 and value left-shifted to the high (64 - nb_bits) bits. The\n   FAST=true add path reads the u64 once and does shr+or+add without\n   any masks (donor's `HUF_getValueFast(elt) = elt` trick — the\n   dirty low-byte bits land in the already-occupied lower portion\n   that the next shr discards).\n\nThe new `huf_cstream` module implements the donor HUF_CStream_t shape\ndirectly. `HuffmanEncoder::encode4x` is rewritten as a port of\n`HUF_compress4X_usingCTable_internal` + `HUF_compress1X_using\nCTable_internal_body_loop`:\n\n- 6-byte jump table placeholder, patched after each stream.\n- Per-segment: pre-reserve `huf_tight_compress_bound` bytes of slack\n  so the hot loop skips overflow checks; route through\n  `BitWriter::with_aligned_output_mut` (new bridge) so HufCStream\n  writes directly into our backing Vec<u8>.\n- Dispatch on `table_log` to pick `kUnroll` matching donor's 64-bit\n  branch (`huf_compress.c:1092-1110`): 11→5/0/F, 10→5/1/T, 9→6/0/F,\n  8→7/0/F, 7→8/0/F, default→4/0/F. Each instantiation keeps\n  `kUnroll * max_nb_bits + 4 <= 64` (donor's \"≥4 free bits\"\n  precondition for `kFast=1`).\n\nHuffmanTable gains `packed_codes: Vec<u64>` (built in lockstep with\nthe existing `(value, nb_bits)` tuples) and `table_log: u32` for the\ndispatch.\n\nAll 592 tests pass (unit + cross-validation roundtrip + FFI\ncompatibility). Bench pending.\n\n* perf(encoding): single-pass histogram for FSE table selection\n\nReplace three sequential sequences.iter().map(...) chains in\ncompress_literals_and_sequences with a single forward loop counting\nll/ml/of code histograms in one pass. Add choose_table_from_counts\noverload taking pre-computed [usize; 256] + total directly. The\niterator form (choose_table) is retained for the cost estimator\nwhich operates on iterator-shaped data.\n\nEliminates Map::fold + closure-dispatch overhead profiled at ~5% of\ntotal bench CPU on the L1 Fast compress path. All 592 tests pass.\n\n* perf(fse): donor-faithful unchecked-add fast path in encode_sequences\n\nAdd BitWriter::write_bits_64_no_check (donor BIT_addBitsFast,\nbitstream.h:193-200) and flush_bulk (donor BIT_flushBitsFast,\nbitstream.h:202-214): always-accumulate + 8-byte bulk flush with no\noverflow check, mirroring donor's BIT_CStream primitives.\n\nencode_sequences uses these for the per-sequence hot loop with\nexplicit flush points at burst boundaries matching\nZSTD_encodeSequences_body (zstd_compress_sequences.c:303-360):\n  - State diffs burst: of/ml/ll deltas (max ~30 bits), flush.\n  - Extras burst: ll/ml/of add_bits (max ~56 bits), flush.\n\nPre-loop flush drains the safe-path tail from the final sequence's\nadd_bits writes so the per-burst budget invariant (leftover ≤ 7 +\nburst ≤ 30 or ≤ 56 ≤ 64) holds from the first iteration.\n\nPre-reserves output capacity (sequences.len() * 12 + 64) so the\nper-flush extend_from_slice never triggers Vec realloc.\n\nAll 592 tests pass.\n\n* perf(bit_io): unsafe direct 8-byte ptr write in BitWriter::flush_bulk\n\nVec::extend_from_slice for 0..=7-byte tails dominated FSE flush\ncadence (~54K flushes per L1 fast compress on z000033) — its\nper-call capacity check + memcpy dispatch dwarfs the actual byte\nwrite. Replace with a single ptr::copy_nonoverlapping of the full 8\nbytes from partial.to_le_bytes(), then Vec::set_len with only the\nnb_bytes committed. The remaining (8 - nb_bytes) bytes stay within\ncapacity past len; the next flush_bulk overwrites them. Matches\ndonor MEM_writeLEST cycle-for-cycle.\n\nCaller (reserve_output) ensures capacity >= len + 8 at all flush\nsites.\n\nAll 592 tests pass.\n\n* refactor(fast_kernel): bundle prefix_start_index + window_low into PrefixBounds\n\nClippy lint flagged compress_block_fast at 8/7 args after the window_low\nparameter was added for the issue #220 prologue fix. Bundle the two\nrelated fields into a PrefixBounds { prefix_start_index, window_low }\ncopy-struct so the kernel signature stays within the 7-arg budget\nwhile keeping the donor-parity field names visible at call sites.\n\nAlso drop three needless &counts borrows in choose_table_from_counts\nflagged by clippy::needless_borrow (counts is already &[usize; 256]\nin the function body).\n\nAll 592 tests pass; cargo clippy + fmt clean.\n\n* refactor(levels): align level->strategy mapping with donor clevels.h\n\nDonor `ZSTD_defaultCParameters[0]` (srcSize > 256 KiB tier) at\n`zstd/lib/compress/clevels.h:25-50` assigns:\n\n  L1-2: ZSTD_fast       L3-4: ZSTD_dfast      L5: ZSTD_greedy\n  L6-7: ZSTD_lazy       L8-12: ZSTD_lazy2     L13-15: ZSTD_btlazy2\n\nOur LEVEL_TABLE was shifted by one: L2 was Dfast (donor: Fast), L4\nwas Greedy (donor: Dfast), L5 was Lazy (donor: Greedy). The\nmismatch produced large sequence-stream divergence vs donor on the\ndecodecorpus-z000033 fixture across L2-L12 (all the strategy\nboundaries were misplaced by one level slot).\n\nThis commit only adjusts the strategy_tag column at L2/L3/L4/L5\nplus L2's cparams (W=20/H=16/mls=6 to match donor's L2 Fast). The\nrest of the per-level cparams (window_log, hash_log, mls,\ntarget_len, search_depth) are left at our previous values for L3+\nso the diff stays small and focused on the strategy-routing fix.\nPer-level cparams alignment is a separate follow-up.\n\nWe retain the `Lazy` tag for L6-15 even though donor splits the\nband into lazy / lazy2 / btlazy2; the runtime variance lives in\n`LevelParams.lazy_depth` and the optimal-parser BT toggle, which\nalready cover the relevant donor distinctions.\n\n* fix(encoding): close 4 hot-path safety / correctness gaps\n\n1. **encode_sequences extras burst overflow (Copilot #1):** when\n   `of_num_bits > 24`, the unchecked\n   `ll + ml + of + bits_in_partial` sum exceeded the 64-bit\n   container and corrupted the bit stream (in release builds —\n   debug_assert caught it in test). Donor handles this via\n   `longOffsets` mode; we insert a `flush_bulk()` between the ml\n   and of writes when of_num_bits crosses the threshold. The bug\n   was only reachable on `window_log >= 25`, which our top levels\n   (L13+) allow; a direct regression test would require a 32 MiB+\n   crafted input plus a manual FSE table — left to integration.\n\n2. **BitWriter::flush_bulk safety contract (Copilot #2):** marked\n   `unsafe fn` with explicit Safety section. The function performs\n   an unconditional 8-byte raw store guarded only by\n   `debug_assert!` — in release a missed `reserve_output` produces\n   silent OOB writes. All four call sites updated with explicit\n   SAFETY comments tying the precondition to the local\n   `reserve_output` they own.\n\n3. **HufCStream::close overflow detection (Copilot #3):**\n   `encode4x` now `assert!`s `bytes_written > 0` per segment.\n   Previously a `close()` overflow (mis-sized\n   `huf_tight_compress_bound`) silently emitted a 0-length stream\n   into the jump table, producing an invalid Huffman section that\n   decodes to garbage rather than failing loudly.\n\n4. **HufCStream::new avoids eager memset (Copilot #4):** dropped\n   the `resize(start_idx + dst_capacity, 0)` worst-case zero pass.\n   Hot-path writes now go through raw pointers into spare\n   capacity; `close()` calls `set_len` once the actual byte count\n   is known. For large literal sections this skips a multi-MiB\n   memset per stream.\n\n* fix(encoding): harden 5 unsafe / contract gaps caught on PR\n\n1. HufCStream::close overflow detection: the post-flush\n   `cursor >= end_ptr + 8` check could never fire — `flush_bits<false>`\n   clamps `cursor` at `end_ptr` the instant overflow happens, masking\n   the symptom. Added an explicit `overflow: bool` flag set at the\n   clamp site and consulted in `close`; an undersized `dst_capacity`\n   now returns 0 (donor convention) instead of silently emitting a\n   truncated stream.\n\n2. BitWriter::write_bits_64_no_check is now `unsafe fn` with an\n   explicit Safety section. Two preconditions\n   (`num_bits + bits_in_partial <= 64` and `bits >> num_bits == 0`)\n   are caller invariants — debug_assert catches them in debug, but\n   release builds would silently corrupt the bitstream (the\n   `<< num_bits` shift overflow is undefined for `num_bits >= 64` in\n   Rust, and dirty high bits leak through the OR). Marking the\n   function unsafe forces every caller to spell out a SAFETY rationale.\n\n3. BitWriter::with_aligned_output_mut: promoted the closure\n   \"must not shrink output\" check from `debug_assert!` to `assert!`.\n   A shrink would underflow `(new_len - prev_len) * 8` in release and\n   corrupt `bit_idx` into a phantom future bit, propagating silently\n   into downstream `change_bits` callers.\n\n4. fast_kernel test helpers: 6 sites passed\n   `PrefixBounds { prefix_start_index: 0, .. }` despite the production\n   matcher pinning that field to ≥ 1 (sentinel-0 floor — rejects the\n   hash table's empty-slot value `0` so a fresh-table probe cannot be\n   mistaken for a position-0 match). Tests now mirror the production\n   contract; spurious matches against `data[0..4]` from uninitialised\n   slots can no longer make fixtures accidentally pass.\n\n5. encode_sequences: 5 call sites of `write_bits_64_no_check` rewrapped\n   in `unsafe { ... }` blocks with localized SAFETY comments tying the\n   precondition to each burst's bit budget (state diffs ≤ 30 + leftover\n   ≤ 7; extras gated by the of_num_bits > 24 conditional flush).\n\nTests: 592 / 592 nextest pass.\n\n* fix(encoding): guard shift-by-64 UB, enforce append_literals reserve\n\n* docs(encoding): align safety + arg docs with current signatures, tighten huf_cstream byte assertion\n\n* docs(encoding): align huf_cstream + huff0 + fast_matcher docs with current behaviour\n\n- HufCStream: doc-comments rewritten — `close` is the finalization\n  API (was `finalize`), and `Vec::len()` stays at the construction-time\n  value through the entire add/flush cycle, only advancing once on\n  `close` via `set_len(start_idx + bytes_written)`. The previous\n  \"in sync after every flush\" wording was inherited from the eager-\n  zero-then-truncate variant and contradicted the spare-capacity\n  raw-write implementation.\n- HufCStream `add_bits_single_symbol_emits_correct_byte` test: removed\n  the stale \"0xB8 / top-5 bits [1011, 1]\" rationale that pre-dated\n  the actual 0x1B / 0b11011 derivation directly below it. The remaining\n  comment block walks the donor-equivalent packing layout correctly.\n- huff0_encoder `encode4x`: clarified the `HufCStream::new` `.expect`\n  message — `new` returns `None` only when `dst_capacity <= 8` (it\n  reserves capacity internally rather than relying on the caller),\n  so the failure mode is \"bound formula returned ≤ 8\", not \"output\n  buffer too small\".\n- fast_matcher `block_zero_prologue_preserves_default_rep_offset_one`:\n  added the missing `first_literals_len == Some(2)` assertion that\n  pins the rep-at-ip2 path exactly. With offset-only the test passes\n  both the fixed AND the buggy paths (slot collision lets explicit-\n  match catch up and emit offset=1 too on uniform-byte data). The\n  literal prefix length is the actual discriminator. Header doc-\n  comment updated to reflect the correct donor emit sequence — rep-\n  at-ip2 lands at ip2=3, then the one-byte backward extension drops\n  new_ip to 2 (literals = `[0x01, 0x42]`, length 2), not 1 as the\n  previous doc claimed.\n\nTests: 594/594 nextest pass.\n\n* fix(bit_io): guard shift-by-64 UB in safe flush() (full-accumulator path)",
+          "timestamp": "2026-05-23T21:48:41+03:00",
+          "tree_id": "5a3842841cc20ed9a2092204c88f8110aa918618",
+          "url": "https://github.com/structured-world/structured-zstd/commit/34ae28bb3586257a66f1459023cedc2c3ed4bc41"
+        },
+        "date": 1779566751771,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.141,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 327.293,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 222.481,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.496,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.525,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.104,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.072,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.086,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.016,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.317,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.769,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.237,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 2.096,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 6.178,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.061,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 6.269,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.104,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.321,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.321,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
