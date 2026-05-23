@@ -147,27 +147,40 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bits_in_partial += num_bits;
     }
 
-    /// Donor `BIT_flushBitsFast` (`bitstream.h:202-214`): write full
-    /// bytes from `partial` to output, shift container down to keep
-    /// the leftover `< 8` bits at the bottom for the next add. No
-    /// overflow check on the output buffer — caller pre-reserves
-    /// sufficient capacity.
+    /// Donor `BIT_flushBitsFast` (`bitstream.h:202-214`): write the
+    /// full 8 bytes of `partial` directly to the output buffer via a
+    /// single `MEM_writeLEST` (unaligned 8-byte LE store), then
+    /// advance the Vec's `len` by only `nb_bytes` so the scratch
+    /// bytes past the commit point get overwritten by the next
+    /// flush. No overflow check — caller must have pre-reserved at
+    /// least 8 bytes of spare capacity via [`Self::reserve_output`].
     ///
-    /// Pairs with [`Self::write_bits_64_no_check`] in the FSE
-    /// sequence encoder's hot loop: a single flush_bulk after each
-    /// sequence keeps the budget under 64 bits + 7-bit tail.
+    /// `extend_from_slice` for tiny (0..=7-byte) tails was previously
+    /// hot — its per-call capacity check + memcpy dispatch cost
+    /// dwarfs the actual byte write at FSE flush cadence (~54K
+    /// flushes per compress on the L1 fast path). The direct
+    /// unaligned store path matches donor's hot loop cycle-for-cycle.
     #[inline(always)]
     pub fn flush_bulk(&mut self) {
         let nb_bytes = self.bits_in_partial >> 3;
-        // Donor `MEM_writeLEST` analogue. We can't do an unconditional
-        // 8-byte unaligned write without `Vec::reserve`; instead push
-        // the exact `nb_bytes` to extend the Vec by that much. LLVM
-        // typically lowers `extend_from_slice` of a fixed-size byte
-        // slice to a single store + len bump when capacity is large
-        // enough (the caller's pre-reserve guarantees this on the
-        // hot path).
         let bytes = self.partial.to_le_bytes();
-        self.output.as_mut().extend_from_slice(&bytes[..nb_bytes]);
+        // SAFETY: caller's `reserve_output` guarantees `capacity >=
+        // len + 8` (the per-burst budget bound documented on the
+        // FSE encoder side). We write 8 bytes starting at `len`,
+        // then commit only `nb_bytes` — the remaining `8 - nb_bytes`
+        // bytes stay within capacity but past `len`, and the next
+        // flush_bulk overwrites them.
+        let output = self.output.as_mut();
+        let len = output.len();
+        debug_assert!(
+            output.capacity() >= len + 8,
+            "flush_bulk requires 8 bytes of spare capacity; caller forgot reserve_output",
+        );
+        unsafe {
+            let dst = output.as_mut_ptr().add(len);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
+            output.set_len(len + nb_bytes);
+        }
         self.partial >>= nb_bytes * 8;
         self.bits_in_partial &= 7;
         self.bit_idx += nb_bytes * 8;
