@@ -167,12 +167,16 @@ impl RowMatchGenerator {
                 }
             }
             Some(false) => {
-                // Dictionary priming: the driver explicitly asked for the
-                // entire skipped range to be queryable by subsequent
-                // blocks. Donor's `ZSTD_loadDictionaryContent` does the
-                // same dense fill via `ZSTD_row_update_internalImpl` over
-                // every dict byte, so future scans against the primed
-                // window find matches into the dict. Keep dense here.
+                // Dense seeding requested by the caller: the entire
+                // skipped range must remain queryable so subsequent
+                // blocks can match into it. Currently only used by the
+                // dictionary-priming path (donor's
+                // `ZSTD_loadDictionaryContent` does the same dense fill
+                // via `ZSTD_row_update_internalImpl` over every dict
+                // byte), but the semantic is "dense fill on demand" and
+                // future fast-paths (e.g. an RLE / raw-block emitter
+                // that still wants cross-block matches into the skipped
+                // bytes) can reuse it without rewording the contract.
                 self.insert_positions(current_abs_start, current_abs_end);
             }
             None => {
