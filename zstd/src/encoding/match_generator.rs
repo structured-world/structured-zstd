@@ -8454,3 +8454,31 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
         );
     }
 }
+
+/// Pins lazy-band `hc.target_len` to donor `cParams.targetLength` from
+/// `clevels.h` table[0] (default — `srcSize > 256 KB`). Donor's lazy
+/// outer loop treats `targetLength` as `sufficient_len` — the
+/// "nice match" threshold that breaks the chain walk as soon as a
+/// candidate reaches that length. Inflating it above donor forces the
+/// chain walk to complete `search_depth` iterations on inputs that
+/// would have committed early under donor — the dominant cost in
+/// the L5..=L15 speed regression vs FFI tracked at the parent issue.
+///
+/// Test queries donor via `ZSTD_getCParams(level, 0, 0)` so any future
+/// donor-table tweak in upstream zstd is reflected automatically.
+#[test]
+fn lazy_band_target_len_matches_donor_default_table() {
+    use zstd::zstd_safe::zstd_sys;
+
+    for level in 5..=15i32 {
+        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
+        // call with any (level, srcSize, dictSize) combination.
+        let donor = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let params = resolve_level_params(CompressionLevel::Level(level), None);
+        assert_eq!(
+            params.hc.target_len as u32, donor.targetLength,
+            "L{level}: hc.target_len ({}) must match donor cParams.targetLength ({})",
+            params.hc.target_len, donor.targetLength
+        );
+    }
+}
