@@ -360,21 +360,50 @@ fn ensure_regular_output_destination(output: &Path) -> color_eyre::Result<()> {
 
 fn decompress(input: PathBuf, output: PathBuf) -> color_eyre::Result<()> {
     info!("extracting {input:?} to {output:?}");
-    let source_file = File::open(input).wrap_err("failed to open input file")?;
-    let source_size = source_file.metadata()?.len() as usize;
+    ensure_distinct_paths(&input, &output)?;
+    ensure_regular_output_destination(&output)?;
+
+    let source_file = File::open(&input).wrap_err("failed to open input file")?;
+    let source_size: usize = source_file
+        .metadata()?
+        .len()
+        .try_into()
+        .wrap_err("input file too large for this platform")?;
     let buffered_source = BufReader::new(source_file);
     let decoder_input = ProgressMonitor::new(buffered_source, source_size);
-    let mut output: File =
-        File::create(output).wrap_err("failed to open output file for writing")?;
 
-    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(decoder_input)?;
+    let (temporary_output_path, temporary_output) = create_temporary_output_file(&output)?;
 
-    std::io::copy(&mut decoder, &mut output)?;
+    let decompression_result: color_eyre::Result<File> = (|| {
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(decoder_input)?;
+        let mut sink = temporary_output;
+        std::io::copy(&mut decoder, &mut sink).wrap_err("streaming decompression failed")?;
+        Ok(sink)
+    })();
+
+    let temporary_output = match decompression_result {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = fs::remove_file(&temporary_output_path);
+            return Err(err);
+        }
+    };
+
+    let inflated_size = match temporary_output.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            drop(temporary_output);
+            let _ = fs::remove_file(&temporary_output_path);
+            return Err(err).wrap_err("failed to get decompressed file size");
+        }
+    };
+    drop(temporary_output);
+    replace_output_file(&temporary_output_path, &output)?;
 
     info!(
         "inflated {} ——> {}",
         fmt_size(source_size as f64),
-        fmt_size(output.metadata()?.len() as f64),
+        fmt_size(inflated_size as f64),
     );
     Ok(())
 }
@@ -404,7 +433,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, compress, replace_output_file};
+    use super::{Cli, compress, decompress, replace_output_file};
     use std::path::PathBuf;
 
     use crate::add_extension;
@@ -638,6 +667,147 @@ mod tests {
                 .is_symlink(),
             "destination symlink should remain untouched"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Build a real `.zst` file in `dir` from `plain_content`, return paths
+    /// (compressed_path, plain_content_path). The compressed file is what
+    /// the decompress tests use as input.
+    fn build_zst_fixture(dir: &Path, plain_content: &[u8]) -> (PathBuf, PathBuf) {
+        let plain_path = dir.join("plain.txt");
+        fs::write(&plain_path, plain_content).unwrap();
+        let compressed_path = dir.join("plain.zst");
+        compress(plain_path.clone(), compressed_path.clone(), 3, false).unwrap();
+        (compressed_path, plain_path)
+    }
+
+    #[test]
+    fn decompress_rejects_same_input_and_output_paths() {
+        let dir = unique_test_dir("structured-zstd-cli-decompress-alias");
+        let (compressed, _plain) = build_zst_fixture(&dir, b"streaming-cli-decompress-alias");
+
+        let err = decompress(compressed.clone(), compressed.clone()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("input and output"),
+            "unexpected error: {message}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decompress_rejects_hardlinked_output_paths() {
+        let dir = unique_test_dir("structured-zstd-cli-decompress-hardlink");
+        let (compressed, _plain) = build_zst_fixture(&dir, b"streaming-cli-decompress-hardlink");
+        let output = dir.join("output.bin");
+        fs::hard_link(&compressed, &output).unwrap();
+
+        let err = decompress(compressed.clone(), output.clone()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("input and output"),
+            "unexpected error: {message}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decompress_reports_open_error_for_missing_input() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_input = std::env::temp_dir().join(format!(
+            "structured-zstd-cli-decompress-missing-input-{unique}.zst"
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "structured-zstd-cli-decompress-missing-output-{unique}.bin"
+        ));
+
+        let err = decompress(missing_input, output.clone()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to open input file"),
+            "unexpected error: {message}"
+        );
+
+        // Output must not exist — ensure_distinct_paths or canonicalize
+        // failed before any file was created.
+        assert!(
+            !output.exists(),
+            "output file must not be created when input is missing"
+        );
+    }
+
+    #[test]
+    fn decompress_rejects_non_regular_output_before_creating_temp_file() {
+        let dir = unique_test_dir("structured-zstd-cli-decompress-preflight-output");
+        let (compressed, _plain) = build_zst_fixture(&dir, b"streaming-cli-decompress-preflight");
+        let output = dir.join("existing-dir");
+        fs::create_dir(&output).unwrap();
+
+        let err = decompress(compressed, output.clone()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not a regular file"),
+            "unexpected error: {message}"
+        );
+
+        let tmp_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(tmp_count, 0, "temporary output should not be created");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decompress_cleans_temp_file_on_decode_failure() {
+        let dir = unique_test_dir("structured-zstd-cli-decompress-decode-fail");
+        // Garbage bytes — not a zstd frame. StreamingDecoder construction
+        // or copy will fail; the temp file MUST be removed on error.
+        let input = dir.join("garbage.zst");
+        write_file(&input, b"not-a-real-zstd-frame-header");
+        let output = dir.join("output.bin");
+
+        let err = decompress(input, output.clone()).unwrap_err();
+        let _ = format!("{err:#}");
+
+        let tmp_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(
+            tmp_count, 0,
+            "temporary decompressed file must be cleaned up on decode failure"
+        );
+        assert!(
+            !output.exists(),
+            "final output must not be created on decode failure"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decompress_roundtrips_known_content() {
+        let dir = unique_test_dir("structured-zstd-cli-decompress-roundtrip");
+        let content = b"streaming-cli-decompress-roundtrip\nline-two\n".repeat(32);
+        let (compressed, _plain) = build_zst_fixture(&dir, &content);
+        let recovered = dir.join("recovered.bin");
+
+        decompress(compressed, recovered.clone()).unwrap();
+        let got = fs::read(&recovered).unwrap();
+        assert_eq!(got, content);
 
         let _ = fs::remove_dir_all(dir);
     }
