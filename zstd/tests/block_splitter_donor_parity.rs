@@ -83,6 +83,13 @@ fn load_corpus_chunks() -> Vec<(String, Vec<u8>)> {
     for entry in fs::read_dir(&dir).expect("read_dir corpus") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
+        // Skip non-regular entries (subdirectories, symlinks-to-dirs,
+        // device nodes if the fixture tree ever grows). `fs::read` on
+        // a directory would panic and turn an extensible fixture
+        // layout into a parity-harness failure.
+        if !entry.file_type().expect("entry file_type").is_file() {
+            continue;
+        }
         // Skip compressed fixtures — we want raw payloads.
         if path
             .extension()
@@ -200,6 +207,10 @@ fn corpus_borders_heuristic_matches_donor() {
 #[test]
 fn corpus_by_chunks_matches_donor_at_each_sampling_level() {
     let chunks = load_corpus_chunks();
+    assert!(
+        !chunks.is_empty(),
+        "expected at least one 128 KB chunk from the decode corpus"
+    );
     for (label, block) in &chunks {
         for level in 1..=4 {
             assert_parity(label, block, level);
