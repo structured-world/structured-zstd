@@ -7810,46 +7810,58 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
 }
 
-/// Mirror of [`dfast_inserts_tail_positions_for_next_block_matching`] for
-/// the [`HcMatchGenerator`]: feed two consecutive blocks where the
-/// second block's prefix repeats the first block's tail and assert the
-/// first sequence emitted on the second block is a tail-anchored
-/// cross-block match (no leading literals). Drives the
-/// `start_matching_lazy` arm via the default `Lazy`
-/// `strategy_tag`. The cross-block match is only reachable when
-/// `MatchTable::backfill_boundary_positions` correctly seeded the
-/// previous block's `[chain_log .. block_end)` tail into the hash +
-/// chain tables — without that seeding the `HcMatchGenerator` would
-/// hash only the new block's positions and miss the tail-anchored
-/// match, falling back to a leading literals run.
+/// Regression for #49 — locks down `MatchTable::backfill_boundary_positions`
+/// for the [`HcMatchGenerator`] lazy path. `backfill_boundary_positions`
+/// seeds ONLY the last `< 4` bytes of the previous slice (positions in
+/// `[current_abs_start - 3, current_abs_start)`) — the bytes that
+/// `insert_position` could not hash at the time because hashing needs
+/// 4 bytes of lookahead. The existing 8 MiB window roundtrip test
+/// exercises cross-slice behaviour end-to-end, but does not isolate
+/// the backfill of those final 1-3 unhashable bytes.
 ///
-/// Regression for #49 — the existing 8 MiB window roundtrip test
-/// exercises cross-slice behaviour end-to-end, but a targeted unit
-/// test more precisely catches boundary-anchor losses in
-/// `HcMatchGenerator`.
+/// Fixture is built so the cross-block match's candidate position
+/// MUST lie in `[block_1_end - 3, block_1_end)`:
+///
+/// - Block 1 = `b"PQRSTBCD"` (8 bytes). Block 1's `start_matching`
+///   hashes positions 0..=4 (each has 4 bytes of forward context);
+///   positions 5/6/7 are the unhashable tail.
+/// - Block 2 = `b"BCDBCDBCDB"` (10 bytes). At absolute position 8
+///   (block 2 start) the 4-byte window is `b"BCDB"`. The ONLY place
+///   `b"BCDB"` was inserted in the hash + chain tables is position 5
+///   — via `backfill_boundary_positions` on the next-slice entry
+///   (the 4-byte window at position 5 is `data[5..9] = b"BCD" +
+///   block_2[0] = b"BCDB"`).
+///
+/// If `backfill_boundary_positions` regresses, position 5 is never
+/// hashed, position 8's lookup misses, and the lazy parser falls
+/// through to a leading literals run — `offset == 3, match_len >= 4`
+/// would no longer hold.
 #[test]
 fn hashchain_inserts_tail_positions_for_next_block_matching() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
     matcher.configure(HC_CONFIG, super::strategy::StrategyTag::Lazy, 22);
 
-    matcher.table.add_data(b"012345bcdea".to_vec(), |_| {});
+    matcher.table.add_data(b"PQRSTBCD".to_vec(), |_| {});
     let mut history = alloc::vec::Vec::new();
     matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => history.extend_from_slice(literals),
-        Sequence::Triple { .. } => unreachable!("first block should not match history"),
+        Sequence::Triple { .. } => unreachable!("first block has no internal repeats"),
     });
-    assert_eq!(history, b"012345bcdea");
+    assert_eq!(history, b"PQRSTBCD");
 
-    matcher.table.add_data(b"bcdeabcdeab".to_vec(), |_| {});
-    let mut saw_first_sequence = false;
+    matcher.table.add_data(b"BCDBCDBCDB".to_vec(), |_| {});
+    let mut first_sequence_offset: Option<usize> = None;
+    let mut first_sequence_match_len: Option<usize> = None;
     matcher.start_matching(|seq| {
-        if saw_first_sequence {
+        if first_sequence_offset.is_some() {
             return;
         }
-        saw_first_sequence = true;
         match seq {
             Sequence::Literals { .. } => {
-                panic!("expected tail-anchored cross-block match before any literals")
+                panic!(
+                    "expected tail-anchored cross-block match before any literals — \
+                     backfill_boundary_positions did not seed positions 5/6/7"
+                )
             }
             Sequence::Triple {
                 literals,
@@ -7857,22 +7869,30 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
                 match_len,
             } => {
                 assert_eq!(literals, b"", "no leading literals on the boundary match");
-                assert_eq!(
-                    offset, 5,
-                    "boundary match must reach back into the previous block's `bcdea` tail \
-                     (5 bytes back from block-2 start)"
-                );
-                assert!(
-                    match_len >= HC_MIN_MATCH_LEN,
-                    "match_len {match_len} must clear the HC min-match floor"
-                );
+                first_sequence_offset = Some(offset);
+                first_sequence_match_len = Some(match_len);
             }
         }
     });
 
+    let offset = first_sequence_offset.expect(
+        "expected tail-anchored cross-block match emitted from backfill_boundary_positions",
+    );
     assert!(
-        saw_first_sequence,
-        "expected tail-anchored cross-block match emitted from `backfill_boundary_positions`"
+        (1..=3).contains(&offset),
+        "boundary match offset {offset} must point into the unhashable tail \
+         (positions 5/6/7 of an 8-byte block 1) so the test specifically \
+         locks down backfill_boundary_positions",
+    );
+    assert_eq!(
+        offset, 3,
+        "candidate position must land at 5 (= block_1_len - 3) so the 4-byte \
+         window `data[5..9] = b\"BCDB\"` matches block 2's first hash lookup",
+    );
+    let match_len = first_sequence_match_len.unwrap();
+    assert!(
+        match_len >= HC_MIN_MATCH_LEN,
+        "match_len {match_len} must clear the HC min-match floor",
     );
 }
 
