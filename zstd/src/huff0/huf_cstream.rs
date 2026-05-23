@@ -25,9 +25,14 @@
 
 use alloc::vec::Vec;
 
-/// Donor `HUF_BITS_IN_CONTAINER = sizeof(size_t) * 8`. We commit to 64
-/// (donor's `MEM_32bits()` path is irrelevant on the targets we care
-/// about — every host that runs production zstd is 64-bit).
+/// Donor `HUF_BITS_IN_CONTAINER = sizeof(size_t) * 8`. We hard-code 64
+/// regardless of target pointer width. Donor's `MEM_32bits()` branch
+/// switches the container to `u32` on 32-bit hosts; this crate's CI
+/// includes i686, but a 32-bit `usize` host can still operate a 64-bit
+/// arithmetic accumulator — the container is just `u64`, not
+/// `[u8; size_of::<usize>()]`. Skipping the 32-bit branch keeps the
+/// type signatures uniform across targets and matches the speed of
+/// the 64-bit hot path on all supported architectures.
 pub(crate) const HUF_BITS_IN_CONTAINER: usize = 64;
 
 /// Donor `HUF_TABLELOG_ABSOLUTEMAX = 12` (defined in `common/huf.h`).

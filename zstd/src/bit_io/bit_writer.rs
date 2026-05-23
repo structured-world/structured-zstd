@@ -128,10 +128,13 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     ///
     /// Caller MUST guarantee BOTH preconditions BEFORE calling:
     ///
-    /// 1. `num_bits + bits_in_partial <= 64` — accumulator must not
-    ///    overflow. A violation triggers `<< num_bits` shift overflow
-    ///    (undefined in Rust for shift ≥ 64) and corrupts the bit
-    ///    stream silently.
+    /// 1. `num_bits + bits_in_partial <= 64` AND **not both 64**, i.e.
+    ///    if `bits_in_partial == 64` then `num_bits` MUST be 0 — and
+    ///    the explicit `num_bits == 0` early-return below handles that
+    ///    case without ever evaluating `bits << bits_in_partial`. The
+    ///    point of the precondition: any other combination would either
+    ///    shift-by-64 (undefined for `u64 << 64` in Rust) or overflow
+    ///    `bits_in_partial` past 64.
     /// 2. `num_bits == 64 || bits >> num_bits == 0` — value must be
     ///    clean of high junk past `num_bits`. Dirty high bits leak
     ///    into the packed stream at the next OR.
@@ -150,10 +153,25 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// pays.
     #[inline(always)]
     pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
+        // num_bits == 0 short-circuit: matches donor `BIT_addBits` no-op
+        // semantics AND guards the `bits << self.bits_in_partial` below
+        // from a `<< 64` undefined-behaviour evaluation when the
+        // accumulator is already full (`bits_in_partial == 64`). Callers
+        // that legitimately drain a full container (e.g. the FSE encoder
+        // hitting a state-diff burst boundary) can call this with
+        // `num_bits = 0` as a no-op without tripping UB.
+        if num_bits == 0 {
+            return;
+        }
         debug_assert!(
             num_bits + self.bits_in_partial <= 64,
             "write_bits_64_no_check would overflow partial: would push to {} bits",
             num_bits + self.bits_in_partial,
+        );
+        debug_assert!(
+            self.bits_in_partial < 64,
+            "write_bits_64_no_check called with full accumulator and num_bits>0; \
+             caller must flush_bulk before adding more bits",
         );
         debug_assert!(
             num_bits == 64 || bits >> num_bits == 0,
@@ -207,7 +225,15 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
             output.set_len(len + nb_bytes);
         }
-        self.partial >>= nb_bytes * 8;
+        // `nb_bytes == 8` means the accumulator was full (64 bits). A
+        // raw `partial >>= 64` is UB on `u64`, so we zero explicitly.
+        // Donor's `BIT_flushBitsFast` writes a fresh 8 bytes the next
+        // round so the post-flush state must be clean either way.
+        if nb_bytes == 8 {
+            self.partial = 0;
+        } else {
+            self.partial >>= nb_bytes * 8;
+        }
         self.bits_in_partial &= 7;
         self.bit_idx += nb_bytes * 8;
     }

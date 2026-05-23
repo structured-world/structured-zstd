@@ -367,20 +367,25 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
         return;
     }
     if lit_len <= 32 {
-        // Caller pre-reserved `src_len` (the whole block); the sum
-        // of all literal runs is ≤ src_len, so the unused tail
-        // always has ≥ `lit_len` capacity.
-        debug_assert!(
-            dst.capacity() - dst.len() >= lit_len,
-            "append_literals requires `dst` to have at least `lit_len` reserved capacity \
-             past `dst.len()` — caller failed to reserve before the emit loop",
-        );
+        // Production callers (`collect_block_parts`) pre-reserve
+        // `src_len` of spare capacity, so the sum of all literal
+        // runs across a block fits without grow. But this function
+        // is `pub(crate)` and stays a SAFE fn, so we must enforce
+        // the precondition in release too — otherwise a future
+        // caller skipping the pre-reserve would get an immediate
+        // 32-byte OOB write into whatever follows the `Vec`'s
+        // allocation. The branch is cold on the production hot
+        // path (debug_assert in tests confirms it stays untaken).
         let cur_len = dst.len();
+        if dst.capacity() - cur_len < lit_len {
+            dst.reserve(lit_len);
+        }
         let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
         // SAFETY: `lits` is a valid slice (so reading `lit_len`
-        // bytes from `lits.as_ptr()` is in-bounds); `dst_ptr` has
-        // `lit_len` bytes of reserved capacity (debug_assert above).
-        // copy_bytes_overshooting writes EXACTLY `lit_len` bytes when
+        // bytes from `lits.as_ptr()` is in-bounds); the
+        // `dst.reserve(lit_len)` above guarantees `dst_ptr` has
+        // `lit_len` bytes of spare capacity. copy_bytes_overshooting
+        // writes EXACTLY `lit_len` bytes when
         // `min(src.1, dst.1) == lit_len`.
         unsafe {
             crate::decoding::simd_copy::copy_bytes_overshooting(
