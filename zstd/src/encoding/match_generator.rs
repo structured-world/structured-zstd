@@ -174,14 +174,6 @@ const HC_CONFIG: HcConfig = HcConfig {
     target_len: HC_TARGET_LEN,
 };
 
-/// Best-level: deeper search, larger tables, higher target length.
-const BEST_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 21,
-    chain_log: 20,
-    search_depth: 32,
-    target_len: 128,
-};
-
 const BTOPT_HC_CONFIG: HcConfig = HcConfig {
     hash_log: 23,
     chain_log: 22,
@@ -299,17 +291,24 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 20, fast_hash_log: 16, fast_mls: 6, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 32 }, row: ROW_CONFIG },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 48 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 48 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 64 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 96 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BEST_HC_CONFIG, row: ROW_CONFIG },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 128 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 160 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 192 }, row: ROW_CONFIG },
+    // target_len column for L5..=L15 matches donor cParams.targetLength
+    // from clevels.h table[0] (default — srcSize > 256 KB). Donor uses
+    // it as the lazy outer loop's `sufficient_len` (nice-match) threshold.
+    // Inflating it above donor forces the chain walk to complete
+    // search_depth iterations instead of breaking on the first
+    // long-enough match — the dominant cost in the L5..=L15 speed
+    // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
     /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
