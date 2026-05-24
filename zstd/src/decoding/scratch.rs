@@ -64,6 +64,20 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.sequences.clear();
         self.block_content_buffer.clear();
 
+        // Pre-allocate the per-block scratch Vecs to `min(window_size,
+        // MAX_BLOCK_SIZE)` so the first block's
+        // `extend_from_slice` / `resize` does not pay anonymous-page
+        // first-touch faults inside the decode hot path. `clear()`
+        // keeps `capacity()`, so subsequent frames with the same
+        // (or smaller) window also avoid realloc. Matches donor's
+        // upfront sizing strategy where `dctx->litExtraBuffer` and
+        // the dst layout are sized to `blockSizeMax` at frame init.
+        // Measured at ~18% of decode-time page-fault cost on
+        // level_-7_fast/decodecorpus-z000033 — see #244.
+        let block_cap = (window_size.min(crate::common::MAX_BLOCK_SIZE as usize)).max(8);
+        self.literals_buffer.reserve(block_cap);
+        self.block_content_buffer.reserve(block_cap);
+
         self.buffer.reset(window_size);
 
         self.fse.literal_lengths.reset();

@@ -21,7 +21,7 @@
 //! tables, offset_hist, sequence cache) lives in `FrameDecoder` and
 //! is borrowed in by reference for the call's duration.
 
-use crate::io::{Error, ErrorKind, Read};
+use crate::io::{Error, Read};
 use core::ptr;
 
 use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
@@ -44,6 +44,7 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// overshoots from `extend_from_within_unchecked` stay inside the
 /// allocation. The dispatch site in [`crate::decoding::FrameDecoder`]
 /// validates this precondition.
+#[allow(dead_code)]
 pub(crate) struct UserSliceBackend<'a> {
     slice: &'a mut [u8],
     /// Bytes in `slice[..head]` have been drained to the output
@@ -63,6 +64,7 @@ impl<'a> UserSliceBackend<'a> {
     /// least `frame_content_size + WILDCOPY_OVERLENGTH` bytes of
     /// length so SIMD wildcopy overshoots stay inside the allocation;
     /// the dispatcher in `FrameDecoder` enforces this.
+    #[allow(dead_code)]
     pub(crate) fn from_slice(slice: &'a mut [u8]) -> Self {
         Self {
             slice,
@@ -163,8 +165,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let old = self.tail;
         let new_tail = old + fill_length;
         if new_tail > self.slice.len() {
-            return Err(Error::new(
-                ErrorKind::Other,
+            return Err(Error::other(
                 "UserSliceBackend: raw block exceeds caller-provided output capacity",
             ));
         }
