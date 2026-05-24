@@ -1164,7 +1164,7 @@ impl FrameDecoder {
     /// Decode a single zstd frame from `input` directly into
     /// `output`, bypassing the internal `DecodeBuffer` -> `read()`
     /// drain copy when the frame is eligible. Donor parity with the
-    /// `ZSTD_in_dst` litBuffer placement strategy — see #244.
+    /// `ZSTD_in_dst` litBuffer placement strategy.
     ///
     /// Eligibility requires all of:
     /// - `frame_content_size` is present in the header (> 0).
@@ -1256,9 +1256,17 @@ impl FrameDecoder {
     ///
     /// Callers must use the bytes from `output[..n]` (where `n`
     /// is the returned count); do not mix `decode_to_slice` with
-    /// `read`/`collect` on the same `FrameDecoder`. The
-    /// fallback (`decode_all`) sub-path inside this method
-    /// behaves like the regular `decode_all` w.r.t. state.
+    /// `read`/`collect` on the same `FrameDecoder`.
+    ///
+    /// When the frame is NOT eligible (no FCS in the header, or
+    /// output buffer too small for the WILDCOPY slack, or active
+    /// dictionary), this method falls back to a single-frame
+    /// `decode_blocks` + `read` drain loop, draining into the
+    /// caller's `output` slice. This is NOT `decode_all`: it
+    /// processes only one frame (no trailing-frame iteration, no
+    /// silent skippable-frame skip) and returns
+    /// [`FrameDecoderError::TargetTooSmall`] if the decoded
+    /// output does not fit in `output`.
     ///
     /// # Panic / DoS surface
     ///
@@ -1591,7 +1599,7 @@ mod tests {
         // must produce identical output bytes — the only difference
         // is the internal buffer/drain shape, not the decoded
         // semantics. This is the regression gate for the
-        // direct-decode wiring (#244).
+        // direct-decode wiring.
         let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
         compressor.set_source(payload.as_slice());

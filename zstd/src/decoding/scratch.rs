@@ -40,8 +40,8 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
 /// independent borrows of distinct fields — the field-split is
 /// what makes "borrow huf and literals_buffer at the same time"
 /// type-check, both for the owned [`DecoderScratch<B>`] path and the
-/// upcoming direct-decode path (#244) where these fields are
-/// borrowed by reference from a [`crate::decoding::FrameDecoder`].
+/// direct-decode path where these fields are borrowed by reference
+/// from a [`crate::decoding::FrameDecoder`].
 ///
 /// The lifetime `'a` is the shorter-of (a) the underlying owner's
 /// lifetime and (b) the active borrow. The backend type `B` flows
@@ -57,12 +57,12 @@ pub struct WorkspaceRef<'a, B: BufferBackend> {
 }
 
 /// Polymorphic accessor for the decoder's per-call scratch state.
-/// Both the existing owned [`DecoderScratch<B>`] (used by the
-/// streaming and one-shot `decode_all` paths) and the upcoming
-/// direct-decode borrow-ref scratch (#244) implement this trait so
-/// the block / literals / sequence decode functions are written
-/// once against `Workspace` and instantiated for both shapes via
-/// compile-time monomorphisation.
+/// Both the owned [`DecoderScratch<B>`] (used by the streaming and
+/// one-shot `decode_all` paths) and the borrow-ref direct-decode
+/// scratch (`DirectScratch`) implement this trait, so the block /
+/// literals / sequence decode functions are written once against
+/// `Workspace` and instantiated for both shapes via compile-time
+/// monomorphisation.
 ///
 /// The single `split` method returns all fields at once as a
 /// [`WorkspaceRef`] so callers retain Rust's field-level
@@ -102,9 +102,10 @@ impl<B: BufferBackend> Workspace for DecoderScratch<B> {
 ///
 /// Implementing [`Workspace`] lets the existing
 /// `block_decoder::decode_block_content` / `decompress_block`
-/// generic-over-W functions consume this scratch unchanged — see
-/// the donor-parity rationale in #244 for why eliminating the
-/// `DecodeBuffer::read` drain copy is the perf target.
+/// generic-over-W functions consume this scratch unchanged. The
+/// perf rationale: eliminating the `DecodeBuffer::read` drain copy
+/// that the owned-buffer path performs, by writing decoded bytes
+/// straight into the caller-provided output slice.
 ///
 /// Constructed inside `FrameDecoder::decode_to_slice` and dropped
 /// at function exit; never persisted across calls.
@@ -177,7 +178,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // upfront sizing strategy where `dctx->litExtraBuffer` and
         // the dst layout are sized to `blockSizeMax` at frame init.
         // Measured at ~18% of decode-time page-fault cost on
-        // level_-7_fast/decodecorpus-z000033 — see #244.
+        // level_-7_fast/decodecorpus-z000033.
         let block_cap = (window_size.min(crate::common::MAX_BLOCK_SIZE as usize)).max(8);
         // Pre-TOUCH (not just reserve) so the kernel maps the
         // anonymous pages here instead of inside the decode hot
