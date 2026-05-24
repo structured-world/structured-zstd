@@ -1394,6 +1394,25 @@ impl FrameDecoder {
                     break;
                 }
             }
+            // When the frame header declares a `frame_content_size`,
+            // ensure the drained byte count actually matches it.
+            // Without this check a corrupt frame that sets FCS but
+            // ends early (e.g. last-block flag on a sub-FCS payload)
+            // would silently return success here, while the
+            // eligible-frame direct path catches the same condition
+            // via `FrameContentSizeMismatch`. The fallback path now
+            // matches that behaviour.
+            //
+            // `content_size == 0` in the header means "FCS not
+            // declared on the wire", which our parser surfaces by
+            // leaving the field at the default 0. Skip the check in
+            // that case — there's nothing to compare against.
+            if content_size > 0 && (total_bytes_written as u64) != content_size {
+                return Err(err::FrameContentSizeMismatch {
+                    declared: content_size,
+                    produced: total_bytes_written as u64,
+                });
+            }
             return Ok(total_bytes_written);
         }
 
@@ -1823,6 +1842,51 @@ mod tests {
             .expect("decode_to_slice should still succeed via fallback");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
+    }
+
+    #[test]
+    fn decode_to_slice_fallback_validates_fcs_against_total_output() {
+        // Synthetic single-segment frame: FCS = 20 bytes, but the
+        // last-block flag fires after only 4 bytes of raw payload.
+        // On the direct path this would trip the post-block
+        // `produced > content_size` check; the fallback path
+        // (eligible=false because output is sized exactly to FCS,
+        // no WILDCOPY slack) used to silently return Ok(4). With
+        // the fix it now surfaces `FrameContentSizeMismatch`
+        // matching the direct path.
+        //
+        // Frame layout: 4 B magic | 1 B FHD (single_segment=1,
+        // FCS_flag=3 → 8-byte FCS) | 8 B FCS=20 | block header
+        // (Raw, last, size=4) | 4 raw bytes.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0xFD2F_B528u32.to_le_bytes()); // magic
+        // FHD: FCS_flag=3 (8-byte FCS) <<6 | single_segment=1 <<5.
+        wire.push(0b1110_0000);
+        wire.extend_from_slice(&20u64.to_le_bytes()); // declared FCS
+        // Block header: (size << 3) | (block_type << 1) | last_block.
+        // Raw block (block_type=0), last_block=1, size=4 → 0b00100001 = 0x21.
+        wire.push(0x21);
+        wire.push(0x00);
+        wire.push(0x00);
+        wire.extend_from_slice(&[1u8, 2, 3, 4]);
+
+        let mut dec = FrameDecoder::new();
+        // Size output exactly at declared FCS (no WILDCOPY slack)
+        // so the eligibility check gates the direct path out.
+        let mut out = alloc::vec![0u8; 20];
+        let err = dec
+            .decode_to_slice(wire.as_slice(), &mut out)
+            .expect_err("fallback must reject corrupt FCS underflow");
+        match err {
+            crate::decoding::errors::FrameDecoderError::FrameContentSizeMismatch {
+                declared,
+                produced,
+            } => {
+                assert_eq!(declared, 20);
+                assert_eq!(produced, 4);
+            }
+            other => panic!("expected FrameContentSizeMismatch, got {other:?}"),
+        }
     }
 
     #[test]
