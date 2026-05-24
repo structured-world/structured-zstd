@@ -170,14 +170,34 @@ impl SkippableFrame {
         reader
             .read_exact(&mut len_buf)
             .map_err(DecodeSkippableFrameError::Length)?;
-        let length = u32::from_le_bytes(len_buf) as usize;
+        let length_u32 = u32::from_le_bytes(len_buf);
+
+        // Convert the wire-format u32 length to `usize` via
+        // `TryFrom` (NOT `as usize`). On 16-bit pointer-width
+        // targets (e.g. MSP430) the bare `as usize` would silently
+        // truncate any value above `u16::MAX`, leaving the
+        // subsequent allocation + `read_exact` to consume far fewer
+        // bytes than the wire declared and leaving the reader
+        // mis-aligned at a junk position in the stream. Surface
+        // unrepresentable lengths as `PayloadTooLarge` BEFORE any
+        // allocation; the `requested` payload is reported in u32
+        // wire-format units so callers can still see the declared
+        // value even when it does not fit in this target's
+        // `usize`.
+        let length = usize::try_from(length_u32).map_err(|_| {
+            DecodeSkippableFrameError::PayloadTooLarge {
+                length: length_u32 as usize, // saturates to usize::MAX on truncation, for diagnostic only
+            }
+        })?;
 
         // Reject lengths that the `new()` / `write_skippable_frame()`
-        // path would also reject up front. On 32-bit targets this is
-        // the only protection against `serialized_size()` and
-        // `write_skippable_frame_to` overflowing `usize` when
-        // computing `length + SKIPPABLE_HEADER_SIZE`. On 64-bit the
-        // check is a no-op (every u32 length is representable).
+        // path would also reject up front. On 32-bit targets this
+        // catches `length + SKIPPABLE_HEADER_SIZE` overflowing
+        // `usize` when the declared length sits near `u32::MAX`.
+        // On 64-bit the check is a no-op (every u32 length is
+        // representable). On 16-bit the upstream `try_from` already
+        // rejected everything above `u16::MAX`, so this is also
+        // a no-op there.
         if length.checked_add(SKIPPABLE_HEADER_SIZE).is_none() {
             return Err(DecodeSkippableFrameError::PayloadTooLarge { length });
         }
