@@ -1161,24 +1161,39 @@ impl FrameDecoder {
         }
     }
 
-    /// Decode a single zstd frame from `input` directly into `output`,
-    /// bypassing the internal `DecodeBuffer` -> `read()` drain copy
-    /// when the frame is eligible. Donor parity with the
+    /// Decode a single zstd frame from `input` directly into
+    /// `output`, bypassing the internal `DecodeBuffer` -> `read()`
+    /// drain copy when the frame is eligible. Donor parity with the
     /// `ZSTD_in_dst` litBuffer placement strategy — see #244.
     ///
     /// Eligibility requires all of:
     /// - `frame_content_size` is present in the header (> 0).
     /// - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
     ///   (room for the SIMD wildcopy overshoot slack).
+    /// - `single_segment_flag` is set on the frame descriptor.
+    ///   This bounds `frame_content_size <= window_size` by
+    ///   construction, so the offset/window validation that
+    ///   `DecodeBuffer::repeat` performs (`offset <= buffer.len()`)
+    ///   coincides with the spec's `offset <= window_size` rule.
+    ///   Multi-segment frames need a `head`-advancing strategy on
+    ///   `UserSliceBackend` to cap `len()` at `window_size`; left
+    ///   as a follow-up.
     /// - No active dictionary on `self.state` (dict_content is not
     ///   carried into the stack-local DecodeBuffer this method
     ///   builds).
-    /// - Frame header lacks `content_checksum_flag` (the rolling
-    ///   hash lives on the persistent buffer; hash propagation
-    ///   across the direct path is a follow-up).
+    /// - With `feature = "hash"`: frame header lacks
+    ///   `content_checksum_flag` (the rolling hash lives on the
+    ///   persistent buffer; hash propagation across the direct
+    ///   path is a follow-up).
     ///
-    /// `single_segment_flag` is NOT a precondition — multi-segment
-    /// frames in non-streaming mode work identically.
+    /// Non-eligible frames fall back transparently to the existing
+    /// `decode_blocks` + `read` drain path.
+    ///
+    /// `input` must contain a complete single zstd frame followed
+    /// by no other bytes; trailing data past the frame is not
+    /// validated and is silently ignored on the direct path
+    /// (matches `decode_all` shape for the unverified-tail case).
+    /// Multi-frame streams must use [`Self::decode_all`].
     ///
     /// On the direct-decode path (eligible single-segment frame +
     /// sized output) the literal pushes and sequence-execution match
@@ -1217,13 +1232,18 @@ impl FrameDecoder {
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-        // Eligibility independent of `single_segment_flag`: donor's
-        // `ZSTD_in_dst` litBuffer-in-dst trick works identically for
-        // multi-segment frames as long as we're non-streaming
-        // (whole `frame_content_size` fits in `output`, no mid-frame
-        // drain ever issued). The flag only affects the internal
-        // scratch's FlatBuf-vs-RingBuffer choice; for direct decode
-        // the internal buffer is bypassed entirely.
+        // Eligibility requires `single_segment_flag`: under that
+        // flag `frame_content_size <= window_size` is guaranteed by
+        // the spec, so the offset bound `DecodeBuffer::repeat`
+        // enforces (`offset <= buffer.len()`) coincides with the
+        // window rule (`offset <= window_size`). Multi-segment
+        // frames would let `UserSliceBackend.len()` grow past
+        // `window_size` (we don't advance `head` on the direct
+        // path), letting malformed frames with `offset >
+        // window_size` slip through validation. Gating those off
+        // the fast path keeps correctness; the regular
+        // `decode_blocks` + drain path handles them via
+        // `drain_to_window_size`.
         //
         // Disabled when a dictionary is active: the persistent
         // `DecoderScratch::buffer.dict_content` seeded by
@@ -1243,13 +1263,17 @@ impl FrameDecoder {
         // gate the direct path off when the frame header has the
         // content_checksum_flag set — the existing drain path
         // remains correct for those frames.
+        let single_segment = state.frame_header.descriptor.single_segment_flag();
         let dict_active = state.using_dict.is_some();
         #[cfg(feature = "hash")]
         let hash_active = state.frame_header.descriptor.content_checksum_flag();
         #[cfg(not(feature = "hash"))]
         let hash_active = false;
-        let eligible =
-            content_size > 0 && !dict_active && !hash_active && (output.len() as u64) >= needed;
+        let eligible = single_segment
+            && content_size > 0
+            && !dict_active
+            && !hash_active
+            && (output.len() as u64) >= needed;
 
         if !eligible {
             // Frame doesn't qualify for direct decode (empty

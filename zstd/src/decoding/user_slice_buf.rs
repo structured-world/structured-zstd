@@ -3,21 +3,22 @@
 //!
 //! Selected by [`crate::decoding::FrameDecoder::decode_to_slice`]
 //! when ALL of the following hold:
+//! - `single_segment_flag` is set on the frame descriptor. Under
+//!   that flag the spec guarantees `frame_content_size <=
+//!   window_size`, which matches `DecodeBuffer::repeat`'s offset
+//!   bound and keeps offset/window validation correct without a
+//!   head-advancing strategy on this backend.
 //! - `frame_content_size > 0` (FCS present in the frame header).
 //! - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
 //!   (room for the SIMD wildcopy overshoot slack).
 //! - No active dictionary (the persistent dict_content is not
 //!   carried into the stack-local DecodeBuffer this backend
 //!   builds; dict frames stay on the regular path).
-//! - No `content_checksum_flag` (the persistent rolling hash is
-//!   on `DecoderScratch::buffer.hash`, not on the stack-local
-//!   buffer; checksummed frames stay on the regular path until
-//!   hash propagation lands as a follow-up).
-//!
-//! The `single_segment_flag` is NOT a precondition: donor's
-//! `ZSTD_in_dst` litBuffer-in-dst trick works identically for
-//! multi-segment frames in non-streaming mode (whole content fits
-//! in caller's output, no mid-frame drain ever issued).
+//! - With `feature = "hash"`: no `content_checksum_flag` (the
+//!   persistent rolling hash is on `DecoderScratch::buffer.hash`,
+//!   not on the stack-local buffer; checksummed frames stay on
+//!   the regular path until hash propagation lands as a
+//!   follow-up). When `hash` is disabled this gate has no effect.
 //!
 //! When eligible, literal pushes and match-history copies write
 //! directly into the user's slice. Compared to
