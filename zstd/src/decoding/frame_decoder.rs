@@ -1525,7 +1525,7 @@ mod tests {
 
         // Baseline: decode_all.
         let mut dec_a = FrameDecoder::new();
-        let mut out_a = std::vec![0u8; payload.len()];
+        let mut out_a = alloc::vec![0u8; payload.len()];
         let n_a = dec_a
             .decode_all(compressed.as_slice(), &mut out_a)
             .expect("decode_all should succeed");
@@ -1535,7 +1535,7 @@ mod tests {
         // Direct: decode_to_slice with WILDCOPY slack.
         let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut dec_b = FrameDecoder::new();
-        let mut out_b = std::vec![0u8; payload.len() + slack];
+        let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
             .decode_to_slice(compressed.as_slice(), &mut out_b)
             .expect("decode_to_slice should succeed");
@@ -1573,7 +1573,7 @@ mod tests {
 
         // Baseline: decode_all through the FlatBuf+drain path.
         let mut dec_a = FrameDecoder::new();
-        let mut out_a = std::vec![0u8; payload.len()];
+        let mut out_a = alloc::vec![0u8; payload.len()];
         let n_a = dec_a
             .decode_all(compressed.as_slice(), &mut out_a)
             .expect("decode_all should succeed");
@@ -1584,7 +1584,7 @@ mod tests {
         // + per-block drop_to_window_size.
         let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut dec_b = FrameDecoder::new();
-        let mut out_b = std::vec![0u8; payload.len() + slack];
+        let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
             .decode_to_slice(compressed.as_slice(), &mut out_b)
             .expect("decode_to_slice should succeed on multi-segment frame");
@@ -1628,7 +1628,7 @@ mod tests {
 
         let mut dec = FrameDecoder::new();
         // Exactly payload.len(), no slack — direct path is gated out.
-        let mut out = std::vec![0u8; payload.len()];
+        let mut out = alloc::vec![0u8; payload.len()];
         let n = dec
             .decode_to_slice(compressed.as_slice(), &mut out)
             .expect("decode_to_slice should still succeed via fallback");
