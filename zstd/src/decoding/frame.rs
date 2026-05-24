@@ -168,6 +168,28 @@ impl FrameHeader {
     pub fn frame_content_size(&self) -> u64 {
         self.frame_content_size
     }
+
+    /// Raw `Window_Descriptor` byte from the frame header
+    /// (RFC 8878 §3.1.1.1.2 layout: `(exp << 3) | mantissa`),
+    /// or `None` when the `Single_Segment_flag` is set — in
+    /// single-segment frames the byte is omitted from the wire
+    /// (the `Window_Size` is derived from `Frame_Content_Size`
+    /// instead) and the corresponding field on this struct is
+    /// not populated.
+    ///
+    /// `frame` module is `pub(crate)`, so this method is reachable
+    /// only from in-crate validation paths (e.g. the `lsm` feature's
+    /// `expect_window_descriptor` setter); `allow(dead_code)` keeps
+    /// default builds warning-free when no in-crate caller invokes
+    /// it.
+    #[allow(dead_code)]
+    pub fn window_descriptor(&self) -> Option<u8> {
+        if self.descriptor.single_segment_flag() {
+            None
+        } else {
+            Some(self.window_descriptor)
+        }
+    }
 }
 
 /// The first byte is called the `Frame Header Descriptor`, and it describes what other fields

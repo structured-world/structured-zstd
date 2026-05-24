@@ -75,6 +75,18 @@ std = []
 # activation via `STRUCTURED_ZSTD_KERNEL_TRACE=1` env var. Used by the
 # `trace_fast_kernel` example for #220 ratio-divergence investigation.
 kernel_trace = ["std"]
+# Opt-in storage-format extensions: typed Rust APIs that downstream
+# storage / wire-format consumers (lsm-tree, future graph stores) can
+# layer on top of the spec-mandated zstd decoder behaviour. Default
+# off, no C FFI symbols added regardless of this feature's state.
+# Currently exposes:
+# - expected-field validation setters on `FrameDecoder`
+#   (`expect_dict_id` / `expect_window_descriptor`) for wire-format
+#   consumers that need post-AEAD-decrypt sanity checks against a
+#   pinned `dict_id` / `window_descriptor`.
+# Other typed APIs land here over time as bilateral storage-format
+# work expands the surface.
+lsm = []
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
