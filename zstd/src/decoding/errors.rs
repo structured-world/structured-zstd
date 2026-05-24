@@ -627,17 +627,27 @@ impl core::fmt::Display for FrameDecoderError {
             }
             #[cfg(feature = "lsm")]
             FrameDecoderError::UnexpectedDictId { expected, found } => {
-                write!(
-                    f,
-                    "Frame header dict_id mismatch: expected {expected:?}, found {found:?}"
-                )
+                write!(f, "Frame header dict_id mismatch: expected ")?;
+                match expected {
+                    Some(id) => write!(f, "0x{id:X}")?,
+                    None => write!(f, "<none>")?,
+                }
+                write!(f, ", found ")?;
+                match found {
+                    Some(id) => write!(f, "0x{id:X}"),
+                    None => write!(f, "<none>"),
+                }
             }
             #[cfg(feature = "lsm")]
             FrameDecoderError::UnexpectedWindowDescriptor { expected, found } => {
                 write!(
                     f,
-                    "Frame header window_descriptor mismatch: expected 0x{expected:02X}, found {found:?}"
-                )
+                    "Frame header window_descriptor mismatch: expected 0x{expected:02X}, found "
+                )?;
+                match found {
+                    Some(byte) => write!(f, "0x{byte:02X}"),
+                    None => write!(f, "<none> (single-segment frame omits window_descriptor)"),
+                }
             }
         }
     }

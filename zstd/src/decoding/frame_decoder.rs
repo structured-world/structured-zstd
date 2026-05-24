@@ -633,51 +633,33 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         Self::validate_registered_dictionary(dict.as_dict())?;
         let magicless = self.magicless;
-        let state = match &mut self.state {
-            Some(s) => {
-                s.reset_with_format(source, magicless)?;
-                s
-            }
+        // Scope the &mut borrow of `self.state` to the header parse
+        // alone, so the subsequent `validate_expectations(&self, ...)`
+        // call below can take a fresh shared borrow of self without
+        // tripping the borrow checker.
+        match &mut self.state {
+            Some(s) => s.reset_with_format(source, magicless)?,
             None => {
                 self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
-                self.state.as_mut().unwrap()
-            }
-        };
-        #[cfg(feature = "lsm")]
-        {
-            // Borrow-check workaround: validate_expectations needs
-            // &self, but we hold &mut state via self.state. Read
-            // the pinned values out, drop the mutable borrow path
-            // briefly, validate, then continue.
-            let expect_dict = self.expect_dict_id;
-            let expect_wd = self.expect_window_descriptor;
-            if expect_dict.is_some() || expect_wd.is_some() {
-                let header = &state.frame_header;
-                if let Some(expected) = expect_dict {
-                    let found = header.dictionary_id();
-                    let matches = match (expected, found) {
-                        (0, None) => true,
-                        (e, Some(f)) => e == f,
-                        _ => false,
-                    };
-                    if !matches {
-                        return Err(FrameDecoderError::UnexpectedDictId {
-                            expected: Some(expected),
-                            found,
-                        });
-                    }
-                }
-                if let Some(expected) = expect_wd {
-                    let found = header.window_descriptor();
-                    if found != Some(expected) {
-                        return Err(FrameDecoderError::UnexpectedWindowDescriptor {
-                            expected,
-                            found,
-                        });
-                    }
-                }
             }
         }
+        // Single source of truth: route through the same
+        // `validate_expectations` used by `reset()`. Routing through
+        // the helper keeps the two code paths from drifting (e.g.,
+        // if expect-semantics or error wiring changes later).
+        #[cfg(feature = "lsm")]
+        {
+            let header = &self
+                .state
+                .as_ref()
+                .expect("state populated by reset_with_format/new_with_format")
+                .frame_header;
+            self.validate_expectations(header)?;
+        }
+        let state = self
+            .state
+            .as_mut()
+            .expect("state populated by reset_with_format/new_with_format");
         if let Some(dict_id) = state.frame_header.dictionary_id()
             && dict_id != dict.id()
         {
