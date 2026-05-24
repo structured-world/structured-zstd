@@ -9,11 +9,12 @@
 //! - No active dictionary (the persistent dict_content is not
 //!   carried into the stack-local DecodeBuffer this backend
 //!   builds; dict frames stay on the regular path).
-//! - With `feature = "hash"`: no `content_checksum_flag` (the
-//!   persistent rolling hash is on `DecoderScratch::buffer.hash`,
-//!   not on the stack-local buffer; checksummed frames stay on
-//!   the regular path until hash propagation lands as a
-//!   follow-up). When `hash` is disabled this gate has no effect.
+//!
+//! `content_checksum_flag` is NOT a precondition: when set, the
+//! direct-decode caller walks `output[..content_size]` once at end
+//! of decode (single sequential xxhash pass over cache-hot data)
+//! and stores the digest into the persistent scratch's hasher so
+//! `get_calculated_checksum()` reads the right value.
 //!
 //! Multi-segment frames work via the caller's per-block
 //! `DecodeBuffer::drop_to_window_size` invocation — bytes drop

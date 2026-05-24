@@ -154,11 +154,11 @@ impl BlockDecoder {
                 Ok(1)
             }
             BlockType::Raw => {
-                // Pass `source` by value, not `&mut source`: `extend_from_reader<R: Read>`
-                // takes `R` by value, and `crate::io::Read` (the `no_std` shim) does not
-                // provide a blanket `impl<R: Read + ?Sized> Read for &mut R` like
-                // `std::io::Read` does, so `&mut source` would fail to compile without
-                // the `std` feature. `source` is not used after this match arm.
+                // Pass `source` by value rather than `&mut source` — it isn't
+                // used after this match arm anyway, so moving avoids the
+                // borrow-by-reference indirection. (Both io shims provide a
+                // blanket `Read for &mut T`, so `&mut source` would also
+                // compile; the by-value form is just cleaner here.)
                 workspace
                     .split()
                     .buffer

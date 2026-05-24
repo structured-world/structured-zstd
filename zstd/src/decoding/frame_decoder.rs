@@ -1173,10 +1173,12 @@ impl FrameDecoder {
     /// - No active dictionary on `self.state` (dict_content is not
     ///   carried into the stack-local DecodeBuffer this method
     ///   builds).
-    /// - With `feature = "hash"`: frame header lacks
-    ///   `content_checksum_flag` (the rolling hash lives on the
-    ///   persistent buffer; hash propagation across the direct
-    ///   path is a follow-up).
+    ///
+    /// `content_checksum_flag` is NOT a disqualifier: when set,
+    /// the direct path hashes the decoded `output[..content_size]`
+    /// once at the end of decode and propagates the digest into
+    /// the persistent scratch's `hash` so
+    /// [`Self::get_calculated_checksum`] returns the right value.
     ///
     /// Multi-segment frames are supported via a per-block
     /// `DecodeBuffer::drop_to_window_size` call that caps the
@@ -1205,17 +1207,25 @@ impl FrameDecoder {
     /// second frame (or error) on trailing bytes. Multi-frame
     /// streams must use [`Self::decode_all`].
     ///
-    /// On the direct-decode path (eligible single-segment frame +
-    /// sized output) the literal pushes and sequence-execution match
-    /// copies write straight into `output`, eliminating the
-    /// FlatBuf-as-intermediate `read()` drain that dominates
-    /// poorly-compressed L-7-class corpora (~28% of decode time on
-    /// `level_-7_fast/decodecorpus-z000033/rust_stream`).
+    /// On the direct path the literal pushes and
+    /// sequence-execution match copies write straight into
+    /// `output`, eliminating the FlatBuf-as-intermediate `read()`
+    /// drain that dominates poorly-compressed L-7-class corpora
+    /// (~28% of decode time on
+    /// `level_-7_fast/decodecorpus-z000033/rust_stream`). Both
+    /// single-segment and multi-segment frames take the direct
+    /// path; multi-segment frames cap the visible buffer at
+    /// `window_size` between blocks via
+    /// `DecodeBuffer::drop_to_window_size`.
     ///
-    /// Frames that are not single-segment, or where `output` is too
-    /// small for the WILDCOPY_OVERLENGTH slack, transparently fall
-    /// back to the existing [`Self::decode_all`] path. Both paths
-    /// return the number of bytes written into `output`.
+    /// Frames that aren't eligible (zero `frame_content_size`,
+    /// active dictionary, undersized `output`) transparently fall
+    /// back to the internal block-decode + read drain loop. The
+    /// fallback is NOT [`Self::decode_all`] semantics: it decodes
+    /// exactly one frame and returns; trailing bytes past the
+    /// frame are silently ignored. Use [`Self::decode_all`] for
+    /// multi-frame input or streams that may contain skippable
+    /// frames.
     ///
     /// `input` is expected to contain exactly ONE non-skippable
     /// zstd frame. **Skippable frames are rejected with
@@ -1235,11 +1245,14 @@ impl FrameDecoder {
     ///
     /// - [`Self::is_finished`] returns `true`,
     /// - [`Self::can_collect`] returns `0`,
-    /// - [`Self::read`] (`std::io::Read`) reads 0 bytes,
+    /// - [`Self::read`] (the crate's `io::Read` impl, which under
+    ///   `feature = "std"` is `std::io::Read`) reads 0 bytes,
     /// - [`Self::collect`] returns `Some(Vec::new())`,
-    /// - [`Self::get_calculated_checksum`] is `None` on the
-    ///   direct path because the rolling hash lives on the
-    ///   stack-local buffer that was dropped.
+    /// - [`Self::get_calculated_checksum`] returns the correct
+    ///   value when the frame had `content_checksum_flag` set —
+    ///   the direct path walks the output once at end of decode
+    ///   and propagates the digest into the persistent scratch's
+    ///   hasher so this accessor reads the right state.
     ///
     /// Callers must use the bytes from `output[..n]` (where `n`
     /// is the returned count); do not mix `decode_to_slice` with
@@ -1261,8 +1274,13 @@ impl FrameDecoder {
     /// in-block writes from running first.
     ///
     /// Callers handling untrusted input must use [`Self::decode_all`]
-    /// which routes through `FlatBuf` / `RingBuffer` whose
-    /// `Vec::reserve` growth path returns errors. Fallible
+    /// which routes through `FlatBuf` / `RingBuffer`. Those
+    /// backends grow via `Vec::reserve` (succeeds or aborts on
+    /// alloc failure — not error-returning), but the growable Vec
+    /// capacity absorbs a malformed block's overshoot inside the
+    /// allocation; the frame-level checks then turn the size
+    /// mismatch into `FrameContentSizeMismatch` instead of OOB
+    /// writes into a fixed-size user slice. Fallible
     /// `BufferBackend` writes that would let `decode_to_slice`
     /// remain safe on adversarial input are tracked in issue #246.
     pub fn decode_to_slice(
@@ -1324,12 +1342,15 @@ impl FrameDecoder {
         // content_checksum_flag set — the existing drain path
         // remains correct for those frames.
         let dict_active = state.using_dict.is_some();
-        #[cfg(feature = "hash")]
-        let hash_active = state.frame_header.descriptor.content_checksum_flag();
-        #[cfg(not(feature = "hash"))]
-        let hash_active = false;
-        let eligible =
-            content_size > 0 && !dict_active && !hash_active && (output.len() as u64) >= needed;
+        // `content_checksum_flag` is no longer a disqualifier. The
+        // direct path writes the decoded bytes into the user's
+        // `output` slice, and we hash that slice once at the end of
+        // decode (single sequential pass over cache-hot data). The
+        // computed digest is then propagated into the persistent
+        // `state.decoder_scratch.buffer.hash` so the public
+        // `get_calculated_checksum()` accessor reads the correct
+        // value just like on the `decode_all` path.
+        let eligible = content_size > 0 && !dict_active && (output.len() as u64) >= needed;
 
         if !eligible {
             // Frame doesn't qualify for direct decode (empty
@@ -1507,6 +1528,28 @@ impl FrameDecoder {
         // `output[0]`.
         let written = content_size as usize;
         state.frame_finished = true;
+        // Drop the stack-local DirectScratch (and its DecodeBuffer
+        // borrow on `output`) so we can re-borrow `output` for the
+        // hash pass below. After this point `direct` is gone.
+        drop(direct);
+        #[cfg(feature = "hash")]
+        if state.frame_header.descriptor.content_checksum_flag() {
+            // Direct path bypasses the per-write hash accounting
+            // (DecodeBuffer hashes during drain; the direct path
+            // never drains because the user slice IS the buffer).
+            // Walk the decoded output once and propagate the
+            // resulting hasher state into the persistent scratch's
+            // buffer so `get_calculated_checksum()` returns the
+            // right value. Cost: ~330 us / MiB at xxhash's
+            // ~3 GB/s throughput on x86_64, against cache-hot data.
+            use core::hash::Hasher;
+            let mut hasher = twox_hash::XxHash64::with_seed(0);
+            hasher.write(&output[..written]);
+            match &mut state.decoder_scratch {
+                DecoderScratchKind::Flat(s) => s.buffer.hash = hasher,
+                DecoderScratchKind::Ring(s) => s.buffer.hash = hasher,
+            }
+        }
         Ok(written)
     }
 }
@@ -1633,6 +1676,48 @@ mod tests {
                 .descriptor
                 .single_segment_flag(),
             "test precondition violated: frame is single-segment, rename or resize"
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn decode_to_slice_propagates_checksum_into_persistent_scratch() {
+        // Direct path on a checksum-flagged frame: the FrameCompressor
+        // under `feature = "hash"` sets content_checksum_flag, so the
+        // decoded frame has a recorded checksum. After
+        // decode_to_slice we must be able to verify it matches via
+        // the public get_calculated_checksum() accessor — the digest
+        // is computed by walking output at end of decode and stored
+        // into the persistent scratch's hasher.
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let n = dec
+            .decode_to_slice(compressed.as_slice(), &mut out)
+            .expect("decode_to_slice with checksum must succeed");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], payload.as_slice());
+
+        // Both sides must report the same checksum: the frame header
+        // carries the stored u32, and get_calculated_checksum reads
+        // the running digest the direct path just propagated.
+        let stored = dec.get_checksum_from_data();
+        let calculated = dec.get_calculated_checksum();
+        assert!(stored.is_some(), "frame must carry stored checksum");
+        assert!(
+            calculated.is_some(),
+            "direct path must propagate calculated checksum"
+        );
+        assert_eq!(
+            stored, calculated,
+            "stored vs calculated checksum mismatch on direct path"
         );
     }
 
