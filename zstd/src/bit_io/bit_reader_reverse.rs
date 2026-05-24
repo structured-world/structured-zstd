@@ -152,7 +152,15 @@ unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u
 /// back to front to decode it properly. `BitReaderReversed` provides a
 /// convenient interface to do that.
 pub struct BitReaderReversed<'s> {
-    /// The index of the last read byte in the source.
+    /// Start offset (in bytes) of the 8-byte source window currently
+    /// loaded into `bit_container`. Decreases monotonically as bytes
+    /// are consumed: `refill` walks it backward toward 0 by
+    /// `bits_consumed / 8`, and `bits_remaining()` uses
+    /// `index * 8 + (64 - bits_consumed)` to compute how many stream
+    /// bits remain. The byte at `source[index]` is the LSB of the
+    /// `from_le_bytes` u64 in `bit_container`; the byte at
+    /// `source[index + 7]` is the MSB (= the next stream bit at
+    /// position 63 of `bit_container`, before any consumption).
     ///
     /// `pub(crate)` so the HUF 4-stream burst hot loop in
     /// `decoding::literals_section_decoder` can run donor's

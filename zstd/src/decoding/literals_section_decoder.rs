@@ -484,15 +484,22 @@ unsafe fn run_4stream_burst_loop(
         //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
         //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
         //     pre-computes).
-        //   * `ip[s] + 8 <= source.len()`: the `refill` fast-path during
-        //     `init_state` establishes `brs[s].index <= source.len() - 8`
-        //     (only for `source.len() >= 8`); the `refill_slow` path used
-        //     for shorter streams leaves `index = 0` and `bits_consumed = 0`,
-        //     making `min_ip = 0 < bytes_per_iter_upper` so the burst
-        //     loop exits via `any_iter = false` BEFORE reaching this
-        //     reload (the writeback below is unreachable on `source.len()
-        //     < 8`). Within the loop, `ip[s]` only decreases via the
-        //     line above this comment, preserving the upper bound.
+        //   * `ip[s] + 8 <= source.len()`: `BitReaderReversed::new()`
+        //     starts with `bits_consumed = 64`, so the very first
+        //     `get_bits(1)` in the per-stream padding-skip loop
+        //     above triggers `refill()`. For `source.len() >= 8` that
+        //     fast-path establishes `brs[s].index = source.len() - 8`;
+        //     `init_state`'s subsequent `get_bits(max_num_bits)`
+        //     stays inside the same 8-byte window without another
+        //     refill (only `bits_consumed` advances). The
+        //     `refill_slow` path used for shorter streams leaves
+        //     `index = 0` (with the partial bytes left-shifted into
+        //     `bit_container`), making `min_ip = 0 <
+        //     bytes_per_iter_upper` so the burst loop exits via
+        //     `any_iter = false` BEFORE reaching this reload (the
+        //     writeback below is unreachable on `source.len() < 8`).
+        //     Within the loop, `ip[s]` only decreases via the line
+        //     above this comment, preserving the upper bound.
         for s in 0..4 {
             let ctz = bits[s].trailing_zeros();
             let nb_bytes = (ctz >> 3) as usize;
