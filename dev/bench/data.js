@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779595333843,
+  "lastUpdate": 1779632697863,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -45398,6 +45398,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.273,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0f5036a448938d924a4db82d2b46f6c5872e6463",
+          "message": "feat(decode): expect_dict_id + expect_window_descriptor setters on FrameDecoder (#249)\n\n* feat(decode): expect_dict_id + expect_window_descriptor setters on FrameDecoder\n\nAdd post-frame-header validation setters gated behind the `lsm`\nCargo feature (default off, std-free).\n\n* `FrameDecoder::expect_dict_id(Option<u32>)` — pin the\n  `Dictionary_ID` the next frame must carry. `Some(0)` is the\n  \"no dictionary expected\" sentinel matching frames whose header\n  omits the optional field; `Some(n)` requires an exact match;\n  `None` (default) disables the check.\n* `FrameDecoder::expect_window_descriptor(Option<u8>)` — pin the\n  raw `Window_Descriptor` byte the next frame must carry. Byte-\n  exact equality (NOT a ceiling — donor `ZSTD_d_windowLogMax` is\n  a separate semantic). Single-segment frames (which omit the\n  byte from the wire) surface as `found: None` so callers\n  distinguish \"wrong descriptor\" from \"no descriptor on the\n  wire\" rather than silently passing.\n* New `FrameHeader::window_descriptor() -> Option<u8>` accessor\n  returns the raw byte (None for single-segment frames).\n* New typed error variants\n  `FrameDecoderError::UnexpectedDictId { expected, found }` and\n  `FrameDecoderError::UnexpectedWindowDescriptor { expected,\n  found }`, both gated `#[cfg(feature = \"lsm\")]`. Validation\n  fires BEFORE any block decode work — no allocation, no XXH64\n  init, no partial output. After failure, the decoder is\n  re-resettable cleanly on the next `reset()` call.\n\nValidation hooks in `FrameDecoder::reset` and\n`FrameDecoder::reset_with_dict_handle` after frame header parses\nand BEFORE dict lookup / scratch init-from-dict.\n\n`lsm` feature stays `[]` (no implied std). `no-std + alloc + lsm`\nbuild clean. Default build (lsm off) byte-identical to today:\nno new public symbols, no behaviour change, no C FFI surface\ntouched.\n\nTests added (9, gated on `lsm`): default-None passes, Some(0) ~\nNone equivalence, matching value passes via reset_with_dict_handle,\nmismatching value fails before decode, nonzero-on-dictless fails,\nwindow_descriptor mismatch fails, single-segment + expectation\nfails with found=None (via synthetic frame builder),\nvalidation-failure-then-clear leaves decoder re-resettable.\n\n* refactor(decode): single validate_expectations + hex Display for expect-errors\n\n* `reset_with_dict_handle` no longer inlines a hand-copy of the\n  pinned-value validation. It scopes the `&mut self.state` borrow\n  to header-parse alone, then routes through the same\n  `validate_expectations(&self, &FrameHeader)` helper that\n  `reset()` uses. Single source of truth — semantics or error\n  wiring changes touch one place.\n* `FrameDecoderError::UnexpectedDictId` Display formats both\n  `expected` and `found` as `0x{id:X}` (matching the\n  `DictIdMismatch` / `DictNotProvided` / `DictAlreadyRegistered`\n  variants in the same enum). `None` cases render as `<none>`\n  to distinguish \"no dictionary expected/found\" from a zero id.\n* `FrameDecoderError::UnexpectedWindowDescriptor` Display formats\n  `found` as `0x{byte:02X}` for `Some(_)` (matching `expected`'s\n  hex style) and as `<none> (single-segment frame omits\n  window_descriptor)` for `None`. Removes the prior inconsistency\n  where `{:?}` would render the byte in decimal alongside hex\n  `expected`.\n\n* docs(decode): honest validate_expectations cost + window_descriptor field\n\n* `expect_dict_id` rustdoc and `UnexpectedDictId` variant docs no\n  longer claim mismatches return \"with no allocation\". Validation\n  fires AFTER `FrameDecoderState::new_with_format` /\n  `reset_with_format` populates the scratch (which may allocate /\n  reserve decode buffers for the parsed window size). The\n  guarantee promised today is \"no block decode, no XXH64 init,\n  no partial output\" — the scratch sizing cost is paid even on a\n  mismatched header.\n* `FrameHeader::window_descriptor` accessor doc no longer says\n  the underlying field is \"not populated\" for single-segment\n  frames. The parser always initialises the field; for\n  single-segment frames it stays at its default `0` because no\n  byte is read from the wire. The accessor reports the absence\n  as `None` so callers don't conflate \"missing byte on the wire\"\n  with \"byte present and equal to 0\".",
+          "timestamp": "2026-05-24T16:32:14+03:00",
+          "tree_id": "868b62dfdad529cc03f168fd9a35986144d4f8be",
+          "url": "https://github.com/structured-world/structured-zstd/commit/0f5036a448938d924a4db82d2b46f6c5872e6463"
+        },
+        "date": 1779632692130,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.142,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 274.279,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.544,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.383,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.068,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.905,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.975,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.302,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.891,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.739,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.484,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.538,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.046,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.573,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.075,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.284,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
