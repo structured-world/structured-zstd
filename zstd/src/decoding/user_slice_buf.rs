@@ -81,17 +81,16 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 ///
 /// # DoS surface on malformed Compressed blocks
 ///
-/// The bounds checks on write entry points are release-mode
-/// `assert!` (for `extend` and `extend_from_within_unchecked`) and
-/// `debug_assert!` (for `extend_and_fill`). On adversarial input —
-/// a frame header that declares a small `frame_content_size` AND a
+/// The bounds checks on write entry points are uniformly
+/// release-mode `assert!` (for `extend`, `extend_and_fill`, and
+/// `extend_from_within_unchecked`). On adversarial input — a frame
+/// header that declares a small `frame_content_size` AND a
 /// Compressed block whose payload expands to more than the declared
 /// size — the burst's per-symbol writes can reach past `slice.len()`
-/// and panic (`assert!` failure or, in `extend_and_fill`'s release
-/// build, a slice-indexing panic) instead of returning a structured
-/// error. The frame-level `decode_to_slice` checks `produced >
-/// content_size` AFTER each block; within a single block the
-/// panic-on-overshoot is the only stop.
+/// and panic via the `assert!` failure instead of returning a
+/// structured error. The frame-level `decode_to_slice` checks
+/// `produced > content_size` AFTER each block; within a single block
+/// the panic-on-overshoot is the only stop.
 ///
 /// Callers handling untrusted input should use
 /// [`crate::decoding::FrameDecoder::decode_all`] which routes
@@ -250,7 +249,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     #[inline]
     fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         let new_tail = self.tail + fill_length;
-        debug_assert!(new_tail <= self.slice.len());
+        // Release-mode `assert!` (not `debug_assert!`) for symmetry
+        // with `extend` / `extend_from_within_unchecked`. Without it,
+        // a malformed Compressed block whose RLE fill expands past
+        // the declared `frame_content_size` would panic via the
+        // subsequent `self.slice[self.tail..new_tail]` slice index
+        // with a less-informative message, AND the in-block writes
+        // would already have happened up to the slice length. Fail
+        // fast with a clear corruption / capacity diagnostic.
+        assert!(
+            new_tail <= self.slice.len(),
+            "UserSliceBackend::extend_and_fill overflows slice (tail+={}, cap={}) — corrupt frame",
+            fill_length,
+            self.slice.len()
+        );
         for b in &mut self.slice[self.tail..new_tail] {
             *b = fill_with;
         }
