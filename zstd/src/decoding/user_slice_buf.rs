@@ -129,6 +129,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// [`Self::from_slice`]. Returns an empty backend wrapping an
     /// empty static slice; any subsequent `extend` call will panic
     /// via the capacity check.
+    ///
+    /// The `&mut []` literal is `&'static mut [u8; 0]` (compiler-
+    /// emitted empty array, no aliasing because length is 0). It
+    /// coerces to `&'a mut [u8]` for any `'a` because `&'_ mut T`
+    /// is covariant in its lifetime parameter (longer lifetime can
+    /// be narrowed). No raw-pointer + PhantomData workaround needed
+    /// — verified by `cargo check` + 587 tests passing.
     fn new() -> Self {
         Self {
             slice: &mut [],

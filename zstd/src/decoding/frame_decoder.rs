@@ -1246,6 +1246,25 @@ impl FrameDecoder {
     /// `read`/`collect` on the same `FrameDecoder`. The
     /// fallback (`decode_all`) sub-path inside this method
     /// behaves like the regular `decode_all` w.r.t. state.
+    ///
+    /// # Panic / DoS surface
+    ///
+    /// **For trusted input only.** On the direct path
+    /// `UserSliceBackend` uses release-mode `assert!` /
+    /// debug-asserted slice indexing for capacity checks. A
+    /// malformed Compressed block whose payload expands past the
+    /// declared `frame_content_size` (and beyond the
+    /// `WILDCOPY_OVERLENGTH` slack the caller sized into `output`)
+    /// will panic mid-block rather than returning a structured
+    /// error. The per-block `produced > content_size` guard catches
+    /// the overshoot AFTER the block, but cannot prevent the
+    /// in-block writes from running first.
+    ///
+    /// Callers handling untrusted input must use [`Self::decode_all`]
+    /// which routes through `FlatBuf` / `RingBuffer` whose
+    /// `Vec::reserve` growth path returns errors. Fallible
+    /// `BufferBackend` writes that would let `decode_to_slice`
+    /// remain safe on adversarial input are tracked in issue #246.
     pub fn decode_to_slice(
         &mut self,
         mut input: &[u8],
