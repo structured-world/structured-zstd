@@ -235,8 +235,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let total_writable = self.slice.len() - self.tail;
         // SAFETY: caller-provided `data` is non-aliasing with the
         // backend's slice (it's the literals buffer or input view).
-        // `new_tail <= self.slice.len()` (debug_assert above), so
-        // both regions have ≥ `len` valid bytes.
+        // `new_tail <= self.slice.len()` (release-mode `assert!`
+        // above), so both regions have ≥ `len` valid bytes.
         unsafe {
             super::simd_copy::copy_bytes_overshooting(
                 (data.as_ptr(), len),
@@ -361,12 +361,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
+    extern crate alloc;
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn extend_writes_at_tail() {
-        let mut buf = std::vec![0u8; 32];
+        let mut buf = vec![0u8; 32];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[1, 2, 3, 4]);
         assert_eq!(b.len(), 4);
@@ -379,7 +380,7 @@ mod tests {
 
     #[test]
     fn extend_and_fill_repeats_byte() {
-        let mut buf = std::vec![0u8; 16];
+        let mut buf = vec![0u8; 16];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[0xAA]);
         b.extend_and_fill(0xBB, 4);
@@ -389,7 +390,7 @@ mod tests {
 
     #[test]
     fn extend_from_within_unchecked_copies_non_overlapping() {
-        let mut buf = std::vec![0u8; 32];
+        let mut buf = vec![0u8; 32];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[10, 20, 30, 40, 50]);
         // SAFETY: 0+3 <= 5 = len; cap 32 covers 5+3.
@@ -400,7 +401,7 @@ mod tests {
 
     #[test]
     fn drop_first_n_advances_head_keeps_history() {
-        let mut buf = std::vec![0u8; 32];
+        let mut buf = vec![0u8; 32];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[1, 2, 3, 4, 5]);
         b.drop_first_n(2);
@@ -416,7 +417,7 @@ mod tests {
 
     #[test]
     fn set_tail_rollback() {
-        let mut buf = std::vec![0u8; 32];
+        let mut buf = vec![0u8; 32];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[1, 2, 3]);
         let saved = b.tail();
@@ -430,7 +431,7 @@ mod tests {
 
     #[test]
     fn clear_resets_cursors() {
-        let mut buf = std::vec![0u8; 32];
+        let mut buf = vec![0u8; 32];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.extend(&[1, 2, 3]);
         b.drop_first_n(1);
@@ -441,7 +442,7 @@ mod tests {
 
     #[test]
     fn extend_from_reader_into_slice() {
-        let mut buf = std::vec![0u8; 16];
+        let mut buf = vec![0u8; 16];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         let src = [9u8, 8, 7, 6, 5];
         b.extend_from_reader(&src[..], 5).unwrap();
@@ -451,7 +452,7 @@ mod tests {
 
     #[test]
     fn extend_from_reader_over_capacity_errors() {
-        let mut buf = std::vec![0u8; 4];
+        let mut buf = vec![0u8; 4];
         let mut b = UserSliceBackend::from_slice(&mut buf);
         let src = [9u8, 8, 7, 6, 5];
         // 5 bytes requested, only 4 cap -> error, tail unchanged.
