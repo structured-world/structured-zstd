@@ -11,7 +11,7 @@ use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
     DecompressBlockError,
 };
-use crate::decoding::scratch::DecoderScratch;
+use crate::decoding::scratch::Workspace;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -41,10 +41,10 @@ impl BlockDecoder {
     /// The decode buffer inside `workspace` may be reserved or grown during
     /// decoding. For some block types the decompressed size is known up front,
     /// but this is not guaranteed before any data is written.
-    pub fn decode_block_content<B: super::buffer_backend::BufferBackend>(
+    pub fn decode_block_content<W: Workspace>(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch<B>,
+        workspace: &mut W,
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {
@@ -66,6 +66,7 @@ impl BlockDecoder {
                     }
                 })?;
                 workspace
+                    .split()
                     .buffer
                     .extend_and_fill(buf[0], header.decompressed_size as usize);
 
@@ -80,6 +81,7 @@ impl BlockDecoder {
                 // `std::io::Read` does, so `&mut source` would fail to compile without
                 // the `std` feature. `source` is not used after this match arm.
                 workspace
+                    .split()
                     .buffer
                     .extend_from_reader(source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
@@ -106,18 +108,19 @@ impl BlockDecoder {
         }
     }
 
-    fn decompress_block<B: super::buffer_backend::BufferBackend>(
+    fn decompress_block<W: Workspace>(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch<B>, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut W,
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
-        workspace
+        let parts = workspace.split();
+        parts
             .block_content_buffer
             .resize(header.content_size as usize, 0);
 
-        source.read_exact(workspace.block_content_buffer.as_mut_slice())?;
-        let raw = workspace.block_content_buffer.as_slice();
+        source.read_exact(parts.block_content_buffer.as_mut_slice())?;
+        let raw = parts.block_content_buffer.as_slice();
 
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
@@ -148,17 +151,13 @@ impl BlockDecoder {
         let raw_literals = &raw[..upper_limit_for_literals];
         vprintln!("Slice for literals: {}", raw_literals.len());
 
-        workspace.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
-        let bytes_used_in_literals_section = decode_literals(
-            &section,
-            &mut workspace.huf,
-            raw_literals,
-            &mut workspace.literals_buffer,
-        )?;
+        parts.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
+        let bytes_used_in_literals_section =
+            decode_literals(&section, parts.huf, raw_literals, parts.literals_buffer)?;
         assert!(
-            section.regenerated_size == workspace.literals_buffer.len() as u32,
+            section.regenerated_size == parts.literals_buffer.len() as u32,
             "Wrong number of literals: {}, Should have been: {}",
-            workspace.literals_buffer.len(),
+            parts.literals_buffer.len(),
             section.regenerated_size
         );
         assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
@@ -189,17 +188,18 @@ impl BlockDecoder {
             // and inlines the per-iter execute_one_sequence work next to
             // the FSE state advance. Falls back to the legacy two-pass
             // pipeline internally when any of LL/ML/OF is in RLE mode.
-            // Pass field-level borrows so `raw` (immutable view into
-            // workspace.block_content_buffer) can coexist with the mutable
-            // borrows on the FSE / decode-buffer / offset-hist fields.
+            // Pass field-level borrows from the WorkspaceRef so `raw`
+            // (immutable view into block_content_buffer) can coexist
+            // with the mutable borrows on the FSE / decode-buffer /
+            // offset-hist fields.
             decode_and_execute_sequences(
                 &seq_section,
                 raw,
-                &mut workspace.fse,
-                &mut workspace.buffer,
-                &mut workspace.offset_hist,
-                &workspace.literals_buffer,
-                &mut workspace.sequences,
+                parts.fse,
+                parts.buffer,
+                parts.offset_hist,
+                parts.literals_buffer,
+                parts.sequences,
             )?;
         } else {
             if !raw.is_empty() {
@@ -209,8 +209,8 @@ impl BlockDecoder {
                     },
                 ));
             }
-            workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
+            parts.buffer.push(parts.literals_buffer);
+            parts.sequences.clear();
         }
 
         Ok(())
