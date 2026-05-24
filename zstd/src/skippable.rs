@@ -214,7 +214,13 @@ impl SkippableFrame {
         // reads commit pages only as the reader delivers bytes,
         // so a 4 GiB-declared payload on a 12-byte stream commits
         // ~one page, surfaces `Payload`, and exits.
-        const CHUNK: usize = 16 * 1024;
+        // 1 KiB scratch — small enough to live comfortably on a
+        // Cortex-M0 4 KiB default stack while still amortising the
+        // per-read overhead vs byte-by-byte reads. Larger sizes
+        // (16 KiB) realistically overflow small-stack embedded
+        // targets that this crate explicitly supports via the
+        // no-std + alloc build.
+        const CHUNK: usize = 1024;
         let mut scratch = [0u8; CHUNK];
         let mut remaining = length;
         while remaining > 0 {
