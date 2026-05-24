@@ -69,7 +69,7 @@ pub struct WorkspaceRef<'a, B: BufferBackend> {
 /// disjoint-borrow analysis. Per-field accessors would force
 /// sequential borrows and break call sites that need e.g.
 /// `&mut huf` and `&mut literals_buffer` simultaneously.
-pub trait Workspace {
+pub(crate) trait Workspace {
     type Backend: BufferBackend;
     fn split(&mut self) -> WorkspaceRef<'_, Self::Backend>;
 }
@@ -85,6 +85,55 @@ impl<B: BufferBackend> Workspace for DecoderScratch<B> {
             literals_buffer: &mut self.literals_buffer,
             sequences: &mut self.sequences,
             block_content_buffer: &mut self.block_content_buffer,
+        }
+    }
+}
+
+/// Direct-decode scratch: per-call workspace that wraps a
+/// stack-local [`DecodeBuffer<UserSliceBackend<'o>>`] over the
+/// caller's `&'o mut [u8]` output slice, plus `&'p mut` borrows of
+/// the persistent decoder state (HUF / FSE tables, offset_hist,
+/// sequence cache, scratch Vecs) owned by [`crate::decoding::FrameDecoder`].
+///
+/// The lifetime split:
+/// - `'o` — caller's output slice (borrowed via `buffer`).
+/// - `'p` — FrameDecoder's persistent fields (borrowed via the
+///   `&'p mut` fields).
+///
+/// Implementing [`Workspace`] lets the existing
+/// `block_decoder::decode_block_content` / `decompress_block`
+/// generic-over-W functions consume this scratch unchanged — see
+/// the donor-parity rationale in #244 for why eliminating the
+/// `DecodeBuffer::read` drain copy is the perf target.
+///
+/// Constructed inside `FrameDecoder::decode_to_slice` and dropped
+/// at function exit; never persisted across calls.
+pub struct DirectScratch<'o, 'p> {
+    pub huf: &'p mut HuffmanScratch,
+    pub fse: &'p mut FSEScratch,
+    pub buffer: DecodeBuffer<super::user_slice_buf::UserSliceBackend<'o>>,
+    pub offset_hist: &'p mut [u32; 3],
+    pub literals_buffer: &'p mut Vec<u8>,
+    pub sequences: &'p mut Vec<Sequence>,
+    pub block_content_buffer: &'p mut Vec<u8>,
+}
+
+impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
+    type Backend = super::user_slice_buf::UserSliceBackend<'o>;
+    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend> {
+        // Reborrow the `&'p mut` fields to `&'_ mut` so the returned
+        // WorkspaceRef's lifetime is tied to the `&mut self` of this
+        // call, not to `'p`. This is what lets nested decode
+        // functions hold a WorkspaceRef without freezing the whole
+        // `'p`-bound DirectScratch for their entire scope.
+        WorkspaceRef {
+            huf: &mut *self.huf,
+            fse: &mut *self.fse,
+            buffer: &mut self.buffer,
+            offset_hist: &mut *self.offset_hist,
+            literals_buffer: &mut *self.literals_buffer,
+            sequences: &mut *self.sequences,
+            block_content_buffer: &mut *self.block_content_buffer,
         }
     }
 }
