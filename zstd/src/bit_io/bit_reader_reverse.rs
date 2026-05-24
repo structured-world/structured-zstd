@@ -153,7 +153,13 @@ unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u
 /// convenient interface to do that.
 pub struct BitReaderReversed<'s> {
     /// The index of the last read byte in the source.
-    index: usize,
+    ///
+    /// `pub(crate)` so the HUF 4-stream burst hot loop in
+    /// `decoding::literals_section_decoder` can run donor's
+    /// `ip[s] -= nb_bytes; bits[s] = MEM_read64(ip[s]) | 1` reload
+    /// pattern directly against the byte stream — see
+    /// [`Self::bits_consumed`] for the broader rationale.
+    pub(crate) index: usize,
 
     /// How many bits have been consumed from `bit_container`.
     ///
@@ -172,7 +178,11 @@ pub struct BitReaderReversed<'s> {
     extra_bits: usize,
 
     /// The source data to read from.
-    source: &'s [u8],
+    ///
+    /// `pub(crate)` — paired with [`Self::index`], the HUF 4-stream
+    /// burst hot loop needs direct slice access for the per-iter
+    /// donor-pattern reload (`MEM_read64(source[ip..ip+8])`).
+    pub(crate) source: &'s [u8],
 
     /// The reader doesn't read directly from the source, it reads bits from here, and the container
     /// is "refilled" as it's emptied.
