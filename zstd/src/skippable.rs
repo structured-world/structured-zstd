@@ -36,8 +36,9 @@
 //! Magic variants `0x184D2A50..=0x184D2A5F` are an **application-protocol**
 //! concern, NOT a structured-zstd concern. This crate accepts
 //! `magic_variant: u8` in `0..=15` and validates only that bound. No
-//! per-variant constants are baked into the source. The README
-//! tracks known allocations across the ecosystem.
+//! per-variant constants are baked into the source — applications are
+//! responsible for documenting which variants they claim and
+//! coordinating with other ecosystem consumers to avoid collisions.
 
 extern crate alloc;
 
@@ -340,7 +341,14 @@ impl core::fmt::Display for SkippableFrameError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for SkippableFrameError {}
+impl std::error::Error for SkippableFrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::InvalidMagicVariant(_) | Self::PayloadTooLarge(_) => None,
+        }
+    }
+}
 
 impl From<Error> for SkippableFrameError {
     fn from(value: Error) -> Self {
@@ -371,7 +379,16 @@ impl core::fmt::Display for DecodeSkippableFrameError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for DecodeSkippableFrameError {}
+impl std::error::Error for DecodeSkippableFrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Magic(e) | Self::Length(e) | Self::Payload(e) => Some(e),
+            Self::BadMagicNumber(_)
+            | Self::AllocationFailed { .. }
+            | Self::PayloadTooLarge { .. } => None,
+        }
+    }
+}
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
