@@ -317,6 +317,19 @@ impl FSETable {
                 let meta = packed[idx];
                 entry.base_value = meta & 0x00FF_FFFF;
                 entry.num_additional_bits = (meta >> 24) as u8;
+            } else {
+                // Out-of-range symbol — reachable only on
+                // `feature = "fuzz_exports"` builds where external
+                // code can stuff arbitrary entries into the table.
+                // Explicitly zero both fields so the next decode
+                // pass observes a clean state instead of stale
+                // metadata from a previous (well-formed) enrich
+                // call. The downstream `decode_one_sequence_inline`
+                // hot path still surfaces the corruption via the
+                // existing bitstream checks; this clears prior
+                // values rather than introducing a new fast-fail.
+                entry.base_value = 0;
+                entry.num_additional_bits = 0;
             }
         }
     }
@@ -336,6 +349,11 @@ impl FSETable {
     /// wraparound shift here.
     pub fn enrich_for_offsets(&mut self) {
         for entry in self.decode.iter_mut() {
+            // Reset before the bound check so out-of-range
+            // symbols clear stale metadata instead of carrying it
+            // over from a previous enrich pass.
+            entry.base_value = 0;
+            entry.num_additional_bits = 0;
             let code = entry.symbol;
             if code < 32 {
                 entry.base_value = 1u32 << code;
