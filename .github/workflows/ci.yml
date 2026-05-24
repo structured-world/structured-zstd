@@ -472,6 +472,31 @@ jobs:
       - name: Build compare_ffi + compare_ffi_memory bench binaries
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
+          # The donor zstd-sys C library uses runtime feature detection
+          # (is_x86_feature_detected!-equivalent) so it transparently
+          # picks up BMI2/AVX2/etc. on the runner. Pure-Rust hot paths
+          # gate intrinsics on COMPILE-time cfg!(target_feature = ...)
+          # and the default rustc x86_64 target ships with SSE2 only.
+          # Without explicit target selection the bench compares
+          # "donor with full ISA" vs "us with SSE2 baseline" — not
+          # apples-to-apples.
+          #
+          # Use a DETERMINISTIC baseline (x86-64-v3 = BMI2 + AVX2 +
+          # everything in the Haswell ISA, the 2013+ x86_64 baseline)
+          # ONLY for x86_64 targets via target.<triple>.rustflags. NOT
+          # target-cpu=native: that picks whatever CPU the BUILD runner
+          # has, which (a) varies across github-runners, (b) crashes
+          # with SIGILL when a bench shard runner lacks features the
+          # build runner had, and (c) is meaningless for cross-compile
+          # targets like i686-unknown-linux-gnu.
+          #
+          # i686 / non-x86 / musl targets keep the default rustc
+          # baseline. Measured +8.5% on
+          # decompress/level_-1_fast/decodecorpus-z000033/c_stream on
+          # i9-9900K; the win comes from _bzhi_u64-backed
+          # mask_lower_bits in the FSE state-update hot path.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
           # `--no-run` builds without executing; `--message-format=json`
           # exposes the resolved binary path in the build log so we

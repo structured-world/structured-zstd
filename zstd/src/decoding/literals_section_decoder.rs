@@ -9,6 +9,10 @@ use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
+/// Test-only Vec-output wrapper retained for the existing roundtrip
+/// test suite, which asserts the literal byte stream lands fully
+/// in a Vec. Production callers use [`decode_literals_zerocopy`].
+#[cfg(test)]
 pub fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
@@ -26,9 +30,86 @@ pub fn decode_literals(
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
             let bytes_read = decompress_literals(section, scratch, source, target)?;
-
-            //return sum of used bytes
             Ok(bytes_read)
+        }
+    }
+}
+
+/// Result of [`decode_literals_zerocopy`]. For Raw sections this is a
+/// borrow straight into the input — no memcpy. For RLE / HUF
+/// sections it's a borrow of the scratch `literals_buffer` where the
+/// data was materialised.
+pub struct LiteralsView<'a> {
+    /// Decoded literal bytes available for the sequence executor.
+    pub data: &'a [u8],
+    /// Bytes consumed from the input literals section payload
+    /// (Raw: regenerated_size; HUF: header + jump + 4 streams).
+    pub bytes_used: u32,
+}
+
+/// Zero-copy variant of [`decode_literals`]. For Raw literal sections
+/// returns a slice straight into `source` instead of copying bytes
+/// into a Vec — eliminates one memcpy + one zero-touch wave per RAW
+/// literal byte on the direct-decode path. RLE / HUF paths still go
+/// through `target` because they have to produce new bytes (RLE: N
+/// copies of one byte; HUF: indexed burst writes).
+///
+/// Donor parity: `dctx->litPtr` is set to either `src` (Raw) or
+/// `dctx->litBuffer` (HUF); the seq executor reads from
+/// `dctx->litPtr` uniformly.
+pub fn decode_literals_zerocopy<'a>(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &'a [u8],
+    target: &'a mut Vec<u8>,
+) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
+    // Snapshot `target.len()` before any decode work — the returned
+    // view must point ONLY at the newly-decoded bytes, not at any
+    // pre-existing tail the caller forgot to `clear()`. The current
+    // in-tree callers clear before this call, but anchoring the
+    // view at `base..` makes the API robust against future
+    // misuse and matches donor's `dctx->litPtr` semantics (always
+    // points at the current frame's literals, never carries
+    // history from earlier blocks' Vecs).
+    let base = target.len();
+    match section.ls_type {
+        LiteralsSectionType::Raw => {
+            let n = section.regenerated_size as usize;
+            // Bounds check: a truncated frame can claim more raw
+            // literals than the source slice carries. Return a
+            // structured error instead of panicking on `source[0..n]`.
+            if source.len() < n {
+                return Err(DecompressLiteralsError::MissingBytesForLiterals {
+                    got: source.len(),
+                    needed: n,
+                });
+            }
+            // Zero-copy: borrow the payload from source. `target` is
+            // left untouched — the caller passes `LiteralsView::data`
+            // to the sequence executor instead.
+            Ok(LiteralsView {
+                data: &source[0..n],
+                bytes_used: section.regenerated_size,
+            })
+        }
+        LiteralsSectionType::RLE => {
+            // RLE expands one byte to N — has to write into target.
+            // Need at least one source byte (the fill byte).
+            if source.is_empty() {
+                return Err(DecompressLiteralsError::MissingBytesForLiterals { got: 0, needed: 1 });
+            }
+            target.resize(base + section.regenerated_size as usize, source[0]);
+            Ok(LiteralsView {
+                data: &target[base..],
+                bytes_used: 1,
+            })
+        }
+        LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
+            let bytes_used = decompress_literals(section, scratch, source, target)?;
+            Ok(LiteralsView {
+                data: &target[base..],
+                bytes_used,
+            })
         }
     }
 }
@@ -549,6 +630,108 @@ unsafe fn run_4stream_burst_loop(
         });
         brs[s].bits_consumed = nb_bits_last[s] + max_num_bits;
         decoders[s].state = bits[s] >> table_shift;
+    }
+}
+
+#[cfg(test)]
+mod zerocopy_robustness_tests {
+    //! Regression coverage for `decode_literals_zerocopy` on
+    //! truncated / corrupt payloads: every branch must return a
+    //! structured error instead of panicking on out-of-bounds
+    //! slice indexing. Hit each `*[..n]` / `*[0]` index in the
+    //! function with a payload one byte short of what the header
+    //! declares.
+    //
+    // Tests live in a separate module so the broader `burst_gate_tests`
+    // module's helpers don't have to depend on truncated-input
+    // builders.
+    use super::{LiteralsView, decode_literals_zerocopy};
+    use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+    use crate::decoding::scratch::HuffmanScratch;
+    use crate::huff0::HuffmanTable;
+    use alloc::vec::Vec;
+
+    fn raw_section(regen: u32) -> LiteralsSection {
+        LiteralsSection {
+            ls_type: LiteralsSectionType::Raw,
+            regenerated_size: regen,
+            compressed_size: None,
+            num_streams: None,
+        }
+    }
+
+    fn rle_section(regen: u32) -> LiteralsSection {
+        LiteralsSection {
+            ls_type: LiteralsSectionType::RLE,
+            regenerated_size: regen,
+            compressed_size: None,
+            num_streams: None,
+        }
+    }
+
+    fn fresh_scratch() -> HuffmanScratch {
+        HuffmanScratch {
+            table: HuffmanTable::new(),
+        }
+    }
+
+    #[test]
+    fn raw_truncated_source_returns_error_no_panic() {
+        // Header claims 10 raw literal bytes, source carries 3.
+        // Indexing `source[0..10]` would panic; the fix must turn
+        // it into a structured DecompressLiteralsError.
+        let section = raw_section(10);
+        let source: [u8; 3] = [1, 2, 3];
+        let mut target: Vec<u8> = Vec::new();
+        let mut scratch = fresh_scratch();
+        let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+        assert!(
+            result.is_err(),
+            "truncated raw source must error, not panic; got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn rle_empty_source_returns_error_no_panic() {
+        // RLE section needs at least one source byte (the fill byte).
+        // Indexing `source[0]` on an empty slice would panic.
+        let section = rle_section(10);
+        let source: [u8; 0] = [];
+        let mut target: Vec<u8> = Vec::new();
+        let mut scratch = fresh_scratch();
+        let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+        assert!(
+            result.is_err(),
+            "empty RLE source must error, not panic; got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn rle_view_excludes_pre_existing_target_bytes() {
+        // Even if the caller forgot to clear `target`, the returned
+        // LiteralsView::data must point only at the bytes this call
+        // produced. The API hardening (`&target[base..]`) is what
+        // makes this hold.
+        let mut target: Vec<u8> = Vec::from([0xAA, 0xBB, 0xCC]);
+        let section = rle_section(4);
+        let source: [u8; 1] = [0x42];
+        let mut scratch = fresh_scratch();
+        let view = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target)
+            .expect("RLE with valid source must succeed");
+        assert_eq!(view.data.len(), 4, "view length must match regen_size");
+        assert!(
+            view.data.iter().all(|&b| b == 0x42),
+            "view must contain only the newly-RLE-expanded bytes, got {:?}",
+            view.data
+        );
+        // Silence unused-warning if the compiler ever strips
+        // LiteralsView fields — read bytes_used too.
+        let _ = LiteralsView {
+            data: view.data,
+            bytes_used: view.bytes_used,
+        };
     }
 }
 

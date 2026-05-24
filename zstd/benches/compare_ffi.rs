@@ -318,6 +318,28 @@ fn bench_decompress_source(
         })
     });
 
+    // Direct-decode path (#244): target sized with WILDCOPY_OVERLENGTH
+    // slack so `decode_to_slice_trusted` takes the direct-write branch
+    // (decode straight into `target`, no FlatBuf drain copy).
+    // Exposed alongside `pure_rust` so dashboards can attribute the
+    // memory-traffic delta directly.
+    group.bench_function("pure_rust_direct", |b| {
+        let compressed = materialize();
+        // Sized to match the dispatcher's eligibility check —
+        // mirror the constant from the decoder instead of
+        // duplicating its value so the bench can't silently drift
+        // off the direct path if the slack changes.
+        let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+        let mut decoder = FrameDecoder::new();
+        b.iter(|| {
+            let written = decoder
+                .decode_to_slice_trusted(black_box(compressed), &mut target)
+                .unwrap();
+            black_box(&target[..written]);
+            assert_eq!(written, expected_len);
+        })
+    });
+
     group.bench_function("c_ffi", |b| {
         // Reuse one DCtx + target buffer across iterations so the
         // timing sample reflects decode steady-state — matches the

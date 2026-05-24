@@ -592,6 +592,62 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Total bytes ever produced into the backend across this
+    /// `DecodeBuffer`'s lifetime. Incremented by `push` / `repeat` /
+    /// `extend_and_fill` / `extend_from_reader`. Survives across
+    /// `drop_to_window_size` and `drain_*` calls (those only narrow
+    /// the visible region; they don't roll back produced).
+    ///
+    /// Used by the direct-decode path (`FrameDecoder::decode_to_slice_trusted`)
+    /// to track actual bytes written against the declared
+    /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
+    /// which is intentionally 0 for `BlockType::Compressed` (the
+    /// header parser doesn't decode the body), so per-block tracking
+    /// via the header field would always read 0 on compressed blocks
+    /// and miscount.
+    pub fn total_produced(&self) -> u64 {
+        self.total_output_counter
+    }
+
+    /// Advance the backend's head past any bytes beyond `window_size`
+    /// without producing them to a sink — the bytes remain physically
+    /// present (the backend's allocation never shrinks), but they are
+    /// no longer visible through [`Self::len`] / `as_slices` /
+    /// `repeat`. Used by the direct-decode path on multi-segment
+    /// frames where the caller's output IS the buffer, so the bytes
+    /// don't need to be drained anywhere — they just need to drop
+    /// out of `len()` so the offset-bound match validation
+    /// (`offset <= buffer.len()`) coincides with the spec's
+    /// window-size rule (`offset <= window_size`).
+    ///
+    /// Does NOT update the rolling content checksum. On the direct
+    /// path the caller (`FrameDecoder::decode_to_slice_trusted`) hashes the
+    /// final `output[..content_size]` slice ONCE at end of decode
+    /// (single sequential xxhash pass over cache-hot data) and
+    /// propagates the digest into the persistent scratch's hasher.
+    /// Hashing inside `drop_to_window_size` would re-hash the same
+    /// bytes per block (this method runs once per block on
+    /// multi-segment frames), which is wasted work — the end-of-
+    /// decode walk covers the entire output uniformly.
+    ///
+    /// Returns the number of bytes whose visibility was discarded.
+    ///
+    /// Does NOT mutate `total_output_counter`: that counter tracks
+    /// total bytes produced (incremented by `push` / `repeat` /
+    /// `extend_and_fill`). Advancing `head` just hides
+    /// already-produced bytes from the visible region; counting them
+    /// again would double-count and break `repeat_from_dict`'s offset
+    /// reachability check.
+    pub fn drop_to_window_size(&mut self) -> usize {
+        match self.can_drain_to_window_size() {
+            None => 0,
+            Some(can_drop) => {
+                self.buffer.drop_first_n(can_drop);
+                can_drop
+            }
+        }
+    }
+
     /// drain the buffer completely
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();

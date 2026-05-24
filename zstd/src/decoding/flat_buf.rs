@@ -16,7 +16,6 @@
 
 use crate::io::{Error, Read};
 use alloc::vec::Vec;
-use core::ptr;
 
 use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 
@@ -183,11 +182,28 @@ impl BufferBackend for FlatBuf {
         let src_off = self.head + start;
         debug_assert!(src_off + len <= dst_off);
         debug_assert!(dst_off + len <= self.buf.capacity());
+        // Route through `simd_copy::copy_bytes_overshooting` so short
+        // match copies (the common L-1 fast pattern) hit the inline
+        // SIMD / overlapping-u64 fast paths instead of going to
+        // libc `__memmove_avx_unaligned_erms` via
+        // `ptr::copy_nonoverlapping`. The dispatch cost was 40% of
+        // decode CPU on the L-1 c_stream flamegraph.
+        let total_readable = self.buf.len() - src_off;
+        let total_writable = self.buf.capacity() - dst_off;
         // SAFETY: caller's non-overlap precondition gives
-        // src_off + len <= dst_off. Capacity covers dst_off + len.
+        // `src_off + len <= dst_off`. `total_readable >= len` since
+        // `src_off + len <= dst_off <= self.buf.len()`.
+        // `total_writable >= len` because Vec capacity covers the
+        // upfront reserve. The helper may overshoot up to
+        // `total_writable` (= cap - dst_off, which includes the
+        // WILDCOPY_OVERLENGTH slack baked into with_capacity).
         unsafe {
-            let ptr = self.buf.as_mut_ptr();
-            ptr::copy_nonoverlapping(ptr.add(src_off), ptr.add(dst_off), len);
+            let base = self.buf.as_mut_ptr();
+            super::simd_copy::copy_bytes_overshooting(
+                (base.add(src_off), total_readable),
+                (base.add(dst_off), total_writable),
+                len,
+            );
             self.buf.set_len(dst_off + len);
         }
     }

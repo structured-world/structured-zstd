@@ -34,6 +34,111 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     pub block_content_buffer: Vec<u8>,
 }
 
+/// Borrowed view of all per-call decoder scratch fields as `&mut`
+/// references. Returned by [`Workspace::split`] so the block /
+/// literals / sequence decoder functions can hold simultaneous
+/// independent borrows of distinct fields — the field-split is
+/// what makes "borrow huf and literals_buffer at the same time"
+/// type-check, both for the owned [`DecoderScratch<B>`] path and the
+/// direct-decode path where these fields are borrowed by reference
+/// from a [`crate::decoding::FrameDecoder`].
+///
+/// The lifetime `'a` is the shorter-of (a) the underlying owner's
+/// lifetime and (b) the active borrow. The backend type `B` flows
+/// through to [`super::decode_buffer::DecodeBuffer<B>`].
+pub struct WorkspaceRef<'a, B: BufferBackend> {
+    pub huf: &'a mut HuffmanScratch,
+    pub fse: &'a mut FSEScratch,
+    pub buffer: &'a mut DecodeBuffer<B>,
+    pub offset_hist: &'a mut [u32; 3],
+    pub literals_buffer: &'a mut Vec<u8>,
+    pub sequences: &'a mut Vec<Sequence>,
+    pub block_content_buffer: &'a mut Vec<u8>,
+}
+
+/// Polymorphic accessor for the decoder's per-call scratch state.
+/// Both the owned [`DecoderScratch<B>`] (used by the streaming and
+/// one-shot `decode_all` paths) and the borrow-ref direct-decode
+/// scratch (`DirectScratch`) implement this trait, so the block /
+/// literals / sequence decode functions are written once against
+/// `Workspace` and instantiated for both shapes via compile-time
+/// monomorphisation.
+///
+/// The single `split` method returns all fields at once as a
+/// [`WorkspaceRef`] so callers retain Rust's field-level
+/// disjoint-borrow analysis. Per-field accessors would force
+/// sequential borrows and break call sites that need e.g.
+/// `&mut huf` and `&mut literals_buffer` simultaneously.
+pub(crate) trait Workspace {
+    type Backend: BufferBackend;
+    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend>;
+}
+
+impl<B: BufferBackend> Workspace for DecoderScratch<B> {
+    type Backend = B;
+    fn split(&mut self) -> WorkspaceRef<'_, B> {
+        WorkspaceRef {
+            huf: &mut self.huf,
+            fse: &mut self.fse,
+            buffer: &mut self.buffer,
+            offset_hist: &mut self.offset_hist,
+            literals_buffer: &mut self.literals_buffer,
+            sequences: &mut self.sequences,
+            block_content_buffer: &mut self.block_content_buffer,
+        }
+    }
+}
+
+/// Direct-decode scratch: per-call workspace that wraps a
+/// stack-local [`DecodeBuffer<UserSliceBackend<'o>>`] over the
+/// caller's `&'o mut [u8]` output slice, plus `&'p mut` borrows of
+/// the persistent decoder state (HUF / FSE tables, offset_hist,
+/// sequence cache, scratch Vecs) owned by [`crate::decoding::FrameDecoder`].
+///
+/// The lifetime split:
+/// - `'o` — caller's output slice (borrowed via `buffer`).
+/// - `'p` — FrameDecoder's persistent fields (borrowed via the
+///   `&'p mut` fields).
+///
+/// Implementing [`Workspace`] lets the existing
+/// `block_decoder::decode_block_content` / `decompress_block`
+/// generic-over-W functions consume this scratch unchanged. The
+/// perf rationale: eliminating the `DecodeBuffer::read` drain copy
+/// that the owned-buffer path performs, by writing decoded bytes
+/// straight into the caller-provided output slice.
+///
+/// Constructed inside `FrameDecoder::decode_to_slice_trusted` and dropped
+/// at function exit; never persisted across calls.
+pub struct DirectScratch<'o, 'p> {
+    pub huf: &'p mut HuffmanScratch,
+    pub fse: &'p mut FSEScratch,
+    pub buffer: DecodeBuffer<super::user_slice_buf::UserSliceBackend<'o>>,
+    pub offset_hist: &'p mut [u32; 3],
+    pub literals_buffer: &'p mut Vec<u8>,
+    pub sequences: &'p mut Vec<Sequence>,
+    pub block_content_buffer: &'p mut Vec<u8>,
+}
+
+impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
+    type Backend = super::user_slice_buf::UserSliceBackend<'o>;
+    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend> {
+        // Reborrow the `&'p mut` fields to `&'_ mut` so the returned
+        // WorkspaceRef's lifetime is tied to the `&mut self` of this
+        // call, not to `'p`. This is what lets nested decode
+        // functions hold a WorkspaceRef without freezing the whole
+        // `'p`-bound DirectScratch for their entire scope.
+        WorkspaceRef {
+            huf: &mut *self.huf,
+            fse: &mut *self.fse,
+            buffer: &mut self.buffer,
+            offset_hist: &mut *self.offset_hist,
+            literals_buffer: &mut *self.literals_buffer,
+            sequences: &mut *self.sequences,
+            block_content_buffer: &mut *self.block_content_buffer,
+        }
+    }
+}
+
 impl<B: BufferBackend> DecoderScratch<B> {
     pub fn new(window_size: usize) -> DecoderScratch<B> {
         DecoderScratch {
@@ -63,6 +168,45 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.literals_buffer.clear();
         self.sequences.clear();
         self.block_content_buffer.clear();
+
+        // Pre-allocate the per-block scratch Vecs to `min(window_size,
+        // MAX_BLOCK_SIZE)` so the first block's
+        // `extend_from_slice` / `resize` does not pay anonymous-page
+        // first-touch faults inside the decode hot path. `clear()`
+        // keeps `capacity()`, so subsequent frames with the same
+        // (or smaller) window also avoid realloc. Matches donor's
+        // upfront sizing strategy where `dctx->litExtraBuffer` and
+        // the dst layout are sized to `blockSizeMax` at frame init.
+        // Measured at ~18% of decode-time page-fault cost on
+        // level_-7_fast/decodecorpus-z000033.
+        let block_cap = (window_size.min(crate::common::MAX_BLOCK_SIZE as usize)).max(8);
+        // Pre-TOUCH (not just reserve) so the kernel maps the
+        // anonymous pages here instead of inside the decode hot
+        // path. `Vec::reserve` only allocates address space; the
+        // first byte-write to each 4 KiB page still triggers a
+        // page fault.
+        //
+        // ONLY when the Vec's capacity is below the target — once
+        // a frame has touched the pages once, `clear()` keeps both
+        // `capacity()` AND the kernel's anonymous-page mapping, so
+        // subsequent frames hit warm memory without re-zeroing.
+        // The previous shape (`resize` + `clear` unconditionally)
+        // paid an O(block_cap) memset every frame reset, ~37 µs
+        // per 128 KiB at AVX2 store rates. Now it's only paid on
+        // the very first reset (or after a grow to larger
+        // window_size).
+        //
+        // This matches donor's `dctx->litExtraBuffer` /
+        // `dctx->workspace` lifecycle — touched once at decoder
+        // construction, warm across all subsequent frames.
+        if self.literals_buffer.capacity() < block_cap {
+            self.literals_buffer.resize(block_cap, 0);
+            self.literals_buffer.clear();
+        }
+        if self.block_content_buffer.capacity() < block_cap {
+            self.block_content_buffer.resize(block_cap, 0);
+            self.block_content_buffer.clear();
+        }
 
         self.buffer.reset(window_size);
 

@@ -15,3 +15,16 @@ members = ["zstd", "cli"]
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+# `cargo flamegraph` profile — like bench, but with FULL debug info
+# so Rust symbol-mangling resolves in the .svg. The flamegraph tool
+# reads DWARF inline info to demangle frames; `line-tables-only`
+# strips the type info the demangler needs and leaves large `[unknown]`
+# regions in the output. Kept separate from `bench` so timing runs
+# stay fast (debug = "full" roughly doubles build time and bloats
+# binaries ~5×). Use via
+#   cargo flamegraph --profile flamegraph --bench compare_ffi -- ...
+[profile.flamegraph]
+inherits = "bench"
+debug = "full"
+strip = "none"
