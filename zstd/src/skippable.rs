@@ -180,15 +180,12 @@ impl SkippableFrame {
         // bytes than the wire declared and leaving the reader
         // mis-aligned at a junk position in the stream. Surface
         // unrepresentable lengths as `PayloadTooLarge` BEFORE any
-        // allocation; the `requested` payload is reported in u32
-        // wire-format units so callers can still see the declared
-        // value even when it does not fit in this target's
-        // `usize`.
-        let length = usize::try_from(length_u32).map_err(|_| {
-            DecodeSkippableFrameError::PayloadTooLarge {
-                length: length_u32 as usize, // saturates to usize::MAX on truncation, for diagnostic only
-            }
-        })?;
+        // allocation. The error variant carries the raw wire-format
+        // `u32` so the diagnostic reports the declared value
+        // verbatim — no narrowing cast where it would matter most
+        // (the 16-bit target).
+        let length = usize::try_from(length_u32)
+            .map_err(|_| DecodeSkippableFrameError::PayloadTooLarge { length: length_u32 })?;
 
         // Reject lengths that the `new()` / `write_skippable_frame()`
         // path would also reject up front. On 32-bit targets this
@@ -199,7 +196,7 @@ impl SkippableFrame {
         // rejected everything above `u16::MAX`, so this is also
         // a no-op there.
         if length.checked_add(SKIPPABLE_HEADER_SIZE).is_none() {
-            return Err(DecodeSkippableFrameError::PayloadTooLarge { length });
+            return Err(DecodeSkippableFrameError::PayloadTooLarge { length: length_u32 });
         }
 
         let mut payload: Vec<u8> = Vec::new();
@@ -337,12 +334,17 @@ pub enum DecodeSkippableFrameError {
     /// asked for.
     AllocationFailed { requested: usize },
     /// Wire-format `length` field is not representable on this
-    /// target's `usize` width: `length + SKIPPABLE_HEADER_SIZE`
-    /// would overflow. Hits only 32-bit targets where the u32
-    /// wire-format ceiling coincides with `usize::MAX`. On 64-bit
-    /// every u32 length is representable and this variant is
-    /// unreachable.
-    PayloadTooLarge { length: usize },
+    /// target's `usize` width: either `usize::try_from(length)`
+    /// fails outright (16-bit targets where the declared length
+    /// exceeds `u16::MAX`) or `length + SKIPPABLE_HEADER_SIZE`
+    /// would overflow `usize` (32-bit targets where the declared
+    /// length sits near `u32::MAX`). On 64-bit every u32 length
+    /// is representable and this variant is unreachable.
+    ///
+    /// `length` is the raw wire-format `u32` value from the
+    /// length field — preserved exactly so callers can diagnose
+    /// what the stream declared, without any narrowing cast.
+    PayloadTooLarge { length: u32 },
 }
 
 impl core::fmt::Display for SkippableFrameError {
@@ -669,7 +671,7 @@ mod tests {
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
         match err {
             DecodeSkippableFrameError::PayloadTooLarge { length } => {
-                assert_eq!(length, huge as usize);
+                assert_eq!(length, huge);
             }
             DecodeSkippableFrameError::AllocationFailed { requested } => {
                 assert_eq!(requested, huge as usize);
