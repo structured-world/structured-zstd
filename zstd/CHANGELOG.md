@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.24](https://github.com/structured-world/structured-zstd/compare/v0.0.23...v0.0.24) - 2026-05-24
+
+### Performance
+
+- *(decode)* pack HUF decode table as u16 (donor HUF_DEltX1 layout) ([#243](https://github.com/structured-world/structured-zstd/pull/243))
+- *(decode)* collapse HUF 4-stream burst-gate to single-cursor olimit ([#238](https://github.com/structured-world/structured-zstd/pull/238))
+- *(encoder)* align lazy-band target_len with donor clevels.h table[0] ([#239](https://github.com/structured-world/structured-zstd/pull/239))
+- *(fast)* donor-parity hot-path cleanups in Fast kernel + inline short-literal append (#220 follow-up) ([#231](https://github.com/structured-world/structured-zstd/pull/231))
+
+### Testing
+
+- *(encoding)* donor-parity comparator for block splitter port ([#240](https://github.com/structured-world/structured-zstd/pull/240))
+- *(bench)* add decompress-dict group to compare_ffi ([#236](https://github.com/structured-world/structured-zstd/pull/236))
+
 ## [0.0.23](https://github.com/structured-world/structured-zstd/compare/v0.0.22...v0.0.23) - 2026-05-23
 
 ### Added
