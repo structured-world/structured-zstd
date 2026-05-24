@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.25](https://github.com/structured-world/structured-zstd/compare/v0.0.24...v0.0.25) - 2026-05-24
+
+### Added
+
+- *(skippable)* typed SkippableFrame API behind lsm feature ([#248](https://github.com/structured-world/structured-zstd/pull/248))
+- *(decode)* expect_dict_id + expect_window_descriptor setters on FrameDecoder ([#249](https://github.com/structured-world/structured-zstd/pull/249))
+
+### Performance
+
+- *(decode)* direct-write decode_to_slice path ([#244](https://github.com/structured-world/structured-zstd/pull/244)) ([#245](https://github.com/structured-world/structured-zstd/pull/245))
+
 ## [0.0.24](https://github.com/structured-world/structured-zstd/compare/v0.0.23...v0.0.24) - 2026-05-24
 
 ### Performance
