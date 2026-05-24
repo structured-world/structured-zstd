@@ -1952,6 +1952,46 @@ mod tests {
     }
 
     #[test]
+    fn decode_to_slice_fallback_accepts_honest_explicit_fcs_zero() {
+        // Companion to the corrupt-FCS=0 test above: an HONEST
+        // empty frame with FCS_flag=2 (4-byte FCS) explicitly set
+        // to 0 AND a 0-byte raw last-block. `fcs_declared()`
+        // returns true and `content_size == 0 == total_written`,
+        // so the fallback validation accepts the frame instead of
+        // misreporting a mismatch.
+        //
+        // (Single-segment FCS=0 would test a similar invariant
+        // but trips header-stage validation: `window_size =
+        // frame_content_size = 0 < MIN_WINDOW_SIZE` fails the
+        // window-size sanity check before decode runs. Use the
+        // multi-segment shape where `window_size` comes from
+        // `window_descriptor` independently of FCS.)
+        //
+        // Frame layout:
+        //   4 B magic
+        //   1 B FHD              — FCS_flag=2, others 0 → 0x80
+        //   1 B window_descriptor — exp=10 → 1 MiB window
+        //   4 B FCS              — 0 LE
+        //   3 B block header     — raw, last, size=0 → 0x01 0x00 0x00
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+        wire.push(0b1000_0000);
+        wire.push(0x50);
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        // Block header: (0 << 3) | (0 << 1) | 1 = 0x01.
+        wire.push(0x01);
+        wire.push(0x00);
+        wire.push(0x00);
+
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; 16];
+        let n = dec
+            .decode_to_slice(wire.as_slice(), &mut out)
+            .expect("honest FCS=0 + empty block must succeed");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
     fn reset_with_dict_handle_applies_dict_when_no_dict_id() {
         let payload = b"reset-without-dict-id";
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
