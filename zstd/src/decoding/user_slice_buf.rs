@@ -140,12 +140,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// empty static slice; any subsequent `extend` call will panic
     /// via the capacity check.
     ///
-    /// The `&mut []` literal is `&'static mut [u8; 0]` (compiler-
-    /// emitted empty array, no aliasing because length is 0). It
-    /// coerces to `&'a mut [u8]` for any `'a` because `&'_ mut T`
-    /// is covariant in its lifetime parameter (longer lifetime can
-    /// be narrowed). No raw-pointer + PhantomData workaround needed
-    /// — verified by `cargo check` + 587 tests passing.
+    /// `&mut []` is a zero-length placeholder slice the compiler
+    /// emits with `'static` lifetime; assigning it into the
+    /// `slice: &'a mut [u8]` field compiles for any `'a` because
+    /// `'static` outlives every other lifetime. No aliasing concern
+    /// because the length is 0 (no addressable bytes the field
+    /// could alias against). No raw-pointer + PhantomData workaround
+    /// needed — verified by `cargo check` + the full nextest suite.
+    /// This placeholder shape is fine ONLY because `new()` is never
+    /// the entry point on the direct-decode path; non-empty
+    /// constructions go through `from_slice` with a real `&'a mut [u8]`.
     fn new() -> Self {
         Self {
             slice: &mut [],

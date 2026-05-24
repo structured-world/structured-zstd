@@ -1314,14 +1314,24 @@ impl FrameDecoder {
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
         // Eligibility independent of `single_segment_flag`:
-        // multi-segment frames work too as long as we cap
-        // `buffer.len()` at `window_size` between blocks (so the
-        // `DecodeBuffer::repeat` offset bound coincides with the
-        // spec's `offset <= window_size` rule). The post-block
-        // `drop_to_window_size` call in the loop below does exactly
-        // that — bytes physically remain in the user slice, they
-        // just leave `len()`'s visible range so malformed
-        // `offset > window_size` matches get rejected.
+        // multi-segment frames work via a coarse, block-boundary
+        // cap on the visible buffer. The post-block
+        // `drop_to_window_size` call in the loop below advances the
+        // backend's `head` so `buffer.len()` doesn't grow past
+        // `window_size` between blocks — bytes physically remain
+        // in the user slice, just leave `len()`'s visible range so
+        // a subsequent block's match-offset cannot reach back
+        // arbitrarily far via stale history.
+        //
+        // This is NOT strict spec enforcement of
+        // `offset <= window_size`: within a single block
+        // `buffer.len()` can temporarily exceed `window_size` and
+        // `DecodeBuffer::repeat` validates against `buffer.len()`
+        // (not `window_size`), so an in-block match with
+        // `offset > window_size` but `offset <= current
+        // buffer.len()` is accepted on both direct and fallback
+        // paths. See the `decode_to_slice` doc for the full
+        // limitation note.
         //
         // Disabled when a dictionary is active: the persistent
         // `DecoderScratch::buffer.dict_content` seeded by
@@ -1522,7 +1532,7 @@ impl FrameDecoder {
         // hash pass below. After this point `direct` is gone.
         drop(direct);
         #[cfg(feature = "hash")]
-        if state.frame_header.descriptor.content_checksum_flag() {
+        {
             // Direct path bypasses the per-write hash accounting
             // (DecodeBuffer hashes during drain; the direct path
             // never drains because the user slice IS the buffer).
@@ -1531,6 +1541,13 @@ impl FrameDecoder {
             // buffer so `get_calculated_checksum()` returns the
             // right value. Cost: ~330 us / MiB at xxhash's
             // ~3 GB/s throughput on x86_64, against cache-hot data.
+            //
+            // Done unconditionally for every successful direct
+            // decode (not just frames with `content_checksum_flag`)
+            // so `get_calculated_checksum()` returns the running
+            // digest path-independently — matches what
+            // `decode_all`'s drain-time hashing produces on
+            // checksumless frames too.
             use core::hash::Hasher;
             let mut hasher = twox_hash::XxHash64::with_seed(0);
             hasher.write(&output[..written]);
