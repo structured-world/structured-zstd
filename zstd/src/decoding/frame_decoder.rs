@@ -1271,8 +1271,9 @@ impl FrameDecoder {
     /// # Panic / DoS surface
     ///
     /// **For trusted input only.** On the direct path
-    /// `UserSliceBackend` uses release-mode `assert!` /
-    /// debug-asserted slice indexing for capacity checks. A
+    /// `UserSliceBackend` uses release-mode `assert!` for capacity
+    /// checks across all three write entry points (`extend`,
+    /// `extend_and_fill`, `extend_from_within_unchecked`). A
     /// malformed Compressed block whose payload expands past the
     /// declared `frame_content_size` (and beyond the
     /// `WILDCOPY_OVERLENGTH` slack the caller sized into `output`)
@@ -1280,6 +1281,17 @@ impl FrameDecoder {
     /// error. The per-block `produced > content_size` guard catches
     /// the overshoot AFTER the block, but cannot prevent the
     /// in-block writes from running first.
+    ///
+    /// The trade-off is deliberate for this PR. Making the writes
+    /// fallible requires extending the `BufferBackend` trait
+    /// surface, touching every backend implementation, and
+    /// propagating `Result<_, _>` through the entire sequence
+    /// executor — a refactor too large to fold into the direct
+    /// decode wiring without losing review tractability. The
+    /// follow-up issue tracking that work (referenced below in
+    /// "Fallible BufferBackend writes") is a hard prerequisite
+    /// before this entry point becomes safe to expose on
+    /// untrusted streams.
     ///
     /// Callers handling untrusted input must use [`Self::decode_all`]
     /// which routes through `FlatBuf` / `RingBuffer`. Those
