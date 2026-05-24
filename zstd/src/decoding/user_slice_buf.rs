@@ -3,7 +3,14 @@
 //!
 //! Selected by [`crate::decoding::FrameDecoder::decode_to_slice`]
 //! when ALL of the following hold:
-//! - `frame_content_size > 0` (FCS present in the frame header).
+//! - `frame_content_size > 0` — the header-derived content size
+//!   is non-zero. This is the actual eligibility condition (NOT
+//!   "FCS present"): an empty frame with an explicit FCS=0
+//!   declaration on the wire stays on the fallback path because
+//!   there is no payload to write into the user slice. To
+//!   distinguish "FCS absent" from "FCS=0 explicit" elsewhere in
+//!   the decoder, use `FrameHeader::fcs_declared()` (e.g. the
+//!   fallback path's post-decode size check does).
 //! - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
 //!   (room for the SIMD wildcopy overshoot slack).
 //! - No active dictionary (the persistent dict_content is not

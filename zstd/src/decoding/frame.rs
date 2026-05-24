@@ -169,6 +169,32 @@ impl FrameHeader {
         self.frame_content_size
     }
 
+    /// Whether the frame header carried an explicit `Frame_Content_Size`
+    /// field on the wire. Distinguishes "FCS absent" (FCS_flag=0 +
+    /// `Single_Segment_flag=0`) from "FCS=0 explicitly declared"
+    /// (FCS_flag>=1 with a zero value, or FCS_flag=0 +
+    /// `Single_Segment_flag=1` with a 1-byte FCS=0). Both leave
+    /// [`Self::frame_content_size`] at `0`, so [`Self::frame_content_size`]
+    /// alone cannot distinguish the two; callers that need to know
+    /// whether the value is actually a wire-format declaration (e.g.
+    /// for post-decode size validation) should consult this method.
+    #[allow(dead_code)]
+    pub fn fcs_declared(&self) -> bool {
+        // `frame_content_size_bytes()` returns 0 only when FCS_flag=0
+        // AND single_segment_flag=0 — exactly the "no FCS on the wire"
+        // case. Any other combination (FCS_flag in 1..=3, or
+        // single_segment_flag set) writes a non-zero number of bytes.
+        // The descriptor was already validated when the header was
+        // parsed; if `frame_content_size_bytes()` is `Err` here the
+        // header object should not exist, so unwrap_or(0) collapses
+        // the (unreachable) error into the safe "treat as absent"
+        // answer.
+        self.descriptor
+            .frame_content_size_bytes()
+            .map(|n| n != 0)
+            .unwrap_or(false)
+    }
+
     /// Raw `Window_Descriptor` byte from the frame header
     /// (RFC 8878 §3.1.1.1.2 layout: `(exp << 3) | mantissa`),
     /// or `None` when the `Single_Segment_flag` is set — in

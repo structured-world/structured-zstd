@@ -1405,11 +1405,17 @@ impl FrameDecoder {
             // via `FrameContentSizeMismatch`. The fallback path now
             // matches that behaviour.
             //
-            // `content_size == 0` in the header means "FCS not
-            // declared on the wire", which our parser surfaces by
-            // leaving the field at the default 0. Skip the check in
-            // that case — there's nothing to compare against.
-            if content_size > 0 && (total_bytes_written as u64) != content_size {
+            // Use `fcs_declared()` (NOT `content_size > 0`) as the
+            // "is FCS on the wire" gate. The two diverge on the
+            // legitimate edge case of an empty frame with an
+            // EXPLICIT FCS=0 on the wire (FCS_flag>=1 with bytes
+            // reading 0, or single_segment+FCS_flag=0 with the
+            // 1-byte FCS=0): `content_size` is 0 in BOTH the
+            // "absent" and "explicitly zero" cases, while
+            // `fcs_declared()` returns false only in the truly
+            // absent case.
+            let state = self.state.as_ref().expect("state populated by init");
+            if state.frame_header.fcs_declared() && (total_bytes_written as u64) != content_size {
                 return Err(err::FrameContentSizeMismatch {
                     declared: content_size,
                     produced: total_bytes_written as u64,
