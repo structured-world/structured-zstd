@@ -28,7 +28,7 @@ categories = ["compression"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "dict_builder"]
+features = ["std", "hash", "dict_builder", "lsm"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -84,6 +84,9 @@ kernel_trace = ["std"]
 #   (`expect_dict_id` / `expect_window_descriptor`) for wire-format
 #   consumers that need post-AEAD-decrypt sanity checks against a
 #   pinned `dict_id` / `window_descriptor`.
+# - typed `SkippableFrame` builder + `write_skippable_frame` free
+#   function in `zstd::skippable` for RFC 8878 §3.1 skippable
+#   frames (16-variant magic + 4-byte LE length + payload).
 # Other typed APIs land here over time as bilateral storage-format
 # work expands the surface.
 lsm = []

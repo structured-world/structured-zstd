@@ -51,6 +51,10 @@ pub mod dictionary;
 pub mod encoding;
 mod histogram;
 
+#[cfg(feature = "lsm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+pub mod skippable;
+
 pub(crate) mod blocks;
 
 #[cfg(feature = "fuzz_exports")]
