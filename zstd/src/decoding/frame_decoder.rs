@@ -1330,17 +1330,6 @@ impl FrameDecoder {
         // match that reaches into the external dictionary would
         // decode against an empty prefix. Fall back to the regular
         // path which keeps the dict in the persistent buffer.
-        //
-        // Disabled under `feature = "hash"`: the rolling content
-        // checksum lives on the persistent
-        // `DecoderScratch::buffer.hash` field, but the direct path
-        // writes through a stack-local `DecodeBuffer` that has its
-        // own (separate) hash. After `decode_to_slice` returns,
-        // `get_calculated_checksum()` would read a stale persistent
-        // hash. Until we wire hash propagation (see #244 follow-up),
-        // gate the direct path off when the frame header has the
-        // content_checksum_flag set — the existing drain path
-        // remains correct for those frames.
         let dict_active = state.using_dict.is_some();
         // `content_checksum_flag` is no longer a disqualifier. The
         // direct path writes the decoded bytes into the user's

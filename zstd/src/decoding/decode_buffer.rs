@@ -620,13 +620,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// (`offset <= buffer.len()`) coincides with the spec's
     /// window-size rule (`offset <= window_size`).
     ///
-    /// Does NOT update the rolling content checksum: the direct-
-    /// decode caller (`FrameDecoder::decode_to_slice`) gates the
-    /// direct path off when the frame has `content_checksum_flag`,
-    /// so the hash this method would touch is dropped along with
-    /// the stack-local `DecodeBuffer` anyway. Skipping the hash
-    /// write saves measurable cycles on large multi-segment frames
-    /// where this is called once per block.
+    /// Does NOT update the rolling content checksum. On the direct
+    /// path the caller (`FrameDecoder::decode_to_slice`) hashes the
+    /// final `output[..content_size]` slice ONCE at end of decode
+    /// (single sequential xxhash pass over cache-hot data) and
+    /// propagates the digest into the persistent scratch's hasher.
+    /// Hashing inside `drop_to_window_size` would re-hash the same
+    /// bytes per block (this method runs once per block on
+    /// multi-segment frames), which is wasted work — the end-of-
+    /// decode walk covers the entire output uniformly.
     ///
     /// Returns the number of bytes whose visibility was discarded.
     ///
