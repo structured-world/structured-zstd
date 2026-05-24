@@ -1205,16 +1205,27 @@ impl FrameDecoder {
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-        let eligible = state.frame_header.descriptor.single_segment_flag()
-            && content_size > 0
-            && (output.len() as u64) >= needed;
+        // Eligibility is independent of `single_segment_flag`:
+        // donor's `ZSTD_in_dst` litBuffer-in-dst trick works
+        // identically for multi-segment frames as long as we're in
+        // non-streaming mode (the whole `frame_content_size` fits
+        // in the caller's `output` slice, no mid-frame drain is
+        // ever issued). The flag only changes whether the
+        // _internal_ scratch picks FlatBuf vs RingBuffer; for
+        // direct decode the internal buffer is bypassed entirely
+        // and the user slice IS the buffer. Both Flat- and
+        // Ring-backed persistent state are equally fine as
+        // donors of the HUF/FSE/scratch Vecs the direct scratch
+        // borrows.
+        let eligible = content_size > 0 && (output.len() as u64) >= needed;
 
         if !eligible {
-            // Frame doesn't qualify for direct decode (multi-segment,
-            // empty, or output too small for the WILDCOPY slack).
-            // Fall through to the existing per-block decode + drain
-            // path — `init` already populated `self.state`, so
-            // `decode_blocks` + `read` pick up from there.
+            // Frame doesn't qualify for direct decode (empty
+            // frame_content_size — header lacks FCS — or output too
+            // small for the WILDCOPY slack). Fall through to the
+            // existing per-block decode + drain path — `init`
+            // already populated `self.state`, so `decode_blocks` +
+            // `read` pick up from there.
             let mut output_tail: &mut [u8] = output;
             let mut total_bytes_written = 0;
             loop {
@@ -1241,26 +1252,42 @@ impl FrameDecoder {
         // is the main scratch-reuse win on small frames). Then
         // construct a stack-local DecodeBuffer<UserSliceBackend<'o>>
         // over `output` and bundle into a `DirectScratch`.
-        let scratch = match &mut state.decoder_scratch {
-            DecoderScratchKind::Flat(s) => s,
-            DecoderScratchKind::Ring(_) => {
-                // single_segment_flag was checked above, so this
-                // branch is unreachable on a well-formed init.
-                // Fall back defensively rather than `unreachable!()`
-                // — corrupted headers could in theory drift this.
-                return Err(err::TargetTooSmall);
-            }
-        };
-        let window_size = scratch.buffer.window_size;
+        // Borrow persistent fields out of whichever scratch variant
+        // `init` produced (Flat for single_segment, Ring for
+        // multi-segment) — both expose the same set of HUF/FSE/Vec
+        // fields; only `buffer` differs and we don't use that here.
+        // Macro-style binding to avoid the closure / generic
+        // gymnastics of returning multiple &mut from a match arm.
+        let (huf, fse, offset_hist, literals_buffer, sequences, block_content_buffer, window_size) =
+            match &mut state.decoder_scratch {
+                DecoderScratchKind::Flat(s) => (
+                    &mut s.huf,
+                    &mut s.fse,
+                    &mut s.offset_hist,
+                    &mut s.literals_buffer,
+                    &mut s.sequences,
+                    &mut s.block_content_buffer,
+                    s.buffer.window_size,
+                ),
+                DecoderScratchKind::Ring(s) => (
+                    &mut s.huf,
+                    &mut s.fse,
+                    &mut s.offset_hist,
+                    &mut s.literals_buffer,
+                    &mut s.sequences,
+                    &mut s.block_content_buffer,
+                    s.buffer.window_size,
+                ),
+            };
         let backend = UserSliceBackend::from_slice(output);
         let buffer = DecodeBuffer::from_backend(backend, window_size);
         let mut direct = DirectScratch {
-            huf: &mut scratch.huf,
-            fse: &mut scratch.fse,
-            offset_hist: &mut scratch.offset_hist,
-            literals_buffer: &mut scratch.literals_buffer,
-            sequences: &mut scratch.sequences,
-            block_content_buffer: &mut scratch.block_content_buffer,
+            huf,
+            fse,
+            offset_hist,
+            literals_buffer,
+            sequences,
+            block_content_buffer,
             buffer,
         };
 

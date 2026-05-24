@@ -95,21 +95,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     }
 
     #[inline]
-    fn reserve(&mut self, n: usize) {
-        // Capacity is fixed at construction; the dispatcher sized the
-        // slice to cover `frame_content_size + WILDCOPY_OVERLENGTH`.
-        // `reserve` is a no-op as long as we have room. If the caller
-        // requests more than we can provide it's a bug at the
-        // dispatch site (frame header lied about content size, or
-        // sizing math underflowed). Same shape as FlatBuf's contract:
-        // reserve is best-effort; the actual capacity check is at
-        // the write site via the debug_assert in extend/etc.
-        debug_assert!(
-            self.tail.saturating_add(n) <= self.slice.len(),
-            "UserSliceBackend::reserve({n}) overflows slice (tail={}, cap={})",
-            self.tail,
-            self.slice.len()
-        );
+    fn reserve(&mut self, _n: usize) {
+        // No-op: capacity is fixed at construction (slice length).
+        // The decoder's sequence-execution path issues
+        // `buffer.reserve(MAX_BLOCK_SIZE)` upfront as a precaution
+        // for FlatBuf's growable Vec; for UserSliceBackend we can
+        // never satisfy that precaution because the slice can't
+        // grow. The actual write-site debug_asserts in `extend` /
+        // `extend_and_fill` / `extend_from_within_unchecked` /
+        // `extend_from_reader` catch the real (much smaller)
+        // capacity bound — `match_length` and per-block writes are
+        // bounded by the well-formed-frame contract such that
+        // `tail + write_size <= frame_content_size`.
     }
 
     #[inline]
