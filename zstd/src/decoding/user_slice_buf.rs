@@ -43,7 +43,6 @@
 //! call's duration via [`super::scratch::DirectScratch`].
 
 use crate::io::{Error, Read};
-use core::ptr;
 
 use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 
@@ -212,22 +211,41 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // the caller, but UserSliceBackend's reserve is a no-op
         // (slice can't grow), so a malformed frame with an out-of-
         // bounds match could otherwise turn the unchecked
-        // `copy_nonoverlapping` into UB in release builds.
-        // FlatBuf relies on `Vec::reserve` to enforce this; we have
-        // no allocator to call so the check has to be inline.
-        // Cost: one compare on a path that's already memory-bound;
-        // negligible vs the wildcopy itself.
+        // SIMD copy into UB in release builds. FlatBuf relies on
+        // `Vec::reserve`; we have no allocator to call so the
+        // check has to be inline. Cost: one compare on a path
+        // that's already memory-bound.
         assert!(
             dst_off + len <= self.slice.len(),
             "UserSliceBackend: match write past slice capacity (corrupt frame)"
         );
+        // Route the match copy through `simd_copy::copy_bytes_overshooting`
+        // rather than `ptr::copy_nonoverlapping`. The latter goes to
+        // libc `__memmove_avx_unaligned_erms` on x86_64, which costs
+        // ~10ns of dispatch overhead per call — measured at 40% of
+        // decode CPU on the L-1 fast c_stream flamegraph because
+        // L-1 produces thousands of short matches per frame.
+        // `copy_bytes_overshooting` inlines a single SIMD
+        // load+store for `len <= 16` with WILDCOPY_OVERLENGTH slack
+        // (typical match case), and a byte / overlapping-u64
+        // sequence for shorter copies without slack — both bypass
+        // the libc memmove dispatch entirely.
+        let total_readable = self.tail - src_off;
+        let total_writable = self.slice.len() - dst_off;
         // SAFETY: caller's non-overlap precondition gives
-        // `src_off + len <= dst_off`. The assert above guarantees
-        // `dst_off + len <= self.slice.len()`, so the
-        // `copy_nonoverlapping` stays inside the slice.
+        // `src_off + len <= dst_off` (so src/dst regions don't
+        // overlap), `total_readable >= len` follows from
+        // `src_off + len <= dst_off <= self.tail`, and
+        // `total_writable >= len` by the assert above. The
+        // helper writes ≤ `total_writable` bytes, so it stays
+        // inside the slice even when it overshoots `len`.
         unsafe {
-            let ptr = self.slice.as_mut_ptr();
-            ptr::copy_nonoverlapping(ptr.add(src_off), ptr.add(dst_off), len);
+            let base = self.slice.as_mut_ptr();
+            super::simd_copy::copy_bytes_overshooting(
+                (base.add(src_off), total_readable),
+                (base.add(dst_off), total_writable),
+                len,
+            );
         }
         self.tail = dst_off + len;
     }
