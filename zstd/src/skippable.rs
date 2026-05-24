@@ -7,14 +7,14 @@
 //!
 //! ```text
 //! +----------+-----------+----------------+
-//! | 4 B      | 4 B       | payload-length |
-//! | magic LE | length LE | payload bytes  |
+//! | 4 B      | 4 B       | length bytes   |
+//! | magic LE | length LE | payload        |
 //! +----------+-----------+----------------+
 //! ```
 //!
 //! - `magic = 0x184D2A50 + magic_variant`, with `magic_variant` in
 //!   `0..=15` — 16 application-claimed magic numbers in the
-//!   skippable-magic range `[0x184D2A50, 0x184D2A5F]`.
+//!   skippable-magic range `0x184D2A50..=0x184D2A5F`.
 //! - `length` is the payload byte count as a little-endian `u32`,
 //!   so payloads above `u32::MAX` are not representable on the wire
 //!   (the validation in [`SkippableFrame::new`] / [`write_skippable_frame`]
@@ -33,7 +33,7 @@
 //!
 //! # Magic variant allocation policy
 //!
-//! Magic variants `0x184D2A50..5F` are an **application-protocol**
+//! Magic variants `0x184D2A50..=0x184D2A5F` are an **application-protocol**
 //! concern, NOT a structured-zstd concern. This crate accepts
 //! `magic_variant: u8` in `0..=15` and validates only that bound. No
 //! per-variant constants are baked into the source. The README
@@ -43,7 +43,6 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::decoding::errors::ReadFrameHeaderError;
 use crate::io::{Error, Read, Write};
 
 /// First magic number in the skippable-frame range (RFC 8878 §3.1.2).
@@ -125,29 +124,41 @@ impl SkippableFrame {
     /// 4-byte magic + 4-byte length + `length` payload bytes. The
     /// caller is responsible for positioning the reader at a frame
     /// boundary; this method does not scan past unknown content.
-    pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self, ReadFrameHeaderError> {
-        use ReadFrameHeaderError as e;
+    ///
+    /// Allocates the payload buffer via [`Vec::try_reserve_exact`],
+    /// so a crafted input declaring a `length` up to `u32::MAX` that
+    /// would otherwise abort on out-of-memory instead returns
+    /// [`DecodeSkippableFrameError::AllocationFailed`]. Callers
+    /// handling untrusted streams should additionally cap the
+    /// acceptable payload size at the application layer; this method
+    /// itself imposes no upper bound beyond the wire-format
+    /// `u32::MAX`.
+    pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self, DecodeSkippableFrameError> {
         let mut magic_buf = [0u8; 4];
         reader
             .read_exact(&mut magic_buf)
-            .map_err(e::MagicNumberReadError)?;
+            .map_err(DecodeSkippableFrameError::Magic)?;
         let magic_number = u32::from_le_bytes(magic_buf);
 
         let variant = magic_number.wrapping_sub(SKIPPABLE_MAGIC_START);
         if !(0..=u32::from(SKIPPABLE_MAGIC_MAX_VARIANT)).contains(&variant) {
-            return Err(e::BadMagicNumber(magic_number));
+            return Err(DecodeSkippableFrameError::BadMagicNumber(magic_number));
         }
 
         let mut len_buf = [0u8; 4];
         reader
             .read_exact(&mut len_buf)
-            .map_err(e::FrameDescriptorReadError)?;
+            .map_err(DecodeSkippableFrameError::Length)?;
         let length = u32::from_le_bytes(len_buf) as usize;
 
-        let mut payload = alloc::vec![0u8; length];
+        let mut payload: Vec<u8> = Vec::new();
+        payload
+            .try_reserve_exact(length)
+            .map_err(|_| DecodeSkippableFrameError::AllocationFailed { requested: length })?;
+        payload.resize(length, 0);
         reader
             .read_exact(&mut payload)
-            .map_err(e::FrameDescriptorReadError)?;
+            .map_err(DecodeSkippableFrameError::Payload)?;
 
         Ok(Self {
             magic_variant: variant as u8,
@@ -209,22 +220,53 @@ fn validate_payload_size(len: usize) -> Result<(), SkippableFrameError> {
     // condition trivially folds away (correct: no payload on 32-bit
     // can exceed the limit).
     if (len as u64) > u64::from(u32::MAX) {
-        Err(SkippableFrameError::PayloadTooLarge(len))
-    } else {
-        Ok(())
+        return Err(SkippableFrameError::PayloadTooLarge(len));
     }
+    // On 32-bit targets `usize` IS `u32` so the wire-format limit
+    // (`u32::MAX`) is identical to `usize::MAX`. Computing the total
+    // serialised size as `len + SKIPPABLE_HEADER_SIZE` would then
+    // overflow `usize` when `len` sits at the wire-format ceiling.
+    // Reject those borderline-sized payloads up front so
+    // `serialized_size()` and `write_skippable_frame_to` stay
+    // unconditionally panic-free across target widths.
+    if len.checked_add(SKIPPABLE_HEADER_SIZE).is_none() {
+        return Err(SkippableFrameError::PayloadTooLarge(len));
+    }
+    Ok(())
 }
 
 /// Errors surfaced when constructing or writing a [`SkippableFrame`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SkippableFrameError {
     /// `magic_variant` outside the spec's `0..=15` range.
     InvalidMagicVariant(u8),
     /// `payload.len()` exceeds `u32::MAX`, the on-wire length field
-    /// width.
+    /// width, OR would overflow `usize` when combined with the
+    /// 8-byte skippable-frame header (32-bit targets).
     PayloadTooLarge(usize),
     /// Underlying I/O error from the writer.
     Io(Error),
+}
+
+/// Errors surfaced when reading a [`SkippableFrame`] from a stream.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DecodeSkippableFrameError {
+    /// I/O error while reading the 4-byte magic prefix.
+    Magic(Error),
+    /// First 4 bytes are not a skippable-frame magic in the
+    /// `0x184D2A50..=0x184D2A5F` range.
+    BadMagicNumber(u32),
+    /// I/O error while reading the 4-byte length field.
+    Length(Error),
+    /// I/O error while reading the payload bytes.
+    Payload(Error),
+    /// Allocation of the payload buffer failed (e.g. a crafted
+    /// length field requested more memory than is available).
+    /// `requested` is the byte count the on-wire length field
+    /// asked for.
+    AllocationFailed { requested: usize },
 }
 
 impl core::fmt::Display for SkippableFrameError {
@@ -250,6 +292,27 @@ impl From<Error> for SkippableFrameError {
         Self::Io(value)
     }
 }
+
+impl core::fmt::Display for DecodeSkippableFrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Magic(e) => write!(f, "skippable frame: error reading magic number: {e}"),
+            Self::BadMagicNumber(m) => write!(
+                f,
+                "skippable frame: magic 0x{m:08X} is not in the skippable range 0x184D2A50..=0x184D2A5F"
+            ),
+            Self::Length(e) => write!(f, "skippable frame: error reading length field: {e}"),
+            Self::Payload(e) => write!(f, "skippable frame: error reading payload bytes: {e}"),
+            Self::AllocationFailed { requested } => write!(
+                f,
+                "skippable frame: failed to allocate {requested} bytes for payload"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DecodeSkippableFrameError {}
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
@@ -400,7 +463,7 @@ mod tests {
         let mut cursor: &[u8] = wire.as_slice();
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
         match err {
-            ReadFrameHeaderError::BadMagicNumber(m) => assert_eq!(m, 0xFD2F_B528),
+            DecodeSkippableFrameError::BadMagicNumber(m) => assert_eq!(m, 0xFD2F_B528),
             other => panic!("expected BadMagicNumber, got {other:?}"),
         }
     }
@@ -417,41 +480,51 @@ mod tests {
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
         assert!(matches!(
             err,
-            ReadFrameHeaderError::BadMagicNumber(0x184D_2A60)
+            DecodeSkippableFrameError::BadMagicNumber(0x184D_2A60)
         ));
     }
 
     #[test]
-    fn decode_truncated_header_surfaces_read_error() {
+    fn decode_truncated_magic_surfaces_typed_error() {
         // Three bytes (one less than a magic) — must fail on the
         // magic read step, not panic.
         let wire = [0x50u8, 0x2A, 0x4D];
         let mut cursor: &[u8] = &wire;
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
         assert!(
-            matches!(err, ReadFrameHeaderError::MagicNumberReadError(_)),
-            "expected MagicNumberReadError, got {err:?}"
+            matches!(err, DecodeSkippableFrameError::Magic(_)),
+            "expected Magic, got {err:?}"
         );
     }
 
     #[test]
-    fn decode_truncated_payload_surfaces_read_error() {
+    fn decode_truncated_length_surfaces_typed_error() {
+        // Magic OK, but length field is short (3 bytes instead of 4).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&SKIPPABLE_MAGIC_START.to_le_bytes());
+        wire.extend_from_slice(&[0u8, 0, 0]);
+        let mut cursor: &[u8] = wire.as_slice();
+        let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
+        assert!(
+            matches!(err, DecodeSkippableFrameError::Length(_)),
+            "expected Length, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_truncated_payload_surfaces_typed_error() {
         // Header claims 16-byte payload but only 4 bytes follow.
+        // The error must point at the PAYLOAD read step, not get
+        // misreported as a header / descriptor read.
         let mut wire = Vec::new();
         wire.extend_from_slice(&SKIPPABLE_MAGIC_START.to_le_bytes());
         wire.extend_from_slice(&16u32.to_le_bytes());
         wire.extend_from_slice(&[0u8; 4]);
         let mut cursor: &[u8] = wire.as_slice();
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
-        // Payload-read failures are routed through the
-        // FrameDescriptorReadError variant in this skippable decoder
-        // (the variant name is the existing structured-zstd
-        // convention for "any post-magic header read error"); the
-        // important property is that it surfaces as a typed read
-        // error rather than panicking.
         assert!(
-            matches!(err, ReadFrameHeaderError::FrameDescriptorReadError(_)),
-            "expected FrameDescriptorReadError, got {err:?}"
+            matches!(err, DecodeSkippableFrameError::Payload(_)),
+            "expected Payload, got {err:?}"
         );
     }
 
@@ -467,6 +540,37 @@ mod tests {
                 frame.serialized_size(),
                 "serialized_size() must match actual encode length for payload_len={payload_len}"
             );
+        }
+    }
+
+    #[test]
+    fn decode_huge_length_returns_typed_error_not_oom_abort() {
+        // Crafted wire declares a 4 GiB - 1 payload but provides
+        // zero payload bytes. The decoder must surface a typed
+        // error (AllocationFailed if the allocator rejects the
+        // reservation, OR Payload(UnexpectedEof) if the allocator
+        // overcommits and the read_exact step is what catches the
+        // truncation). What it must NOT do is abort the process on
+        // OOM or panic via Vec::with_capacity. Both error paths are
+        // acceptable; the test pins the goal (no process abort, no
+        // panic) rather than a specific variant — which one fires
+        // depends on the host allocator's overcommit policy.
+        let huge: u32 = u32::MAX;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&SKIPPABLE_MAGIC_START.to_le_bytes());
+        wire.extend_from_slice(&huge.to_le_bytes());
+        let mut cursor: &[u8] = wire.as_slice();
+        let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
+        match err {
+            DecodeSkippableFrameError::AllocationFailed { requested } => {
+                assert_eq!(requested, huge as usize);
+            }
+            DecodeSkippableFrameError::Payload(_) => {
+                // Allocator accepted the reservation (overcommit);
+                // read_exact then failed because no payload bytes
+                // followed the 8-byte header. Also acceptable.
+            }
+            other => panic!("expected AllocationFailed or Payload(io_err), got {other:?}"),
         }
     }
 
