@@ -592,6 +592,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Total bytes ever produced into the backend across this
+    /// `DecodeBuffer`'s lifetime. Incremented by `push` / `repeat` /
+    /// `extend_and_fill` / `extend_from_reader`. Survives across
+    /// `drop_to_window_size` and `drain_*` calls (those only narrow
+    /// the visible region; they don't roll back produced).
+    ///
+    /// Used by the direct-decode path (`FrameDecoder::decode_to_slice`)
+    /// to track actual bytes written against the declared
+    /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
+    /// which is intentionally 0 for `BlockType::Compressed` (the
+    /// header parser doesn't decode the body), so per-block tracking
+    /// via the header field would always read 0 on compressed blocks
+    /// and miscount.
+    pub fn total_produced(&self) -> u64 {
+        self.total_output_counter
+    }
+
     /// Advance the backend's head past any bytes beyond `window_size`
     /// without producing them to a sink — the bytes remain physically
     /// present (the backend's allocation never shrinks), but they are

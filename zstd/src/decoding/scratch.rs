@@ -183,18 +183,29 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // anonymous pages here instead of inside the decode hot
         // path. `Vec::reserve` only allocates address space; the
         // first byte-write to each 4 KiB page still triggers a
-        // page fault. By resizing-with-zero (which writes every
-        // byte) we pay all faults upfront in `reset`, then `clear`
-        // brings len back to 0 while capacity (and the now-touched
-        // pages) stay. Subsequent per-block writes hit warm pages.
+        // page fault.
+        //
+        // ONLY when the Vec's capacity is below the target — once
+        // a frame has touched the pages once, `clear()` keeps both
+        // `capacity()` AND the kernel's anonymous-page mapping, so
+        // subsequent frames hit warm memory without re-zeroing.
+        // The previous shape (`resize` + `clear` unconditionally)
+        // paid an O(block_cap) memset every frame reset, ~37 µs
+        // per 128 KiB at AVX2 store rates. Now it's only paid on
+        // the very first reset (or after a grow to larger
+        // window_size).
         //
         // This matches donor's `dctx->litExtraBuffer` /
-        // `dctx->workspace` lifecycle — those are touched once at
-        // frame init and stay warm across all blocks.
-        self.literals_buffer.resize(block_cap, 0);
-        self.literals_buffer.clear();
-        self.block_content_buffer.resize(block_cap, 0);
-        self.block_content_buffer.clear();
+        // `dctx->workspace` lifecycle — touched once at decoder
+        // construction, warm across all subsequent frames.
+        if self.literals_buffer.capacity() < block_cap {
+            self.literals_buffer.resize(block_cap, 0);
+            self.literals_buffer.clear();
+        }
+        if self.block_content_buffer.capacity() < block_cap {
+            self.block_content_buffer.resize(block_cap, 0);
+            self.block_content_buffer.clear();
+        }
 
         self.buffer.reset(window_size);
 

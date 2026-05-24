@@ -1351,30 +1351,29 @@ impl FrameDecoder {
         // accurate values.
         let mut block_dec = block_decoder::new();
         // Track total output bytes against the declared
-        // `frame_content_size`. A malformed frame whose blocks claim
-        // more decompressed bytes than the FCS would otherwise let
-        // the burst write past `output[..content_size]` into the
-        // wildcopy slack and beyond — `UserSliceBackend` would
-        // panic on the bounds assert. Catch the overflow here and
-        // return a structured `TargetTooSmall` error instead.
+        // `frame_content_size` via the buffer's actual write
+        // counter — `BlockHeader.decompressed_size` is 0 for
+        // Compressed blocks (the header parser can't know the
+        // expanded size before decoding the body), so per-header
+        // tracking would always count 0 for those blocks and
+        // miscount frames that aren't pure Raw/RLE.
         let mut produced: u64 = 0;
         loop {
             let (block_header, hsize) = block_dec
                 .read_block_header(&mut input)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += u64::from(hsize);
-            // Pre-flight FCS check: a single block's
-            // `decompressed_size` is bounded by `MAX_BLOCK_SIZE`
-            // (128 KiB), so even for compressed blocks the upper
-            // bound on what this block will write is known before
-            // the body decodes. Reject early when adding it would
-            // exceed `content_size`.
+            // Pre-flight FCS check ONLY for Raw / RLE blocks where
+            // `decompressed_size` is the actual block output size.
+            // For Compressed blocks the header field is 0; the
+            // post-decode check below catches overflow via the
+            // backend's actual write counter delta.
             let block_upper = u64::from(block_header.decompressed_size);
-            if produced + block_upper > content_size {
-                // Frame is corrupt — block headers claim more output
-                // than the FCS allowed. Caller's buffer was sized
-                // against FCS (validated above), so this is a
-                // decoder-side correctness issue, not a sizing one.
+            if block_upper > 0 && produced + block_upper > content_size {
+                // Frame is corrupt — Raw/RLE block headers claim
+                // more output than the FCS allows. Caller's buffer
+                // was sized against FCS, so this is decoder-side
+                // corruption, not user sizing.
                 return Err(err::FrameContentSizeMismatch {
                     declared: content_size,
                     produced: produced + block_upper,
@@ -1382,14 +1381,27 @@ impl FrameDecoder {
             }
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
-            // persistent `block_content_buffer`. This is the
-            // largest single perf win behind the direct-decode
-            // path at L-1 — see #244 follow-up flamegraph
-            // analysis.
+            // persistent `block_content_buffer`.
+            let before = direct.buffer.total_produced();
             let body_consumed = block_dec
                 .decode_block_content_from_slice(&block_header, &mut direct, &mut input)
                 .map_err(err::FailedToReadBlockBody)?;
-            produced += u64::from(block_header.decompressed_size);
+            produced = direct.buffer.total_produced();
+            // Post-decode FCS overflow check. Works uniformly for
+            // Raw/RLE/Compressed since it reads the actual bytes
+            // written by the backend rather than the header's
+            // (possibly zero) `decompressed_size`.
+            if produced > content_size {
+                return Err(err::FrameContentSizeMismatch {
+                    declared: content_size,
+                    produced,
+                });
+            }
+            // Silence unused-binding warning when this delta isn't
+            // consulted — it's there so future debug builds can
+            // assert (produced - before) <= MAX_BLOCK_SIZE if the
+            // spec invariant ever needs an explicit gate.
+            let _ = before;
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
             // Cap the visible buffer at window_size between blocks

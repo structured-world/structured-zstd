@@ -9,9 +9,9 @@ use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
-/// Legacy compatibility wrapper around [`decode_literals_zerocopy`]
-/// for tests / callers that still expect the literals to land in a
-/// Vec. New code paths should use the zero-copy variant directly.
+/// Test-only Vec-output wrapper retained for the existing roundtrip
+/// test suite, which asserts the literal byte stream lands fully
+/// in a Vec. Production callers use [`decode_literals_zerocopy`].
 #[cfg(test)]
 pub fn decode_literals(
     section: &LiteralsSection,
