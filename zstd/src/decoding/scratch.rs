@@ -179,8 +179,22 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // Measured at ~18% of decode-time page-fault cost on
         // level_-7_fast/decodecorpus-z000033 — see #244.
         let block_cap = (window_size.min(crate::common::MAX_BLOCK_SIZE as usize)).max(8);
-        self.literals_buffer.reserve(block_cap);
-        self.block_content_buffer.reserve(block_cap);
+        // Pre-TOUCH (not just reserve) so the kernel maps the
+        // anonymous pages here instead of inside the decode hot
+        // path. `Vec::reserve` only allocates address space; the
+        // first byte-write to each 4 KiB page still triggers a
+        // page fault. By resizing-with-zero (which writes every
+        // byte) we pay all faults upfront in `reset`, then `clear`
+        // brings len back to 0 while capacity (and the now-touched
+        // pages) stay. Subsequent per-block writes hit warm pages.
+        //
+        // This matches donor's `dctx->litExtraBuffer` /
+        // `dctx->workspace` lifecycle — those are touched once at
+        // frame init and stay warm across all blocks.
+        self.literals_buffer.resize(block_cap, 0);
+        self.literals_buffer.clear();
+        self.block_content_buffer.resize(block_cap, 0);
+        self.block_content_buffer.clear();
 
         self.buffer.reset(window_size);
 
