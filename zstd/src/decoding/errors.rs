@@ -489,7 +489,9 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
 pub enum FrameDecoderError {
     ReadFrameHeaderError(ReadFrameHeaderError),
     FrameHeaderError(FrameHeaderError),
-    WindowSizeTooBig { requested: u64 },
+    WindowSizeTooBig {
+        requested: u64,
+    },
     DictionaryDecodeError(DictionaryDecodeError),
     FailedToReadBlockHeader(BlockHeaderReadError),
     FailedToReadBlockBody(DecodeBlockContentError),
@@ -499,9 +501,44 @@ pub enum FrameDecoderError {
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
     TargetTooSmall,
-    DictNotProvided { dict_id: u32 },
-    DictIdMismatch { expected: u32, provided: u32 },
-    DictAlreadyRegistered { dict_id: u32 },
+    DictNotProvided {
+        dict_id: u32,
+    },
+    DictIdMismatch {
+        expected: u32,
+        provided: u32,
+    },
+    DictAlreadyRegistered {
+        dict_id: u32,
+    },
+    /// Frame header's `dict_id` did not match the value pinned via
+    /// `FrameDecoder::expect_dict_id`. Returned BEFORE any block
+    /// decode and BEFORE any output is produced — no XXH64 init,
+    /// no partial output. Scratch buffer allocation / reservation
+    /// for the decode pipeline happens during frame-header parsing,
+    /// which is already complete when this validation fires, so
+    /// the cost of scratch sizing is paid even on a mismatched
+    /// header. `expected` is the pinned value (`Some(0)` is
+    /// treated as "no dictionary expected", matching a frame whose
+    /// header omits the optional `Dictionary_ID` field); `found`
+    /// reports what the frame actually carried (`None` when the
+    /// header omits the field, `Some(id)` when it does not).
+    #[cfg(feature = "lsm")]
+    UnexpectedDictId {
+        expected: Option<u32>,
+        found: Option<u32>,
+    },
+    /// Frame header's raw `Window_Descriptor` byte did not match
+    /// the value pinned via `FrameDecoder::expect_window_descriptor`.
+    /// Returned BEFORE any block decode work. Single-segment frames
+    /// (which omit the `Window_Descriptor` byte from the wire) are
+    /// reported via `found: None` so callers can distinguish
+    /// "wrong descriptor" from "no descriptor on the wire".
+    #[cfg(feature = "lsm")]
+    UnexpectedWindowDescriptor {
+        expected: u8,
+        found: Option<u8>,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -591,6 +628,30 @@ impl core::fmt::Display for FrameDecoderError {
                     f,
                     "Dictionary id 0x{dict_id:X} already registered in decoder"
                 )
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::UnexpectedDictId { expected, found } => {
+                write!(f, "Frame header dict_id mismatch: expected ")?;
+                match expected {
+                    Some(id) => write!(f, "0x{id:X}")?,
+                    None => write!(f, "<none>")?,
+                }
+                write!(f, ", found ")?;
+                match found {
+                    Some(id) => write!(f, "0x{id:X}"),
+                    None => write!(f, "<none>"),
+                }
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::UnexpectedWindowDescriptor { expected, found } => {
+                write!(
+                    f,
+                    "Frame header window_descriptor mismatch: expected 0x{expected:02X}, found "
+                )?;
+                match found {
+                    Some(byte) => write!(f, "0x{byte:02X}"),
+                    None => write!(f, "<none> (single-segment frame omits window_descriptor)"),
+                }
             }
         }
     }

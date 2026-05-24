@@ -84,6 +84,24 @@ pub struct FrameDecoder {
     /// expect frames without the 4-byte magic number prefix.
     /// Default false (standard zstd format).
     magicless: bool,
+    /// Pinned `Dictionary_ID` expectation set via
+    /// [`Self::expect_dict_id`]. `None` (default) disables the
+    /// check; `Some(0)` matches frames whose header omits the
+    /// optional dict_id (treated as "no dictionary"). Validated in
+    /// [`Self::reset`] AFTER the frame header parses successfully
+    /// and BEFORE any block decode work.
+    #[cfg(feature = "lsm")]
+    expect_dict_id: Option<u32>,
+    /// Pinned `Window_Descriptor` byte expectation set via
+    /// [`Self::expect_window_descriptor`]. `None` (default)
+    /// disables the check. Validated in [`Self::reset`] AFTER the
+    /// frame header parses successfully and BEFORE any block
+    /// decode work. Single-segment frames (which omit the
+    /// `Window_Descriptor` byte from the wire) surface as
+    /// [`crate::decoding::errors::FrameDecoderError::UnexpectedWindowDescriptor`]
+    /// with `found: None`.
+    #[cfg(feature = "lsm")]
+    expect_window_descriptor: Option<u8>,
 }
 
 /// Backend-tagged decode scratch — chosen at frame-reset time based
@@ -347,7 +365,116 @@ impl FrameDecoder {
             #[cfg(not(target_has_atomic = "ptr"))]
             shared_dicts: (),
             magicless: false,
+            #[cfg(feature = "lsm")]
+            expect_dict_id: None,
+            #[cfg(feature = "lsm")]
+            expect_window_descriptor: None,
         }
+    }
+
+    /// Pin the expected `Dictionary_ID` for the next frame.
+    ///
+    /// When `expected` is set, [`Self::init`] / [`Self::reset`]
+    /// validate it against the parsed frame header BEFORE any
+    /// block decode work runs. A mismatch returns
+    /// [`crate::decoding::errors::FrameDecoderError::UnexpectedDictId`]
+    /// before any block decode and before any output is produced.
+    /// Scratch buffer allocation / reservation for the decode
+    /// pipeline happens during frame-header parsing, which is
+    /// already complete when this validation fires — the cost of
+    /// scratch sizing is paid even on a mismatched header. The
+    /// guarantee is "no block decode, no XXH64 init, no partial
+    /// output", not "zero allocation".
+    ///
+    /// `Some(0)` is treated as "no dictionary expected": a frame
+    /// whose header omits the optional `Dictionary_ID` field
+    /// (flag value 0) passes the check; a frame that carries an
+    /// explicit non-zero id fails.
+    ///
+    /// `None` (default) disables the check.
+    ///
+    /// Primary use case: post-AEAD-decrypt sanity check in
+    /// wire-format consumers (e.g. lsm-tree's encrypted block
+    /// format pins the `dict_id` baked into the AAD against the
+    /// inner zstd frame's `dict_id` to defeat dict-substitution
+    /// attacks).
+    ///
+    /// NOT a replacement for AEAD authentication. NOT the same
+    /// semantic as donor `ZSTD_d_windowLogMax` (which is a
+    /// ceiling-style limit, separate concern).
+    #[cfg(feature = "lsm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+    pub fn expect_dict_id(&mut self, expected: Option<u32>) {
+        self.expect_dict_id = expected;
+    }
+
+    /// Pin the expected raw `Window_Descriptor` byte (RFC 8878
+    /// §3.1.1.1.2 layout: `(exp << 3) | mantissa`) for the next
+    /// frame.
+    ///
+    /// When `expected` is set, [`Self::init`] / [`Self::reset`]
+    /// validate it against the parsed frame header BEFORE any
+    /// block decode work runs. A mismatch returns
+    /// [`crate::decoding::errors::FrameDecoderError::UnexpectedWindowDescriptor`].
+    ///
+    /// Single-segment frames omit the `Window_Descriptor` byte
+    /// from the wire entirely. Setting an expectation while
+    /// receiving a single-segment frame fails the check with
+    /// `found: None` — there is no on-wire byte to match against,
+    /// which is reported explicitly rather than silently passing.
+    ///
+    /// `None` (default) disables the check.
+    ///
+    /// Byte-exact equality, NOT a ceiling. Donor
+    /// `ZSTD_d_windowLogMax` is a separate ceiling-style limit
+    /// available through the C FFI surface; this method is for
+    /// strict equality validation against a pinned expectation
+    /// (e.g. lsm-tree's wire format pins the window descriptor
+    /// from the AAD to defeat decompression-bomb-swap attacks).
+    #[cfg(feature = "lsm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+    pub fn expect_window_descriptor(&mut self, expected: Option<u8>) {
+        self.expect_window_descriptor = expected;
+    }
+
+    /// Validate the just-parsed frame header against any pinned
+    /// expectations set via [`Self::expect_dict_id`] /
+    /// [`Self::expect_window_descriptor`].
+    ///
+    /// Returns the typed error variant on mismatch and leaves
+    /// `self.state` in a re-resettable shape — a subsequent
+    /// `reset()` will overwrite `frame_header` from the new source
+    /// without needing intermediate cleanup.
+    #[cfg(feature = "lsm")]
+    fn validate_expectations(
+        &self,
+        frame_header: &frame::FrameHeader,
+    ) -> Result<(), FrameDecoderError> {
+        if let Some(expected) = self.expect_dict_id {
+            let found = frame_header.dictionary_id();
+            // `Some(0)` is the "no dictionary expected" sentinel —
+            // matches a frame whose header omits the optional
+            // dict_id field (which is reported as `None` by the
+            // parser). All other values must match exactly.
+            let matches = match (expected, found) {
+                (0, None) => true,
+                (e, Some(f)) => e == f,
+                _ => false,
+            };
+            if !matches {
+                return Err(FrameDecoderError::UnexpectedDictId {
+                    expected: Some(expected),
+                    found,
+                });
+            }
+        }
+        if let Some(expected) = self.expect_window_descriptor {
+            let found = frame_header.window_descriptor();
+            if found != Some(expected) {
+                return Err(FrameDecoderError::UnexpectedWindowDescriptor { expected, found });
+            }
+        }
+        Ok(())
     }
 
     /// Enable or disable magicless frame format
@@ -452,6 +579,16 @@ impl FrameDecoder {
                     .and_then(|state| state.frame_header.dictionary_id())
             }
         };
+        // Validate any pinned expectations BEFORE block decode work
+        // runs. Catches dict_id substitution / window-descriptor
+        // tampering on inputs already authenticated by an outer
+        // layer (e.g. AEAD). Returning here leaves `self.state` in
+        // a re-resettable shape — next `reset()` re-parses the
+        // frame header without intermediate cleanup.
+        #[cfg(feature = "lsm")]
+        if let Some(state) = self.state.as_ref() {
+            self.validate_expectations(&state.frame_header)?;
+        }
         if let Some(dict_id) = dict_id {
             let state = self.state.as_mut().expect("state initialized");
             let owned_dicts = &self.owned_dicts;
@@ -502,16 +639,33 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         Self::validate_registered_dictionary(dict.as_dict())?;
         let magicless = self.magicless;
-        let state = match &mut self.state {
-            Some(s) => {
-                s.reset_with_format(source, magicless)?;
-                s
-            }
+        // Scope the &mut borrow of `self.state` to the header parse
+        // alone, so the subsequent `validate_expectations(&self, ...)`
+        // call below can take a fresh shared borrow of self without
+        // tripping the borrow checker.
+        match &mut self.state {
+            Some(s) => s.reset_with_format(source, magicless)?,
             None => {
                 self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
-                self.state.as_mut().unwrap()
             }
-        };
+        }
+        // Single source of truth: route through the same
+        // `validate_expectations` used by `reset()`. Routing through
+        // the helper keeps the two code paths from drifting (e.g.,
+        // if expect-semantics or error wiring changes later).
+        #[cfg(feature = "lsm")]
+        {
+            let header = &self
+                .state
+                .as_ref()
+                .expect("state populated by reset_with_format/new_with_format")
+                .frame_header;
+            self.validate_expectations(header)?;
+        }
+        let state = self
+            .state
+            .as_mut()
+            .expect("state populated by reset_with_format/new_with_format");
         if let Some(dict_id) = state.frame_header.dictionary_id()
             && dict_id != dict.id()
         {
@@ -1051,5 +1205,254 @@ mod tests {
         let state = decoder.state.as_ref().expect("state should be initialized");
         assert!(state.frame_header.dictionary_id().is_none());
         assert_eq!(state.using_dict, Some(handle.id()));
+    }
+
+    #[cfg(feature = "lsm")]
+    mod expect_validation {
+        use super::*;
+        use crate::decoding::errors::FrameDecoderError;
+
+        fn compress(payload: &[u8]) -> Vec<u8> {
+            let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+            compressor.set_source(payload);
+            let mut compressed = Vec::new();
+            compressor.set_drain(&mut compressed);
+            compressor.compress();
+            compressed
+        }
+
+        fn compress_with_dict(payload: &[u8], dict_raw: &[u8]) -> Vec<u8> {
+            let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+            compressor
+                .set_dictionary_from_bytes(dict_raw)
+                .expect("dict load");
+            compressor.set_source(payload);
+            let mut compressed = Vec::new();
+            compressor.set_drain(&mut compressed);
+            compressor.compress();
+            compressed
+        }
+
+        #[test]
+        fn expect_dict_id_none_default_allows_anything() {
+            let compressed = compress(b"hello-no-expect");
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .reset(compressed.as_slice())
+                .expect("default None passes");
+        }
+
+        #[test]
+        fn expect_dict_id_zero_matches_frame_without_dict_id() {
+            // Default-encoded frame has no dict_id; pinning Some(0)
+            // ("no dictionary expected") must accept it.
+            let compressed = compress(b"payload");
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_dict_id(Some(0));
+            decoder
+                .reset(compressed.as_slice())
+                .expect("Some(0) ~ None");
+        }
+
+        #[test]
+        fn expect_dict_id_matching_value_passes() {
+            let dict_raw = include_bytes!("../../dict_tests/dictionary");
+            let handle = DictionaryHandle::decode_dict(dict_raw).expect("dict parse");
+            let actual_id = handle.id();
+
+            let compressed = compress_with_dict(b"payload-with-dict", dict_raw);
+
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_dict_id(Some(actual_id));
+            // Decode requires the dict to be registered; using
+            // reset_with_dict_handle for that.
+            decoder
+                .reset_with_dict_handle(compressed.as_slice(), &handle)
+                .expect("matching dict_id passes");
+        }
+
+        #[test]
+        fn expect_dict_id_mismatching_value_fails_before_decode() {
+            let dict_raw = include_bytes!("../../dict_tests/dictionary");
+            let handle = DictionaryHandle::decode_dict(dict_raw).expect("dict parse");
+            let actual_id = handle.id();
+            let wrong_id = actual_id.wrapping_add(1);
+
+            let compressed = compress_with_dict(b"payload-with-dict", dict_raw);
+
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_dict_id(Some(wrong_id));
+            let err = decoder
+                .reset_with_dict_handle(compressed.as_slice(), &handle)
+                .expect_err("mismatch must fail");
+            match err {
+                FrameDecoderError::UnexpectedDictId { expected, found } => {
+                    assert_eq!(expected, Some(wrong_id));
+                    assert_eq!(found, Some(actual_id));
+                }
+                other => panic!("expected UnexpectedDictId, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn expect_dict_id_nonzero_fails_on_frame_without_dict_id() {
+            // Frame has no dict_id; expecting Some(42) (non-zero)
+            // must fail with found = None.
+            let compressed = compress(b"no-dict-frame");
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_dict_id(Some(42));
+            let err = decoder
+                .reset(compressed.as_slice())
+                .expect_err("nonzero expectation on dictless frame must fail");
+            match err {
+                FrameDecoderError::UnexpectedDictId { expected, found } => {
+                    assert_eq!(expected, Some(42));
+                    assert_eq!(found, None);
+                }
+                other => panic!("expected UnexpectedDictId, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn expect_window_descriptor_none_default_allows_anything() {
+            let compressed = compress(b"hello-no-wd-expect");
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .reset(compressed.as_slice())
+                .expect("default None passes");
+        }
+
+        #[test]
+        fn expect_window_descriptor_mismatch_fails_before_decode() {
+            // Compress a payload large enough to force a
+            // multi-segment frame (window_descriptor on wire).
+            // Default compression at >256 KiB produces multi-
+            // segment frames with a real window_descriptor byte.
+            let payload = alloc::vec![0xABu8; 512 * 1024];
+            let compressed = compress(&payload);
+
+            // Read the actual window_descriptor by decoding once
+            // without expectations, then pin a wrong value.
+            let mut probe_decoder = FrameDecoder::new();
+            probe_decoder.reset(compressed.as_slice()).unwrap();
+            let probe_state = probe_decoder.state.as_ref().unwrap();
+            let actual_wd = probe_state
+                .frame_header
+                .window_descriptor()
+                .expect("multi-segment frame should expose window_descriptor");
+            let wrong_wd = actual_wd.wrapping_add(0x10); // bump exponent
+
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_window_descriptor(Some(wrong_wd));
+            let err = decoder
+                .reset(compressed.as_slice())
+                .expect_err("wrong window_descriptor must fail");
+            match err {
+                FrameDecoderError::UnexpectedWindowDescriptor { expected, found } => {
+                    assert_eq!(expected, wrong_wd);
+                    assert_eq!(found, Some(actual_wd));
+                }
+                other => panic!("expected UnexpectedWindowDescriptor, got {other:?}"),
+            }
+        }
+
+        /// Build a minimal synthetic single-segment zstd frame
+        /// carrying a 4-byte raw payload. RFC 8878 §3.1.1.1
+        /// layout, hand-rolled because our default
+        /// `FrameCompressor` settings don't emit
+        /// `single_segment_flag` for tiny inputs.
+        ///
+        /// Wire bytes (13 total for 4-byte payload):
+        /// ```text
+        /// 28 B5 2F FD       magic
+        /// 20                FHD: single_segment=1, FCS_flag=0
+        /// 04                FCS (single byte, value = payload.len())
+        /// 21 00 00          block header: raw, last, size=4
+        /// .. .. .. ..       payload bytes
+        /// ```
+        fn synth_single_segment_frame(payload: &[u8]) -> Vec<u8> {
+            assert!(payload.len() <= 255, "1-byte FCS field caps at 255");
+            assert!(payload.len() < (1usize << 21), "block size 21-bit max");
+            let mut out = Vec::new();
+            // Magic 0xFD2FB528 LE.
+            out.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+            // FHD: single_segment_flag (bit 5) set, everything
+            // else zero. With single_segment + FCS_flag=0 the FCS
+            // field is 1 byte. No window_descriptor on wire.
+            out.push(0b0010_0000);
+            // 1-byte FCS = payload length.
+            out.push(payload.len() as u8);
+            // Block header (3 bytes LE):
+            // last_block=1, block_type=0 (Raw), block_size=payload.len().
+            // Encoded: (size << 3) | (block_type << 1) | last_block.
+            // Block header: last_block flag in bit 0, block_type
+            // (0 = Raw) in bits 1-2, block size in bits 3+.
+            let bh: u32 = ((payload.len() as u32) << 3) | 1;
+            out.push((bh & 0xFF) as u8);
+            out.push(((bh >> 8) & 0xFF) as u8);
+            out.push(((bh >> 16) & 0xFF) as u8);
+            // Raw payload.
+            out.extend_from_slice(payload);
+            out
+        }
+
+        #[test]
+        fn expect_window_descriptor_on_single_segment_frame_fails_with_found_none() {
+            // Single-segment frames omit the window_descriptor
+            // byte from the wire entirely. Setting an expectation
+            // here must surface `found: None` so callers
+            // distinguish "wrong descriptor" from "no descriptor
+            // on the wire" — never silently pass.
+            let compressed = synth_single_segment_frame(b"tiny");
+
+            // First sanity-check: the synthetic frame decodes
+            // cleanly without any expectation.
+            {
+                let mut probe = FrameDecoder::new();
+                probe
+                    .reset(compressed.as_slice())
+                    .expect("synth frame parses");
+                let probe_state = probe.state.as_ref().unwrap();
+                assert!(
+                    probe_state.frame_header.window_descriptor().is_none(),
+                    "synth frame must be single-segment"
+                );
+            }
+
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_window_descriptor(Some(0x40));
+            let err = decoder
+                .reset(compressed.as_slice())
+                .expect_err("single-segment + expectation must fail");
+            match err {
+                FrameDecoderError::UnexpectedWindowDescriptor { expected, found } => {
+                    assert_eq!(expected, 0x40);
+                    assert_eq!(found, None);
+                }
+                other => panic!("expected UnexpectedWindowDescriptor, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn validation_failure_leaves_decoder_re_resettable() {
+            // After UnexpectedDictId on a wrong-expectation reset,
+            // clearing the expectation and re-calling reset must
+            // succeed on the same source — no lingering failed
+            // state.
+            let compressed = compress(b"re-resettable");
+
+            let mut decoder = FrameDecoder::new();
+            decoder.expect_dict_id(Some(42));
+            let err = decoder
+                .reset(compressed.as_slice())
+                .expect_err("first reset fails");
+            assert!(matches!(err, FrameDecoderError::UnexpectedDictId { .. }));
+
+            // Clear expectation and retry on a fresh source.
+            decoder.expect_dict_id(None);
+            decoder
+                .reset(compressed.as_slice())
+                .expect("retry after clearing expectation should succeed");
+        }
     }
 }
