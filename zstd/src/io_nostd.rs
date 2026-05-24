@@ -55,10 +55,18 @@ impl Error {
         }
     }
 
-    /// `std::io::Error::other(...)` equivalent for no-std builds.
-    /// Mirrors `std::io::Error::other` shape so call sites compile
-    /// uniformly across feature toggles. Always produces an
-    /// [`ErrorKind::Other`] error.
+    /// `Error::other(_)` constructor for no-std builds.
+    /// Always produces an [`ErrorKind::Other`] error.
+    ///
+    /// NOT a drop-in mirror of `std::io::Error::other`: this no-std
+    /// version takes `Display + Send + Sync + 'static` because the
+    /// no-std shim stores the payload via the existing
+    /// `Box<dyn Display + Send + Sync>` field. `std::io::Error::other`
+    /// takes `impl Into<Box<dyn core::error::Error + Send + Sync>>`.
+    /// The crate's call sites pass concrete types that satisfy BOTH
+    /// bounds (e.g. `&'static str`, `String`, custom error types
+    /// implementing both), so the same call site compiles uniformly
+    /// across feature toggles without per-call adaptation.
     pub fn other<E: core::fmt::Display + Send + Sync + 'static>(err: E) -> Self {
         Self {
             kind: ErrorKind::Other,

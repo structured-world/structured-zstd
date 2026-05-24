@@ -64,6 +64,27 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// overshoots from `extend_from_within_unchecked` stay inside the
 /// allocation. The dispatch site in [`crate::decoding::FrameDecoder`]
 /// validates this precondition.
+///
+/// # DoS surface on malformed Compressed blocks
+///
+/// The bounds checks on write entry points are `debug_assert!` (for
+/// `extend`, `extend_and_fill`) and a release-mode `assert!` (for
+/// `extend_from_within_unchecked`). On adversarial input — a frame
+/// header that declares a small `frame_content_size` AND a Compressed
+/// block whose payload expands to more than the declared size — the
+/// burst's per-symbol writes can reach past `slice.len()` and
+/// `assert!` (or panic via slice indexing in `extend`) instead of
+/// returning a structured error. The frame-level
+/// `decode_to_slice` checks `produced > content_size` AFTER each
+/// block; within a single block the panic-on-overshoot is the
+/// only stop. Callers handling untrusted input should use
+/// [`crate::decoding::FrameDecoder::decode_all`] which routes
+/// through `FlatBuf` / `RingBuffer` backends whose `Vec::reserve`
+/// growth path returns errors rather than panicking.
+/// Replacing the panics with `Result<_, _>`-returning writes is
+/// tracked in issue #246 — it requires extending the
+/// `BufferBackend` trait surface and would gate the direct path on
+/// the new fallible signatures.
 #[allow(dead_code)]
 pub(crate) struct UserSliceBackend<'a> {
     slice: &'a mut [u8],
@@ -153,14 +174,33 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
 
     #[inline]
     fn extend(&mut self, data: &[u8]) {
-        let new_tail = self.tail + data.len();
+        let len = data.len();
+        let new_tail = self.tail + len;
         debug_assert!(
             new_tail <= self.slice.len(),
             "UserSliceBackend::extend overflows slice (tail+={}, cap={})",
-            data.len(),
+            len,
             self.slice.len()
         );
-        self.slice[self.tail..new_tail].copy_from_slice(data);
+        // Literal pushes (the sequence executor calls this for the
+        // literal portion of every sequence) frequently land in the
+        // 1..=16 byte range on highly-compressed corpora — exactly
+        // the range where libc memmove dispatch overhead dominates
+        // the cost of the actual copy. Route through
+        // `copy_bytes_overshooting` so short pushes inline a single
+        // SIMD / overlapping-u64 store instead.
+        let total_writable = self.slice.len() - self.tail;
+        // SAFETY: caller-provided `data` is non-aliasing with the
+        // backend's slice (it's the literals buffer or input view).
+        // `new_tail <= self.slice.len()` (debug_assert above), so
+        // both regions have ≥ `len` valid bytes.
+        unsafe {
+            super::simd_copy::copy_bytes_overshooting(
+                (data.as_ptr(), len),
+                (self.slice.as_mut_ptr().add(self.tail), total_writable),
+                len,
+            );
+        }
         self.tail = new_tail;
     }
 

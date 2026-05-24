@@ -1209,9 +1209,35 @@ impl FrameDecoder {
     /// back to the existing [`Self::decode_all`] path. Both paths
     /// return the number of bytes written into `output`.
     ///
-    /// `input` must contain at most ONE frame (skippable frames not
-    /// supported on the direct-decode path — fall back to
-    /// `decode_all` for multi-frame streams).
+    /// `input` is expected to contain exactly ONE non-skippable
+    /// zstd frame. **Skippable frames are rejected with
+    /// `ReadFrameHeaderError::SkipFrame` from `init`** — this
+    /// method does NOT skip them. Multi-frame input or input that
+    /// might contain skippable frames must go through
+    /// [`Self::decode_all`], which iterates `init` and handles
+    /// `SkipFrame` by advancing past the skippable payload.
+    ///
+    /// # State observability after this call
+    ///
+    /// On the direct path, decoded bytes are written into `output`
+    /// via a stack-local `DecodeBuffer<UserSliceBackend>` that is
+    /// dropped before this function returns. The persistent
+    /// `state.decoder_scratch.buffer` stays empty. Consequently,
+    /// after `decode_to_slice` returns:
+    ///
+    /// - [`Self::is_finished`] returns `true`,
+    /// - [`Self::can_collect`] returns `0`,
+    /// - [`Self::read`] (`std::io::Read`) reads 0 bytes,
+    /// - [`Self::collect`] returns `Some(Vec::new())`,
+    /// - [`Self::get_calculated_checksum`] is `None` on the
+    ///   direct path because the rolling hash lives on the
+    ///   stack-local buffer that was dropped.
+    ///
+    /// Callers must use the bytes from `output[..n]` (where `n`
+    /// is the returned count); do not mix `decode_to_slice` with
+    /// `read`/`collect` on the same `FrameDecoder`. The
+    /// fallback (`decode_all`) sub-path inside this method
+    /// behaves like the regular `decode_all` w.r.t. state.
     pub fn decode_to_slice(
         &mut self,
         mut input: &[u8],
@@ -1229,6 +1255,14 @@ impl FrameDecoder {
         // the frame descriptor + resets the per-frame scratch
         // (DecoderScratchKind::Flat for single-segment, ::Ring
         // otherwise).
+        //
+        // Skippable frames are reported by `init` as
+        // `ReadFrameHeaderError::SkipFrame`. The direct path
+        // doesn't have a state model for "skip + decode next" since
+        // it processes a single frame at most — propagate the error
+        // unchanged so callers learn this input needs `decode_all`
+        // (which iterates init and advances past skippable
+        // payloads).
         self.init(&mut input)?;
 
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
