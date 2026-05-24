@@ -107,19 +107,6 @@ pub mod testing {
     /// Exposed for parity tests that feed exactly-one-block chunks
     /// into the donor splitter comparator.
     pub const MAX_BLOCK_SIZE: u32 = crate::common::MAX_BLOCK_SIZE;
-}
-
-/// SIMD wildcopy overshoot slack carried by every decoder backend.
-/// Mirrors donor zstd's `WILDCOPY_OVERLENGTH` (16 bytes). Public so
-/// callers sizing an output slice for
-/// [`crate::decoding::FrameDecoder::decode_to_slice`] can size
-/// `frame_content_size + WILDCOPY_OVERLENGTH` without duplicating
-/// the constant.
-pub const WILDCOPY_OVERLENGTH: usize = crate::decoding::buffer_backend::WILDCOPY_OVERLENGTH;
-
-#[cfg(feature = "bench_internals")]
-#[doc(hidden)]
-mod bench_block_splitter {
 
     /// Run our donor-port block splitter on a 128 KB chunk.
     ///
@@ -135,3 +122,11 @@ mod bench_block_splitter {
         crate::encoding::frame_compressor::block_splitter_decision_for_bench(block, split_level)
     }
 }
+
+/// SIMD wildcopy overshoot slack carried by every decoder backend.
+/// Mirrors donor zstd's `WILDCOPY_OVERLENGTH` (16 bytes). Public so
+/// callers sizing an output slice for
+/// [`crate::decoding::FrameDecoder::decode_to_slice`] can size
+/// `frame_content_size + WILDCOPY_OVERLENGTH` without duplicating
+/// the constant.
+pub const WILDCOPY_OVERLENGTH: usize = crate::decoding::buffer_backend::WILDCOPY_OVERLENGTH;
