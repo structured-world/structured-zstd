@@ -1355,8 +1355,14 @@ impl FrameDecoder {
                 .read_block_header(&mut input)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += u64::from(hsize);
+            // Slice-source fast path: consume the block body
+            // straight from `input` without copying into the
+            // persistent `block_content_buffer`. This is the
+            // largest single perf win behind the direct-decode
+            // path at L-1 — see #244 follow-up flamegraph
+            // analysis.
             let body_consumed = block_dec
-                .decode_block_content(&block_header, &mut direct, &mut input)
+                .decode_block_content_from_slice(&block_header, &mut direct, &mut input)
                 .map_err(err::FailedToReadBlockBody)?;
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;

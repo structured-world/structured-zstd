@@ -41,6 +41,85 @@ impl BlockDecoder {
     /// The decode buffer inside `workspace` may be reserved or grown during
     /// decoding. For some block types the decompressed size is known up front,
     /// but this is not guaranteed before any data is written.
+    /// Slice-source fast path for `decode_block_content`. Consumes
+    /// the right number of bytes from `*source` (advancing the slice)
+    /// without going through the persistent `block_content_buffer`.
+    /// Used by `FrameDecoder::decode_to_slice` where `source` is
+    /// already a `&[u8]` view into the user's input.
+    ///
+    /// Returns the number of bytes consumed from `*source`.
+    pub fn decode_block_content_from_slice<W: Workspace>(
+        &mut self,
+        header: &BlockHeader,
+        workspace: &mut W,
+        source: &mut &[u8],
+    ) -> Result<u64, DecodeBlockContentError> {
+        use DecoderState as State;
+        match self.internal_state {
+            State::ReadyToDecodeNextBody => { /* ok */ }
+            State::Failed => return Err(DecodeBlockContentError::DecoderStateIsFailed),
+            State::ReadyToDecodeNextHeader => {
+                return Err(DecodeBlockContentError::ExpectedHeaderOfPreviousBlock);
+            }
+        }
+
+        let block_type = header.block_type;
+        match block_type {
+            BlockType::RLE => {
+                // 1 byte from source via slice; no Read overhead.
+                if source.is_empty() {
+                    return Err(DecodeBlockContentError::ReadError {
+                        step: block_type,
+                        source: crate::io::Error::other("RLE block missing fill byte"),
+                    });
+                }
+                let fill = source[0];
+                *source = &source[1..];
+                workspace
+                    .split()
+                    .buffer
+                    .extend_and_fill(fill, header.decompressed_size as usize);
+                self.internal_state = State::ReadyToDecodeNextHeader;
+                Ok(1)
+            }
+            BlockType::Raw => {
+                // Raw payload IS the source bytes; push them
+                // directly to the buffer. For UserSliceBackend this
+                // is a single memcpy from input -> output, no
+                // intermediate Vec.
+                let n = header.decompressed_size as usize;
+                if source.len() < n {
+                    return Err(DecodeBlockContentError::ReadError {
+                        step: block_type,
+                        source: crate::io::Error::other("Raw block truncated"),
+                    });
+                }
+                let (payload, tail) = source.split_at(n);
+                workspace.split().buffer.push(payload);
+                *source = tail;
+                self.internal_state = State::ReadyToDecodeNextHeader;
+                Ok(u64::from(header.decompressed_size))
+            }
+            BlockType::Reserved => {
+                panic!("Reserved-type block should be rejected during header parsing");
+            }
+            BlockType::Compressed => {
+                let n = header.content_size as usize;
+                if source.len() < n {
+                    return Err(DecodeBlockContentError::ReadError {
+                        step: block_type,
+                        source: crate::io::Error::other("Compressed block truncated"),
+                    });
+                }
+                let (payload, tail) = source.split_at(n);
+                self.decompress_block_inplace(header, workspace, payload)?;
+                *source = tail;
+                self.internal_state = State::ReadyToDecodeNextHeader;
+                Ok(u64::from(header.content_size))
+            }
+        }
+    }
+
     pub fn decode_block_content<W: Workspace>(
         &mut self,
         header: &BlockHeader,
@@ -114,14 +193,56 @@ impl BlockDecoder {
         workspace: &mut W,
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
+        // Streaming-path entry: copy `content_size` bytes from the
+        // `Read` source into `block_content_buffer`, then dispatch
+        // to the in-place body. The direct-decode path
+        // (`decode_to_slice`) skips this copy by passing a borrowed
+        // slice of the input straight to `decompress_block_inplace`.
+        {
+            let parts = workspace.split();
+            parts
+                .block_content_buffer
+                .resize(header.content_size as usize, 0);
+            source.read_exact(parts.block_content_buffer.as_mut_slice())?;
+        }
+        // SAFETY: block_content_buffer aliases the WorkspaceRef's
+        // `block_content_buffer` field returned by the inner fn's
+        // `split()`. We only read from `raw` inside
+        // `decompress_block_inplace`; that fn never mutates
+        // block_content_buffer (it only writes the OTHER scratch
+        // fields). Without the lifetime widening here Rust would
+        // refuse the second `split()` call inside the body.
+        let raw_ptr_len = {
+            let bc = &workspace.split().block_content_buffer;
+            (bc.as_ptr(), bc.len())
+        };
+        let raw: &[u8] = unsafe { core::slice::from_raw_parts(raw_ptr_len.0, raw_ptr_len.1) };
+        self.decompress_block_inplace(header, workspace, raw)
+    }
+
+    /// Compressed-block fast path that takes the block content as a
+    /// borrowed slice (no per-block memcpy into
+    /// `block_content_buffer`).
+    ///
+    /// Called by:
+    /// - `decompress_block` (streaming path) after it has copied the
+    ///   compressed bytes from the source `Read` into the persistent
+    ///   `block_content_buffer`.
+    /// - `decode_block_content_from_slice` (direct-decode path) where
+    ///   the source is a `&[u8]` already, so the slice IS the input —
+    ///   saving the per-block memcpy + anonymous-page first-touch on
+    ///   `block_content_buffer.resize(...)`. At L-1 fast on
+    ///   `decodecorpus-z000033` this `block_content_buffer` traffic
+    ///   was the largest single contributor to the
+    ///   `__memmove_avx_unaligned_erms` + `exc_page_fault` flame
+    ///   on the post-#244 baseline (~30% of decode time combined).
+    pub(crate) fn decompress_block_inplace<W: Workspace>(
+        &mut self,
+        header: &BlockHeader,
+        workspace: &mut W,
+        raw: &[u8],
+    ) -> Result<(), DecompressBlockError> {
         let parts = workspace.split();
-        parts
-            .block_content_buffer
-            .resize(header.content_size as usize, 0);
-
-        source.read_exact(parts.block_content_buffer.as_mut_slice())?;
-        let raw = parts.block_content_buffer.as_slice();
-
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
         let raw = &raw[bytes_in_literals_header as usize..];
