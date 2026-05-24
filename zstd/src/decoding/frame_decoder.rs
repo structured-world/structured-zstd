@@ -1711,6 +1711,57 @@ mod tests {
     }
 
     #[test]
+    fn decode_to_slice_fcs_overflow_via_corrupt_frame_returns_structured_error() {
+        // Hand-build a corrupt frame that declares
+        // frame_content_size = 4 but the (last) block carries a
+        // larger Raw payload. The pre-flight FCS check inside the
+        // direct path's block loop catches this and returns the
+        // structured FrameContentSizeMismatch variant — not a
+        // panic, not a generic TargetTooSmall.
+        //
+        // Frame layout (single_segment, FCS=4):
+        //   magic            4 bytes  0xFD2FB528
+        //   FHD              1 byte   single_segment=1, no checksum,
+        //                              FCS field size = 0 (-> 1-byte FCS)
+        //   FCS              1 byte   0x04
+        //   block_header     3 bytes  last=1, type=Raw, block_size=10
+        //   block_payload    10 bytes 0xAA repeated
+        let mut frame = alloc::vec::Vec::new();
+        // magic
+        frame.extend_from_slice(&0xFD2FB528u32.to_le_bytes());
+        // FHD: single_segment=1, fcs_flag=0 (1-byte FCS), no checksum,
+        // no dict. Bit layout: FCS(7-6)=0, single_segment(5)=1,
+        // reserved/uncs(4)=0, content_checksum(2)=0, dict(0-1)=00.
+        frame.push(0b0010_0000);
+        // FCS: 1 byte
+        frame.push(4);
+        // Block header: cBlockSize=10, type=Raw (0), last=1
+        // 3-byte LE: bit0=last, bits1-2=type(2 bits), bits3-23=size
+        let cblock_size: u32 = 10;
+        let bh: u32 = 1 | (cblock_size << 3); // last=1, type=Raw=0
+        frame.push((bh & 0xFF) as u8);
+        frame.push((bh >> 8) as u8);
+        frame.push((bh >> 16) as u8);
+        // Payload — 10 bytes that, if decoded, would exceed FCS=4.
+        frame.extend(core::iter::repeat_n(0xAAu8, 10));
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; 4 + slack];
+        let err = dec
+            .decode_to_slice(&frame, &mut out)
+            .expect_err("FCS-overflow frame must fail decode");
+        assert!(
+            matches!(
+                err,
+                super::FrameDecoderError::FrameContentSizeMismatch { .. }
+            ),
+            "expected FrameContentSizeMismatch, got {:?}",
+            err
+        );
+    }
+
+    #[test]
     fn decode_to_slice_falls_back_when_output_too_small_for_wildcopy_slack() {
         // Output sized exactly to frame_content_size (no
         // WILDCOPY_OVERLENGTH slack) must NOT trigger the direct

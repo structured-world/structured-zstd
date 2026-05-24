@@ -1357,6 +1357,14 @@ mod tests {
             FrameDecoderError::DictAlreadyRegistered { dict_id: 0xABCD }.to_string(),
             "Dictionary id 0xABCD already registered in decoder"
         );
+        assert_eq!(
+            FrameDecoderError::FrameContentSizeMismatch {
+                declared: 100,
+                produced: 87,
+            }
+            .to_string(),
+            "Frame content size mismatch (corrupt frame): declared 100 bytes, blocks summed to 87 bytes"
+        );
     }
 
     #[test]
