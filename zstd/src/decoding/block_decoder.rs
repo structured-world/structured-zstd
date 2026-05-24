@@ -3,7 +3,7 @@ use super::super::blocks::block::BlockType;
 use super::super::blocks::literals_section::LiteralsSection;
 use super::super::blocks::literals_section::LiteralsSectionType;
 use super::super::blocks::sequence_section::SequencesHeader;
-use super::literals_section_decoder::decode_literals;
+use super::literals_section_decoder::{LiteralsView, decode_literals_zerocopy};
 use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeSequenceError;
@@ -195,29 +195,31 @@ impl BlockDecoder {
     ) -> Result<(), DecompressBlockError> {
         // Streaming-path entry: copy `content_size` bytes from the
         // `Read` source into `block_content_buffer`, then dispatch
-        // to the in-place body. The direct-decode path
-        // (`decode_to_slice`) skips this copy by passing a borrowed
-        // slice of the input straight to `decompress_block_inplace`.
-        {
-            let parts = workspace.split();
-            parts
-                .block_content_buffer
-                .resize(header.content_size as usize, 0);
-            source.read_exact(parts.block_content_buffer.as_mut_slice())?;
-        }
-        // SAFETY: block_content_buffer aliases the WorkspaceRef's
-        // `block_content_buffer` field returned by the inner fn's
-        // `split()`. We only read from `raw` inside
-        // `decompress_block_inplace`; that fn never mutates
-        // block_content_buffer (it only writes the OTHER scratch
-        // fields). Without the lifetime widening here Rust would
-        // refuse the second `split()` call inside the body.
-        let raw_ptr_len = {
-            let bc = &workspace.split().block_content_buffer;
-            (bc.as_ptr(), bc.len())
-        };
-        let raw: &[u8] = unsafe { core::slice::from_raw_parts(raw_ptr_len.0, raw_ptr_len.1) };
-        self.decompress_block_inplace(header, workspace, raw)
+        // to the in-place body via per-field borrows. The direct-
+        // decode path (`decode_to_slice`) skips this copy by passing
+        // a borrowed slice of the input straight to
+        // `decompress_block_inplace_with_parts`.
+        let parts = workspace.split();
+        parts
+            .block_content_buffer
+            .resize(header.content_size as usize, 0);
+        source.read_exact(parts.block_content_buffer.as_mut_slice())?;
+        // Disjoint-fields borrow: `as_slice()` reborrows
+        // block_content_buffer as `&[u8]`; the other WorkspaceRef
+        // fields stay independently movable into the helper since
+        // each is a distinct struct field. No `unsafe` needed —
+        // Rust's borrow checker tracks per-field disjointness.
+        let raw = parts.block_content_buffer.as_slice();
+        self.decompress_block_inplace_with_parts(
+            header,
+            parts.huf,
+            parts.fse,
+            parts.buffer,
+            parts.offset_hist,
+            parts.literals_buffer,
+            parts.sequences,
+            raw,
+        )
     }
 
     /// Compressed-block fast path that takes the block content as a
@@ -243,6 +245,42 @@ impl BlockDecoder {
         raw: &[u8],
     ) -> Result<(), DecompressBlockError> {
         let parts = workspace.split();
+        // block_content_buffer is intentionally NOT passed — the
+        // in-place body does not need it (raw already IS the block
+        // content). Dropping it here keeps the helper signature
+        // free of an unused-field reference.
+        self.decompress_block_inplace_with_parts(
+            header,
+            parts.huf,
+            parts.fse,
+            parts.buffer,
+            parts.offset_hist,
+            parts.literals_buffer,
+            parts.sequences,
+            raw,
+        )
+    }
+
+    /// Inner body of [`Self::decompress_block_inplace`] that takes
+    /// the scratch fields as disjoint `&mut` references. The split
+    /// happens at the call site (so the streaming path can keep its
+    /// `block_content_buffer` borrow alive while passing `raw =
+    /// block_content_buffer.as_slice()` here without aliasing the
+    /// other scratch fields). All `unsafe` from the previous
+    /// lifetime-widening trick is gone — disjoint-field borrows
+    /// type-check naturally.
+    #[allow(clippy::too_many_arguments)]
+    fn decompress_block_inplace_with_parts<B: super::buffer_backend::BufferBackend>(
+        &mut self,
+        header: &BlockHeader,
+        huf: &mut crate::decoding::scratch::HuffmanScratch,
+        fse: &mut crate::decoding::scratch::FSEScratch,
+        buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
+        offset_hist: &mut [u32; 3],
+        literals_buffer: &mut alloc::vec::Vec<u8>,
+        sequences: &mut alloc::vec::Vec<crate::blocks::sequence_section::Sequence>,
+        raw: &[u8],
+    ) -> Result<(), DecompressBlockError> {
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
         let raw = &raw[bytes_in_literals_header as usize..];
@@ -272,13 +310,22 @@ impl BlockDecoder {
         let raw_literals = &raw[..upper_limit_for_literals];
         vprintln!("Slice for literals: {}", raw_literals.len());
 
-        parts.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
-        let bytes_used_in_literals_section =
-            decode_literals(&section, parts.huf, raw_literals, parts.literals_buffer)?;
+        literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
+        // Zero-copy literals view — for Raw sections this borrows
+        // straight into `raw_literals` (no memcpy into the Vec).
+        // For RLE / HUF it materialises into `literals_buffer`
+        // and `data` is a slice over that buffer. Eliminates a major
+        // memcpy contributor (Vec::extend_from_slice → spec_extend)
+        // flagged at ~20% of decode time on the L-1 fast c_stream
+        // flamegraph.
+        let LiteralsView {
+            data: literals_view,
+            bytes_used: bytes_used_in_literals_section,
+        } = decode_literals_zerocopy(&section, huf, raw_literals, literals_buffer)?;
         assert!(
-            section.regenerated_size == parts.literals_buffer.len() as u32,
+            section.regenerated_size as usize == literals_view.len(),
             "Wrong number of literals: {}, Should have been: {}",
-            parts.literals_buffer.len(),
+            literals_view.len(),
             section.regenerated_size
         );
         assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
@@ -316,11 +363,11 @@ impl BlockDecoder {
             decode_and_execute_sequences(
                 &seq_section,
                 raw,
-                parts.fse,
-                parts.buffer,
-                parts.offset_hist,
-                parts.literals_buffer,
-                parts.sequences,
+                fse,
+                buffer,
+                offset_hist,
+                literals_view,
+                sequences,
             )?;
         } else {
             if !raw.is_empty() {
@@ -330,8 +377,8 @@ impl BlockDecoder {
                     },
                 ));
             }
-            parts.buffer.push(parts.literals_buffer);
-            parts.sequences.clear();
+            buffer.push(literals_view);
+            sequences.clear();
         }
 
         Ok(())

@@ -9,6 +9,10 @@ use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
+/// Legacy compatibility wrapper around [`decode_literals_zerocopy`]
+/// for tests / callers that still expect the literals to land in a
+/// Vec. New code paths should use the zero-copy variant directly.
+#[cfg(test)]
 pub fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
@@ -26,9 +30,65 @@ pub fn decode_literals(
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
             let bytes_read = decompress_literals(section, scratch, source, target)?;
-
-            //return sum of used bytes
             Ok(bytes_read)
+        }
+    }
+}
+
+/// Result of [`decode_literals_zerocopy`]. For Raw sections this is a
+/// borrow straight into the input — no memcpy. For RLE / HUF
+/// sections it's a borrow of the scratch `literals_buffer` where the
+/// data was materialised.
+pub struct LiteralsView<'a> {
+    /// Decoded literal bytes available for the sequence executor.
+    pub data: &'a [u8],
+    /// Bytes consumed from the input literals section payload
+    /// (Raw: regenerated_size; HUF: header + jump + 4 streams).
+    pub bytes_used: u32,
+}
+
+/// Zero-copy variant of [`decode_literals`]. For Raw literal sections
+/// returns a slice straight into `source` instead of copying bytes
+/// into a Vec — eliminates one memcpy + one zero-touch wave per RAW
+/// literal byte on the direct-decode path. RLE / HUF paths still go
+/// through `target` because they have to produce new bytes (RLE: N
+/// copies of one byte; HUF: indexed burst writes).
+///
+/// Donor parity: `dctx->litPtr` is set to either `src` (Raw) or
+/// `dctx->litBuffer` (HUF); the seq executor reads from
+/// `dctx->litPtr` uniformly.
+pub fn decode_literals_zerocopy<'a>(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &'a [u8],
+    target: &'a mut Vec<u8>,
+) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
+    match section.ls_type {
+        LiteralsSectionType::Raw => {
+            let n = section.regenerated_size as usize;
+            // Zero-copy: borrow the payload from source. `target` is
+            // left empty — the caller passes `LiteralsView::data` to
+            // the sequence executor instead.
+            Ok(LiteralsView {
+                data: &source[0..n],
+                bytes_used: section.regenerated_size,
+            })
+        }
+        LiteralsSectionType::RLE => {
+            // RLE expands one byte to N — has to write into target.
+            // Same shape as decode_literals' RLE branch.
+            target.resize(target.len() + section.regenerated_size as usize, source[0]);
+            Ok(LiteralsView {
+                data: target.as_slice(),
+                bytes_used: 1,
+            })
+        }
+        LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
+            let bytes_used = decompress_literals(section, scratch, source, target)?;
+            Ok(LiteralsView {
+                data: target.as_slice(),
+                bytes_used,
+            })
         }
     }
 }

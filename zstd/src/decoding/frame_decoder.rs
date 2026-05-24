@@ -1350,11 +1350,29 @@ impl FrameDecoder {
         // (`bytes_read_from_source`, `blocks_decoded`) return
         // accurate values.
         let mut block_dec = block_decoder::new();
+        // Track total output bytes against the declared
+        // `frame_content_size`. A malformed frame whose blocks claim
+        // more decompressed bytes than the FCS would otherwise let
+        // the burst write past `output[..content_size]` into the
+        // wildcopy slack and beyond — `UserSliceBackend` would
+        // panic on the bounds assert. Catch the overflow here and
+        // return a structured `TargetTooSmall` error instead.
+        let mut produced: u64 = 0;
         loop {
             let (block_header, hsize) = block_dec
                 .read_block_header(&mut input)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += u64::from(hsize);
+            // Pre-flight FCS check: a single block's
+            // `decompressed_size` is bounded by `MAX_BLOCK_SIZE`
+            // (128 KiB), so even for compressed blocks the upper
+            // bound on what this block will write is known before
+            // the body decodes. Reject early when adding it would
+            // exceed `content_size`.
+            let block_upper = u64::from(block_header.decompressed_size);
+            if produced + block_upper > content_size {
+                return Err(err::TargetTooSmall);
+            }
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
             // persistent `block_content_buffer`. This is the
@@ -1364,6 +1382,7 @@ impl FrameDecoder {
             let body_consumed = block_dec
                 .decode_block_content_from_slice(&block_header, &mut direct, &mut input)
                 .map_err(err::FailedToReadBlockBody)?;
+            produced += u64::from(block_header.decompressed_size);
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
             // Cap the visible buffer at window_size between blocks
@@ -1387,6 +1406,12 @@ impl FrameDecoder {
                 }
                 break;
             }
+        }
+        // Final sanity: blocks summed to exactly `content_size`. A
+        // malformed frame with `last_block` set early would produce
+        // less than declared.
+        if produced != content_size {
+            return Err(err::TargetTooSmall);
         }
 
         // `direct.buffer.len()` would only show the visible (post
@@ -1462,6 +1487,68 @@ mod tests {
             "direct decode produced wrong byte count"
         );
         assert_eq!(&out_b[..n_b], payload.as_slice());
+    }
+
+    #[test]
+    fn decode_to_slice_multi_segment_frame_decodes_correctly() {
+        // Multi-segment frame: payload large enough that the
+        // encoder's default frame layout has `single_segment_flag =
+        // false` and `window_size < frame_content_size`. The direct
+        // path must cap the visible buffer at window_size after each
+        // block (drop_to_window_size) so match-offset validation
+        // matches the spec rule `offset <= window_size`, and still
+        // produce the same bytes as decode_all on the
+        // FlatBuf/Ring-backed path.
+        //
+        // Make the payload structured so multi-segment behavior
+        // actually kicks in: 2 MiB of repeating + random-ish bytes
+        // forces window_size lower than content_size at the encoder.
+        let mut payload: Vec<u8> = Vec::with_capacity(2 * 1024 * 1024);
+        for i in 0..payload.capacity() {
+            payload.push((i.wrapping_mul(2_654_435_761) & 0xFF) as u8);
+        }
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Baseline: decode_all through the FlatBuf+drain path.
+        let mut dec_a = FrameDecoder::new();
+        let mut out_a = std::vec![0u8; payload.len()];
+        let n_a = dec_a
+            .decode_all(compressed.as_slice(), &mut out_a)
+            .expect("decode_all should succeed");
+        assert_eq!(n_a, payload.len());
+        assert_eq!(&out_a[..n_a], payload.as_slice());
+
+        // Direct path: must give identical bytes via UserSliceBackend
+        // + per-block drop_to_window_size.
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec_b = FrameDecoder::new();
+        let mut out_b = std::vec![0u8; payload.len() + slack];
+        let n_b = dec_b
+            .decode_to_slice(compressed.as_slice(), &mut out_b)
+            .expect("decode_to_slice should succeed on multi-segment frame");
+        assert_eq!(n_b, payload.len(), "wrong byte count on direct path");
+        assert_eq!(&out_b[..n_b], payload.as_slice());
+
+        // Sanity-check: confirm the encoded frame really IS
+        // multi-segment. If a future encoder default changes,
+        // catching the assumption here is better than silently
+        // testing single_segment on this name.
+        let mut sanity = FrameDecoder::new();
+        sanity.init(&mut compressed.as_slice()).unwrap();
+        assert!(
+            !sanity
+                .state
+                .as_ref()
+                .unwrap()
+                .frame_header
+                .descriptor
+                .single_segment_flag(),
+            "test precondition violated: frame is single-segment, rename or resize"
+        );
     }
 
     #[test]
