@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779632697863,
+  "lastUpdate": 1779642752298,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -45602,6 +45602,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.2,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d348f4f39a14eebd58b0da4ea2360284203cc247",
+          "message": "feat(skippable): typed SkippableFrame API behind lsm feature (#248)\n\n* feat(skippable): typed SkippableFrame API behind lsm feature\n\nAdd `zstd::skippable` module exposing a typed builder for RFC 8878\n§3.1 skippable frames, gated behind the new `lsm` Cargo feature\n(default off, no-std + alloc compatible).\n\n* `SkippableFrame { magic_variant, payload }` with `new` /\n  `encode_into` / `decode_from` / `serialized_size` /\n  `magic_variant` / `magic_number` / `payload` / `into_payload`.\n* Free function `write_skippable_frame(variant, payload, writer)`\n  matching donor `ZSTD_writeSkippableFrame` validation +\n  byte-layout shape, returning bytes written.\n* Validation: `magic_variant <= 15` and\n  `payload.len() <= u32::MAX`, surfaced via `SkippableFrameError`.\n* Constants `SKIPPABLE_MAGIC_START`, `SKIPPABLE_HEADER_SIZE`,\n  `SKIPPABLE_MAGIC_MAX_VARIANT` for downstream callers building\n  custom wrappers.\n\nWire format is byte-compatible with upstream\n`ZSTD_writeSkippableFrame` (`lib/compress/zstd_compress.c:4751-4763`\nin zstd v1.5.7) — locked in by a parity test that builds the donor\nlayout inline and compares every variant × every interesting\npayload size byte-for-byte.\n\n`lsm` feature is `[]` (no implied std). The module routes I/O\nthrough `crate::io::{Read, Write, Error}` (no-std shim under\n`#[cfg(not(feature = \"std\"))]`, std re-exports otherwise) so\n`cargo check --target thumbv6m-none-eabi --no-default-features\n--features lsm` succeeds. With the feature off the public surface\nis byte-identical to today; the cdylib from the C FFI track is\nunaffected regardless of feature state.\n\nTests added: 13 covering 16-variant round-trip, empty + 1 MiB\npayloads, validation rejection paths, donor byte-parity across\nvariant × payload-size matrix, decode error pathways (wrong magic,\nmagic above band, truncated header, truncated payload), and the\n`serialized_size()` invariant.\n\nCloses #171\n\n* fix(skippable): DoS-safe decode + dedicated error type + non_exhaustive\n\n* `SkippableFrame::decode_from` now returns\n  `DecodeSkippableFrameError` (new typed enum: `Magic` / `BadMagicNumber`\n  / `Length` / `Payload` / `AllocationFailed`) instead of routing\n  through the unrelated `ReadFrameHeaderError`. Payload-read failures\n  no longer surface with the misleading \"Error while reading frame\n  descriptor\" message.\n* Payload buffer allocated via `Vec::try_reserve_exact`, converting\n  crafted-length OOM scenarios into typed\n  `AllocationFailed { requested }` instead of process abort.\n* `validate_payload_size` also rejects payloads whose\n  `len + SKIPPABLE_HEADER_SIZE` would overflow `usize` (matters only\n  on 32-bit targets where the wire-format `u32::MAX` ceiling\n  coincides with `usize::MAX`).\n* `SkippableFrameError` and `DecodeSkippableFrameError` carry\n  `#[non_exhaustive]` so adding variants stays a non-breaking\n  change.\n* Module-doc wire diagram column header corrected from\n  `payload-length` (already represented in the 4-byte length field)\n  to `length bytes / payload`. Range notation `0x184D2A50..5F`\n  spelled out as `0x184D2A50..=0x184D2A5F` to match the RFC.\n* Tests updated for the new error type. Added\n  `decode_truncated_length_surfaces_typed_error` and\n  `decode_huge_length_returns_typed_error_not_oom_abort` covering\n  the new branches.\n* `lsm` Cargo feature comment reworded to describe only what the\n  feature actually gates today (no stale forward-references).\n\n* fix(skippable): DoS-safer decode_from + 32-bit length validation\n\n* `decode_from` now applies `length + SKIPPABLE_HEADER_SIZE` overflow\n  validation on the wire-format length field before allocating.\n  New `DecodeSkippableFrameError::PayloadTooLarge { length }` variant\n  fires on 32-bit targets where `u32::MAX + 8` overflows `usize`. The\n  invariant is symmetric with what `new()` / `write_skippable_frame()`\n  enforce; missing it here let a crafted wire `length` near `u32::MAX`\n  reach `serialized_size()` / `write_skippable_frame_to` and overflow\n  there on i686.\n* Payload buffer no longer zero-filled up front via\n  `try_reserve_exact + resize(length, 0)`. On OSes with memory\n  overcommit (Linux default, macOS) the `resize` pre-fill committed\n  the full crafted-length worth of pages before the I/O read had a\n  chance to report truncation — the OOM killer would fire even\n  though `try_reserve_exact` had succeeded. New path reads in\n  16 KiB chunks via a stack scratch buffer and pushes via\n  `extend_from_slice`, so the OS commits pages only as the reader\n  delivers bytes. A 4 GiB-declared payload on a 12-byte stream now\n  commits ~one page and surfaces `Payload(UnexpectedEof)` reliably.\n* `SkippableFrameError::PayloadTooLarge` Display message corrected:\n  the variant fires for two causes (wire-format `u32::MAX` ceiling\n  AND 32-bit `usize` overflow when combined with the 8-byte header),\n  the message now spells out both rather than implying only the\n  wire-format limit.\n* Renamed test `payload_too_large_check_is_inert_on_32bit_but_present`\n  → `payload_too_large_check_branches_on_pointer_width`. The previous\n  assertion that `validate_payload_size(u32::MAX as usize)` is OK is\n  TRUE on 64-bit but FALSE on 32-bit (where `u32::MAX + 8` overflows).\n  Test now branches on `target_pointer_width` and asserts the right\n  boundary for each.\n* `decode_huge_length_returns_typed_error_not_oom_abort` updated to\n  accept all three valid outcomes: `PayloadTooLarge` (32-bit),\n  `AllocationFailed` (64-bit, no overcommit), `Payload(io_err)`\n  (64-bit, overcommit OS like Linux/macOS). The pinned goal stays\n  \"no process abort, no panic\".\n\n* fix(skippable): expose I/O source() chain + drop stale README mention\n\n* `std::error::Error` impl on `SkippableFrameError` now returns the\n  wrapped `crate::io::Error` from the `Io` variant via `source()`,\n  matching the chaining pattern used elsewhere in the crate (e.g.\n  `decoding/errors.rs`). `InvalidMagicVariant` and `PayloadTooLarge`\n  remain leaf nodes.\n* Same treatment for `DecodeSkippableFrameError`: `Magic`, `Length`,\n  `Payload` expose the inner I/O error; `BadMagicNumber`,\n  `AllocationFailed`, `PayloadTooLarge` are leaves.\n* Module-doc no longer claims the README hosts a magic-variant\n  allocations registry (none exists in `zstd/README.md`). Reworded\n  to put the documentation burden on the applications that claim\n  variants, with a note about coordinating to avoid collisions.\n\n* build(docs): add `lsm` to docs.rs feature set\n\nThe `lsm` feature gates the public `zstd::skippable` module (+\n`SkippableFrame` / `write_skippable_frame` / error types) but was\nnot listed in `[package.metadata.docs.rs].features`. Without it,\ndocs.rs renders the published crate without the skippable module\nand without the `doc(cfg(feature = \"lsm\"))` feature badges. Adding\n`lsm` to the docs.rs feature list keeps the published\ndocumentation aligned with the actual public surface.\n\n* docs(skippable): clarify wire-format ASCII column header\n\nThird column was labelled \"length bytes / payload\", which conflated\n\"the count is given by the length field\" with the payload's own\nidentity. New labels: header row `payload bytes`, sub-row\n`(size = length)` makes the relationship to the preceding length\nfield explicit without overloading the word \"length\".\n\n* fix(skippable): safe u32→usize via try_from for 16-bit decode targets\n\n`decode_from` cast the wire-format `length: u32` to `usize` via\nthe bare `as` cast. On 16-bit pointer-width targets (e.g. MSP430,\nAVR) any declared length above `u16::MAX` silently truncates,\nleaving the subsequent allocation + `read_exact` to consume far\nfewer bytes than the wire declared and the reader mis-aligned at\na junk position in the stream.\n\nSwitched to `usize::try_from(length_u32)`, surfacing the\nunrepresentable case as `DecodeSkippableFrameError::PayloadTooLarge`\nBEFORE any allocation. On 32-bit and wider this is unreachable\n(every u32 fits in usize); the explicit conversion just makes the\ncontract uniform across pointer widths.\n\nThe downstream `checked_add(SKIPPABLE_HEADER_SIZE)` overflow check\nremains for 32-bit targets where lengths near `u32::MAX` are\nrepresentable but `length + 8` is not.\n\n* fix(skippable): PayloadTooLarge carries raw u32 wire length\n\n`DecodeSkippableFrameError::PayloadTooLarge { length: usize }`\ntruncated the declared wire length when reported on the very\ntarget the error was added to protect (16-bit MSP430 where\n`usize::try_from(length_u32)` fails).\n\nVariant now carries the raw `u32` from the wire-format length\nfield. Both call sites (`try_from` failure and `checked_add`\noverflow) pass the original `length_u32` directly — no narrowing\n`as` cast on the diagnostic path, matching the comment block that\nsays the wire value is preserved verbatim for diagnostics.\n\nVariant doc-string updated to spell out both trigger conditions\n(16-bit `try_from` failure + 32-bit `+ 8` overflow) so it stays\nhonest about why the variant exists on each pointer width.\n\n* docs(skippable): InvalidMagicVariant uses const + PayloadTooLarge wording\n\n* `SkippableFrameError::InvalidMagicVariant` Display string now\n  interpolates `SKIPPABLE_MAGIC_MAX_VARIANT` instead of a\n  hard-coded `15`. Keeps the diagnostic synced with the constant\n  if the variant ceiling ever changes.\n* `DecodeSkippableFrameError::PayloadTooLarge` Display now spells\n  out both trigger conditions (16-bit `length > usize::MAX`, and\n  32-bit `length + 8 byte header overflows usize`). The previous\n  wording only mentioned the 32-bit `+ 8` case, which was\n  misleading when the variant fires on the 16-bit path it was\n  added to protect.\n\n* fix(skippable): drop decode_from chunk scratch from 16 KiB to 1 KiB\n\nThe on-stack `[0u8; 16 * 1024]` scratch overflows the default\nCortex-M0 4 KiB stack, which the no-std + alloc build the crate\nexplicitly supports. Shrunk to `1024` — still amortises the\nper-read overhead vs byte-by-byte reads but lives comfortably on\nsmall-stack embedded targets. The chunked-read DoS-protection\nproperty (OS commits pages only for delivered bytes) is unchanged;\nthe OS commits in page-sized increments either way.",
+          "timestamp": "2026-05-24T19:21:23+03:00",
+          "tree_id": "19ca9423d880ff664bbfc596a8e399302bbd0393",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d348f4f39a14eebd58b0da4ea2360284203cc247"
+        },
+        "date": 1779642746026,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 302.476,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 250.148,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.61,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.465,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.096,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.041,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.932,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.985,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.317,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.258,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.079,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.627,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.244,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.046,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.826,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.089,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.85,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.244,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.244,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
             "unit": "ms"
           }
         ]
