@@ -19,11 +19,25 @@ pub use fse_decoder::*;
 pub mod fse_encoder;
 
 #[test]
-fn decoder_entry_is_packed_4_bytes() {
-    assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);
+fn decoder_entry_layout_12_bytes_donor_seqsymbol_shape() {
+    // Donor `ZSTD_seqSymbol` shape: 4-byte header (new_state /
+    // symbol / num_bits), 4-byte `base_value`, 1-byte
+    // `num_additional_bits` + 3-byte tail padding for natural u32
+    // alignment. Total 12 bytes. The classical 4-byte layout was
+    // grown in #247 Part 1 to remove the per-sequence
+    // `lookup_ll_code` / `lookup_ml_code` indirection — LL / ML /
+    // OF tables fill `base_value` / `num_additional_bits` from
+    // their respective code-meta tables in the post-build enrich
+    // pass; HUF-weight FSE tables leave them zero (unused).
+    assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 12);
     assert_eq!(core::mem::offset_of!(fse_decoder::Entry, new_state), 0);
     assert_eq!(core::mem::offset_of!(fse_decoder::Entry, symbol), 2);
     assert_eq!(core::mem::offset_of!(fse_decoder::Entry, num_bits), 3);
+    assert_eq!(core::mem::offset_of!(fse_decoder::Entry, base_value), 4);
+    assert_eq!(
+        core::mem::offset_of!(fse_decoder::Entry, num_additional_bits),
+        8
+    );
 }
 
 #[test]

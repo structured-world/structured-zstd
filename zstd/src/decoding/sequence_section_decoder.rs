@@ -493,12 +493,22 @@ fn decode_one_sequence_inline(
     of_dec: &mut FSEDecoder<'_>,
     br: &mut BitReaderReversed<'_>,
 ) -> Sequence {
-    let ll_code = ll_dec.decode_symbol();
-    let ml_code = ml_dec.decode_symbol();
-    let of_code = of_dec.decode_symbol();
+    // Read base/extra-bits directly off the active FSE state's
+    // `Entry` (populated by `enrich_with_packed_seq_meta` /
+    // `enrich_for_offsets` during table build). Drops the previous
+    // `lookup_ll_code` / `lookup_ml_code` indirections — those did
+    // a second cache touch on the separate `LL_META` / `ML_META`
+    // tables per sequence. The active entry was already loaded
+    // when `decode_symbol` read `state.symbol`, so the new fields
+    // come for free in the same cache line.
+    let ll_state = ll_dec.state;
+    let ml_state = ml_dec.state;
+    let of_code = of_dec.state.symbol;
 
-    let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-    let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+    let ll_value = ll_state.base_value;
+    let ll_num_bits = ll_state.num_additional_bits;
+    let ml_value = ml_state.base_value;
+    let ml_num_bits = ml_state.num_additional_bits;
 
     debug_assert!(of_code <= MAX_OFFSET_CODE);
 
@@ -574,8 +584,22 @@ fn decode_sequences_with_rle(
             of_dec.decode_symbol()
         };
 
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+        // RLE-mode tables don't have an enriched FSE entry to read
+        // from — fall back to `lookup_ll_code` / `lookup_ml_code`
+        // for the RLE byte. FSE-mode tables read base / extra-bits
+        // directly off the active state's enriched `Entry`. The
+        // RLE-fallback path is the only place these `lookup_*`
+        // helpers are still used after #247 Part 1.
+        let (ll_value, ll_num_bits) = if scratch.ll_rle.is_some() {
+            lookup_ll_code(ll_code)
+        } else {
+            (ll_dec.state.base_value, ll_dec.state.num_additional_bits)
+        };
+        let (ml_value, ml_num_bits) = if scratch.ml_rle.is_some() {
+            lookup_ml_code(ml_code)
+        } else {
+            (ml_dec.state.base_value, ml_dec.state.num_additional_bits)
+        };
 
         // OF code / offset==0 checks dropped per FSE invariants (see comment
         // in decode_sequences_without_rle). For RLE mode, the singleton
@@ -642,7 +666,7 @@ fn decode_sequences_with_rle(
 /// `LL_EXTRA_BITS[idx]` loads (two distinct cache-line touches into
 /// 144 B + 36 B = 180 B; packed table is 144 B = one contiguous
 /// region).
-const LL_META: [u32; 36] = pack_code_meta(
+pub(crate) const LL_META: [u32; 36] = pack_code_meta(
     &[
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
         64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
@@ -656,7 +680,7 @@ const LL_META: [u32; 36] = pack_code_meta(
 /// Packed (baseline, extra_bits) pairs for match-length codes.
 /// Donor parity: `ML_base` + `ML_bits`. Codes 0..=52 per Zstandard
 /// format §3.1.1.3.2.1.1.2. Same packed layout as [`LL_META`].
-const ML_META: [u32; 53] = pack_code_meta(
+pub(crate) const ML_META: [u32; 53] = pack_code_meta(
     &[
         3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
         27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
@@ -786,6 +810,9 @@ fn maybe_update_fse_tables(
         ModeType::FSECompressed => {
             let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
             bytes_read += bytes;
+            scratch
+                .literal_lengths
+                .enrich_with_packed_seq_meta(&LL_META);
 
             vprintln!("Updating ll table");
             vprintln!("Used bytes: {}", bytes);
@@ -808,11 +835,14 @@ fn maybe_update_fse_tables(
                 LL_DEFAULT_ACC_LOG,
                 &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
             )?;
+            scratch
+                .literal_lengths
+                .enrich_with_packed_seq_meta(&LL_META);
             scratch.ll_rle = None;
         }
         ModeType::Repeat => {
             vprintln!("Repeat ll table");
-            /* Nothing to do */
+            /* Nothing to do — cached enriched values stay valid. */
         }
     };
 
@@ -821,6 +851,7 @@ fn maybe_update_fse_tables(
     match modes.of_mode() {
         ModeType::FSECompressed => {
             let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
+            scratch.offsets.enrich_for_offsets();
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
@@ -844,12 +875,13 @@ fn maybe_update_fse_tables(
                 OF_DEFAULT_ACC_LOG,
                 &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
             )?;
+            scratch.offsets.enrich_for_offsets();
             scratch.of_rle = None;
             scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::Repeat => {
             vprintln!("Repeat of table");
-            /* Nothing to do — cached `offsets_long_share` stays valid. */
+            /* Nothing to do — cached enriched values stay valid. */
         }
     };
 
@@ -858,6 +890,7 @@ fn maybe_update_fse_tables(
     match modes.ml_mode() {
         ModeType::FSECompressed => {
             let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
+            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
             bytes_read += bytes;
             vprintln!("Updating ml table");
             vprintln!("Used bytes: {}", bytes);
@@ -880,11 +913,12 @@ fn maybe_update_fse_tables(
                 ML_DEFAULT_ACC_LOG,
                 &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
             )?;
+            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {
             vprintln!("Repeat ml table");
-            /* Nothing to do */
+            /* Nothing to do — cached enriched values stay valid. */
         }
     };
 
@@ -981,6 +1015,8 @@ mod offsets_long_share_tests {
                 new_state: 0,
                 symbol: s,
                 num_bits: 0,
+                base_value: 0,
+                num_additional_bits: 0,
             })
             .collect();
         t
