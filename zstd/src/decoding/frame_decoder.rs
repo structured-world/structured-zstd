@@ -1898,6 +1898,60 @@ mod tests {
     }
 
     #[test]
+    fn decode_to_slice_fallback_treats_explicit_fcs_zero_as_declared() {
+        // Synthetic multi-segment frame with FCS_flag=2 (4-byte
+        // FCS) explicitly set to 0. The header DECLARES zero
+        // content, but the body carries a 5-byte raw last-block.
+        // `fcs_declared()` must return true (the field is on the
+        // wire) so the fallback's post-decode size check sees the
+        // mismatch — even though `frame_content_size == 0`. This
+        // is exactly the FCS=0 edge case where the previous
+        // `content_size > 0` proxy would have silently accepted
+        // the corrupt frame.
+        //
+        // Frame layout:
+        //   4 B magic            — 28 B5 2F FD
+        //   1 B FHD              — FCS_flag=2 (bits 7-6), no
+        //                          single_segment, content_checksum=0,
+        //                          dict_id_flag=0 → 0b1000_0000
+        //   1 B window_descriptor — exp=10, mantissa=0 → window=1 MiB
+        //   4 B FCS              — 0 LE
+        //   3 B block header     — raw, last, size=5 → 0x29 0x00 0x00
+        //   5 B raw payload      — anything non-empty
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+        wire.push(0b1000_0000); // FHD: FCS_flag=2, others 0.
+        wire.push(0x50); // window_descriptor: exp=10, mantissa=0.
+        wire.extend_from_slice(&0u32.to_le_bytes()); // FCS = 0.
+        // Block header (24-bit LE): (size << 3) | (block_type << 1) | last_block
+        // = (5 << 3) | (0 << 1) | 1 = 0x29.
+        wire.push(0x29);
+        wire.push(0x00);
+        wire.push(0x00);
+        wire.extend_from_slice(&[1u8, 2, 3, 4, 5]);
+
+        let mut dec = FrameDecoder::new();
+        // FCS=0 declared, so eligibility (`content_size > 0`)
+        // false — falls through to the drain loop. Output buffer
+        // size doesn't matter for the eligibility check here;
+        // give it some room so `read()` can drain the block.
+        let mut out = alloc::vec![0u8; 16];
+        let err = dec
+            .decode_to_slice(wire.as_slice(), &mut out)
+            .expect_err("corrupt FCS=0 + 5-byte block must error");
+        match err {
+            crate::decoding::errors::FrameDecoderError::FrameContentSizeMismatch {
+                declared,
+                produced,
+            } => {
+                assert_eq!(declared, 0);
+                assert_eq!(produced, 5);
+            }
+            other => panic!("expected FrameContentSizeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reset_with_dict_handle_applies_dict_when_no_dict_id() {
         let payload = b"reset-without-dict-id";
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
