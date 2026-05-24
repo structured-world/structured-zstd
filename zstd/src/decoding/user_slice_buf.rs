@@ -75,21 +75,30 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 ///
 /// # DoS surface on malformed Compressed blocks
 ///
-/// The bounds checks on write entry points are `debug_assert!` (for
-/// `extend`, `extend_and_fill`) and a release-mode `assert!` (for
-/// `extend_from_within_unchecked`). On adversarial input — a frame
-/// header that declares a small `frame_content_size` AND a Compressed
-/// block whose payload expands to more than the declared size — the
-/// burst's per-symbol writes can reach past `slice.len()` and
-/// `assert!` (or panic via slice indexing in `extend`) instead of
-/// returning a structured error. The frame-level
-/// `decode_to_slice` checks `produced > content_size` AFTER each
-/// block; within a single block the panic-on-overshoot is the
-/// only stop. Callers handling untrusted input should use
+/// The bounds checks on write entry points are release-mode
+/// `assert!` (for `extend` and `extend_from_within_unchecked`) and
+/// `debug_assert!` (for `extend_and_fill`). On adversarial input —
+/// a frame header that declares a small `frame_content_size` AND a
+/// Compressed block whose payload expands to more than the declared
+/// size — the burst's per-symbol writes can reach past `slice.len()`
+/// and panic (`assert!` failure or, in `extend_and_fill`'s release
+/// build, a slice-indexing panic) instead of returning a structured
+/// error. The frame-level `decode_to_slice` checks `produced >
+/// content_size` AFTER each block; within a single block the
+/// panic-on-overshoot is the only stop.
+///
+/// Callers handling untrusted input should use
 /// [`crate::decoding::FrameDecoder::decode_all`] which routes
-/// through `FlatBuf` / `RingBuffer` backends whose `Vec::reserve`
-/// growth path returns errors rather than panicking.
-/// Replacing the panics with `Result<_, _>`-returning writes is
+/// through `FlatBuf` / `RingBuffer` backends. Those backends grow
+/// via `Vec::reserve` — growth doesn't return errors (it succeeds
+/// or aborts on alloc failure), but the growable Vec capacity
+/// means a malformed block whose decompressed output exceeds FCS
+/// stays inside the allocation instead of writing OOB into a
+/// fixed-size user slice. The frame-level checks then catch the
+/// FCS mismatch and return `FrameContentSizeMismatch`.
+///
+/// Replacing the panics with `Result<_, _>`-returning writes (so
+/// `decode_to_slice` itself can stay safe on adversarial input) is
 /// tracked in issue #246 — it requires extending the
 /// `BufferBackend` trait surface and would gate the direct path on
 /// the new fallible signatures.
