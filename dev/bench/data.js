@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779580183078,
+  "lastUpdate": 1779592252632,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -44985,6 +44985,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e2e529f95dfca97bf3e89f572c5c4cf545a00edc",
+          "message": "perf(decode): pack HUF decode table as u16 (donor HUF_DEltX1 layout) (#243)\n\n* perf(decode): pack HUF decode table as u16 (donor HUF_DEltX1 layout)\n\nDonor `huf_decompress.c` defines the HUF decoding table entry as\n`HUF_DEltX1 = {BYTE byte; BYTE nbBits}` — exactly 2 bytes per state\nindex. The inner loop reads `dtable[index]` as a 16-bit scalar load\nand splits the low byte (symbol) from the high byte (nbBits).\n\nOur `packed_decode: Vec<u32>` used a 32-bit slot per state index\neven though only the low 16 bits carried payload. At\n`max_num_bits = 11` (zstd spec ceiling) that doubled the HUF table\nfrom donor's 4 KiB to 8 KiB. On poorly-compressed inputs (L-7 Fast\nin particular) the HUF decode reads 1 entry per output literal byte,\nthe literal buffer is ~100 KiB per block, and the table competes\nwith the output buffer for L1d residency. Halving the table\nfootprint to match donor restores the cache hit rate on those\nworkloads.\n\nChanges:\n\n- `HuffmanTable::packed_decode: Vec<u32>` → `Vec<u16>`. Build site\n  packs `u16::from(symbol) | (u16::from(num_bits) << 8)` — same\n  layout as donor `HUF_DEltX1` (symbol in low byte, nbBits in high\n  byte).\n- `run_4stream_decode_loop`'s `packed: &[u32]` parameter → `&[u16]`.\n  The burst body's `(entry & 0xFF) as u8` + `(entry >> 8) & 0xFF`\n  pattern is unchanged in shape since the low/high byte split is\n  identical between u32 and u16.\n- AVX2 kernel: dropped `_mm_i32gather_epi32`. Donor never uses\n  gather — `HUF_4X1_DECODE_SYMBOL` reads scalar entries through\n  multiple load ports. Match donor: four scalar u16 lookups.\n- VBMI2 kernel: still uses `_mm_maskz_compress_epi8` to compact\n  the 4 entries down to {[symbols], [bits]} byte tuples, but loads\n  via scalar u16 reads into a packed u64 instead of the prior u32\n  lane-set.\n- NEON kernel: dropped `vld1q_u32`/`vandq_u32`/`vshrq_n_u32` round\n  trip. M1's 4-way load pipeline executes four scalar u16 reads in\n  fewer cycles than the SIMD pack-unpack on this 4-element batch.\n- SVE kernel: dropped the `ld1w`/`whilelt`/`p0.s` inline-asm\n  4-lane unpack. Scalar u16 reads + byte split — donor parity.\n- `decode4_symbols_and_num_bits_avx2` retains its `#[target_feature]`\n  guard for the kernel-dispatch surface but its body is now scalar.\n- Test fixture in `huff0_decoder.rs`: `u32::from` → `u16::from` for\n  the manually-built `packed_decode` vector.\n- Drop now-unused `vandq_u32` / `vdupq_n_u32` / `vld1q_u32` /\n  `vshrq_n_u32` / `vst1q_u32` / `asm` imports.\n- Drive-by: tighten the `block_splitter_decision_for_bench` cfg\n  gate from `any(test, feature = \"bench_internals\")` to just\n  `feature = \"bench_internals\"`. The previous form fired\n  dead-code warnings under `cargo clippy --all-targets` without\n  the feature.\n\nTests: 577/577 nextest pass, clippy clean. The L-7 Fast decompress\nhot path (HUF 4-stream burst body + SIMD fallback kernels) is the\ntarget — bench validation requires CI-equivalent x86_64 runners\nsince the regression presents most acutely on cache-pressured\nshared-machine workloads.\n\nPart of #178.\n\n* perf(decode): unchecked burst writes + #[inline] kernels + thread fixes\n\nThree coupled changes on the HUF 4-stream burst hot path:\n\n1. **Unchecked indexing in the burst body.** Donor `huf_decompress.c`\n   `HUF_4X1_DECODE_SYMBOL` writes via raw pointer\n   (`op[stream][symbol] = ...`) and reads via raw pointer\n   (`dtable[index]`) — no bounds-check overhead. We mirror that with\n   `get_unchecked_mut` / `get_unchecked`.\n\n   Safety: justified per-line in an inlined SAFETY block above the\n   for-loop. `idx{0..=3}` is `(bits[s] >> table_shift)` which lands\n   in `[0, 1 << max_num_bits)`; `packed.len()` matches `1 <<\n   max_num_bits` by `HuffmanTable::build_decoder`'s upfront `resize`.\n   `cursors[s] < ends[s]` is the lockstep cursor invariant guaranteed\n   by the `burst_eligible` / `cursor_burst_ceil` precondition: a full\n   burst of `symbols_per_burst` writes never advances past\n   `cursor_exit_olimit = starts[0] + min_seg_len`, which is\n   `<= ends[s]` for every stream `s`.\n\n2. **`#[inline]` on the four SIMD kernel facades** (`_vbmi2` / `_avx2`\n   / `_neon` / `_sve`). `#[inline(always)]` is rejected by rustc when\n   combined with `#[target_feature]` (E0658, rustc#145574); plain\n   `#[inline]` lets the optimizer cross the kernel-dispatch trait\n   boundary so the per-call dispatch overhead disappears in the\n   SIMD-fallback path.\n\n3. **Drop unused intrinsics imports.** After removing\n   `_mm_i32gather_epi32` from the AVX2 kernel body, the import\n   itself plus `_mm_srli_si128` (used by the prior gather-lane\n   extract) became dead. Removing them keeps `-D warnings` clean.\n\n4. **Clarify the VBMI2 unpack comment.** The pre-fix comment said\n   \"Move the u64 into the low 64 bits of an xmm reg\", but the code\n   actually unpacks the u64 into four 32-bit lanes via\n   `_mm_set_epi32` to preserve the per-lane byte layout the\n   `_mm_maskz_compress_epi8` masks below depend on. Updated to match\n   the code.\n\n5. **Typo fix.** \"occurences\" → \"occurrences\" in the `weights` field\n   doc.\n\nBench delta on i9-9900K (Linux,\n`decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust`):\n  6.84 ms (pre-fix main) → 5.63 ms (u16 packing alone)\n  -17.77% time from the u16 fix (p < 0.05); the\n  unchecked/inline follow-ups in this commit compose on top.\n\n577/577 nextest pass, clippy clean.\n\nPart of #178.\n\n* perf(decode): unify state+stream in single u64 register (donor parity)\n\nReplace the hybrid burst+SIMD-fallback HUF 4-stream decode with donor's\nalways-firing single-path loop. State is no longer carried in a separate\n`decoders[s].state` field during the burst — it lives at the top\nmax_num_bits of one fused `bits[s]` u64 per stream (state + stream +\nsentinel), matching `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`.\n\nEach outer iter:\n  1. Decode `symbols_per_burst` x 4 symbols via top-bits state lookup\n     into `packed_decode` (`bits[s] >> table_shift` indexes the table,\n     `bits[s] <<= entry.num_bits` consumes the symbol).\n  2. Reload all 4 streams per donor `HUF_4X1_RELOAD_STREAM`:\n     `ctz(bits[s])` -> `nb_bytes = ctz/8`, `nb_bits = ctz%8`;\n     `ip[s] -= nb_bytes`; `bits[s] = (MEM_read64(ip[s]) | 1) << nb_bits`.\n\nInitial composition mirrors donor `HUF_DecompressFastArgs_init`:\n`bits[s] = (bit_container | 1) << padding_skip`. Top max bits carries\nthe initial state implicitly (HUF encoding invariant: top max bits of\nunconsumed stream at any consumption point = current state machine\nstate), so we do not re-inject `decoders[s].state`.\n\n`symbols_per_burst = (64 - max - 8) / max` (was `(63 - max) / max`).\nThe -8 accounts for worst-case `padding_skip` so the corrupted bit-0\nfrom `bit_container | 1` never reaches the top max-bit state region\nduring the burst's shift sequence. Without this cap, max=4 with\npadding_skip=8 reads a 1 from the corrupted bit as the LSB of the\nburst's final state and produces a wrong symbol at the burst boundary\n(regression caught by `burst_gate_sweep_sizes_and_alphabets`).\n\nWriteback to `brs[s]` for the drain phase:\n`brs[s].bits_consumed = nb_bits_last + max_num_bits`. Drain's\n`get_bits(N)` then reads bits below the state region of the post-burst\n`bit_container`, picking up where the burst stopped.\n\nRemoved:\n- `HufKernel` trait + kernel structs (SIMD-fallback path is gone;\n  burst reads `packed_decode[idx]` directly).\n- `decode4_symbols_and_num_bits_*` SIMD helpers + their kernel tests.\n- `decode_symbol_and_num_bits` (only used by the deleted SIMD batching).\n- Dispatch-site kernel match in `decompress_literals` (single\n  un-genericised call now).\n- `LoopBounds` fields that lived only for the fallback path\n  (`max_bits`, `max_num_bits`, `burst_bits_isize`, `state_shift`,\n  `cursor_exit_olimit`).\n\n`BitReaderReversed::index` + `source` exposed `pub(crate)` so the\nburst runs donor's `ip[s] -= nb_bytes; MEM_read64(ip[s])` reload\ndirectly against the source byte slice, matching donor's per-iter\nMEM_read64 cadence.\n\nCopilot thread #4 addressed: tightened the unchecked-write SAFETY\ncomment with the explicit lockstep math `cursors[s] + symbols_per_burst\n- 1 < starts[s] + min_seg_len <= ends[s]`, added a `debug_assert!` to\ncatch any future drift.\n\n573/573 nextest pass, clippy clean. Bench delta to be measured on i9.\n\nPart of #178.\n\n* perf(decode): skip target zero-fill in HUF 4-stream literal decode\n\n`target.resize(base + regen, 0)` was zero-filling the entire literal\noutput range before the burst + drain wrote it. On poorly-compressed\nL-7 corpora the literal section is large (tens of KiB per block) and\nthe memset dominated the page-touch cost — flamegraph on i9 attributed\n~28% of decompress time to `__memmove_avx_unaligned_erms` chained from\n`Vec::extend_from_slice`/`spec_extend`, plus ~18% to anonymous-page\nfaults from first-touching the zeroed range.\n\nReplace with `Vec::set_len` (no memset). Every position in\n`[base..base+regen)` is written by the burst's unchecked stores plus\nthe drain tail, and the error path uses `target.truncate(base)` which\ndrops the uninit suffix without reading any element (`u8` has no\n`Drop`). Safety justified per-line in an inlined SAFETY block.\n\nBench delta to be measured.\n\nPart of #178.\n\n* Revert \"perf(decode): skip target zero-fill in HUF 4-stream literal decode\"\n\nThis reverts commit 999c19405b5556926411e1622752c3205a35c143.\n\n* fix(decode): widen bytes_per_iter_upper for max=8 burst safety + drop dead x86 imports\n\nThree related fixes on the unified-state HUF burst:\n\n1. `bytes_per_iter_upper` undersized for burst configurations where\n   `burst_bits` is a multiple of 8 (notably max_num_bits=8 ->\n   burst_bits=48). Worst-case `nb_bytes = ctz(bits[s]) >> 3` accounts\n   for the burst's trailing-sentinel offset, which is\n   `padding_skip ∈ [1, 8]` on the first iter and `nb_bits ∈ [0, 7]`\n   from the previous reload on later iters — i.e. up to 8 extra bits\n   of phase on top of `burst_bits`. Old formula `ceil(burst_bits/8)`\n   missed this slack, allowing `ip[s] -= nb_bytes` to underflow on\n   adversarial inputs. New formula `(8 + burst_bits) / 8` adds the\n   worst-case 8-bit cushion. 573/573 nextest pass.\n\n2. Drop unused x86 intrinsics `_mm_cvtsi128_si32` /\n   `_mm_maskz_compress_epi8` / `_mm_set_epi32` from\n   `huff0_decoder.rs`. The donor-parity burst lookup reads\n   `packed_decode[idx]` as plain u16; the previous SIMD-gather\n   kernels that consumed those intrinsics were deleted in the\n   unify-state commit. Keeping the imports tripped\n   `cargo clippy -- -D warnings` on x86 in CI.\n\n3. `HuffmanTable::packed_decode` doc updated — previously referred\n   to \"bypassing the kernel-dispatch path used by SIMD fallback\";\n   that path was removed in the unify-state commit. Now describes\n   packed_decode as the primary (only) 4-stream lookup table.\n\nStrengthened the burst's reload SAFETY comment to spell out the\n`source.len() < 8` early-return case (refill_slow -> index = 0 ->\nmin_ip = 0 < bytes_per_iter_upper -> any_iter = false -> writeback\nunreachable) instead of the terser claim that init_state alone\nestablishes `index <= source.len() - 8`.\n\nclippy clean (`hash,std,dict_builder` features), 573/573 nextest pass.\n\n* docs(decode): clarify index/SAFETY wording for HUF burst\n\nTwo doc-only updates flagged by Copilot review.\n\n1. BitReaderReversed.index field doc was a misnomer ('the index of\n   the last read byte'). Reword to reflect actual semantics: start\n   offset of the currently-loaded 8-byte source window, walked\n   backward by refill() and used by bits_remaining() to compute\n   the residual bit budget. Includes the LSB/MSB byte-position\n   mapping under from_le_bytes for the HUF burst direct slice\n   access.\n\n2. Burst reload SAFETY block attributed the index <= source.len() - 8\n   guarantee to init_state. The actual establishing step is the\n   refill inside the very first get_bits(1) of the padding-skip\n   loop (BitReaderReversed::new starts with bits_consumed = 64,\n   so the first peek_bits triggers refill). init_state runs after\n   and only advances bits_consumed inside the same window. Reword\n   the SAFETY block so the citation points at the correct\n   establishing step.",
+          "timestamp": "2026-05-24T05:26:49+03:00",
+          "tree_id": "19ab16e52b7edf713ae12fc99f1ad8eaf65d6891",
+          "url": "https://github.com/structured-world/structured-zstd/commit/e2e529f95dfca97bf3e89f572c5c4cf545a00edc"
+        },
+        "date": 1779592246556,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 281.721,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 230.964,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.44,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.366,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.077,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.036,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.914,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.976,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.035,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.369,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.782,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.997,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.298,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.402,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.441,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.305,
             "unit": "ms"
           },
           {
