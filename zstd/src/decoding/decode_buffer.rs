@@ -603,26 +603,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// (`offset <= buffer.len()`) coincides with the spec's
     /// window-size rule (`offset <= window_size`).
     ///
+    /// Does NOT update the rolling content checksum: the direct-
+    /// decode caller (`FrameDecoder::decode_to_slice`) gates the
+    /// direct path off when the frame has `content_checksum_flag`,
+    /// so the hash this method would touch is dropped along with
+    /// the stack-local `DecodeBuffer` anyway. Skipping the hash
+    /// write saves measurable cycles on large multi-segment frames
+    /// where this is called once per block.
+    ///
     /// Returns the number of bytes whose visibility was discarded.
     pub fn drop_to_window_size(&mut self) -> usize {
         match self.can_drain_to_window_size() {
             None => 0,
             Some(can_drop) => {
-                // Hash the bytes about to drop out of the visible
-                // region so the rolling content checksum still sees
-                // them. Matches `drain_to`'s shape (it hashes via
-                // the closure each chunk it writes).
-                #[cfg(feature = "hash")]
-                {
-                    use core::hash::Hasher;
-                    let (s1, s2) = self.buffer.as_slices();
-                    let head_take = s1.len().min(can_drop);
-                    self.hash.write(&s1[..head_take]);
-                    let remaining = can_drop - head_take;
-                    if remaining > 0 {
-                        self.hash.write(&s2[..remaining.min(s2.len())]);
-                    }
-                }
                 self.buffer.drop_first_n(can_drop);
                 self.total_output_counter += can_drop as u64;
                 can_drop
