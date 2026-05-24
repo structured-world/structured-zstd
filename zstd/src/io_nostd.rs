@@ -55,6 +55,17 @@ impl Error {
         }
     }
 
+    /// `std::io::Error::other(...)` equivalent for no-std builds.
+    /// Mirrors `std::io::Error::other` shape so call sites compile
+    /// uniformly across feature toggles. Always produces an
+    /// [`ErrorKind::Other`] error.
+    pub fn other<E: core::fmt::Display + Send + Sync + 'static>(err: E) -> Self {
+        Self {
+            kind: ErrorKind::Other,
+            err: Some(Box::new(err)),
+        }
+    }
+
     pub fn from(kind: ErrorKind) -> Self {
         Self { kind, err: None }
     }
