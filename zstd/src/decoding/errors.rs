@@ -513,8 +513,12 @@ pub enum FrameDecoderError {
     },
     /// Frame header's `dict_id` did not match the value pinned via
     /// `FrameDecoder::expect_dict_id`. Returned BEFORE any block
-    /// decode work — no allocation, no XXH64 init, no partial
-    /// output. `expected` is the pinned value (`Some(0)` is
+    /// decode and BEFORE any output is produced — no XXH64 init,
+    /// no partial output. Scratch buffer allocation / reservation
+    /// for the decode pipeline happens during frame-header parsing,
+    /// which is already complete when this validation fires, so
+    /// the cost of scratch sizing is paid even on a mismatched
+    /// header. `expected` is the pinned value (`Some(0)` is
     /// treated as "no dictionary expected", matching a frame whose
     /// header omits the optional `Dictionary_ID` field); `found`
     /// reports what the frame actually carried (`None` when the

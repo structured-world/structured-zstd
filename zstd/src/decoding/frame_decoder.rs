@@ -378,7 +378,13 @@ impl FrameDecoder {
     /// validate it against the parsed frame header BEFORE any
     /// block decode work runs. A mismatch returns
     /// [`crate::decoding::errors::FrameDecoderError::UnexpectedDictId`]
-    /// with no allocation, no XXH64 init, and no partial output.
+    /// before any block decode and before any output is produced.
+    /// Scratch buffer allocation / reservation for the decode
+    /// pipeline happens during frame-header parsing, which is
+    /// already complete when this validation fires — the cost of
+    /// scratch sizing is paid even on a mismatched header. The
+    /// guarantee is "no block decode, no XXH64 init, no partial
+    /// output", not "zero allocation".
     ///
     /// `Some(0)` is treated as "no dictionary expected": a frame
     /// whose header omits the optional `Dictionary_ID` field

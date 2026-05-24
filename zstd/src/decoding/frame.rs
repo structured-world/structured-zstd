@@ -172,10 +172,13 @@ impl FrameHeader {
     /// Raw `Window_Descriptor` byte from the frame header
     /// (RFC 8878 §3.1.1.1.2 layout: `(exp << 3) | mantissa`),
     /// or `None` when the `Single_Segment_flag` is set — in
-    /// single-segment frames the byte is omitted from the wire
+    /// single-segment frames the byte is absent from the wire
     /// (the `Window_Size` is derived from `Frame_Content_Size`
-    /// instead) and the corresponding field on this struct is
-    /// not populated.
+    /// instead). The parser leaves the struct's
+    /// `window_descriptor` field at its default `0` in that case;
+    /// this accessor reports the absence via `None` so callers
+    /// don't conflate "missing byte on the wire" with "byte
+    /// present and equal to 0".
     ///
     /// `frame` module is `pub(crate)`, so this method is reachable
     /// only from in-crate validation paths (e.g. the `lsm` feature's
