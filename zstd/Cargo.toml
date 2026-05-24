@@ -28,7 +28,7 @@ categories = ["compression"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "dict_builder"]
+features = ["std", "hash", "dict_builder", "lsm"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
