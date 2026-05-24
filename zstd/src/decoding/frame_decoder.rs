@@ -1371,7 +1371,14 @@ impl FrameDecoder {
             // exceed `content_size`.
             let block_upper = u64::from(block_header.decompressed_size);
             if produced + block_upper > content_size {
-                return Err(err::TargetTooSmall);
+                // Frame is corrupt — block headers claim more output
+                // than the FCS allowed. Caller's buffer was sized
+                // against FCS (validated above), so this is a
+                // decoder-side correctness issue, not a sizing one.
+                return Err(err::FrameContentSizeMismatch {
+                    declared: content_size,
+                    produced: produced + block_upper,
+                });
             }
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
@@ -1408,10 +1415,15 @@ impl FrameDecoder {
             }
         }
         // Final sanity: blocks summed to exactly `content_size`. A
-        // malformed frame with `last_block` set early would produce
-        // less than declared.
+        // malformed frame with `last_block` set early (or one whose
+        // block headers under-count) would land here. Distinct from
+        // TargetTooSmall — the caller did their part, the frame
+        // itself is corrupt.
         if produced != content_size {
-            return Err(err::TargetTooSmall);
+            return Err(err::FrameContentSizeMismatch {
+                declared: content_size,
+                produced,
+            });
         }
 
         // `direct.buffer.len()` would only show the visible (post

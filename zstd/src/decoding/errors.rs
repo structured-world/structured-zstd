@@ -501,6 +501,17 @@ pub enum FrameDecoderError {
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
     TargetTooSmall,
+    /// Decoded block sizes don't sum to the frame's declared
+    /// `frame_content_size` (either a block claims to expand past
+    /// FCS, or the stream ends before reaching FCS). Indicates a
+    /// malformed or corrupt frame — distinct from
+    /// [`Self::TargetTooSmall`] (which is the caller's
+    /// responsibility) so callers can tell decoder-side issues
+    /// apart from their own buffer sizing mistakes.
+    FrameContentSizeMismatch {
+        declared: u64,
+        produced: u64,
+    },
     DictNotProvided {
         dict_id: u32,
     },
@@ -609,6 +620,12 @@ impl core::fmt::Display for FrameDecoderError {
                 write!(
                     f,
                     "Target must have at least as many bytes as the content size reported by the frame"
+                )
+            }
+            FrameDecoderError::FrameContentSizeMismatch { declared, produced } => {
+                write!(
+                    f,
+                    "Frame content size mismatch (corrupt frame): declared {declared} bytes, blocks summed to {produced} bytes"
                 )
             }
             FrameDecoderError::DictNotProvided { dict_id } => {

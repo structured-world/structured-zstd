@@ -63,12 +63,30 @@ pub fn decode_literals_zerocopy<'a>(
     source: &'a [u8],
     target: &'a mut Vec<u8>,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
+    // Snapshot `target.len()` before any decode work — the returned
+    // view must point ONLY at the newly-decoded bytes, not at any
+    // pre-existing tail the caller forgot to `clear()`. The current
+    // in-tree callers clear before this call, but anchoring the
+    // view at `base..` makes the API robust against future
+    // misuse and matches donor's `dctx->litPtr` semantics (always
+    // points at the current frame's literals, never carries
+    // history from earlier blocks' Vecs).
+    let base = target.len();
     match section.ls_type {
         LiteralsSectionType::Raw => {
             let n = section.regenerated_size as usize;
+            // Bounds check: a truncated frame can claim more raw
+            // literals than the source slice carries. Return a
+            // structured error instead of panicking on `source[0..n]`.
+            if source.len() < n {
+                return Err(DecompressLiteralsError::MissingBytesForLiterals {
+                    got: source.len(),
+                    needed: n,
+                });
+            }
             // Zero-copy: borrow the payload from source. `target` is
-            // left empty — the caller passes `LiteralsView::data` to
-            // the sequence executor instead.
+            // left untouched — the caller passes `LiteralsView::data`
+            // to the sequence executor instead.
             Ok(LiteralsView {
                 data: &source[0..n],
                 bytes_used: section.regenerated_size,
@@ -76,17 +94,20 @@ pub fn decode_literals_zerocopy<'a>(
         }
         LiteralsSectionType::RLE => {
             // RLE expands one byte to N — has to write into target.
-            // Same shape as decode_literals' RLE branch.
-            target.resize(target.len() + section.regenerated_size as usize, source[0]);
+            // Need at least one source byte (the fill byte).
+            if source.is_empty() {
+                return Err(DecompressLiteralsError::MissingBytesForLiterals { got: 0, needed: 1 });
+            }
+            target.resize(base + section.regenerated_size as usize, source[0]);
             Ok(LiteralsView {
-                data: target.as_slice(),
+                data: &target[base..],
                 bytes_used: 1,
             })
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
             let bytes_used = decompress_literals(section, scratch, source, target)?;
             Ok(LiteralsView {
-                data: target.as_slice(),
+                data: &target[base..],
                 bytes_used,
             })
         }
