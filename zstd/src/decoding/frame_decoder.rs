@@ -1160,6 +1160,137 @@ impl FrameDecoder {
             }
         }
     }
+
+    /// Decode a single zstd frame from `input` directly into `output`,
+    /// bypassing the internal `DecodeBuffer` -> `read()` drain copy
+    /// when the frame's `Single_Segment_flag` is set AND `output` has
+    /// enough room for the frame's content plus the SIMD wildcopy
+    /// slack. Donor parity with the `ZSTD_in_dst` litBuffer placement
+    /// strategy — see #244.
+    ///
+    /// On the direct-decode path (eligible single-segment frame +
+    /// sized output) the literal pushes and sequence-execution match
+    /// copies write straight into `output`, eliminating the
+    /// FlatBuf-as-intermediate `read()` drain that dominates
+    /// poorly-compressed L-7-class corpora (~28% of decode time on
+    /// `level_-7_fast/decodecorpus-z000033/rust_stream`).
+    ///
+    /// Frames that are not single-segment, or where `output` is too
+    /// small for the WILDCOPY_OVERLENGTH slack, transparently fall
+    /// back to the existing [`Self::decode_all`] path. Both paths
+    /// return the number of bytes written into `output`.
+    ///
+    /// `input` must contain at most ONE frame (skippable frames not
+    /// supported on the direct-decode path — fall back to
+    /// `decode_all` for multi-frame streams).
+    pub fn decode_to_slice(
+        &mut self,
+        mut input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, FrameDecoderError> {
+        use super::block_decoder;
+        use super::buffer_backend::WILDCOPY_OVERLENGTH;
+        use super::decode_buffer::DecodeBuffer;
+        use super::scratch::DirectScratch;
+        use super::user_slice_buf::UserSliceBackend;
+        use crate::io::Read;
+        use FrameDecoderError as err;
+
+        // Parse the frame header. This populates `self.state` with
+        // the frame descriptor + resets the per-frame scratch
+        // (DecoderScratchKind::Flat for single-segment, ::Ring
+        // otherwise).
+        self.init(&mut input)?;
+
+        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        let content_size = state.frame_header.frame_content_size();
+        let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+        let eligible = state.frame_header.descriptor.single_segment_flag()
+            && content_size > 0
+            && (output.len() as u64) >= needed;
+
+        if !eligible {
+            // Frame doesn't qualify for direct decode (multi-segment,
+            // empty, or output too small for the WILDCOPY slack).
+            // Fall through to the existing per-block decode + drain
+            // path — `init` already populated `self.state`, so
+            // `decode_blocks` + `read` pick up from there.
+            let mut output_tail: &mut [u8] = output;
+            let mut total_bytes_written = 0;
+            loop {
+                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                let bytes_written = self
+                    .read(output_tail)
+                    .map_err(err::FailedToDrainDecodebuffer)?;
+                output_tail = &mut output_tail[bytes_written..];
+                total_bytes_written += bytes_written;
+                if self.can_collect() != 0 {
+                    return Err(err::TargetTooSmall);
+                }
+                if self.is_finished() {
+                    break;
+                }
+            }
+            return Ok(total_bytes_written);
+        }
+
+        // Direct decode path. Borrow the persistent fields
+        // (HUF/FSE tables, offset_hist, scratch Vecs) out of the
+        // existing single-segment Flat scratch; we keep them
+        // populated across `decode_to_slice` calls (HUF table reuse
+        // is the main scratch-reuse win on small frames). Then
+        // construct a stack-local DecodeBuffer<UserSliceBackend<'o>>
+        // over `output` and bundle into a `DirectScratch`.
+        let scratch = match &mut state.decoder_scratch {
+            DecoderScratchKind::Flat(s) => s,
+            DecoderScratchKind::Ring(_) => {
+                // single_segment_flag was checked above, so this
+                // branch is unreachable on a well-formed init.
+                // Fall back defensively rather than `unreachable!()`
+                // — corrupted headers could in theory drift this.
+                return Err(err::TargetTooSmall);
+            }
+        };
+        let window_size = scratch.buffer.window_size;
+        let backend = UserSliceBackend::from_slice(output);
+        let buffer = DecodeBuffer::from_backend(backend, window_size);
+        let mut direct = DirectScratch {
+            huf: &mut scratch.huf,
+            fse: &mut scratch.fse,
+            offset_hist: &mut scratch.offset_hist,
+            literals_buffer: &mut scratch.literals_buffer,
+            sequences: &mut scratch.sequences,
+            block_content_buffer: &mut scratch.block_content_buffer,
+            buffer,
+        };
+
+        // Block loop. Mirrors `decode_blocks` (without the
+        // strategy-bounded early exit — we always decode the whole
+        // frame in one shot for the direct path).
+        let mut block_dec = block_decoder::new();
+        loop {
+            let (block_header, _hsize) = block_dec
+                .read_block_header(&mut input)
+                .map_err(err::FailedToReadBlockHeader)?;
+            block_dec
+                .decode_block_content(&block_header, &mut direct, &mut input)
+                .map_err(err::FailedToReadBlockBody)?;
+            if block_header.last_block {
+                if state.frame_header.descriptor.content_checksum_flag() {
+                    let mut chksum = [0u8; 4];
+                    input
+                        .read_exact(&mut chksum)
+                        .map_err(err::FailedToReadChecksum)?;
+                    state.check_sum = Some(u32::from_le_bytes(chksum));
+                }
+                break;
+            }
+        }
+
+        let written = direct.buffer.len();
+        state.frame_finished = true;
+        Ok(written)
+    }
 }
 
 /// Read bytes from the decode_buffer that are no longer needed. While the frame is not yet finished
@@ -1185,6 +1316,72 @@ mod tests {
     use super::{DictionaryHandle, FrameDecoder};
     use crate::encoding::{CompressionLevel, FrameCompressor};
     use alloc::vec::Vec;
+
+    #[test]
+    fn decode_to_slice_matches_decode_all_on_single_segment_frame() {
+        // Roundtrip a small payload through the encoder, then decode
+        // it via both `decode_all` and `decode_to_slice`. Both paths
+        // must produce identical output bytes — the only difference
+        // is the internal buffer/drain shape, not the decoded
+        // semantics. This is the regression gate for the
+        // direct-decode wiring (#244).
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Baseline: decode_all.
+        let mut dec_a = FrameDecoder::new();
+        let mut out_a = std::vec![0u8; payload.len()];
+        let n_a = dec_a
+            .decode_all(compressed.as_slice(), &mut out_a)
+            .expect("decode_all should succeed");
+        assert_eq!(n_a, payload.len());
+        assert_eq!(&out_a[..n_a], payload.as_slice());
+
+        // Direct: decode_to_slice with WILDCOPY slack.
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec_b = FrameDecoder::new();
+        let mut out_b = std::vec![0u8; payload.len() + slack];
+        let n_b = dec_b
+            .decode_to_slice(compressed.as_slice(), &mut out_b)
+            .expect("decode_to_slice should succeed");
+        assert_eq!(
+            n_b,
+            payload.len(),
+            "direct decode produced wrong byte count"
+        );
+        assert_eq!(&out_b[..n_b], payload.as_slice());
+    }
+
+    #[test]
+    fn decode_to_slice_falls_back_when_output_too_small_for_wildcopy_slack() {
+        // Output sized exactly to frame_content_size (no
+        // WILDCOPY_OVERLENGTH slack) must NOT trigger the direct
+        // path — the burst's `extend_from_within_unchecked` writes
+        // past `tail` into the slack region. Direct dispatcher
+        // recognises this and falls back to the FlatBuf + drain
+        // path which still produces the right output.
+        let payload: Vec<u8> = (0..2048u32)
+            .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
+            .collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut dec = FrameDecoder::new();
+        // Exactly payload.len(), no slack — direct path is gated out.
+        let mut out = std::vec![0u8; payload.len()];
+        let n = dec
+            .decode_to_slice(compressed.as_slice(), &mut out)
+            .expect("decode_to_slice should still succeed via fallback");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], payload.as_slice());
+    }
 
     #[test]
     fn reset_with_dict_handle_applies_dict_when_no_dict_id() {
