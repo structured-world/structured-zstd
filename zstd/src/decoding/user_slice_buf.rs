@@ -64,9 +64,14 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 ///   [`Self::extend`] / [`Self::extend_and_fill`] /
 ///   [`Self::extend_from_within_unchecked`] /
 ///   [`Self::extend_from_reader`]).
-/// - Bytes in `slice[tail..]` are NOT yet initialised — the FlatBuf
-///   precedent skips zero-initialising spare capacity for the same
-///   reason; callers must not read past `tail`.
+/// - Bytes in `slice[tail..]` are initialised memory (the slice was
+///   passed in as safe `&mut [u8]` so every element is a valid `u8`)
+///   but hold contents the decoder has not yet written — they carry
+///   whatever the caller put in the buffer before passing it in.
+///   The FlatBuf precedent skips zero-pre-fill on `extend` for the
+///   same reason: writes happen at the band `[tail, tail + n)` and
+///   the rest stays unread by the decoder. Callers must not read
+///   past `tail` and expect meaningful decode output.
 ///
 /// The caller MUST size the output slice with at least
 /// `frame_content_size + WILDCOPY_OVERLENGTH` bytes so SIMD wildcopy

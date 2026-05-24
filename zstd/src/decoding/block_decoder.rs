@@ -68,9 +68,13 @@ impl BlockDecoder {
             BlockType::RLE => {
                 // 1 byte from source via slice; no Read overhead.
                 if source.is_empty() {
+                    // ErrorKind::UnexpectedEof matches what the streaming path
+                    // gets from Read::read_exact on truncated input — callers
+                    // and tests can detect truncation by kind alone, identical
+                    // across slice-source and Read-source decode entry points.
                     return Err(DecodeBlockContentError::ReadError {
                         step: block_type,
-                        source: crate::io::Error::other("RLE block missing fill byte"),
+                        source: crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
                     });
                 }
                 let fill = source[0];
@@ -91,7 +95,7 @@ impl BlockDecoder {
                 if source.len() < n {
                     return Err(DecodeBlockContentError::ReadError {
                         step: block_type,
-                        source: crate::io::Error::other("Raw block truncated"),
+                        source: crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
                     });
                 }
                 let (payload, tail) = source.split_at(n);
@@ -108,7 +112,7 @@ impl BlockDecoder {
                 if source.len() < n {
                     return Err(DecodeBlockContentError::ReadError {
                         step: block_type,
-                        source: crate::io::Error::other("Compressed block truncated"),
+                        source: crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
                     });
                 }
                 let (payload, tail) = source.split_at(n);
@@ -545,13 +549,17 @@ mod tests {
         let err = d
             .decode_block_content_from_slice(&h, &mut ws, &mut src)
             .expect_err("must err on empty RLE source");
-        assert!(matches!(
-            err,
-            DecodeBlockContentError::ReadError {
-                step: BlockType::RLE,
-                ..
+        match &err {
+            DecodeBlockContentError::ReadError { step, source } => {
+                assert_eq!(*step, BlockType::RLE);
+                assert_eq!(
+                    source.kind(),
+                    crate::io::ErrorKind::UnexpectedEof,
+                    "slice-source truncation must report UnexpectedEof to match the streaming path's Read::read_exact behaviour"
+                );
             }
-        ));
+            other => panic!("expected ReadError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -566,13 +574,13 @@ mod tests {
         let err = d
             .decode_block_content_from_slice(&h, &mut ws, &mut src)
             .expect_err("must err on truncated raw source");
-        assert!(matches!(
-            err,
-            DecodeBlockContentError::ReadError {
-                step: BlockType::Raw,
-                ..
+        match &err {
+            DecodeBlockContentError::ReadError { step, source } => {
+                assert_eq!(*step, BlockType::Raw);
+                assert_eq!(source.kind(), crate::io::ErrorKind::UnexpectedEof);
             }
-        ));
+            other => panic!("expected ReadError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -586,13 +594,13 @@ mod tests {
         let err = d
             .decode_block_content_from_slice(&h, &mut ws, &mut src)
             .expect_err("must err on truncated compressed source");
-        assert!(matches!(
-            err,
-            DecodeBlockContentError::ReadError {
-                step: BlockType::Compressed,
-                ..
+        match &err {
+            DecodeBlockContentError::ReadError { step, source } => {
+                assert_eq!(*step, BlockType::Compressed);
+                assert_eq!(source.kind(), crate::io::ErrorKind::UnexpectedEof);
             }
-        ));
+            other => panic!("expected ReadError, got {other:?}"),
+        }
     }
 
     #[test]
