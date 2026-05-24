@@ -79,10 +79,16 @@ impl BlockDecoder {
                 }
                 let fill = source[0];
                 *source = &source[1..];
+                // `try_extend_and_fill` returns `Err(BackendOverflow)`
+                // on `UserSliceBackend` when the declared
+                // `decompressed_size` would push past the caller's
+                // output slice. Growable backends (FlatBuf/RingBuffer)
+                // grow on demand and always succeed.
                 workspace
                     .split()
                     .buffer
-                    .extend_and_fill(fill, header.decompressed_size as usize);
+                    .try_extend_and_fill(fill, header.decompressed_size as usize)
+                    .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(1)
             }
@@ -99,7 +105,15 @@ impl BlockDecoder {
                     });
                 }
                 let (payload, tail) = source.split_at(n);
-                workspace.split().buffer.push(payload);
+                // `try_push` returns `Err(BackendOverflow)` on
+                // `UserSliceBackend` when the Raw payload would push
+                // past the caller's output slice. Growable backends
+                // grow on demand and always succeed.
+                workspace
+                    .split()
+                    .buffer
+                    .try_push(payload)
+                    .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
                 *source = tail;
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))

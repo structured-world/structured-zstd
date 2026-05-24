@@ -1518,9 +1518,30 @@ impl FrameDecoder {
             // straight from `input` without copying into the
             // persistent `block_content_buffer`.
             let before = direct.buffer.total_produced();
-            let body_consumed = block_dec
-                .decode_block_content_from_slice(&block_header, &mut direct, &mut input)
-                .map_err(err::FailedToReadBlockBody)?;
+            let body_consumed = match block_dec.decode_block_content_from_slice(
+                &block_header,
+                &mut direct,
+                &mut input,
+            ) {
+                Ok(n) => n,
+                // Defense-in-depth: RLE / Raw block whose declared
+                // `decompressed_size` slipped past the per-block
+                // pre-flight above (e.g. due to overflow arithmetic)
+                // and tripped the backend's fallible write surface.
+                // The pre-flight catches this case via
+                // `FrameContentSizeMismatch` already; convert here
+                // for the residual paths to keep the public surface
+                // panic-free.
+                Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
+                    step: _,
+                }) => {
+                    return Err(err::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced: produced + u64::from(block_header.decompressed_size),
+                    });
+                }
+                Err(e) => return Err(err::FailedToReadBlockBody(e)),
+            };
             produced = direct.buffer.total_produced();
             // Post-decode FCS overflow check. Works uniformly for
             // Raw/RLE/Compressed since it reads the actual bytes

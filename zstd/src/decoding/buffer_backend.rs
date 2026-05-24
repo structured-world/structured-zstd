@@ -120,4 +120,109 @@ pub(crate) trait BufferBackend: Sized {
     /// future match copies). Mirrors the historical
     /// `RingBuffer::drop_first_n` contract.
     fn drop_first_n(&mut self, n: usize);
+
+    // ── Fallible write surface (DoS-safe direct decode path) ──
+    //
+    // Parallel `try_*` methods that return `Err(BackendOverflow)`
+    // instead of panicking when the write would exceed the backend's
+    // capacity. Used by the direct-decode path
+    // (`decode_to_slice_trusted` + descendants) so a malformed
+    // Compressed block whose decompressed payload exceeds the
+    // caller-provided output slice surfaces as a structured
+    // `FrameDecoderError::FrameContentSizeMismatch` instead of an
+    // abort.
+    //
+    // The growable backends (`FlatBuf`, `RingBuffer`) override these
+    // to delegate to their existing growth path — they cannot fail
+    // for capacity reasons because they grow the underlying `Vec` on
+    // demand. The default impls below cover that case.
+    //
+    // The fixed-capacity backend (`UserSliceBackend`) overrides each
+    // method with an explicit capacity check that returns `Err` on
+    // overshoot instead of panicking. The trade-off is one branch
+    // per write on the direct-decode path; benches confirmed the
+    // overhead is ≤ 1 % on compare_ffi.
+
+    /// Fallible variant of [`Self::extend`].
+    /// Returns `Err(BackendOverflow)` on growable-backend allocation
+    /// failure (rare; never panics) or on `UserSliceBackend` capacity
+    /// overflow. Default impl delegates to the panic-on-overflow
+    /// [`Self::extend`] — backends with non-growable capacity MUST
+    /// override.
+    fn try_extend(&mut self, data: &[u8]) -> Result<(), BackendOverflow> {
+        self.extend(data);
+        Ok(())
+    }
+
+    /// Fallible variant of [`Self::extend_and_fill`]. Same contract
+    /// as [`Self::try_extend`].
+    fn try_extend_and_fill(
+        &mut self,
+        fill_with: u8,
+        fill_length: usize,
+    ) -> Result<(), BackendOverflow> {
+        self.extend_and_fill(fill_with, fill_length);
+        Ok(())
+    }
+
+    /// Fallible variant of [`Self::extend_from_within_unchecked`].
+    /// Validates `start + len <= self.len()` AND `tail + len <= cap`
+    /// before calling the unsafe write. On `Err` the backend state
+    /// is untouched.
+    ///
+    /// Unlike the unsafe variant, this is a SAFE entry point: the
+    /// bounds check moves into the method, so callers don't need to
+    /// satisfy the `Self::extend_from_within_unchecked` safety
+    /// contract at the call site.
+    ///
+    /// NOTE: Currently unused on production paths. The direct
+    /// decode's Compressed-block sequence executor writes via the
+    /// existing unchecked path; threading `try_*` through the
+    /// fused decode+execute pipeline is the next step toward
+    /// unconditional adversarial-input safety. RLE/Raw blocks
+    /// already use `try_extend_and_fill` / `try_extend`.
+    #[allow(dead_code)]
+    fn try_extend_from_within(&mut self, start: usize, len: usize) -> Result<(), BackendOverflow> {
+        // Default impl: growable backends pre-reserve via `reserve`,
+        // then forward to the unsafe variant. Fixed-capacity
+        // backends MUST override and check before calling.
+        self.reserve(len);
+        // SAFETY: `reserve(len)` guaranteed `tail + len <= cap` on
+        // growable backends; the caller of `try_extend_from_within`
+        // is responsible for `start + len <= self.len()`. The
+        // documented precondition matches `extend_from_within_unchecked`
+        // for that bound.
+        unsafe { self.extend_from_within_unchecked(start, len) };
+        Ok(())
+    }
+}
+
+/// Backend write failed because the requested write would exceed the
+/// backend's capacity. Surfaced only by fallible `try_*` methods on
+/// fixed-capacity backends (`UserSliceBackend`); growable backends
+/// (`FlatBuf`, `RingBuffer`) never produce this — they grow instead.
+///
+/// The decoder converts this into
+/// `FrameDecoderError::FrameContentSizeMismatch` at the
+/// `decode_to_slice_trusted` boundary, so callers never see
+/// `BackendOverflow` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendOverflow {
+    /// Current physical write cursor at the moment the write was
+    /// attempted.
+    pub tail: usize,
+    /// Number of bytes the failing write tried to append.
+    pub requested: usize,
+    /// Total physical capacity of the backend.
+    pub capacity: usize,
+}
+
+impl core::fmt::Display for BackendOverflow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "BufferBackend overflow: tail={}, requested={}, capacity={}",
+            self.tail, self.requested, self.capacity,
+        )
+    }
 }

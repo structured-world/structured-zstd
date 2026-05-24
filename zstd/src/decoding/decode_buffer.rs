@@ -196,6 +196,32 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.total_output_counter += data.len() as u64;
     }
 
+    /// Fallible variant of [`Self::push`]. Returns `Err(BackendOverflow)`
+    /// when the underlying backend's `try_extend` rejects the write
+    /// (only possible on fixed-capacity backends like
+    /// `UserSliceBackend`). Used by the direct-decode path so a
+    /// malformed Compressed block whose payload exceeds the user's
+    /// output slice surfaces as a structured error.
+    #[inline]
+    pub fn try_push(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
+        self.buffer.try_extend(data)?;
+        self.total_output_counter += data.len() as u64;
+        Ok(())
+    }
+
+    /// Fallible variant of [`Self::extend_and_fill`]. Same contract
+    /// as [`Self::try_push`].
+    #[inline]
+    pub fn try_extend_and_fill(
+        &mut self,
+        fill_with: u8,
+        fill_length: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        self.buffer.try_extend_and_fill(fill_with, fill_length)?;
+        self.total_output_counter += fill_length as u64;
+        Ok(())
+    }
+
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         self.repeat_inner::<false>(offset, match_length)
     }

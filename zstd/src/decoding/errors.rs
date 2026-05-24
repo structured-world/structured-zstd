@@ -347,8 +347,21 @@ impl From<ExecuteSequencesError> for DecompressBlockError {
 pub enum DecodeBlockContentError {
     DecoderStateIsFailed,
     ExpectedHeaderOfPreviousBlock,
-    ReadError { step: BlockType, source: Error },
+    ReadError {
+        step: BlockType,
+        source: Error,
+    },
     DecompressBlockError(DecompressBlockError),
+    /// The block's decompressed payload would not fit in the
+    /// caller-provided output buffer (only reachable via the
+    /// direct-decode path with a fixed-capacity backend). The
+    /// frame-level decoder converts this into
+    /// `FrameDecoderError::FrameContentSizeMismatch` before
+    /// returning to the user. Carries the BlockType so callers can
+    /// distinguish RLE / Raw / Compressed overshoot in diagnostics.
+    BackendOverflow {
+        step: BlockType,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -381,6 +394,10 @@ impl core::fmt::Display for DecodeBlockContentError {
                 write!(f, "Error while reading bytes for {step}: {source}",)
             }
             DecodeBlockContentError::DecompressBlockError(e) => write!(f, "{e:?}"),
+            DecodeBlockContentError::BackendOverflow { step } => write!(
+                f,
+                "{step} block's decompressed payload exceeds the caller-provided output buffer",
+            ),
         }
     }
 }
@@ -394,9 +411,22 @@ impl From<DecompressBlockError> for DecodeBlockContentError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeBufferError {
-    NotEnoughBytesInDictionary { got: usize, need: usize },
-    OffsetTooBig { offset: usize, buf_len: usize },
+    NotEnoughBytesInDictionary {
+        got: usize,
+        need: usize,
+    },
+    OffsetTooBig {
+        offset: usize,
+        buf_len: usize,
+    },
     ZeroOffset,
+    /// Match repeat would overflow a fixed-capacity backend
+    /// (`UserSliceBackend`). Only surfaced on the direct-decode
+    /// path; growable backends (FlatBuf/RingBuffer) grow on demand
+    /// and never produce this. Converted to
+    /// `FrameDecoderError::FrameContentSizeMismatch` at the
+    /// `decode_to_slice_trusted` boundary.
+    BackendOverflow,
 }
 
 #[cfg(feature = "std")]
@@ -416,6 +446,12 @@ impl core::fmt::Display for DecodeBufferError {
             }
             DecodeBufferError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
+            }
+            DecodeBufferError::BackendOverflow => {
+                write!(
+                    f,
+                    "Match repeat would overflow the output buffer's fixed capacity"
+                )
             }
         }
     }

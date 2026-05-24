@@ -386,6 +386,100 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         self.head += n;
         debug_assert!(self.head <= self.tail);
     }
+
+    // ── Fallible write surface ──
+    //
+    // Override the default trait impls (which call panic-on-overflow
+    // variants) with explicit capacity checks that return
+    // `BackendOverflow` instead. This is the entire point of the
+    // backend: a fixed-capacity output slice that cannot grow on
+    // demand, so any overshoot must be reported instead of aborting.
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
+        let len = data.len();
+        let new_tail = self.tail + len;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        let total_writable = self.slice.len() - self.tail;
+        // SAFETY: `new_tail <= self.slice.len()` (checked above);
+        // `data` is non-aliasing with the backend's slice (caller
+        // contract — literals buffer / input view).
+        unsafe {
+            super::simd_copy::copy_bytes_overshooting(
+                (data.as_ptr(), len),
+                (self.slice.as_mut_ptr().add(self.tail), total_writable),
+                len,
+            );
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend_and_fill(
+        &mut self,
+        fill_with: u8,
+        fill_length: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        let new_tail = self.tail + fill_length;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: fill_length,
+                capacity: self.slice.len(),
+            });
+        }
+        self.slice[self.tail..new_tail].fill(fill_with);
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend_from_within(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        // Bound 1: source range fits in live region.
+        // The caller's `start` is relative to the live-region head;
+        // map to a physical absolute position and check against the
+        // current tail.
+        let abs_start = self.head + start;
+        let abs_end = abs_start
+            .checked_add(len)
+            .ok_or(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            })?;
+        if abs_end > self.tail {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        // Bound 2: destination has capacity for `len`.
+        let new_tail = self.tail + len;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        // SAFETY: both bounds checked above. Forward to the unsafe
+        // variant which performs the wildcopy with the same
+        // preconditions the bounds checks established.
+        unsafe { self.extend_from_within_unchecked(start, len) };
+        Ok(())
+    }
 }
 
 // `WILDCOPY_OVERLENGTH` is used implicitly via the dispatcher's
