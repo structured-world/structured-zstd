@@ -144,9 +144,13 @@ pub(crate) trait BufferBackend: Sized {
     // overhead is ≤ 1 % on compare_ffi.
 
     /// Fallible variant of [`Self::extend`].
-    /// Returns `Err(BackendOverflow)` on growable-backend allocation
-    /// failure (rare; never panics) or on `UserSliceBackend` capacity
-    /// overflow. Default impl delegates to the panic-on-overflow
+    /// Returns `Err(BackendOverflow)` on fixed-capacity backends
+    /// (`UserSliceBackend`) when the write would exceed the slice
+    /// length. Growable backends (FlatBuf / RingBuffer) cannot
+    /// return `Err` for capacity reasons — their underlying `Vec`
+    /// grows on demand, and a true allocation failure aborts the
+    /// process rather than surfacing through `Result` (`Vec`
+    /// contract). Default impl delegates to the panic-on-overflow
     /// [`Self::extend`] — backends with non-growable capacity MUST
     /// override.
     fn try_extend(&mut self, data: &[u8]) -> Result<(), BackendOverflow> {
@@ -183,15 +187,47 @@ pub(crate) trait BufferBackend: Sized {
     /// already use `try_extend_and_fill` / `try_extend`.
     #[allow(dead_code)]
     fn try_extend_from_within(&mut self, start: usize, len: usize) -> Result<(), BackendOverflow> {
-        // Default impl: growable backends pre-reserve via `reserve`,
-        // then forward to the unsafe variant. Fixed-capacity
-        // backends MUST override and check before calling.
+        // Default impl: a SAFE method must NOT delegate to the
+        // unsafe variant without validating both halves of its
+        // safety contract. Validate the source range first
+        // (`start + len <= self.len()`), then grow capacity and
+        // validate the destination range (`tail + len <= cap`),
+        // then forward to the unsafe write. Fixed-capacity
+        // backends override this with a tighter pair of checks
+        // that does not call `reserve` (a no-op on them).
+        let tail = self.tail();
+        let capacity = self.cap();
+        let src_end = start.checked_add(len).ok_or(BackendOverflow {
+            tail,
+            requested: len,
+            capacity,
+        })?;
+        if src_end > self.len() {
+            return Err(BackendOverflow {
+                tail,
+                requested: len,
+                capacity,
+            });
+        }
         self.reserve(len);
-        // SAFETY: `reserve(len)` guaranteed `tail + len <= cap` on
-        // growable backends; the caller of `try_extend_from_within`
-        // is responsible for `start + len <= self.len()`. The
-        // documented precondition matches `extend_from_within_unchecked`
-        // for that bound.
+        let tail = self.tail();
+        let capacity = self.cap();
+        let new_tail = tail.checked_add(len).ok_or(BackendOverflow {
+            tail,
+            requested: len,
+            capacity,
+        })?;
+        if new_tail > capacity {
+            return Err(BackendOverflow {
+                tail,
+                requested: len,
+                capacity,
+            });
+        }
+        // SAFETY: both halves of the `extend_from_within_unchecked`
+        // safety contract validated above — source bound checked
+        // against `self.len()`, destination bound checked against
+        // `cap()` after `reserve`.
         unsafe { self.extend_from_within_unchecked(start, len) };
         Ok(())
     }

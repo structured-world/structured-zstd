@@ -354,11 +354,14 @@ pub enum DecodeBlockContentError {
     DecompressBlockError(DecompressBlockError),
     /// The block's decompressed payload would not fit in the
     /// caller-provided output buffer (only reachable via the
-    /// direct-decode path with a fixed-capacity backend). The
-    /// frame-level decoder converts this into
+    /// direct-decode path with a fixed-capacity backend). Internal
+    /// diagnostic variant — the frame-level decoder always
+    /// converts this into
     /// `FrameDecoderError::FrameContentSizeMismatch` before
-    /// returning to the user. Carries the BlockType so callers can
-    /// distinguish RLE / Raw / Compressed overshoot in diagnostics.
+    /// returning to the user, so external callers never observe
+    /// it. The `step: BlockType` field is kept for in-crate
+    /// debugging (which decode arm triggered the overshoot) but is
+    /// not part of any caller-visible distinction.
     BackendOverflow {
         step: BlockType,
     },

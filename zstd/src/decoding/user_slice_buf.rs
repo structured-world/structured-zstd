@@ -398,7 +398,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     #[inline]
     fn try_extend(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
         let len = data.len();
-        let new_tail = self.tail + len;
+        // Use `checked_add` to catch adversarial input where
+        // `self.tail + len` would wrap `usize` — without the wrap
+        // check, the subsequent `new_tail > self.slice.len()` test
+        // can be bypassed by an `len` near `usize::MAX`, turning
+        // the fallible write into a release-mode panic via
+        // `copy_bytes_overshooting`.
+        let new_tail =
+            self.tail
+                .checked_add(len)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
         if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
@@ -427,7 +440,17 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         fill_with: u8,
         fill_length: usize,
     ) -> Result<(), super::buffer_backend::BackendOverflow> {
-        let new_tail = self.tail + fill_length;
+        // Same wrap-check rationale as `try_extend` above — an
+        // adversarial `fill_length` near `usize::MAX` would wrap
+        // `new_tail`, bypass the upper bound, and panic in
+        // `slice[tail..new_tail]` (start > end).
+        let new_tail = self.tail.checked_add(fill_length).ok_or({
+            super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: fill_length,
+                capacity: self.slice.len(),
+            }
+        })?;
         if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
@@ -449,8 +472,17 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // Bound 1: source range fits in live region.
         // The caller's `start` is relative to the live-region head;
         // map to a physical absolute position and check against the
-        // current tail.
-        let abs_start = self.head + start;
+        // current tail. Both `head + start` and `+ len` get
+        // `checked_add` so an adversarial `start` or `len` near
+        // `usize::MAX` cannot wrap past the bounds checks.
+        let abs_start =
+            self.head
+                .checked_add(start)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
         let abs_end = abs_start
             .checked_add(len)
             .ok_or(super::buffer_backend::BackendOverflow {
@@ -465,8 +497,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 capacity: self.slice.len(),
             });
         }
-        // Bound 2: destination has capacity for `len`.
-        let new_tail = self.tail + len;
+        // Bound 2: destination has capacity for `len`. Same wrap
+        // protection — without it, an adversarial `len` near
+        // `usize::MAX` wraps and bypasses the upper bound, turning
+        // the unchecked write into a release-mode UB / panic.
+        let new_tail =
+            self.tail
+                .checked_add(len)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
         if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
