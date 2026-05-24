@@ -362,7 +362,7 @@ fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
 /// through. Caller is responsible for passing exactly
 /// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
 /// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
-#[cfg(any(test, feature = "bench_internals"))]
+#[cfg(feature = "bench_internals")]
 pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
     assert_eq!(
         block.len(),

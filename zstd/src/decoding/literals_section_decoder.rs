@@ -6,13 +6,6 @@ use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::huff0::huff0_decoder::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
-use crate::huff0::huff0_decoder::{
-    HufKernel, HuffmanDecodeKernel, ScalarKernel, detect_huffman_decode_kernel,
-};
-#[cfg(target_arch = "aarch64")]
-use crate::huff0::huff0_decoder::{NeonKernel, SveKernel};
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
@@ -152,180 +145,77 @@ fn decompress_literals(
         let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
-        // Donor-style burst loop with SIMD fallback interleaved per
-        // iteration — burst is the primary tier whenever the gate
-        // holds, SIMD takes over for the iterations where the burst
-        // is gated out (typically right after `advance_state_by_bits`
-        // triggers a refill inside a SIMD iter and `bits_consumed`
-        // rebases to `[0, 7]`).
-        //
-        // bits[s] register (per stream) layout for the burst, MSB → LSB:
-        //   [ state (max_num_bits) | stream (≤ 64 - 2·max bits) | zeros + sentinel ]
-        //
-        // Our `decoder.state` is conceptually "the next max-bit
-        // lookahead window starting at the current consumption
-        // point"; the stream bits that constitute it sit in
-        // `bit_container` at positions
-        // `[(64 - bits_consumed), (63 - bits_consumed + max))` BUT
-        // ONLY when `bits_consumed >= max_num_bits`. After a refill
-        // `bits_consumed` resets to `[0, 7]`, where those positions
-        // partially fall outside the current window — the formula
-        // would then lose low stream bits. The `bits_consumed >=
-        // max_num_bits` gate keeps the burst sound; the SIMD branch
-        // handles the post-refill iterations until `bits_consumed`
-        // grows back into burst range, at which point we re-enter
-        // the burst body in the same outer loop.
+        // Donor-parity 4-stream HUF decode. `bits[s]` is the fused
+        // state+stream+sentinel u64 register (see `run_4stream_burst_loop`).
+        // Each iter decodes `symbols_per_burst` symbols × 4 streams,
+        // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
+        // MEM_read64(ip[s]) | 1`.
         let max_num_bits = scratch.table.max_num_bits;
-        // symbols_per_burst * max ≤ 63 - max so the sentinel stays
-        // below the state region after the worst-case T-shift.
-        // For max=11: 4 symbols. For max=8: 6 symbols.
-        let symbols_per_burst: usize = (63 - max_num_bits as usize) / max_num_bits as usize;
+        // `symbols_per_burst * max + max_padding_skip < 64 - max` so
+        // the corrupted bit-0 from donor's `(bit_container | 1)`
+        // composition (which lands at bit `padding_skip` initially)
+        // never reaches the top `max_num_bits` state region after
+        // the worst-case shift sequence. `padding_skip ∈ [1, 8]` —
+        // we cap by 8 to stay safe for the upper boundary case.
+        // For max=11: 4 symbols. For max=8: 6 symbols. For max=4: 13.
+        let symbols_per_burst: usize = (64 - max_num_bits as usize - 8) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
-        let burst_bits_isize = burst_bits as isize;
         let table_shift = (64 - max_num_bits) as u32;
-        let state_shift = 64 - max_num_bits;
         let packed = scratch.table.packed_decode.as_slice();
 
-        // Lockstep cursor invariant: every outer-loop iteration advances
-        // ALL four cursors by the same amount (1 in the SIMD-fallback
-        // path, `symbols_per_burst` in the burst path), so
-        // `cursors[i] - starts[i]` stays identical across `i`. The
-        // first stream to hit its end is the one with the smallest
-        // segment length, and `cursors[0] - starts[0]` tracks the
-        // progress of all four. Donor parity with `huf_decompress.c`
-        // `olimit`-style single-pointer bound.
+        // Lockstep cursor invariant: every burst iter advances all 4
+        // cursors by `symbols_per_burst` in step, so `cursors[0]`
+        // tracks progress for all four streams. `cursor_exit_olimit
+        // = starts[0] + min(seg_len[i])` is the cursor value at which
+        // the lagging segment runs out — donor parity with
+        // `huf_decompress.c` `olimit`-style single-pointer bound.
         let min_seg_len = (ends[0] - starts[0])
             .min(ends[1] - starts[1])
             .min(ends[2] - starts[2])
             .min(ends[3] - starts[3]);
-        let cursor_exit_olimit = starts[0] + min_seg_len;
-        // `burst_eligible` is the load-bearing safety gate against
+        // `burst_eligible` is a load-bearing safety gate against
         // adversarial frame headers. If `min_seg_len < symbols_per_burst`
-        // (small `regenerated_size` paired with large compressed streams,
-        // forging a 4-stream HUF block where `seg = div_ceil(regen, 4) <
-        // symbols_per_burst`) then `cursor_burst_ceil` saturates to 0
-        // and `cursors[0] <= 0` is trivially true on entry — admitting
-        // the burst path, whose inner loop would then advance
-        // `cursors[i]` past `ends[i]` and panic on the `target[cursors[i]]`
-        // write. Requiring `min_seg_len >= symbols_per_burst` up front
-        // means the burst path only runs when a full burst fits inside
-        // EVERY segment, so the inner loop's cursor advance is sound by
-        // construction. The non-burst SIMD-fallback path advances each
-        // cursor by 1 per outer iteration and is naturally guarded by
-        // the existing per-iteration top-of-loop exit check.
+        // (small `regenerated_size` paired with large compressed
+        // streams, forging a 4-stream HUF block where
+        // `seg = div_ceil(regen, 4) < symbols_per_burst`) then
+        // `cursor_burst_ceil` saturates to 0 and `cursors[0] <= 0`
+        // is trivially true on entry, admitting a burst whose inner
+        // loop would advance `cursors[i]` past `ends[i]` and panic
+        // on the `target[cursors[i]]` write. Requiring
+        // `min_seg_len >= symbols_per_burst` up front means the
+        // burst only runs when a full burst fits inside EVERY
+        // segment; the drain phase outside `run_4stream_burst_loop`
+        // handles the small-`min_seg_len` case via single-symbol
+        // per-stream decode.
         let burst_eligible = symbols_per_burst >= 1 && min_seg_len >= symbols_per_burst;
-        let cursor_burst_ceil = cursor_exit_olimit.saturating_sub(symbols_per_burst);
+        let cursor_burst_ceil = (starts[0] + min_seg_len).saturating_sub(symbols_per_burst);
 
-        // Kernel choice is invariant across this whole call (all four
-        // decoders came from the same `HuffmanDecoder::new(&scratch.table)`,
-        // and `detect_huffman_decode_kernel` returns a process-wide
-        // constant — cached via `OnceLock` on `std`, resolved at compile
-        // time via `cfg!(target_feature = …)` on `no_std`). Dispatch once
-        // on the kernel and run the monomorphised inner loop — inside the
-        // loop, K::decode4_unchecked / K::advance_state resolve at compile
-        // time, eliminating the per-call enum match that the dynamic API
-        // does. The donor burst body itself bypasses kernel dispatch
-        // (reads `packed_decode` directly), so the burst path is identical
-        // across all K — the generic monomorphisation costs nothing there
-        // and removes 5 runtime branches per fallback iteration (1 in
-        // decode4_*, 4 in advance_state_*).
         let bounds = LoopBounds {
-            max_bits,
-            max_num_bits,
             symbols_per_burst,
             burst_bits,
-            burst_bits_isize,
             table_shift,
-            state_shift,
-            cursor_exit_olimit,
             cursor_burst_ceil,
             burst_eligible,
         };
 
-        match detect_huffman_decode_kernel() {
-            HuffmanDecodeKernel::Scalar => {
-                // SAFETY: ScalarKernel has no SIMD prereqs; always sound to call.
-                unsafe {
-                    run_4stream_decode_loop::<ScalarKernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            HuffmanDecodeKernel::X86Bmi2 => {
-                // SAFETY: kernel selector returned X86Bmi2 ⇒ BMI2 detected.
-                unsafe {
-                    run_4stream_decode_loop::<Bmi2Kernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            HuffmanDecodeKernel::X86Avx2 => {
-                // SAFETY: kernel selector returned X86Avx2 ⇒ AVX2+BMI2 detected.
-                unsafe {
-                    run_4stream_decode_loop::<Avx2Kernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            HuffmanDecodeKernel::X86Vbmi2 => {
-                // SAFETY: kernel selector returned X86Vbmi2 ⇒ VBMI2+BMI2 detected.
-                unsafe {
-                    run_4stream_decode_loop::<Vbmi2Kernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Neon => {
-                // SAFETY: kernel selector returned Aarch64Neon ⇒ NEON detected.
-                unsafe {
-                    run_4stream_decode_loop::<NeonKernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            HuffmanDecodeKernel::Aarch64Sve => {
-                // SAFETY: kernel selector returned Aarch64Sve ⇒ SVE detected.
-                unsafe {
-                    run_4stream_decode_loop::<SveKernel>(
-                        &mut decoders,
-                        &mut brs,
-                        target,
-                        packed,
-                        &mut cursors,
-                        &bounds,
-                    );
-                }
-            }
+        // Burst is identical across all kernels (donor parity: reads
+        // `packed[idx]` u16 directly + `MEM_read64` reload pattern,
+        // no SIMD intrinsics needed). Single un-genericised call.
+        //
+        // SAFETY: caller guarantees `brs[s].source` is the same as the
+        // stream slice each decoder was initialised against; the
+        // upfront `target.resize(base + regen, 0)` covers all cursor
+        // writes; `packed` length matches `1 << max_num_bits` by
+        // `HuffmanTable::build_decoder`'s `resize`.
+        unsafe {
+            run_4stream_burst_loop(
+                &mut decoders,
+                &mut brs,
+                target,
+                packed,
+                &mut cursors,
+                &bounds,
+            );
         }
 
         // Drain remaining symbols from each stream, bounded by segment end
@@ -401,225 +291,264 @@ fn decompress_literals(
     Ok(bytes_read)
 }
 
-/// Loop-invariant constants for [`run_4stream_decode_loop`].
-///
-/// All fields are derived once per `decompress_literals` call and stay
-/// constant across the outer loop. Bundling them keeps the function
-/// signature short and lets the compiler hoist their loads outside the
-/// loop body.
-///
-/// `cursor_exit_olimit` / `cursor_burst_ceil` rely on the lockstep
-/// cursor invariant — every outer iteration advances all 4 cursors by
-/// the same amount, so a single comparison against `cursors[0]`
-/// suffices in place of 4 per-stream cursor checks.
-///
-/// All fields are scalar (Copy). `Copy` is derived so the inner
-/// `run_4stream_decode_loop` can destructure `*bounds` without
-/// per-field copy ceremony — every field is a register-sized
-/// integer, so copying-by-value at the call site is cheap.
+/// Loop-invariant constants for [`run_4stream_burst_loop`]. Derived
+/// once per `decompress_literals` call; `Copy` so the burst can
+/// destructure `*bounds` for register-resident reads.
 #[derive(Copy, Clone)]
 struct LoopBounds {
-    max_bits: isize,
-    max_num_bits: u8,
     symbols_per_burst: usize,
     burst_bits: u8,
-    burst_bits_isize: isize,
     table_shift: u32,
-    state_shift: u8,
-    cursor_exit_olimit: usize,
     cursor_burst_ceil: usize,
     /// Set iff a full burst (`symbols_per_burst` symbols per stream)
-    /// can fit in the lagging segment. When false the burst gate is
-    /// hard-disabled regardless of per-iteration bits state — the
-    /// SIMD-fallback path runs the loop instead. See setup site for
-    /// the safety rationale (adversarial / small-regen DoS guard).
+    /// can fit in the lagging segment. When false the burst is
+    /// hard-disabled and the drain phase outside the burst loop
+    /// decodes ALL symbols via the single-symbol path. Setup-site
+    /// safety rationale: adversarial / small-regen DoS guard.
     burst_eligible: bool,
 }
 
-/// Monomorphised 4-stream HUF decode outer loop — burst tier + SIMD
-/// 4-symbol fallback — selected at compile time over `K: HufKernel`.
+/// Donor-parity 4-stream HUF decode burst loop. Single code path —
+/// no kernel dispatch, no SIMD-fallback hybrid. Mirrors
+/// `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
+/// each outer iter decodes `symbols_per_burst` symbols × 4 streams,
+/// then reloads all 4 stream registers from raw source bytes via the
+/// `ctz(bits[s])` → `ip[s] -= nb_bytes` → `MEM_read64(ip[s])` pattern.
 ///
-/// The kernel choice is dispatched once at `decompress_literals` entry
-/// (see the `match detect_huffman_decode_kernel() { ... }` block
-/// above). Inside this function `K::decode4_unchecked` and
-/// `K::advance_state` resolve at compile time, eliminating the per-call
-/// runtime enum branch that the dynamic API does.
-///
-/// The burst tier itself bypasses kernel dispatch by indexing
-/// `packed_decode` directly, so it generates identical code across all
-/// `K` — the const-generic dispatch costs nothing on the burst path
-/// and removes 5 runtime branches per SIMD-fallback iteration.
+/// State + unconsumed stream + sentinel are fused into one u64
+/// per stream (`bits[s]`). The decoder's separate `state` field is
+/// reconstructed once at burst exit for the drain phase below.
 ///
 /// # Safety
 ///
-/// The caller must have selected `K` based on
-/// [`detect_huffman_decode_kernel`] so the kernel's required CPU
-/// feature set is supported. All four decoders must share the same
-/// table (holds by construction since they are all built from
-/// `&scratch.table`).
+/// All four decoders must share the same table (holds by construction —
+/// built from `&scratch.table`). `target.len() >= base + regen`. Each
+/// `brs[s].source` must be the slice the corresponding decoder was
+/// initialised against.
 #[inline(always)]
-unsafe fn run_4stream_decode_loop<K: HufKernel>(
+unsafe fn run_4stream_burst_loop(
     decoders: &mut [HuffmanDecoder<'_>; 4],
     brs: &mut [BitReaderReversed<'_>; 4],
     target: &mut [u8],
-    packed: &[u32],
+    packed: &[u16],
     cursors: &mut [usize; 4],
     bounds: &LoopBounds,
 ) {
     let LoopBounds {
-        max_bits,
-        max_num_bits,
         symbols_per_burst,
         burst_bits,
-        burst_bits_isize,
         table_shift,
-        state_shift,
-        cursor_exit_olimit,
         cursor_burst_ceil,
         burst_eligible,
     } = *bounds;
+    let max_num_bits = (64 - table_shift) as u8;
 
-    loop {
-        // Combined exit: every iteration advances all 4 cursors in
-        // lockstep, so `cursors[0]` tracks progress for all four
-        // streams. `cursor_exit_olimit = starts[0] + min(seg_len[i])`
-        // is the cursor value at which the lagging segment runs out
-        // of room — collapsing 4 per-stream cursor checks into 1.
-        // The bits_remaining checks stay per-stream because each
-        // stream's bit budget burns down at its own (code-length-
-        // dependent) rate.
-        if cursors[0] >= cursor_exit_olimit
-            || brs[0].bits_remaining() <= -max_bits
-            || brs[1].bits_remaining() <= -max_bits
-            || brs[2].bits_remaining() <= -max_bits
-            || brs[3].bits_remaining() <= -max_bits
-        {
+    // Skip burst entirely if min_seg_len < symbols_per_burst — drain
+    // (the single-symbol tail outside this function) handles ALL
+    // symbols. See the `burst_eligible` doc on `LoopBounds`.
+    if !burst_eligible {
+        return;
+    }
+
+    // Donor-parity burst loop. `bits[s]` is the unified u64 register
+    // that fuses state + unconsumed stream + sentinel:
+    //   bits 63..(64-max_num_bits): current state (next index into `packed`)
+    //   below:                       upcoming stream bits, top-aligned
+    //   bottom:                      sentinel `1`, position grows upward
+    //                                with each consumed bit
+    //
+    // The encoder side of HUF writes the bitstream backward such that
+    // at every byte boundary the top `max_num_bits` of unconsumed
+    // stream = current state. So state is implicit in `bits[s]`; we
+    // do NOT carry a separate `decoder.state` inside the burst — it
+    // is reconstructed via `bits[s] >> table_shift` at the burst exit
+    // and written back to `decoders[s].state` for the drain phase.
+    //
+    // Composition matches donor `HUF_DecompressFastArgs_init` and
+    // `HUF_4X1_RELOAD_STREAM` (huf_decompress.c:795-804): each iter
+    // reloads `bits[s] = MEM_read64(ip[s]) | 1; bits[s] <<= nb_bits`
+    // after advancing `ip[s] -= nb_bytes` (where nb_bytes/nb_bits
+    // come from `ctz(bits[s])` at the end of the previous iter).
+    // Initial composition exactly mirrors donor `HUF_DecompressFastArgs_init`:
+    // `bits[s] = (MEM_read64(ip) | 1) << padding_skip`. Top `max_num_bits`
+    // of the result is the state value implicitly (HUF stream encoding
+    // ensures the top max bits of unconsumed stream at any consumption
+    // point = current state machine state), so we don't inject
+    // `decoders[s].state` explicitly here — the bit pattern already
+    // carries it.
+    //
+    // `padding_skip = brs[s].bits_consumed - max_num_bits`: `init_state`
+    // pre-consumed `max_num_bits` for `decoders[s].state`, so
+    // `brs[s].bits_consumed = padding_skip + max_num_bits`. Donor leaves
+    // state implicit; we reverse our pre-consumption by shifting only
+    // by `padding_skip` (not by `bits_consumed`) so the top max bits
+    // come from the unshifted stream-position-of-state.
+    //
+    // Sentinel ends up at bit `padding_skip` after the shift, so
+    // `ctz(initial bits[s]) = padding_skip` and the first reload's
+    // `nb_bytes = (padding_skip + K) / 8` matches donor's byte-cursor
+    // advance from absolute stream position 0.
+    let mut bits: [u64; 4] = [
+        (brs[0].bit_container | 1) << (brs[0].bits_consumed - max_num_bits),
+        (brs[1].bit_container | 1) << (brs[1].bits_consumed - max_num_bits),
+        (brs[2].bit_container | 1) << (brs[2].bits_consumed - max_num_bits),
+        (brs[3].bit_container | 1) << (brs[3].bits_consumed - max_num_bits),
+    ];
+    let mut ip: [usize; 4] = [brs[0].index, brs[1].index, brs[2].index, brs[3].index];
+    // Sub-byte phase of the consumption point in the current 8-byte
+    // window of `brs[s]`. Initial value mirrors the post-init reader
+    // state: drain compatibility wants `bits_consumed = nb_bits + max_num_bits`,
+    // so `nb_bits_last[s] = brs[s].bits_consumed - max_num_bits` for the
+    // pre-reload writeback path (no burst iter ran). After the first
+    // reload `nb_bits_last[s] = ctz & 7` (sub-byte phase of donor's
+    // `MEM_read64 + shift`).
+    let mut nb_bits_last: [u8; 4] = [
+        brs[0].bits_consumed - max_num_bits,
+        brs[1].bits_consumed - max_num_bits,
+        brs[2].bits_consumed - max_num_bits,
+        brs[3].bits_consumed - max_num_bits,
+    ];
+
+    // Donor `iiters` safety budget. Worst-case `nb_bytes` per iter is
+    // `floor(ctz_max / 8)` where `ctz_max = pad_max + burst_bits`,
+    // since at the first iter the sentinel starts at `padding_skip
+    // ∈ [1, 8]` and on subsequent iters at `nb_bits ∈ [0, 7]` set by
+    // the previous reload's `(MEM_read64 | 1) << nb_bits`. Taking
+    // `pad_max = 8` covers both regimes — without the `+8` slack,
+    // burst configurations where `burst_bits` is a multiple of 8
+    // (e.g. max=8 -> burst_bits=48) accept a `min_ip` that
+    // `nb_bytes` then overruns, underflowing `ip[s] -= nb_bytes`.
+    // The check below ensures `ip[s] >= bytes_per_iter_upper` for
+    // every stream before entering an iter, so per-iter `ip[s] -=
+    // nb_bytes` plus the subsequent `source[ip[s]..ip[s]+8]` read
+    // both stay in-bounds without per-stream conditionals.
+    let bytes_per_iter_upper = (8 + burst_bits as usize) / 8;
+    let mut any_iter = false;
+
+    while cursors[0] <= cursor_burst_ceil {
+        let min_ip = ip[0].min(ip[1]).min(ip[2]).min(ip[3]);
+        if min_ip < bytes_per_iter_upper {
             break;
         }
+        any_iter = true;
 
-        // Branchless min/max chain over the 4 `bits_consumed` values
-        // (u8 → cmov). Then the per-stream interval check
-        // `bits_consumed ∈ [max_num_bits, 64 - burst_bits]` for all 4
-        // streams collapses to two comparisons: the minimum is the
-        // tightest lower bound, the maximum is the tightest upper
-        // bound. Replaces 8 per-stream checks with 2.
-        let min_consumed = brs[0]
-            .bits_consumed
-            .min(brs[1].bits_consumed)
-            .min(brs[2].bits_consumed)
-            .min(brs[3].bits_consumed);
-        let max_consumed = brs[0]
-            .bits_consumed
-            .max(brs[1].bits_consumed)
-            .max(brs[2].bits_consumed)
-            .max(brs[3].bits_consumed);
-        // 64 - burst_bits would underflow if burst_bits > 64; symbols_per_burst
-        // is sized so `burst_bits < 63` (sentinel constraint), so saturating_sub
-        // is a no-op on the well-typed path but defensive against future drift.
-        let max_consumed_ceil = 64u8.saturating_sub(burst_bits);
-
-        let burst_ok = burst_eligible
-            && brs[0].bits_remaining() > burst_bits_isize
-            && brs[1].bits_remaining() > burst_bits_isize
-            && brs[2].bits_remaining() > burst_bits_isize
-            && brs[3].bits_remaining() > burst_bits_isize
-            // Lockstep cursor → single bound. `cursor_burst_ceil =
-            // cursor_exit_olimit.saturating_sub(symbols_per_burst)`
-            // is the largest cursor value at which a full burst of
-            // `symbols_per_burst` symbols still fits inside the
-            // lagging segment (which, by lockstep, fits inside ALL
-            // four segments). Replaces 4 per-stream
-            // `cursors[i] <= ends[i].saturating_sub(symbols_per_burst)`
-            // checks with one.
-            && cursors[0] <= cursor_burst_ceil
-            // Each stream needs `bits_consumed ∈ [max_num_bits,
-            // 64 - burst_bits]`: the lower bound ensures the
-            // burst-entry state shift is sound, the upper bound
-            // ensures the burst body's shifts stay inside the
-            // current 8-byte `bit_container` window. Folded into
-            // min/max across the 4 streams — 2 comparisons + 6
-            // branchless cmovs replace the previous 8 dependent
-            // conditional branches.
-            && min_consumed >= max_num_bits
-            && max_consumed <= max_consumed_ceil;
-
-        if burst_ok {
-            let mut bits = [
-                (decoders[0].state << state_shift)
-                    | ((brs[0].bit_container << brs[0].bits_consumed) >> max_num_bits)
-                    | 1,
-                (decoders[1].state << state_shift)
-                    | ((brs[1].bit_container << brs[1].bits_consumed) >> max_num_bits)
-                    | 1,
-                (decoders[2].state << state_shift)
-                    | ((brs[2].bit_container << brs[2].bits_consumed) >> max_num_bits)
-                    | 1,
-                (decoders[3].state << state_shift)
-                    | ((brs[3].bit_container << brs[3].bits_consumed) >> max_num_bits)
-                    | 1,
-            ];
-
-            for _ in 0..symbols_per_burst {
-                let idx0 = (bits[0] >> table_shift) as usize;
-                let entry0 = packed[idx0];
-                target[cursors[0]] = (entry0 & 0xFF) as u8;
-                cursors[0] += 1;
-                bits[0] <<= (entry0 >> 8) & 0xFF;
-
-                let idx1 = (bits[1] >> table_shift) as usize;
-                let entry1 = packed[idx1];
-                target[cursors[1]] = (entry1 & 0xFF) as u8;
-                cursors[1] += 1;
-                bits[1] <<= (entry1 >> 8) & 0xFF;
-
-                let idx2 = (bits[2] >> table_shift) as usize;
-                let entry2 = packed[idx2];
-                target[cursors[2]] = (entry2 & 0xFF) as u8;
-                cursors[2] += 1;
-                bits[2] <<= (entry2 >> 8) & 0xFF;
-
-                let idx3 = (bits[3] >> table_shift) as usize;
-                let entry3 = packed[idx3];
-                target[cursors[3]] = (entry3 & 0xFF) as u8;
-                cursors[3] += 1;
-                bits[3] <<= (entry3 >> 8) & 0xFF;
-            }
-
-            for s in 0..4 {
-                let consumed = bits[s].trailing_zeros() as u8;
-                brs[s].consume(consumed);
-                decoders[s].state = bits[s] >> table_shift;
-            }
-        } else {
-            // SIMD 4-symbol fallback for one outer iteration.
-            // K::advance_state triggers a refill inside `get_bits`
-            // when needed; after this iter `bits_consumed` is back
-            // in `[0, 7]+n` and the burst gate may be satisfied
-            // again on the next outer-loop pass.
-            //
-            // SAFETY: caller has dispatched K based on
-            // `detect_huffman_decode_kernel`, so the kernel's
-            // feature set is available. All four decoders share
-            // `scratch.table` by construction (built from the same
-            // `&scratch.table` reference at `decompress_literals`
-            // entry), satisfying `decode4_unchecked`'s shared-table
-            // contract.
-            let (symbols, nbits) = unsafe { K::decode4_unchecked(decoders) };
-            target[cursors[0]] = symbols[0];
+        // Inner: decode `symbols_per_burst` symbols × 4 streams.
+        //
+        // SAFETY for `packed.get_unchecked(idx)`:
+        //   `idx = (bits[s] >> table_shift) as usize` with
+        //   `table_shift = 64 - max_num_bits` lands in
+        //   `[0, 1 << max_num_bits)`. `packed.len() == 1 << max_num_bits`
+        //   by `HuffmanTable::build_decoder`'s upfront `resize`.
+        //
+        // SAFETY for `target.get_unchecked_mut(cursors[s])`:
+        //   The outer-loop gate `cursors[0] <= cursor_burst_ceil`
+        //   gives `cursors[0] + symbols_per_burst <= cursor_burst_ceil
+        //   + symbols_per_burst = starts[0] + min_seg_len`. By lockstep
+        //   advance, `cursors[s] - starts[s] == cursors[0] - starts[0]`
+        //   for all `s`, so `cursors[s] + symbols_per_burst - 1 <
+        //   starts[s] + min_seg_len <= ends[s] <= target.len()` —
+        //   every write in this iter (max index `cursors[s] +
+        //   symbols_per_burst - 1`) is strictly in-bounds.
+        debug_assert!(cursors[0] + symbols_per_burst <= cursor_burst_ceil + symbols_per_burst);
+        for _ in 0..symbols_per_burst {
+            let idx0 = (bits[0] >> table_shift) as usize;
+            let entry0 = unsafe { *packed.get_unchecked(idx0) };
+            unsafe { *target.get_unchecked_mut(cursors[0]) = (entry0 & 0xFF) as u8 };
             cursors[0] += 1;
-            target[cursors[1]] = symbols[1];
+            bits[0] <<= (entry0 >> 8) & 0xFF;
+
+            let idx1 = (bits[1] >> table_shift) as usize;
+            let entry1 = unsafe { *packed.get_unchecked(idx1) };
+            unsafe { *target.get_unchecked_mut(cursors[1]) = (entry1 & 0xFF) as u8 };
             cursors[1] += 1;
-            target[cursors[2]] = symbols[2];
+            bits[1] <<= (entry1 >> 8) & 0xFF;
+
+            let idx2 = (bits[2] >> table_shift) as usize;
+            let entry2 = unsafe { *packed.get_unchecked(idx2) };
+            unsafe { *target.get_unchecked_mut(cursors[2]) = (entry2 & 0xFF) as u8 };
             cursors[2] += 1;
-            target[cursors[3]] = symbols[3];
+            bits[2] <<= (entry2 >> 8) & 0xFF;
+
+            let idx3 = (bits[3] >> table_shift) as usize;
+            let entry3 = unsafe { *packed.get_unchecked(idx3) };
+            unsafe { *target.get_unchecked_mut(cursors[3]) = (entry3 & 0xFF) as u8 };
             cursors[3] += 1;
-            unsafe {
-                K::advance_state(&mut decoders[0], &mut brs[0], nbits[0]);
-                K::advance_state(&mut decoders[1], &mut brs[1], nbits[1]);
-                K::advance_state(&mut decoders[2], &mut brs[2], nbits[2]);
-                K::advance_state(&mut decoders[3], &mut brs[3], nbits[3]);
-            }
+            bits[3] <<= (entry3 >> 8) & 0xFF;
         }
+
+        // Reload all 4 streams (donor `HUF_4X1_RELOAD_STREAM`).
+        //
+        // SAFETY:
+        //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
+        //     gate at outer-loop entry guarantees `nb_bytes <= bytes_per_iter_upper`
+        //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
+        //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
+        //     pre-computes).
+        //   * `ip[s] + 8 <= source.len()`: `BitReaderReversed::new()`
+        //     starts with `bits_consumed = 64`, so the very first
+        //     `get_bits(1)` in the per-stream padding-skip loop
+        //     above triggers `refill()`. For `source.len() >= 8` that
+        //     fast-path establishes `brs[s].index = source.len() - 8`;
+        //     `init_state`'s subsequent `get_bits(max_num_bits)`
+        //     stays inside the same 8-byte window without another
+        //     refill (only `bits_consumed` advances). The
+        //     `refill_slow` path used for shorter streams leaves
+        //     `index = 0` (with the partial bytes left-shifted into
+        //     `bit_container`), making `min_ip = 0 <
+        //     bytes_per_iter_upper` so the burst loop exits via
+        //     `any_iter = false` BEFORE reaching this reload (the
+        //     writeback below is unreachable on `source.len() < 8`).
+        //     Within the loop, `ip[s]` only decreases via the line
+        //     above this comment, preserving the upper bound.
+        for s in 0..4 {
+            let ctz = bits[s].trailing_zeros();
+            let nb_bytes = (ctz >> 3) as usize;
+            let nb_bits = (ctz & 7) as u8;
+            ip[s] -= nb_bytes;
+            let new_window = u64::from_le_bytes(unsafe {
+                brs[s]
+                    .source
+                    .get_unchecked(ip[s]..ip[s] + 8)
+                    .try_into()
+                    .unwrap_unchecked()
+            });
+            // Donor `HUF_4X1_RELOAD_STREAM` order: `(MEM_read64 | 1) << nb_bits`,
+            // NOT `(MEM_read64 << nb_bits) | 1`. The two are NOT equivalent —
+            // the former puts the sentinel at bit `nb_bits` (so `ctz` of the
+            // post-reload register accumulates the sub-byte phase into the
+            // NEXT reload's `ctz`), the latter resets the sentinel to bit 0
+            // and loses the phase between reloads.
+            bits[s] = (new_window | 1) << nb_bits;
+            nb_bits_last[s] = nb_bits;
+        }
+    }
+
+    // No iter ran → nothing changed in `brs[s]` / `decoders[s]`; the
+    // drain phase below picks up from the post-`init_state` reader.
+    if !any_iter {
+        return;
+    }
+
+    // Write back to `brs[s]` + `decoders[s].state` so the drain phase
+    // (single-symbol `decode_symbol_and_advance`) picks up where the
+    // burst stopped. The burst's final `bits[s]` is post-reload
+    // (`= (new_window << nb_bits) | 1`), and `nb_bits_last[s]` holds
+    // the sub-byte phase used in that reload. Drain's read frontier
+    // sits at `nb_bits_last + max_num_bits` bits into the topmost
+    // window byte: `nb_bits_last` of padding-skip already aligned by
+    // the burst's reload shift, plus `max_num_bits` for the state we
+    // just extracted to `decoders[s].state`.
+    for s in 0..4 {
+        brs[s].index = ip[s];
+        brs[s].bit_container = u64::from_le_bytes(unsafe {
+            brs[s]
+                .source
+                .get_unchecked(ip[s]..ip[s] + 8)
+                .try_into()
+                .unwrap_unchecked()
+        });
+        brs[s].bits_consumed = nb_bits_last[s] + max_num_bits;
+        decoders[s].state = bits[s] >> table_shift;
     }
 }
 

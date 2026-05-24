@@ -4,20 +4,10 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
-#[cfg(target_arch = "aarch64")]
-use core::arch::asm;
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    _bzhi_u32, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
-    _mm_srli_si128,
-};
+use core::arch::x86::_bzhi_u32;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    _bzhi_u64, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
-    _mm_srli_si128,
-};
+use core::arch::x86_64::_bzhi_u64;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -246,178 +236,6 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[inline(always)]
-    pub(crate) fn decode_symbol_and_num_bits(&self) -> (u8, u8) {
-        let entry = self.table.decode[self.state as usize];
-        (entry.symbol, entry.num_bits)
-    }
-
-    #[inline(always)]
-    fn decode4_symbols_and_num_bits_scalar(
-        decoders: &[HuffmanDecoder<'_>; 4],
-    ) -> ([u8; 4], [u8; 4]) {
-        let mut symbols = [0_u8; 4];
-        let mut num_bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            let (sym, bits) = decoders[i].decode_symbol_and_num_bits();
-            symbols[i] = sym;
-            num_bits[i] = bits;
-            i += 1;
-        }
-        (symbols, num_bits)
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw")]
-    unsafe fn decode4_symbols_and_num_bits_vbmi2(
-        decoders: &[HuffmanDecoder<'_>; 4],
-    ) -> ([u8; 4], [u8; 4]) {
-        let table = decoders[0].table;
-        let packed = _mm_set_epi32(
-            table.packed_decode[decoders[3].state as usize] as i32,
-            table.packed_decode[decoders[2].state as usize] as i32,
-            table.packed_decode[decoders[1].state as usize] as i32,
-            table.packed_decode[decoders[0].state as usize] as i32,
-        );
-
-        // Keep byte0 and byte1 from each u32 lane, then compress them to the low bytes.
-        let symbols_bytes = _mm_maskz_compress_epi8(0b0001_0001_0001_0001, packed);
-        let bits_bytes = _mm_maskz_compress_epi8(0b0010_0010_0010_0010, packed);
-
-        let symbols_word = _mm_cvtsi128_si32(symbols_bytes) as u32;
-        let bits_word = _mm_cvtsi128_si32(bits_bytes) as u32;
-        let symbols = symbols_word.to_le_bytes();
-        let bits = bits_word.to_le_bytes();
-        (
-            [symbols[0], symbols[1], symbols[2], symbols[3]],
-            [bits[0], bits[1], bits[2], bits[3]],
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    unsafe fn decode4_symbols_and_num_bits_avx2(
-        decoders: &[HuffmanDecoder<'_>; 4],
-    ) -> ([u8; 4], [u8; 4]) {
-        let table = decoders[0].table;
-        let states = _mm_set_epi32(
-            decoders[3].state as i32,
-            decoders[2].state as i32,
-            decoders[1].state as i32,
-            decoders[0].state as i32,
-        );
-        let gathered =
-            unsafe { _mm_i32gather_epi32(table.packed_decode.as_ptr().cast::<i32>(), states, 4) };
-
-        let packed = [
-            _mm_cvtsi128_si32(gathered) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<4>(gathered)) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<8>(gathered)) as u32,
-            _mm_cvtsi128_si32(_mm_srli_si128::<12>(gathered)) as u32,
-        ];
-
-        let mut symbols = [0_u8; 4];
-        let mut num_bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            let v = packed[i];
-            symbols[i] = (v & 0xFF) as u8;
-            num_bits[i] = ((v >> 8) & 0xFF) as u8;
-            i += 1;
-        }
-        (symbols, num_bits)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
-    unsafe fn decode4_symbols_and_num_bits_neon(
-        decoders: &[HuffmanDecoder<'_>; 4],
-    ) -> ([u8; 4], [u8; 4]) {
-        let table = decoders[0].table;
-        let packed_scalar = [
-            table.packed_decode[decoders[0].state as usize],
-            table.packed_decode[decoders[1].state as usize],
-            table.packed_decode[decoders[2].state as usize],
-            table.packed_decode[decoders[3].state as usize],
-        ];
-
-        let packed = unsafe { vld1q_u32(packed_scalar.as_ptr()) };
-        let mask = vdupq_n_u32(0xFF);
-        let symbols_v = vandq_u32(packed, mask);
-        let bits_v = vandq_u32(vshrq_n_u32::<8>(packed), mask);
-
-        let mut symbols_u32 = [0_u32; 4];
-        let mut bits_u32 = [0_u32; 4];
-        unsafe {
-            vst1q_u32(symbols_u32.as_mut_ptr(), symbols_v);
-            vst1q_u32(bits_u32.as_mut_ptr(), bits_v);
-        }
-
-        let mut symbols = [0_u8; 4];
-        let mut bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            symbols[i] = symbols_u32[i] as u8;
-            bits[i] = bits_u32[i] as u8;
-            i += 1;
-        }
-        (symbols, bits)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "sve")]
-    unsafe fn decode4_symbols_and_num_bits_sve(
-        decoders: &[HuffmanDecoder<'_>; 4],
-    ) -> ([u8; 4], [u8; 4]) {
-        let table = decoders[0].table;
-        let packed_scalar = [
-            table.packed_decode[decoders[0].state as usize],
-            table.packed_decode[decoders[1].state as usize],
-            table.packed_decode[decoders[2].state as usize],
-            table.packed_decode[decoders[3].state as usize],
-        ];
-
-        let mut symbols_u32 = [0_u32; 4];
-        let mut bits_u32 = [0_u32; 4];
-        let lanes = 4_usize;
-
-        // Stable Rust does not yet expose SVE intrinsics in core::arch.
-        // Use SVE inline asm for 4-lane packed-entry unpack:
-        // symbol = packed & 0xff; bits = (packed >> 8) & 0xff.
-        unsafe {
-            asm!(
-                "whilelt p0.s, xzr, {lanes}",
-                "ld1w z0.s, p0/z, [{inptr}]",
-                "mov z1.d, z0.d",
-                "lsr z2.s, z0.s, #8",
-                "and z1.s, z1.s, #0xff",
-                "and z2.s, z2.s, #0xff",
-                "st1w z1.s, p0, [{symptr}]",
-                "st1w z2.s, p0, [{bitptr}]",
-                inptr = in(reg) packed_scalar.as_ptr(),
-                symptr = in(reg) symbols_u32.as_mut_ptr(),
-                bitptr = in(reg) bits_u32.as_mut_ptr(),
-                lanes = in(reg) lanes,
-                lateout("z0") _,
-                lateout("z1") _,
-                lateout("z2") _,
-                lateout("p0") _,
-                options(nostack),
-            );
-        }
-
-        let mut symbols = [0_u8; 4];
-        let mut bits = [0_u8; 4];
-        let mut i = 0;
-        while i < 4 {
-            symbols[i] = symbols_u32[i] as u8;
-            bits[i] = bits_u32[i] as u8;
-            i += 1;
-        }
-        (symbols, bits)
-    }
-
-    #[inline(always)]
     fn decode_symbol_and_advance_scalar(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
@@ -458,209 +276,30 @@ impl<'t> HuffmanDecoder<'t> {
     // them was dead code.
 }
 
-/// Compile-time-monomorphised kernel dispatch for the HUF 4-stream
-/// SIMD-fallback decode tier in `literals_section_decoder`.
-///
-/// The fallback tier fires every post-refill iteration of the 4-stream
-/// burst loop. Each iteration needs one 4-symbol decode (kernel-specific
-/// 4-symbol gather: scalar / AVX2 / VBMI2 / NEON / SVE) and four state
-/// advances (BMI2 `_bzhi_u64` on x86, scalar on aarch64). Before this
-/// trait, each of those five calls did its own runtime `match self.kernel`
-/// on the same process-wide constant choice. The `HufKernel` ZST + single
-/// dispatch at `decompress_literals` entry lets the inner loop bake in
-/// one kernel choice at compile time and skip the per-call branch
-/// (5 runtime branches eliminated per fallback iteration).
-///
-/// Implementors are zero-sized marker types whose associated functions
-/// directly call the kernel-specific helpers on `HuffmanDecoder`. The
-/// runtime kernel selection happens once via
-/// [`detect_huffman_decode_kernel`] and dispatches into the
-/// monomorphised inner loop via `match kernel { ... }`.
-///
-/// # Safety
-///
-/// Each implementor's associated functions are only safe to call after
-/// the running CPU has been verified to support the kernel's required
-/// instruction set. `decompress_literals` performs this check exactly
-/// once and dispatches accordingly; callers within the monomorphised
-/// loop can assume the precondition.
-pub(crate) trait HufKernel {
-    /// Decode 4 symbols + their bit-widths, one per stream, sharing a
-    /// single table read through `decoders[0].table`.
-    ///
-    /// # Safety
-    /// All four decoders must reference the same table (verified at
-    /// `decompress_literals` entry, holds by construction inside the
-    /// monomorphised loop). The running CPU must support this
-    /// kernel's feature set.
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]);
-
-    /// Pull `num_bits` from `br` and fold into `decoder.state`.
-    ///
-    /// # Safety
-    /// The running CPU must support this kernel's feature set
-    /// (matters for `Bmi2Kernel` / `Avx2Kernel` / `Vbmi2Kernel`,
-    /// which use `_bzhi_u64`).
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    );
-}
-
-/// Universal scalar fallback — no SIMD intrinsics, always safe to
-/// call on any target.
-pub(crate) struct ScalarKernel;
-
-impl HufKernel for ScalarKernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        HuffmanDecoder::decode4_symbols_and_num_bits_scalar(decoders)
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        decoder.state = ((decoder.state << num_bits) & decoder.table.state_mask) | new_bits;
-    }
-}
-
-/// x86 BMI2 kernel — `_bzhi_u64`-based state advance, scalar decode4
-/// (no AVX2 vector decode at this tier).
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) struct Bmi2Kernel;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl HufKernel for Bmi2Kernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        HuffmanDecoder::decode4_symbols_and_num_bits_scalar(decoders)
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        // SAFETY: caller guarantees BMI2 availability (kernel dispatch
-        // at `decompress_literals` entry).
-        decoder.state = unsafe { decoder.advance_state_x86_bmi2(num_bits, new_bits) };
-    }
-}
-
-/// x86 AVX2+BMI2 kernel — AVX2 4-symbol gather + BMI2 state advance.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) struct Avx2Kernel;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl HufKernel for Avx2Kernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        // SAFETY: caller guarantees AVX2+BMI2 availability.
-        unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_avx2(decoders) }
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        // SAFETY: AVX2 path implies BMI2 (kernel selector requires both).
-        decoder.state = unsafe { decoder.advance_state_x86_bmi2(num_bits, new_bits) };
-    }
-}
-
-/// x86 AVX-512 VBMI2+BMI2 kernel — VBMI2 4-symbol gather + BMI2 state.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(crate) struct Vbmi2Kernel;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl HufKernel for Vbmi2Kernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        // SAFETY: caller guarantees VBMI2 availability.
-        unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_vbmi2(decoders) }
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        // SAFETY: VBMI2 path implies BMI2 (kernel selector requires both).
-        decoder.state = unsafe { decoder.advance_state_x86_bmi2(num_bits, new_bits) };
-    }
-}
-
-/// aarch64 NEON kernel — NEON 4-symbol gather + scalar state advance
-/// (the NEON `decode_symbol_and_advance` variant was dropped in an
-/// earlier commit; it was a verbatim clone of scalar).
-#[cfg(target_arch = "aarch64")]
-pub(crate) struct NeonKernel;
-
-#[cfg(target_arch = "aarch64")]
-impl HufKernel for NeonKernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        // SAFETY: caller guarantees NEON availability.
-        unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_neon(decoders) }
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        decoder.state = ((decoder.state << num_bits) & decoder.table.state_mask) | new_bits;
-    }
-}
-
-/// aarch64 SVE kernel — SVE 4-symbol gather + scalar state advance.
-#[cfg(target_arch = "aarch64")]
-pub(crate) struct SveKernel;
-
-#[cfg(target_arch = "aarch64")]
-impl HufKernel for SveKernel {
-    #[inline(always)]
-    unsafe fn decode4_unchecked(decoders: &[HuffmanDecoder<'_>; 4]) -> ([u8; 4], [u8; 4]) {
-        // SAFETY: caller guarantees SVE availability.
-        unsafe { HuffmanDecoder::decode4_symbols_and_num_bits_sve(decoders) }
-    }
-
-    #[inline(always)]
-    unsafe fn advance_state(
-        decoder: &mut HuffmanDecoder<'_>,
-        br: &mut BitReaderReversed<'_>,
-        num_bits: u8,
-    ) {
-        let new_bits = br.get_bits(num_bits);
-        decoder.state = ((decoder.state << num_bits) & decoder.table.state_mask) | new_bits;
-    }
-}
-
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
     /// Packed `symbol | (num_bits << 8)` per state index, exposed
     /// `pub(crate)` because the HUF 4-stream burst hot path in
-    /// `literals_section_decoder::decode_literals` indexes it
-    /// directly (`packed_decode[idx]`) for a single-load table lookup
-    /// matching donor `huf_decompress.c:dtable[index]` — bypassing the
-    /// kernel-dispatch path used by SIMD fallback.
-    pub(crate) packed_decode: Vec<u32>,
-    /// The weight of a symbol is the number of occurences in a table.
+    /// `literals_section_decoder::decode_literals` indexes it directly
+    /// (`packed_decode[idx]`) for a single-load table lookup matching
+    /// donor `huf_decompress.c:dtable[index]`. This is the primary
+    /// (and only) 4-stream decode lookup table since the previous
+    /// SIMD-fallback dispatch was removed in favour of donor's
+    /// always-firing burst.
+    ///
+    /// **`u16` (matches donor `HUF_DEltX1` layout exactly).** Donor's
+    /// `dtable[index]` returns a 2-byte entry — low byte is `symbol`,
+    /// high byte is `nbBits`. We mirror that representation so the
+    /// table size is `2 × (1 << max_num_bits)` bytes instead of `4 ×`.
+    /// At `max_num_bits = 11` (zstd spec ceiling) that's 4 KiB vs the
+    /// older 8 KiB representation — halves L1d footprint on the hot
+    /// HUF decode path. Worth the change because the L-7 Fast workload
+    /// (and any small-alphabet poorly-compressed input) decodes most
+    /// output bytes through this table; literal-buffer pressure on
+    /// L1d makes the cache hit rate sensitive to table footprint.
+    pub(crate) packed_decode: Vec<u16>,
+    /// The weight of a symbol is the number of occurrences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
     /// lookup table
@@ -1006,7 +645,10 @@ impl HuffmanTable {
                     num_bits: bits_for_symbol,
                 };
                 self.decode[base_idx..base_idx + len].fill(entry);
-                let packed = u32::from(entry.symbol) | (u32::from(entry.num_bits) << 8);
+                // Donor `HUF_DEltX1` packing: low byte = symbol, high
+                // byte = nbBits. `num_bits ≤ 11` always fits in the
+                // upper byte alongside an 8-bit symbol.
+                let packed = u16::from(entry.symbol) | (u16::from(entry.num_bits) << 8);
                 self.packed_decode[base_idx..base_idx + len].fill(packed);
             }
         }
@@ -1064,7 +706,7 @@ mod tests {
         ];
         let packed_decode = decode
             .iter()
-            .map(|e| u32::from(e.symbol) | (u32::from(e.num_bits) << 8))
+            .map(|e| u16::from(e.symbol) | (u16::from(e.num_bits) << 8))
             .collect::<Vec<_>>();
 
         HuffmanTable {
@@ -1102,201 +744,6 @@ mod tests {
         assert_eq!(decoder.state, expected_state);
     }
 
-    #[test]
-    fn scalar_kernel_advance_state_matches_formula() {
-        let table = test_table();
-        let initial_state = 2_u64;
-        let num_bits = 2_u8;
-        let mut manual_br = BitReaderReversed::new(&[0b00110110, 0b11110000]);
-        let expected_new_bits = manual_br.get_bits(num_bits);
-        let expected_state = ((initial_state << num_bits) & table.state_mask) | expected_new_bits;
-
-        let mut decoder = HuffmanDecoder {
-            table: &table,
-            kernel: HuffmanDecodeKernel::Scalar,
-            state: initial_state,
-        };
-        let mut br = BitReaderReversed::new(&[0b00110110, 0b11110000]);
-        // SAFETY: ScalarKernel has no SIMD prereqs.
-        unsafe { ScalarKernel::advance_state(&mut decoder, &mut br, num_bits) };
-
-        assert_eq!(decoder.state, expected_state);
-    }
-
-    #[test]
-    fn decode4_scalar_reads_symbols_and_num_bits_from_each_state() {
-        let table = test_table();
-        let decoders = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 3,
-            },
-        ];
-
-        // SAFETY: ScalarKernel has no SIMD prereqs.
-        let (symbols, bits) = unsafe { ScalarKernel::decode4_unchecked(&decoders) };
-        assert_eq!(symbols, [b'A', b'B', b'C', b'D']);
-        assert_eq!(bits, [1, 2, 1, 2]);
-    }
-
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[test]
-    fn bmi2_advance_matches_scalar_formula_when_available() {
-        if !std::arch::is_x86_feature_detected!("bmi2") {
-            return;
-        }
-
-        let table = test_table();
-        let decoder = HuffmanDecoder {
-            table: &table,
-            kernel: HuffmanDecodeKernel::X86Bmi2,
-            state: 3,
-        };
-
-        let num_bits = 2_u8;
-        let new_bits = 1_u64;
-        let expected = ((decoder.state << num_bits) & table.state_mask) | new_bits;
-        let actual = unsafe { decoder.advance_state_x86_bmi2(num_bits, new_bits) };
-        assert_eq!(actual, expected);
-    }
-
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[test]
-    fn decode4_avx2_matches_scalar_when_available() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        let table = test_table();
-        let scalar = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 3,
-            },
-        ];
-        let avx2 = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Avx2,
-                state: 3,
-            },
-        ];
-
-        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
-        let actual = unsafe { Avx2Kernel::decode4_unchecked(&avx2) };
-        assert_eq!(actual, expected);
-    }
-
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[test]
-    fn decode4_vbmi2_matches_scalar_when_available() {
-        if !(std::arch::is_x86_feature_detected!("avx512vbmi2")
-            && std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("bmi2"))
-        {
-            return;
-        }
-
-        let table = test_table();
-        let scalar = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 3,
-            },
-        ];
-        let vbmi2 = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Vbmi2,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Vbmi2,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Vbmi2,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::X86Vbmi2,
-                state: 3,
-            },
-        ];
-
-        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
-        let actual = unsafe { Vbmi2Kernel::decode4_unchecked(&vbmi2) };
-        assert_eq!(actual, expected);
-    }
-
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn select_x86_kernel_ordering_is_stable() {
@@ -1316,135 +763,5 @@ mod tests {
             select_x86_huffman_decode_kernel(false, false, false, false, false, true),
             HuffmanDecodeKernel::Scalar
         );
-    }
-
-    // Mixed-table and mixed-kernel fallback tests removed: those exercised the
-    // old dispatcher's defensive fallback when callers passed decoders with
-    // different tables or kernels. The `HufKernel` trait API requires shared
-    // table+kernel by precondition, established by construction at the
-    // single dispatch site in `literals_section_decoder::decompress_literals`
-    // (all four decoders are built from the same `&scratch.table`, and the
-    // outer `match detect_huffman_decode_kernel()` picks one kernel per
-    // call). The trait dispatch itself is compile-time monomorphisation,
-    // but the precondition guarantee is structural, not statically checked.
-    // The mixed-input shape is now a caller-side invariant violation, not a
-    // tested-fallback behaviour.
-
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
-    #[test]
-    fn decode4_neon_matches_scalar_when_available() {
-        if !std::arch::is_aarch64_feature_detected!("neon") {
-            return;
-        }
-
-        let table = test_table();
-        let scalar = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 3,
-            },
-        ];
-        let neon = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Neon,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Neon,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Neon,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Neon,
-                state: 3,
-            },
-        ];
-
-        // SAFETY: Scalar has no SIMD prereqs; NEON checked by feature-detect above.
-        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
-        let actual = unsafe { NeonKernel::decode4_unchecked(&neon) };
-        assert_eq!(actual, expected);
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
-    #[test]
-    fn decode4_sve_matches_scalar_when_available() {
-        if !std::arch::is_aarch64_feature_detected!("sve") {
-            return;
-        }
-
-        let table = test_table();
-        let scalar = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Scalar,
-                state: 3,
-            },
-        ];
-        let sve = [
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Sve,
-                state: 0,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Sve,
-                state: 1,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Sve,
-                state: 2,
-            },
-            HuffmanDecoder {
-                table: &table,
-                kernel: HuffmanDecodeKernel::Aarch64Sve,
-                state: 3,
-            },
-        ];
-
-        // SAFETY: Scalar has no SIMD prereqs; SVE checked by feature-detect above.
-        let expected = unsafe { ScalarKernel::decode4_unchecked(&scalar) };
-        let actual = unsafe { SveKernel::decode4_unchecked(&sve) };
-        assert_eq!(actual, expected);
     }
 }
