@@ -19,9 +19,17 @@
 //! `DecodeBuffer::drop_to_window_size` invocation — bytes drop
 //! out of `len()`'s visible range once decoded output exceeds
 //! `window_size`, but physically stay in the user's slice (this
-//! backend's `drop_first_n` only advances `head`). Offset
-//! validation then coincides with the spec's
-//! `offset <= window_size` rule.
+//! backend's `drop_first_n` only advances `head`).
+//!
+//! The `drop_to_window_size` call runs only BETWEEN blocks, so
+//! within a single block `len()` can temporarily exceed
+//! `window_size`. `DecodeBuffer::repeat` validates match offsets
+//! against `len()` (not `window_size`), so this is not a strict
+//! enforcement of the spec's `offset <= window_size` rule — only
+//! a coarse end-of-block cap. The fallback path
+//! (`FlatBuf`/`RingBuffer`) shares the same limitation. Strict
+//! in-block offset bounds would require additional validation
+//! that neither path currently performs.
 //!
 //! When eligible, literal pushes and match-history copies write
 //! directly into the user's slice. Compared to
@@ -176,9 +184,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     fn extend(&mut self, data: &[u8]) {
         let len = data.len();
         let new_tail = self.tail + len;
-        debug_assert!(
+        // Release-mode capacity assert (mirrors
+        // extend_from_within_unchecked). The body issues an unsafe
+        // SIMD copy that takes `total_writable` as its
+        // upper-bound contract; a malformed Compressed block whose
+        // literals expand past the declared frame_content_size
+        // would otherwise pass through `debug_assert!` in release
+        // builds and turn the unchecked copy into UB. Cost: one
+        // compare on the literal-push path — same magnitude as
+        // the surrounding bounds-already-baked-in writes.
+        assert!(
             new_tail <= self.slice.len(),
-            "UserSliceBackend::extend overflows slice (tail+={}, cap={})",
+            "UserSliceBackend::extend overflows slice (tail+={}, cap={}) — corrupt frame",
             len,
             self.slice.len()
         );

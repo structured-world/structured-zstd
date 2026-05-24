@@ -1180,12 +1180,20 @@ impl FrameDecoder {
     ///
     /// Multi-segment frames are supported via a per-block
     /// `DecodeBuffer::drop_to_window_size` call that caps the
-    /// visible buffer at `window_size` so match-offset validation
-    /// (`offset <= buffer.len()`) coincides with the spec's
-    /// `offset <= window_size` rule. The discarded bytes stay
-    /// physically in the user slice (they're the frame's
-    /// already-decoded output); only their `BufferBackend::head`
-    /// visibility moves forward.
+    /// visible buffer at `window_size` at block boundaries. The
+    /// discarded bytes stay physically in the user slice (they're
+    /// the frame's already-decoded output); only their
+    /// `BufferBackend::head` visibility moves forward.
+    ///
+    /// Note: `drop_to_window_size` runs only BETWEEN blocks, so
+    /// within a single block `buffer.len()` can temporarily exceed
+    /// `window_size`. `DecodeBuffer::repeat` validates match
+    /// offsets against `buffer.len()` (not against `window_size`),
+    /// so corrupted streams with `offset > window_size` but
+    /// `offset <= current buffer.len()` are NOT rejected by this
+    /// gate. Strict spec compliance for offsets in multi-segment
+    /// frames would require an in-block offset bound that we don't
+    /// currently enforce on either the direct or the fallback path.
     ///
     /// Non-eligible frames fall back transparently to the existing
     /// `decode_blocks` + `read` drain path.
