@@ -1170,14 +1170,6 @@ impl FrameDecoder {
     /// - `frame_content_size` is present in the header (> 0).
     /// - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
     ///   (room for the SIMD wildcopy overshoot slack).
-    /// - `single_segment_flag` is set on the frame descriptor.
-    ///   This bounds `frame_content_size <= window_size` by
-    ///   construction, so the offset/window validation that
-    ///   `DecodeBuffer::repeat` performs (`offset <= buffer.len()`)
-    ///   coincides with the spec's `offset <= window_size` rule.
-    ///   Multi-segment frames need a `head`-advancing strategy on
-    ///   `UserSliceBackend` to cap `len()` at `window_size`; left
-    ///   as a follow-up.
     /// - No active dictionary on `self.state` (dict_content is not
     ///   carried into the stack-local DecodeBuffer this method
     ///   builds).
@@ -1185,6 +1177,15 @@ impl FrameDecoder {
     ///   `content_checksum_flag` (the rolling hash lives on the
     ///   persistent buffer; hash propagation across the direct
     ///   path is a follow-up).
+    ///
+    /// Multi-segment frames are supported via a per-block
+    /// `DecodeBuffer::drop_to_window_size` call that caps the
+    /// visible buffer at `window_size` so match-offset validation
+    /// (`offset <= buffer.len()`) coincides with the spec's
+    /// `offset <= window_size` rule. The discarded bytes stay
+    /// physically in the user slice (they're the frame's
+    /// already-decoded output); only their `BufferBackend::head`
+    /// visibility moves forward.
     ///
     /// Non-eligible frames fall back transparently to the existing
     /// `decode_blocks` + `read` drain path.
@@ -1232,18 +1233,15 @@ impl FrameDecoder {
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-        // Eligibility requires `single_segment_flag`: under that
-        // flag `frame_content_size <= window_size` is guaranteed by
-        // the spec, so the offset bound `DecodeBuffer::repeat`
-        // enforces (`offset <= buffer.len()`) coincides with the
-        // window rule (`offset <= window_size`). Multi-segment
-        // frames would let `UserSliceBackend.len()` grow past
-        // `window_size` (we don't advance `head` on the direct
-        // path), letting malformed frames with `offset >
-        // window_size` slip through validation. Gating those off
-        // the fast path keeps correctness; the regular
-        // `decode_blocks` + drain path handles them via
-        // `drain_to_window_size`.
+        // Eligibility independent of `single_segment_flag`:
+        // multi-segment frames work too as long as we cap
+        // `buffer.len()` at `window_size` between blocks (so the
+        // `DecodeBuffer::repeat` offset bound coincides with the
+        // spec's `offset <= window_size` rule). The post-block
+        // `drop_to_window_size` call in the loop below does exactly
+        // that — bytes physically remain in the user slice, they
+        // just leave `len()`'s visible range so malformed
+        // `offset > window_size` matches get rejected.
         //
         // Disabled when a dictionary is active: the persistent
         // `DecoderScratch::buffer.dict_content` seeded by
@@ -1263,17 +1261,13 @@ impl FrameDecoder {
         // gate the direct path off when the frame header has the
         // content_checksum_flag set — the existing drain path
         // remains correct for those frames.
-        let single_segment = state.frame_header.descriptor.single_segment_flag();
         let dict_active = state.using_dict.is_some();
         #[cfg(feature = "hash")]
         let hash_active = state.frame_header.descriptor.content_checksum_flag();
         #[cfg(not(feature = "hash"))]
         let hash_active = false;
-        let eligible = single_segment
-            && content_size > 0
-            && !dict_active
-            && !hash_active
-            && (output.len() as u64) >= needed;
+        let eligible =
+            content_size > 0 && !dict_active && !hash_active && (output.len() as u64) >= needed;
 
         if !eligible {
             // Frame doesn't qualify for direct decode (empty
@@ -1365,6 +1359,16 @@ impl FrameDecoder {
                 .map_err(err::FailedToReadBlockBody)?;
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
+            // Cap the visible buffer at window_size between blocks
+            // so the next block's match-offset validation matches
+            // the spec's `offset <= window_size` rule. Bytes
+            // physically stay in the user slice; we just narrow
+            // the visible range via `head`. For single-segment
+            // frames `content_size <= window_size` so this is a
+            // no-op on every iteration; for multi-segment frames
+            // it advances `head` once `tail - head` outgrows the
+            // window.
+            direct.buffer.drop_to_window_size();
             if block_header.last_block {
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
@@ -1378,7 +1382,13 @@ impl FrameDecoder {
             }
         }
 
-        let written = direct.buffer.len();
+        // `direct.buffer.len()` would only show the visible (post
+        // head-advance) range, not the total bytes physically
+        // written into the user slice. The decode succeeded so
+        // `content_size` is the authoritative byte count — the
+        // backend wrote exactly that many bytes starting at
+        // `output[0]`.
+        let written = content_size as usize;
         state.frame_finished = true;
         Ok(written)
     }

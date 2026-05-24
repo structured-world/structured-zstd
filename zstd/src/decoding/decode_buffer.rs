@@ -592,6 +592,44 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Advance the backend's head past any bytes beyond `window_size`
+    /// without producing them to a sink — the bytes remain physically
+    /// present (the backend's allocation never shrinks), but they are
+    /// no longer visible through [`Self::len`] / `as_slices` /
+    /// `repeat`. Used by the direct-decode path on multi-segment
+    /// frames where the caller's output IS the buffer, so the bytes
+    /// don't need to be drained anywhere — they just need to drop
+    /// out of `len()` so the offset-bound match validation
+    /// (`offset <= buffer.len()`) coincides with the spec's
+    /// window-size rule (`offset <= window_size`).
+    ///
+    /// Returns the number of bytes whose visibility was discarded.
+    pub fn drop_to_window_size(&mut self) -> usize {
+        match self.can_drain_to_window_size() {
+            None => 0,
+            Some(can_drop) => {
+                // Hash the bytes about to drop out of the visible
+                // region so the rolling content checksum still sees
+                // them. Matches `drain_to`'s shape (it hashes via
+                // the closure each chunk it writes).
+                #[cfg(feature = "hash")]
+                {
+                    use core::hash::Hasher;
+                    let (s1, s2) = self.buffer.as_slices();
+                    let head_take = s1.len().min(can_drop);
+                    self.hash.write(&s1[..head_take]);
+                    let remaining = can_drop - head_take;
+                    if remaining > 0 {
+                        self.hash.write(&s2[..remaining.min(s2.len())]);
+                    }
+                }
+                self.buffer.drop_first_n(can_drop);
+                self.total_output_counter += can_drop as u64;
+                can_drop
+            }
+        }
+    }
+
     /// drain the buffer completely
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();

@@ -3,11 +3,6 @@
 //!
 //! Selected by [`crate::decoding::FrameDecoder::decode_to_slice`]
 //! when ALL of the following hold:
-//! - `single_segment_flag` is set on the frame descriptor. Under
-//!   that flag the spec guarantees `frame_content_size <=
-//!   window_size`, which matches `DecodeBuffer::repeat`'s offset
-//!   bound and keeps offset/window validation correct without a
-//!   head-advancing strategy on this backend.
 //! - `frame_content_size > 0` (FCS present in the frame header).
 //! - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
 //!   (room for the SIMD wildcopy overshoot slack).
@@ -19,6 +14,14 @@
 //!   not on the stack-local buffer; checksummed frames stay on
 //!   the regular path until hash propagation lands as a
 //!   follow-up). When `hash` is disabled this gate has no effect.
+//!
+//! Multi-segment frames work via the caller's per-block
+//! `DecodeBuffer::drop_to_window_size` invocation — bytes drop
+//! out of `len()`'s visible range once decoded output exceeds
+//! `window_size`, but physically stay in the user's slice (this
+//! backend's `drop_first_n` only advances `head`). Offset
+//! validation then coincides with the spec's
+//! `offset <= window_size` rule.
 //!
 //! When eligible, literal pushes and match-history copies write
 //! directly into the user's slice. Compared to
