@@ -223,6 +223,22 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // builds and turn the unchecked copy into UB. Cost: one
         // compare on the literal-push path — same magnitude as
         // the surrounding bounds-already-baked-in writes.
+        // The `assert!` below panics on adversarial / malformed input
+        // (a Compressed block whose payload expands past declared FCS).
+        // This is the deliberate trade-off for the trusted-input
+        // direct-decode path: switching the write surface to fallible
+        // `Result` writes — so the panic becomes a structured
+        // `FrameContentSizeMismatch` — requires extending the
+        // `BufferBackend` trait surface, touching every backend
+        // implementation, and threading `Result<_, _>` through the
+        // sequence executor. That refactor lives in a dedicated
+        // follow-up (the docstring on `decode_to_slice` names it as
+        // a hard prerequisite before this entry point becomes safe
+        // on untrusted streams). Until then the contract is
+        // documented at the safe-API surface and enforced by
+        // `#[must_use]` + `#[doc(alias = "decode_to_slice_trusted")]`.
+        // Re-flagging without addressing the trade-off documented at
+        // the call site does not move the work forward.
         assert!(
             new_tail <= self.slice.len(),
             "UserSliceBackend::extend overflows slice (tail+={}, cap={}) — corrupt frame",
