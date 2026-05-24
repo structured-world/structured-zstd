@@ -1190,11 +1190,12 @@ impl FrameDecoder {
     /// Non-eligible frames fall back transparently to the existing
     /// `decode_blocks` + `read` drain path.
     ///
-    /// `input` must contain a complete single zstd frame followed
-    /// by no other bytes; trailing data past the frame is not
-    /// validated and is silently ignored on the direct path
-    /// (matches `decode_all` shape for the unverified-tail case).
-    /// Multi-frame streams must use [`Self::decode_all`].
+    /// `input` is expected to contain a single zstd frame. Bytes
+    /// past the end of that frame are NOT validated and are silently
+    /// ignored — this differs from [`Self::decode_all`], which loops
+    /// until `input` is fully consumed and will attempt to parse a
+    /// second frame (or error) on trailing bytes. Multi-frame
+    /// streams must use [`Self::decode_all`].
     ///
     /// On the direct-decode path (eligible single-segment frame +
     /// sized output) the literal pushes and sequence-execution match

@@ -612,12 +612,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// where this is called once per block.
     ///
     /// Returns the number of bytes whose visibility was discarded.
+    ///
+    /// Does NOT mutate `total_output_counter`: that counter tracks
+    /// total bytes produced (incremented by `push` / `repeat` /
+    /// `extend_and_fill`). Advancing `head` just hides
+    /// already-produced bytes from the visible region; counting them
+    /// again would double-count and break `repeat_from_dict`'s offset
+    /// reachability check.
     pub fn drop_to_window_size(&mut self) -> usize {
         match self.can_drain_to_window_size() {
             None => 0,
             Some(can_drop) => {
                 self.buffer.drop_first_n(can_drop);
-                self.total_output_counter += can_drop as u64;
                 can_drop
             }
         }
