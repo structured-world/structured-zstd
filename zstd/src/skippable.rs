@@ -351,7 +351,11 @@ impl core::fmt::Display for SkippableFrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidMagicVariant(v) => {
-                write!(f, "skippable frame magic_variant {v} out of range 0..=15")
+                write!(
+                    f,
+                    "skippable frame magic_variant {v} out of range 0..={}",
+                    SKIPPABLE_MAGIC_MAX_VARIANT
+                )
             }
             Self::PayloadTooLarge(n) => write!(
                 f,
@@ -394,7 +398,7 @@ impl core::fmt::Display for DecodeSkippableFrameError {
             ),
             Self::PayloadTooLarge { length } => write!(
                 f,
-                "skippable frame: declared length {length} not representable on this target (length + 8 byte header overflows usize)"
+                "skippable frame: declared length {length} not representable on this target (length > usize::MAX on 16-bit, or length + 8 byte header overflows usize on 32-bit)"
             ),
         }
     }
