@@ -409,13 +409,20 @@ unsafe fn run_4stream_burst_loop(
         brs[3].bits_consumed - max_num_bits,
     ];
 
-    // Donor `iiters` safety budget: each burst iter consumes at most
-    // `burst_bits` bits = `ceil(burst_bits/8)` bytes per stream. The
-    // bound check below ensures `ip[s] >= bytes_per_iter_upper` for
-    // every stream before entering an iter, so the per-iter
-    // `ip[s] -= nb_bytes` and the subsequent `source[ip[s]..ip[s]+8]`
-    // read stay in-bounds without per-stream conditionals.
-    let bytes_per_iter_upper = (burst_bits as usize).div_ceil(8);
+    // Donor `iiters` safety budget. Worst-case `nb_bytes` per iter is
+    // `floor(ctz_max / 8)` where `ctz_max = pad_max + burst_bits`,
+    // since at the first iter the sentinel starts at `padding_skip
+    // ∈ [1, 8]` and on subsequent iters at `nb_bits ∈ [0, 7]` set by
+    // the previous reload's `(MEM_read64 | 1) << nb_bits`. Taking
+    // `pad_max = 8` covers both regimes — without the `+8` slack,
+    // burst configurations where `burst_bits` is a multiple of 8
+    // (e.g. max=8 -> burst_bits=48) accept a `min_ip` that
+    // `nb_bytes` then overruns, underflowing `ip[s] -= nb_bytes`.
+    // The check below ensures `ip[s] >= bytes_per_iter_upper` for
+    // every stream before entering an iter, so per-iter `ip[s] -=
+    // nb_bytes` plus the subsequent `source[ip[s]..ip[s]+8]` read
+    // both stay in-bounds without per-stream conditionals.
+    let bytes_per_iter_upper = (8 + burst_bits as usize) / 8;
     let mut any_iter = false;
 
     while cursors[0] <= cursor_burst_ceil {
@@ -471,12 +478,21 @@ unsafe fn run_4stream_burst_loop(
 
         // Reload all 4 streams (donor `HUF_4X1_RELOAD_STREAM`).
         //
-        // SAFETY: `ip[s] - nb_bytes >= 0` by the `min_ip >= bytes_per_iter_upper`
-        // gate above (`nb_bytes <= bytes_per_iter_upper` because
-        // `ctz(bits[s]) <= burst_bits` after the inner loop). The
-        // `ip[s] + 8` read is in-bounds because `init_state` sets
-        // `index <= source.len() - 8` initially and we only move
-        // backward.
+        // SAFETY:
+        //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
+        //     gate at outer-loop entry guarantees `nb_bytes <= bytes_per_iter_upper`
+        //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
+        //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
+        //     pre-computes).
+        //   * `ip[s] + 8 <= source.len()`: the `refill` fast-path during
+        //     `init_state` establishes `brs[s].index <= source.len() - 8`
+        //     (only for `source.len() >= 8`); the `refill_slow` path used
+        //     for shorter streams leaves `index = 0` and `bits_consumed = 0`,
+        //     making `min_ip = 0 < bytes_per_iter_upper` so the burst
+        //     loop exits via `any_iter = false` BEFORE reaching this
+        //     reload (the writeback below is unreachable on `source.len()
+        //     < 8`). Within the loop, `ip[s]` only decreases via the
+        //     line above this comment, preserving the upper bound.
         for s in 0..4 {
             let ctz = bits[s].trailing_zeros();
             let nb_bytes = (ctz >> 3) as usize;

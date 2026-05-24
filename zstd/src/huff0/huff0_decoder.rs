@@ -5,9 +5,9 @@ use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86")]
-use core::arch::x86::{_bzhi_u32, _mm_cvtsi128_si32, _mm_maskz_compress_epi8, _mm_set_epi32};
+use core::arch::x86::_bzhi_u32;
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{_bzhi_u64, _mm_cvtsi128_si32, _mm_maskz_compress_epi8, _mm_set_epi32};
+use core::arch::x86_64::_bzhi_u64;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -281,10 +281,12 @@ pub struct HuffmanTable {
     decode: Vec<Entry>,
     /// Packed `symbol | (num_bits << 8)` per state index, exposed
     /// `pub(crate)` because the HUF 4-stream burst hot path in
-    /// `literals_section_decoder::decode_literals` indexes it
-    /// directly (`packed_decode[idx]`) for a single-load table lookup
-    /// matching donor `huf_decompress.c:dtable[index]` — bypassing the
-    /// kernel-dispatch path used by SIMD fallback.
+    /// `literals_section_decoder::decode_literals` indexes it directly
+    /// (`packed_decode[idx]`) for a single-load table lookup matching
+    /// donor `huf_decompress.c:dtable[index]`. This is the primary
+    /// (and only) 4-stream decode lookup table since the previous
+    /// SIMD-fallback dispatch was removed in favour of donor's
+    /// always-firing burst.
     ///
     /// **`u16` (matches donor `HUF_DEltX1` layout exactly).** Donor's
     /// `dtable[index]` returns a 2-byte entry — low byte is `symbol`,
