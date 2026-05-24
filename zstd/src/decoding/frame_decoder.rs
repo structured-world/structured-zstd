@@ -1303,6 +1303,14 @@ impl FrameDecoder {
     /// writes into a fixed-size user slice. Fallible
     /// `BufferBackend` writes that would let `decode_to_slice`
     /// remain safe on adversarial input are tracked in issue #246.
+    // KNOWN PANIC SURFACE — direct path panics on adversarial
+    // input via release-mode `assert!` in `UserSliceBackend`. The
+    // doc-string above explains why this trade-off is deliberate
+    // for this PR and names the fallible-`BufferBackend` refactor
+    // as the prerequisite. Re-flagging the panic surface without
+    // engaging with the trade-off in the doc-string is not
+    // actionable here; the refactor lives in a dedicated
+    // follow-up.
     #[doc(alias = "decode_to_slice_trusted")]
     #[must_use = "decode_to_slice returns the decoded byte count; ignoring it leaves the output's effective length ambiguous"]
     pub fn decode_to_slice(
