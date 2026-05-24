@@ -1303,6 +1303,8 @@ impl FrameDecoder {
     /// writes into a fixed-size user slice. Fallible
     /// `BufferBackend` writes that would let `decode_to_slice`
     /// remain safe on adversarial input are tracked in issue #246.
+    #[doc(alias = "decode_to_slice_trusted")]
+    #[must_use = "decode_to_slice returns the decoded byte count; ignoring it leaves the output's effective length ambiguous"]
     pub fn decode_to_slice(
         &mut self,
         mut input: &[u8],
