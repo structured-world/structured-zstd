@@ -1,25 +1,42 @@
 //! User-slice-backed output buffer for the "decode straight into the
 //! caller's output slice" fast path.
 //!
-//! When the frame's `Single_Segment_flag` is set AND the caller passed
-//! a sufficiently sized `&mut [u8]` to [`crate::decoding::FrameDecoder::decode_all`],
-//! we can skip the FlatBuf-as-intermediate detour entirely: literal
-//! pushes and match-history copies write directly into the user's
-//! slice. Compared to `DecodeBuffer<FlatBuf>`, this elides one full
-//! `memmove` of the live region (the `read` drain that copies the
-//! flat Vec into the user slice) and one anonymous-page allocation
-//! cycle per frame. On `level_-7_fast/decodecorpus-z000033/rust_stream`
-//! the drain copy + page-touch chain was measured at ~46% of total
-//! decompress time on i9-9900K — see #244 for the flamegraph.
+//! Selected by [`crate::decoding::FrameDecoder::decode_to_slice`]
+//! when ALL of the following hold:
+//! - `frame_content_size > 0` (FCS present in the frame header).
+//! - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
+//!   (room for the SIMD wildcopy overshoot slack).
+//! - No active dictionary (the persistent dict_content is not
+//!   carried into the stack-local DecodeBuffer this backend
+//!   builds; dict frames stay on the regular path).
+//! - No `content_checksum_flag` (the persistent rolling hash is
+//!   on `DecoderScratch::buffer.hash`, not on the stack-local
+//!   buffer; checksummed frames stay on the regular path until
+//!   hash propagation lands as a follow-up).
+//!
+//! The `single_segment_flag` is NOT a precondition: donor's
+//! `ZSTD_in_dst` litBuffer-in-dst trick works identically for
+//! multi-segment frames in non-streaming mode (whole content fits
+//! in caller's output, no mid-frame drain ever issued).
+//!
+//! When eligible, literal pushes and match-history copies write
+//! directly into the user's slice. Compared to
+//! `DecodeBuffer<FlatBuf>`, this elides one full `memmove` of the
+//! live region (the `read` drain that copies the flat Vec into the
+//! user slice) and one anonymous-page allocation cycle per frame.
+//! On `level_-7_fast/decodecorpus-z000033/rust_stream` the
+//! direct-write path measured -20.33% vs the FlatBuf+drain path on
+//! i9-9900K — see #244 for the flamegraph.
 //!
 //! Selected at compile time via `DecodeBuffer<UserSliceBackend<'a>>`
 //! (generic [`BufferBackend`](super::buffer_backend::BufferBackend)
 //! parameter). The lifetime parameter binds the backend to the
-//! user-provided slice — `DecoderScratch<UserSliceBackend<'a>>` is
-//! stack-local in [`crate::decoding::FrameDecoder::decode_all`] and
-//! does not survive across calls. Persistent decoder state (HUF/FSE
-//! tables, offset_hist, sequence cache) lives in `FrameDecoder` and
-//! is borrowed in by reference for the call's duration.
+//! user-provided slice — the backing
+//! `DecodeBuffer<UserSliceBackend<'a>>` is stack-local in
+//! `decode_to_slice` and does not survive across calls. Persistent
+//! decoder state (HUF/FSE tables, offset_hist, sequence cache)
+//! lives in `FrameDecoder` and is borrowed in by reference for the
+//! call's duration via [`super::scratch::DirectScratch`].
 
 use crate::io::{Error, Read};
 use core::ptr;
@@ -186,11 +203,24 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let dst_off = self.tail;
         let src_off = self.head + start;
         debug_assert!(src_off + len <= dst_off);
-        debug_assert!(dst_off + len <= self.slice.len());
+        // Release-mode capacity check: the trait contract says
+        // capacity for `len` bytes past the tail was reserved by
+        // the caller, but UserSliceBackend's reserve is a no-op
+        // (slice can't grow), so a malformed frame with an out-of-
+        // bounds match could otherwise turn the unchecked
+        // `copy_nonoverlapping` into UB in release builds.
+        // FlatBuf relies on `Vec::reserve` to enforce this; we have
+        // no allocator to call so the check has to be inline.
+        // Cost: one compare on a path that's already memory-bound;
+        // negligible vs the wildcopy itself.
+        assert!(
+            dst_off + len <= self.slice.len(),
+            "UserSliceBackend: match write past slice capacity (corrupt frame)"
+        );
         // SAFETY: caller's non-overlap precondition gives
-        // `src_off + len <= dst_off`. Capacity covers `dst_off + len`
-        // by the dispatcher's `frame_content_size + WILDCOPY_OVERLENGTH`
-        // sizing.
+        // `src_off + len <= dst_off`. The assert above guarantees
+        // `dst_off + len <= self.slice.len()`, so the
+        // `copy_nonoverlapping` stays inside the slice.
         unsafe {
             let ptr = self.slice.as_mut_ptr();
             ptr::copy_nonoverlapping(ptr.add(src_off), ptr.add(dst_off), len);

@@ -1163,10 +1163,22 @@ impl FrameDecoder {
 
     /// Decode a single zstd frame from `input` directly into `output`,
     /// bypassing the internal `DecodeBuffer` -> `read()` drain copy
-    /// when the frame's `Single_Segment_flag` is set AND `output` has
-    /// enough room for the frame's content plus the SIMD wildcopy
-    /// slack. Donor parity with the `ZSTD_in_dst` litBuffer placement
-    /// strategy — see #244.
+    /// when the frame is eligible. Donor parity with the
+    /// `ZSTD_in_dst` litBuffer placement strategy — see #244.
+    ///
+    /// Eligibility requires all of:
+    /// - `frame_content_size` is present in the header (> 0).
+    /// - `output.len() >= frame_content_size + WILDCOPY_OVERLENGTH`
+    ///   (room for the SIMD wildcopy overshoot slack).
+    /// - No active dictionary on `self.state` (dict_content is not
+    ///   carried into the stack-local DecodeBuffer this method
+    ///   builds).
+    /// - Frame header lacks `content_checksum_flag` (the rolling
+    ///   hash lives on the persistent buffer; hash propagation
+    ///   across the direct path is a follow-up).
+    ///
+    /// `single_segment_flag` is NOT a precondition — multi-segment
+    /// frames in non-streaming mode work identically.
     ///
     /// On the direct-decode path (eligible single-segment frame +
     /// sized output) the literal pushes and sequence-execution match
@@ -1205,19 +1217,39 @@ impl FrameDecoder {
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-        // Eligibility is independent of `single_segment_flag`:
-        // donor's `ZSTD_in_dst` litBuffer-in-dst trick works
-        // identically for multi-segment frames as long as we're in
-        // non-streaming mode (the whole `frame_content_size` fits
-        // in the caller's `output` slice, no mid-frame drain is
-        // ever issued). The flag only changes whether the
-        // _internal_ scratch picks FlatBuf vs RingBuffer; for
-        // direct decode the internal buffer is bypassed entirely
-        // and the user slice IS the buffer. Both Flat- and
-        // Ring-backed persistent state are equally fine as
-        // donors of the HUF/FSE/scratch Vecs the direct scratch
-        // borrows.
-        let eligible = content_size > 0 && (output.len() as u64) >= needed;
+        // Eligibility independent of `single_segment_flag`: donor's
+        // `ZSTD_in_dst` litBuffer-in-dst trick works identically for
+        // multi-segment frames as long as we're non-streaming
+        // (whole `frame_content_size` fits in `output`, no mid-frame
+        // drain ever issued). The flag only affects the internal
+        // scratch's FlatBuf-vs-RingBuffer choice; for direct decode
+        // the internal buffer is bypassed entirely.
+        //
+        // Disabled when a dictionary is active: the persistent
+        // `DecoderScratch::buffer.dict_content` seeded by
+        // `init_from_dict` is NOT carried into the stack-local
+        // `DecodeBuffer<UserSliceBackend>` we build below, so any
+        // match that reaches into the external dictionary would
+        // decode against an empty prefix. Fall back to the regular
+        // path which keeps the dict in the persistent buffer.
+        //
+        // Disabled under `feature = "hash"`: the rolling content
+        // checksum lives on the persistent
+        // `DecoderScratch::buffer.hash` field, but the direct path
+        // writes through a stack-local `DecodeBuffer` that has its
+        // own (separate) hash. After `decode_to_slice` returns,
+        // `get_calculated_checksum()` would read a stale persistent
+        // hash. Until we wire hash propagation (see #244 follow-up),
+        // gate the direct path off when the frame header has the
+        // content_checksum_flag set — the existing drain path
+        // remains correct for those frames.
+        let dict_active = state.using_dict.is_some();
+        #[cfg(feature = "hash")]
+        let hash_active = state.frame_header.descriptor.content_checksum_flag();
+        #[cfg(not(feature = "hash"))]
+        let hash_active = false;
+        let eligible =
+            content_size > 0 && !dict_active && !hash_active && (output.len() as u64) >= needed;
 
         if !eligible {
             // Frame doesn't qualify for direct decode (empty
@@ -1293,21 +1325,29 @@ impl FrameDecoder {
 
         // Block loop. Mirrors `decode_blocks` (without the
         // strategy-bounded early exit — we always decode the whole
-        // frame in one shot for the direct path).
+        // frame in one shot for the direct path). Keeps
+        // `state.bytes_read_counter` / `state.block_counter` in
+        // sync with `decode_blocks` so post-call accessors
+        // (`bytes_read_from_source`, `blocks_decoded`) return
+        // accurate values.
         let mut block_dec = block_decoder::new();
         loop {
-            let (block_header, _hsize) = block_dec
+            let (block_header, hsize) = block_dec
                 .read_block_header(&mut input)
                 .map_err(err::FailedToReadBlockHeader)?;
-            block_dec
+            state.bytes_read_counter += u64::from(hsize);
+            let body_consumed = block_dec
                 .decode_block_content(&block_header, &mut direct, &mut input)
                 .map_err(err::FailedToReadBlockBody)?;
+            state.bytes_read_counter += body_consumed;
+            state.block_counter += 1;
             if block_header.last_block {
                 if state.frame_header.descriptor.content_checksum_flag() {
                     let mut chksum = [0u8; 4];
                     input
                         .read_exact(&mut chksum)
                         .map_err(err::FailedToReadChecksum)?;
+                    state.bytes_read_counter += 4;
                     state.check_sum = Some(u32::from_le_bytes(chksum));
                 }
                 break;

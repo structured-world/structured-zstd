@@ -325,8 +325,11 @@ fn bench_decompress_source(
     // memory-traffic delta directly.
     group.bench_function("pure_rust_direct", |b| {
         let compressed = materialize();
-        const WILDCOPY_OVERLENGTH: usize = 16;
-        let mut target = vec![0u8; expected_len + WILDCOPY_OVERLENGTH];
+        // Sized to match the dispatcher's eligibility check —
+        // mirror the constant from the decoder instead of
+        // duplicating its value so the bench can't silently drift
+        // off the direct path if the slack changes.
+        let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
