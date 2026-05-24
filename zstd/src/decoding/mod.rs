@@ -52,18 +52,18 @@ pub(crate) mod frame;
 pub(crate) mod literals_section_decoder;
 pub(crate) mod prefetch;
 mod ringbuffer;
-// UserSliceBackend is the compile-time-monomorphised backend that
-// writes directly into the caller's `&mut [u8]` output slice, used
-// by the `FrameDecoder::decode_to_slice` direct-decode path. It
-// eliminates the `FlatBuf` drain copy + anonymous-page-faults on
-// large literal sections (see #244). Wiring happens via
-// `DecodeBuffer<UserSliceBackend<'a>>`; the lifetime binds the
-// backend to the caller's slice for the call duration.
 #[allow(dead_code)]
 pub(crate) mod scratch;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
+// `UserSliceBackend` is the compile-time-monomorphised backend that
+// writes directly into the caller's `&mut [u8]` output slice, used
+// by the `FrameDecoder::decode_to_slice` direct-decode path. It
+// eliminates the `FlatBuf` drain copy + anonymous-page-fault cost
+// on large literal sections. Wiring happens via
+// `DecodeBuffer<UserSliceBackend<'a>>`; the lifetime binds the
+// backend to the caller's slice for the call duration.
 pub(crate) mod user_slice_buf;
 
 #[cfg(feature = "bench_internals")]
