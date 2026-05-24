@@ -7,8 +7,8 @@
 //!
 //! ```text
 //! +----------+-----------+----------------+
-//! | 4 B      | 4 B       | length bytes   |
-//! | magic LE | length LE | payload        |
+//! | 4 bytes  | 4 bytes   | payload bytes  |
+//! | magic LE | length LE | (size = length)|
 //! +----------+-----------+----------------+
 //! ```
 //!
