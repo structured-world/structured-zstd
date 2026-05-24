@@ -130,7 +130,7 @@ pub mod testing {
 /// SIMD wildcopy overshoot slack carried by every decoder backend.
 /// Mirrors donor zstd's `WILDCOPY_OVERLENGTH` (16 bytes). Public so
 /// callers sizing an output slice for
-/// [`crate::decoding::FrameDecoder::decode_to_slice`] can size
+/// [`crate::decoding::FrameDecoder::decode_to_slice_trusted`] can size
 /// `frame_content_size + WILDCOPY_OVERLENGTH` without duplicating
 /// the constant.
 pub const WILDCOPY_OVERLENGTH: usize = crate::decoding::buffer_backend::WILDCOPY_OVERLENGTH;

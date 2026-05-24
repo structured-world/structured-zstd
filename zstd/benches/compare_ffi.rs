@@ -319,7 +319,7 @@ fn bench_decompress_source(
     });
 
     // Direct-decode path (#244): target sized with WILDCOPY_OVERLENGTH
-    // slack so `decode_to_slice` takes the direct-write branch
+    // slack so `decode_to_slice_trusted` takes the direct-write branch
     // (decode straight into `target`, no FlatBuf drain copy).
     // Exposed alongside `pure_rust` so dashboards can attribute the
     // memory-traffic delta directly.
@@ -333,7 +333,7 @@ fn bench_decompress_source(
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
-                .decode_to_slice(black_box(compressed), &mut target)
+                .decode_to_slice_trusted(black_box(compressed), &mut target)
                 .unwrap();
             black_box(&target[..written]);
             assert_eq!(written, expected_len);

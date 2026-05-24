@@ -44,7 +44,7 @@ impl BlockDecoder {
     /// Slice-source fast path for `decode_block_content`. Consumes
     /// the right number of bytes from `*source` (advancing the slice)
     /// without going through the persistent `block_content_buffer`.
-    /// Used by `FrameDecoder::decode_to_slice` where `source` is
+    /// Used by `FrameDecoder::decode_to_slice_trusted` where `source` is
     /// already a `&[u8]` view into the user's input.
     ///
     /// Returns the number of bytes consumed from `*source`.
@@ -200,7 +200,7 @@ impl BlockDecoder {
         // Streaming-path entry: copy `content_size` bytes from the
         // `Read` source into `block_content_buffer`, then dispatch
         // to the in-place body via per-field borrows. The direct-
-        // decode path (`decode_to_slice`) skips this copy by passing
+        // decode path (`decode_to_slice_trusted`) skips this copy by passing
         // a borrowed slice of the input straight to
         // `decompress_block_inplace_with_parts`.
         let parts = workspace.split();
@@ -481,7 +481,7 @@ mod tests {
     //! truncated / empty source on each block type, plus the
     //! `DecoderState::Failed` / `ReadyToDecodeNextHeader` entry-state
     //! guards. The happy path is exercised indirectly via the
-    //! roundtrip tests on `decode_to_slice`; these tests pin the
+    //! roundtrip tests on `decode_to_slice_trusted`; these tests pin the
     //! fail-fast behaviour for malformed input.
     use super::*;
     use crate::blocks::block::{BlockHeader, BlockType};

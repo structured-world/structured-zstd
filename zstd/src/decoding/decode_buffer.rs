@@ -598,7 +598,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// `drop_to_window_size` and `drain_*` calls (those only narrow
     /// the visible region; they don't roll back produced).
     ///
-    /// Used by the direct-decode path (`FrameDecoder::decode_to_slice`)
+    /// Used by the direct-decode path (`FrameDecoder::decode_to_slice_trusted`)
     /// to track actual bytes written against the declared
     /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
     /// which is intentionally 0 for `BlockType::Compressed` (the
@@ -621,7 +621,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// window-size rule (`offset <= window_size`).
     ///
     /// Does NOT update the rolling content checksum. On the direct
-    /// path the caller (`FrameDecoder::decode_to_slice`) hashes the
+    /// path the caller (`FrameDecoder::decode_to_slice_trusted`) hashes the
     /// final `output[..content_size]` slice ONCE at end of decode
     /// (single sequential xxhash pass over cache-hot data) and
     /// propagates the digest into the persistent scratch's hasher.

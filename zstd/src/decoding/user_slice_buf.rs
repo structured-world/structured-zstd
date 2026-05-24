@@ -1,7 +1,7 @@
 //! User-slice-backed output buffer for the "decode straight into the
 //! caller's output slice" fast path.
 //!
-//! Selected by [`crate::decoding::FrameDecoder::decode_to_slice`]
+//! Selected by [`crate::decoding::FrameDecoder::decode_to_slice_trusted`]
 //! when ALL of the following hold:
 //! - `frame_content_size > 0` — the header-derived content size
 //!   is non-zero. This is the actual eligibility condition (NOT
@@ -53,7 +53,7 @@
 //! parameter). The lifetime parameter binds the backend to the
 //! user-provided slice — the backing
 //! `DecodeBuffer<UserSliceBackend<'a>>` is stack-local in
-//! `decode_to_slice` and does not survive across calls. Persistent
+//! `decode_to_slice_trusted` and does not survive across calls. Persistent
 //! decoder state (HUF/FSE tables, offset_hist, sequence cache)
 //! lives in `FrameDecoder` and is borrowed in by reference for the
 //! call's duration via [`super::scratch::DirectScratch`].
@@ -95,7 +95,7 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// Compressed block whose payload expands to more than the declared
 /// size — the burst's per-symbol writes can reach past `slice.len()`
 /// and panic via the `assert!` failure instead of returning a
-/// structured error. The frame-level `decode_to_slice` checks
+/// structured error. The frame-level `decode_to_slice_trusted` checks
 /// `produced > content_size` AFTER each block; within a single block
 /// the panic-on-overshoot is the only stop.
 ///
@@ -110,7 +110,7 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// FCS mismatch and return `FrameContentSizeMismatch`.
 ///
 /// Replacing the panics with `Result<_, _>`-returning writes (so
-/// `decode_to_slice` itself can stay safe on adversarial input) is
+/// `decode_to_slice_trusted` itself can stay safe on adversarial input) is
 /// tracked in issue #246 — it requires extending the
 /// `BufferBackend` trait surface and would gate the direct path on
 /// the new fallible signatures.
@@ -232,11 +232,11 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // `BufferBackend` trait surface, touching every backend
         // implementation, and threading `Result<_, _>` through the
         // sequence executor. That refactor lives in a dedicated
-        // follow-up (the docstring on `decode_to_slice` names it as
+        // follow-up (the docstring on `decode_to_slice_trusted` names it as
         // a hard prerequisite before this entry point becomes safe
         // on untrusted streams). Until then the contract is
         // documented at the safe-API surface and enforced by
-        // `#[must_use]` + `#[doc(alias = "decode_to_slice_trusted")]`.
+        // `#[must_use]` + `#[doc(alias = "decode_to_slice_trusted_trusted")]`.
         // Re-flagging without addressing the trade-off documented at
         // the call site does not move the work forward.
         assert!(

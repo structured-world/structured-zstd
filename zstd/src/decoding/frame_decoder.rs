@@ -1241,7 +1241,7 @@ impl FrameDecoder {
     /// via a stack-local `DecodeBuffer<UserSliceBackend>` that is
     /// dropped before this function returns. The persistent
     /// `state.decoder_scratch.buffer` stays empty. Consequently,
-    /// after `decode_to_slice` returns:
+    /// after `decode_to_slice_trusted` returns:
     ///
     /// - [`Self::is_finished`] returns `true`,
     /// - [`Self::can_collect`] returns `0`,
@@ -1255,7 +1255,7 @@ impl FrameDecoder {
     ///   hasher so this accessor reads the right state.
     ///
     /// Callers must use the bytes from `output[..n]` (where `n`
-    /// is the returned count); do not mix `decode_to_slice` with
+    /// is the returned count); do not mix `decode_to_slice_trusted` with
     /// `read`/`collect` on the same `FrameDecoder`.
     ///
     /// When the frame is NOT eligible (no FCS in the header, or
@@ -1301,19 +1301,18 @@ impl FrameDecoder {
     /// allocation; the frame-level checks then turn the size
     /// mismatch into `FrameContentSizeMismatch` instead of OOB
     /// writes into a fixed-size user slice. Fallible
-    /// `BufferBackend` writes that would let `decode_to_slice`
+    /// `BufferBackend` writes that would let `decode_to_slice_trusted`
     /// remain safe on adversarial input are tracked in issue #246.
-    // KNOWN PANIC SURFACE — direct path panics on adversarial
-    // input via release-mode `assert!` in `UserSliceBackend`. The
-    // doc-string above explains why this trade-off is deliberate
-    // for this PR and names the fallible-`BufferBackend` refactor
-    // as the prerequisite. Re-flagging the panic surface without
-    // engaging with the trade-off in the doc-string is not
-    // actionable here; the refactor lives in a dedicated
-    // follow-up.
-    #[doc(alias = "decode_to_slice_trusted")]
-    #[must_use = "decode_to_slice returns the decoded byte count; ignoring it leaves the output's effective length ambiguous"]
-    pub fn decode_to_slice(
+    // The `_trusted` suffix is part of the API contract: this
+    // entry point is for trusted input only. Adversarial /
+    // malformed input can panic via release-mode `assert!` inside
+    // `UserSliceBackend`. Callers handling untrusted data MUST use
+    // `decode_all` instead. The fallible-`BufferBackend` refactor
+    // that would let this entry point be safe on adversarial
+    // input is tracked as a follow-up.
+    #[doc(alias = "decode_to_slice")]
+    #[must_use = "decode_to_slice_trusted returns the decoded byte count; ignoring it leaves the output's effective length ambiguous"]
+    pub fn decode_to_slice_trusted(
         &mut self,
         mut input: &[u8],
         output: &mut [u8],
@@ -1360,7 +1359,7 @@ impl FrameDecoder {
         // (not `window_size`), so an in-block match with
         // `offset > window_size` but `offset <= current
         // buffer.len()` is accepted on both direct and fallback
-        // paths. See the `decode_to_slice` doc for the full
+        // paths. See the `decode_to_slice_trusted` doc for the full
         // limitation note.
         //
         // Disabled when a dictionary is active: the persistent
@@ -1435,7 +1434,7 @@ impl FrameDecoder {
         // Direct decode path. Borrow the persistent fields
         // (HUF/FSE tables, offset_hist, scratch Vecs) out of the
         // existing single-segment Flat scratch; we keep them
-        // populated across `decode_to_slice` calls (HUF table reuse
+        // populated across `decode_to_slice_trusted` calls (HUF table reuse
         // is the main scratch-reuse win on small frames). Then
         // construct a stack-local DecodeBuffer<UserSliceBackend<'o>>
         // over `output` and bundle into a `DirectScratch`.
@@ -1640,9 +1639,9 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
-    fn decode_to_slice_matches_decode_all_on_single_segment_frame() {
+    fn decode_to_slice_trusted_matches_decode_all_on_single_segment_frame() {
         // Roundtrip a small payload through the encoder, then decode
-        // it via both `decode_all` and `decode_to_slice`. Both paths
+        // it via both `decode_all` and `decode_to_slice_trusted`. Both paths
         // must produce identical output bytes — the only difference
         // is the internal buffer/drain shape, not the decoded
         // semantics. This is the regression gate for the
@@ -1663,13 +1662,13 @@ mod tests {
         assert_eq!(n_a, payload.len());
         assert_eq!(&out_a[..n_a], payload.as_slice());
 
-        // Direct: decode_to_slice with WILDCOPY slack.
+        // Direct: decode_to_slice_trusted with WILDCOPY slack.
         let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut dec_b = FrameDecoder::new();
         let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
-            .decode_to_slice(compressed.as_slice(), &mut out_b)
-            .expect("decode_to_slice should succeed");
+            .decode_to_slice_trusted(compressed.as_slice(), &mut out_b)
+            .expect("decode_to_slice_trusted should succeed");
         assert_eq!(
             n_b,
             payload.len(),
@@ -1679,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_multi_segment_frame_decodes_correctly() {
+    fn decode_to_slice_trusted_multi_segment_frame_decodes_correctly() {
         // Multi-segment frame: payload large enough that the
         // encoder's default frame layout has `single_segment_flag =
         // false` and `window_size < frame_content_size`. The direct
@@ -1717,8 +1716,8 @@ mod tests {
         let mut dec_b = FrameDecoder::new();
         let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
-            .decode_to_slice(compressed.as_slice(), &mut out_b)
-            .expect("decode_to_slice should succeed on multi-segment frame");
+            .decode_to_slice_trusted(compressed.as_slice(), &mut out_b)
+            .expect("decode_to_slice_trusted should succeed on multi-segment frame");
         assert_eq!(n_b, payload.len(), "wrong byte count on direct path");
         assert_eq!(&out_b[..n_b], payload.as_slice());
 
@@ -1742,11 +1741,11 @@ mod tests {
 
     #[cfg(feature = "hash")]
     #[test]
-    fn decode_to_slice_propagates_checksum_into_persistent_scratch() {
+    fn decode_to_slice_trusted_propagates_checksum_into_persistent_scratch() {
         // Direct path on a checksum-flagged frame: the FrameCompressor
         // under `feature = "hash"` sets content_checksum_flag, so the
         // decoded frame has a recorded checksum. After
-        // decode_to_slice we must be able to verify it matches via
+        // decode_to_slice_trusted we must be able to verify it matches via
         // the public get_calculated_checksum() accessor — the digest
         // is computed by walking output at end of decode and stored
         // into the persistent scratch's hasher.
@@ -1761,8 +1760,8 @@ mod tests {
         let mut dec = FrameDecoder::new();
         let mut out = alloc::vec![0u8; payload.len() + slack];
         let n = dec
-            .decode_to_slice(compressed.as_slice(), &mut out)
-            .expect("decode_to_slice with checksum must succeed");
+            .decode_to_slice_trusted(compressed.as_slice(), &mut out)
+            .expect("decode_to_slice_trusted with checksum must succeed");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
 
@@ -1783,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_fcs_overflow_via_corrupt_frame_returns_structured_error() {
+    fn decode_to_slice_trusted_fcs_overflow_via_corrupt_frame_returns_structured_error() {
         // Hand-build a corrupt frame that declares
         // frame_content_size = 4 but the (last) block carries a
         // larger Raw payload. The pre-flight FCS check inside the
@@ -1821,7 +1820,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         let mut out = alloc::vec![0u8; 4 + slack];
         let err = dec
-            .decode_to_slice(&frame, &mut out)
+            .decode_to_slice_trusted(&frame, &mut out)
             .expect_err("FCS-overflow frame must fail decode");
         assert!(
             matches!(
@@ -1834,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_falls_back_when_output_too_small_for_wildcopy_slack() {
+    fn decode_to_slice_trusted_falls_back_when_output_too_small_for_wildcopy_slack() {
         // Output sized exactly to frame_content_size (no
         // WILDCOPY_OVERLENGTH slack) must NOT trigger the direct
         // path — the burst's `extend_from_within_unchecked` writes
@@ -1854,14 +1853,14 @@ mod tests {
         // Exactly payload.len(), no slack — direct path is gated out.
         let mut out = alloc::vec![0u8; payload.len()];
         let n = dec
-            .decode_to_slice(compressed.as_slice(), &mut out)
-            .expect("decode_to_slice should still succeed via fallback");
+            .decode_to_slice_trusted(compressed.as_slice(), &mut out)
+            .expect("decode_to_slice_trusted should still succeed via fallback");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
     }
 
     #[test]
-    fn decode_to_slice_fallback_validates_fcs_against_total_output() {
+    fn decode_to_slice_trusted_fallback_validates_fcs_against_total_output() {
         // Synthetic single-segment frame: FCS = 20 bytes, but the
         // last-block flag fires after only 4 bytes of raw payload.
         // On the direct path this would trip the post-block
@@ -1891,7 +1890,7 @@ mod tests {
         // so the eligibility check gates the direct path out.
         let mut out = alloc::vec![0u8; 20];
         let err = dec
-            .decode_to_slice(wire.as_slice(), &mut out)
+            .decode_to_slice_trusted(wire.as_slice(), &mut out)
             .expect_err("fallback must reject corrupt FCS underflow");
         match err {
             crate::decoding::errors::FrameDecoderError::FrameContentSizeMismatch {
@@ -1906,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_fallback_treats_explicit_fcs_zero_as_declared() {
+    fn decode_to_slice_trusted_fallback_treats_explicit_fcs_zero_as_declared() {
         // Synthetic multi-segment frame with FCS_flag=2 (4-byte
         // FCS) explicitly set to 0. The header DECLARES zero
         // content, but the body carries a 5-byte raw last-block.
@@ -1945,7 +1944,7 @@ mod tests {
         // give it some room so `read()` can drain the block.
         let mut out = alloc::vec![0u8; 16];
         let err = dec
-            .decode_to_slice(wire.as_slice(), &mut out)
+            .decode_to_slice_trusted(wire.as_slice(), &mut out)
             .expect_err("corrupt FCS=0 + 5-byte block must error");
         match err {
             crate::decoding::errors::FrameDecoderError::FrameContentSizeMismatch {
@@ -1960,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_fallback_accepts_honest_explicit_fcs_zero() {
+    fn decode_to_slice_trusted_fallback_accepts_honest_explicit_fcs_zero() {
         // Companion to the corrupt-FCS=0 test above: an HONEST
         // empty frame with FCS_flag=2 (4-byte FCS) explicitly set
         // to 0 AND a 0-byte raw last-block. `fcs_declared()`
@@ -1994,7 +1993,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         let mut out = alloc::vec![0u8; 16];
         let n = dec
-            .decode_to_slice(wire.as_slice(), &mut out)
+            .decode_to_slice_trusted(wire.as_slice(), &mut out)
             .expect("honest FCS=0 + empty block must succeed");
         assert_eq!(n, 0);
     }
