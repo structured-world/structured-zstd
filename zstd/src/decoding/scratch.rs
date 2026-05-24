@@ -34,6 +34,61 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     pub block_content_buffer: Vec<u8>,
 }
 
+/// Borrowed view of all per-call decoder scratch fields as `&mut`
+/// references. Returned by [`Workspace::split`] so the block /
+/// literals / sequence decoder functions can hold simultaneous
+/// independent borrows of distinct fields — the field-split is
+/// what makes "borrow huf and literals_buffer at the same time"
+/// type-check, both for the owned [`DecoderScratch<B>`] path and the
+/// upcoming direct-decode path (#244) where these fields are
+/// borrowed by reference from a [`crate::decoding::FrameDecoder`].
+///
+/// The lifetime `'a` is the shorter-of (a) the underlying owner's
+/// lifetime and (b) the active borrow. The backend type `B` flows
+/// through to [`super::decode_buffer::DecodeBuffer<B>`].
+pub struct WorkspaceRef<'a, B: BufferBackend> {
+    pub huf: &'a mut HuffmanScratch,
+    pub fse: &'a mut FSEScratch,
+    pub buffer: &'a mut DecodeBuffer<B>,
+    pub offset_hist: &'a mut [u32; 3],
+    pub literals_buffer: &'a mut Vec<u8>,
+    pub sequences: &'a mut Vec<Sequence>,
+    pub block_content_buffer: &'a mut Vec<u8>,
+}
+
+/// Polymorphic accessor for the decoder's per-call scratch state.
+/// Both the existing owned [`DecoderScratch<B>`] (used by the
+/// streaming and one-shot `decode_all` paths) and the upcoming
+/// direct-decode borrow-ref scratch (#244) implement this trait so
+/// the block / literals / sequence decode functions are written
+/// once against `Workspace` and instantiated for both shapes via
+/// compile-time monomorphisation.
+///
+/// The single `split` method returns all fields at once as a
+/// [`WorkspaceRef`] so callers retain Rust's field-level
+/// disjoint-borrow analysis. Per-field accessors would force
+/// sequential borrows and break call sites that need e.g.
+/// `&mut huf` and `&mut literals_buffer` simultaneously.
+pub trait Workspace {
+    type Backend: BufferBackend;
+    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend>;
+}
+
+impl<B: BufferBackend> Workspace for DecoderScratch<B> {
+    type Backend = B;
+    fn split(&mut self) -> WorkspaceRef<'_, B> {
+        WorkspaceRef {
+            huf: &mut self.huf,
+            fse: &mut self.fse,
+            buffer: &mut self.buffer,
+            offset_hist: &mut self.offset_hist,
+            literals_buffer: &mut self.literals_buffer,
+            sequences: &mut self.sequences,
+            block_content_buffer: &mut self.block_content_buffer,
+        }
+    }
+}
+
 impl<B: BufferBackend> DecoderScratch<B> {
     pub fn new(window_size: usize) -> DecoderScratch<B> {
         DecoderScratch {
