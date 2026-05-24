@@ -125,14 +125,34 @@ impl SkippableFrame {
     /// caller is responsible for positioning the reader at a frame
     /// boundary; this method does not scan past unknown content.
     ///
-    /// Allocates the payload buffer via [`Vec::try_reserve_exact`],
-    /// so a crafted input declaring a `length` up to `u32::MAX` that
-    /// would otherwise abort on out-of-memory instead returns
-    /// [`DecodeSkippableFrameError::AllocationFailed`]. Callers
-    /// handling untrusted streams should additionally cap the
-    /// acceptable payload size at the application layer; this method
-    /// itself imposes no upper bound beyond the wire-format
-    /// `u32::MAX`.
+    /// Three layers of protection against crafted-`length` DoS:
+    ///
+    /// 1. Validates that `length` is representable on the target
+    ///    pointer width (`length + SKIPPABLE_HEADER_SIZE` must not
+    ///    overflow `usize`). On 32-bit targets a wire `length` near
+    ///    `u32::MAX` would otherwise overflow `serialized_size()` and
+    ///    `write_skippable_frame_to`. Returns
+    ///    [`DecodeSkippableFrameError::PayloadTooLarge`] up front.
+    ///
+    /// 2. Reserves the address space via [`Vec::try_reserve_exact`],
+    ///    converting alloc-failure into typed
+    ///    [`DecodeSkippableFrameError::AllocationFailed`] instead of
+    ///    process abort.
+    ///
+    /// 3. Reads the payload in fixed-size chunks via a stack scratch
+    ///    buffer, so the OS only commits pages for bytes the reader
+    ///    actually delivers. A crafted `length` near `u32::MAX` on a
+    ///    reader that terminates early surfaces as
+    ///    `DecodeSkippableFrameError::Payload` without ever
+    ///    committing the full allocation — on OSes with memory
+    ///    overcommit (Linux default) where step 2 would otherwise
+    ///    succeed for any nominal size, this is what makes the
+    ///    "no abort on huge length" guarantee actually reliable.
+    ///
+    /// Callers handling untrusted streams should additionally cap
+    /// the acceptable payload size at the application layer; this
+    /// method itself imposes no upper bound beyond the wire-format
+    /// `u32::MAX` plus target-representability.
     pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self, DecodeSkippableFrameError> {
         let mut magic_buf = [0u8; 4];
         reader
@@ -151,14 +171,42 @@ impl SkippableFrame {
             .map_err(DecodeSkippableFrameError::Length)?;
         let length = u32::from_le_bytes(len_buf) as usize;
 
+        // Reject lengths that the `new()` / `write_skippable_frame()`
+        // path would also reject up front. On 32-bit targets this is
+        // the only protection against `serialized_size()` and
+        // `write_skippable_frame_to` overflowing `usize` when
+        // computing `length + SKIPPABLE_HEADER_SIZE`. On 64-bit the
+        // check is a no-op (every u32 length is representable).
+        if length.checked_add(SKIPPABLE_HEADER_SIZE).is_none() {
+            return Err(DecodeSkippableFrameError::PayloadTooLarge { length });
+        }
+
         let mut payload: Vec<u8> = Vec::new();
         payload
             .try_reserve_exact(length)
             .map_err(|_| DecodeSkippableFrameError::AllocationFailed { requested: length })?;
-        payload.resize(length, 0);
-        reader
-            .read_exact(&mut payload)
-            .map_err(DecodeSkippableFrameError::Payload)?;
+
+        // Read in chunks via a stack scratch buffer instead of
+        // `resize(length, 0) + read_exact(&mut payload)`. The
+        // resize-then-read path eagerly zero-fills the entire
+        // address range up front, which on overcommit OSes
+        // (Linux default) triggers the OOM killer the moment the
+        // crafted-`length` worth of pages get committed — even
+        // though `try_reserve_exact` succeeded earlier. Chunked
+        // reads commit pages only as the reader delivers bytes,
+        // so a 4 GiB-declared payload on a 12-byte stream commits
+        // ~one page, surfaces `Payload`, and exits.
+        const CHUNK: usize = 16 * 1024;
+        let mut scratch = [0u8; CHUNK];
+        let mut remaining = length;
+        while remaining > 0 {
+            let take = remaining.min(CHUNK);
+            reader
+                .read_exact(&mut scratch[..take])
+                .map_err(DecodeSkippableFrameError::Payload)?;
+            payload.extend_from_slice(&scratch[..take]);
+            remaining -= take;
+        }
 
         Ok(Self {
             magic_variant: variant as u8,
@@ -267,6 +315,13 @@ pub enum DecodeSkippableFrameError {
     /// `requested` is the byte count the on-wire length field
     /// asked for.
     AllocationFailed { requested: usize },
+    /// Wire-format `length` field is not representable on this
+    /// target's `usize` width: `length + SKIPPABLE_HEADER_SIZE`
+    /// would overflow. Hits only 32-bit targets where the u32
+    /// wire-format ceiling coincides with `usize::MAX`. On 64-bit
+    /// every u32 length is representable and this variant is
+    /// unreachable.
+    PayloadTooLarge { length: usize },
 }
 
 impl core::fmt::Display for SkippableFrameError {
@@ -277,7 +332,7 @@ impl core::fmt::Display for SkippableFrameError {
             }
             Self::PayloadTooLarge(n) => write!(
                 f,
-                "skippable frame payload size {n} exceeds u32::MAX wire-format limit"
+                "skippable frame payload size {n} not representable: either exceeds u32::MAX (wire-format length-field ceiling) or overflows usize when combined with the 8-byte header (32-bit targets)"
             ),
             Self::Io(e) => write!(f, "skippable frame I/O error: {e}"),
         }
@@ -306,6 +361,10 @@ impl core::fmt::Display for DecodeSkippableFrameError {
             Self::AllocationFailed { requested } => write!(
                 f,
                 "skippable frame: failed to allocate {requested} bytes for payload"
+            ),
+            Self::PayloadTooLarge { length } => write!(
+                f,
+                "skippable frame: declared length {length} not representable on this target (length + 8 byte header overflows usize)"
             ),
         }
     }
@@ -545,16 +604,26 @@ mod tests {
 
     #[test]
     fn decode_huge_length_returns_typed_error_not_oom_abort() {
-        // Crafted wire declares a 4 GiB - 1 payload but provides
+        // Crafted wire declares a u32::MAX payload but provides
         // zero payload bytes. The decoder must surface a typed
-        // error (AllocationFailed if the allocator rejects the
-        // reservation, OR Payload(UnexpectedEof) if the allocator
-        // overcommits and the read_exact step is what catches the
-        // truncation). What it must NOT do is abort the process on
-        // OOM or panic via Vec::with_capacity. Both error paths are
-        // acceptable; the test pins the goal (no process abort, no
-        // panic) rather than a specific variant — which one fires
-        // depends on the host allocator's overcommit policy.
+        // error rather than aborting the process or panicking.
+        // Three paths are acceptable, each gated by the host's
+        // ABI / allocator behaviour:
+        //
+        // - `PayloadTooLarge { length }` — 32-bit host, where
+        //   `length + 8` overflows `usize`. The decoder rejects
+        //   the length before allocating.
+        // - `AllocationFailed { requested }` — 64-bit host, no
+        //   memory overcommit (Windows / configured Linux):
+        //   `try_reserve_exact` reports failure.
+        // - `Payload(io_err)` — 64-bit host, memory overcommit
+        //   (Linux default / macOS): allocation succeeds for the
+        //   address range, chunked read on truncated stream
+        //   surfaces the I/O error after committing one page
+        //   for the scratch buffer.
+        //
+        // What it must NOT do: abort the process on OOM or panic
+        // via Vec::with_capacity / Vec::resize.
         let huge: u32 = u32::MAX;
         let mut wire = Vec::new();
         wire.extend_from_slice(&SKIPPABLE_MAGIC_START.to_le_bytes());
@@ -562,37 +631,60 @@ mod tests {
         let mut cursor: &[u8] = wire.as_slice();
         let err = SkippableFrame::decode_from(&mut cursor).unwrap_err();
         match err {
+            DecodeSkippableFrameError::PayloadTooLarge { length } => {
+                assert_eq!(length, huge as usize);
+            }
             DecodeSkippableFrameError::AllocationFailed { requested } => {
                 assert_eq!(requested, huge as usize);
             }
             DecodeSkippableFrameError::Payload(_) => {
-                // Allocator accepted the reservation (overcommit);
-                // read_exact then failed because no payload bytes
-                // followed the 8-byte header. Also acceptable.
+                // Chunked read on the truncated payload surfaced
+                // the I/O error after the OS overcommitted the
+                // address range. Also acceptable.
             }
-            other => panic!("expected AllocationFailed or Payload(io_err), got {other:?}"),
+            other => panic!("expected PayloadTooLarge / AllocationFailed / Payload, got {other:?}"),
         }
     }
 
     #[test]
-    fn payload_too_large_check_is_inert_on_32bit_but_present() {
-        // We can't construct a payload above u32::MAX on a 32-bit
-        // host (usize == u32) — the check is unreachable there.
-        // Document the invariant explicitly so the validation path
-        // is not silently optimised out.
-        if (usize::MAX as u64) > u64::from(u32::MAX) {
-            // 64-bit-only: construct a fake-len test via the free
-            // function on a slice. We cannot actually allocate
-            // u32::MAX+1 bytes in a test, so this branch only
-            // asserts that the validator function itself
-            // distinguishes the boundary value.
+    fn payload_too_large_check_branches_on_pointer_width() {
+        // The `validate_payload_size` invariant is twofold:
+        //
+        // 1. `len > u32::MAX` is rejected on every target (the
+        //    on-wire length field is u32).
+        // 2. `len + SKIPPABLE_HEADER_SIZE` overflowing `usize` is
+        //    rejected on every target. On 64-bit this is
+        //    unreachable because `u32::MAX + 8 < usize::MAX`. On
+        //    32-bit `len == u32::MAX` itself trips condition 2:
+        //    `u32::MAX + 8` wraps `usize`.
+        //
+        // Branch the boundary expectation on pointer width so the
+        // test passes on both i686 (CI cross-i686 shard) and
+        // x86_64 hosts.
+        #[cfg(target_pointer_width = "64")]
+        {
             let result = validate_payload_size(u32::MAX as usize + 1);
             assert!(matches!(
                 result,
                 Err(SkippableFrameError::PayloadTooLarge(_))
             ));
+            let ok = validate_payload_size(u32::MAX as usize);
+            assert!(ok.is_ok(), "u32::MAX representable on 64-bit");
         }
-        let ok = validate_payload_size(u32::MAX as usize);
-        assert!(ok.is_ok());
+
+        #[cfg(target_pointer_width = "32")]
+        {
+            // `u32::MAX + 1` literally cannot be expressed as
+            // `usize` on 32-bit — `u32::MAX as usize + 1` wraps
+            // to 0. So construct the test only through values
+            // that are validly representable.
+            let result = validate_payload_size(u32::MAX as usize);
+            assert!(
+                matches!(result, Err(SkippableFrameError::PayloadTooLarge(_))),
+                "u32::MAX overflows when combined with the 8-byte header on 32-bit"
+            );
+            let ok = validate_payload_size((u32::MAX as usize) - SKIPPABLE_HEADER_SIZE);
+            assert!(ok.is_ok(), "below the header-overflow boundary on 32-bit");
+        }
     }
 }
