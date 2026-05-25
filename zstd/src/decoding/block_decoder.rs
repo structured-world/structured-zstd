@@ -664,6 +664,57 @@ mod tests {
         assert_eq!(direct.buffer.len(), 0, "no bytes written on overflow");
     }
 
+    /// Regression test: on BackendOverflow error from the RLE
+    /// fallible write, the input `*source` must NOT have been
+    /// advanced. Otherwise `FrameDecoder::bytes_read_counter`
+    /// accounting is off by one byte on the error path: the caller
+    /// exits early and the 1-byte advance never gets reflected in
+    /// the read counter, but the next call would skip past the RLE
+    /// byte.
+    #[test]
+    fn rle_overflow_leaves_source_unadvanced() {
+        use crate::decoding::decode_buffer::DecodeBuffer;
+        use crate::decoding::scratch::{DirectScratch, FSEScratch, HuffmanScratch};
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut output = [0u8; 4];
+        let backend = UserSliceBackend::from_slice(&mut output);
+        let buffer = DecodeBuffer::from_backend(backend, 1 << 20);
+        let mut huf = HuffmanScratch::new();
+        let mut fse = FSEScratch::new();
+        let mut offset_hist = [1u32, 4, 8];
+        let mut literals_buffer = alloc::vec::Vec::new();
+        let mut sequences = alloc::vec::Vec::new();
+        let mut block_content_buffer = alloc::vec::Vec::new();
+        let mut direct = DirectScratch {
+            huf: &mut huf,
+            fse: &mut fse,
+            offset_hist: &mut offset_hist,
+            literals_buffer: &mut literals_buffer,
+            sequences: &mut sequences,
+            block_content_buffer: &mut block_content_buffer,
+            buffer,
+        };
+
+        let mut d = primed_decoder();
+        let payload = [0xCDu8, 0xEE, 0xFF];
+        let mut src: &[u8] = &payload;
+        let h = header(BlockType::RLE, 10, 1);
+        let _ = d
+            .decode_block_content_from_slice(&h, &mut direct, &mut src)
+            .expect_err("RLE 10 bytes into 4-byte slice must error");
+        assert_eq!(
+            src.as_ptr(),
+            payload.as_ptr(),
+            "source advanced despite write failure"
+        );
+        assert_eq!(
+            src.len(),
+            payload.len(),
+            "source length changed on error path"
+        );
+    }
+
     #[test]
     fn rle_advances_source_by_one_byte_and_extends_buffer() {
         // Happy path on a freshly primed decoder: 1 byte consumed
