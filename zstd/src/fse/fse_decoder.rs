@@ -1,7 +1,6 @@
 use crate::bit_io::{BitReader, BitReaderReversed};
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
-use core::ptr;
 
 pub struct FSEDecoder<'table> {
     /// An FSE state value represents an index in the FSE table.
@@ -18,6 +17,8 @@ impl<'t> FSEDecoder<'t> {
                 new_state: 0,
                 symbol: 0,
                 num_bits: 0,
+                base_value: 0,
+                num_additional_bits: 0,
             }),
             table,
         }
@@ -290,6 +291,77 @@ impl FSETable {
         Ok(bytes_read)
     }
 
+    /// Populate each entry's `base_value` and `num_additional_bits`
+    /// from a packed code-metadata table. The packed format matches
+    /// the donor-style `(baseline << 0) | (extra_bits << 24)` layout
+    /// used by the sequence section's `LL_META` / `ML_META`
+    /// constants. Call site indexes into `packed` by entry symbol.
+    ///
+    /// MUST be called after `build_decoding_table` for tables whose
+    /// per-sequence decode path expects pre-computed metadata (LL /
+    /// ML sub-tables of the sequence section). Tables that don't
+    /// (HUF-weight stream) skip the call and leave the new fields
+    /// at their zero default.
+    ///
+    /// Symbols outside `packed.len()` are treated as a corrupt
+    /// table — both fields stay at 0 for that entry. Upstream
+    /// `build_decoding_table` already caps symbols at
+    /// `max_symbol + 1`, so this branch is reachable only on
+    /// `feature = "fuzz_exports"` builds where external code can
+    /// stuff arbitrary entries; the safe default keeps the decode
+    /// hot path from observing UB even in that contrived case.
+    pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
+        for entry in self.decode.iter_mut() {
+            let idx = entry.symbol as usize;
+            if idx < packed.len() {
+                let meta = packed[idx];
+                entry.base_value = meta & 0x00FF_FFFF;
+                entry.num_additional_bits = (meta >> 24) as u8;
+            } else {
+                // Out-of-range symbol — reachable only on
+                // `feature = "fuzz_exports"` builds where external
+                // code can stuff arbitrary entries into the table.
+                // Explicitly zero both fields so the next decode
+                // pass observes a clean state instead of stale
+                // metadata from a previous (well-formed) enrich
+                // call. The downstream `decode_one_sequence_inline`
+                // hot path still surfaces the corruption via the
+                // existing bitstream checks; this clears prior
+                // values rather than introducing a new fast-fail.
+                entry.base_value = 0;
+                entry.num_additional_bits = 0;
+            }
+        }
+    }
+
+    /// Populate each entry's `base_value` and `num_additional_bits`
+    /// for the sequence section's offset table.
+    ///
+    /// Offset codes follow a different shape than LL / ML: each
+    /// offset code `c` decodes to `base = 1 << c`, with `c` extra
+    /// bits read from the stream. No external meta table — the
+    /// computation is closed-form on the symbol value.
+    ///
+    /// Per the format spec, valid offset codes are 0..=31 (offsets
+    /// up to 2³¹). Larger symbols would overflow the `1 << c` shift
+    /// — the entry's fields stay at zero so the decode path
+    /// surfaces the corruption downstream instead of producing a
+    /// wraparound shift here.
+    pub(crate) fn enrich_for_offsets(&mut self) {
+        for entry in self.decode.iter_mut() {
+            // Reset before the bound check so out-of-range
+            // symbols clear stale metadata instead of carrying it
+            // over from a previous enrich pass.
+            entry.base_value = 0;
+            entry.num_additional_bits = 0;
+            let code = entry.symbol;
+            if code < 32 {
+                entry.base_value = 1u32 << code;
+                entry.num_additional_bits = code;
+            }
+        }
+    }
+
     /// Given the provided accuracy log, build a decoding table from that log.
     pub fn build_from_probabilities(
         &mut self,
@@ -411,70 +483,31 @@ impl FSETable {
         debug_assert_eq!(table_symbols.len(), table_size);
         debug_assert!(table_size <= self.decode.capacity());
 
-        #[cfg(target_endian = "little")]
-        {
-            debug_assert_eq!(core::mem::size_of::<Entry>(), 4);
-            debug_assert_eq!(core::mem::offset_of!(Entry, new_state), 0);
-            debug_assert_eq!(core::mem::offset_of!(Entry, symbol), 2);
-            debug_assert_eq!(core::mem::offset_of!(Entry, num_bits), 3);
-            // SAFETY: capacity is guaranteed by the caller; the init
-            // loop immediately below writes a full Entry to every slot
-            // in 0..table_size via raw `ptr::write_unaligned`. The
-            // set_len + writes form a single panic-free window —
-            // nothing in between this call and the loop body can unwind
-            // (no allocations, no user-visible &mut self.decode[..],
-            // no borrows that could observe uninitialized slots).
-            unsafe {
-                self.decode.set_len(table_size);
-            }
-            // Write two packed entries (8 bytes) at once:
-            // Entry bytes are [new_state_lo, new_state_hi, symbol, num_bits].
-            let mut idx = 0usize;
-            while idx + 1 < table_size {
-                let packed =
-                    ((table_symbols[idx] as u64) << 16) | ((table_symbols[idx + 1] as u64) << 48);
-                // SAFETY: idx + 1 < table_size == self.decode.len()
-                // (just set above) and capacity covers two u32 slots.
-                // Unaligned writes are intentional because `Entry`
-                // alignment may be < 8.
-                unsafe {
-                    ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u64>(), packed);
-                }
-                idx += 2;
-            }
-            if idx < table_size {
-                // Trailing odd entry: write a full 4-byte Entry { new_state: 0,
-                // symbol, num_bits: 0 } via a single u32 store. Field assignment
-                // (`self.decode[idx].symbol = …`) would have left new_state /
-                // num_bits uninitialized after the set_len above — leaking UB
-                // until the per-entry baseline pass overwrote them.
-                let packed = (table_symbols[idx] as u32) << 16;
-                // SAFETY: idx < table_size == self.decode.len(), capacity
-                // covers a u32 slot. Unaligned write is intentional
-                // because `Entry`'s alignment may be < 4 on some targets.
-                unsafe {
-                    ptr::write_unaligned(self.decode.as_mut_ptr().add(idx).cast::<u32>(), packed);
-                }
-            }
-        }
-
-        #[cfg(not(target_endian = "little"))]
-        {
-            // BE path uses iter_mut(), which constructs `&mut Entry` and
-            // therefore needs initialized storage — resize-with-default
-            // is the natural shape. No production target ships BE so
-            // the extra zero-fill is irrelevant.
-            self.decode.resize(
-                table_size,
-                Entry {
-                    new_state: 0,
-                    symbol: 0,
-                    num_bits: 0,
-                },
-            );
-            for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
-                entry.symbol = symbol;
-            }
+        // Entry is now 12 bytes (header + base_value + num_additional_bits
+        // + tail padding). The previous LE fast path that packed two
+        // 4-byte entries into a single u64 store no longer applies.
+        // Zero-init through `resize` and then set per-slot `.symbol`
+        // — the per-block table build is not on the per-sequence hot
+        // path (this runs once per FSE-mode block, not per emit), so
+        // dropping the byte-packed write here keeps the layout change
+        // contained without measurable cost.
+        //
+        // The `base_value` / `num_additional_bits` fields stay at
+        // their zero default here; per-table enrichment for LL / ML /
+        // OF runs in `enrich_for_*` after the baseline / num_bits
+        // computation below populates the rest of each entry.
+        self.decode.resize(
+            table_size,
+            Entry {
+                new_state: 0,
+                symbol: 0,
+                num_bits: 0,
+                base_value: 0,
+                num_additional_bits: 0,
+            },
+        );
+        for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
+            entry.symbol = symbol;
         }
     }
 
@@ -573,6 +606,19 @@ impl FSETable {
 }
 
 /// A single entry in an FSE table.
+///
+/// The first four bytes (`new_state`, `symbol`, `num_bits`) mirror the
+/// classical donor `FSE_decode_t` layout used by every FSE-backed
+/// decoder in the crate (sequence-section LL/ML/OF, HUF-weight
+/// stream). The trailing `base_value` + `num_additional_bits`
+/// fields are populated only by the LL / ML / OF tables in the
+/// sequence-section decoder (donor `ZSTD_seqSymbol` shape) so the
+/// per-sequence hot path can read them directly off the active
+/// entry instead of issuing a second lookup into a separate
+/// metadata table. HUF tables leave these two fields at their
+/// default zero — the extra eight bytes per slot are a fixed cost
+/// on the small HUF FSE table (≤ 64 entries) and the dominant
+/// savings live in the sequence section.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
@@ -583,6 +629,18 @@ pub struct Entry {
     pub symbol: u8,
     /// How many bits should be read from the stream when decoding this entry.
     pub num_bits: u8,
+    /// For LL / ML / OF tables: pre-computed code baseline.
+    /// `actual_value = base_value + extra_bits_read`. Donor
+    /// `ZSTD_seqSymbol::baseValue`. Populated by the per-table
+    /// `enrich_for_*` post-build pass; stays 0 for FSE tables that
+    /// don't need it (HUF-weight stream).
+    pub base_value: u32,
+    /// For LL / ML / OF tables: number of bits to read from the
+    /// bitstream after the symbol has been decoded, to obtain the
+    /// additional value to add to `base_value`. Donor
+    /// `ZSTD_seqSymbol::nbAdditionalBits`. Populated alongside
+    /// `base_value`; stays 0 for FSE tables that don't need it.
+    pub num_additional_bits: u8,
 }
 
 #[cfg(target_endian = "little")]
@@ -592,7 +650,13 @@ const _: [(); 2] = [(); core::mem::offset_of!(Entry, symbol)];
 #[cfg(target_endian = "little")]
 const _: [(); 3] = [(); core::mem::offset_of!(Entry, num_bits)];
 #[cfg(target_endian = "little")]
-const _: [(); 4] = [(); core::mem::size_of::<Entry>()];
+const _: [(); 4] = [(); core::mem::offset_of!(Entry, base_value)];
+#[cfg(target_endian = "little")]
+const _: [(); 8] = [(); core::mem::offset_of!(Entry, num_additional_bits)];
+// 12 bytes: 4 (header) + 4 (base_value) + 1 (num_additional_bits)
+// + 3 bytes tail padding for natural u32 alignment.
+#[cfg(target_endian = "little")]
+const _: [(); 12] = [(); core::mem::size_of::<Entry>()];
 
 /// This value is added to the first 4 bits of the stream to determine the
 /// `Accuracy_Log`
