@@ -341,11 +341,34 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // and one pre-built chunk feeds the entire loop with zero
         // phase tracking. Inner loop = one 16-byte SIMD store + one
         // add.
+        //
+        // The chunk-build is materialised with literal constants per
+        // arm rather than `chunk16[i] = base[i % offset]`. The naive
+        // form gets unrolled by LLVM into 14×`divb` (8-bit divides)
+        // because the compiler does not propagate `offset == 1|2|4`
+        // from the outer match arm into the inner loop's modulo —
+        // divb cost ~1% per byte = ~14% of decode time on
+        // `decompress/level_-1_fast/decodecorpus-z000033`. Explicit
+        // literal arms eliminate the divide entirely.
         if matches!(offset, 1 | 2 | 4) {
-            let mut chunk16 = [0u8; 16];
-            for i in 0..16 {
-                chunk16[i] = base[i % offset];
-            }
+            let b0 = base[0];
+            let b1 = base[1];
+            let b2 = base[2];
+            let b3 = base[3];
+            let chunk16: [u8; 16] = match offset {
+                1 => [b0; 16],
+                2 => [
+                    b0, b1, b0, b1, b0, b1, b0, b1, b0, b1, b0, b1, b0, b1, b0, b1,
+                ],
+                4 => [
+                    b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2, b3,
+                ],
+                // SAFETY: outer `matches!(offset, 1 | 2 | 4)` rejects
+                // any other value; this arm is statically dead and
+                // exists only to satisfy match exhaustiveness without
+                // a runtime branch.
+                _ => unsafe { core::hint::unreachable_unchecked() },
+            };
             let mut copied = 0usize;
             while copied + 16 <= match_length {
                 self.buffer.extend(&chunk16);
