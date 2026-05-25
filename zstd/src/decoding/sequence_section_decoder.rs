@@ -525,12 +525,19 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     // past the end of the literals buffer slice — UB even when the
     // bytes happen to be valid memory inside the backing `Vec`.
     // Donor guards with `iLitEnd > litLimit` → slow path. We mirror
-    // the same gate: only take the donor inline arm when the source
-    // window has ≥ 16 bytes left from `lit_cur_before`. The final
-    // few sequences of a block fall through to the legacy
+    // the same gate. For `lit_length <= 16` the over-read is from the
+    // first unconditional `ZSTD_copy16` (16 bytes from `lit_cur_before`).
+    // For `lit_length > 16` the wildcopy_no_overlap tail loop's final
+    // 16-byte chunk loads bytes
+    // `lits.as_ptr() + (lit_length - 16) .. + lit_length`. Both cases
+    // are covered by `high + 15 <= lit_len`
+    // (`high = lit_cur_before + lit_length`): the over-read past the
+    // declared literal end is bounded by 15 bytes, and `high + 15`
+    // staying inside `lit_len` proves the load is in-bounds. The
+    // final few sequences of a block fall through to the legacy
     // `push`/`repeat` chain which handles short literals exactly
     // (no over-read).
-    if B::SUPPORTS_INLINE_DONOR_EXEC && lit_cur_before + 16 <= lit_len {
+    if B::SUPPORTS_INLINE_DONOR_EXEC && high + 15 <= lit_len {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
         // gate). Donor inline path stays on the prefix-resident

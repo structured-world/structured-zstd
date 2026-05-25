@@ -192,12 +192,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         #[cfg(feature = "hash")]
         {
             // Read the just-written tail bytes via the backend's
-            // slice view. Donor-path callers always operate on
-            // contiguous slack (UserSliceBackend / FlatBuf both),
-            // so the live region is one slice; `as_slices().0` is
-            // the prefix that covers everything up to the current
-            // tail. Take the last `n` bytes of that prefix.
-            let (front, _) = self.buffer.as_slices();
+            // slice view. Donor-path callers (gated by
+            // `BufferBackend::SUPPORTS_INLINE_DONOR_EXEC = true`) are
+            // currently restricted to `UserSliceBackend`, whose
+            // `as_slices()` returns `(&slice[head..tail], &[])` — a
+            // single contiguous prefix. Two-slice ring-wrap layout
+            // (`RingBuffer`) returns `false` for the const above and
+            // therefore never reaches this helper. If a future backend
+            // opts into the donor path AND uses two-slice layout,
+            // the `as_slices().0` shortcut here would miss bytes
+            // straddling the wrap — update both slices then.
+            let (front, back) = self.buffer.as_slices();
+            debug_assert!(
+                back.is_empty(),
+                "advance_output_counter assumes contiguous front slice; \
+                 only backends with single-slice layout may opt into \
+                 SUPPORTS_INLINE_DONOR_EXEC"
+            );
             let lo = front.len().saturating_sub(n);
             self.hash.write(&front[lo..]);
         }

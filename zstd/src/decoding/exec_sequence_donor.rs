@@ -118,10 +118,22 @@ pub(crate) mod x86 {
                 let dec32 = DEC32_TABLE[offset] as usize;
                 let v: u32 = src.add(dec32).cast::<u32>().read_unaligned();
                 dst.add(4).cast::<u32>().write_unaligned(v);
-                // src was advanced by `dec32` to read the second u32;
-                // `sub2` rewinds it so the post-call src is at
-                // `original_src + dec32 - sub2 + 8`.
-                let src_after = src.add(dec32).offset(-(sub2 as isize)).add(8);
+                // Post-call src position is `src + (dec32 - sub2 + 8)`.
+                // Computing this as
+                // `src.add(dec32).offset(-(sub2 as isize)).add(8)`
+                // (donor's literal C transcription) produces an
+                // intermediate pointer below the allocation base
+                // when `dec32 < sub2` — true for every offset ∈ 1..=7
+                // in donor's tables — which is UB under Rust's
+                // `.offset()` provenance rules even when the final
+                // pointer lands back in-bounds. Apply the net signed
+                // offset once so no intermediate underflows.
+                let net_offset = dec32 as isize - sub2 as isize + 8;
+                debug_assert!(
+                    net_offset >= 0,
+                    "overlap_copy8 net offset is non-negative for all offset ∈ 1..=7"
+                );
+                let src_after = src.offset(net_offset);
                 (dst.add(8), src_after)
             } else {
                 // ZSTD_copy8 — straight 8-byte unaligned move.

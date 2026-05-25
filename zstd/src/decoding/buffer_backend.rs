@@ -50,7 +50,10 @@ pub(crate) trait BufferBackend: Sized {
     /// donor-shape inline `donor_exec_one_sequence` path (literal
     /// copy + match copy in one straight-line body, no per-call
     /// dispatch through `extend` / `repeat`). Defaults to `false`;
-    /// `UserSliceBackend` overrides to `true` on x86/x86_64 targets.
+    /// `UserSliceBackend` overrides to `true` on `x86_64` only —
+    /// 32-bit `x86` is excluded because the donor helpers emit SSE2
+    /// intrinsics without a `#[target_feature]` gate, and pre-SSE2
+    /// i386 / i486 / i586 baselines would SIGILL.
     ///
     /// Reads of this const at the dispatch site fold to a compile-time
     /// branch the optimiser dead-eliminates — the unused arm
