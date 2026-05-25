@@ -44,6 +44,7 @@ macro_rules! vprintln {
 
 mod bit_io;
 mod common;
+mod cpu_kernel;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
