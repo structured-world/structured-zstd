@@ -45,9 +45,19 @@ const _: () = assert!(
 /// `cfg(target_feature)` under `no_std` — then dispatches to a
 /// kernel-monomorphised body so the inner pipeline's
 /// `BitReaderReversed<K>` resolves `K::mask_lower_bits` at compile
-/// time, bypassing the runtime `use_pext_triple` branch. The per-call
-/// dispatch cost is one `OnceLock::get` (std) or zero (no_std) plus a
-/// small `match` — amortised over the whole block.
+/// time (one BMI2 `bzhi` codegen per bit-mask call, no per-call
+/// kernel-selection dispatch). The per-call dispatch cost is one
+/// `OnceLock::get` (std) or zero (no_std) plus a small `match` —
+/// amortised over the whole block.
+///
+/// (Note: `BitReaderReversed::peek_bits_triple` still carries a
+/// per-call `if self.use_pext_triple` branch under
+/// `feature = "std"` + `target_arch = "x86_64"`, choosing between
+/// scalar mask and PEXT extract. That branch is **independent** of
+/// the kernel cascade and is left as-is — folding it into the
+/// kernel type would force VBMI2/Avx2/Bmi2 to commit to PEXT-only
+/// codegen, which is not always the fastest choice on the FSE
+/// state-update extracts.)
 ///
 /// The BMI2/AVX2/VBMI2 arms route through `#[target_feature]`-wrapped
 /// trampolines so LLVM can inline the kernel's `_bzhi_u64` / pext
@@ -759,7 +769,14 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         // back to the layered path below.
         let buf_len = buffer.len();
         let offset = resolved_offset as usize;
-        if offset > buf_len + lits.len() {
+        // `checked_add` against adversarial input: if `buf_len +
+        // lits.len()` would wrap `usize`, treat the offset as
+        // out-of-range and fall back to the layered path. Without
+        // the check, wrapping addition could classify a wildly
+        // out-of-range `offset` as in-range and feed the donor
+        // inline path an OOB match-source pointer.
+        let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
+        if prefix_end.is_none() {
             // Match source reaches outside what's been written in this
             // frame — donor's `extDict` arm. Punt back to the slow
             // `repeat()` path; that path already routes through

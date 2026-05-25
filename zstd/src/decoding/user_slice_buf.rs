@@ -164,8 +164,6 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         let lit_length = lits.len();
-        let total = lit_length + match_length;
-        let new_tail = self.tail + total;
         // Release-mode capacity assert — covers the literal+match
         // copies INCLUDING the wildcopy overshoot tail (up to 15
         // bytes past `tail + total`). The caller-side
@@ -174,9 +172,24 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // explicit so a future caller that supplies a smaller slice
         // fails immediately with a clear diagnostic instead of
         // silently corrupting memory past the declared tail.
+        //
+        // All sums use `checked_*` so adversarial / corrupt input
+        // that would wrap `usize` ends up as `None` → assert fires
+        // with a clean error instead of wrapping past the slice
+        // length and letting the subsequent unsafe pointer math go
+        // out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let total = lit_length
+            .checked_add(match_length)
+            .expect("UserSliceBackend::donor_exec_one_sequence: lit+ml overflow on corrupt frame");
+        let new_tail = self.tail.checked_add(total).expect(
+            "UserSliceBackend::donor_exec_one_sequence: tail+total overflow on corrupt frame",
+        );
+        let cap_required = new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT).expect(
+            "UserSliceBackend::donor_exec_one_sequence: overshoot bound overflow on corrupt frame",
+        );
         assert!(
-            new_tail + MAX_WILDCOPY_OVERSHOOT <= self.slice.len(),
+            cap_required <= self.slice.len(),
             "UserSliceBackend::donor_exec_one_sequence overflows slice \
              (tail+={} + {} overshoot, cap={}) — corrupt frame or missing WILDCOPY_OVERLENGTH slack",
             total,
@@ -186,13 +199,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         debug_assert!(
-            offset <= self.tail + lit_length,
-            "donor_exec_one_sequence: offset ({}) exceeds output start \
-             ({} + lit {} = {})",
+            self.tail
+                .checked_add(lit_length)
+                .is_some_and(|end| offset <= end),
+            "donor_exec_one_sequence: offset ({}) exceeds output start (tail={} + lit={})",
             offset,
             self.tail,
             lit_length,
-            self.tail + lit_length
         );
 
         // SAFETY: capacity asserted above; pointer arithmetic stays
