@@ -1,14 +1,22 @@
-//! Top-level CPU kernel dispatch — single detect+match per zstd call,
-//! propagated through the entire pipeline as a generic parameter so
-//! inner code (HUF burst, FSE state update, sequence executor,
-//! match-copy, bit-reader) monomorphises against the chosen kernel.
+//! CPU kernel dispatch — single detect+match at the dispatch site,
+//! propagated through the inner pipeline as a generic parameter so
+//! leaf hot-path code monomorphises against the chosen kernel.
 //!
-//! See issue #247 for the architecture rationale: per-subsystem dispatch
-//! scatters the choice across HUF / FSE / SIMD-copy independently and
-//! pays the cost N times per call. The lifted top-level dispatch
-//! collapses to one detect at the FrameDecoder / FrameCompressor entry;
-//! all inner leaf-hot-path ops route through `K::method` calls on the
-//! chosen kernel zero-sized type.
+//! See issue #247 for the architecture rationale: per-subsystem
+//! dispatch scatters the choice across HUF / FSE / SIMD-copy
+//! independently and pays the cost N times per call. Lifting the
+//! dispatch to the outermost feasible call site collapses it to one
+//! detect there; the inner leaf-hot-path ops then route through
+//! `K::method` calls on the chosen kernel zero-sized type.
+//!
+//! Current wiring (as of #247 Part 2): the only active dispatch site
+//! is `decoding::literals_section_decoder::decompress_literals`,
+//! which `match`es `detect_cpu_kernel()` and routes into per-K
+//! `decompress_literals_*` `#[target_feature]` wrappers. The full
+//! pipeline-wide propagation envisioned in the issue (FrameDecoder /
+//! FrameCompressor entry, sequence executor, match copy) is
+//! incremental; subsequent tiers extend the dispatch surface without
+//! changing this trait or the kernel ZSTs.
 //!
 //! Structure code (block loop, FCS check, offset history, repeat
 //! semantics) stays single-impl and only carries `K` as a phantom on

@@ -127,15 +127,19 @@ fn decompress_literals(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    // Per-block CpuKernel dispatch. detect_cpu_kernel() is OnceLock-cached
-    // so the tag is resolved once per process; the match below collapses
-    // to a single cmp+jmp on subsequent calls. Each arm dispatches into a
-    // target_feature-wrapped outer function so the entire impl::<K> pipeline
-    // executes inside the matching target_feature context — without that
-    // wrapping, LLVM cannot inline target_feature'd intrinsics (e.g.
-    // _bzhi_u64 inside K::mask_lower_bits) through the trait-method call
-    // boundary back into the generic caller, and the inlined-intrinsic
-    // win evaporates into a function-call trampoline per mask op.
+    // Per-block CpuKernel dispatch. `detect_cpu_kernel()` resolves the
+    // tag at most once per process: under `feature = "std"` via an
+    // `OnceLock` cache around `is_x86_feature_detected!`, and under
+    // `no_std` it is a `cfg(target_feature = ...)` const at compile
+    // time. Either way the match below collapses to a single cmp+jmp
+    // on subsequent calls (or to a single arm at codegen on no-std).
+    // Each arm dispatches into a target_feature-wrapped outer function
+    // so the entire impl::<K> pipeline executes inside the matching
+    // target_feature context — without that wrapping, LLVM cannot
+    // inline target_feature'd intrinsics (e.g. _bzhi_u64 inside
+    // K::mask_lower_bits) through the trait-method call boundary back
+    // into the generic caller, and the inlined-intrinsic win
+    // evaporates into a function-call trampoline per mask op.
     match detect_cpu_kernel() {
         #[cfg(target_arch = "x86_64")]
         CpuKernelTag::Vbmi2 => unsafe {

@@ -63,6 +63,14 @@ pub mod fse;
 #[cfg(feature = "fuzz_exports")]
 pub mod huff0;
 
+// `pub fn init_state<K: CpuKernel>` and friends inside the
+// fuzz_exports-public `huff0` module name `crate::cpu_kernel::CpuKernel`
+// in their signatures. Without a publicly-reachable path to `CpuKernel`
+// the bound triggers `private_bounds` / `private_interfaces`. Re-export
+// under the same feature gate so the fuzz harness build is clean.
+#[cfg(feature = "fuzz_exports")]
+pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
+
 #[cfg(not(feature = "fuzz_exports"))]
 pub(crate) mod fse;
 #[cfg(not(feature = "fuzz_exports"))]
