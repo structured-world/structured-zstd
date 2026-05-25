@@ -1077,6 +1077,7 @@ impl FrameDecoder {
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
+        use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
         while !input.is_empty() {
             match init_frame(self, &mut input) {
@@ -1091,6 +1092,30 @@ impl FrameDecoder {
                 }
                 Err(e) => return Err(e),
             };
+            // Per-frame direct-path dispatch. Eligibility mirrors
+            // `decode_to_slice_trusted`: FCS declared and > 0, no
+            // active dictionary, and the remaining `output` slice has
+            // room for FCS + WILDCOPY_OVERLENGTH slack. When all hold
+            // the frame decodes straight into `output[..content_size]`
+            // through `UserSliceBackend`, bypassing the FlatBuf/Ring
+            // -> `read()` drain copy that dominates throughput on
+            // poorly-compressed corpora. Ineligible frames (no FCS,
+            // active dict, output too small for slack, streaming
+            // multi-frame inputs where the next frame needs the
+            // current iteration's tail) fall through to the legacy
+            // `decode_blocks` + `read` drain loop below.
+            let state_ref = self.state.as_ref().expect("init populated state");
+            let content_size = state_ref.frame_header.frame_content_size();
+            let dict_active = state_ref.using_dict.is_some();
+            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+            let direct_eligible =
+                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+            if direct_eligible {
+                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                output = &mut output[written..];
+                total_bytes_written += written;
+                continue;
+            }
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self
@@ -1317,12 +1342,7 @@ impl FrameDecoder {
         mut input: &[u8],
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
-        use super::block_decoder;
         use super::buffer_backend::WILDCOPY_OVERLENGTH;
-        use super::decode_buffer::DecodeBuffer;
-        use super::scratch::DirectScratch;
-        use super::user_slice_buf::UserSliceBackend;
-        use crate::io::Read;
         use FrameDecoderError as err;
 
         // Parse the frame header. This populates `self.state` with
@@ -1339,111 +1359,115 @@ impl FrameDecoder {
         // payloads).
         self.init(&mut input)?;
 
-        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        let state = self.state.as_ref().ok_or(err::NotYetInitialized)?;
         let content_size = state.frame_header.frame_content_size();
         let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-        // Eligibility independent of `single_segment_flag`:
-        // multi-segment frames work via a coarse, block-boundary
-        // cap on the visible buffer. The post-block
-        // `drop_to_window_size` call in the loop below advances the
-        // backend's `head` so `buffer.len()` doesn't grow past
-        // `window_size` between blocks — bytes physically remain
-        // in the user slice, just leave `len()`'s visible range so
-        // a subsequent block's match-offset cannot reach back
-        // arbitrarily far via stale history.
-        //
-        // This is NOT strict spec enforcement of
-        // `offset <= window_size`: within a single block
-        // `buffer.len()` can temporarily exceed `window_size` and
-        // `DecodeBuffer::repeat` validates against `buffer.len()`
-        // (not `window_size`), so an in-block match with
-        // `offset > window_size` but `offset <= current
-        // buffer.len()` is accepted on both direct and fallback
-        // paths. See the `decode_to_slice_trusted` doc for the full
-        // limitation note.
-        //
-        // Disabled when a dictionary is active: the persistent
-        // `DecoderScratch::buffer.dict_content` seeded by
-        // `init_from_dict` is NOT carried into the stack-local
-        // `DecodeBuffer<UserSliceBackend>` we build below, so any
-        // match that reaches into the external dictionary would
-        // decode against an empty prefix. Fall back to the regular
-        // path which keeps the dict in the persistent buffer.
         let dict_active = state.using_dict.is_some();
-        // `content_checksum_flag` is no longer a disqualifier. The
-        // direct path writes the decoded bytes into the user's
-        // `output` slice, and we hash that slice once at the end of
-        // decode (single sequential pass over cache-hot data). The
-        // computed digest is then propagated into the persistent
-        // `state.decoder_scratch.buffer.hash` so the public
-        // `get_calculated_checksum()` accessor reads the correct
-        // value just like on the `decode_all` path.
         let eligible = content_size > 0 && !dict_active && (output.len() as u64) >= needed;
 
         if !eligible {
             // Frame doesn't qualify for direct decode (empty
             // frame_content_size — header lacks FCS — or output too
-            // small for the WILDCOPY slack). Fall through to the
-            // existing per-block decode + drain path — `init`
+            // small for the WILDCOPY slack, or active dict). Fall
+            // through to the per-block decode + drain path. `init`
             // already populated `self.state`, so `decode_blocks` +
             // `read` pick up from there.
-            let mut output_tail: &mut [u8] = output;
-            let mut total_bytes_written = 0;
-            loop {
-                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
-                let bytes_written = self
-                    .read(output_tail)
-                    .map_err(err::FailedToDrainDecodebuffer)?;
-                output_tail = &mut output_tail[bytes_written..];
-                total_bytes_written += bytes_written;
-                if self.can_collect() != 0 {
-                    return Err(err::TargetTooSmall);
-                }
-                if self.is_finished() {
-                    break;
-                }
-            }
-            // When the frame header declares a `frame_content_size`,
-            // ensure the drained byte count actually matches it.
-            // Without this check a corrupt frame that sets FCS but
-            // ends early (e.g. last-block flag on a sub-FCS payload)
-            // would silently return success here, while the
-            // eligible-frame direct path catches the same condition
-            // via `FrameContentSizeMismatch`. The fallback path now
-            // matches that behaviour.
-            //
-            // Use `fcs_declared()` (NOT `content_size > 0`) as the
-            // "is FCS on the wire" gate. The two diverge on the
-            // legitimate edge case of an empty frame with an
-            // EXPLICIT FCS=0 on the wire (FCS_flag>=1 with bytes
-            // reading 0, or single_segment+FCS_flag=0 with the
-            // 1-byte FCS=0): `content_size` is 0 in BOTH the
-            // "absent" and "explicitly zero" cases, while
-            // `fcs_declared()` returns false only in the truly
-            // absent case.
-            let state = self.state.as_ref().expect("state populated by init");
-            if state.frame_header.fcs_declared() && (total_bytes_written as u64) != content_size {
-                return Err(err::FrameContentSizeMismatch {
-                    declared: content_size,
-                    produced: total_bytes_written as u64,
-                });
-            }
-            return Ok(total_bytes_written);
+            return self.decode_single_frame_legacy_drain(&mut input, output, content_size);
         }
 
-        // Direct decode path. Borrow the persistent fields
-        // (HUF/FSE tables, offset_hist, scratch Vecs) out of the
-        // existing single-segment Flat scratch; we keep them
-        // populated across `decode_to_slice_trusted` calls (HUF table reuse
-        // is the main scratch-reuse win on small frames). Then
-        // construct a stack-local DecodeBuffer<UserSliceBackend<'o>>
-        // over `output` and bundle into a `DirectScratch`.
+        self.run_direct_decode(&mut input, output, content_size)
+    }
+
+    /// Single-frame legacy drain path: per-block decode + `read()`
+    /// drain into `output`. Used as fallback by
+    /// [`Self::decode_to_slice_trusted`] when direct-decode
+    /// eligibility fails (no FCS, active dict, output too small for
+    /// WILDCOPY slack). Not invoked from `decode_all_impl` since
+    /// that has its own multi-frame loop.
+    fn decode_single_frame_legacy_drain(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        content_size: u64,
+    ) -> Result<usize, FrameDecoderError> {
+        use FrameDecoderError as err;
+
+        let mut output_tail: &mut [u8] = output;
+        let mut total_bytes_written = 0;
+        loop {
+            self.decode_blocks(&mut *input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+            let bytes_written = self
+                .read(output_tail)
+                .map_err(err::FailedToDrainDecodebuffer)?;
+            output_tail = &mut output_tail[bytes_written..];
+            total_bytes_written += bytes_written;
+            if self.can_collect() != 0 {
+                return Err(err::TargetTooSmall);
+            }
+            if self.is_finished() {
+                break;
+            }
+        }
+        // Use `fcs_declared()` (NOT `content_size > 0`) as the
+        // "is FCS on the wire" gate. The two diverge on an empty
+        // frame with explicit FCS=0: `content_size` is 0 in both
+        // "absent" and "explicitly zero" cases, while
+        // `fcs_declared()` returns false only in the truly absent
+        // case.
+        let state = self.state.as_ref().expect("state populated by init");
+        if state.frame_header.fcs_declared() && (total_bytes_written as u64) != content_size {
+            return Err(err::FrameContentSizeMismatch {
+                declared: content_size,
+                produced: total_bytes_written as u64,
+            });
+        }
+        Ok(total_bytes_written)
+    }
+
+    /// Single-frame direct-decode path. Decodes one zstd frame into
+    /// `output[..content_size]` via a stack-local
+    /// `DecodeBuffer<UserSliceBackend>`, bypassing the per-block
+    /// FlatBuf/Ring -> `read()` drain copy.
+    ///
+    /// # Preconditions (caller-enforced)
+    ///
+    /// - `self.init` (or `init_with_dict_handle`) was called for
+    ///   this frame so `self.state` is populated.
+    /// - `content_size` matches `self.state.frame_header
+    ///   .frame_content_size()` and is `> 0` (caller already passed
+    ///   the eligibility gate).
+    /// - `output.len() >= content_size + WILDCOPY_OVERLENGTH`.
+    /// - No active dictionary
+    ///   (`self.state.using_dict.is_none()`).
+    ///
+    /// On return, `input` points at the byte immediately after the
+    /// frame's checksum (or after the last block, when the frame
+    /// has `content_checksum_flag = 0`). `self.state.frame_finished`
+    /// is set so [`Self::is_finished`] reports `true`.
+    fn run_direct_decode(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        content_size: u64,
+    ) -> Result<usize, FrameDecoderError> {
+        use super::block_decoder;
+        use super::decode_buffer::DecodeBuffer;
+        use super::scratch::DirectScratch;
+        use super::user_slice_buf::UserSliceBackend;
+        use crate::io::Read;
+        use FrameDecoderError as err;
+
+        let state = self
+            .state
+            .as_mut()
+            .expect("caller ensures init populated state");
+
         // Borrow persistent fields out of whichever scratch variant
         // `init` produced (Flat for single_segment, Ring for
-        // multi-segment) — both expose the same set of HUF/FSE/Vec
+        // multi-segment) — both expose the same HUF/FSE/Vec
         // fields; only `buffer` differs and we don't use that here.
-        // Macro-style binding to avoid the closure / generic
-        // gymnastics of returning multiple &mut from a match arm.
+        // Macro-style binding avoids the closure / generic
+        // gymnastics of returning multiple `&mut` from a match arm.
         let (huf, fse, offset_hist, literals_buffer, sequences, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => (
@@ -1495,7 +1519,7 @@ impl FrameDecoder {
         let mut produced: u64 = 0;
         loop {
             let (block_header, hsize) = block_dec
-                .read_block_header(&mut input)
+                .read_block_header(&mut *input)
                 .map_err(err::FailedToReadBlockHeader)?;
             state.bytes_read_counter += u64::from(hsize);
             // Pre-flight FCS check ONLY for Raw / RLE blocks where
@@ -1506,9 +1530,7 @@ impl FrameDecoder {
             let block_upper = u64::from(block_header.decompressed_size);
             if block_upper > 0 && produced + block_upper > content_size {
                 // Frame is corrupt — Raw/RLE block headers claim
-                // more output than the FCS allows. Caller's buffer
-                // was sized against FCS, so this is decoder-side
-                // corruption, not user sizing.
+                // more output than the FCS allows.
                 return Err(err::FrameContentSizeMismatch {
                     declared: content_size,
                     produced: produced + block_upper,
@@ -1521,33 +1543,22 @@ impl FrameDecoder {
             let body_consumed = match block_dec.decode_block_content_from_slice(
                 &block_header,
                 &mut direct,
-                &mut input,
+                &mut *input,
             ) {
                 Ok(n) => n,
                 // Defense-in-depth: RLE / Raw block whose declared
                 // `decompressed_size` slipped past the per-block
-                // pre-flight above (e.g. due to overflow arithmetic)
-                // and tripped the backend's fallible write surface.
-                // The pre-flight catches this case via
-                // `FrameContentSizeMismatch` already; convert here
-                // for the residual paths to keep the public surface
-                // panic-free.
+                // pre-flight above and tripped the backend's
+                // fallible write surface.
                 Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
                     ..
                 }) => {
-                    // Use saturating_add on the `produced (u64) +
-                    // decompressed_size (u32 → u64)` sum. Each block's
-                    // `decompressed_size` is bounded by 128 KiB
-                    // (`MAX_BLOCK_SIZE`, smaller than u32::MAX let
-                    // alone u64::MAX), but accumulated `produced`
-                    // across many adversarial frames can grow toward
-                    // u64::MAX. Saturating avoids a panic-in-debug /
-                    // wrap-in-release on the error path itself, which
-                    // would undermine the defense-in-depth this
-                    // conversion exists for. The cap value
-                    // (`u64::MAX`) is informative enough for the
-                    // caller — they only care that `produced` exceeds
-                    // declared `content_size`.
+                    // Use saturating_add on the
+                    // `produced + decompressed_size` sum. Each block
+                    // is bounded by 128 KiB (MAX_BLOCK_SIZE), but
+                    // accumulated `produced` can grow toward
+                    // u64::MAX across adversarial frames. Saturating
+                    // avoids a panic on the error path itself.
                     return Err(err::FrameContentSizeMismatch {
                         declared: content_size,
                         produced: produced
@@ -1557,32 +1568,19 @@ impl FrameDecoder {
                 Err(e) => return Err(err::FailedToReadBlockBody(e)),
             };
             produced = direct.buffer.total_produced();
-            // Post-decode FCS overflow check. Works uniformly for
-            // Raw/RLE/Compressed since it reads the actual bytes
-            // written by the backend rather than the header's
-            // (possibly zero) `decompressed_size`.
+            // Post-decode FCS overflow check.
             if produced > content_size {
                 return Err(err::FrameContentSizeMismatch {
                     declared: content_size,
                     produced,
                 });
             }
-            // Silence unused-binding warning when this delta isn't
-            // consulted — it's there so future debug builds can
-            // assert (produced - before) <= MAX_BLOCK_SIZE if the
-            // spec invariant ever needs an explicit gate.
             let _ = before;
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
             // Cap the visible buffer at window_size between blocks
             // so the next block's match-offset validation matches
-            // the spec's `offset <= window_size` rule. Bytes
-            // physically stay in the user slice; we just narrow
-            // the visible range via `head`. For single-segment
-            // frames `content_size <= window_size` so this is a
-            // no-op on every iteration; for multi-segment frames
-            // it advances `head` once `tail - head` outgrows the
-            // window.
+            // the spec's `offset <= window_size` rule.
             direct.buffer.drop_to_window_size();
             if block_header.last_block {
                 if state.frame_header.descriptor.content_checksum_flag() {
@@ -1596,11 +1594,7 @@ impl FrameDecoder {
                 break;
             }
         }
-        // Final sanity: blocks summed to exactly `content_size`. A
-        // malformed frame with `last_block` set early (or one whose
-        // block headers under-count) would land here. Distinct from
-        // TargetTooSmall — the caller did their part, the frame
-        // itself is corrupt.
+        // Final sanity: blocks summed to exactly `content_size`.
         if produced != content_size {
             return Err(err::FrameContentSizeMismatch {
                 declared: content_size,
@@ -1608,17 +1602,11 @@ impl FrameDecoder {
             });
         }
 
-        // `direct.buffer.len()` would only show the visible (post
-        // head-advance) range, not the total bytes physically
-        // written into the user slice. The decode succeeded so
-        // `content_size` is the authoritative byte count — the
-        // backend wrote exactly that many bytes starting at
-        // `output[0]`.
         let written = content_size as usize;
         state.frame_finished = true;
         // Drop the stack-local DirectScratch (and its DecodeBuffer
         // borrow on `output`) so we can re-borrow `output` for the
-        // hash pass below. After this point `direct` is gone.
+        // hash pass below.
         drop(direct);
         #[cfg(feature = "hash")]
         {
@@ -1628,15 +1616,7 @@ impl FrameDecoder {
             // Walk the decoded output once and propagate the
             // resulting hasher state into the persistent scratch's
             // buffer so `get_calculated_checksum()` returns the
-            // right value. Cost: ~330 us / MiB at xxhash's
-            // ~3 GB/s throughput on x86_64, against cache-hot data.
-            //
-            // Done unconditionally for every successful direct
-            // decode (not just frames with `content_checksum_flag`)
-            // so `get_calculated_checksum()` returns the running
-            // digest path-independently — matches what
-            // `decode_all`'s drain-time hashing produces on
-            // checksumless frames too.
+            // right value path-independently.
             use core::hash::Hasher;
             let mut hasher = twox_hash::XxHash64::with_seed(0);
             hasher.write(&output[..written]);
@@ -1772,6 +1752,53 @@ mod tests {
                 .single_segment_flag(),
             "test precondition violated: frame is single-segment, rename or resize"
         );
+    }
+
+    #[test]
+    fn decode_all_routes_eligible_frame_through_direct_path() {
+        // Regression test for the per-frame direct-path dispatch in
+        // `decode_all_impl`. With a sized-with-slack output buffer
+        // the eligibility gate (FCS > 0, no dict, output.len() >=
+        // FCS + WILDCOPY_OVERLENGTH) holds, so `decode_all` must
+        // route through `run_direct_decode` and produce the same
+        // bytes the legacy drain path would.
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect("decode_all with WILDCOPY slack should succeed via direct path");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], payload.as_slice());
+    }
+
+    #[test]
+    fn decode_all_with_tight_output_routes_through_legacy_drain() {
+        // Output sized to EXACTLY content_size (no slack) must
+        // fail the direct-path eligibility gate and fall back to
+        // the per-block decode + read drain loop. This covers
+        // callers that don't / can't pre-size with WILDCOPY slack.
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect("decode_all with tight output must succeed via legacy drain");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], payload.as_slice());
     }
 
     #[cfg(feature = "hash")]
