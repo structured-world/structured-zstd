@@ -1419,6 +1419,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_block_content_backend_overflow_display_names_the_step() {
+        use crate::blocks::block::BlockType;
+        assert_eq!(
+            DecodeBlockContentError::BackendOverflow {
+                step: BlockType::RLE
+            }
+            .to_string(),
+            "RLE block's decompressed payload exceeds the caller-provided output buffer"
+        );
+        assert_eq!(
+            DecodeBlockContentError::BackendOverflow {
+                step: BlockType::Raw
+            }
+            .to_string(),
+            "Raw block's decompressed payload exceeds the caller-provided output buffer"
+        );
+    }
+
+    #[test]
     fn literal_display_messages_are_specific() {
         assert_eq!(
             DecompressLiteralsError::MissingCompressedSize.to_string(),
