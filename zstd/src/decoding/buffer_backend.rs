@@ -87,17 +87,24 @@ pub(crate) trait BufferBackend: Sized {
     ///   issues an unconditional `copy16` from `lits.as_ptr()` and,
     ///   when `lit_length > 16`, a 16-byte-stride wildcopy that may
     ///   load up to 15 bytes past `lits.len()` on its final
-    ///   iteration. Callers MUST ensure the backing literal buffer
-    ///   has ≥ `lits.len() + 15` initialised bytes addressable
-    ///   from `lits.as_ptr()`. The current dispatch site
+    ///   iteration. Callers MUST satisfy two distinct slack bounds:
+    ///   - `lit_cur_before + 16 <= lit_len` ALWAYS (the
+    ///     unconditional `copy16` reads 16 bytes regardless of
+    ///     `lit_length`, including the `lit_length == 0` case).
+    ///   - `lit_cur_before + lit_length + 15 <= lit_len` ONLY when
+    ///     `lit_length > 16` (the wildcopy tail's final 16-byte
+    ///     load).
+    ///
+    ///   The current dispatch site
     ///   (`sequence_section_decoder::execute_one_sequence_pipelined`)
-    ///   gates on `high + 15 <= lit_len` (where `high = lit_cur +
-    ///   lit_length` and `lit_len` is the parent literals-buffer
-    ///   length) and falls through to the legacy `push`/`repeat`
-    ///   chain when the slack is unavailable — a future caller
-    ///   reusing this hook must enforce an equivalent gate or pad
-    ///   the literals buffer with 15 bytes of slack at allocation
-    ///   time.
+    ///   enforces both via `donor_path_safe = lit_cur_before + 16 <=
+    ///   lit_len && (lit_length <= 16 || high + 15 <= lit_len)`
+    ///   (with `high = lit_cur_before + lit_length`, `lit_len` =
+    ///   parent literals-buffer length) and falls through to the
+    ///   legacy `push`/`repeat` chain when either bound fails — a
+    ///   future caller reusing this hook must enforce the same gate
+    ///   or pad the literals buffer with 15 bytes of slack at
+    ///   allocation time.
     /// - Caller is responsible for updating any DecodeBuffer-level
     ///   counters (`total_output_counter`, hash) that mirror the
     ///   bytes this method writes — see

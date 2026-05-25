@@ -35,32 +35,22 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
 ///
-/// Snapshots tail / counter / cap. Under `feature = "hash"` also
-/// snapshots the frame `XxHash64` state so a rollback after a path
-/// that folded bytes into `self.hash` does not leave the hash
-/// committed for bytes the caller has discarded. Hash mutation
-/// sites on the decode write surface are:
-///   * `advance_output_counter` — donor inline path bookkeeping
-///     (writes `n` bytes' worth straight into `self.hash`).
-///   * `drain_to` / `read` — drain-time hashing of the bytes that
-///     leave the live region.
-///
-/// `push` and `extend_and_fill` themselves do NOT touch `self.hash`
-/// — they only advance `total_output_counter`; the rolling hash gets
-/// folded later when those bytes drain out, OR (on the donor inline
-/// path) directly by `advance_output_counter`. Rollback still needs
-/// to restore the hash because the same checkpoint covers both
-/// classes of write surface.
-///
-/// Cloning `XxHash64` is cheap — internal state is a handful of u64
-/// accumulators plus a short remainder buffer.
-#[derive(Clone)]
+/// Snapshots tail / counter / cap. Hash state is NOT snapshotted:
+/// no mutation site between `checkpoint()` and the matched
+/// `try_restore_checkpoint()` writes to `self.hash`:
+///   * `push` and `extend_and_fill` only advance
+///     `total_output_counter`.
+///   * `advance_output_counter` (donor inline path) only advances
+///     `total_output_counter` (hashing is deferred to the final
+///     full-slice pass in `FrameDecoder::decode_to_slice_trusted`).
+///   * `drain_to` / `read` DO write hash, but they run BETWEEN
+///     blocks, never inside the fused sequence loop the checkpoint
+///     guards.
+#[derive(Copy, Clone)]
 pub(crate) struct DecodeBufferCheckpoint {
     tail: usize,
     total_output_counter: u64,
     cap: usize,
-    #[cfg(feature = "hash")]
-    hash: twox_hash::XxHash64,
 }
 
 impl<B: BufferBackend> Read for DecodeBuffer<B> {
@@ -142,8 +132,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             tail: self.buffer.tail(),
             total_output_counter: self.total_output_counter,
             cap: self.buffer.cap(),
-            #[cfg(feature = "hash")]
-            hash: self.hash.clone(),
         }
     }
 
@@ -174,18 +162,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // and the current tail as discarded.
         unsafe { self.buffer.set_tail(cp.tail) };
         self.total_output_counter = cp.total_output_counter;
-        #[cfg(feature = "hash")]
-        {
-            // Hash state is mutated by `push` / `extend_and_fill` /
-            // `advance_output_counter` as bytes flow in. Restoring the
-            // snapshot here undoes those mutations so the rolled-back
-            // bytes don't end up in the frame digest. Without this
-            // the checksum that ships in the frame trailer would
-            // mismatch on rollback paths that the legacy two-pass
-            // pipeline used to handle by simply never writing the
-            // bytes in the first place.
-            self.hash = cp.hash;
-        }
+        // No hash restore: see `DecodeBufferCheckpoint` doc. No
+        // mutation site between `checkpoint()` and this call writes
+        // to `self.hash` (drain runs between blocks, not inside the
+        // fused sequence loop; the donor inline path's
+        // `advance_output_counter` advances only the counter).
         true
     }
 
@@ -211,43 +192,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         &mut self.buffer
     }
 
-    /// Advance the output counter (and frame hash if enabled) by `n`
-    /// bytes — pair with [`super::buffer_backend::BufferBackend::donor_exec_one_sequence`]
+    /// Advance the `total_output_counter` by `n` bytes — pair with
+    /// [`super::buffer_backend::BufferBackend::donor_exec_one_sequence`]
     /// which writes the actual bytes through the backend without
     /// touching DecodeBuffer-level bookkeeping. Without this helper
-    /// the donor-shape path would leave `total_output_counter` and
-    /// the frame-content hash stale on every sequence executed
-    /// through it.
+    /// the donor-shape path would leave `total_output_counter` stale
+    /// on every sequence executed through it.
     ///
-    /// Hash bytes are read straight off the backend tail prior to
-    /// advancing; the caller has just written `n` bytes ending at
-    /// the current tail position.
+    /// **Hash is NOT mutated here.** On the direct-decode path
+    /// `FrameDecoder::decode_to_slice_trusted` walks the full output
+    /// slice once at end of decode and writes the result into
+    /// `self.hash`, overwriting any incremental state. Hashing per
+    /// sequence here would be wasted work whose result the final
+    /// pass discards. The legacy decode path likewise folds bytes
+    /// into the hash via `drain_to`, not at write time.
     #[inline]
     pub(crate) fn advance_output_counter(&mut self, n: usize) {
         self.total_output_counter += n as u64;
-        #[cfg(feature = "hash")]
-        {
-            // Read the just-written tail bytes via the backend's
-            // slice view. Donor-path callers (gated by
-            // `BufferBackend::SUPPORTS_INLINE_DONOR_EXEC = true`) are
-            // currently restricted to `UserSliceBackend`, whose
-            // `as_slices()` returns `(&slice[head..tail], &[])` — a
-            // single contiguous prefix. Two-slice ring-wrap layout
-            // (`RingBuffer`) returns `false` for the const above and
-            // therefore never reaches this helper. If a future backend
-            // opts into the donor path AND uses two-slice layout,
-            // the `as_slices().0` shortcut here would miss bytes
-            // straddling the wrap — update both slices then.
-            let (front, back) = self.buffer.as_slices();
-            debug_assert!(
-                back.is_empty(),
-                "advance_output_counter assumes contiguous front slice; \
-                 only backends with single-slice layout may opt into \
-                 SUPPORTS_INLINE_DONOR_EXEC"
-            );
-            let lo = front.len().saturating_sub(n);
-            self.hash.write(&front[lo..]);
-        }
     }
 
     /// Fill `fill_length` bytes of the output with the literal `fill_with`,
