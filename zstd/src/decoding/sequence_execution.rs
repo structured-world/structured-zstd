@@ -78,12 +78,16 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     do_offset_history_repcode(offset_value, lit_len, scratch)
 }
 
-// Previously `#[cold] #[inline(never)]` on the assumption that the
-// repcode path (offset_value ∈ {1, 2, 3}) is rare. perf annotate on the
-// i9 primary bench shows it fires at ~2% of decode time with ~21% of
-// the function's own samples in pushq/popq prologue/epilogue — a clear
-// signal that "cold" was the wrong call. Drop the annotations and let
-// LLVM heuristics decide inlining based on body size + call count.
+// Kept `#[cold]` + `#[inline(never)]` despite the helper firing at
+// ~2% of decode time on the i9 primary bench. An earlier experiment
+// dropping both annotations (audit row #18) regressed +1.68% — the
+// out-of-line placement plus branch-prediction bias for the common
+// non-repcode fallthrough are worth more than the saved push/pop
+// observed in perf annotate. Removing the annotations let LLVM either
+// inline too aggressively (caller bloat / icache pressure) or pick a
+// worse code layout. Hands-off LLVM heuristic is the wrong call here.
+#[cold]
+#[inline(never)]
 fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
