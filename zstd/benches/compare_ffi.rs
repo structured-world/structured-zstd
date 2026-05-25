@@ -284,20 +284,22 @@ fn pretouch_pages(buf: &mut [u8]) {
     if buf.is_empty() {
         return;
     }
-    // 4 KiB is the small-page size on every supported target. Targets
-    // with larger base pages (16 KiB on Apple Silicon, etc.) just touch
-    // more often than strictly required — still correct, cheap.
+    // 4 KiB is a common base page size; on systems with larger base
+    // pages (16 KiB on Apple Silicon, 64 KiB on some aarch64 kernels)
+    // we touch more often than strictly required — still correct,
+    // cheap.
     const STRIDE: usize = 4096;
     let len = buf.len();
     let ptr = buf.as_mut_ptr();
     // SAFETY: `ptr` is non-null (buf non-empty above) and each
-    // `ptr.add(off)` stays within `len` due to the loop bound.
-    // `write_volatile` of `0u8` does not alias other live references.
+    // `ptr.add(off)` stays within `len` due to the `step_by` range
+    // bound. `write_volatile` of `0u8` does not alias other live
+    // references. Iterating via `(0..len).step_by(STRIDE)` guarantees
+    // termination — no `usize` overflow risk that a manual `off +=
+    // STRIDE` accumulator carries for buffers approaching `usize::MAX`.
     unsafe {
-        let mut off = 0usize;
-        while off < len {
+        for off in (0..len).step_by(STRIDE) {
             ptr.add(off).write_volatile(0);
-            off += STRIDE;
         }
         // Also touch the final byte so the tail page is in even if
         // `len` is not a multiple of STRIDE.
