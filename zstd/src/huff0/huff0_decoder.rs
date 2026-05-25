@@ -166,7 +166,10 @@ impl<'t> HuffmanDecoder<'t> {
     /// impls (`decode4_unchecked` + `advance_state`) and is selected
     /// once via `match detect_huffman_decode_kernel() { ... }`.
     #[inline(always)]
-    pub fn init_state<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    pub fn init_state<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         let num_bits = self.table.max_num_bits;
         let new_bits = br.get_bits(num_bits);
         self.state = new_bits;
@@ -177,7 +180,10 @@ impl<'t> HuffmanDecoder<'t> {
     /// to read from the new position.
     #[cfg(feature = "fuzz_exports")]
     #[inline(always)]
-    fn next_state<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    fn next_state<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
         let num_bits = self.table.decode[self.state as usize].num_bits;
@@ -191,13 +197,19 @@ impl<'t> HuffmanDecoder<'t> {
     /// Fuzz-only shim for advancing to the next decoding state.
     #[cfg(feature = "fuzz_exports")]
     #[inline(always)]
-    pub fn fuzz_next_state<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    pub fn fuzz_next_state<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         self.next_state(br)
     }
 
     /// Decode symbol and advance state in one table lookup.
     #[inline(always)]
-    pub fn decode_symbol_and_advance<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    pub fn decode_symbol_and_advance<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         // On x86 the BMI2 kernel uses `_bzhi_u64` and is a real
         // perf win over the scalar `((state << n) & mask) | new_bits`
         // sequence, so the runtime match is load-bearing. On aarch64
@@ -236,7 +248,10 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     #[inline(always)]
-    fn decode_symbol_and_advance_scalar<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    fn decode_symbol_and_advance_scalar<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
         self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
@@ -245,7 +260,10 @@ impl<'t> HuffmanDecoder<'t> {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "bmi2")]
-    unsafe fn decode_symbol_and_advance_x86_bmi2<K: crate::cpu_kernel::CpuKernel>(&mut self, br: &mut BitReaderReversed<'_, K>) -> u8 {
+    unsafe fn decode_symbol_and_advance_x86_bmi2<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
         let entry = self.table.decode[self.state as usize];
         let new_bits = br.get_bits(entry.num_bits);
         self.state = unsafe { self.advance_state_x86_bmi2(entry.num_bits, new_bits) };
@@ -453,7 +471,8 @@ impl HuffmanTable {
                     });
                 }
                 let compressed_weights = &compressed_weights[..compressed_length];
-                let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(compressed_weights);
+                let mut br =
+                    BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(compressed_weights);
 
                 bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
 
@@ -727,7 +746,8 @@ mod tests {
         let table = test_table();
         let initial_state = 1_u64;
         let entry = table.decode[initial_state as usize];
-        let mut manual_br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
+        let mut manual_br =
+            BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
         let expected_new_bits = manual_br.get_bits(entry.num_bits);
         let expected_state =
             ((initial_state << entry.num_bits) & table.state_mask) | expected_new_bits;
@@ -737,7 +757,8 @@ mod tests {
             kernel: HuffmanDecodeKernel::Scalar,
             state: initial_state,
         };
-        let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
+        let mut br =
+            BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
         let symbol = decoder.decode_symbol_and_advance(&mut br);
 
         assert_eq!(symbol, entry.symbol);
