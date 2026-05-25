@@ -200,13 +200,15 @@ pub(crate) trait BufferBackend: Sized {
     #[allow(dead_code)]
     fn try_extend_from_within(&mut self, start: usize, len: usize) -> Result<(), BackendOverflow> {
         // Default impl: a SAFE method must NOT delegate to the
-        // unsafe variant without validating both halves of its
-        // safety contract. Validate the source range first
-        // (`start + len <= self.len()`), then grow capacity and
-        // validate the destination range (`tail + len <= cap`),
-        // then forward to the unsafe write. Fixed-capacity
-        // backends override this with a tighter pair of checks
-        // that does not call `reserve` (a no-op on them).
+        // unsafe variant without validating its safety contract.
+        // Validate the source range (`start + len <= self.len()`),
+        // then `reserve(len)` to guarantee destination capacity
+        // (growable-backend invariant — see the linear vs wrap-aware
+        // discussion below). NO eager `tail + len <= cap` check
+        // because `RingBuffer::tail` is a modular wrap-index where
+        // `tail + len > cap` is normal mid-stream. Fixed-capacity
+        // backends (`UserSliceBackend`) override with their own
+        // wrap-unaware linear capacity check.
         let tail = self.tail();
         let capacity = self.cap();
         let src_end = start.checked_add(len).ok_or(BackendOverflow {

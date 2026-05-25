@@ -1535,17 +1535,19 @@ impl FrameDecoder {
                 Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
                     ..
                 }) => {
-                    // Use saturating_add — this arm is reached when the
-                    // block content exceeded the backend's capacity, i.e.
-                    // exactly the case where naive `produced +
-                    // decompressed_size` is most at risk of overflowing
-                    // u64 itself on adversarial header values (e.g.
-                    // `decompressed_size == u64::MAX`). Reporting
-                    // `u64::MAX` is informative enough for the caller
-                    // and avoids a panic-in-debug / wrap-in-release
-                    // bug in the error-path itself, which would
-                    // undermine the defense-in-depth this conversion
-                    // exists for.
+                    // Use saturating_add on the `produced (u64) +
+                    // decompressed_size (u32 → u64)` sum. Each block's
+                    // `decompressed_size` is bounded by 128 KiB
+                    // (`MAX_BLOCK_SIZE`, smaller than u32::MAX let
+                    // alone u64::MAX), but accumulated `produced`
+                    // across many adversarial frames can grow toward
+                    // u64::MAX. Saturating avoids a panic-in-debug /
+                    // wrap-in-release on the error path itself, which
+                    // would undermine the defense-in-depth this
+                    // conversion exists for. The cap value
+                    // (`u64::MAX`) is informative enough for the
+                    // caller — they only care that `produced` exceeds
+                    // declared `content_size`.
                     return Err(err::FrameContentSizeMismatch {
                         declared: content_size,
                         produced: produced

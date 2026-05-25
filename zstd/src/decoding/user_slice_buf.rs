@@ -404,10 +404,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // can be bypassed by an `len` near `usize::MAX`, turning
         // the fallible write into a release-mode panic via
         // `copy_bytes_overshooting`.
+        // BackendOverflow is `Copy` with three usize fields; eager
+        // construction is cheaper than a closure indirection on this
+        // hot path (clippy::unnecessary_lazy_evaluations).
         let new_tail =
             self.tail
                 .checked_add(len)
-                .ok_or_else(|| super::buffer_backend::BackendOverflow {
+                .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
@@ -444,13 +447,14 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // adversarial `fill_length` near `usize::MAX` would wrap
         // `new_tail`, bypass the upper bound, and panic in
         // `slice[tail..new_tail]` (start > end).
-        let new_tail = self.tail.checked_add(fill_length).ok_or_else(|| {
-            super::buffer_backend::BackendOverflow {
-                tail: self.tail,
-                requested: fill_length,
-                capacity: self.slice.len(),
-            }
-        })?;
+        let new_tail =
+            self.tail
+                .checked_add(fill_length)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: fill_length,
+                    capacity: self.slice.len(),
+                })?;
         if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
@@ -478,19 +482,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let abs_start =
             self.head
                 .checked_add(start)
-                .ok_or_else(|| super::buffer_backend::BackendOverflow {
+                .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
                 })?;
-        let abs_end =
-            abs_start
-                .checked_add(len)
-                .ok_or_else(|| super::buffer_backend::BackendOverflow {
-                    tail: self.tail,
-                    requested: len,
-                    capacity: self.slice.len(),
-                })?;
+        let abs_end = abs_start
+            .checked_add(len)
+            .ok_or(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            })?;
         if abs_end > self.tail {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
@@ -502,10 +505,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // protection — without it, an adversarial `len` near
         // `usize::MAX` wraps and bypasses the upper bound, turning
         // the unchecked write into a release-mode UB / panic.
+        // BackendOverflow is `Copy` with three usize fields; eager
+        // construction is cheaper than a closure indirection on this
+        // hot path (clippy::unnecessary_lazy_evaluations).
         let new_tail =
             self.tail
                 .checked_add(len)
-                .ok_or_else(|| super::buffer_backend::BackendOverflow {
+                .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
@@ -636,7 +642,7 @@ mod tests {
     // Coverage for the fallible try_* surface. Exercises:
     //   - happy paths (exact-fit + room to spare),
     //   - capacity-overflow paths (returns Err with diagnostic fields),
-    //   - integer-overflow wrap-guards (checked_add ok_or_else branch).
+    //   - integer-overflow wrap-guards (checked_add ok_or branch).
 
     use super::super::buffer_backend::BufferBackend;
 
