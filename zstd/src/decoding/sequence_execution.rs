@@ -78,8 +78,12 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     do_offset_history_repcode(offset_value, lit_len, scratch)
 }
 
-#[cold]
-#[inline(never)]
+// Previously `#[cold] #[inline(never)]` on the assumption that the
+// repcode path (offset_value ∈ {1, 2, 3}) is rare. perf annotate on the
+// i9 primary bench shows it fires at ~2% of decode time with ~21% of
+// the function's own samples in pushq/popq prologue/epilogue — a clear
+// signal that "cold" was the wrong call. Drop the annotations and let
+// LLVM heuristics decide inlining based on body size + call count.
 fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
