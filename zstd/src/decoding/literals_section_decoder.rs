@@ -4,6 +4,9 @@
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
+use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
@@ -124,6 +127,65 @@ fn decompress_literals(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
+    // Per-block CpuKernel dispatch. detect_cpu_kernel() is OnceLock-cached
+    // so the tag is resolved once per process; the match below collapses
+    // to a single cmp+jmp on subsequent calls. Each arm dispatches into a
+    // target_feature-wrapped outer function so the entire impl::<K> pipeline
+    // executes inside the matching target_feature context — without that
+    // wrapping, LLVM cannot inline target_feature'd intrinsics (e.g.
+    // _bzhi_u64 inside K::mask_lower_bits) through the trait-method call
+    // boundary back into the generic caller, and the inlined-intrinsic
+    // win evaporates into a function-call trampoline per mask op.
+    match detect_cpu_kernel() {
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Vbmi2 => unsafe { decompress_literals_vbmi2(section, scratch, source, target) },
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Avx2 => unsafe { decompress_literals_avx2(section, scratch, source, target) },
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Bmi2 => unsafe { decompress_literals_bmi2(section, scratch, source, target) },
+        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, source, target),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,avx2")]
+unsafe fn decompress_literals_avx2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Avx2Kernel>(section, scratch, source, target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn decompress_literals_bmi2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Bmi2Kernel>(section, scratch, source, target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw,bmi2,avx2")]
+unsafe fn decompress_literals_vbmi2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, source, target)
+}
+
+fn decompress_literals_impl<K: CpuKernel>(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 
     let compressed_size = section.compressed_size.ok_or(err::MissingCompressedSize)? as usize;
@@ -182,11 +244,11 @@ fn decompress_literals(
             HuffmanDecoder::new(&scratch.table),
             HuffmanDecoder::new(&scratch.table),
         ];
-        let mut brs: [BitReaderReversed<'_>; 4] = [
-            BitReaderReversed::new(streams[0]),
-            BitReaderReversed::new(streams[1]),
-            BitReaderReversed::new(streams[2]),
-            BitReaderReversed::new(streams[3]),
+        let mut brs: [BitReaderReversed<'_, K>; 4] = [
+            BitReaderReversed::<K>::new(streams[0]),
+            BitReaderReversed::<K>::new(streams[1]),
+            BitReaderReversed::<K>::new(streams[2]),
+            BitReaderReversed::<K>::new(streams[3]),
         ];
 
         // Initialize all 4 streams: skip padding and set initial state
@@ -332,7 +394,7 @@ fn decompress_literals(
         //just decode the one stream
         assert!(num_streams == 1);
         let mut decoder = HuffmanDecoder::new(&scratch.table);
-        let mut br = BitReaderReversed::new(source);
+        let mut br = BitReaderReversed::<K>::new(source);
         let mut skipped_bits = 0;
         loop {
             let val = br.get_bits(1);
@@ -407,9 +469,9 @@ struct LoopBounds {
 /// `brs[s].source` must be the slice the corresponding decoder was
 /// initialised against.
 #[inline(always)]
-unsafe fn run_4stream_burst_loop(
+unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
-    brs: &mut [BitReaderReversed<'_>; 4],
+    brs: &mut [BitReaderReversed<'_, K>; 4],
     target: &mut [u8],
     packed: &[u16],
     cursors: &mut [usize; 4],
@@ -647,6 +709,9 @@ mod zerocopy_robustness_tests {
     // builders.
     use super::{LiteralsView, decode_literals_zerocopy};
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
     use crate::decoding::scratch::HuffmanScratch;
     use crate::huff0::HuffmanTable;
     use alloc::vec::Vec;

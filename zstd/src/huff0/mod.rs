@@ -36,7 +36,7 @@ pub fn round_trip(data: &[u8]) {
     let table_bytes = decoder_table.build_decoder(&encoded).unwrap();
     let mut decoder = HuffmanDecoder::new(&decoder_table);
 
-    let mut br = BitReaderReversed::new(&encoded[table_bytes as usize..]);
+    let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&encoded[table_bytes as usize..]);
     let mut skipped_bits = 0;
     loop {
         let val = br.get_bits(1);
