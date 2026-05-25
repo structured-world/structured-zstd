@@ -310,7 +310,7 @@ impl FSETable {
     /// `feature = "fuzz_exports"` builds where external code can
     /// stuff arbitrary entries; the safe default keeps the decode
     /// hot path from observing UB even in that contrived case.
-    pub fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
+    pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
         for entry in self.decode.iter_mut() {
             let idx = entry.symbol as usize;
             if idx < packed.len() {
@@ -347,7 +347,7 @@ impl FSETable {
     /// — the entry's fields stay at zero so the decode path
     /// surfaces the corruption downstream instead of producing a
     /// wraparound shift here.
-    pub fn enrich_for_offsets(&mut self) {
+    pub(crate) fn enrich_for_offsets(&mut self) {
         for entry in self.decode.iter_mut() {
             // Reset before the bound check so out-of-range
             // symbols clear stale metadata instead of carrying it
