@@ -330,7 +330,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         }
     }
 
-    #[inline]
+    // Force-inline for the same reason as `extend` above: this is
+    // the match-copy hot path called from every sequence executor
+    // iteration in `decode_and_execute_sequences`. perf annotate
+    // on the primary bench shows the prologue/epilogue contributing
+    // a non-trivial fraction of the 9-10% sample slot.
+    #[inline(always)]
     unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         let dst_off = self.tail;
         let src_off = self.head + start;
