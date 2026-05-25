@@ -1535,9 +1535,21 @@ impl FrameDecoder {
                 Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
                     step: _,
                 }) => {
+                    // Use saturating_add — this arm is reached when the
+                    // block content exceeded the backend's capacity, i.e.
+                    // exactly the case where naive `produced +
+                    // decompressed_size` is most at risk of overflowing
+                    // u64 itself on adversarial header values (e.g.
+                    // `decompressed_size == u64::MAX`). Reporting
+                    // `u64::MAX` is informative enough for the caller
+                    // and avoids a panic-in-debug / wrap-in-release
+                    // bug in the error-path itself, which would
+                    // undermine the defense-in-depth this conversion
+                    // exists for.
                     return Err(err::FrameContentSizeMismatch {
                         declared: content_size,
-                        produced: produced + u64::from(block_header.decompressed_size),
+                        produced: produced
+                            .saturating_add(u64::from(block_header.decompressed_size)),
                     });
                 }
                 Err(e) => return Err(err::FailedToReadBlockBody(e)),

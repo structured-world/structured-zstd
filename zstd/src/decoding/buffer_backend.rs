@@ -213,25 +213,32 @@ pub(crate) trait BufferBackend: Sized {
                 capacity,
             });
         }
+        // Growth + linear destination bound:
+        //
+        // `reserve(len)` is the growable-backend invariant — after
+        // it returns, the backend has room for `len` more bytes.
+        // For `FlatBuf` that's a linear `Vec::reserve`; for
+        // `RingBuffer` it's a wrap-aware grow that maintains the
+        // ring invariant. EITHER way, the only check needed by the
+        // default impl is the `start + len` source bound above —
+        // capacity for the write is guaranteed by `reserve`.
+        //
+        // We deliberately do NOT add a `tail + len <= cap` check
+        // here: `RingBuffer::tail` is a modular index that wraps,
+        // so a `tail + len > cap` situation is normal mid-stream
+        // (the write straddles the wrap and lands at the head end).
+        // An eager linear check would reject valid wrap writes and
+        // return `Err(BackendOverflow)` on inputs the underlying
+        // `extend_from_within_unchecked` would handle correctly.
+        // Fixed-capacity backends (`UserSliceBackend`) override
+        // `try_extend_from_within` with their own non-wrap-aware
+        // capacity check.
         self.reserve(len);
-        let tail = self.tail();
-        let capacity = self.cap();
-        let new_tail = tail.checked_add(len).ok_or(BackendOverflow {
-            tail,
-            requested: len,
-            capacity,
-        })?;
-        if new_tail > capacity {
-            return Err(BackendOverflow {
-                tail,
-                requested: len,
-                capacity,
-            });
-        }
-        // SAFETY: both halves of the `extend_from_within_unchecked`
-        // safety contract validated above — source bound checked
-        // against `self.len()`, destination bound checked against
-        // `cap()` after `reserve`.
+        // SAFETY: source bound `start + len <= self.len()` checked
+        // above; destination capacity guaranteed by the just-called
+        // `reserve(len)`, both linear (FlatBuf) and wrap-aware
+        // (RingBuffer). Wrap-unaware fixed-capacity backends
+        // override this method.
         unsafe { self.extend_from_within_unchecked(start, len) };
         Ok(())
     }

@@ -678,23 +678,29 @@ mod tests {
     }
 
     #[test]
-    fn try_extend_checked_add_wrap_returns_overflow() {
+    fn try_extend_zero_length_succeeds_and_leaves_tail_unchanged() {
+        // The `checked_add(tail, len)` wrap branch in `try_extend` is
+        // a defense-in-depth guard for corrupted input that names
+        // `regenerated_size` near `usize::MAX`. Constructing such a
+        // `&[u8]` from safe Rust is not expressible — `from_raw_parts`
+        // with a forged length is UB. The wrap branch is exercised
+        // only from the fuzz harness under `feature = "fuzz_exports"`
+        // (which routes a controlled `len` through `try_*`) and from
+        // the real malformed-frame decode path that the harness
+        // emulates.
+        //
+        // This test covers the adjacent normal case — a zero-length
+        // `try_extend` MUST succeed regardless of current `tail`
+        // (the new_tail = tail + 0 = tail comparison both passes
+        // checked_add and the upper-bound check). Without this case
+        // the early-return on `len == 0` could regress silently.
         let mut buf = vec![0u8; 8];
         let mut b = UserSliceBackend::from_slice(&mut buf);
-        // Build a fake-length slice that would wrap tail + len. Using
-        // a zero-length slice with a forged `len` via from_raw_parts
-        // would be UB; instead we drive the wrap by extending until
-        // `tail = 8`, then crafting `data.len()` near usize::MAX
-        // through a manually-constructed slice descriptor is not
-        // safely expressible. The wrap branch is reachable in
-        // practice only from corrupted input that names
-        // `regenerated_size` near usize::MAX; documenting the
-        // unreachable-from-safe-Rust nature here suffices for the
-        // codecov line — the branch IS exercised by the fuzz harness
-        // when `feature = "fuzz_exports"` is set, which routes a
-        // controlled `len` through `try_*`. Skip in this unit-test
-        // sweep.
-        assert!(b.try_extend(&[0; 0]).is_ok());
+        assert!(b.try_extend(&[]).is_ok());
+        assert_eq!(b.tail(), 0);
+        b.extend(&[1, 2, 3]);
+        assert!(b.try_extend(&[]).is_ok());
+        assert_eq!(b.tail(), 3);
     }
 
     #[test]
