@@ -4,9 +4,9 @@
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
-use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
+use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
@@ -138,7 +138,9 @@ fn decompress_literals(
     // win evaporates into a function-call trampoline per mask op.
     match detect_cpu_kernel() {
         #[cfg(target_arch = "x86_64")]
-        CpuKernelTag::Vbmi2 => unsafe { decompress_literals_vbmi2(section, scratch, source, target) },
+        CpuKernelTag::Vbmi2 => unsafe {
+            decompress_literals_vbmi2(section, scratch, source, target)
+        },
         #[cfg(target_arch = "x86_64")]
         CpuKernelTag::Avx2 => unsafe { decompress_literals_avx2(section, scratch, source, target) },
         #[cfg(target_arch = "x86_64")]
@@ -294,14 +296,20 @@ fn decompress_literals_impl<K: CpuKernel>(
         // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
         // MEM_read64(ip[s]) | 1`.
         let max_num_bits = scratch.table.max_num_bits;
-        // `symbols_per_burst * max + max_padding_skip < 64 - max` so
-        // the corrupted bit-0 from donor's `(bit_container | 1)`
-        // composition (which lands at bit `padding_skip` initially)
-        // never reaches the top `max_num_bits` state region after
-        // the worst-case shift sequence. `padding_skip ∈ [1, 8]` —
-        // we cap by 8 to stay safe for the upper boundary case.
-        // For max=11: 4 symbols. For max=8: 6 symbols. For max=4: 13.
-        let symbols_per_burst: usize = (64 - max_num_bits as usize - 8) / max_num_bits as usize;
+        // Safety constraint per donor `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
+        // before each `bits[s] >> table_shift` read, the sentinel-bit position
+        // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
+        // `max_num_bits` read region). After K shifts the sentinel is at bit
+        // `padding_skip + K*max_num_bits`. The N-th read happens after (N-1)
+        // shifts, so the inclusive bound is
+        //   padding_skip + (N-1)*max_num_bits < 64 - max_num_bits
+        // i.e.
+        //   padding_skip + N*max_num_bits <= 63
+        // Solving for N with padding_skip ≤ 8:
+        //   N <= (63 - 8) / max_num_bits = 55 / max_num_bits
+        // For max=11: 5 symbols (donor parity — was 4 with the old off-by-one
+        // formula). For max=8: 6 symbols. For max=4: 13.
+        let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
         let table_shift = (64 - max_num_bits) as u32;
         let packed = scratch.table.packed_decode.as_slice();
@@ -709,9 +717,9 @@ mod zerocopy_robustness_tests {
     // builders.
     use super::{LiteralsView, decode_literals_zerocopy};
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
-use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
-#[cfg(target_arch = "x86_64")]
-use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
+    #[cfg(target_arch = "x86_64")]
+    use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
+    use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
     use crate::decoding::scratch::HuffmanScratch;
     use crate::huff0::HuffmanTable;
     use alloc::vec::Vec;
