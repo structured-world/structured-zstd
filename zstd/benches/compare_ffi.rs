@@ -264,6 +264,47 @@ fn bench_decompress(c: &mut Criterion) {
     }
 }
 
+/// Force every page of `buf` into the process's resident set with one
+/// volatile write per page-sized stride. `vec![0u8; N]` returns pages
+/// CoW-mapped to the kernel zero page on Linux; the first real write
+/// per page in the timed iter would otherwise trigger a synchronous
+/// page-fault to allocate the anon backing. On `--profile-time` runs
+/// (no warmup) that accounted for 67% of total samples on z000033 L-3
+/// c_stream flamegraph.
+///
+/// Volatile writes are required because under the bench profile's fat
+/// LTO + single-codegen-unit settings, a plain `slice::fill(0)` /
+/// `Vec::resize` followed by full-slice overwrite from the decoder is
+/// a dead-store the optimizer can elide. `write_volatile` is a guaranteed
+/// side effect — LLVM may not remove it. One write per 4 KiB stride
+/// (the most common page size; larger huge pages still get touched at
+/// the smaller stride) is enough to fault each anon page in.
+#[inline(never)]
+fn pretouch_pages(buf: &mut [u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    // 4 KiB is the small-page size on every supported target. Targets
+    // with larger base pages (16 KiB on Apple Silicon, etc.) just touch
+    // more often than strictly required — still correct, cheap.
+    const STRIDE: usize = 4096;
+    let len = buf.len();
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: `ptr` is non-null (buf non-empty above) and each
+    // `ptr.add(off)` stays within `len` due to the loop bound.
+    // `write_volatile` of `0u8` does not alias other live references.
+    unsafe {
+        let mut off = 0usize;
+        while off < len {
+            ptr.add(off).write_volatile(0);
+            off += STRIDE;
+        }
+        // Also touch the final byte so the tail page is in even if
+        // `len` is not a multiple of STRIDE.
+        ptr.add(len - 1).write_volatile(0);
+    }
+}
+
 fn bench_decompress_source(
     c: &mut Criterion,
     scenario: &Scenario,
@@ -308,21 +349,7 @@ fn bench_decompress_source(
     group.bench_function("pure_rust", |b| {
         let compressed = materialize();
         let mut target = vec![0u8; expected_len];
-        // `vec![0u8; N]` performs a zero-initialized allocation via
-        // `alloc_zeroed`. On glibc + Linux that typically resolves to
-        // `mmap(MAP_ANONYMOUS)` (or `calloc` for smaller buffers),
-        // both of which return pages CoW-mapped to the kernel zero
-        // page. First write to each page in the measured iter
-        // triggers a page-fault to allocate a real anon page. On
-        // `--profile-time` runs (no warmup) that synchronous
-        // allocation accounted for 67% of total samples on the
-        // z000033 L-3 c_stream flamegraph. Allocator / OS specifics
-        // vary, but the lazy-zero-page CoW behaviour is common
-        // enough that pre-touching is the portable fix: a non-zero
-        // fill then a reset to zero forces every page into the
-        // resident set before measurement starts.
-        target.fill(0xAA);
-        target.fill(0);
+        pretouch_pages(&mut target);
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
@@ -345,9 +372,7 @@ fn bench_decompress_source(
         // duplicating its value so the bench can't silently drift
         // off the direct path if the slack changes.
         let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
-        // See note on pure_rust above — same lazy-zero-page CoW story.
-        target.fill(0xAA);
-        target.fill(0);
+        pretouch_pages(&mut target);
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
@@ -367,12 +392,7 @@ fn bench_decompress_source(
         let compressed = materialize();
         let mut dctx = FfiDCtxHandle::new();
         let mut target = vec![0u8; expected_len];
-        // See note on pure_rust above — c_ffi gets the same pre-touch
-        // so the timing comparison stays apples-to-apples (FFI side
-        // would otherwise pay the identical lazy-zero-page CoW tax
-        // hidden inside one big ZSTD_decompressDCtx call).
-        target.fill(0xAA);
-        target.fill(0);
+        pretouch_pages(&mut target);
         b.iter(|| {
             let written = dctx.decompress_into(black_box(compressed), &mut target);
             assert_eq!(written, expected_len);
