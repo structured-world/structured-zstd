@@ -727,7 +727,7 @@ mod tests {
         let table = test_table();
         let initial_state = 1_u64;
         let entry = table.decode[initial_state as usize];
-        let mut manual_br = BitReaderReversed::new(&[0b10101010, 0b01010101]);
+        let mut manual_br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
         let expected_new_bits = manual_br.get_bits(entry.num_bits);
         let expected_state =
             ((initial_state << entry.num_bits) & table.state_mask) | expected_new_bits;
@@ -737,7 +737,7 @@ mod tests {
             kernel: HuffmanDecodeKernel::Scalar,
             state: initial_state,
         };
-        let mut br = BitReaderReversed::new(&[0b10101010, 0b01010101]);
+        let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
         let symbol = decoder.decode_symbol_and_advance(&mut br);
 
         assert_eq!(symbol, entry.symbol);
