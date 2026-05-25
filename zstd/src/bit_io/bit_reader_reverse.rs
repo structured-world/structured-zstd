@@ -1,6 +1,6 @@
+use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 use core::convert::TryInto;
 use core::marker::PhantomData;
-use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 
@@ -204,6 +204,16 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     /// drives monomorphisation of methods that route through `K::mask_lower_bits`
     /// without forcing the struct itself to carry runtime kernel state.
     _kernel: PhantomData<K>,
+
+    /// Cached `triple_extract_dispatch().use_pext` snapshot, populated
+    /// once in `new()`. `peek_bits_triple` reads this field instead of
+    /// re-checking the global `OnceLock` on every sequence — the
+    /// per-call atomic load + dispatch-branch was paying ~3 cycles on
+    /// every sequence decode (thousands per block × many blocks per
+    /// frame). One bool per `BitReaderReversed` lifetime, amortised
+    /// across every `peek_bits_triple` in the same decode pass.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    pub(crate) use_pext_triple: bool,
 }
 
 impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
@@ -220,6 +230,8 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
             bit_container: 0,
             extra_bits: 0,
             _kernel: PhantomData,
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            use_pext_triple: triple_extract_dispatch().use_pext,
         }
     }
 
@@ -389,8 +401,13 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        if let Some(values) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
-            return values;
+        if self.use_pext_triple {
+            // SAFETY: `use_pext_triple` was set in `new()` from
+            // `triple_extract_dispatch().use_pext`, which only returns
+            // `true` when BMI2 is runtime-detected; the unsafe call is
+            // gated on the same runtime check that the inline-form
+            // `try_extract_triple_with_pext` used to perform per-call.
+            return unsafe { extract_triple_pext(all_three, n1, n2, n3) };
         }
 
         let val1 = K::mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
