@@ -132,10 +132,14 @@ pub(crate) trait BufferBackend: Sized {
     // `FrameDecoderError::FrameContentSizeMismatch` instead of an
     // abort.
     //
-    // The growable backends (`FlatBuf`, `RingBuffer`) override these
-    // to delegate to their existing growth path — they cannot fail
-    // for capacity reasons because they grow the underlying `Vec` on
-    // demand. The default impls below cover that case.
+    // The growable backends (`FlatBuf`, `RingBuffer`) rely on the
+    // default impls below — they delegate to the corresponding
+    // panic-on-overflow method (`extend`, `extend_and_fill`,
+    // `extend_from_within_unchecked`) and always return `Ok(())`.
+    // Those underlying methods grow the backing `Vec` on demand, so
+    // there is no capacity-mismatch case to surface as `Err`. No
+    // per-backend `try_*` impl exists on `FlatBuf` / `RingBuffer`
+    // because the default behaviour is exactly what they want.
     //
     // The fixed-capacity backend (`UserSliceBackend`) overrides each
     // method with an explicit capacity check that returns `Err` on

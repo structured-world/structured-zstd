@@ -424,11 +424,23 @@ pub enum DecodeBufferError {
     },
     ZeroOffset,
     /// Match repeat would overflow a fixed-capacity backend
-    /// (`UserSliceBackend`). Only surfaced on the direct-decode
-    /// path; growable backends (FlatBuf/RingBuffer) grow on demand
-    /// and never produce this. Converted to
-    /// `FrameDecoderError::FrameContentSizeMismatch` at the
-    /// `decode_to_slice_trusted` boundary.
+    /// (`UserSliceBackend`). Growable backends (FlatBuf/RingBuffer)
+    /// grow on demand and never produce this.
+    ///
+    /// Reserved for the Compressed-block sequence-executor hardening
+    /// follow-up. Currently NOT surfaced from any production path —
+    /// `extend_from_within_unchecked` on `UserSliceBackend` still
+    /// panics on overshoot via its release-mode `assert!`. The
+    /// `_trusted` suffix on `decode_to_slice_trusted` is the
+    /// shipping contract until that follow-up wires
+    /// `BufferBackend::try_extend_from_within` through
+    /// `DecodeBuffer::repeat*` and maps `BackendOverflow` into
+    /// `FrameDecoderError::FrameContentSizeMismatch`.
+    ///
+    /// The variant lives now (vs landing later with the
+    /// follow-up) so the typed conversion at the `decode_to_slice_trusted`
+    /// boundary is in place; only the constructor on the burst path
+    /// is missing.
     BackendOverflow,
 }
 
