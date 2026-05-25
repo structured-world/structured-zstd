@@ -21,11 +21,15 @@
 //! on those targets, so the dispatch site dead-eliminates this code
 //! at compile time per backend monomorphisation).
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// x86_64 only: SSE2 is the architectural baseline there (every x86_64
+// CPU has SSE2 by definition). 32-bit `x86` is excluded because the
+// SSE2 intrinsics here are emitted without a `#[target_feature]`
+// gate, and 32-bit i386 / i486 / i586 targets do not always have
+// SSE2 in their baseline. The dispatch site
+// (`UserSliceBackend::SUPPORTS_INLINE_DONOR_EXEC`) mirrors this cfg
+// so the legacy chain handles non-x86_64 targets.
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
-    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 
     /// Donor's `ZSTD_copy16`: one unaligned 16-byte SIMD store.

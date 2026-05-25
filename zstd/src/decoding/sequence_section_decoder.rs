@@ -492,7 +492,8 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     seq: Sequence,
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
-    let high = *lit_cur + seq.ll as usize;
+    let lit_cur_before = *lit_cur;
+    let high = lit_cur_before + seq.ll as usize;
     if high > lit_len {
         return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
             wanted: high,
@@ -501,22 +502,35 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         .into());
     }
     // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
-    let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+    let lits = unsafe { literals.get_unchecked(lit_cur_before..high) };
     *lit_cur = high;
 
     if resolved_offset == 0 {
         return Err(ExecuteSequencesError::ZeroOffset.into());
     }
 
-    // Donor-shape inline dispatch — when the backend opts in (only
-    // `UserSliceBackend` on x86/x86_64 today, per its
+    // Donor-shape inline dispatch — when the backend opts in
+    // (`UserSliceBackend` on x86_64 today, per its
     // `SUPPORTS_INLINE_DONOR_EXEC = true` const) we collapse the
     // literal copy + match copy into a single straight-line body
     // that mirrors donor `ZSTD_execSequence`
     // (zstd_decompress_block.c:1008-1105). The const branch is
     // compile-time per backend monomorphisation, so the dead arm
     // carries no runtime cost on either side.
-    if B::SUPPORTS_INLINE_DONOR_EXEC {
+    //
+    // **Literal-source slack guard** (the read-side donor-port
+    // safety contract): donor's `ZSTD_copy16` reads 16 bytes
+    // unconditionally regardless of `litLength`; on truncated
+    // literals (the closing sequences of a block) that would read
+    // past the end of the literals buffer slice — UB even when the
+    // bytes happen to be valid memory inside the backing `Vec`.
+    // Donor guards with `iLitEnd > litLimit` → slow path. We mirror
+    // the same gate: only take the donor inline arm when the source
+    // window has ≥ 16 bytes left from `lit_cur_before`. The final
+    // few sequences of a block fall through to the legacy
+    // `push`/`repeat` chain which handles short literals exactly
+    // (no over-read).
+    if B::SUPPORTS_INLINE_DONOR_EXEC && lit_cur_before + 16 <= lit_len {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
         // gate). Donor inline path stays on the prefix-resident
@@ -535,17 +549,27 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
                 .map_err(ExecuteSequencesError::from)?;
             return Ok(());
         }
-        // SAFETY: backend opted in (compile-time const), `lits` is a
-        // non-aliased slice of the literal block, `offset` is within
-        // the live region (prefix-resident, asserted above),
-        // `match_length >= 1` is enforced by the
-        // `resolved_offset == 0` check above (offset > 0 implies
-        // match exists; degenerate `ml = 0` is benign — donor copies
-        // zero bytes through the wildcopy's `do/while` body once).
-        // Caller's upfront `reserve(MAX_BLOCK_SIZE)` guarantees the
-        // writable tail has room for `lit_length + match_length`
-        // plus the wildcopy overshoot slack
-        // (`WILDCOPY_OVERLENGTH = 32`).
+        // SAFETY:
+        // - Backend opted in (compile-time const).
+        // - `lits` is a non-aliased slice of the literals block.
+        // - Source-side slack: `lit_cur_before + 16 <= lit_len`
+        //   (gated above), so `lits.as_ptr().add(16)` reads stay
+        //   inside the literals buffer. Donor unconditional
+        //   `ZSTD_copy16` over-read of up to 16 bytes past
+        //   `lits.len()` is bounded by the slack we just asserted.
+        // - Offset is within the live region (prefix-resident,
+        //   asserted above), so the match-copy source pointer
+        //   `base + tail + lit_length - offset` is in-bounds.
+        // - Match length is `>= 1` by zstd spec invariant (a
+        //   sequence with `matchLength = 0` is malformed; the FSE
+        //   decode produces baseline values starting at 3 for ml
+        //   codes 0..3, so `seq.ml >= 3` for any valid sequence).
+        //   The wildcopy helpers assert this in debug builds.
+        // - Caller's upfront `reserve(MAX_BLOCK_SIZE)` plus the
+        //   `WILDCOPY_OVERLENGTH = 32` slack on the user slice
+        //   guarantees the writable tail has room for
+        //   `lit_length + match_length + 15` (max wildcopy
+        //   overshoot is 15 bytes past the declared end).
         unsafe {
             buffer
                 .buffer_mut()

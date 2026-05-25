@@ -187,7 +187,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// advancing; the caller has just written `n` bytes ending at
     /// the current tail position.
     #[inline]
-    #[allow(dead_code)] // wired in once donor path lands in pipelined executor
     pub(crate) fn advance_output_counter(&mut self, n: usize) {
         self.total_output_counter += n as u64;
         #[cfg(feature = "hash")]

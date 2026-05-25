@@ -143,18 +143,21 @@ impl<'a> UserSliceBackend<'a> {
 }
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
-    /// Donor-shape inline `ZSTD_execSequence` is available on x86 /
-    /// x86_64 where the SSE2 baseline gives us 16-byte SIMD store/load
-    /// for free. On other arches (aarch64 NEON, riscv, etc.) the
-    /// dispatch site falls back to the existing `extend` + `repeat`
-    /// chain — those paths already emit the architecture's
-    /// best-available SIMD via `copy_bytes_overshooting`'s runtime
-    /// detect.
-    const SUPPORTS_INLINE_DONOR_EXEC: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+    /// Donor-shape inline `ZSTD_execSequence` is available on
+    /// `x86_64`, where SSE2 is the architectural baseline and the
+    /// helpers in [`super::exec_sequence_donor::x86`] emit
+    /// `_mm_loadu_si128` / `_mm_storeu_si128` without needing a
+    /// `#[target_feature]` gate. 32-bit `x86` is excluded — its
+    /// pre-SSE2 baseline (i386 / i486 / i586) would SIGILL on the
+    /// SSE2 intrinsics. aarch64 NEON, riscv etc. fall back to the
+    /// existing `extend` + `repeat` chain — those paths already
+    /// emit the architecture's best-available SIMD via
+    /// `copy_bytes_overshooting`'s runtime detect.
+    const SUPPORTS_INLINE_DONOR_EXEC: bool = cfg!(target_arch = "x86_64");
 
     /// Donor `ZSTD_execSequence` body — see trait doc for
     /// preconditions / contract.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn donor_exec_one_sequence(&mut self, lits: &[u8], offset: usize, match_length: usize) {
         use super::exec_sequence_donor::x86::{
@@ -164,15 +167,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let total = lit_length + match_length;
         let new_tail = self.tail + total;
         // Release-mode capacity assert — covers the literal+match
-        // copies together. The wildcopy bodies overshoot up to 15
-        // bytes past `tail + total`; the caller-side
-        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice
-        // accommodates that.
+        // copies INCLUDING the wildcopy overshoot tail (up to 15
+        // bytes past `tail + total`). The caller-side
+        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice covers
+        // any value ≤ 32; the assert here makes the requirement
+        // explicit so a future caller that supplies a smaller slice
+        // fails immediately with a clear diagnostic instead of
+        // silently corrupting memory past the declared tail.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         assert!(
-            new_tail <= self.slice.len(),
+            new_tail + MAX_WILDCOPY_OVERSHOOT <= self.slice.len(),
             "UserSliceBackend::donor_exec_one_sequence overflows slice \
-             (tail+={}, cap={}) — corrupt frame",
+             (tail+={} + {} overshoot, cap={}) — corrupt frame or missing WILDCOPY_OVERLENGTH slack",
             total,
+            MAX_WILDCOPY_OVERSHOOT,
             self.slice.len()
         );
         debug_assert!(offset >= 1);
