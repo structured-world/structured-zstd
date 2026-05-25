@@ -83,6 +83,21 @@ pub(crate) trait BufferBackend: Sized {
     /// - `offset >= 1` and `offset <= self.len() + lits.len()`
     ///   (donor's `oLitEnd - offset` precondition).
     /// - `match_length >= 1`.
+    /// - **Read-side slack on `lits`**: the donor literal-copy path
+    ///   issues an unconditional `copy16` from `lits.as_ptr()` and,
+    ///   when `lit_length > 16`, a 16-byte-stride wildcopy that may
+    ///   load up to 15 bytes past `lits.len()` on its final
+    ///   iteration. Callers MUST ensure the backing literal buffer
+    ///   has ≥ `lits.len() + 15` initialised bytes addressable
+    ///   from `lits.as_ptr()`. The current dispatch site
+    ///   (`sequence_section_decoder::execute_one_sequence_pipelined`)
+    ///   gates on `high + 15 <= lit_len` (where `high = lit_cur +
+    ///   lit_length` and `lit_len` is the parent literals-buffer
+    ///   length) and falls through to the legacy `push`/`repeat`
+    ///   chain when the slack is unavailable — a future caller
+    ///   reusing this hook must enforce an equivalent gate or pad
+    ///   the literals buffer with 15 bytes of slack at allocation
+    ///   time.
     /// - Caller is responsible for updating any DecodeBuffer-level
     ///   counters (`total_output_counter`, hash) that mirror the
     ///   bytes this method writes — see

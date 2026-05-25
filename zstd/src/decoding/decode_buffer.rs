@@ -34,11 +34,21 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
-#[derive(Copy, Clone)]
+///
+/// Snapshots tail / counter / cap. Under `feature = "hash"` also
+/// snapshots the frame `XxHash64` state so a rollback after
+/// `push` / `extend_and_fill` / `advance_output_counter` (all of which
+/// fold the written bytes into `self.hash`) does not leave the hash
+/// committed for bytes the caller has discarded. Cloning `XxHash64`
+/// is cheap — internal state is a handful of u64 accumulators plus a
+/// short remainder buffer.
+#[derive(Clone)]
 pub(crate) struct DecodeBufferCheckpoint {
     tail: usize,
     total_output_counter: u64,
     cap: usize,
+    #[cfg(feature = "hash")]
+    hash: twox_hash::XxHash64,
 }
 
 impl<B: BufferBackend> Read for DecodeBuffer<B> {
@@ -120,6 +130,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             tail: self.buffer.tail(),
             total_output_counter: self.total_output_counter,
             cap: self.buffer.cap(),
+            #[cfg(feature = "hash")]
+            hash: self.hash.clone(),
         }
     }
 
@@ -150,6 +162,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // and the current tail as discarded.
         unsafe { self.buffer.set_tail(cp.tail) };
         self.total_output_counter = cp.total_output_counter;
+        #[cfg(feature = "hash")]
+        {
+            // Hash state is mutated by `push` / `extend_and_fill` /
+            // `advance_output_counter` as bytes flow in. Restoring the
+            // snapshot here undoes those mutations so the rolled-back
+            // bytes don't end up in the frame digest. Without this
+            // the checksum that ships in the frame trailer would
+            // mismatch on rollback paths that the legacy two-pass
+            // pipeline used to handle by simply never writing the
+            // bytes in the first place.
+            self.hash = cp.hash;
+        }
         true
     }
 
