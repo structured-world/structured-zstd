@@ -310,7 +310,7 @@ impl FSETable {
     /// `feature = "fuzz_exports"` builds where external code can
     /// stuff arbitrary entries; the safe default keeps the decode
     /// hot path from observing UB even in that contrived case.
-    pub fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
+    pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
         for entry in self.decode.iter_mut() {
             let idx = entry.symbol as usize;
             if idx < packed.len() {
@@ -347,7 +347,7 @@ impl FSETable {
     /// — the entry's fields stay at zero so the decode path
     /// surfaces the corruption downstream instead of producing a
     /// wraparound shift here.
-    pub fn enrich_for_offsets(&mut self) {
+    pub(crate) fn enrich_for_offsets(&mut self) {
         for entry in self.decode.iter_mut() {
             // Reset before the bound check so out-of-range
             // symbols clear stale metadata instead of carrying it
@@ -404,12 +404,6 @@ impl FSETable {
 
         let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
         table_symbols.clear();
-        // Retain the `resize(table_size, 0)` zero-fill: skipping it
-        // via `reserve + unsafe set_len` measured +0.16% (NULL noise
-        // on i9 primary bench). LLVM lowers the resize to a vectorised
-        // memset that hides in the existing write-bandwidth window;
-        // the skip saved no measurable time on the only path that
-        // matters.
         table_symbols.resize(table_size, 0);
         let negative_idx = {
             let table_symbols = &mut table_symbols;
@@ -463,46 +457,18 @@ impl FSETable {
         self.symbol_counter.clear();
         self.symbol_counter
             .resize(self.symbol_probabilities.len(), 0);
-        // SAFETY scaffolding: pre-validate that every entry symbol read in
-        // the loop below falls within symbol_counter / symbol_probabilities
-        // bounds. Both vectors are sized to symbol_probabilities.len(),
-        // which caps at max_symbol + 1 in build_decoding_table's guard at
-        // line 386. Each Entry.symbol value was written by
-        // copy_symbols_into_decode from table_symbols, and table_symbols
-        // entries were assigned from `for symbol in 0..symbol_probabilities.len()`
-        // ranges - so every entry.symbol is guaranteed in bounds.
-        // The unchecked path below relies on this invariant.
-        let prob_len = self.symbol_probabilities.len();
-        debug_assert!(prob_len <= 256, "FSE symbol space caps at 256");
-        let probs_ptr = self.symbol_probabilities.as_ptr();
-        let counter_ptr = self.symbol_counter.as_mut_ptr();
         for idx in 0..negative_idx {
-            // SAFETY: idx < negative_idx <= table_size <= decode.len()
-            // (decode was set to table_size by copy_symbols_into_decode).
-            let entry = unsafe { self.decode.get_unchecked_mut(idx) };
+            let entry = &mut self.decode[idx];
             let symbol = entry.symbol;
-            let s = symbol as usize;
-            // SAFETY: per the doc-comment above, every entry.symbol value
-            // is < prob_len, so symbol_probabilities[s] / symbol_counter[s]
-            // accesses are in-bounds. Debug-assert documents the invariant.
-            debug_assert!(
-                s < prob_len,
-                "FSE entry symbol {} >= prob_len {}",
-                s,
-                prob_len
-            );
-            let prob = unsafe { *probs_ptr.add(s) };
-            let symbol_count = unsafe { *counter_ptr.add(s) };
+            let prob = self.symbol_probabilities[symbol as usize];
+
+            let symbol_count = self.symbol_counter[symbol as usize];
             let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
 
-            // nb <= accuracy_log is enforced by calc_baseline_and_numbits
-            // (nb = accuracy_log - highest_bit(prob)), so the previous
-            // release-mode assert is redundant; debug build still catches
-            // any future drift via the debug_assert below.
-            debug_assert!(nb <= self.accuracy_log);
-            unsafe {
-                *counter_ptr.add(s) += 1;
-            }
+            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
+
+            assert!(nb <= self.accuracy_log);
+            self.symbol_counter[symbol as usize] += 1;
 
             entry.new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
                 got: self.accuracy_log,
