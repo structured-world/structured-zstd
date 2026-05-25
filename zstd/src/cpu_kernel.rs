@@ -235,9 +235,13 @@ const fn select_x86_kernel(
 }
 
 /// Cached runtime-detected kernel tag. The actual `CpuKernel` impl
-/// is constructed from this at the FrameDecoder / FrameCompressor
-/// entry via a `match` that branches into the appropriate generic
-/// `*_impl<K>` specialisation.
+/// (`ScalarKernel` / `Bmi2Kernel` / `Avx2Kernel` / `Vbmi2Kernel` /
+/// `NeonKernel` / `SveKernel`) is constructed at the dispatch site —
+/// currently only `decoding::literals_section_decoder::decompress_literals`
+/// — via a `match` on this tag that branches into the per-K
+/// `target_feature`-wrapped specialisation. Pipeline-wide dispatch
+/// (FrameDecoder / FrameCompressor entry, sequence executor, match
+/// copy) lands incrementally in follow-up tiers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
@@ -299,25 +303,19 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
 pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     #[cfg(target_arch = "x86_64")]
     {
-        #[cfg(all(
-            target_feature = "avx512vbmi2",
-            target_feature = "avx512f",
-            target_feature = "avx512vl",
-            target_feature = "avx512bw",
-            target_feature = "bmi2",
-            target_feature = "avx2"
-        ))]
-        {
-            return CpuKernelTag::Vbmi2;
-        }
-        #[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
-        {
-            return CpuKernelTag::Avx2;
-        }
-        #[cfg(target_feature = "bmi2")]
-        {
-            return CpuKernelTag::Bmi2;
-        }
+        // Route through the same const-fn precedence helper as the
+        // `feature = "std"` path. `cfg!(target_feature = ...)`
+        // returns a compile-time bool that constant-folds through
+        // `select_x86_kernel`, so the runtime call has the same
+        // codegen as the previous hand-written #[cfg] chain.
+        return select_x86_kernel(
+            cfg!(target_feature = "avx512vbmi2"),
+            cfg!(target_feature = "avx512f"),
+            cfg!(target_feature = "avx512vl"),
+            cfg!(target_feature = "avx512bw"),
+            cfg!(target_feature = "bmi2"),
+            cfg!(target_feature = "avx2"),
+        );
     }
     #[cfg(target_arch = "aarch64")]
     {
