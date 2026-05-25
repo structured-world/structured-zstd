@@ -164,6 +164,37 @@ unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
     unsafe { core::arch::x86_64::_bzhi_u64(value, n as u32) }
 }
 
+/// Pure boolean-input variant of the x86 kernel-tag selection. Both the
+/// `std` runtime-detect path and the `no_std` compile-time-cfg path
+/// route through this helper so the precedence rules stay in one place
+/// (and are unit-testable without runtime CPUID).
+///
+/// The VBMI2 tier requires every AVX-512 sub-feature it touches AND the
+/// AVX2 baseline — VBMI2 kernels mix VBMI2-only intrinsics with AVX2
+/// 256-bit moves, so the dispatch must be conditioned on `has_avx2` too.
+/// Likewise the Avx2 tier requires both AVX2 and BMI2.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+const fn select_x86_kernel(
+    has_avx512vbmi2: bool,
+    has_avx512f: bool,
+    has_avx512vl: bool,
+    has_avx512bw: bool,
+    has_bmi2: bool,
+    has_avx2: bool,
+) -> CpuKernelTag {
+    if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 {
+        return CpuKernelTag::Vbmi2;
+    }
+    if has_avx2 && has_bmi2 {
+        return CpuKernelTag::Avx2;
+    }
+    if has_bmi2 {
+        return CpuKernelTag::Bmi2;
+    }
+    CpuKernelTag::Scalar
+}
+
 /// Cached runtime-detected kernel tag. The actual `CpuKernel` impl
 /// is constructed from this at the FrameDecoder / FrameCompressor
 /// entry via a `match` that branches into the appropriate generic
@@ -198,22 +229,14 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::is_x86_feature_detected;
-        let has_avx512vbmi2 = is_x86_feature_detected!("avx512vbmi2");
-        let has_avx512f = is_x86_feature_detected!("avx512f");
-        let has_avx512vl = is_x86_feature_detected!("avx512vl");
-        let has_avx512bw = is_x86_feature_detected!("avx512bw");
-        let has_bmi2 = is_x86_feature_detected!("bmi2");
-        let has_avx2 = is_x86_feature_detected!("avx2");
-        if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 {
-            return CpuKernelTag::Vbmi2;
-        }
-        if has_avx2 && has_bmi2 {
-            return CpuKernelTag::Avx2;
-        }
-        if has_bmi2 {
-            return CpuKernelTag::Bmi2;
-        }
-        return CpuKernelTag::Scalar;
+        return select_x86_kernel(
+            is_x86_feature_detected!("avx512vbmi2"),
+            is_x86_feature_detected!("avx512f"),
+            is_x86_feature_detected!("avx512vl"),
+            is_x86_feature_detected!("avx512bw"),
+            is_x86_feature_detected!("bmi2"),
+            is_x86_feature_detected!("avx2"),
+        );
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -317,6 +340,41 @@ mod tests {
                 n
             );
         }
+    }
+
+    /// Regression: a CPU advertising AVX-512 VBMI2 but NOT AVX2 (the
+    /// AMD64 baseline allows this combination at the spec level) was
+    /// previously selected as `Vbmi2`, which would SIGILL on the
+    /// first AVX2-mixed VBMI2 kernel invocation. The selection must
+    /// fall through to Scalar (or a non-AVX tier) in that case.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
+        let tag = select_x86_kernel(
+            /* avx512vbmi2 */ true, /* avx512f */ true, /* avx512vl */ true,
+            /* avx512bw */ true, /* bmi2 */ true, /* avx2 */ false,
+        );
+        assert_ne!(
+            tag,
+            CpuKernelTag::Vbmi2,
+            "selecting Vbmi2 without AVX2 would call AVX2 instructions and SIGILL"
+        );
+    }
+
+    /// Sanity: when every flag is present the selector returns Vbmi2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
+        let tag = select_x86_kernel(true, true, true, true, true, true);
+        assert_eq!(tag, CpuKernelTag::Vbmi2);
+    }
+
+    /// Sanity: AVX2 + BMI2 without AVX-512 → Avx2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_avx2_baseline_picks_avx2() {
+        let tag = select_x86_kernel(false, false, false, false, true, true);
+        assert_eq!(tag, CpuKernelTag::Avx2);
     }
 
     #[test]
