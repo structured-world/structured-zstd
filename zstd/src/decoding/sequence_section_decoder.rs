@@ -732,19 +732,26 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     // past the end of the literals buffer slice — UB even when the
     // bytes happen to be valid memory inside the backing `Vec`.
     // Donor guards with `iLitEnd > litLimit` → slow path. We mirror
-    // the same gate. For `lit_length <= 16` the over-read is from the
-    // first unconditional `ZSTD_copy16` (16 bytes from `lit_cur_before`).
-    // For `lit_length > 16` the wildcopy_no_overlap tail loop's final
-    // 16-byte chunk loads bytes
-    // `lits.as_ptr() + (lit_length - 16) .. + lit_length`. Both cases
-    // are covered by `high + 15 <= lit_len`
-    // (`high = lit_cur_before + lit_length`): the over-read past the
-    // declared literal end is bounded by 15 bytes, and `high + 15`
-    // staying inside `lit_len` proves the load is in-bounds. The
-    // final few sequences of a block fall through to the legacy
-    // `push`/`repeat` chain which handles short literals exactly
-    // (no over-read).
-    if B::SUPPORTS_INLINE_DONOR_EXEC && high + 15 <= lit_len {
+    // the same gate. The donor inline path issues two distinct reads
+    // past the declared literal end:
+    //   (1) Unconditional first `ZSTD_copy16` from `lit_cur_before`
+    //       — needs `lit_cur_before + 16 <= lit_len`. THIS GATE
+    //       MATTERS EVEN WHEN `seq.ll == 0`: the copy still happens,
+    //       overwriting the dst region the match copy will rewrite.
+    //   (2) Tail wildcopy's final 16-byte chunk — ONLY when
+    //       `lit_length > 16` (the donor inline path gates the
+    //       wildcopy call on that same threshold). Reads up to
+    //       `lit_cur_before + lit_length + 15`, i.e. `high + 15`.
+    // For `lit_length ∈ 0..=16` only (1) fires; gate (2) would
+    // unnecessarily reject short-literal-tail sequences near
+    // `lit_len` whose `copy16` over-read fits inside the buffer
+    // (`lit_cur_before + 16 <= lit_len`) but whose `high + 15`
+    // exceeds it. Apply (2) only in the wildcopy regime.
+    // `checked_add` covers adversarial overflow.
+    let donor_path_safe = B::SUPPORTS_INLINE_DONOR_EXEC
+        && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
+        && (seq.ll as usize <= 16 || high.checked_add(15).is_some_and(|b| b <= lit_len));
+    if donor_path_safe {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
         // gate). Donor inline path stays on the prefix-resident
