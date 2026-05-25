@@ -27,12 +27,13 @@ use crate::io::{Error, Read};
 /// The kernel gates on `min_buffer_size >= rounded(copy_at_least, 32)`;
 /// at the end of a fixed-capacity output buffer that gate fails when
 /// slack is < 32, and the dispatch falls through to whatever
-/// `ptr::copy_nonoverlapping` lowers to on the target (typically a
-/// platform-specific `memcpy` / `memmove` — on glibc x86-64 that is
-/// `__memmove_avx_unaligned_erms`, on musl a plain SIMD memmove, on
-/// other targets the corresponding libc implementation). Bumping slack
-/// from 16 → 32 keeps the AVX2 path live across every match-copy and
-/// literal-push.
+/// `ptr::copy_nonoverlapping` lowers to on the target — a
+/// platform-specific `memcpy`-like primitive (the source/dest regions
+/// are non-overlapping by the caller's contract, so memcpy semantics
+/// apply; the exact symbol the linker resolves is libc-specific and
+/// not part of any guaranteed contract). Bumping slack from 16 → 32
+/// keeps the AVX2 path live across every match-copy and literal-push,
+/// avoiding the libc detour.
 ///
 /// Both `RingBuffer` and `FlatBuf` reuse this single constant so the
 /// slack contract cannot drift between backends.

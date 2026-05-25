@@ -152,7 +152,9 @@ pub mod testing {
 /// [`crate::decoding::FrameDecoder::decode_to_slice_trusted`] can size
 /// `frame_content_size + WILDCOPY_OVERLENGTH` symbolically without
 /// duplicating the value. Use the const reference rather than a
-/// hardcoded literal — the slack size may grow in the future if a
-/// wider SIMD kernel (AVX-512, 64-byte stride) is added to the
-/// fast path.
+/// hardcoded literal — `simd_copy::copy_bytes_overshooting` already
+/// ships an AVX-512 64-byte chunked kernel, and the slack may grow
+/// further to reliably enable that wider kernel at buffer tails
+/// (mirroring how the bump from 16 → 32 enabled the AVX2 32-byte
+/// kernel at the tail).
 pub const WILDCOPY_OVERLENGTH: usize = crate::decoding::buffer_backend::WILDCOPY_OVERLENGTH;
