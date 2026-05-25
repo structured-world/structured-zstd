@@ -330,12 +330,14 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         }
     }
 
-    // Force-inline for the same reason as `extend` above: this is
-    // the match-copy hot path called from every sequence executor
-    // iteration in `decode_and_execute_sequences`. perf annotate
-    // on the primary bench shows the prologue/epilogue contributing
-    // a non-trivial fraction of the 9-10% sample slot.
-    #[inline(always)]
+    // Keep `#[inline]` (hint, not force). An earlier experiment with
+    // `#[inline(always)]` regressed primary bench by +2.96% — body
+    // is materially larger than `extend` (assert + readable/writable
+    // derivation + simd_copy::copy_bytes_overshooting call), and
+    // forced inlining bloats each pipeline-slot caller past icache
+    // budget. The per-call boundary save is dwarfed by the
+    // duplicated body weight; LLVM's heuristic was right to decline.
+    #[inline]
     unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         let dst_off = self.tail;
         let src_off = self.head + start;
