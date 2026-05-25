@@ -36,12 +36,24 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
 ///
 /// Snapshots tail / counter / cap. Under `feature = "hash"` also
-/// snapshots the frame `XxHash64` state so a rollback after
-/// `push` / `extend_and_fill` / `advance_output_counter` (all of which
-/// fold the written bytes into `self.hash`) does not leave the hash
-/// committed for bytes the caller has discarded. Cloning `XxHash64`
-/// is cheap — internal state is a handful of u64 accumulators plus a
-/// short remainder buffer.
+/// snapshots the frame `XxHash64` state so a rollback after a path
+/// that folded bytes into `self.hash` does not leave the hash
+/// committed for bytes the caller has discarded. Hash mutation
+/// sites on the decode write surface are:
+///   * `advance_output_counter` — donor inline path bookkeeping
+///     (writes `n` bytes' worth straight into `self.hash`).
+///   * `drain_to` / `read` — drain-time hashing of the bytes that
+///     leave the live region.
+///
+/// `push` and `extend_and_fill` themselves do NOT touch `self.hash`
+/// — they only advance `total_output_counter`; the rolling hash gets
+/// folded later when those bytes drain out, OR (on the donor inline
+/// path) directly by `advance_output_counter`. Rollback still needs
+/// to restore the hash because the same checkpoint covers both
+/// classes of write surface.
+///
+/// Cloning `XxHash64` is cheap — internal state is a handful of u64
+/// accumulators plus a short remainder buffer.
 #[derive(Clone)]
 pub(crate) struct DecodeBufferCheckpoint {
     tail: usize,
