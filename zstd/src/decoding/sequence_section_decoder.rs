@@ -121,79 +121,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     //     `*offset_hist = saved_offset_hist`. Cheap no-op on the
     //     pipelined branch (real hist was never touched mid-loop),
     //     correct rewind on the non-pipelined branch.
-    #[inline(always)]
-    fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
-        buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-        literals: &[u8],
-        lit_cur: &mut usize,
-        lit_len: usize,
-        offset_hist: &mut [u32; 3],
-        seq: Sequence,
-    ) -> Result<(), DecompressBlockError> {
-        let high = *lit_cur + seq.ll as usize;
-        if high > lit_len {
-            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                wanted: high,
-                have: lit_len,
-            }
-            .into());
-        }
-        // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
-        // (high = lit_cur + seq.ll, seq.ll >= 0).
-        let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
-        *lit_cur = high;
-        buffer.push(lits);
-
-        let actual = do_offset_history(seq.of, seq.ll, offset_hist);
-        if actual == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset.into());
-        }
-        buffer
-            .repeat(actual as usize, seq.ml as usize)
-            .map_err(ExecuteSequencesError::from)?;
-        Ok(())
-    }
-
-    /// Pipelined-path variant: takes the offset already resolved by
-    /// the decode-ahead `shadow_hist` walk, so `do_offset_history` is
-    /// NOT called here (caller mutated only the shadow). Routes the
-    /// match copy through `repeat_lookahead_prefetched`, which skips
-    /// only the in-loop `prefetch_match_source` (redundant because
-    /// the lookahead pipeline already issued a PREFETCH_L1 ADVANCE
-    /// iterations earlier). The per-call `buffer.reserve(match_length)`
-    /// is preserved by that variant — required for memory safety
-    /// against malformed inputs whose `match_length` exceeds the
-    /// upfront `reserve(MAX_BLOCK_SIZE)` headroom.
-    #[inline(always)]
-    fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
-        buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-        literals: &[u8],
-        lit_cur: &mut usize,
-        lit_len: usize,
-        seq: Sequence,
-        resolved_offset: u32,
-    ) -> Result<(), DecompressBlockError> {
-        let high = *lit_cur + seq.ll as usize;
-        if high > lit_len {
-            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                wanted: high,
-                have: lit_len,
-            }
-            .into());
-        }
-        // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
-        let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
-        *lit_cur = high;
-        buffer.push(lits);
-
-        if resolved_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset.into());
-        }
-        buffer
-            .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
-            .map_err(ExecuteSequencesError::from)?;
-        Ok(())
-    }
 
     let num_sequences = section.num_sequences as usize;
 
@@ -479,6 +406,84 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         seq_sum as usize, diff,
         "seq_sum {seq_sum} != buffer growth {diff}"
     );
+    Ok(())
+}
+
+/// Per-sequence executor for the non-pipelined (short-block) fallback
+/// path. Mutates the real `offset_hist` in lockstep with the sequence
+/// being executed — preserving the legacy "Err leaves partial output +
+/// pre-mutation hist" rollback contract.
+#[inline(always)]
+fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+    lit_cur: &mut usize,
+    lit_len: usize,
+    offset_hist: &mut [u32; 3],
+    seq: Sequence,
+) -> Result<(), DecompressBlockError> {
+    let high = *lit_cur + seq.ll as usize;
+    if high > lit_len {
+        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: high,
+            have: lit_len,
+        }
+        .into());
+    }
+    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
+    // (high = lit_cur + seq.ll, seq.ll >= 0).
+    let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+    *lit_cur = high;
+    buffer.push(lits);
+
+    let actual = do_offset_history(seq.of, seq.ll, offset_hist);
+    if actual == 0 {
+        return Err(ExecuteSequencesError::ZeroOffset.into());
+    }
+    buffer
+        .repeat(actual as usize, seq.ml as usize)
+        .map_err(ExecuteSequencesError::from)?;
+    Ok(())
+}
+
+/// Pipelined-path executor variant: takes the offset already resolved
+/// by the decode-ahead `shadow_hist` walk, so `do_offset_history` is
+/// NOT called here (caller mutated only the shadow). Routes the match
+/// copy through `repeat_lookahead_prefetched`, which skips only the
+/// in-loop `prefetch_match_source` (redundant because the lookahead
+/// pipeline already issued a PREFETCH_L1 ADVANCE iterations earlier).
+/// The per-call `buffer.reserve(match_length)` is preserved by that
+/// variant — required for memory safety against malformed inputs whose
+/// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
+/// headroom.
+#[inline(always)]
+fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+    lit_cur: &mut usize,
+    lit_len: usize,
+    seq: Sequence,
+    resolved_offset: u32,
+) -> Result<(), DecompressBlockError> {
+    let high = *lit_cur + seq.ll as usize;
+    if high > lit_len {
+        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: high,
+            have: lit_len,
+        }
+        .into());
+    }
+    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
+    let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+    *lit_cur = high;
+    buffer.push(lits);
+
+    if resolved_offset == 0 {
+        return Err(ExecuteSequencesError::ZeroOffset.into());
+    }
+    buffer
+        .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
+        .map_err(ExecuteSequencesError::from)?;
     Ok(())
 }
 
