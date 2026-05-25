@@ -404,7 +404,21 @@ impl FSETable {
 
         let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
         table_symbols.clear();
-        table_symbols.resize(table_size, 0);
+        table_symbols.reserve(table_size);
+        // SAFETY: `u8` has all bit patterns valid and no `Drop`, so
+        // `set_len` without prior initialization cannot create UB on
+        // its own. The two spread loops below write to every position
+        // in `[0, table_size)` (positive-probability symbols fill
+        // `[0, negative_idx)`; negative-probability symbols fill
+        // `[negative_idx, table_size)`) before any reader observes
+        // the buffer (the `copy_symbols_into_decode` call at line ~450
+        // is the first reader). Avoiding the `resize(table_size, 0)`
+        // zero-fill drops `table_size` byte-stores per FSE table build
+        // (3 builds per Compressed sequence block) — wasted work since
+        // every slot gets overwritten by the spread.
+        unsafe {
+            table_symbols.set_len(table_size);
+        }
         let negative_idx = {
             let table_symbols = &mut table_symbols;
             let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
