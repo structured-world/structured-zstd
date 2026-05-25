@@ -30,7 +30,7 @@ fn bench_get_bits(c: &mut Criterion) {
     group.throughput(Throughput::Elements(reads_9));
     group.bench_function("sequential_9bit", |b| {
         b.iter(|| {
-            let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
+            let mut br = structured_zstd::testing::BitReaderReversed::<'_, structured_zstd::testing::ScalarKernel>::new(black_box(&data));
             let mut sum = 0u64;
             for _ in 0..reads_9 {
                 sum = sum.wrapping_add(br.get_bits(9));
@@ -42,7 +42,7 @@ fn bench_get_bits(c: &mut Criterion) {
     group.throughput(Throughput::Elements(reads_11));
     group.bench_function("sequential_11bit", |b| {
         b.iter(|| {
-            let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
+            let mut br = structured_zstd::testing::BitReaderReversed::<'_, structured_zstd::testing::ScalarKernel>::new(black_box(&data));
             let mut sum = 0u64;
             for _ in 0..reads_11 {
                 sum = sum.wrapping_add(br.get_bits(11));
@@ -65,7 +65,7 @@ fn bench_get_bits_triple(c: &mut Criterion) {
     // Simulates FSE sequence decode: offset(8) + match(9) + literal(9) = 26 bits
     group.bench_function("fse_pattern_8_9_9", |b| {
         b.iter(|| {
-            let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
+            let mut br = structured_zstd::testing::BitReaderReversed::<'_, structured_zstd::testing::ScalarKernel>::new(black_box(&data));
             let mut sum = 0u64;
             for _ in 0..reads_triple {
                 let (a, b_val, c_val) = br.get_bits_triple(8, 9, 9);
@@ -89,7 +89,7 @@ fn bench_ensure_and_unchecked(c: &mut Criterion) {
     // Simulates interleaved FSE: one ensure_bits(26) then 3 unchecked reads
     group.bench_function("ensure26_3x_unchecked", |b| {
         b.iter(|| {
-            let mut br = structured_zstd::testing::BitReaderReversed::new(black_box(&data));
+            let mut br = structured_zstd::testing::BitReaderReversed::<'_, structured_zstd::testing::ScalarKernel>::new(black_box(&data));
             let mut sum = 0u64;
             for _ in 0..reads_unchecked {
                 br.ensure_bits(26);
