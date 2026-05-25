@@ -453,7 +453,7 @@ impl HuffmanTable {
                     });
                 }
                 let compressed_weights = &compressed_weights[..compressed_length];
-                let mut br = BitReaderReversed::new(compressed_weights);
+                let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(compressed_weights);
 
                 bits_read += (bytes_used_by_fse_header + compressed_length) * 8;
 

@@ -31,7 +31,7 @@ impl<'t> FSEDecoder<'t> {
 
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
-    pub fn init_state(&mut self, bits: &mut BitReaderReversed<'_>) -> Result<(), FSEDecoderError> {
+    pub fn init_state<K: crate::cpu_kernel::CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) -> Result<(), FSEDecoderError> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
@@ -91,7 +91,7 @@ impl<'t> FSEDecoder<'t> {
     /// unchecked indexing in `read_entry`) into a clear fail-fast
     /// panic that surfaces the API misuse immediately instead of
     /// leaving the bitstream and decode state silently desynchronised.
-    pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
+    pub fn update_state<K: crate::cpu_kernel::CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
         // Public-API safety guard: `FSEDecoder::new` builds a decoder
         // with a zero-default `state` (Entry { new_state: 0, num_bits:
         // 0, symbol: 0 }) regardless of whether the table was actually
@@ -183,7 +183,7 @@ impl<'t> FSEDecoder<'t> {
     /// [`init_state`]: Self::init_state
     /// [`update_state`]: Self::update_state
     #[inline(always)]
-    pub(crate) fn update_state_fast(&mut self, bits: &mut BitReaderReversed<'_>) {
+    pub(crate) fn update_state_fast<K: crate::cpu_kernel::CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits_unchecked(num_bits);
         let next_state = usize::from(self.state.new_state) + add as usize;
