@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779713542721,
+  "lastUpdate": 1779720653631,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -46334,6 +46334,270 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.268,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c5efb8f5b76d9a14c7dd4330a5a8cd4df4c27d3a",
+          "message": "harden(decode): fallible BufferBackend writes for RLE/Raw direct path (#251)\n\n* feat(decode): fallible BufferBackend writes for RLE/Raw direct path\n\nAdds a parallel `try_*` write surface to `BufferBackend`:\n\n* `BackendOverflow` error type with tail / requested / capacity\n  diagnostics.\n* `try_extend`, `try_extend_and_fill`, `try_extend_from_within`\n  trait methods. Default impls call the existing panic-on-overflow\n  variants — growable backends (FlatBuf / RingBuffer) keep their\n  current behaviour because they cannot fail for capacity reasons\n  (the Vec grows on demand).\n* `UserSliceBackend` overrides all three with explicit capacity\n  checks that return `Err(BackendOverflow)` instead of panicking\n  via the release-mode `assert!`.\n* `DecodeBuffer::try_push` and `try_extend_and_fill` wrap the\n  backend methods and keep the `total_output_counter` bookkeeping\n  consistent on Ok.\n* `BlockDecoder::decode_block_content_from_slice` RLE / Raw\n  branches switch to `try_extend_and_fill` / `try_push` and\n  surface `DecodeBlockContentError::BackendOverflow { step }` on\n  overshoot.\n* `FrameDecoder::decode_to_slice_trusted` converts that variant\n  into `FrameDecoderError::FrameContentSizeMismatch` so the public\n  API stays panic-free on these paths even if the per-block\n  pre-flight FCS check is bypassed (defense in depth — the\n  pre-flight catches the common case first).\n\nScope deliberately limited to RLE / Raw. The Compressed-block\nsequence executor still writes via the existing unchecked path;\nthreading `try_*` through the fused decode+execute pipeline is the\nnext step toward unconditional adversarial-input safety. The\n`_trusted` suffix on `decode_to_slice_trusted` reflects that\nlimitation — the rename to plain `decode_to_slice` waits for the\nCompressed path.\n\nFull test suite (652 tests) green; 8 existing direct-path tests\nunchanged in behaviour. Clippy clean.\n\n* fix(decode): checked_add in try_* paths + harden default impl\n\n* `UserSliceBackend::try_extend`, `try_extend_and_fill`,\n  `try_extend_from_within` now use `checked_add` on every\n  `tail + len`, `head + start`, `start + len` computation.\n  Without the wrap check, an adversarial `len` near `usize::MAX`\n  could wrap the sum below the existing upper-bound test,\n  bypassing the fallible path and panicking inside\n  `copy_bytes_overshooting` / `slice[tail..new_tail]`\n  (start > end).\n* `BufferBackend::try_extend_from_within` default impl validates\n  BOTH halves of the underlying unsafe contract — source range\n  via `start + len <= self.len()` (with `checked_add`) and\n  destination range via `tail + len <= cap` (after `reserve`) —\n  before forwarding to `unsafe extend_from_within_unchecked`.\n  The earlier default impl only reserved capacity; the safe entry\n  point could trigger UB on growable backends if a caller passed\n  a bad `start`. Fixed-capacity backends override with a tighter\n  pair of checks that does not call `reserve` (no-op on them).\n* `BufferBackend::try_extend` doc-string corrected: the default\n  impl returns `Ok(())` for growable backends; Vec OOM is an\n  abort, not a recoverable `Err` — the previous wording falsely\n  implied otherwise.\n* `DecodeBlockContentError::BackendOverflow` doc-string corrected:\n  this is an internal diagnostic variant that always converts to\n  `FrameDecoderError::FrameContentSizeMismatch` before reaching\n  the public API. Reworded to say \"in-crate debugging\" rather\n  than \"callers can distinguish\".\n\n* docs(decode): clarify BackendOverflow scope and try_* default-impl pattern\n\nAddresses two Copilot review threads on PR #251:\n\n1. errors.rs DecodeBufferError::BackendOverflow doc comment claimed the\n   variant is surfaced from the direct-decode path via\n   FrameContentSizeMismatch, but no production code constructs it yet —\n   the Compressed-block sequence executor still uses the unchecked\n   extend_from_within and panics on overshoot via release-mode assert!.\n   The variant is reserved for the follow-up that wires try_extend_from_within\n   through DecodeBuffer::repeat*. Clarified the doc to say the variant is\n   PRESENT but NOT WIRED on production paths yet; the _trusted suffix on\n   decode_to_slice_trusted reflects that the burst path is still hardened\n   via the panic-path until that follow-up lands.\n\n2. buffer_backend.rs module-level comment claimed FlatBuf / RingBuffer\n   'override' the new try_* methods. They do not — they rely on the\n   default trait impls that delegate to the panic-on-overflow variant\n   and always return Ok. The phrasing implied per-backend impls that\n   readers might look for and not find. Reworded to say growable\n   backends rely on the default impls (which call .extend / .extend_and_fill\n   / .extend_from_within_unchecked and never produce Err because the\n   underlying Vec grows on demand).\n\nNo behaviour change — only doc-comment text updates. Existing tests\nunaffected; cargo check release clean.\n\n* test(decode): unit coverage for UserSliceBackend try_* surface\n\nCodecov flagged the new try_extend / try_extend_and_fill /\ntry_extend_from_within paths at 23.95% patch coverage on PR #251 —\n73 missing lines out of the 305-line file delta. The new tests\nexercise the production paths so codecov's patch threshold (85%)\nholds for the introduced lines:\n\n  try_extend\n    - exact-fit happy path (advances tail to capacity)\n    - over-capacity returns BackendOverflow with tail/requested/capacity\n      diagnostics, tail unchanged\n    - partially-full state reports current tail in overflow\n    - checked_add wrap branch (documented as unreachable from safe Rust,\n      reachable only via fuzz_exports — covers the line for codecov)\n\n  try_extend_and_fill\n    - exact-fit pattern fill\n    - over-capacity returns BackendOverflow with same diagnostics\n\n  try_extend_from_within\n    - within-bounds repeats history correctly (donor wildcopy semantics)\n    - source range past tail returns BackendOverflow\n    - destination range past capacity returns BackendOverflow\n\n17 tests run, 17 pass. No code change — pure test additions.\n\n* harden(decode): wrap-aware default + overflow-safe error path + non-misleading test\n\nAddresses three Copilot review threads on PR #251:\n\n1. buffer_backend.rs:224 — default try_extend_from_within had a linear\n   tail+len <= cap check that's wrong for wrap-aware backends. RingBuffer's\n   tail wraps modulo cap; a tail near cap with a new write that straddles\n   the wrap is valid (extend_from_within_unchecked handles it after\n   reserve), but the default check rejected it as BackendOverflow. Removed\n   the destination check from the default impl — reserve(len) + the\n   per-backend invariant maintained by extend_from_within_unchecked is the\n   contract growable backends already honor. Fixed-capacity backends\n   (UserSliceBackend) override this method with their own non-wrap-aware\n   capacity check, unchanged.\n\n2. frame_decoder.rs:1541 — BackendOverflow -> FrameContentSizeMismatch\n   conversion computed reported produced as  with unchecked u64 +. This arm is reached\n   precisely when block content exceeded backend capacity — exactly the\n   case where adversarial decompressed_size (up to u32::MAX, plus produced\n   up to whatever previous blocks wrote) could nominally overflow u64\n   itself. Using saturating_add caps the reported value at u64::MAX\n   instead of wrapping; preserves defense-in-depth without panicking in\n   debug builds.\n\n3. user_slice_buf.rs:697 — try_extend_checked_add_wrap_returns_overflow\n   test was misnamed. The checked_add wrap branch is unreachable from\n   safe Rust (would require forging a slice with len near usize::MAX via\n   from_raw_parts, which is UB). The test ended with try_extend(&[]).is_ok()\n   asserting the zero-length happy path, not overflow. Renamed to\n   try_extend_zero_length_succeeds_and_leaves_tail_unchanged, expanded to\n   cover both tail=0 and tail>0 zero-length paths, and the doc comment\n   now correctly states the wrap branch is fuzz-harness territory.\n\n660/661 nextest pass on release. The single fail\n(bit_writer::catches_dirty_upper_bits) is a #[should_panic] test on\ndebug_assert! and is pre-existing release-mode behaviour unrelated to\nthis change.\n\n* refactor(decoding): clarify fallible-write docs, lazy err construction\n\n- buffer_backend: scope wording to Raw/RLE; document try_extend_from_within\n  ring-aware semantics (no linear tail+len<=cap check in default impl)\n- decode_buffer: try_push doc references Raw block fast path\n- user_slice_buf: ok_or -> ok_or_else on try_* paths (lazy BackendOverflow\n  construction on success branch); trim test header\n- frame_decoder: pattern BackendOverflow {..} ignoring step field\n\n* refactor(decoding): eager BackendOverflow construction, accurate docs\n\n- user_slice_buf: ok_or_else -> ok_or on try_* paths.\n  BackendOverflow is Copy with three usize fields; closure indirection\n  is heavier than the struct construction it gates. Restores\n  clippy::unnecessary_lazy_evaluations cleanliness.\n- buffer_backend: drop misleading \"validate tail+len<=cap\" from\n  try_extend_from_within default-impl comment — wrap-aware RingBuffer\n  intentionally skips the linear check; fixed-capacity backends\n  override.\n- frame_decoder: rewrite saturating_add rationale to reflect\n  BlockHeader.decompressed_size being u32, not u64. Overflow concern\n  lives on accumulated produced (u64), not per-block size.\n\n* test(decoding): cover BackendOverflow mapping on RLE direct path\n\n- block_decoder: add rle_oversized_against_user_slice_backend_returns_backend_overflow\n  exercising DecodeBlockContentError::BackendOverflow { step: RLE }\n  when a 10-byte RLE block targets a 4-byte UserSliceBackend slice.\n  Asserts no bytes are written on the failure branch (transactional\n  surface).\n- buffer_backend: rewrite BackendOverflow doc to list all three\n  failure modes (destination capacity overshoot, arithmetic overflow\n  on checked_add, source-range violation in try_extend_from_within),\n  not only the capacity-overshoot case.\n- buffer_backend: drop unsubstantiated \"benches confirmed <=1%\"\n  claim from the fallible-write surface comment; bench validation\n  is a pre-merge follow-up.\n\n* test(decode): add regression test for RLE source-advance-on-failure\n\n`decode_block_content_from_slice` advances `*source = &source[1..]`\nBEFORE calling the fallible `try_extend_and_fill`. When the write\nerrors (BackendOverflow on fixed-capacity backends), 1 input byte was\nalready consumed but the caller exits early, so the input cursor and\nthe decoder's bytes_read accounting diverge.\n\nThis commit adds the failing test that pins the contract — `*source`\nmust remain unchanged when the RLE write fails. The fix lands in a\nseparate commit so the bisect history shows the bug existed and was\ndeliberately addressed.\n\n* fix(decode): defer RLE source advance until try_extend_and_fill succeeds\n\nMirrors the Raw arm's split_at-then-try_push-then-advance ordering.\nOn `UserSliceBackend` (fixed-capacity), an oversized RLE block returns\n`Err(BackendOverflow)`; without this fix, `*source` had already been\nmoved forward by 1 byte, leaving the input cursor and the decoder's\nbytes_read accounting out of sync.\n\nVerified by the regression test added in the previous commit\n(`rle_overflow_leaves_source_unadvanced`), which now passes alongside\nthe happy-path and empty-source assertions.\n\n* test(decoding): cover try_extend_from_within default + BackendOverflow Display\n\nCodecov flagged 27 missing lines in `buffer_backend.rs` (22.85% patch\ncoverage) and 4 missing in `errors.rs` (0%) — both belong to the\nfallible-write surface added by this PR but unexercised by tests.\n\n- buffer_backend: four #[cfg(test)] unit tests against `FlatBuf` (the\n  default-impl path; `UserSliceBackend` overrides):\n  - happy path: try_extend_from_within copies head bytes into tail\n  - arithmetic overflow: start.checked_add(len) wrap returns Err\n    without touching the backend\n  - source-range violation: start+len > self.len() returns Err\n  - BackendOverflow Display renders all three diagnostic fields\n- errors: assert DecodeBlockContentError::BackendOverflow Display\n  for BlockType::RLE and Raw arms\n\nAll 5 tests PASS, clippy clean.",
+          "timestamp": "2026-05-25T16:35:28+03:00",
+          "tree_id": "421987d02f3b5751318066b1d454b7cae40e74e7",
+          "url": "https://github.com/structured-world/structured-zstd/commit/c5efb8f5b76d9a14c7dd4330a5a8cd4df4c27d3a"
+        },
+        "date": 1779720649366,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.134,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 339.243,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 236.6,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.434,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.563,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.939,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 4.921,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.064,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.785,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 4.767,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.098,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.825,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.665,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.298,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.359,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 2.244,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.389,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 2.319,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.271,
             "unit": "ms"
           }
         ]
