@@ -531,16 +531,19 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     //       — needs `lit_cur_before + 16 <= lit_len`. THIS GATE
     //       MATTERS EVEN WHEN `seq.ll == 0`: the copy still happens,
     //       overwriting the dst region the match copy will rewrite.
-    //   (2) Tail wildcopy's final 16-byte chunk at offset
-    //       `(lit_length - 16) .. lit_length` — needs
-    //       `lit_cur_before + lit_length + 15 <= lit_len`, i.e.
-    //       `high + 15 <= lit_len`.
-    // For `lit_length == 0` only (1) fires. For `lit_length ∈ 1..=16`
-    // (1) is tighter than (2). For `lit_length > 16` (2) is tighter.
-    // Take both as guards. `checked_add` covers adversarial overflow.
+    //   (2) Tail wildcopy's final 16-byte chunk — ONLY when
+    //       `lit_length > 16` (the donor inline path gates the
+    //       wildcopy call on that same threshold). Reads up to
+    //       `lit_cur_before + lit_length + 15`, i.e. `high + 15`.
+    // For `lit_length ∈ 0..=16` only (1) fires; gate (2) would
+    // unnecessarily reject short-literal-tail sequences near
+    // `lit_len` whose `copy16` over-read fits inside the buffer
+    // (`lit_cur_before + 16 <= lit_len`) but whose `high + 15`
+    // exceeds it. Apply (2) only in the wildcopy regime.
+    // `checked_add` covers adversarial overflow.
     let donor_path_safe = B::SUPPORTS_INLINE_DONOR_EXEC
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
-        && high.checked_add(15).is_some_and(|b| b <= lit_len);
+        && (seq.ll as usize <= 16 || high.checked_add(15).is_some_and(|b| b <= lit_len));
     if donor_path_safe {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
