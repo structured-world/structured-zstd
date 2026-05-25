@@ -92,6 +92,11 @@ mod tests;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::bit_io::BitReaderReversed;
+    // `BitReaderReversed` is generic over `K: CpuKernel = ScalarKernel`,
+    // so both the trait bound and the default need a `pub` path to
+    // match the re-exported type's visibility. Without this the
+    // bench-build trips `private_bounds` / `private_interfaces`.
+    pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 
     /// Bench-only facade for the decoder wildcopy implementation.
     ///

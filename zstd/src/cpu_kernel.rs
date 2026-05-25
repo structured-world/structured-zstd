@@ -28,7 +28,16 @@ use std::sync::OnceLock;
 /// SSE2 128-bit move, etc.). Structure ops that have one canonical
 /// implementation must NOT be on this trait — they stay on the
 /// existing decoder / encoder types.
-pub(crate) trait CpuKernel: Copy + 'static {
+// Public (rather than `pub(crate)`) because `BitReaderReversed` is
+// generic over `K: CpuKernel = ScalarKernel` and is re-exported via
+// the `bench_internals`-gated `testing` module; under that feature
+// the visibility of every type that appears in `BitReaderReversed`'s
+// bounds (the trait + the default kernel) must match the type's own
+// visibility, otherwise rustc rejects with `private_bounds` /
+// `private_interfaces`. The trait surface stays narrow on stable
+// crate users: nothing outside `bench_internals` constructs a
+// non-Scalar kernel directly.
+pub trait CpuKernel: Copy + 'static {
     /// Mask the low `n` bits of `value`, returning the remaining
     /// high bits zeroed. The FSE bitstream hot path fires this 3×
     /// per decoded sequence; on BMI2-capable hardware this maps to
@@ -44,7 +53,7 @@ pub(crate) trait CpuKernel: Copy + 'static {
 /// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
 /// when no x86 or aarch64 feature is detected at runtime.
 #[derive(Copy, Clone, Default)]
-pub(crate) struct ScalarKernel;
+pub struct ScalarKernel;
 
 impl CpuKernel for ScalarKernel {
     #[inline(always)]
@@ -74,9 +83,11 @@ pub(crate) struct Bmi2Kernel;
 impl CpuKernel for Bmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
-        // SAFETY: this impl is only constructed via
-        // `dispatch_cpu_kernel` after `detect_cpu_kernel` confirmed
-        // BMI2 is available on the running CPU.
+        // SAFETY: this kernel ZST is only reachable via the
+        // `match detect_cpu_kernel() { CpuKernelTag::Bmi2 => ... }`
+        // dispatch arms at decoder entry sites, all of which fire only
+        // after `detect_cpu_kernel` confirmed BMI2 is available on the
+        // running CPU.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
 }

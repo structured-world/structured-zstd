@@ -299,14 +299,16 @@ fn decompress_literals_impl<K: CpuKernel>(
         // Safety constraint per donor `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
         // before each `bits[s] >> table_shift` read, the sentinel-bit position
         // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
-        // `max_num_bits` read region). After K shifts the sentinel is at bit
-        // `padding_skip + K*max_num_bits`. The N-th read happens after (N-1)
+        // `max_num_bits` read region). After `s` shifts the sentinel is at bit
+        // `padding_skip + s*max_num_bits`. The N-th read happens after (N-1)
         // shifts, so the inclusive bound is
         //   padding_skip + (N-1)*max_num_bits < 64 - max_num_bits
         // i.e.
         //   padding_skip + N*max_num_bits <= 63
         // Solving for N with padding_skip ≤ 8:
         //   N <= (63 - 8) / max_num_bits = 55 / max_num_bits
+        // (Letter `s` is used here for shift-count to avoid colliding with
+        // the surrounding generic parameter `K: CpuKernel`.)
         // For max=11: 5 symbols (donor parity — was 4 with the old off-by-one
         // formula). For max=8: 6 symbols. For max=4: 13.
         let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
