@@ -146,8 +146,10 @@ pub(crate) trait BufferBackend: Sized {
     // The fixed-capacity backend (`UserSliceBackend`) overrides each
     // method with an explicit capacity check that returns `Err` on
     // overshoot instead of panicking. The trade-off is one branch
-    // per write on the direct-decode path; benches confirmed the
-    // overhead is ≤ 1 % on compare_ffi.
+    // per write on the direct-decode path; the overhead is expected
+    // to be modest but has not yet been benchmarked on this branch
+    // (bench validation tracked as a follow-up before merging into
+    // the perf-critical path).
 
     /// Fallible variant of [`Self::extend`].
     /// Returns `Err(BackendOverflow)` on fixed-capacity backends
@@ -254,12 +256,24 @@ pub(crate) trait BufferBackend: Sized {
     }
 }
 
-/// Backend write failed because the requested write would exceed the
-/// backend's capacity. Surfaced only by fallible `try_*` methods on
-/// fixed-capacity backends (`UserSliceBackend`); growable backends
+/// Backend write failed. Surfaced only by fallible `try_*` methods
+/// on fixed-capacity backends (`UserSliceBackend`); growable backends
 /// (`FlatBuf`, `RingBuffer`) never produce this — they grow instead.
 ///
-/// The decoder converts this into
+/// Covers three distinct failure modes on `UserSliceBackend`:
+/// 1. **Destination capacity overshoot** — `tail + len > slice.len()`:
+///    the new tail would exceed the caller's output slice.
+/// 2. **Arithmetic overflow** — `tail.checked_add(len)` overflowed
+///    (or `head.checked_add(start)` in `try_extend_from_within`):
+///    adversarial `len` near `usize::MAX` triggers the wrap-guard
+///    `ok_or` branch.
+/// 3. **Source-range violation** (`try_extend_from_within` only) —
+///    `abs_end > self.tail`: the requested match-copy source range
+///    extends past the live region.
+///
+/// All three modes return the same struct shape so the caller doesn't
+/// need to discriminate; `tail` / `requested` / `capacity` carry the
+/// diagnostic context. The decoder converts this into
 /// `FrameDecoderError::FrameContentSizeMismatch` at the
 /// `decode_to_slice_trusted` boundary, so callers never see
 /// `BackendOverflow` directly.

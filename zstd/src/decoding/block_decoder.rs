@@ -617,6 +617,53 @@ mod tests {
         }
     }
 
+    /// Exercise the BackendOverflow -> DecodeBlockContentError mapping
+    /// on the direct-decode path. Constructs a fixed-capacity
+    /// `UserSliceBackend` over a 4-byte slice and feeds it an RLE
+    /// block whose `decompressed_size` (10) exceeds the slice; the
+    /// `try_extend_and_fill` failure must surface as
+    /// `BackendOverflow { step: RLE }`, never panic.
+    #[test]
+    fn rle_oversized_against_user_slice_backend_returns_backend_overflow() {
+        use crate::decoding::decode_buffer::DecodeBuffer;
+        use crate::decoding::scratch::{DirectScratch, FSEScratch, HuffmanScratch};
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut output = [0u8; 4];
+        let backend = UserSliceBackend::from_slice(&mut output);
+        let buffer = DecodeBuffer::from_backend(backend, 1 << 20);
+        let mut huf = HuffmanScratch::new();
+        let mut fse = FSEScratch::new();
+        let mut offset_hist = [1u32, 4, 8];
+        let mut literals_buffer = alloc::vec::Vec::new();
+        let mut sequences = alloc::vec::Vec::new();
+        let mut block_content_buffer = alloc::vec::Vec::new();
+        let mut direct = DirectScratch {
+            huf: &mut huf,
+            fse: &mut fse,
+            offset_hist: &mut offset_hist,
+            literals_buffer: &mut literals_buffer,
+            sequences: &mut sequences,
+            block_content_buffer: &mut block_content_buffer,
+            buffer,
+        };
+
+        let mut d = primed_decoder();
+        let payload = [0xCDu8];
+        let mut src: &[u8] = &payload;
+        let h = header(BlockType::RLE, 10, 1);
+        let err = d
+            .decode_block_content_from_slice(&h, &mut direct, &mut src)
+            .expect_err("RLE 10 bytes into 4-byte slice must error");
+        match err {
+            DecodeBlockContentError::BackendOverflow { step } => {
+                assert_eq!(step, BlockType::RLE);
+            }
+            other => panic!("expected BackendOverflow, got {other:?}"),
+        }
+        assert_eq!(direct.buffer.len(), 0, "no bytes written on overflow");
+    }
+
     #[test]
     fn rle_advances_source_by_one_byte_and_extends_buffer() {
         // Happy path on a freshly primed decoder: 1 byte consumed
