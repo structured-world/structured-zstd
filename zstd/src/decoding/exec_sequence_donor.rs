@@ -17,7 +17,7 @@
 //! Helpers are private SSE2-baseline x86_64 ops (all supported
 //! x86_64 targets carry SSE2). Non-x86 paths fall back through the
 //! existing `BufferBackend::extend` + `DecodeBuffer::repeat` chain
-//! (`UserSliceBackend::supports_inline_donor_exec` returns `false`
+//! (`UserSliceBackend::SUPPORTS_INLINE_DONOR_EXEC` returns `false`
 //! on those targets, so the dispatch site dead-eliminates this code
 //! at compile time per backend monomorphisation).
 
