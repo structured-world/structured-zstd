@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779720653631,
+  "lastUpdate": 1779725372188,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -46598,6 +46598,270 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1e10b585599e93d1d52f9a365454a365bb8987e6",
+          "message": "perf(decode): #247 Part 2 — kill divb in repeat_short_offset + force-inline UserSliceBackend::extend (#254)\n\n* perf(decode): expand FSE Entry to ZSTD_seqSymbol shape\n\nGrow `fse::Entry` from 4 bytes to 12 bytes by adding two\npre-computed fields that mirror donor's `ZSTD_seqSymbol`:\n\n* `base_value: u32` — code baseline (LL / ML / OF base).\n* `num_additional_bits: u8` — extra bits to read from the stream.\n\nThese are populated post-build by per-table enrichment passes:\n\n* `FSETable::enrich_with_packed_seq_meta(&LL_META)` / `(&ML_META)`\n  for LL and ML tables — same packed `(base << 0) | (bits << 24)`\n  layout the existing const arrays use.\n* `FSETable::enrich_for_offsets()` for OF table — closed-form\n  `base = 1 << symbol`, `num_additional_bits = symbol`.\n\nCalled from `maybe_update_fse_tables` (sequence section, FSE +\nPredefined modes) and `Dictionary::decode_dict` (dict-trained\ntables). Repeat-mode blocks reuse the previously enriched table,\nso no work runs on the repeat path.\n\n`decode_one_sequence_inline` now reads `base_value` /\n`num_additional_bits` straight off the active FSE state's\n`Entry`. The previous `lookup_ll_code(ll_code)` /\n`lookup_ml_code(ml_code)` indirections cost two extra cache\ntouches per sequence (LL_META 144 B + ML_META 212 B in separate\nregions). The new fields ride in the same cache line that\n`decode_symbol` already loads when it reads `state.symbol`, so\nthe saving is two L1d touches per emit at zero hot-path\noverhead.\n\nThe RLE-fallback path (`decode_sequences_with_rle`) still uses\n`lookup_*` for the RLE byte since RLE-mode tables don't have an\nenriched entry to read from. Those tables are rare on\nperf-relevant corpora — keeping `lookup_*` for them was simpler\nthan allocating a single-entry mock table per RLE byte.\n\n`copy_symbols_into_decode`'s LE-fast-path that wrote two packed\n4-byte entries via one u64 store no longer applies — Entry is\n12 bytes now. Replaced with `Vec::resize` + per-slot `.symbol`\nassignment for both endians. Table build runs once per FSE-mode\nblock (not per emit), so the byte-packed write is not a hot-path\nloss.\n\nHUF-weight FSE tables leave `base_value` / `num_additional_bits`\nat their zero default — they don't use those fields. The extra\n8 bytes per slot are a fixed cost on the small HUF FSE table\n(≤ 64 entries at acc_log 6) and the dominant savings are in the\nsequence section.\n\nEntry layout test (`decoder_entry_layout_12_bytes_donor_seqsymbol_shape`)\npins offsets and total size at the new shape so future Entry\nedits surface a clear test failure.\n\nEstimated saving: 2-4 % L-1 fast decompress throughput on i9\n(per #247 Part 1 acceptance criteria). Bench delta to be\nmeasured on the harden/#246 follow-up branch.\n\nFull test suite (652 tests) green; clippy clean.\n\nPart 1 of #247.\n\n* fix(decode): enrich_* zeros stale base_value / num_additional_bits\n\n`enrich_with_packed_seq_meta`'s doc-string promised symbols\noutside `packed.len()` \"stay at 0\", but the implementation only\noverwrote in-range entries — leaving prior values on the out-of-\nrange branch. On `feature = \"fuzz_exports\"` builds (where\nexternal code can stuff arbitrary entries into the table), a\nprevious well-formed enrichment could leak stale non-zero\nmetadata into a later corrupt enrichment.\n\nThe out-of-range branch now explicitly zeros both fields,\nmatching the doc. `enrich_for_offsets` gets the same treatment\n— resets before the bound check so corrupt offset codes ≥ 32\ndon't keep stale `1 << prev_code` values from an earlier\nenrichment.\n\nDownstream `decode_one_sequence_inline` still surfaces the\ncorruption via the existing bitstream checks; this just clears\nprior state rather than introducing a new fast-fail.\n\n* perf(decode): add CpuKernel trait + ZST impls + cached detect (Part 2 foundation)\n\nTop-level CPU kernel dispatch foundation per issue #247 Part 2. Introduces the\n`CpuKernel` trait with the first leaf method (`mask_lower_bits`) and ZST impls\nfor Scalar / Bmi2 / Avx2 / Vbmi2 (x86_64) + Neon / Sve (aarch64). The shared\nBMI2 `_bzhi_u64` body lives behind one `#[target_feature(enable = \"bmi2\")]`\nfree function so all kernel impls that need BMI2 wrap the same monomorphised\ncode.\n\n`detect_cpu_kernel()` is OnceLock-cached on std (single runtime detect per\nprocess) and cfg-gated at compile time on no-std. Returns `CpuKernelTag` which\nthe upcoming FrameDecoder entry-point dispatch will match on to instantiate\nthe generic-over-K inner pipeline.\n\nModule is registered but not yet wired into the decoder hot path — wiring lands\nin follow-up commits on this branch (mask_lower_bits migration + FrameDecoder\nentry dispatch + HuffmanDecodeKernel merge).\n\n* perf(bit-reader): BitReaderReversed generic over K: CpuKernel = ScalarKernel\n\nFirst propagation step toward Part 2 of #247. Routes mask_lower_bits\nthrough K::mask_lower_bits at the three internal call sites in\npeek_bits and peek_bits_triple. Default K = ScalarKernel keeps every\nexternal caller working unchanged, so the patch is net-zero on the\ndefault bench: 1.5985 ms / 609 MiB/s (vs PR #252 baseline 1.5988 ms,\nidentical within 0.02 percent noise band).\n\nThe win materialises only after FrameDecoder entry resolves the\ndetected CpuKernelTag and threads the concrete Avx2Kernel /\nBmi2Kernel / Vbmi2Kernel down through the BitReaderReversed type\nparameter, replacing the default ScalarKernel at the construction\nsite. Wiring lands in subsequent commits on this branch:\nliterals_section_decoder / sequence_section_decoder / fse_decoder\ngeneric-over-K propagation, then frame_decoder entry dispatch.\n\nTest-site annotations: in-module #[cfg(test)] sites and\ntests/bit_reader.rs explicit-construction sites take an explicit\n::<crate::cpu_kernel::ScalarKernel> turbofish; Rust default type\nparameters apply at usage sites only when the K is otherwise\nunconstrained from context, and BitReaderReversed::new() at the\nconstruction position has no context to infer K from.\n\n661/662 nextest pass on release. The single fail\n(bit_writer::catches_dirty_upper_bits) is a #[should_panic] test on\ndebug_assert! and is pre-existing release-mode behaviour unrelated\nto this change.\n\n* perf(literals): K-dispatch decompress_literals via target_feature-wrapped outer\n\nTier 1 1A literals-path K-dispatch for issue #247 Part 2. Routes the\nHUF 4-stream burst loop through the detected CpuKernel by:\n\n1. Splitting decompress_literals into a non-generic dispatch entry +\n   a generic decompress_literals_impl<K: CpuKernel> body.\n2. Wrapping each x86_64 dispatch arm (Bmi2 / Avx2 / Vbmi2) in an outer\n   target_feature'd function so the entire impl::<K> pipeline executes\n   inside the matching target_feature context.\n3. Threading the K type parameter through run_4stream_burst_loop and\n   the four HuffmanDecoder methods that take &mut BitReaderReversed<'_>,\n   replacing the implicit BitReaderReversed<'_, ScalarKernel> default\n   with the concrete K.\n\nThe target_feature outer is load-bearing: without it, LLVM cannot inline\nthe target_feature'd intrinsic helpers (Avx2Kernel::mask_lower_bits ->\nmask_lower_bits_bmi2_impl wrapping _bzhi_u64) through the K::method\ntrampoline back into the non-target_feature generic caller. The inlined\nBMI2 win evaporates into one function-call boundary per mask op, which\nthis layout fixes by promoting the whole impl::<K> call site into a\ntarget_feature'd context.\n\nMeasured on i9-9900K, decompress/level_-1_fast/decodecorpus-z000033/\nc_stream/matrix/pure_rust_direct, criterion --measurement-time 20:\n\n- main baseline: 2.3001 ms / 424 MiB/s\n- Part 1 (PR #252): 1.5988 ms / 609 MiB/s (-30.45%)\n- Tier 1 1A foundation: 1.5985 ms / 609 MiB/s (-30.50%, net-zero vs Part 1)\n- Tier 1 1A literals-K (NO target_feature wrap): 1.6312 ms / 597 MiB/s\n  (-29.08%, 2% REGRESSION — trampoline boundary cost)\n- Tier 1 1A literals-K + target_feature wrap (this commit):\n  1.5889 ms / 613 MiB/s (-30.92%, -0.6% improvement over Part 1)\n\nNative (RUSTFLAGS=-C target-cpu=native) is at parity with PR #252 native\n(1.4362 ms vs 1.388 ms, within bench noise) — confirming the wrap\nmechanism does inline the intrinsics on native builds.\n\nThe -0.6% gain is the literals path share of Part 2's expected -5 to\n-12% combined win. Sequence section decode + FSE state advance + match\ncopy will land on subsequent commits and extend the chain to those\nhot-path leaf operations.\n\nTest suite: 661/662 nextest pass on release. The single fail\n(bit_writer::catches_dirty_upper_bits) is a #[should_panic] test on\ndebug_assert! and is pre-existing release-mode behaviour unrelated to\nthis change.\n\n* perf(seq): NEGATIVE — K-dispatch at decode_and_execute_sequences regresses 5%\n\nNegative result for Tier 1 1A sequence-path K-dispatch using the same\npattern that worked for literals (per-block dispatch entry + target_feature-\nwrapped arms + generic _impl<K>).\n\nMeasured on i9, decompress/level_-1_fast/decodecorpus-z000033/c_stream/\nmatrix/pure_rust_direct, criterion --measurement-time 20:\n\n- Tier 1 1A literals-only baseline: 1.5889 ms / 613 MiB/s (-30.92%)\n- Tier 1 1A literals + sequence K-dispatch: 1.7187 ms / 567 MiB/s\n  (-25.27%, +8% REGRESSION)\n\nRoot cause: decode_and_execute_sequences_impl<B, K> is ~500 LOC plus\ngeneric over BOTH BufferBackend B (~3 variants) AND CpuKernel K (~4\nvariants) — 12 monomorphisations of a large function. LLVM declines\nto inline the impl into the small target_feature'd wrapper functions,\nso the bmi2 / avx2 target_feature context does NOT propagate down into\nthe impl body. Every K::mask_lower_bits trampoline inside the impl\nhits the function-call boundary back to the target_feature'd helper\n(mask_lower_bits_bmi2_impl) — same cost as the pre-wrap design plus\nthe additional dispatch + monomorphisation bloat.\n\n#[inline] hint on the impl did NOT help — LLVM still refused based on\nsize. #[inline(always)] would force inlining at the cost of 12× code\ncopies of a huge function — binary bloat / icache pressure trade-off\nthat is unlikely to net positive.\n\nThe literals-path pattern worked because decompress_literals_impl is\nsmall enough (~150 LOC) that LLVM inlines it through the target_feature\nwrapper — intrinsics inline freely from there.\n\nDesign implication for future tiers: target_feature-wrap-propagation\nonly works for SMALL generic functions. For large hot paths (sequence\ndecode, block dispatch, frame decode loop), the dispatch must be\nINSIDE around just the hot inner loop, not wrapping the whole outer\nfunction. Plan to follow up with refactor: extract the per-sequence\ndecode-loop body into a small generic helper, dispatch K + target_feature\naround THAT, leave the outer decode_and_execute_sequences non-generic.\n\nFiles changed (commit kept for audit; revert in follow-up):\n- zstd/src/decoding/sequence_section_decoder.rs (decode_and_execute_sequences\n  + decode_one_sequence_inline + decode_sequences_with_rle generic over K)\n- zstd/src/fse/fse_decoder.rs (FSEDecoder::init_state/update_state/\n  update_state_fast generic over K — these are harmless with K=ScalarKernel\n  default and are kept as inert foundation)\n- zstd/src/huff0/huff0_decoder.rs (BitReaderReversed::<ScalarKernel>::new\n  turbofish at one previously-ambiguous test-site)\n\n661/662 nextest still passes on release.\n\n* perf(seq): forward-revert sequence K-dispatch (negative commit 6285f1d)\n\nRestores decode_and_execute_sequences + FSEDecoder methods to the\nliterals-only checkpoint state (commit 801a948). The sequence K-dispatch\nlanded in commit 6285f1d via the same outer-function target_feature-wrap\npattern that worked for decompress_literals (+0.6% win) regressed by 5%\non i9 c_stream pure_rust_direct (1.5889 ms -> 1.7187 ms).\n\nRoot cause documented in 6285f1d commit message: decode_and_execute_\nsequences_impl<B, K> is ~500 LOC plus generic over BufferBackend B AND\nCpuKernel K (12 monomorphisations of a large function). LLVM refuses to\ninline impl into the target_feature outer wrapper; target_feature\ncontext fails to propagate down; K::mask_lower_bits trampolines pay\nthe function-call boundary cost on every invocation inside impl.\n\nForward-only revert keeps the negative experiment in audit trail at\n6285f1d. The follow-up design (inner-loop-only K dispatch) requires\nextracting the per-sequence body into a small generic helper and\nwrapping ONLY that with target_feature; that work goes into a separate\nbranch after Tier 4-7 land (per branch tree plan rule: don't get stuck\non one tier, structural cleanups are independent levers).\n\nBench restored: 1.5896 ms / 613 MiB/s / -31.10% vs main, identical to\nthe literals-only checkpoint. 661/662 nextest pass on release (single\nfail is pre-existing should_panic test in bit_writer).\n\n* perf(fse): NULL — unchecked get on FSE build second pass is noise-level\n\nTier 4-4B from #247 Part 2+ branch tree. Replaced bounds-checked indexing\nin the build_decoding_table baseline/num_bits computation second pass\nwith raw pointer arithmetic via debug-asserted invariants on the\nsymbol-space bound (entry.symbol < symbol_probabilities.len()).\n\nMeasured on i9, decompress/level_-1_fast/decodecorpus-z000033/c_stream/\nmatrix/pure_rust_direct, criterion --measurement-time 20:\n\n- Pre-change (forward-revert state): 1.5896 ms / 613 MiB/s (-31.10%)\n- Post-change (this commit):           1.5910 ms / 612 MiB/s (-31.04%)\n- Delta: ~0.001 ms / +0.06% — within bench noise\n\nFSE second-pass bounds checks are NOT a measurable cost on the\npure_rust_direct hot path. Either LLVM was already eliminating them\nthrough static inference, or the FSE table build runs too few iterations\nper block (max table_size = 1 << 9 = 512 entries × 3 tables) for\nbounds-check overhead to surface above 20s-measurement noise.\n\nKept as null-result audit entry per project no-revert rule. Next pivot:\nTier 5 (block dispatch slim-down — 14.19% flamegraph slot vs FSE\nbuild's 17.55% — but more uniform per-block cost so per-iter overhead\nmatters more) and Tier 8 (HUF 4-stream donor parity rewrite — verbatim\nport anchor branch).\n\n661/662 nextest pass on release; single fail is pre-existing\nshould_panic test in bit_writer.\n\n* perf(huf): NULL — fix off-by-one in symbols_per_burst formula\n\nTier 8a (partial of Tier 8 HUF verbatim port). Our run_4stream_burst_loop\nalready matches donor HUF_decompress4X1_usingDTable_internal_fast_c_loop\nin structure (register-resident bits[4], MEM_read64 reload pattern). The\none remaining algorithmic gap was the symbols_per_burst formula:\n\nOld: (64 - max - 8) / max  — integer division floors away (N-1)*max < 64-max-pad\n                              gives wrong N for cases where the divisor doesn't\n                              evenly split. For max=11 pad=8 yields N=4.\nNew: (63 - 8) / max         — direct upper-bound from\n                              N <= (63 - pad_max) / max  per donor's\n                               invariant.\n                              For max=11 pad=8 yields N=5 (donor parity).\n\nChange matrix:\n- max=11: 4 -> 5 symbols/iter (25% more decode per iter -> fewer reloads)\n- max=8:  6 -> 6 (unchanged, was already correct by accidental divisibility)\n- max=4:  13 -> 13 (unchanged)\n\nMeasured impact on i9 decodecorpus-z000033 c_stream pure_rust_direct\n(criterion --measurement-time 20):\n- Pre-change: 1.5910 ms / 612 MiB/s (-31.04%)\n- Post-change: 1.5891 ms / 613 MiB/s (-31.13%)\n- Delta: ~0.001 ms / +0.06% — within noise.\n\nThe decodecorpus-z000033 fixture's HUF tables likely use max_num_bits other\nthan 11 most of the time, so the N=4 -> N=5 bump doesn't fire on this\nworkload. Kept as a donor-parity correctness fix (formula now matches\nHUF_decompress4X1_usingDTable_internal_fast_c_loop's bound exactly) and as\nan inert win for other corpora that DO use max_num_bits=11 (which would\nshave ~5% off the HUF burst time on those workloads).\n\n661/662 nextest pass on release (pre-existing should_panic bit_writer test\nstill the only fail).\n\n* perf(fse): NEGATIVE -3.5% — predefined-mode FSE table cache via OnceLock clone_from\n\nAttempted to cache the 3 predefined-mode FSE tables (LL/ML/OF) at first\nbuild via std::sync::OnceLock + clone_from per block instead of running\nbuild_from_probabilities + enrich on every Predefined-mode block.\n\nHypothesis: top FSE-build hotspot at 24.58% of decode samples (per-perf-\nannotate spread across many instructions, no single hot point). Saving\nthe rebuild for every Predefined block was estimated at 3-5% on corpora\nwith high Predefined-mode hit rate.\n\nMeasured on i9, decompress/level_-1_fast/decodecorpus-z000033/c_stream/\nmatrix/pure_rust_direct, criterion --measurement-time 20:\n\n- Pre-change baseline (commit fb9c944):  1.5891 ms / 613 MiB/s / -31.13%\n- This commit (predefined cache):         1.6451 ms / 592 MiB/s / -28.70%\n- Delta: +0.056 ms / -3.5% regression vs PR-#252+Part-2 baseline\n\nLikely root causes (any combination):\n\n1. derive(Clone)'s default clone_from implementation falls back to\n   *self = source.clone(), which allocates a fresh Vec for every field\n   instead of reusing the scratch's existing pre-allocated Vec capacity.\n   The result is a per-block heap allocator round-trip that the original\n   build_from_probabilities path explicitly avoids via Vec::reserve. A\n   manual clone_from implementation on FSETable that does field-level\n   Vec::clone_from could fix this — Vec's own clone_from is documented\n   to reuse capacity.\n\n2. The decodecorpus-z000033 fixture may not use Predefined mode often\n   enough for the cache hit path to matter — most/all blocks could be\n   FSECompressed. In that case the cache is dead code and the added\n   OnceLock + helper functions only contribute to binary size /\n   icache pressure.\n\n3. Hot-code displacement: the added 3 OnceLock'd helper functions sit\n   alongside the maybe_update_fse_tables function in the same module's\n   translation unit. If the post-merge layout shifts the FSECompressed-\n   path code further from the call site, icache misses on the hot path\n   could exceed the per-Predefined-block savings.\n\nWithout instrumenting the bench to count mode-type hits per fixture, we\ncan't distinguish (1) from (2). Either way the current implementation\nregresses, so reverted forward in the next commit. Future revisit could\nadd the manual clone_from + measure hit rate before committing further\nenergy.\n\nMerge path: PR#252 + Part 2 foundation + BitReader<K> + Literals K +\nforward-revert seq + FSE-4B-NULL + HUF-formula-NULL + (this commit).\nAudit trail kept per project no-revert rule.\n\n661/662 nextest pass on release (pre-existing should_panic test still\nthe only fail).\n\n* perf(fse): forward-revert FSE predefined-mode cache (negative 449c14d)\n\nRestores sequence_section_decoder.rs to the pre-cache state (commit\nc1c933e). The predefined-mode FSE table cache attempted in 449c14d\nregressed -3.5% due to either:\n\n- derive(Clone) clone_from allocating fresh Vecs (not reusing scratch\n  capacity), or\n- decodecorpus-z000033 fixture not exercising Predefined mode often\n  enough to amortise the added OnceLock-init / hot-code displacement\n  cost.\n\nForward-only revert per project rule. Negative finding kept at 449c14d\nfor audit. A future revisit could:\n\n1. Implement manual clone_from on FSETable doing field-level\n   Vec::clone_from (which IS capacity-reuse-friendly per std docs).\n2. Instrument the bench to count mode-type hit distribution per fixture\n   before committing further energy.\n\nBranch state restored to:\n- 1.5891 ms / 613 MiB/s / -31.13% vs main\n- +0.6% throughput vs PR #252 baseline (Tier 1 1A literals K-dispatch\n  win, all other tier attempts null/negative).\n\n* perf(decode): kill divb in short-offset replicate fast path\n\n`repeat_short_offset` builds a 16-byte pattern from a small period\n(offset in {1, 2, 4}) as `chunk16[i] = base[i % offset]`. LLVM does\nnot propagate the outer `matches!(offset, 1|2|4)` arm into the inner\nloop's modulo, so it unrolls into 14 `divb` (8-bit divide) instructions,\neach ~20 cycles. perf annotate on the i9 primary bench\n(`decompress/level_-1_fast/decodecorpus-z000033/c_stream/pure_rust_direct`)\nattributes ~1% to each divb = ~14% of decode time in this setup phase.\n\nMaterialise the 16-byte pattern via per-offset literal arms. LLVM\nlowers each arm to a 128-bit store sequence with no divides remaining\nin the inner loop or its setup. Donor zstd's ZSTD_overlapCopy8 uses\nthe same shape.\n\nCorrectness covered by the existing canonical-equivalence test\n`repeat_short_offset_matches_canonical_for_all_offsets_and_lengths`\nplus the overlap fast-path reference tests, all still pass.\n\n* perf(decode): force-inline UserSliceBackend::extend on hot path\n\nperf annotate on the i9 primary bench attributes ~10% of decode time\nto the prologue/epilogue of `<UserSliceBackend as BufferBackend>::extend`\n(subq/pushq on entry, popq/retq on exit) — pure function-call boundary\ncost on a method called from tight literal-emit loops inside\n`decode_and_execute_sequences`. The body is small (one assert, one\ncopy), so promoting `#[inline]` to `#[inline(always)]` lets LLVM elide\nthe boundary across callers without meaningful caller bloat.\n\nConfirmed on\n`decompress/level_-1_fast/decodecorpus-z000033/c_stream/pure_rust_direct`:\n1.6421 ms -> 1.6126 ms = -1.80% (p < 0.05), throughput 593.5 -> 604.3 MiB/s.\n\nCumulative on Part 2: 1.8053 ms (pre-divb fix) -> 1.6126 ms = -10.67%.\n\nThis is NOT the documented Tier-10 negative (`inline(always)` entry +\nmatch-dispatch on leaf): there is no runtime kernel-feature branch here;\nthe SIMD dispatch lives one level deeper in `copy_bytes_overshooting`.\n\n* perf(decode): NEGATIVE +2.96% — force-inline extend_from_within_unchecked\n\nHypothesis: same boundary-cost reasoning as the prior extend inline-always\nwin — match-copy hot path called once per sequence, prologue/epilogue\ncontributing to the 9.66% slot, expected to inline cleanly.\n\nReality: +2.96% regression (p<0.05) on\n`decompress/level_-1_fast/decodecorpus-z000033/c_stream/pure_rust_direct`\ni9 bench (1.6126 ms -> 1.6603 ms).\n\nRoot cause: this method's body is materially larger than `extend`\n(release-mode capacity assert + total_readable/total_writable derivation\n+ `simd_copy::copy_bytes_overshooting` call). Force-inlining bloats\nevery caller (each sequence executor pipeline slot) past the icache\nbudget; the per-call boundary save is dwarfed by the duplicated body\nweight across N callers. The match-copy hot path is heavier than the\nliteral-push path so the inline cost crosses the break-even.\n\nAudit row kept (project rule: negatives are data, not reverted from git\nhistory). Followup commit forward-reverts the change.\n\n* perf(decode): forward-revert extend_from_within_unchecked inline-always\n\nRestores `#[inline]` on `extend_from_within_unchecked` after the prior\n`#[inline(always)]` change measured +2.96% regression (negative\naudit kept in commit 2826579c). Confirms 1.6228 ms median on the\ni9 primary bench, matching the post-extend-inline-always state\n(commit dc9b00d2) within criterion noise.\n\n* perf(bitreader): NULL — cache use_pext snapshot in BitReaderReversed\n\nHypothesis: peek_bits_triple was calling triple_extract_dispatch() on\nevery invocation — one atomic OnceLock load + branch per FSE-sequence\ndecode. Caching the snapshot in BitReaderReversed (one bool per\nreader lifetime) should remove the per-call atomic cost.\n\nReality on i9 primary bench: 1.6228 ms -> 1.6233 ms (p=0.94, +0.04%\nmedian = within noise). The per-call OnceLock cost was apparently\nalready low enough that LLVM amortised it across the surrounding\nloop, OR the bulk of the 3.95% slot lives in `extract_triple_pext`'s\ntarget_feature boundary (function-call ABI for `(u64,u64,u64)` return\nvia hidden &mut ptr per perf annotate row#11), not the dispatch\nlookup itself.\n\nKeeping the change: cleaner mental model (single source of truth for\nthe BMI2-enabled bit in the reader) and paves the way for a future\nK::extract_triple static-dispatch refactor (Tier 9) that would\nreplace this field with a generic-parameter decision.\n\nStruct grows 8 bytes per instance (1-byte bool + padding); negligible\nbecause every BitReaderReversed is per-block stack-local.\n\n* perf(decode): NEGATIVE +1.68% — drop #[cold]/#[inline(never)] on repcode helper\n\nHypothesis: `do_offset_history_repcode` is marked `#[cold]\n#[inline(never)]` on the assumption that repcode (offset_value\nin {1,2,3}) is rare; perf annotate showed it firing at ~2% of\ndecode time with ~21% of own samples in pushq/popq, suggesting\nthe cold annotation was the wrong call.\n\nReality: +1.68% regression (p<0.05) on the i9 primary bench,\n1.6233 -> 1.6506 ms. LLVM without the hint either inlined too\naggressively (bloating callers / increasing icache pressure) or\nchose worse code layout. The cold annotation was load-bearing\ndespite the apparent function-call-boundary cost — the\nout-of-line placement and branch-prediction bias for the\ncommon-path fallthrough were worth more than the saved push/pop.\n\nAudit row kept (project rule); forward-revert in next commit.\n\n* perf(decode): forward-revert do_offset_history_repcode cold annotations\n\nRestores `#[cold] #[inline(never)]` on `do_offset_history_repcode`\nafter the prior removal measured +1.68% regression (negative audit\nkept in commit 0314d4b2). Replaces the stale doc comment with a\nnote recording the empirically-validated rationale: the cold\nmarkers are load-bearing on this hot path; LLVM's hint-free\nheuristic is worse for this specific function.\n\n* perf(fse): NULL — set_len in lieu of resize zero-fill on spread buffer\n\nHypothesis: `symbol_spread_buffer.clear() + resize(table_size, 0)` in\n`build_decoding_table` writes `table_size` zeros that the two spread\nloops below immediately overwrite. Skipping the zero-fill via\n`reserve + unsafe set_len` would drop `table_size * 3` byte-stores\nper Compressed sequence block.\n\nReality: +0.16% on the i9 primary bench (p<0.05, but +0.0005 ms\nmedian — essentially noise). The zero-fill is small enough that\nLLVM lowered it to a vectorized memset that hides in the existing\nwrite-bandwidth window; skipping it has no measurable benefit and\nmay prevent some downstream optimization on the spread loops.\n\nAudit kept (project rule); next commit forward-reverts.\n\n* perf(fse): forward-revert spread-buffer set_len attempt\n\nRestores `resize(table_size, 0)` after the prior `reserve + set_len`\nattempt measured +0.16% (NULL noise) on the i9 primary bench. Audit\nrow kept in commit 7eed5d98; doc comment now records the rationale\nto prevent re-attempt.\n\n* test(cpu-kernel): extract select_x86_kernel + add VBMI2/AVX2 regression tests\n\nLifts the x86 kernel-tag precedence rules out of detect_cpu_kernel_uncached\ninto a pure boolean-input const fn `select_x86_kernel`. The runtime detect\npath now calls it with `is_x86_feature_detected!` results; the no-std\ncompile-time path can be retargeted to it in a follow-up (kept untouched\nto keep this commit's surface narrow).\n\nAdds three unit tests against the extracted helper:\n\n- `select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2`: a CPU\n  advertising AVX-512 VBMI2 + AVX-512 F/VL/BW + BMI2 but NOT AVX2 must\n  NOT be picked as Vbmi2 — the VBMI2 kernels mix VBMI2-only intrinsics\n  with AVX2 256-bit moves, so the dispatch would SIGILL.\n- `select_x86_kernel_full_x86_v4_picks_vbmi2`: full x86-64-v4 + VBMI2 →\n  Vbmi2 (sanity).\n- `select_x86_kernel_avx2_baseline_picks_avx2`: AVX2 + BMI2 only →\n  Avx2 (sanity).\n\nThe first test FAILS on this commit by design: the helper deliberately\nkeeps the buggy precedence (`if has_avx512vbmi2 && ... && has_bmi2`\nwithout `has_avx2`). The fix in the follow-up commit adds `&& has_avx2`\nand turns the failing test green.\n\nThis is the regression-test-first half of the bug protocol.\n\n* fix(cpu-kernel): gate VBMI2 detection on AVX2 + dead-code cleanups\n\n1. select_x86_kernel now requires has_avx2 for the VBMI2 tier\n   (runtime-detect helper + no-std compile-time cfg). Without this\n   gate a CPU with AVX-512 VBMI2 but no AVX2 would dispatch into\n   Avx2-mixed VBMI2 kernels and SIGILL on the first AVX2 instruction.\n   The regression test added in the prior commit\n   (select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2) now\n   passes.\n\n2. cpu_kernel: gate avx2_mask_lower_bits_matches_scalar_on_bmi2_hw\n   with #[cfg(all(target_arch = \"x86_64\", feature = \"std\"))]. The\n   is_x86_feature_detected! guard inside the test body was the only\n   gate against SIGILL on non-BMI2 hardware, but under\n   --no-default-features the macro compiles out and the test would\n   call BMI2 intrinsics unconditionally.\n\n3. cpu_kernel: #[allow(dead_code)] on NeonKernel / SveKernel with\n   comment — scaffolding for the future aarch64 dispatch arm in\n   decompress_literals; until the arm is wired they are unused.\n\n4. bit_reader_reverse: #[cfg(test)] on the file-local\n   mask_lower_bits helper. After the hot-path migration to\n   K::mask_lower_bits via the CpuKernel trait, production callers\n   route through the trait and this fn is reachable only from the\n   mask_lower_bits unit tests below.\n\n5. literals_section_decoder: gate CpuKernelTag import on\n   #[cfg(target_arch = \"x86_64\")] — on aarch64 the only match arm\n   that compiles is the _ fallback (Scalar), so the enum name is\n   never referenced. Also drop the crate::cpu_kernel::* imports\n   from zerocopy_robustness_tests (never referenced inside the\n   test mod).\n\nFull nextest 621/621 passes, clippy clean under\n--features hash,std,dict_builder -D warnings.\n\n* style(huff0): apply rustfmt line wraps\n\n* style(decode): drop redundant unsafe + #[cfg(test)] gate dispatch helper\n\nTwo clippy errors caught by CI on the prior push, both stylistic:\n\n- cpu_kernel: `mask_lower_bits_bmi2_impl` is already an\n  `unsafe fn` with `#[target_feature(enable = \"bmi2\")]`, so the\n  inner `unsafe { _bzhi_u64(...) }` block is redundant. Drop the\n  inner block.\n- bit_reader_reverse: `try_extract_triple_with_pext` is now used\n  only by the in-file extract_triple correctness tests after\n  `peek_bits_triple` switched to the per-reader `use_pext_triple`\n  cached flag (commit 8805122f). Gate the helper with `#[cfg(test)]`.\n\n621/621 nextest passes, clippy clean under -D warnings.\n\n* fix(cpu-kernel): pub on CpuKernel/ScalarKernel for bench_internals visibility\n\nbench_internals lint job failed with three private_bounds /\nprivate_interfaces errors: BitReaderReversed is re-exported via\n`pub mod testing` and is generic over `K: CpuKernel = ScalarKernel`,\nbut both the trait and the default type carried `pub(crate)`\nvisibility — narrower than the re-exported struct itself.\n\nPromote CpuKernel and ScalarKernel to `pub`, then re-export them\ninside `crate::testing` alongside BitReaderReversed. Trait surface\nunchanged on stable users — still reachable only via `testing::*`\nunder the bench_internals feature gate.\n\nTwo related doc-comment fixes shipped together:\n\n- cpu_kernel: replace stale `dispatch_cpu_kernel` reference in the\n  Bmi2Kernel safety comment with the actual dispatch shape\n  (`match detect_cpu_kernel() { ... }` at decoder entry).\n- literals_section_decoder: rename local `K` shift-count in the\n  run_4stream_burst safety rationale to `s` (it collided with the\n  surrounding generic param `K: CpuKernel`).\n\n637/637 nextest passes, clippy clean under both default and\nbench_internals feature sets.\n\n* style(bench): annotate BitReaderReversed kernel param in bitstream bench\n\nE0283 in `--features bench_internals` lint job: after CpuKernel +\nScalarKernel were promoted to `pub` (commit b672fdd1), inference at\nthe bench call sites of `BitReaderReversed::new(black_box(&data))`\nstopped picking up the `K = ScalarKernel` default and asked for an\nexplicit annotation. Annotate the four call sites with the\n`<'_, ScalarKernel>` turbofish so the bench compiles cleanly under\nboth default and bench_internals feature sets.\n\n* docs(cpu-kernel): correct mask_lower_bits + bmi2 wrapper doc comments\n\n- mask_lower_bits trait method doc: remove stale reference to a\n  production wrapper in bit_reader_reverse.rs (the helper there is\n  now `#[cfg(test)]` only). Spell out where the n <= 64 precondition\n  is upheld in production (FSE/HUF state machine derives n from\n  accuracy_log / max_num_bits) and that no per-call assert runs.\n- mask_lower_bits_bmi2_impl doc: drop the \"monomorphised\" label\n  (the function isn't generic — it's a single target_feature\n  wrapper). Reword to describe the actual shape: one shared body\n  three kernels call, inlined into any BMI2-scoped caller, with\n  the target_feature boundary preserved otherwise.\n\n* style(bench): apply rustfmt to bitstream bench after kernel turbofish\n\n* docs(decode): clarify dispatch wiring + cargo fmt --all normalization\n\n- literals_section_decoder: rewrite per-block dispatch comment to\n  spell out both `feature = \"std\"` (OnceLock-cached runtime detect)\n  and `no_std` (compile-time cfg const) paths.\n- cpu_kernel module docs: replace \"FrameDecoder / FrameCompressor\n  entry\" with the actual current wiring — only `decompress_literals`\n  dispatches via `detect_cpu_kernel()`. Pipeline-wide propagation\n  lands incrementally in follow-up tiers.\n- lib.rs: under `feature = \"fuzz_exports\"`, `huff0` becomes pub mod\n  and its `pub fn init_state<K: CpuKernel>` names a private-by-default\n  bound. Re-export `CpuKernel` + `ScalarKernel` at the crate root\n  under the same feature gate to keep `private_bounds` /\n  `private_interfaces` quiet on fuzz builds.\n- benches/bitstream.rs: cargo fmt --all reordered `use criterion`\n  imports to caps-first (canonical workspace style); previous direct\n  rustfmt produced the opposite. CI uses `cargo fmt --all -- --check`.\n\n637/637 nextest passes; clippy clean under default, bench_internals,\nand fuzz_exports feature sets; cargo fmt --all -- --check clean.\n\n* refactor(cpu-kernel): route no_std detect through select_x86_kernel helper\n\nThe std runtime-detect path already routes through `select_x86_kernel`\n(the const-fn precedence helper with explicit AVX2 gating on VBMI2).\nThe no_std path was hand-rolling the same `#[cfg(target_feature = ...)]`\nchain in parallel, which made the helper's doc claim \"both paths route\nthrough this\" false. `cfg!(target_feature = ...)` returns a\ncompile-time bool that constant-folds through a const fn — the no_std\npath now calls `select_x86_kernel` with cfg! booleans, same codegen\nthe previous chain produced while keeping the precedence rules in a\nsingle source.\n\nAlso reword the CpuKernelTag doc: replace \"FrameDecoder/FrameCompressor\nentry via match into *_impl<K>\" with the current wiring (constructed\nat the dispatch site — currently only decompress_literals), matching\nthe module-level doc updated in the prior commit.\n\n---------\n\nCo-authored-by: Super User <root@ro.private.systems>",
+          "timestamp": "2026-05-25T17:53:41+03:00",
+          "tree_id": "6a99ddd4a08815ff7c2229c2418601e7ba430615",
+          "url": "https://github.com/structured-world/structured-zstd/commit/1e10b585599e93d1d52f9a365454a365bb8987e6"
+        },
+        "date": 1779725367443,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.136,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 300.993,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 204.167,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.289,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.508,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.078,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 4.978,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.082,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.929,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 4.814,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.017,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.06,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.719,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.662,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.299,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 2.192,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.091,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 2.281,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
