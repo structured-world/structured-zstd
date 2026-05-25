@@ -403,6 +403,149 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         self.head += n;
         debug_assert!(self.head <= self.tail);
     }
+
+    // ── Fallible write surface ──
+    //
+    // Override the default trait impls (which call panic-on-overflow
+    // variants) with explicit capacity checks that return
+    // `BackendOverflow` instead. This is the entire point of the
+    // backend: a fixed-capacity output slice that cannot grow on
+    // demand, so any overshoot must be reported instead of aborting.
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
+        let len = data.len();
+        // Use `checked_add` to catch adversarial input where
+        // `self.tail + len` would wrap `usize` — without the wrap
+        // check, the subsequent `new_tail > self.slice.len()` test
+        // can be bypassed by an `len` near `usize::MAX`, turning
+        // the fallible write into a release-mode panic via
+        // `copy_bytes_overshooting`.
+        // BackendOverflow is `Copy` with three usize fields; eager
+        // construction is cheaper than a closure indirection on this
+        // hot path (clippy::unnecessary_lazy_evaluations).
+        let new_tail =
+            self.tail
+                .checked_add(len)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        let total_writable = self.slice.len() - self.tail;
+        // SAFETY: `new_tail <= self.slice.len()` (checked above);
+        // `data` is non-aliasing with the backend's slice (caller
+        // contract — literals buffer / input view).
+        unsafe {
+            super::simd_copy::copy_bytes_overshooting(
+                (data.as_ptr(), len),
+                (self.slice.as_mut_ptr().add(self.tail), total_writable),
+                len,
+            );
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend_and_fill(
+        &mut self,
+        fill_with: u8,
+        fill_length: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        // Same wrap-check rationale as `try_extend` above — an
+        // adversarial `fill_length` near `usize::MAX` would wrap
+        // `new_tail`, bypass the upper bound, and panic in
+        // `slice[tail..new_tail]` (start > end).
+        let new_tail =
+            self.tail
+                .checked_add(fill_length)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: fill_length,
+                    capacity: self.slice.len(),
+                })?;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: fill_length,
+                capacity: self.slice.len(),
+            });
+        }
+        self.slice[self.tail..new_tail].fill(fill_with);
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend_from_within(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        // Bound 1: source range fits in live region.
+        // The caller's `start` is relative to the live-region head;
+        // map to a physical absolute position and check against the
+        // current tail. Both `head + start` and `+ len` get
+        // `checked_add` so an adversarial `start` or `len` near
+        // `usize::MAX` cannot wrap past the bounds checks.
+        let abs_start =
+            self.head
+                .checked_add(start)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
+        let abs_end = abs_start
+            .checked_add(len)
+            .ok_or(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            })?;
+        if abs_end > self.tail {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        // Bound 2: destination has capacity for `len`. Same wrap
+        // protection — without it, an adversarial `len` near
+        // `usize::MAX` wraps and bypasses the upper bound, turning
+        // the unchecked write into a release-mode UB / panic.
+        // BackendOverflow is `Copy` with three usize fields; eager
+        // construction is cheaper than a closure indirection on this
+        // hot path (clippy::unnecessary_lazy_evaluations).
+        let new_tail =
+            self.tail
+                .checked_add(len)
+                .ok_or(super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
+        if new_tail > self.slice.len() {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: len,
+                capacity: self.slice.len(),
+            });
+        }
+        // SAFETY: both bounds checked above. Forward to the unsafe
+        // variant which performs the wildcopy with the same
+        // preconditions the bounds checks established.
+        unsafe { self.extend_from_within_unchecked(start, len) };
+        Ok(())
+    }
 }
 
 // `WILDCOPY_OVERLENGTH` is used implicitly via the dispatcher's
@@ -511,5 +654,132 @@ mod tests {
         // 5 bytes requested, only 4 cap -> error, tail unchanged.
         assert!(b.extend_from_reader(&src[..], 5).is_err());
         assert_eq!(b.tail(), 0);
+    }
+
+    // Coverage for the fallible try_* surface. Exercises:
+    //   - happy paths (exact-fit + room to spare),
+    //   - capacity-overflow paths (returns Err with diagnostic fields),
+    //   - integer-overflow wrap-guards (checked_add ok_or branch).
+
+    use super::super::buffer_backend::BufferBackend;
+
+    #[test]
+    fn try_extend_exact_fit_succeeds_and_advances_tail() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        assert!(b.try_extend(&[1, 2, 3, 4]).is_ok());
+        assert_eq!(b.tail(), 4);
+        let (s, _) = b.as_slices();
+        assert_eq!(s, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn try_extend_over_capacity_returns_overflow_and_keeps_tail() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        let err = b.try_extend(&[1, 2, 3, 4, 5]).unwrap_err();
+        assert_eq!(err.tail, 0);
+        assert_eq!(err.requested, 5);
+        assert_eq!(err.capacity, 4);
+        assert_eq!(b.tail(), 0);
+    }
+
+    #[test]
+    fn try_extend_partially_full_overshoot_reports_current_tail() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.extend(&[1, 2]);
+        // 3 more bytes would need 5 total, capacity is 4.
+        let err = b.try_extend(&[3, 4, 5]).unwrap_err();
+        assert_eq!(err.tail, 2);
+        assert_eq!(err.requested, 3);
+        assert_eq!(err.capacity, 4);
+        assert_eq!(b.tail(), 2);
+    }
+
+    #[test]
+    fn try_extend_zero_length_succeeds_and_leaves_tail_unchanged() {
+        // The `checked_add(tail, len)` wrap branch in `try_extend` is
+        // a defense-in-depth guard for corrupted input that names
+        // `regenerated_size` near `usize::MAX`. Constructing such a
+        // `&[u8]` from safe Rust is not expressible — `from_raw_parts`
+        // with a forged length is UB. The wrap branch is exercised
+        // only from the fuzz harness under `feature = "fuzz_exports"`
+        // (which routes a controlled `len` through `try_*`) and from
+        // the real malformed-frame decode path that the harness
+        // emulates.
+        //
+        // This test covers the adjacent normal case — a zero-length
+        // `try_extend` MUST succeed regardless of current `tail`
+        // (the new_tail = tail + 0 = tail comparison both passes
+        // checked_add and the upper-bound check). Without this case
+        // the early-return on `len == 0` could regress silently.
+        let mut buf = vec![0u8; 8];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        assert!(b.try_extend(&[]).is_ok());
+        assert_eq!(b.tail(), 0);
+        b.extend(&[1, 2, 3]);
+        assert!(b.try_extend(&[]).is_ok());
+        assert_eq!(b.tail(), 3);
+    }
+
+    #[test]
+    fn try_extend_and_fill_exact_fit_writes_pattern() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        assert!(b.try_extend_and_fill(0xAB, 4).is_ok());
+        assert_eq!(b.tail(), 4);
+        let (s, _) = b.as_slices();
+        assert_eq!(s, &[0xAB, 0xAB, 0xAB, 0xAB]);
+    }
+
+    #[test]
+    fn try_extend_and_fill_over_capacity_returns_overflow() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.extend(&[1, 2]);
+        let err = b.try_extend_and_fill(0xCD, 5).unwrap_err();
+        assert_eq!(err.tail, 2);
+        assert_eq!(err.requested, 5);
+        assert_eq!(err.capacity, 4);
+        assert_eq!(b.tail(), 2);
+    }
+
+    #[test]
+    fn try_extend_from_within_within_bounds_repeats_history() {
+        let mut buf = vec![0u8; 8];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.extend(&[1, 2, 3]);
+        // Repeat the first 3 bytes from history into the next 3 slots.
+        assert!(b.try_extend_from_within(0, 3).is_ok());
+        let (s, _) = b.as_slices();
+        assert_eq!(s, &[1, 2, 3, 1, 2, 3]);
+        assert_eq!(b.tail(), 6);
+    }
+
+    #[test]
+    fn try_extend_from_within_source_past_tail_returns_overflow() {
+        let mut buf = vec![0u8; 8];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.extend(&[1, 2]);
+        // start=0, len=5 — source range needs bytes 0..5 but tail=2.
+        let err = b.try_extend_from_within(0, 5).unwrap_err();
+        assert_eq!(err.tail, 2);
+        assert_eq!(err.requested, 5);
+        assert_eq!(b.tail(), 2);
+    }
+
+    #[test]
+    fn try_extend_from_within_destination_overflow_returns_err() {
+        let mut buf = vec![0u8; 4];
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.extend(&[1, 2, 3]);
+        // Source 0..2 valid, but writing 2 more bytes would push tail
+        // from 3 to 5, past capacity 4.
+        let err = b.try_extend_from_within(0, 2).unwrap_err();
+        assert_eq!(err.tail, 3);
+        assert_eq!(err.requested, 2);
+        assert_eq!(err.capacity, 4);
+        assert_eq!(b.tail(), 3);
     }
 }

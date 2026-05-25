@@ -1518,9 +1518,44 @@ impl FrameDecoder {
             // straight from `input` without copying into the
             // persistent `block_content_buffer`.
             let before = direct.buffer.total_produced();
-            let body_consumed = block_dec
-                .decode_block_content_from_slice(&block_header, &mut direct, &mut input)
-                .map_err(err::FailedToReadBlockBody)?;
+            let body_consumed = match block_dec.decode_block_content_from_slice(
+                &block_header,
+                &mut direct,
+                &mut input,
+            ) {
+                Ok(n) => n,
+                // Defense-in-depth: RLE / Raw block whose declared
+                // `decompressed_size` slipped past the per-block
+                // pre-flight above (e.g. due to overflow arithmetic)
+                // and tripped the backend's fallible write surface.
+                // The pre-flight catches this case via
+                // `FrameContentSizeMismatch` already; convert here
+                // for the residual paths to keep the public surface
+                // panic-free.
+                Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
+                    ..
+                }) => {
+                    // Use saturating_add on the `produced (u64) +
+                    // decompressed_size (u32 → u64)` sum. Each block's
+                    // `decompressed_size` is bounded by 128 KiB
+                    // (`MAX_BLOCK_SIZE`, smaller than u32::MAX let
+                    // alone u64::MAX), but accumulated `produced`
+                    // across many adversarial frames can grow toward
+                    // u64::MAX. Saturating avoids a panic-in-debug /
+                    // wrap-in-release on the error path itself, which
+                    // would undermine the defense-in-depth this
+                    // conversion exists for. The cap value
+                    // (`u64::MAX`) is informative enough for the
+                    // caller — they only care that `produced` exceeds
+                    // declared `content_size`.
+                    return Err(err::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced: produced
+                            .saturating_add(u64::from(block_header.decompressed_size)),
+                    });
+                }
+                Err(e) => return Err(err::FailedToReadBlockBody(e)),
+            };
             produced = direct.buffer.total_produced();
             // Post-decode FCS overflow check. Works uniformly for
             // Raw/RLE/Compressed since it reads the actual bytes
