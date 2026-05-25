@@ -457,18 +457,46 @@ impl FSETable {
         self.symbol_counter.clear();
         self.symbol_counter
             .resize(self.symbol_probabilities.len(), 0);
+        // SAFETY scaffolding: pre-validate that every entry symbol read in
+        // the loop below falls within symbol_counter / symbol_probabilities
+        // bounds. Both vectors are sized to symbol_probabilities.len(),
+        // which caps at max_symbol + 1 in build_decoding_table's guard at
+        // line 386. Each Entry.symbol value was written by
+        // copy_symbols_into_decode from table_symbols, and table_symbols
+        // entries were assigned from `for symbol in 0..symbol_probabilities.len()`
+        // ranges - so every entry.symbol is guaranteed in bounds.
+        // The unchecked path below relies on this invariant.
+        let prob_len = self.symbol_probabilities.len();
+        debug_assert!(prob_len <= 256, "FSE symbol space caps at 256");
+        let probs_ptr = self.symbol_probabilities.as_ptr();
+        let counter_ptr = self.symbol_counter.as_mut_ptr();
         for idx in 0..negative_idx {
-            let entry = &mut self.decode[idx];
+            // SAFETY: idx < negative_idx <= table_size <= decode.len()
+            // (decode was set to table_size by copy_symbols_into_decode).
+            let entry = unsafe { self.decode.get_unchecked_mut(idx) };
             let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-
-            let symbol_count = self.symbol_counter[symbol as usize];
+            let s = symbol as usize;
+            // SAFETY: per the doc-comment above, every entry.symbol value
+            // is < prob_len, so symbol_probabilities[s] / symbol_counter[s]
+            // accesses are in-bounds. Debug-assert documents the invariant.
+            debug_assert!(
+                s < prob_len,
+                "FSE entry symbol {} >= prob_len {}",
+                s,
+                prob_len
+            );
+            let prob = unsafe { *probs_ptr.add(s) };
+            let symbol_count = unsafe { *counter_ptr.add(s) };
             let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
 
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
+            // nb <= accuracy_log is enforced by calc_baseline_and_numbits
+            // (nb = accuracy_log - highest_bit(prob)), so the previous
+            // release-mode assert is redundant; debug build still catches
+            // any future drift via the debug_assert below.
+            debug_assert!(nb <= self.accuracy_log);
+            unsafe {
+                *counter_ptr.add(s) += 1;
+            }
 
             entry.new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
                 got: self.accuracy_log,
