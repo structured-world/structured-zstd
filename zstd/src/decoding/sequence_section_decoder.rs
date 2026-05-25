@@ -40,7 +40,95 @@ const _: () = assert!(
 /// Falls back to the legacy two-pass pipeline (`decode_sequences` +
 /// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
 /// is rare on perf-relevant corpora and not worth duplicating.
+/// Public entry. Detects the CPU kernel ONCE (cached `OnceLock` lookup),
+/// then dispatches to the kernel-monomorphised `_impl` so the inner
+/// pipeline gets `BitReaderReversed<K>` with compile-time-known
+/// `K::mask_lower_bits` / `K::extract_triple` (where added) instead of
+/// runtime branches on `use_pext_triple` / kernel detect. The per-call
+/// dispatch cost is one `OnceLock::get` + small `match` — amortised
+/// over the whole block.
 pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    #[cfg(target_arch = "x86_64")]
+    use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
+    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+    #[cfg(target_arch = "aarch64")]
+    use crate::cpu_kernel::{NeonKernel, SveKernel};
+
+    match detect_cpu_kernel() {
+        CpuKernelTag::Scalar => decode_and_execute_sequences_impl::<B, ScalarKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Bmi2 => decode_and_execute_sequences_impl::<B, Bmi2Kernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Avx2 => decode_and_execute_sequences_impl::<B, Avx2Kernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Vbmi2 => decode_and_execute_sequences_impl::<B, Vbmi2Kernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelTag::Neon => decode_and_execute_sequences_impl::<B, NeonKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelTag::Sve => decode_and_execute_sequences_impl::<B, SveKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+    }
+}
+
+fn decode_and_execute_sequences_impl<
+    B: super::buffer_backend::BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
@@ -59,7 +147,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     vprintln!("Updating tables used {} bytes", bytes_read);
 
     let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::new(bit_stream);
+    let mut br = BitReaderReversed::<K>::new(bit_stream);
 
     // Skip the 0-padding at the end of the last byte and consume the
     // start-of-stream `1` bit.
@@ -326,8 +414,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 /// Grouping into a struct would push pressure off the argument
 /// registers and onto memory loads, undoing the extraction's win.
 #[allow(clippy::too_many_arguments)]
-fn run_pipelined_sequence_loop<B: super::buffer_backend::BufferBackend>(
-    br: &mut BitReaderReversed<'_>,
+fn run_pipelined_sequence_loop<
+    B: super::buffer_backend::BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+>(
+    br: &mut BitReaderReversed<'_, K>,
     ll_dec: &mut FSEDecoder<'_>,
     ml_dec: &mut FSEDecoder<'_>,
     of_dec: &mut FSEDecoder<'_>,
@@ -599,11 +690,11 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
 /// `decode_sequences_without_rle` — separate copy because Rust does not
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
-fn decode_one_sequence_inline(
+fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     ll_dec: &mut FSEDecoder<'_>,
     ml_dec: &mut FSEDecoder<'_>,
     of_dec: &mut FSEDecoder<'_>,
-    br: &mut BitReaderReversed<'_>,
+    br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
     // `Entry`. LL / ML are populated by `enrich_with_packed_seq_meta`
@@ -645,9 +736,9 @@ fn decode_one_sequence_inline(
     }
 }
 
-fn decode_sequences_with_rle(
+fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
+    br: &mut BitReaderReversed<'_, K>,
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
