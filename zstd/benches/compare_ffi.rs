@@ -308,6 +308,16 @@ fn bench_decompress_source(
     group.bench_function("pure_rust", |b| {
         let compressed = materialize();
         let mut target = vec![0u8; expected_len];
+        // `vec![0u8; N]` calls calloc which maps the kernel zero-page
+        // CoW for every anonymous page. First write to each page in
+        // the measured iter triggers a page-fault to allocate a real
+        // anon page. On `--profile-time` runs (no warmup) that
+        // synchronous allocation accounted for 67% of total samples
+        // on the z000033 L-3 c_stream flamegraph. Pre-touching with
+        // a non-zero fill then resetting to zero forces every page
+        // into the resident set before measurement starts.
+        target.fill(0xAA);
+        target.fill(0);
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
@@ -330,6 +340,9 @@ fn bench_decompress_source(
         // duplicating its value so the bench can't silently drift
         // off the direct path if the slack changes.
         let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+        // See note on pure_rust above — same calloc page-fault story.
+        target.fill(0xAA);
+        target.fill(0);
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
@@ -349,6 +362,10 @@ fn bench_decompress_source(
         let compressed = materialize();
         let mut dctx = FfiDCtxHandle::new();
         let mut target = vec![0u8; expected_len];
+        // See note on pure_rust above — c_ffi gets the same pre-touch
+        // so the timing comparison stays apples-to-apples.
+        target.fill(0xAA);
+        target.fill(0);
         b.iter(|| {
             let written = dctx.decompress_into(black_box(compressed), &mut target);
             assert_eq!(written, expected_len);
