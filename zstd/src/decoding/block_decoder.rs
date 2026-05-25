@@ -77,18 +77,20 @@ impl BlockDecoder {
                         source: crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
                     });
                 }
+                // Peek the fill byte without advancing `*source` yet —
+                // `try_extend_and_fill` is fallible on fixed-capacity
+                // backends, and on `Err` the caller exits early. If we
+                // advanced first, the input cursor would diverge from
+                // the bytes_read accounting by one byte on the error
+                // path. Advance ONLY after the write succeeds, matching
+                // the Raw arm's split_at-then-try_push-then-advance shape.
                 let fill = source[0];
-                *source = &source[1..];
-                // `try_extend_and_fill` returns `Err(BackendOverflow)`
-                // on `UserSliceBackend` when the declared
-                // `decompressed_size` would push past the caller's
-                // output slice. Growable backends (FlatBuf/RingBuffer)
-                // grow on demand and always succeed.
                 workspace
                     .split()
                     .buffer
                     .try_extend_and_fill(fill, header.decompressed_size as usize)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
+                *source = &source[1..];
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(1)
             }
