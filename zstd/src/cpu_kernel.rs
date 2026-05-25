@@ -45,8 +45,13 @@ pub trait CpuKernel: Copy + 'static {
     /// `u64::MAX >> (64 - n)` shift + mask.
     ///
     /// Precondition: `n <= 64`. Behaviour for `n == 0` is "return 0";
-    /// behaviour for `n > 64` is unspecified (debug-asserted by the
-    /// caller through the wrapper in `bit_reader_reverse.rs`).
+    /// behaviour for `n > 64` is unspecified — callers MUST uphold
+    /// the bound. The test-only `mask_lower_bits` helper in
+    /// `bit_reader_reverse.rs` debug-asserts the bound for its
+    /// unit tests, but production callers (FSE / HUF hot paths)
+    /// derive `n` from `accuracy_log` / `max_num_bits` which the
+    /// per-stream table builders pin to `n <= MAX_*_BITS` at
+    /// construction time; no per-call wrapper assert runs.
     fn mask_lower_bits(value: u64, n: u8) -> u64;
 }
 
@@ -171,10 +176,12 @@ impl CpuKernel for SveKernel {
     }
 }
 
-/// Monomorphised BMI2 `_bzhi_u64` wrapper. Lifted to a free function
-/// with `#[target_feature]` so every kernel impl that wraps it
-/// resolves to the same shared inlined code; LLVM emits one
-/// monomorphisation per call site.
+/// Single `#[target_feature(enable = "bmi2")]` wrapper around the
+/// `_bzhi_u64` intrinsic. Lifted to a free function so each kernel
+/// impl that needs the BMI2 path (Bmi2 / Avx2 / Vbmi2) calls the
+/// same shared body. With `#[inline]` LLVM inlines the call into
+/// any caller that itself has BMI2 in scope; outside that scope the
+/// target_feature boundary is preserved.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
