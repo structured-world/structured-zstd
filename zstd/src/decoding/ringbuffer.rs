@@ -66,6 +66,33 @@ impl RingBuffer {
         self.cap
     }
 
+    /// Branchless wrap-around for indices that may overshoot capacity
+    /// by at most one cap-length. Replaces `% self.cap` (which compiles
+    /// to `divl` on i686 / `divq` on x86_64 because `cap` is runtime
+    /// `2^N + 1` per the empty-vs-full sentinel invariant — neither
+    /// power-of-two-AND nor strength-reduce-multiply applies). LLVM
+    /// lowers this to a single CMOV: ~1 cycle vs the ~26-cycle divl.
+    ///
+    /// # Invariant for callers
+    /// `x < 2 * self.cap` — i.e. the input is at most one cap-length
+    /// past the end. Every existing call site (`(tail + len)`,
+    /// `(head + idx)`, `(head + amount)`) satisfies this because the
+    /// addends are bounded: `len`/`amount` come from a write/drain
+    /// that `reserve` already sized for, and `head`/`tail` are
+    /// themselves `< cap` at all times. A double-wrap input would
+    /// leave `x - self.cap` still `>= self.cap` and produce a wrong
+    /// index; the debug_assert below catches that in fuzz builds.
+    #[inline(always)]
+    fn wrap(&self, x: usize) -> usize {
+        debug_assert!(
+            x < self.cap.saturating_mul(2) || self.cap == 0,
+            "ringbuffer wrap: x ({}) must be < 2*cap ({})",
+            x,
+            self.cap.saturating_mul(2)
+        );
+        if x >= self.cap { x - self.cap } else { x }
+    }
+
     /// Current write cursor, used by `DecodeBuffer::checkpoint` to
     /// record a rollback point before speculative writes. Same
     /// forwarding contract as `cap()` above.
@@ -227,7 +254,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 2 by writing initialized memory
         unsafe { self.buf.as_ptr().add(self.tail).write(byte) };
         // SAFETY: Upholds invariant 3 by wrapping `tail` around
-        self.tail = (self.tail + 1) % self.cap;
+        self.tail = self.wrap(self.tail + 1);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
@@ -237,7 +264,7 @@ impl RingBuffer {
         if idx < self.len() {
             // SAFETY: Establishes invariants on memory being initialized and the range being in-bounds
             // (Invariants 2 & 3)
-            let idx = (self.head + idx) % self.cap;
+            let idx = self.wrap(self.head + idx);
             Some(unsafe { self.buf.as_ptr().add(idx).read() })
         } else {
             None
@@ -368,7 +395,7 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = self.wrap(self.tail + len);
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -378,7 +405,7 @@ impl RingBuffer {
         let amount = usize::min(amount, self.len());
         // SAFETY: we maintain invariant 2 here since this will always lead to a smaller buffer
         // for amount≤len
-        self.head = (self.head + amount) % self.cap;
+        self.head = self.wrap(self.head + amount);
     }
 
     /// Return the size of the two contiguous occupied sections of memory used
@@ -588,7 +615,7 @@ impl RingBuffer {
                 // D: Destination bytes, going to be copied from S bytes
                 // _: Uninvolved bytes in the writable section
 
-                let start = (self.head + start) % self.cap;
+                let start = self.wrap(self.head + start);
 
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
@@ -686,7 +713,7 @@ impl RingBuffer {
             }
         }
 
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = self.wrap(self.tail + len);
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -707,7 +734,7 @@ impl RingBuffer {
                 ptr2.write_bytes(fill_with, fill2);
             }
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = self.wrap(self.tail + fill_length);
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -736,7 +763,7 @@ impl RingBuffer {
             };
             read.read_exact(s2)?;
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = self.wrap(self.tail + fill_length);
         Ok(())
     }
 
@@ -816,7 +843,7 @@ impl RingBuffer {
             copy_with_nobranch_check(
                 m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
             );
-            self.tail = (self.tail + len) % self.cap;
+            self.tail = self.wrap(self.tail + len);
         }
     }
 }

@@ -321,6 +321,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 /// fire at the call site, NOT inside this fn. This fn only commits
 /// `*offset_hist = shadow_hist` on the success-tail (after the drain
 /// loop), matching the legacy IIFE contract.
+///
+/// 13 parameters: the closure capture set the IIFE used implicitly.
+/// Grouping into a struct would push pressure off the argument
+/// registers and onto memory loads, undoing the extraction's win.
+#[allow(clippy::too_many_arguments)]
 fn run_pipelined_sequence_loop<B: super::buffer_backend::BufferBackend>(
     br: &mut BitReaderReversed<'_>,
     ll_dec: &mut FSEDecoder<'_>,
