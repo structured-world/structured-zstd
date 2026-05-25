@@ -3,9 +3,6 @@ use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::scratch::FSEScratch;
 use crate::bit_io::BitReaderReversed;
-use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
-#[cfg(target_arch = "x86_64")]
-use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
@@ -37,64 +34,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     literals_buffer: &[u8],
     rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
-    // Per-block CpuKernel dispatch — same pattern as decompress_literals.
-    // Wrapped arms put the entire decode_and_execute_sequences_impl::<B, K>
-    // pipeline under the matching target_feature so K::mask_lower_bits
-    // intrinsics inline through the trait-method trampolines.
-    match detect_cpu_kernel() {
-        #[cfg(target_arch = "x86_64")]
-        CpuKernelTag::Vbmi2 => unsafe { decode_and_execute_sequences_vbmi2::<B>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences) },
-        #[cfg(target_arch = "x86_64")]
-        CpuKernelTag::Avx2 => unsafe { decode_and_execute_sequences_avx2::<B>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences) },
-        #[cfg(target_arch = "x86_64")]
-        CpuKernelTag::Bmi2 => unsafe { decode_and_execute_sequences_bmi2::<B>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences) },
-        _ => decode_and_execute_sequences_impl::<B, ScalarKernel>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences),
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,avx2")]
-unsafe fn decode_and_execute_sequences_avx2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader, source: &[u8], fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3], literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, Avx2Kernel>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn decode_and_execute_sequences_bmi2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader, source: &[u8], fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3], literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, Bmi2Kernel>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw,bmi2,avx2")]
-unsafe fn decode_and_execute_sequences_vbmi2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader, source: &[u8], fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3], literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, Vbmi2Kernel>(section, source, fse, buffer, offset_hist, literals_buffer, rle_fallback_sequences)
-}
-
-#[inline]
-fn decode_and_execute_sequences_impl<B: super::buffer_backend::BufferBackend, K: CpuKernel>(
-    section: &SequencesHeader,
-    source: &[u8],
-    fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3],
-    literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
     // Reset the fallback sequences vec on entry. The non-RLE fast path
     // never writes to it, so without this clear it would carry whatever
     // entries the previous block left behind — a stale-data hazard for
@@ -105,7 +44,7 @@ fn decode_and_execute_sequences_impl<B: super::buffer_backend::BufferBackend, K:
     vprintln!("Updating tables used {} bytes", bytes_read);
 
     let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::<K>::new(bit_stream);
+    let mut br = BitReaderReversed::new(bit_stream);
 
     // Skip the 0-padding at the end of the last byte and consume the
     // start-of-stream `1` bit.
@@ -548,11 +487,11 @@ fn decode_and_execute_sequences_impl<B: super::buffer_backend::BufferBackend, K:
 /// `decode_sequences_without_rle` — separate copy because Rust does not
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
-fn decode_one_sequence_inline<K: CpuKernel>(
+fn decode_one_sequence_inline(
     ll_dec: &mut FSEDecoder<'_>,
     ml_dec: &mut FSEDecoder<'_>,
     of_dec: &mut FSEDecoder<'_>,
-    br: &mut BitReaderReversed<'_, K>,
+    br: &mut BitReaderReversed<'_>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
     // `Entry` (populated by `enrich_with_packed_seq_meta` /
@@ -585,9 +524,9 @@ fn decode_one_sequence_inline<K: CpuKernel>(
     }
 }
 
-fn decode_sequences_with_rle<K: CpuKernel>(
+fn decode_sequences_with_rle(
     section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_, K>,
+    br: &mut BitReaderReversed<'_>,
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
