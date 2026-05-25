@@ -141,10 +141,18 @@ pub mod testing {
     }
 }
 
-/// SIMD wildcopy overshoot slack carried by every decoder backend.
-/// Mirrors donor zstd's `WILDCOPY_OVERLENGTH` (16 bytes). Public so
-/// callers sizing an output slice for
+/// SIMD wildcopy overshoot slack carried by every decoder backend
+/// (currently **32 bytes**). Sized so the AVX2 chunked kernel in
+/// `simd_copy::copy_bytes_overshooting` (32-byte stride on x86-64) can
+/// fire on tail copies near the end of a fixed-capacity output buffer.
+/// Donor zstd's `WILDCOPY_OVERLENGTH` is also 32 bytes today; this
+/// matches that contract.
+///
+/// Public so callers sizing an output slice for
 /// [`crate::decoding::FrameDecoder::decode_to_slice_trusted`] can size
-/// `frame_content_size + WILDCOPY_OVERLENGTH` without duplicating
-/// the constant.
+/// `frame_content_size + WILDCOPY_OVERLENGTH` symbolically without
+/// duplicating the value. Use the const reference rather than a
+/// hardcoded literal — the slack size may grow in the future if a
+/// wider SIMD kernel (AVX-512, 64-byte stride) is added to the
+/// fast path.
 pub const WILDCOPY_OVERLENGTH: usize = crate::decoding::buffer_backend::WILDCOPY_OVERLENGTH;
