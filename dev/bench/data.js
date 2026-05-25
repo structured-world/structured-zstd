@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779663048433,
+  "lastUpdate": 1779713542721,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -46070,6 +46070,270 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3e8d80424442c6feee9574ff813bb7c5f17c2d14",
+          "message": "perf(decode): #247 Part 1 — expand FSE Entry to ZSTD_seqSymbol shape (#252)\n\n* perf(decode): expand FSE Entry to ZSTD_seqSymbol shape\n\nGrow `fse::Entry` from 4 bytes to 12 bytes by adding two\npre-computed fields that mirror donor's `ZSTD_seqSymbol`:\n\n* `base_value: u32` — code baseline (LL / ML / OF base).\n* `num_additional_bits: u8` — extra bits to read from the stream.\n\nThese are populated post-build by per-table enrichment passes:\n\n* `FSETable::enrich_with_packed_seq_meta(&LL_META)` / `(&ML_META)`\n  for LL and ML tables — same packed `(base << 0) | (bits << 24)`\n  layout the existing const arrays use.\n* `FSETable::enrich_for_offsets()` for OF table — closed-form\n  `base = 1 << symbol`, `num_additional_bits = symbol`.\n\nCalled from `maybe_update_fse_tables` (sequence section, FSE +\nPredefined modes) and `Dictionary::decode_dict` (dict-trained\ntables). Repeat-mode blocks reuse the previously enriched table,\nso no work runs on the repeat path.\n\n`decode_one_sequence_inline` now reads `base_value` /\n`num_additional_bits` straight off the active FSE state's\n`Entry`. The previous `lookup_ll_code(ll_code)` /\n`lookup_ml_code(ml_code)` indirections cost two extra cache\ntouches per sequence (LL_META 144 B + ML_META 212 B in separate\nregions). The new fields ride in the same cache line that\n`decode_symbol` already loads when it reads `state.symbol`, so\nthe saving is two L1d touches per emit at zero hot-path\noverhead.\n\nThe RLE-fallback path (`decode_sequences_with_rle`) still uses\n`lookup_*` for the RLE byte since RLE-mode tables don't have an\nenriched entry to read from. Those tables are rare on\nperf-relevant corpora — keeping `lookup_*` for them was simpler\nthan allocating a single-entry mock table per RLE byte.\n\n`copy_symbols_into_decode`'s LE-fast-path that wrote two packed\n4-byte entries via one u64 store no longer applies — Entry is\n12 bytes now. Replaced with `Vec::resize` + per-slot `.symbol`\nassignment for both endians. Table build runs once per FSE-mode\nblock (not per emit), so the byte-packed write is not a hot-path\nloss.\n\nHUF-weight FSE tables leave `base_value` / `num_additional_bits`\nat their zero default — they don't use those fields. The extra\n8 bytes per slot are a fixed cost on the small HUF FSE table\n(≤ 64 entries at acc_log 6) and the dominant savings are in the\nsequence section.\n\nEntry layout test (`decoder_entry_layout_12_bytes_donor_seqsymbol_shape`)\npins offsets and total size at the new shape so future Entry\nedits surface a clear test failure.\n\nEstimated saving: 2-4 % L-1 fast decompress throughput on i9\n(per #247 Part 1 acceptance criteria). Bench delta to be\nmeasured on the harden/#246 follow-up branch.\n\nFull test suite (652 tests) green; clippy clean.\n\nPart 1 of #247.\n\n* fix(decode): enrich_* zeros stale base_value / num_additional_bits\n\n`enrich_with_packed_seq_meta`'s doc-string promised symbols\noutside `packed.len()` \"stay at 0\", but the implementation only\noverwrote in-range entries — leaving prior values on the out-of-\nrange branch. On `feature = \"fuzz_exports\"` builds (where\nexternal code can stuff arbitrary entries into the table), a\nprevious well-formed enrichment could leak stale non-zero\nmetadata into a later corrupt enrichment.\n\nThe out-of-range branch now explicitly zeros both fields,\nmatching the doc. `enrich_for_offsets` gets the same treatment\n— resets before the bound check so corrupt offset codes ≥ 32\ndon't keep stale `1 << prev_code` values from an earlier\nenrichment.\n\nDownstream `decode_one_sequence_inline` still surfaces the\ncorruption via the existing bitstream checks; this just clears\nprior state rather than introducing a new fast-fail.\n\n* perf(fse): downgrade enrich helpers to pub(crate)\n\nPer Copilot review thread on PR #252: enrich_with_packed_seq_meta +\nenrich_for_offsets are only called from sequence_section_decoder +\ndictionary inside the same crate. No external callers (grep-verified).\nDowngrade to pub(crate); behaviour unchanged.\n\n651/652 nextest pass on release (pre-existing should_panic test is the\nonly fail).\n\n* docs(decode): clarify OF closed-form enrichment in sequence helper\n\n- sequence_section_decoder: extend decode_one_sequence_inline note —\n  LL/ML enrich from packed code-meta tables, OF enriches closed-form;\n  explain why hot path keeps shift baseline (single ALU op vs memory\n  load, of_code still required for get_bits_triple and the precondition\n  assert)\n- fse/mod.rs: tighten Entry-layout test comment — OF enrichment is\n  closed-form (no meta table), HUF-weight FSE tables never enrich",
+          "timestamp": "2026-05-25T14:40:17+03:00",
+          "tree_id": "3259dc0dbd351409ef6e2d95aa75c20feb6c6863",
+          "url": "https://github.com/structured-world/structured-zstd/commit/3e8d80424442c6feee9574ff813bb7c5f17c2d14"
+        },
+        "date": 1779713539724,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.136,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.089,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 303.735,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 206.799,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.301,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.514,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.946,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 4.891,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.083,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.795,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 4.733,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.02,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.28,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.313,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.28,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.909,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.662,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.644,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.295,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust_direct",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.363,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust_direct",
+            "value": 2.209,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.086,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.391,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust_direct",
+            "value": 2.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.31,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust_direct",
+            "value": 0.269,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.308,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust_direct",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.268,
             "unit": "ms"
           }
         ]
