@@ -119,7 +119,14 @@ impl CpuKernel for Vbmi2Kernel {
 
 /// aarch64 NEON baseline kernel. Used on all aarch64 hardware that
 /// exposes NEON (effectively universal on the supported targets).
+///
+/// `#[allow(dead_code)]`: scaffolding for the future aarch64 dispatch
+/// arm in `decompress_literals` / `decode_and_execute_sequences`.
+/// The struct + trait impl land first so the dispatch wiring can be
+/// added incrementally without churning the CpuKernel surface; until
+/// the dispatch arm uses it the type is reachable only as a phantom.
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct NeonKernel;
 
@@ -138,7 +145,10 @@ impl CpuKernel for NeonKernel {
 /// aarch64 SVE kernel. Variable-vector-length SVE extends NEON for
 /// HUF burst / SIMD copy on Graviton3 / Apple M-series with SVE
 /// support. Mask op identical to NEON / Scalar.
+///
+/// `#[allow(dead_code)]`: same scaffolding rationale as `NeonKernel`.
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct SveKernel;
 
@@ -183,7 +193,7 @@ const fn select_x86_kernel(
     has_bmi2: bool,
     has_avx2: bool,
 ) -> CpuKernelTag {
-    if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 {
+    if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 && has_avx2 {
         return CpuKernelTag::Vbmi2;
     }
     if has_avx2 && has_bmi2 {
@@ -265,7 +275,8 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
             target_feature = "avx512f",
             target_feature = "avx512vl",
             target_feature = "avx512bw",
-            target_feature = "bmi2"
+            target_feature = "bmi2",
+            target_feature = "avx2"
         ))]
         {
             return CpuKernelTag::Vbmi2;
@@ -321,13 +332,17 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // Whole test gated on `std`: the `is_x86_feature_detected!`
+    // guard below is a no-op under `--no-default-features` (no std,
+    // no runtime feature detection), so the test body would call
+    // `Avx2Kernel::mask_lower_bits` unconditionally and SIGILL on any
+    // non-BMI2 CPU. Gating the test itself with `cfg(feature = "std")`
+    // ensures the runtime check is always live when the test compiles.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
         // Only run when BMI2 actually available — otherwise constructing
-        // Avx2Kernel via dispatch wouldn't happen. Hardcode the run
-        // when detected.
-        #[cfg(feature = "std")]
+        // Avx2Kernel via dispatch wouldn't happen.
         if !std::arch::is_x86_feature_detected!("bmi2") {
             return;
         }

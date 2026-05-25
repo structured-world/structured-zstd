@@ -5,8 +5,8 @@ use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionTyp
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
 #[cfg(target_arch = "x86_64")]
-use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
-use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, CpuKernelTag, Vbmi2Kernel};
+use crate::cpu_kernel::{CpuKernel, ScalarKernel, detect_cpu_kernel};
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
@@ -717,9 +717,6 @@ mod zerocopy_robustness_tests {
     // builders.
     use super::{LiteralsView, decode_literals_zerocopy};
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
-    #[cfg(target_arch = "x86_64")]
-    use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, Vbmi2Kernel};
-    use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel, detect_cpu_kernel};
     use crate::decoding::scratch::HuffmanScratch;
     use crate::huff0::HuffmanTable;
     use alloc::vec::Vec;

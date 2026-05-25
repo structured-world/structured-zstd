@@ -41,6 +41,12 @@ const BIT_MASK: [u64; 65] = {
 /// silently truncate without it; on the fallback path `checked_shr`
 /// returns `None` for the wrapping-underflow shift and the
 /// `unwrap_or(0)` would otherwise hide the upstream bug.
+// Used only by the in-file mask_lower_bits unit tests after the
+// hot-path migration to `K::mask_lower_bits` via the `CpuKernel`
+// trait. Gating with `#[cfg(test)]` keeps the helper available for
+// the regression tests below without triggering a `dead_code`
+// warning under `-D warnings` in normal builds.
+#[cfg(test)]
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
     // Input-validation gate documented in the rustdoc above — keep this
