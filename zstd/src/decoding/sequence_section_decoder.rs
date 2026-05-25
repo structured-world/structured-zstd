@@ -494,13 +494,22 @@ fn decode_one_sequence_inline(
     br: &mut BitReaderReversed<'_>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
-    // `Entry` (populated by `enrich_with_packed_seq_meta` /
-    // `enrich_for_offsets` during table build). Drops the previous
-    // `lookup_ll_code` / `lookup_ml_code` indirections — those did
-    // a second cache touch on the separate `LL_META` / `ML_META`
-    // tables per sequence. The active entry was already loaded
-    // when `decode_symbol` read `state.symbol`, so the new fields
-    // come for free in the same cache line.
+    // `Entry`. LL / ML are populated by `enrich_with_packed_seq_meta`
+    // from the packed `LL_META` / `ML_META` tables during build;
+    // OF is enriched closed-form (`1 << code`) by `enrich_for_offsets`.
+    // Reading `state` directly drops the previous `lookup_ll_code` /
+    // `lookup_ml_code` indirections (those did a second cache touch
+    // on the separate meta tables per sequence) — the active entry
+    // is already cache-hot.
+    //
+    // OF intentionally keeps the closed-form `1u32 << of_code`
+    // baseline computation instead of reading `of_dec.state.base_value`:
+    // the shift is a single ALU op vs a 4-byte memory load, both
+    // produce identical codegen with `obits + ...` add, and `of_code`
+    // is still required for `get_bits_triple` and the
+    // `debug_assert!(of_code <= MAX_OFFSET_CODE)` precondition. The
+    // 12-byte Entry layout still pays off here through LL / ML's
+    // base_value / num_additional_bits reads.
     let ll_state = ll_dec.state;
     let ml_state = ml_dec.state;
     let of_code = of_dec.state.symbol;
