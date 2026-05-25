@@ -77,12 +77,20 @@ impl BlockDecoder {
                         source: crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof),
                     });
                 }
+                // Peek the fill byte without advancing `*source` yet —
+                // `try_extend_and_fill` is fallible on fixed-capacity
+                // backends, and on `Err` the caller exits early. If we
+                // advanced first, the input cursor would diverge from
+                // the bytes_read accounting by one byte on the error
+                // path. Advance ONLY after the write succeeds, matching
+                // the Raw arm's split_at-then-try_push-then-advance shape.
                 let fill = source[0];
-                *source = &source[1..];
                 workspace
                     .split()
                     .buffer
-                    .extend_and_fill(fill, header.decompressed_size as usize);
+                    .try_extend_and_fill(fill, header.decompressed_size as usize)
+                    .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
+                *source = &source[1..];
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(1)
             }
@@ -99,7 +107,15 @@ impl BlockDecoder {
                     });
                 }
                 let (payload, tail) = source.split_at(n);
-                workspace.split().buffer.push(payload);
+                // `try_push` returns `Err(BackendOverflow)` on
+                // `UserSliceBackend` when the Raw payload would push
+                // past the caller's output slice. Growable backends
+                // grow on demand and always succeed.
+                workspace
+                    .split()
+                    .buffer
+                    .try_push(payload)
+                    .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
                 *source = tail;
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))
@@ -601,6 +617,104 @@ mod tests {
             }
             other => panic!("expected ReadError, got {other:?}"),
         }
+    }
+
+    /// Exercise the BackendOverflow -> DecodeBlockContentError mapping
+    /// on the direct-decode path. Constructs a fixed-capacity
+    /// `UserSliceBackend` over a 4-byte slice and feeds it an RLE
+    /// block whose `decompressed_size` (10) exceeds the slice; the
+    /// `try_extend_and_fill` failure must surface as
+    /// `BackendOverflow { step: RLE }`, never panic.
+    #[test]
+    fn rle_oversized_against_user_slice_backend_returns_backend_overflow() {
+        use crate::decoding::decode_buffer::DecodeBuffer;
+        use crate::decoding::scratch::{DirectScratch, FSEScratch, HuffmanScratch};
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut output = [0u8; 4];
+        let backend = UserSliceBackend::from_slice(&mut output);
+        let buffer = DecodeBuffer::from_backend(backend, 1 << 20);
+        let mut huf = HuffmanScratch::new();
+        let mut fse = FSEScratch::new();
+        let mut offset_hist = [1u32, 4, 8];
+        let mut literals_buffer = alloc::vec::Vec::new();
+        let mut sequences = alloc::vec::Vec::new();
+        let mut block_content_buffer = alloc::vec::Vec::new();
+        let mut direct = DirectScratch {
+            huf: &mut huf,
+            fse: &mut fse,
+            offset_hist: &mut offset_hist,
+            literals_buffer: &mut literals_buffer,
+            sequences: &mut sequences,
+            block_content_buffer: &mut block_content_buffer,
+            buffer,
+        };
+
+        let mut d = primed_decoder();
+        let payload = [0xCDu8];
+        let mut src: &[u8] = &payload;
+        let h = header(BlockType::RLE, 10, 1);
+        let err = d
+            .decode_block_content_from_slice(&h, &mut direct, &mut src)
+            .expect_err("RLE 10 bytes into 4-byte slice must error");
+        match err {
+            DecodeBlockContentError::BackendOverflow { step } => {
+                assert_eq!(step, BlockType::RLE);
+            }
+            other => panic!("expected BackendOverflow, got {other:?}"),
+        }
+        assert_eq!(direct.buffer.len(), 0, "no bytes written on overflow");
+    }
+
+    /// Regression test: on BackendOverflow error from the RLE
+    /// fallible write, the input `*source` must NOT have been
+    /// advanced. Otherwise `FrameDecoder::bytes_read_counter`
+    /// accounting is off by one byte on the error path: the caller
+    /// exits early and the 1-byte advance never gets reflected in
+    /// the read counter, but the next call would skip past the RLE
+    /// byte.
+    #[test]
+    fn rle_overflow_leaves_source_unadvanced() {
+        use crate::decoding::decode_buffer::DecodeBuffer;
+        use crate::decoding::scratch::{DirectScratch, FSEScratch, HuffmanScratch};
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut output = [0u8; 4];
+        let backend = UserSliceBackend::from_slice(&mut output);
+        let buffer = DecodeBuffer::from_backend(backend, 1 << 20);
+        let mut huf = HuffmanScratch::new();
+        let mut fse = FSEScratch::new();
+        let mut offset_hist = [1u32, 4, 8];
+        let mut literals_buffer = alloc::vec::Vec::new();
+        let mut sequences = alloc::vec::Vec::new();
+        let mut block_content_buffer = alloc::vec::Vec::new();
+        let mut direct = DirectScratch {
+            huf: &mut huf,
+            fse: &mut fse,
+            offset_hist: &mut offset_hist,
+            literals_buffer: &mut literals_buffer,
+            sequences: &mut sequences,
+            block_content_buffer: &mut block_content_buffer,
+            buffer,
+        };
+
+        let mut d = primed_decoder();
+        let payload = [0xCDu8, 0xEE, 0xFF];
+        let mut src: &[u8] = &payload;
+        let h = header(BlockType::RLE, 10, 1);
+        let _ = d
+            .decode_block_content_from_slice(&h, &mut direct, &mut src)
+            .expect_err("RLE 10 bytes into 4-byte slice must error");
+        assert_eq!(
+            src.as_ptr(),
+            payload.as_ptr(),
+            "source advanced despite write failure"
+        );
+        assert_eq!(
+            src.len(),
+            payload.len(),
+            "source length changed on error path"
+        );
     }
 
     #[test]

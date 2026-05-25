@@ -347,8 +347,24 @@ impl From<ExecuteSequencesError> for DecompressBlockError {
 pub enum DecodeBlockContentError {
     DecoderStateIsFailed,
     ExpectedHeaderOfPreviousBlock,
-    ReadError { step: BlockType, source: Error },
+    ReadError {
+        step: BlockType,
+        source: Error,
+    },
     DecompressBlockError(DecompressBlockError),
+    /// The block's decompressed payload would not fit in the
+    /// caller-provided output buffer (only reachable via the
+    /// direct-decode path with a fixed-capacity backend). Internal
+    /// diagnostic variant — the frame-level decoder always
+    /// converts this into
+    /// `FrameDecoderError::FrameContentSizeMismatch` before
+    /// returning to the user, so external callers never observe
+    /// it. The `step: BlockType` field is kept for in-crate
+    /// debugging (which decode arm triggered the overshoot) but is
+    /// not part of any caller-visible distinction.
+    BackendOverflow {
+        step: BlockType,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -381,6 +397,10 @@ impl core::fmt::Display for DecodeBlockContentError {
                 write!(f, "Error while reading bytes for {step}: {source}",)
             }
             DecodeBlockContentError::DecompressBlockError(e) => write!(f, "{e:?}"),
+            DecodeBlockContentError::BackendOverflow { step } => write!(
+                f,
+                "{step} block's decompressed payload exceeds the caller-provided output buffer",
+            ),
         }
     }
 }
@@ -394,9 +414,34 @@ impl From<DecompressBlockError> for DecodeBlockContentError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeBufferError {
-    NotEnoughBytesInDictionary { got: usize, need: usize },
-    OffsetTooBig { offset: usize, buf_len: usize },
+    NotEnoughBytesInDictionary {
+        got: usize,
+        need: usize,
+    },
+    OffsetTooBig {
+        offset: usize,
+        buf_len: usize,
+    },
     ZeroOffset,
+    /// Match repeat would overflow a fixed-capacity backend
+    /// (`UserSliceBackend`). Growable backends (FlatBuf/RingBuffer)
+    /// grow on demand and never produce this.
+    ///
+    /// Reserved for the Compressed-block sequence-executor hardening
+    /// follow-up. Currently NOT surfaced from any production path —
+    /// `extend_from_within_unchecked` on `UserSliceBackend` still
+    /// panics on overshoot via its release-mode `assert!`. The
+    /// `_trusted` suffix on `decode_to_slice_trusted` is the
+    /// shipping contract until that follow-up wires
+    /// `BufferBackend::try_extend_from_within` through
+    /// `DecodeBuffer::repeat*` and maps `BackendOverflow` into
+    /// `FrameDecoderError::FrameContentSizeMismatch`.
+    ///
+    /// The variant lives now (vs landing later with the
+    /// follow-up) so the typed conversion at the `decode_to_slice_trusted`
+    /// boundary is in place; only the constructor on the burst path
+    /// is missing.
+    BackendOverflow,
 }
 
 #[cfg(feature = "std")]
@@ -416,6 +461,12 @@ impl core::fmt::Display for DecodeBufferError {
             }
             DecodeBufferError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
+            }
+            DecodeBufferError::BackendOverflow => {
+                write!(
+                    f,
+                    "Match repeat would overflow the output buffer's fixed capacity"
+                )
             }
         }
     }
@@ -1364,6 +1415,25 @@ mod tests {
             }
             .to_string(),
             "Frame content size mismatch (corrupt frame): declared 100 bytes, blocks summed to 87 bytes"
+        );
+    }
+
+    #[test]
+    fn decode_block_content_backend_overflow_display_names_the_step() {
+        use crate::blocks::block::BlockType;
+        assert_eq!(
+            DecodeBlockContentError::BackendOverflow {
+                step: BlockType::RLE
+            }
+            .to_string(),
+            "RLE block's decompressed payload exceeds the caller-provided output buffer"
+        );
+        assert_eq!(
+            DecodeBlockContentError::BackendOverflow {
+                step: BlockType::Raw
+            }
+            .to_string(),
+            "Raw block's decompressed payload exceeds the caller-provided output buffer"
         );
     }
 
