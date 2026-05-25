@@ -243,7 +243,7 @@ pub fn round_trip(data: &[u8]) {
 
     check_tables(&dec_table, &enc_table);
 
-    let mut br = BitReaderReversed::new(encoded);
+    let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(encoded);
     let mut skipped_bits = 0;
     loop {
         let val = br.get_bits(1);
