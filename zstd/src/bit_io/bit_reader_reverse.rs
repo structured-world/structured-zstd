@@ -131,7 +131,13 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+// Used only by the in-file extract_triple correctness tests after
+// `peek_bits_triple` switched to the per-reader `use_pext_triple`
+// cached flag (commit 8805122f) — production now calls
+// `extract_triple_pext` directly via that path. Gating with
+// `#[cfg(test)]` keeps the helper available for the tests while
+// avoiding a `dead_code` warning under `-D warnings`.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 #[inline(always)]
 fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
     if !triple_extract_dispatch().use_pext {

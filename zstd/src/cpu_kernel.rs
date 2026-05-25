@@ -168,10 +168,13 @@ impl CpuKernel for SveKernel {
 #[target_feature(enable = "bmi2")]
 #[inline]
 unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
-    // SAFETY: caller selected a kernel whose CpuKernelTag was
-    // resolved after `is_x86_feature_detected!("bmi2")` returned
-    // true. The intrinsic is callable in that context.
-    unsafe { core::arch::x86_64::_bzhi_u64(value, n as u32) }
+    // The intrinsic call is permitted directly inside a function
+    // already annotated `#[target_feature(enable = "bmi2")]` — no
+    // `unsafe { ... }` block needed (the function-level `unsafe`
+    // already covers it). SAFETY: caller selected a kernel whose
+    // CpuKernelTag was resolved after `is_x86_feature_detected!("bmi2")`
+    // returned true, so the BMI2 instruction set is available.
+    core::arch::x86_64::_bzhi_u64(value, n as u32)
 }
 
 /// Pure boolean-input variant of the x86 kernel-tag selection. Both the
