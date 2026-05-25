@@ -1,4 +1,6 @@
+use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 use core::convert::TryInto;
+use core::marker::PhantomData;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 use std::sync::OnceLock;
 
@@ -39,6 +41,12 @@ const BIT_MASK: [u64; 65] = {
 /// silently truncate without it; on the fallback path `checked_shr`
 /// returns `None` for the wrapping-underflow shift and the
 /// `unwrap_or(0)` would otherwise hide the upstream bug.
+// Used only by the in-file mask_lower_bits unit tests after the
+// hot-path migration to `K::mask_lower_bits` via the `CpuKernel`
+// trait. Gating with `#[cfg(test)]` keeps the helper available for
+// the regression tests below without triggering a `dead_code`
+// warning under `-D warnings` in normal builds.
+#[cfg(test)]
 #[inline(always)]
 fn mask_lower_bits(value: u64, n: u8) -> u64 {
     // Input-validation gate documented in the rustdoc above — keep this
@@ -123,7 +131,13 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+// Used only by the in-file extract_triple correctness tests after
+// `peek_bits_triple` switched to the per-reader `use_pext_triple`
+// cached flag (commit 8805122f) — production now calls
+// `extract_triple_pext` directly via that path. Gating with
+// `#[cfg(test)]` keeps the helper available for the tests while
+// avoiding a `dead_code` warning under `-D warnings`.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 #[inline(always)]
 fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
     if !triple_extract_dispatch().use_pext {
@@ -151,7 +165,7 @@ unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u
 /// Zstandard encodes some types of data in a way that the data must be read
 /// back to front to decode it properly. `BitReaderReversed` provides a
 /// convenient interface to do that.
-pub struct BitReaderReversed<'s> {
+pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     /// Start offset (in bytes) of the 8-byte source window currently
     /// loaded into `bit_container`. Decreases monotonically as bytes
     /// are consumed: `refill` walks it backward toward 0 by
@@ -197,21 +211,39 @@ pub struct BitReaderReversed<'s> {
     ///
     /// `pub(crate)` — see [`Self::bits_consumed`] for the rationale.
     pub(crate) bit_container: u64,
+
+    /// Phantom marker for the CPU kernel type parameter `K`. Zero-sized;
+    /// drives monomorphisation of methods that route through `K::mask_lower_bits`
+    /// without forcing the struct itself to carry runtime kernel state.
+    _kernel: PhantomData<K>,
+
+    /// Cached `triple_extract_dispatch().use_pext` snapshot, populated
+    /// once in `new()`. `peek_bits_triple` reads this field instead of
+    /// re-checking the global `OnceLock` on every sequence — the
+    /// per-call atomic load + dispatch-branch was paying ~3 cycles on
+    /// every sequence decode (thousands per block × many blocks per
+    /// frame). One bool per `BitReaderReversed` lifetime, amortised
+    /// across every `peek_bits_triple` in the same decode pass.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    pub(crate) use_pext_triple: bool,
 }
 
-impl<'s> BitReaderReversed<'s> {
+impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// How many bits are left to read by the reader.
     pub fn bits_remaining(&self) -> isize {
         self.index as isize * 8 + (64 - self.bits_consumed as isize) - self.extra_bits as isize
     }
 
-    pub fn new(source: &'s [u8]) -> BitReaderReversed<'s> {
+    pub fn new(source: &'s [u8]) -> BitReaderReversed<'s, K> {
         BitReaderReversed {
             index: source.len(),
             bits_consumed: 64,
             source,
             bit_container: 0,
             extra_bits: 0,
+            _kernel: PhantomData,
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            use_pext_triple: triple_extract_dispatch().use_pext,
         }
     }
 
@@ -346,7 +378,7 @@ impl<'s> BitReaderReversed<'s> {
             n
         );
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(n);
-        mask_lower_bits(self.bit_container.wrapping_shr(shift_by as u32), n)
+        K::mask_lower_bits(self.bit_container.wrapping_shr(shift_by as u32), n)
     }
 
     /// Get the next `n1` `n2` and `n3` bits from the source without consuming them.
@@ -381,13 +413,18 @@ impl<'s> BitReaderReversed<'s> {
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
-        if let Some(values) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
-            return values;
+        if self.use_pext_triple {
+            // SAFETY: `use_pext_triple` was set in `new()` from
+            // `triple_extract_dispatch().use_pext`, which only returns
+            // `true` when BMI2 is runtime-detected; the unsafe call is
+            // gated on the same runtime check that the inline-form
+            // `try_extract_triple_with_pext` used to perform per-call.
+            return unsafe { extract_triple_pext(all_three, n1, n2, n3) };
         }
 
-        let val1 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
-        let val2 = mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
-        let val3 = mask_lower_bits(all_three, n3);
+        let val1 = K::mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
+        let val2 = K::mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
+        let val3 = K::mask_lower_bits(all_three, n3);
 
         (val1, val2, val3)
     }
@@ -451,7 +488,7 @@ mod test {
     #[test]
     fn it_works() {
         let data = [0b10101010, 0b01010101];
-        let mut br = super::BitReaderReversed::new(&data);
+        let mut br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
         assert_eq!(br.get_bits(1), 0);
         assert_eq!(br.get_bits(1), 1);
         assert_eq!(br.get_bits(1), 0);
@@ -474,7 +511,7 @@ mod test {
         let data: [u8; 10] = [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01];
 
         // Reference: read with get_bits
-        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut ref_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
         let r1 = ref_br.get_bits(0);
         let r2 = ref_br.get_bits(7);
         let r3 = ref_br.get_bits(13);
@@ -488,7 +525,7 @@ mod test {
         let r8 = ref_br.get_bits(8);
 
         // Unchecked path: same reads via ensure_bits + get_bits_unchecked
-        let mut fast_br = super::BitReaderReversed::new(&data);
+        let mut fast_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
 
         // n=0 edge case
         fast_br.ensure_bits(0);
@@ -557,7 +594,7 @@ mod test {
     #[test]
     fn peek_bits_zero_is_always_zero() {
         let data = [0xFF; 8];
-        let mut br = super::BitReaderReversed::new(&data);
+        let mut br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
 
         // Initial state: bits_consumed = 64
         assert_eq!(br.peek_bits(0), 0);
@@ -585,13 +622,13 @@ mod test {
         ];
 
         // Reference: individual reads
-        let mut ref_br = super::BitReaderReversed::new(&data);
+        let mut ref_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
         let r1 = ref_br.get_bits(8);
         let r2 = ref_br.get_bits(9);
         let r3 = ref_br.get_bits(9);
 
         // Triple read
-        let mut triple_br = super::BitReaderReversed::new(&data);
+        let mut triple_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
         let (t1, t2, t3) = triple_br.get_bits_triple(8, 9, 9);
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
@@ -600,8 +637,8 @@ mod test {
         // No-refill fast path: 8 bits already consumed, so the next 26 bits
         // still fit in the current container and `ensure_bits(26)` should
         // skip `refill()`.
-        let mut ref_br = super::BitReaderReversed::new(&data);
-        let mut triple_br = super::BitReaderReversed::new(&data);
+        let mut ref_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+        let mut triple_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
         let _ = ref_br.get_bits(8);
         let _ = triple_br.get_bits(8);
 
@@ -614,8 +651,8 @@ mod test {
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
 
         // Mixed zero-widths: individual sequence extra-bit fields can be zero.
-        let mut ref_br = super::BitReaderReversed::new(&data);
-        let mut triple_br = super::BitReaderReversed::new(&data);
+        let mut ref_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+        let mut triple_br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
 
         let r1 = ref_br.get_bits(5);
         let r2 = ref_br.get_bits(0);

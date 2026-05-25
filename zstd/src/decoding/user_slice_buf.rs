@@ -210,7 +210,17 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         self.tail = new_tail;
     }
 
-    #[inline]
+    // `#[inline(always)]` because perf annotate on the primary bench
+    // attributes ~10% of decode time to this method's own prologue /
+    // epilogue (subq+pushq on entry, popq+retq on exit) — pure
+    // function-call boundary cost on a method that is called from
+    // tight literal-emit loops inside `decode_and_execute_sequences`.
+    // The body is small (one assert, one copy), so forced inlining
+    // does not bloat callers meaningfully. NOT a dispatch + match
+    // pattern (the documented Tier-10 negative): the entry has no
+    // runtime branch on kernel features — `copy_bytes_overshooting`
+    // owns that dispatch internally.
+    #[inline(always)]
     fn extend(&mut self, data: &[u8]) {
         let len = data.len();
         let new_tail = self.tail + len;
@@ -320,6 +330,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         }
     }
 
+    // Keep `#[inline]` (hint, not force). An earlier experiment with
+    // `#[inline(always)]` regressed primary bench by +2.96% — body
+    // is materially larger than `extend` (assert + readable/writable
+    // derivation + simd_copy::copy_bytes_overshooting call), and
+    // forced inlining bloats each pipeline-slot caller past icache
+    // budget. The per-call boundary save is dwarfed by the
+    // duplicated body weight; LLVM's heuristic was right to decline.
     #[inline]
     unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         let dst_off = self.tail;

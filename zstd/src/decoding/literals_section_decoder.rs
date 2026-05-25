@@ -4,6 +4,9 @@
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
+#[cfg(target_arch = "x86_64")]
+use crate::cpu_kernel::{Avx2Kernel, Bmi2Kernel, CpuKernelTag, Vbmi2Kernel};
+use crate::cpu_kernel::{CpuKernel, ScalarKernel, detect_cpu_kernel};
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
@@ -124,6 +127,71 @@ fn decompress_literals(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
+    // Per-block CpuKernel dispatch. `detect_cpu_kernel()` resolves the
+    // tag at most once per process: under `feature = "std"` via an
+    // `OnceLock` cache around `is_x86_feature_detected!`, and under
+    // `no_std` it is a `cfg(target_feature = ...)` const at compile
+    // time. Either way the match below collapses to a single cmp+jmp
+    // on subsequent calls (or to a single arm at codegen on no-std).
+    // Each arm dispatches into a target_feature-wrapped outer function
+    // so the entire impl::<K> pipeline executes inside the matching
+    // target_feature context — without that wrapping, LLVM cannot
+    // inline target_feature'd intrinsics (e.g. _bzhi_u64 inside
+    // K::mask_lower_bits) through the trait-method call boundary back
+    // into the generic caller, and the inlined-intrinsic win
+    // evaporates into a function-call trampoline per mask op.
+    match detect_cpu_kernel() {
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Vbmi2 => unsafe {
+            decompress_literals_vbmi2(section, scratch, source, target)
+        },
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Avx2 => unsafe { decompress_literals_avx2(section, scratch, source, target) },
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Bmi2 => unsafe { decompress_literals_bmi2(section, scratch, source, target) },
+        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, source, target),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,avx2")]
+unsafe fn decompress_literals_avx2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Avx2Kernel>(section, scratch, source, target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn decompress_literals_bmi2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Bmi2Kernel>(section, scratch, source, target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw,bmi2,avx2")]
+unsafe fn decompress_literals_vbmi2(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
+    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, source, target)
+}
+
+fn decompress_literals_impl<K: CpuKernel>(
+    section: &LiteralsSection,
+    scratch: &mut HuffmanScratch,
+    source: &[u8],
+    target: &mut Vec<u8>,
+) -> Result<u32, DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 
     let compressed_size = section.compressed_size.ok_or(err::MissingCompressedSize)? as usize;
@@ -182,11 +250,11 @@ fn decompress_literals(
             HuffmanDecoder::new(&scratch.table),
             HuffmanDecoder::new(&scratch.table),
         ];
-        let mut brs: [BitReaderReversed<'_>; 4] = [
-            BitReaderReversed::new(streams[0]),
-            BitReaderReversed::new(streams[1]),
-            BitReaderReversed::new(streams[2]),
-            BitReaderReversed::new(streams[3]),
+        let mut brs: [BitReaderReversed<'_, K>; 4] = [
+            BitReaderReversed::<K>::new(streams[0]),
+            BitReaderReversed::<K>::new(streams[1]),
+            BitReaderReversed::<K>::new(streams[2]),
+            BitReaderReversed::<K>::new(streams[3]),
         ];
 
         // Initialize all 4 streams: skip padding and set initial state
@@ -232,14 +300,22 @@ fn decompress_literals(
         // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
         // MEM_read64(ip[s]) | 1`.
         let max_num_bits = scratch.table.max_num_bits;
-        // `symbols_per_burst * max + max_padding_skip < 64 - max` so
-        // the corrupted bit-0 from donor's `(bit_container | 1)`
-        // composition (which lands at bit `padding_skip` initially)
-        // never reaches the top `max_num_bits` state region after
-        // the worst-case shift sequence. `padding_skip ∈ [1, 8]` —
-        // we cap by 8 to stay safe for the upper boundary case.
-        // For max=11: 4 symbols. For max=8: 6 symbols. For max=4: 13.
-        let symbols_per_burst: usize = (64 - max_num_bits as usize - 8) / max_num_bits as usize;
+        // Safety constraint per donor `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
+        // before each `bits[s] >> table_shift` read, the sentinel-bit position
+        // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
+        // `max_num_bits` read region). After `s` shifts the sentinel is at bit
+        // `padding_skip + s*max_num_bits`. The N-th read happens after (N-1)
+        // shifts, so the inclusive bound is
+        //   padding_skip + (N-1)*max_num_bits < 64 - max_num_bits
+        // i.e.
+        //   padding_skip + N*max_num_bits <= 63
+        // Solving for N with padding_skip ≤ 8:
+        //   N <= (63 - 8) / max_num_bits = 55 / max_num_bits
+        // (Letter `s` is used here for shift-count to avoid colliding with
+        // the surrounding generic parameter `K: CpuKernel`.)
+        // For max=11: 5 symbols (donor parity — was 4 with the old off-by-one
+        // formula). For max=8: 6 symbols. For max=4: 13.
+        let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
         let table_shift = (64 - max_num_bits) as u32;
         let packed = scratch.table.packed_decode.as_slice();
@@ -332,7 +408,7 @@ fn decompress_literals(
         //just decode the one stream
         assert!(num_streams == 1);
         let mut decoder = HuffmanDecoder::new(&scratch.table);
-        let mut br = BitReaderReversed::new(source);
+        let mut br = BitReaderReversed::<K>::new(source);
         let mut skipped_bits = 0;
         loop {
             let val = br.get_bits(1);
@@ -407,9 +483,9 @@ struct LoopBounds {
 /// `brs[s].source` must be the slice the corresponding decoder was
 /// initialised against.
 #[inline(always)]
-unsafe fn run_4stream_burst_loop(
+unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
-    brs: &mut [BitReaderReversed<'_>; 4],
+    brs: &mut [BitReaderReversed<'_, K>; 4],
     target: &mut [u8],
     packed: &[u16],
     cursors: &mut [usize; 4],

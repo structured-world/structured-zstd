@@ -44,6 +44,7 @@ macro_rules! vprintln {
 
 mod bit_io;
 mod common;
+mod cpu_kernel;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
@@ -61,6 +62,14 @@ pub(crate) mod blocks;
 pub mod fse;
 #[cfg(feature = "fuzz_exports")]
 pub mod huff0;
+
+// `pub fn init_state<K: CpuKernel>` and friends inside the
+// fuzz_exports-public `huff0` module name `crate::cpu_kernel::CpuKernel`
+// in their signatures. Without a publicly-reachable path to `CpuKernel`
+// the bound triggers `private_bounds` / `private_interfaces`. Re-export
+// under the same feature gate so the fuzz harness build is clean.
+#[cfg(feature = "fuzz_exports")]
+pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 
 #[cfg(not(feature = "fuzz_exports"))]
 pub(crate) mod fse;
@@ -91,6 +100,11 @@ mod tests;
 #[doc(hidden)]
 pub mod testing {
     pub use crate::bit_io::BitReaderReversed;
+    // `BitReaderReversed` is generic over `K: CpuKernel = ScalarKernel`,
+    // so both the trait bound and the default need a `pub` path to
+    // match the re-exported type's visibility. Without this the
+    // bench-build trips `private_bounds` / `private_interfaces`.
+    pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 
     /// Bench-only facade for the decoder wildcopy implementation.
     ///

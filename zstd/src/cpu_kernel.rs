@@ -1,0 +1,431 @@
+//! CPU kernel dispatch — single detect+match at the dispatch site,
+//! propagated through the inner pipeline as a generic parameter so
+//! leaf hot-path code monomorphises against the chosen kernel.
+//!
+//! See issue #247 for the architecture rationale: per-subsystem
+//! dispatch scatters the choice across HUF / FSE / SIMD-copy
+//! independently and pays the cost N times per call. Lifting the
+//! dispatch to the outermost feasible call site collapses it to one
+//! detect there; the inner leaf-hot-path ops then route through
+//! `K::method` calls on the chosen kernel zero-sized type.
+//!
+//! Current wiring (as of #247 Part 2): the only active dispatch site
+//! is `decoding::literals_section_decoder::decompress_literals`,
+//! which `match`es `detect_cpu_kernel()` and routes into per-K
+//! `decompress_literals_*` `#[target_feature]` wrappers. The full
+//! pipeline-wide propagation envisioned in the issue (FrameDecoder /
+//! FrameCompressor entry, sequence executor, match copy) is
+//! incremental; subsequent tiers extend the dispatch surface without
+//! changing this trait or the kernel ZSTs.
+//!
+//! Structure code (block loop, FCS check, offset history, repeat
+//! semantics) stays single-impl and only carries `K` as a phantom on
+//! the outer function. Monomorphisation specialises ONLY the bodies
+//! that actually differ per ISA — `mask_lower_bits`, `huf_burst`,
+//! `copy_chunk`, etc.
+
+#[cfg(feature = "std")]
+use std::sync::OnceLock;
+
+/// Trait covering the leaf hot-path operations whose bodies differ
+/// per ISA. Implementations are ZSTs; the trait is `Copy` so it can
+/// be `Default`-constructed at each call site without runtime cost.
+///
+/// New methods land here ONLY when their codegen genuinely differs
+/// per kernel (BMI2 intrinsic vs scalar shift, AVX2 256-bit move vs
+/// SSE2 128-bit move, etc.). Structure ops that have one canonical
+/// implementation must NOT be on this trait — they stay on the
+/// existing decoder / encoder types.
+// Public (rather than `pub(crate)`) because `BitReaderReversed` is
+// generic over `K: CpuKernel = ScalarKernel` and is re-exported via
+// the `bench_internals`-gated `testing` module; under that feature
+// the visibility of every type that appears in `BitReaderReversed`'s
+// bounds (the trait + the default kernel) must match the type's own
+// visibility, otherwise rustc rejects with `private_bounds` /
+// `private_interfaces`. The trait surface stays narrow on stable
+// crate users: nothing outside `bench_internals` constructs a
+// non-Scalar kernel directly.
+pub trait CpuKernel: Copy + 'static {
+    /// Mask the low `n` bits of `value`, returning the remaining
+    /// high bits zeroed. The FSE bitstream hot path fires this 3×
+    /// per decoded sequence; on BMI2-capable hardware this maps to
+    /// a single `_bzhi_u64` instruction, otherwise to a scalar
+    /// `u64::MAX >> (64 - n)` shift + mask.
+    ///
+    /// Precondition: `n <= 64`. Behaviour for `n == 0` is "return 0";
+    /// behaviour for `n > 64` is unspecified — callers MUST uphold
+    /// the bound. The test-only `mask_lower_bits` helper in
+    /// `bit_reader_reverse.rs` debug-asserts the bound for its
+    /// unit tests, but production callers (FSE / HUF hot paths)
+    /// derive `n` from `accuracy_log` / `max_num_bits` which the
+    /// per-stream table builders pin to `n <= MAX_*_BITS` at
+    /// construction time; no per-call wrapper assert runs.
+    fn mask_lower_bits(value: u64, n: u8) -> u64;
+}
+
+/// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
+/// when no x86 or aarch64 feature is detected at runtime.
+#[derive(Copy, Clone, Default)]
+pub struct ScalarKernel;
+
+impl CpuKernel for ScalarKernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // `checked_shr` returns `None` for shift counts >= 64, which
+        // happens exactly when `n == 0` (`64 - 0 = 64`). Mapping
+        // both that case and the invalid `n > 64` underflow to 0
+        // gives the mathematically-correct empty mask for n=0 and
+        // a safe-ish fallback for the invalid range.
+        let mask = u64::MAX
+            .checked_shr(64u32.wrapping_sub(n as u32))
+            .unwrap_or(0);
+        value & mask
+    }
+}
+
+/// x86_64 BMI2-only kernel: `_bzhi_u64` for mask_lower_bits. Selected
+/// when the CPU has BMI2 but not the AVX2 SIMD width to upgrade to
+/// the Avx2 kernel. Treated as a stepping stone between Scalar and
+/// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
+/// matches donor's gating).
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Bmi2Kernel;
+
+#[cfg(target_arch = "x86_64")]
+impl CpuKernel for Bmi2Kernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // SAFETY: this kernel ZST is only reachable via the
+        // `match detect_cpu_kernel() { CpuKernelTag::Bmi2 => ... }`
+        // dispatch arms at decoder entry sites, all of which fire only
+        // after `detect_cpu_kernel` confirmed BMI2 is available on the
+        // running CPU.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+}
+
+/// x86_64 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
+/// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
+/// Uses `_bzhi_u64` for mask ops; future trait methods will use AVX2
+/// 256-bit moves for `copy_chunk` and pext for HUF burst.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Avx2Kernel;
+
+#[cfg(target_arch = "x86_64")]
+impl CpuKernel for Avx2Kernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // SAFETY: Avx2Kernel is selected only after runtime detect
+        // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+}
+
+/// x86_64 AVX-512 VBMI2 + AVX2 + BMI2 kernel. Selected when the CPU
+/// has the AVX-512 VBMI2 family available — VBMI2 unlocks a faster
+/// HUF burst inner loop (VPSHUFB-based table lookup); BMI2 mask_lower
+/// bits stays identical to Avx2 kernel.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Vbmi2Kernel;
+
+#[cfg(target_arch = "x86_64")]
+impl CpuKernel for Vbmi2Kernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // SAFETY: same precondition as Avx2Kernel — BMI2 confirmed
+        // at runtime before this kernel is instantiated.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+}
+
+/// aarch64 NEON baseline kernel. Used on all aarch64 hardware that
+/// exposes NEON (effectively universal on the supported targets).
+///
+/// `#[allow(dead_code)]`: scaffolding for the future aarch64 dispatch
+/// arm in `decompress_literals` / `decode_and_execute_sequences`.
+/// The struct + trait impl land first so the dispatch wiring can be
+/// added incrementally without churning the CpuKernel surface; until
+/// the dispatch arm uses it the type is reachable only as a phantom.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct NeonKernel;
+
+#[cfg(target_arch = "aarch64")]
+impl CpuKernel for NeonKernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // aarch64 has no BMI2 equivalent that improves on the scalar
+        // shift-and-mask sequence for this op; the codegen is
+        // identical to the Scalar kernel here. Other trait methods
+        // (huf_burst, copy_chunk) will diverge once they land.
+        ScalarKernel::mask_lower_bits(value, n)
+    }
+}
+
+/// aarch64 SVE kernel. Variable-vector-length SVE extends NEON for
+/// HUF burst / SIMD copy on Graviton3 / Apple M-series with SVE
+/// support. Mask op identical to NEON / Scalar.
+///
+/// `#[allow(dead_code)]`: same scaffolding rationale as `NeonKernel`.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct SveKernel;
+
+#[cfg(target_arch = "aarch64")]
+impl CpuKernel for SveKernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        ScalarKernel::mask_lower_bits(value, n)
+    }
+}
+
+/// Single `#[target_feature(enable = "bmi2")]` wrapper around the
+/// `_bzhi_u64` intrinsic. Lifted to a free function so each kernel
+/// impl that needs the BMI2 path (Bmi2 / Avx2 / Vbmi2) calls the
+/// same shared body. With `#[inline]` LLVM inlines the call into
+/// any caller that itself has BMI2 in scope; outside that scope the
+/// target_feature boundary is preserved.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
+    // The intrinsic call is permitted directly inside a function
+    // already annotated `#[target_feature(enable = "bmi2")]` — no
+    // `unsafe { ... }` block needed (the function-level `unsafe`
+    // already covers it). SAFETY: caller selected a kernel whose
+    // CpuKernelTag was resolved after `is_x86_feature_detected!("bmi2")`
+    // returned true, so the BMI2 instruction set is available.
+    core::arch::x86_64::_bzhi_u64(value, n as u32)
+}
+
+/// Pure boolean-input variant of the x86 kernel-tag selection. Both the
+/// `std` runtime-detect path and the `no_std` compile-time-cfg path
+/// route through this helper so the precedence rules stay in one place
+/// (and are unit-testable without runtime CPUID).
+///
+/// The VBMI2 tier requires every AVX-512 sub-feature it touches AND the
+/// AVX2 baseline — VBMI2 kernels mix VBMI2-only intrinsics with AVX2
+/// 256-bit moves, so the dispatch must be conditioned on `has_avx2` too.
+/// Likewise the Avx2 tier requires both AVX2 and BMI2.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+const fn select_x86_kernel(
+    has_avx512vbmi2: bool,
+    has_avx512f: bool,
+    has_avx512vl: bool,
+    has_avx512bw: bool,
+    has_bmi2: bool,
+    has_avx2: bool,
+) -> CpuKernelTag {
+    if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 && has_avx2 {
+        return CpuKernelTag::Vbmi2;
+    }
+    if has_avx2 && has_bmi2 {
+        return CpuKernelTag::Avx2;
+    }
+    if has_bmi2 {
+        return CpuKernelTag::Bmi2;
+    }
+    CpuKernelTag::Scalar
+}
+
+/// Cached runtime-detected kernel tag. The actual `CpuKernel` impl
+/// (`ScalarKernel` / `Bmi2Kernel` / `Avx2Kernel` / `Vbmi2Kernel` /
+/// `NeonKernel` / `SveKernel`) is constructed at the dispatch site —
+/// currently only `decoding::literals_section_decoder::decompress_literals`
+/// — via a `match` on this tag that branches into the per-K
+/// `target_feature`-wrapped specialisation. Pipeline-wide dispatch
+/// (FrameDecoder / FrameCompressor entry, sequence executor, match
+/// copy) lands incrementally in follow-up tiers.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CpuKernelTag {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Bmi2,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Vbmi2,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(target_arch = "aarch64")]
+    Sve,
+}
+
+/// Detect once and cache the best available CPU kernel for the
+/// current process. Subsequent calls return the cached tag without
+/// re-running CPU-feature detection. Std-only — no-std targets use
+/// the compile-time variant below that resolves at build time.
+#[cfg(feature = "std")]
+pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
+    static CACHED: OnceLock<CpuKernelTag> = OnceLock::new();
+    *CACHED.get_or_init(detect_cpu_kernel_uncached)
+}
+
+#[cfg(feature = "std")]
+fn detect_cpu_kernel_uncached() -> CpuKernelTag {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::is_x86_feature_detected;
+        return select_x86_kernel(
+            is_x86_feature_detected!("avx512vbmi2"),
+            is_x86_feature_detected!("avx512f"),
+            is_x86_feature_detected!("avx512vl"),
+            is_x86_feature_detected!("avx512bw"),
+            is_x86_feature_detected!("bmi2"),
+            is_x86_feature_detected!("avx2"),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("sve") {
+            return CpuKernelTag::Sve;
+        }
+        if is_aarch64_feature_detected!("neon") {
+            return CpuKernelTag::Neon;
+        }
+        return CpuKernelTag::Scalar;
+    }
+    #[allow(unreachable_code)]
+    CpuKernelTag::Scalar
+}
+
+/// no-std variant: rely on compile-time `target_feature` flags
+/// instead of runtime detection. Resolves to the most-capable kernel
+/// that the build target supports.
+#[cfg(not(feature = "std"))]
+pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Route through the same const-fn precedence helper as the
+        // `feature = "std"` path. `cfg!(target_feature = ...)`
+        // returns a compile-time bool that constant-folds through
+        // `select_x86_kernel`, so the runtime call has the same
+        // codegen as the previous hand-written #[cfg] chain.
+        return select_x86_kernel(
+            cfg!(target_feature = "avx512vbmi2"),
+            cfg!(target_feature = "avx512f"),
+            cfg!(target_feature = "avx512vl"),
+            cfg!(target_feature = "avx512bw"),
+            cfg!(target_feature = "bmi2"),
+            cfg!(target_feature = "avx2"),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[cfg(target_feature = "sve")]
+        {
+            return CpuKernelTag::Sve;
+        }
+        #[cfg(target_feature = "neon")]
+        {
+            return CpuKernelTag::Neon;
+        }
+    }
+    #[allow(unreachable_code)]
+    CpuKernelTag::Scalar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_mask_lower_bits_zero_n_returns_zero() {
+        assert_eq!(ScalarKernel::mask_lower_bits(0xDEADBEEF, 0), 0);
+    }
+
+    #[test]
+    fn scalar_mask_lower_bits_full_64_returns_full_value() {
+        assert_eq!(
+            ScalarKernel::mask_lower_bits(0xFFFF_FFFF_FFFF_FFFF, 64),
+            0xFFFF_FFFF_FFFF_FFFF
+        );
+    }
+
+    #[test]
+    fn scalar_mask_lower_bits_mid_keeps_low_n_bits() {
+        // n=8: keep low 8 bits, zero the rest
+        assert_eq!(ScalarKernel::mask_lower_bits(0xDEAD_BEEF, 8), 0xEF);
+        assert_eq!(
+            ScalarKernel::mask_lower_bits(0x0102_0304_0506_0708, 16),
+            0x0708
+        );
+    }
+
+    // Whole test gated on `std`: the `is_x86_feature_detected!`
+    // guard below is a no-op under `--no-default-features` (no std,
+    // no runtime feature detection), so the test body would call
+    // `Avx2Kernel::mask_lower_bits` unconditionally and SIGILL on any
+    // non-BMI2 CPU. Gating the test itself with `cfg(feature = "std")`
+    // ensures the runtime check is always live when the test compiles.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[test]
+    fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
+        // Only run when BMI2 actually available — otherwise constructing
+        // Avx2Kernel via dispatch wouldn't happen.
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        for n in 0..=64u8 {
+            let v = 0x1234_5678_9ABC_DEF0u64;
+            assert_eq!(
+                Avx2Kernel::mask_lower_bits(v, n),
+                ScalarKernel::mask_lower_bits(v, n),
+                "mismatch at n={}",
+                n
+            );
+        }
+    }
+
+    /// Regression: a CPU advertising AVX-512 VBMI2 but NOT AVX2 (the
+    /// AMD64 baseline allows this combination at the spec level) was
+    /// previously selected as `Vbmi2`, which would SIGILL on the
+    /// first AVX2-mixed VBMI2 kernel invocation. The selection must
+    /// fall through to Scalar (or a non-AVX tier) in that case.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
+        let tag = select_x86_kernel(
+            /* avx512vbmi2 */ true, /* avx512f */ true, /* avx512vl */ true,
+            /* avx512bw */ true, /* bmi2 */ true, /* avx2 */ false,
+        );
+        assert_ne!(
+            tag,
+            CpuKernelTag::Vbmi2,
+            "selecting Vbmi2 without AVX2 would call AVX2 instructions and SIGILL"
+        );
+    }
+
+    /// Sanity: when every flag is present the selector returns Vbmi2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
+        let tag = select_x86_kernel(true, true, true, true, true, true);
+        assert_eq!(tag, CpuKernelTag::Vbmi2);
+    }
+
+    /// Sanity: AVX2 + BMI2 without AVX-512 → Avx2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_avx2_baseline_picks_avx2() {
+        let tag = select_x86_kernel(false, false, false, false, true, true);
+        assert_eq!(tag, CpuKernelTag::Avx2);
+    }
+
+    #[test]
+    fn detect_returns_consistent_tag() {
+        let first = detect_cpu_kernel();
+        let second = detect_cpu_kernel();
+        assert_eq!(
+            first, second,
+            "cached detect must return same tag on repeated calls"
+        );
+    }
+}

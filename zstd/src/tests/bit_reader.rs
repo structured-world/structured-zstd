@@ -9,7 +9,7 @@ fn test_bitreader_reversed() {
     //just the u128 in encoded
     let num_rev: u128 = 0x48_D5_2C_F7_BC_D4_79_42_96_C8_EC_00_00_08_41_C1;
 
-    let mut br = BitReaderReversed::new(&encoded[..]);
+    let mut br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&encoded[..]);
     let mut accumulator = 0;
     let mut bits_read = 0;
     let mut x = 0;
