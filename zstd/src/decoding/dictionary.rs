@@ -124,18 +124,27 @@ impl Dictionary {
             raw_tables,
             crate::decoding::sequence_section_decoder::OF_MAX_LOG,
         )?;
+        new_dict.fse.offsets.enrich_for_offsets();
         let raw_tables = &raw_tables[of_size..];
 
         let ml_size = new_dict.fse.match_lengths.build_decoder(
             raw_tables,
             crate::decoding::sequence_section_decoder::ML_MAX_LOG,
         )?;
+        new_dict
+            .fse
+            .match_lengths
+            .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::ML_META);
         let raw_tables = &raw_tables[ml_size..];
 
         let ll_size = new_dict.fse.literal_lengths.build_decoder(
             raw_tables,
             crate::decoding::sequence_section_decoder::LL_MAX_LOG,
         )?;
+        new_dict
+            .fse
+            .literal_lengths
+            .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::LL_META);
         let raw_tables = &raw_tables[ll_size..];
 
         if raw_tables.len() < OFFSET_HISTORY_LEN {
