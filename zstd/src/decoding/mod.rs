@@ -41,6 +41,7 @@ pub(crate) mod block_decoder;
 pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
+pub(crate) mod exec_sequence_donor;
 // FlatBuf is the compile-time-monomorphised "frame fits in window"
 // backend selected via `DecodeBuffer<FlatBuf>`. `FrameDecoder`'s
 // `DecoderScratchKind` picks it when the frame header has

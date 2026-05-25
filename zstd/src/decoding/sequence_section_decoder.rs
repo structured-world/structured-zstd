@@ -503,11 +503,60 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
     let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
     *lit_cur = high;
-    buffer.push(lits);
 
     if resolved_offset == 0 {
         return Err(ExecuteSequencesError::ZeroOffset.into());
     }
+
+    // Donor-shape inline dispatch — when the backend opts in (only
+    // `UserSliceBackend` on x86/x86_64 today, per its
+    // `SUPPORTS_INLINE_DONOR_EXEC = true` const) we collapse the
+    // literal copy + match copy into a single straight-line body
+    // that mirrors donor `ZSTD_execSequence`
+    // (zstd_decompress_block.c:1008-1105). The const branch is
+    // compile-time per backend monomorphisation, so the dead arm
+    // carries no runtime cost on either side.
+    if B::SUPPORTS_INLINE_DONOR_EXEC {
+        // Validate match-copy offset against the live region
+        // (matches `repeat()`'s `offset > buffer.len()` → dict path
+        // gate). Donor inline path stays on the prefix-resident
+        // case; offsets that step into dict / extDict territory fall
+        // back to the layered path below.
+        let buf_len = buffer.len();
+        let offset = resolved_offset as usize;
+        if offset > buf_len + lits.len() {
+            // Match source reaches outside what's been written in this
+            // frame — donor's `extDict` arm. Punt back to the slow
+            // `repeat()` path; that path already routes through
+            // `repeat_from_dict` for these offsets.
+            buffer.push(lits);
+            buffer
+                .repeat_lookahead_prefetched(offset, seq.ml as usize)
+                .map_err(ExecuteSequencesError::from)?;
+            return Ok(());
+        }
+        // SAFETY: backend opted in (compile-time const), `lits` is a
+        // non-aliased slice of the literal block, `offset` is within
+        // the live region (prefix-resident, asserted above),
+        // `match_length >= 1` is enforced by the
+        // `resolved_offset == 0` check above (offset > 0 implies
+        // match exists; degenerate `ml = 0` is benign — donor copies
+        // zero bytes through the wildcopy's `do/while` body once).
+        // Caller's upfront `reserve(MAX_BLOCK_SIZE)` guarantees the
+        // writable tail has room for `lit_length + match_length`
+        // plus the wildcopy overshoot slack
+        // (`WILDCOPY_OVERLENGTH = 32`).
+        unsafe {
+            buffer
+                .buffer_mut()
+                .donor_exec_one_sequence(lits, offset, seq.ml as usize);
+        }
+        buffer.advance_output_counter(lits.len() + seq.ml as usize);
+        return Ok(());
+    }
+
+    // Fallback: the legacy push + repeat chain.
+    buffer.push(lits);
     buffer
         .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;

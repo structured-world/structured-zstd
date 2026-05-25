@@ -143,6 +143,91 @@ impl<'a> UserSliceBackend<'a> {
 }
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
+    /// Donor-shape inline `ZSTD_execSequence` is available on x86 /
+    /// x86_64 where the SSE2 baseline gives us 16-byte SIMD store/load
+    /// for free. On other arches (aarch64 NEON, riscv, etc.) the
+    /// dispatch site falls back to the existing `extend` + `repeat`
+    /// chain — those paths already emit the architecture's
+    /// best-available SIMD via `copy_bytes_overshooting`'s runtime
+    /// detect.
+    const SUPPORTS_INLINE_DONOR_EXEC: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+
+    /// Donor `ZSTD_execSequence` body — see trait doc for
+    /// preconditions / contract.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn donor_exec_one_sequence(&mut self, lits: &[u8], offset: usize, match_length: usize) {
+        use super::exec_sequence_donor::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        let lit_length = lits.len();
+        let total = lit_length + match_length;
+        let new_tail = self.tail + total;
+        // Release-mode capacity assert — covers the literal+match
+        // copies together. The wildcopy bodies overshoot up to 15
+        // bytes past `tail + total`; the caller-side
+        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice
+        // accommodates that.
+        assert!(
+            new_tail <= self.slice.len(),
+            "UserSliceBackend::donor_exec_one_sequence overflows slice \
+             (tail+={}, cap={}) — corrupt frame",
+            total,
+            self.slice.len()
+        );
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        debug_assert!(
+            offset <= self.tail + lit_length,
+            "donor_exec_one_sequence: offset ({}) exceeds output start \
+             ({} + lit {} = {})",
+            offset,
+            self.tail,
+            lit_length,
+            self.tail + lit_length
+        );
+
+        // SAFETY: capacity asserted above; pointer arithmetic stays
+        // within `self.slice` for the writes (tail + total <=
+        // slice.len()) and reads (match src = tail + lit_length -
+        // offset, bounded by `offset <= tail + lit_length`).
+        unsafe {
+            let base_mut = self.slice.as_mut_ptr();
+            let lit_src = lits.as_ptr();
+
+            // ── Literal copy ──
+            // Donor: ZSTD_copy16(op, *litPtr); if (litLength > 16)
+            //         wildcopy(op+16, *litPtr+16, litLength-16, no_overlap)
+            //
+            // The unconditional first copy16 may overshoot up to 15
+            // bytes past `op + lit_length` into the match-destination
+            // region — those bytes are about to be overwritten by the
+            // match copy below, so the overshoot is harmless.
+            let op_lit = base_mut.add(self.tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            // ── Match copy ──
+            // Donor uses `oLitEnd = op + litLength` as the match
+            // destination; the match source is `oLitEnd - offset`.
+            let op_match = base_mut.add(self.tail + lit_length);
+            let match_src = base_mut.cast_const().add(self.tail + lit_length - offset);
+
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                // overlap_copy8 + wildcopy(overlap) tail.
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+        }
+        self.tail = new_tail;
+    }
+
     /// `new()` exists for trait conformance but is not used on the
     /// direct-decode path — the slice is always provided up-front via
     /// [`Self::from_slice`]. Returns an empty backend wrapping an

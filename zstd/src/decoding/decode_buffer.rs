@@ -162,6 +162,48 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve(amount);
     }
 
+    /// Mutable backend handle — paired with
+    /// [`Self::advance_output_counter`] so the donor-shape inline
+    /// sequence executor can write straight into the backend's
+    /// physical storage and then update the buffer-level counters.
+    /// Crate-internal; gated to the
+    /// `BufferBackend::SUPPORTS_INLINE_DONOR_EXEC = true` dispatch
+    /// site.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn buffer_mut(&mut self) -> &mut B {
+        &mut self.buffer
+    }
+
+    /// Advance the output counter (and frame hash if enabled) by `n`
+    /// bytes — pair with [`super::buffer_backend::BufferBackend::donor_exec_one_sequence`]
+    /// which writes the actual bytes through the backend without
+    /// touching DecodeBuffer-level bookkeeping. Without this helper
+    /// the donor-shape path would leave `total_output_counter` and
+    /// the frame-content hash stale on every sequence executed
+    /// through it.
+    ///
+    /// Hash bytes are read straight off the backend tail prior to
+    /// advancing; the caller has just written `n` bytes ending at
+    /// the current tail position.
+    #[inline]
+    #[allow(dead_code)] // wired in once donor path lands in pipelined executor
+    pub(crate) fn advance_output_counter(&mut self, n: usize) {
+        self.total_output_counter += n as u64;
+        #[cfg(feature = "hash")]
+        {
+            // Read the just-written tail bytes via the backend's
+            // slice view. Donor-path callers always operate on
+            // contiguous slack (UserSliceBackend / FlatBuf both),
+            // so the live region is one slice; `as_slices().0` is
+            // the prefix that covers everything up to the current
+            // tail. Take the last `n` bytes of that prefix.
+            let (front, _) = self.buffer.as_slices();
+            let lo = front.len().saturating_sub(n);
+            self.hash.write(&front[lo..]);
+        }
+    }
+
     /// Fill `fill_length` bytes of the output with the literal `fill_with`,
     /// advancing the ringbuffer cursor in place. Used by the RLE block path
     /// (upstream commit `fbc1f2ca`) so the decoder doesn't need a stack

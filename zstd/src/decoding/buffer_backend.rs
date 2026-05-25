@@ -46,6 +46,57 @@ pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 /// semantics match what `RingBuffer` already provides; `FlatBuf`'s
 /// impl is the no-wrap shape of the same contract.
 pub(crate) trait BufferBackend: Sized {
+    /// `true` when the backend can execute a single sequence via the
+    /// donor-shape inline `donor_exec_one_sequence` path (literal
+    /// copy + match copy in one straight-line body, no per-call
+    /// dispatch through `extend` / `repeat`). Defaults to `false`;
+    /// `UserSliceBackend` overrides to `true` on x86/x86_64 targets.
+    ///
+    /// Reads of this const at the dispatch site fold to a compile-time
+    /// branch the optimiser dead-eliminates — the unused arm
+    /// (donor body on `FlatBuf` / `RingBuffer`, existing
+    /// `push`/`repeat` body on `UserSliceBackend`) carries no runtime
+    /// cost.
+    const SUPPORTS_INLINE_DONOR_EXEC: bool = false;
+
+    /// Donor's `ZSTD_execSequence` body
+    /// (zstd_decompress_block.c:1008-1105). Writes `lits.len()` bytes
+    /// from `lits` at the current tail, then writes `match_length`
+    /// bytes via the donor offset-dispatch (offset ≥ 16 → wildcopy
+    /// no-overlap; offset 1..=15 → overlapCopy8 + wildcopy
+    /// overlap-src-before-dst).
+    ///
+    /// Default impl is `unreachable!`; the dispatch site only routes
+    /// here when [`Self::SUPPORTS_INLINE_DONOR_EXEC`] is `true`,
+    /// which is fixed at compile time per backend type. The
+    /// `unreachable!` body costs nothing on backends that gate it
+    /// out (the compiler removes the call entirely).
+    ///
+    /// # Safety
+    /// - `lits.len() + match_length` must fit in the writable tail
+    ///   slack (caller's upfront `reserve(MAX_BLOCK_SIZE)` covers
+    ///   the regular case; for direct decode the slice's
+    ///   `WILDCOPY_OVERLENGTH` slack covers the wildcopy overshoot).
+    /// - `offset >= 1` and `offset <= self.len() + lits.len()`
+    ///   (donor's `oLitEnd - offset` precondition).
+    /// - `match_length >= 1`.
+    /// - Caller is responsible for updating any DecodeBuffer-level
+    ///   counters (`total_output_counter`, hash) that mirror the
+    ///   bytes this method writes — see
+    ///   `decode_buffer::DecodeBuffer::advance_output_counter`.
+    #[allow(unused_variables, unused_mut)]
+    #[inline(always)]
+    unsafe fn donor_exec_one_sequence(&mut self, lits: &[u8], offset: usize, match_length: usize) {
+        // Default body is statically unreachable when the dispatch
+        // site honours `SUPPORTS_INLINE_DONOR_EXEC`. Backends that
+        // return `false` from that const never see this call resolved
+        // — the optimiser dead-eliminates the calling branch in the
+        // monomorphised caller.
+        unreachable!(
+            "donor_exec_one_sequence called on backend whose SUPPORTS_INLINE_DONOR_EXEC is false"
+        );
+    }
+
     /// Construct an empty backend. Backend-specific sizing is done
     /// via `with_capacity` constructors on the concrete types (see
     /// [`super::flat_buf::FlatBuf::with_capacity`]).
