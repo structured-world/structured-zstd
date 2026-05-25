@@ -1533,7 +1533,7 @@ impl FrameDecoder {
                 // for the residual paths to keep the public surface
                 // panic-free.
                 Err(crate::decoding::errors::DecodeBlockContentError::BackendOverflow {
-                    step: _,
+                    ..
                 }) => {
                     // Use saturating_add — this arm is reached when the
                     // block content exceeded the backend's capacity, i.e.

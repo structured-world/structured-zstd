@@ -125,12 +125,14 @@ pub(crate) trait BufferBackend: Sized {
     //
     // Parallel `try_*` methods that return `Err(BackendOverflow)`
     // instead of panicking when the write would exceed the backend's
-    // capacity. Used by the direct-decode path
-    // (`decode_to_slice_trusted` + descendants) so a malformed
-    // Compressed block whose decompressed payload exceeds the
-    // caller-provided output slice surfaces as a structured
-    // `FrameDecoderError::FrameContentSizeMismatch` instead of an
-    // abort.
+    // capacity. Currently wired on Raw and RLE block paths only;
+    // Compressed-block sequence execution still uses the panic-on-
+    // overflow unchecked writes and will be migrated in a follow-up.
+    // Used by the direct-decode path (`decode_to_slice_trusted` +
+    // descendants) so a malformed Raw/RLE block whose declared
+    // decompressed payload exceeds the caller-provided output slice
+    // surfaces as a structured `FrameDecoderError::FrameContentSizeMismatch`
+    // instead of an abort.
     //
     // The growable backends (`FlatBuf`, `RingBuffer`) rely on the
     // default impls below — they delegate to the corresponding
@@ -174,9 +176,15 @@ pub(crate) trait BufferBackend: Sized {
     }
 
     /// Fallible variant of [`Self::extend_from_within_unchecked`].
-    /// Validates `start + len <= self.len()` AND `tail + len <= cap`
-    /// before calling the unsafe write. On `Err` the backend state
-    /// is untouched.
+    /// Validates `start + len <= self.len()` (source bound) and then
+    /// `reserve(len)` to grow capacity for the write. The default
+    /// impl deliberately omits a linear `tail + len <= cap` check
+    /// because `RingBuffer::tail` is a modular wrap-index where
+    /// `tail + len > cap` is normal mid-stream (the write straddles
+    /// the wrap point). Fixed-capacity backends (`UserSliceBackend`)
+    /// override with an explicit linear capacity check that DOES
+    /// validate `tail + len <= cap`. On `Err` the backend state is
+    /// untouched.
     ///
     /// Unlike the unsafe variant, this is a SAFE entry point: the
     /// bounds check moves into the method, so callers don't need to

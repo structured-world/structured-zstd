@@ -199,9 +199,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// Fallible variant of [`Self::push`]. Returns `Err(BackendOverflow)`
     /// when the underlying backend's `try_extend` rejects the write
     /// (only possible on fixed-capacity backends like
-    /// `UserSliceBackend`). Used by the direct-decode path so a
-    /// malformed Compressed block whose payload exceeds the user's
-    /// output slice surfaces as a structured error.
+    /// `UserSliceBackend`). Used by the Raw block fast path on the
+    /// direct-decode pipeline so a malformed Raw block whose declared
+    /// `Block_Size` exceeds the caller's output slice surfaces as a
+    /// structured error instead of panicking. Compressed-block
+    /// sequence execution is a follow-up.
     #[inline]
     pub fn try_push(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
         self.buffer.try_extend(data)?;

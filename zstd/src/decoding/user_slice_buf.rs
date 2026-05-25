@@ -407,7 +407,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let new_tail =
             self.tail
                 .checked_add(len)
-                .ok_or(super::buffer_backend::BackendOverflow {
+                .ok_or_else(|| super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
@@ -444,7 +444,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // adversarial `fill_length` near `usize::MAX` would wrap
         // `new_tail`, bypass the upper bound, and panic in
         // `slice[tail..new_tail]` (start > end).
-        let new_tail = self.tail.checked_add(fill_length).ok_or({
+        let new_tail = self.tail.checked_add(fill_length).ok_or_else(|| {
             super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: fill_length,
@@ -478,18 +478,19 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let abs_start =
             self.head
                 .checked_add(start)
-                .ok_or(super::buffer_backend::BackendOverflow {
+                .ok_or_else(|| super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
                 })?;
-        let abs_end = abs_start
-            .checked_add(len)
-            .ok_or(super::buffer_backend::BackendOverflow {
-                tail: self.tail,
-                requested: len,
-                capacity: self.slice.len(),
-            })?;
+        let abs_end =
+            abs_start
+                .checked_add(len)
+                .ok_or_else(|| super::buffer_backend::BackendOverflow {
+                    tail: self.tail,
+                    requested: len,
+                    capacity: self.slice.len(),
+                })?;
         if abs_end > self.tail {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
@@ -504,7 +505,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let new_tail =
             self.tail
                 .checked_add(len)
-                .ok_or(super::buffer_backend::BackendOverflow {
+                .ok_or_else(|| super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
                     capacity: self.slice.len(),
@@ -632,14 +633,10 @@ mod tests {
         assert_eq!(b.tail(), 0);
     }
 
-    // Coverage for the fallible try_* surface added in PR #251.
-    // Exercises:
+    // Coverage for the fallible try_* surface. Exercises:
     //   - happy paths (exact-fit + room to spare),
     //   - capacity-overflow paths (returns Err with diagnostic fields),
-    //   - integer-overflow wrap-guards (checked_add ok_or branch).
-    // Without these the codecov patch report stays in the 30 % band
-    // for the new error paths; the asserts here let it cross the
-    // 85 % threshold for the introduced lines.
+    //   - integer-overflow wrap-guards (checked_add ok_or_else branch).
 
     use super::super::buffer_backend::BufferBackend;
 
