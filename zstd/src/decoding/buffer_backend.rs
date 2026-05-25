@@ -21,13 +21,23 @@ use crate::io::{Error, Read};
 
 /// Trailing-slack count both backends pad their physical allocation
 /// with so SIMD wildcopy reads / writes can overshoot the live region
-/// without leaving the allocation. Matches donor zstd's
-/// `WILDCOPY_OVERLENGTH` (16 bytes = the largest single chunk
-/// `simd_copy::copy_bytes_overshooting` writes when its single-op
-/// fast path fires on copies ≤ 16 bytes). Both `RingBuffer` and
-/// `FlatBuf` reuse this single constant so the slack contract
-/// cannot drift between backends.
-pub(crate) const WILDCOPY_OVERLENGTH: usize = 16;
+/// without leaving the allocation. Sized at **32 bytes** so the AVX2
+/// chunked kernel in `simd_copy::copy_bytes_overshooting` (32-byte
+/// stride via `_mm256_storeu_si256` on x86-64) can fire on tail copies.
+/// The kernel gates on `min_buffer_size >= rounded(copy_at_least, 32)`;
+/// at the end of a fixed-capacity output buffer that gate fails when
+/// slack is < 32, and the dispatch falls through to whatever
+/// `ptr::copy_nonoverlapping` lowers to on the target — a
+/// platform-specific `memcpy`-like primitive (the source/dest regions
+/// are non-overlapping by the caller's contract, so memcpy semantics
+/// apply; the exact symbol the linker resolves is libc-specific and
+/// not part of any guaranteed contract). Bumping slack from 16 → 32
+/// keeps the AVX2 path live across every match-copy and literal-push,
+/// avoiding the libc detour.
+///
+/// Both `RingBuffer` and `FlatBuf` reuse this single constant so the
+/// slack contract cannot drift between backends.
+pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 
 /// Storage operations the decoder needs from its output buffer.
 ///
