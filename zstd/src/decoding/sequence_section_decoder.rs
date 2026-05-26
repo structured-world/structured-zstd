@@ -517,11 +517,18 @@ fn decode_and_execute_sequences_impl<
             // literal pushes / partial inline writes from the
             // failing sequence — try_restore_checkpoint handles
             // both cases via the captured tail snapshot.
-            if buffer.try_restore_checkpoint(buffer_checkpoint) {
-                // offset_hist intentionally NOT touched here: it
-                // still holds the pre-loop value because shadow_hist
-                // received all the in-band mutations.
-            }
+            //
+            // offset_hist intentionally NOT touched here regardless
+            // of the rollback outcome: it still holds the pre-loop
+            // value because shadow_hist absorbed all the in-band
+            // mutations. The bool return from `try_restore_checkpoint`
+            // is therefore irrelevant on this path — `false` means
+            // an intervening reallocation invalidated the captured
+            // tail, in which case the frame is already corrupted and
+            // the caller surfaces the original `Err` below. We drop
+            // the return value via `let _` to make the
+            // intentional-discard explicit.
+            let _ = buffer.try_restore_checkpoint(buffer_checkpoint);
             return Err(e);
         }
         *offset_hist = shadow_hist;
