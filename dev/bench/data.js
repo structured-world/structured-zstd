@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779740445425,
+  "lastUpdate": 1779807375105,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -47649,6 +47649,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust_direct",
             "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ac5f5fa4282e125c4e8e68ba2a6a51631586a8c9",
+          "message": "perf(decode): inline sequence executor for direct path + auto-route decode_all (z000033 −24%, high-entropy-1m parity) (#263)\n\n* perf(decode): donor ZSTD_execSequence inline port for UserSliceBackend\n\n* fix(decode): donor exec port — x86_64-only gate, lit-source 16B slack guard, explicit overshoot assert\n\n* fix(decode): tighten donor exec port — full-tail lit slack, overlap_copy8 net offset, doc accuracy, hash assert\n\n* fix(decode): checkpoint snapshots frame hash + document literal-read slack contract\n\n* fix(decode): donor gate covers ll==0 over-read; checkpoint doc lists actual hash sites\n\n* fix(decode): donor gate skips high+15 check for lit_length<=16 (wildcopy not called)\n\n* fix(decode): drop redundant incremental hash (final pass overwrites); tighten donor exec docs\n\n* perf(decode): Tier 9 K-cascade + target_feature trampolines (z000033 −8.19%, low-entropy-1m −7.05%) (#267)\n\n* perf(decode): K-cascade through decode_and_execute_sequences (Tier 9)\n\n* perf(decode): wrap BMI2/AVX2/VBMI2 dispatch arms with target_feature trampolines\n\n* fix(decode): checked_add overflow guards on donor inline gates; tighten kernel-cascade docstring\n\n* perf(decode): route decode_all → direct path for eligible frames\n\ndecode_all_impl now dispatches per-frame: when the just-init'd frame\nhas FCS > 0, no active dict, and the remaining output slice carries\nFCS + WILDCOPY_OVERLENGTH slack, the body decodes straight into the\nuser slice via the same UserSliceBackend + run_direct_decode helper\nthat decode_to_slice_trusted uses. Ineligible frames (no FCS, active\ndict, output too small for slack) fall through to the existing\nper-block decode + read drain loop unchanged.\n\nThe direct-path body is extracted from decode_to_slice_trusted into a\nprivate run_direct_decode method so both entry points share it. The\nsingle-frame legacy fallback also moves into its own helper\n(decode_single_frame_legacy_drain) for clarity.\n\nEffect: callers using the public decode_all API on\nstandard-CLI-produced frames (FCS present, single-segment, no dict)\nnow get the 20-35% throughput gain previously available only through\nthe trusted decode_to_slice_trusted entry point. Streaming, dict, and\nmulti-segment-without-slack consumers transparently keep the legacy\nchain.\n\nRegression tests:\n- decode_all_routes_eligible_frame_through_direct_path\n- decode_all_with_tight_output_routes_through_legacy_drain\n\n* docs(decode): note decode_all also routes through UserSliceBackend direct path\n\nAfter the per-frame direct-path dispatch in decode_all_impl, the\n`UserSliceBackend` module-level doc must reflect that both public\nentry points (`decode_to_slice_trusted` and `decode_all`) can land\non this backend for eligible frames. Updates the module preamble to\ncross-reference both, and clarifies that ineligible frames in a\n`decode_all` stream transparently fall through to the legacy\nblock-decode + read drain loop.\n\n* fix(decode): keep decode_all on safe legacy drain path\n\nCodeRabbit caught a safety regression in 2df3d2ed: routing the public\ndecode_all() through run_direct_decode() + UserSliceBackend exposed\nits release-mode assert! capacity checks on the safe API surface.\nMalformed eligible frames would panic mid-block instead of returning\nErr(FrameDecoderError::...), breaking the documented contract.\n\nReverts the per-frame direct-path dispatch added to decode_all_impl\nand drops the related doc cross-reference in user_slice_buf.rs.\nDirect-path routing for safe APIs stays gated behind the fallible\nBufferBackend refactor tracked as issue #246; until that lands,\nonly the _trusted-suffixed decode_to_slice_trusted entry point can\nopt into the panic-on-malformed UserSliceBackend.\n\nThe run_direct_decode helper extraction itself stays — it's a\nprivate cosmetic refactor that doesn't change behaviour, and\nkeeping it makes the dispatch point a single function call instead\nof inline at decode_to_slice_trusted.\n\nThe decode_all routing regression tests are dropped since they\nasserted the now-removed behaviour. Existing\ndecode_to_slice_trusted_matches_decode_all_on_single_segment_frame\nalready cross-validates the two entry points produce identical\nbytes via their respective paths.\n\n* fix(decode): pass donor-exec lit source as raw pointer with full-buffer provenance\n\nCopilot caught Rust UB on the donor inline path: passing\n\\`lits: &[u8]\\` (a sub-slice of the literals buffer) into\n\\`donor_exec_one_sequence\\` and then calling\n\\`lit_src = lits.as_ptr()\\` gives a pointer whose provenance is\nbounded by the sub-slice's \\`len()\\`. The donor body's\nunconditional 16-byte \\`_mm_loadu_si128\\` over-reads past\n\\`lits.len()\\` when \\`lit_length < 16\\`, which is UB by Rust's\nprovenance rules even if the underlying allocation has slack.\n\nChange the trait method signature from\n\\`donor_exec_one_sequence(&mut self, lits: &[u8], offset, ml)\\`\nto\n\\`donor_exec_one_sequence(&mut self, lit_src: *const u8, lit_length,\noffset, ml)\\`. Caller now derives \\`lit_src\\` as\n\\`literals.as_ptr().add(lit_cur_before)\\` — that pointer carries\nthe FULL parent literals buffer's provenance, so the 16-byte\nover-read stays in-bounds (gated by the existing\n\\`lit_cur_before + 16 <= lit_len\\` check in\n\\`execute_one_sequence_pipelined\\`).\n\nTrait safety docs updated to make the parent-buffer-provenance\nrequirement explicit. Assert diagnostic in\n\\`UserSliceBackend::donor_exec_one_sequence\\` reworded to print\n\\`tail\\`, \\`total\\`, and the resulting \\`cap_required\\` so the\narithmetic in the message matches what's being checked\n(Copilot #27).\n\nCloses Copilot threads #26, #27, #28 on PR #263.\n\n* fix(decode): validate per-frame FCS in decode_all_impl\n\nCodeRabbit outside-diff finding: decode_all_impl never checked that\nthe bytes drained for each frame matched the declared\nframe_content_size. A corrupt under-producing frame (last_block flag\ntripped early on a sub-FCS payload) would silently return\nOk(short_len), even though decode_single_frame_legacy_drain catches\nthe same shape via FrameContentSizeMismatch.\n\nTrack per-frame produced bytes via frame_start_total and check\nagainst the declared FCS after the inner block-drain loop exits.\nGate on fcs_declared() (not content_size > 0) so an empty frame\nwith explicit FCS=0 on the wire still gets validated.\n\n* test(decode): add donor SIMD-helper unit tests to lift PR #263 patch coverage\n\nCodecov flagged patch coverage at 38.87% — exec_sequence_donor.rs\nshows 0% even though the end-to-end decode_to_slice_trusted tests\nexercise the donor body. `#[inline(always)]` SIMD helpers don't\nalways get attributed to the calling site under `cargo llvm-cov`.\n\nAdd direct unit tests for each public(crate) primitive:\n- copy16: 16-byte SSE2 store\n- wildcopy_no_overlap: short length (1) + length > 16 (multiple iters)\n- wildcopy_overlap_8byte_stride: 8-byte stride RLE expansion (offset 8)\n- overlap_copy8: both offset >= 8 (plain copy8) and offset < 8 (spread)\n\nTests gated `#[cfg(all(test, target_arch = \"x86_64\"))]` so the\nnon-x86_64 build stays clean — the module itself is x86_64-only by\nthe same gate.\n\n* test(decode): add direct unit tests for UserSliceBackend::donor_exec_one_sequence\n\nCodecov still showed 0% on user_slice_buf.rs's donor body (40 lines)\nafter the prior helper-primitive tests. The inline-always body is\nreached only through the full FrameDecoder pipeline, which llvm-cov\ndoes not always attribute to the inlined call site.\n\nAdd three direct tests covering the three donor execution shapes:\n- short_literal_plus_long_offset_match: lit_len <= 16, offset >= 16\n  (wildcopy_no_overlap match path)\n- long_literal_uses_wildcopy_tail: lit_len > 16 (literal wildcopy\n  tail fires)\n- short_offset_match_uses_overlap_copy: offset < 16 (overlapCopy8 +\n  wildcopy_overlap_8byte_stride path, including RLE expansion)\n\nAll gated `#[cfg(target_arch = \"x86_64\")]` since the method\nitself only compiles on that arch.\n\n* fix(decode): tighten donor inline path gates per Copilot review\n\nThree Copilot review threads in one fix:\n\n#29 (user_slice_buf.rs:214) — `donor_exec_one_sequence`'s offset\ndebug_assert checked against `self.tail + lit_length` but the\ntrait contract specifies `self.len() + lit_length` (= live window\n`tail - head`). On multi-segment frames `head > 0` and asserting\nagainst raw tail would mask offsets reaching past the window\nboundary into dropped history. Switch to `live_len = tail - head`.\n\n#30 (sequence_section_decoder.rs:763) — literal-source slack gate\n`high + 15 <= lit_len` over-counted by up to 15 bytes whenever\n`seq.ll % 16 != 1`. The wildcopy tail's actual maximum read is\n`lit_cur_before + seq.ll.next_multiple_of(16) - 1`. Use the tight\nbound — keeps the donor inline path active on more sequences near\nthe end of the literals buffer (~15 byte gain per seq.ll that's a\nmultiple of 16).\n\nLint fix (bench_internals profile): the new\n`donor_exec_one_sequence` unit tests use `Vec<u8>`, which needs\nan explicit `use alloc::vec::Vec` import alongside the existing\n`use alloc::vec` macro import. Gated on\n`#[cfg(target_arch = \"x86_64\")]` to match the tests.\n\n* fix(decode): silence needless_range_loop in donor_exec unit tests\n\nCI lint (bench_internals profile, clippy 1.95) flagged the two\n`for i in 0..32` history-seed loops in the new\n`donor_exec_one_sequence` tests. Local clippy on aarch64 didn't\ntrigger because the tests are `#[cfg(target_arch = \"x86_64\")]`\nand that arch isn't built locally.\n\nSwitch to `buf.iter_mut().take(32).enumerate()` per the suggested\nform.\n\n* fix(decode): correct overlap-copy test assertion + update donor safety doc\n\nTwo fixes in one commit:\n\n1. CI test failure: `donor_exec_one_sequence_short_offset_match_uses_overlap_copy`\n   panicked because the assertion expected match-output bytes to be\n   in the seed set [0xC0..=0xC7]. The actual donor invariant is that\n   the literal `copy16` may overshoot up to 15 bytes past\n   `lit_length` into the match-destination region. With\n   `lit_length=4`, the literal `copy16` writes 16 bytes (0xFF x 16)\n   at base+32..48. The subsequent match copy (offset=8) then reads\n   from base+28..36, which mixes seed-tail bytes (28..32 unchanged)\n   with literal-overshoot bytes (32..36 = 0xFF). The wildcopy\n   8-byte-stride tail propagates that mix into 40..48.\n\n   Tighten the test to only assert the structural guarantees the\n   donor body actually provides: tail advancement, literal payload\n   landing at 32..36, and the first 4 match bytes (36..40) matching\n   the unaffected seed tail (28..32). Drop the over-strict\n   \"all bytes from seed set\" check on the remaining match output.\n\n2. Copilot thread #31 (buffer_backend.rs:118): trait safety docs\n   still mentioned the old `high + 15 <= lit_len` slack bound after\n   the gate was tightened to `lit_cur_before +\n   lit_length.next_multiple_of(16) <= lit_len` in 71733480. Update\n   the docs to describe the actual enforced condition + reference\n   the `next_multiple_of(16)` max-read formula explicitly.\n\n* refactor(decode): unify decode paths via fallible donor exec\n\nMake UserSliceBackend::donor_exec_one_sequence return\nResult<(), ExecuteSequencesError> instead of panicking on capacity\noverflow (new variant: DonorPathBufferOverflow). The error\npropagates through the sequence executor + block decoder as\nFrameDecoderError, so safe public decode APIs no longer panic on\nmalformed frames.\n\nWith the safety regression addressed, route the public decode_all\nthrough the direct (UserSliceBackend) path automatically whenever\nthe per-frame eligibility gate passes (FCS > 0, no active dict,\nremaining output has WILDCOPY_OVERLENGTH slack). Ineligible frames\nkeep falling through to the per-block decode + read drain loop.\n\ndecode_all_to_vec reserves WILDCOPY_OVERLENGTH extra capacity on\ntop of the caller's vec so the auto-routed decode_all lands on the\ndirect path without the caller having to know about the slack.\nThe slack is internal — the returned vec.len() stays at the actual\ndecompressed size.\n\nDrop the now-redundant public decode_to_slice_trusted (and its\nprivate decode_single_frame_legacy_drain helper) — decode_all's\ninternal dispatch produces identical output via the same\nrun_direct_decode helper. All call sites in tests migrate to\ndecode_all; the bench's pure_rust arm now allocates the target\nwith WILDCOPY_OVERLENGTH slack so it exercises the direct path\n(making the previous pure_rust_direct arm redundant — removed).\n\n* docs(decode): fix misleading cross-validation comment in donor overlap-copy test\n\nCopilot caught that the comment claimed cross-validation against the\nlegacy chain but the test only invokes donor_exec_one_sequence once.\nRewrite the comment to describe what's actually asserted: tail\nadvancement, literal payload landing, and the first 4 match bytes\nmatching the un-overwritten source prefix. Point to the higher-level\nroundtrip_integrity tests for the actual end-to-end parity check.\n\n* fix(decode): handle Result from donor_exec_one_sequence in unit tests\n\nCI bench_internals clippy flagged 3 ignored Results after the donor\nsignature changed to Result<(), ExecuteSequencesError>. Append\n.unwrap() — the tests pass deterministically valid inputs where the\nerror variant is impossible. Also refresh the stale module-doc head\non user_slice_buf.rs that still pointed at the removed\ndecode_to_slice_trusted entry point.\n\n* refactor(decode): rename donor identifiers + fallible BufferBackend writes\n\nTwo convergent changes:\n\n1. Naming: drop \"donor\" from identifiers per the project rule\n   \"describe the value, not its origin\". Renames:\n     donor_exec_one_sequence        → exec_sequence_inline\n     exec_sequence_donor (module)   → exec_sequence_inline\n     SUPPORTS_INLINE_DONOR_EXEC     → SUPPORTS_INLINE_SEQUENCE_EXEC\n     donor_path_safe                → inline_path_safe\n     donor_helper_tests             → inline_helper_tests\n   Donor attribution stays in doc comments / commit messages\n   (citation belongs in prose, not identifier strings).\n\n2. Fallible writes on the legacy fallback path. The fallback path\n   (execute_one_sequence_pipelined: buffer.push + repeat) and the\n   match-execution path (repeat_inner: extend_from_within_unchecked)\n   still went through release-mode \\`assert!\\` on UserSliceBackend\n   overflow:\n   - sequence_section_decoder: buffer.push(lits) → buffer.try_push\n     with BackendOverflow → ExecuteSequencesError::OutputBufferOverflow\n     (renamed from the misleading DonorPathBufferOverflow).\n   - BufferBackend trait: new fallible \\`try_reserve(n)\\` method.\n     Default impl (growable backends: FlatBuf/RingBuffer) delegates\n     to \\`reserve()\\` infallibly. UserSliceBackend overrides with a\n     linear \\`tail + n <= cap\\` check returning BackendOverflow.\n   - decode_buffer::repeat_inner: \\`self.buffer.reserve(match_length)\\`\n     → \\`try_reserve\\` with the BackendOverflow → DecodeBufferError\n     ::OutputBufferOverflow conversion.\n\n   Malformed-frame corrupted sequences whose match length overshoots\n   the user's slice now surface as FrameDecoderError instead of a\n   panic — closing the safety contract on the safe public decode\n   APIs (\\`decode_all\\`, \\`decode_all_to_vec\\`).\n\nAlso clears stale \\`decode_to_slice_trusted\\` doc references across\nmodule preambles + test messages + checkpoint docs, and reworks the\n\\`decode_all_to_vec\\` docstring to reflect the WILDCOPY_OVERLENGTH\nauto-reserve.\n\n* fix(decode): plug remaining panic surfaces in legacy sequence executor\n\n1. usize overflow on 32-bit targets in execute_one_sequence and\n   execute_one_sequence_pipelined: lit_cur + seq.ll as usize\n   could wrap on adversarial input and the subsequent\n   get_unchecked(lit_cur..high) would slice OOB (UB). Both\n   sites now use checked_add(...).filter(|&h| h <= lit_len)\n   so wrap-on-overflow surfaces as\n   ExecuteSequencesError::NotEnoughBytesForSequence instead of\n   undefined behaviour.\n\n2. Tail-literals push in decode_and_execute_sequences_impl still\n   went through the infallible buffer.push(rest). Routes the\n   tail push through buffer.try_push so a malformed block whose\n   unclaimed tail-literal length overshoots the fixed-capacity\n   backend surfaces as ExecuteSequencesError::OutputBufferOverflow\n   instead of panicking via UserSliceBackend::extend's release-mode\n   assert.\n\n3. Stale doc references after the recent identifier renames:\n   - errors.rs DecodeBufferError::BackendOverflow rewritten to\n     describe the variant as kept for binary compatibility and\n     point at the richer OutputBufferOverflow for new code.\n   - user_slice_buf.rs UserSliceBackend::extend comment block\n     rewritten to reflect the new fallible dispatch\n     (try_extend / try_push / try_reserve cover the safe public\n     APIs).\n   - frame_decoder.rs test renamed\n     decode_all_matches_decode_all_on_single_segment_frame to\n     decode_all_legacy_drain_matches_direct_path_on_single_segment_frame\n     with a comment that describes the two distinct internal\n     paths the test exercises.\n\n* fix(decode): plug RLE-fallback panic surface + refresh fallible-write docs\n\n1. \\`execute_sequences_fields\\` (the RLE-mode sequence executor used\n   by the fused decoder's fallback when sequence-section decode hits\n   the RLE branch) still wrote literals through the infallible\n   \\`buffer.push(...)\\`. On a malformed RLE-driven sequence stream\n   whose literal claims overshoot the user's fixed-capacity slice\n   that would panic via the per-call \\`assert!\\` inside\n   \\`UserSliceBackend::extend\\`. Route both the per-sequence\n   literal push and the tail-literals push through \\`buffer.try_push\\`\n   so the overshoot surfaces as\n   \\`ExecuteSequencesError::OutputBufferOverflow\\` and bubbles up as\n   \\`FrameDecoderError\\` instead.\n\n2. \\`UserSliceBackend\\` module docs rewritten: the previous\n   \"DoS surface on malformed Compressed blocks\" section claimed the\n   direct path could panic and pointed at a tracked follow-up. With\n   the safety refactor landed in this PR (try_push / try_reserve /\n   exec_sequence_inline returning Result), the section now describes\n   the actual contract: safe public APIs route through the fallible\n   write surface and surface overshoot as\n   ExecuteSequencesError::OutputBufferOverflow /\n   DecodeBufferError::OutputBufferOverflow; the infallible entry\n   points remain as defense-in-depth for callers that have already\n   validated capacity at a higher layer.\n\n3. \\`BackendOverflow\\` doc updated: it previously claimed the\n   decoder converts \\`BackendOverflow\\` into\n   \\`FrameContentSizeMismatch\\` at the decode_all boundary. The\n   actual mapping is now \\`OutputBufferOverflow\\` (in\n   ExecuteSequencesError or DecodeBufferError) wrapped into\n   FrameDecoderError::FailedToReadBlockBody.\n\n* docs(decode): cross-ref RLE fallback to the fallible execute_sequences_fields contract\n\n* fix(decode): align OutputBufferOverflow.requested with logical write length\n\n1. \\`UserSliceBackend::exec_sequence_inline\\` reported \\`requested\\`\n   as \\`cap_required - tail\\`, which includes the +15-byte wildcopy\n   overshoot. Other overflow producers (\\`BackendOverflow\\` from\n   \\`try_*\\` paths) report the logical write length. Align: split\n   the capacity check into two stages — \\`total = lit_length +\n   match_length\\` is the logical value reported in\n   \\`OutputBufferOverflow.requested\\`; the overshoot stays in the\n   internal \\`cap_required\\` used only for the bounds check.\n\n2. \\`wildcopy_overlap_8byte_stride\\` doc comment said each iter\n   reads \\`src + off + 8\\`; actual access pattern is \\`src + off\\`\n   (8 bytes). Corrected to match the implementation.",
+          "timestamp": "2026-05-26T17:08:02+03:00",
+          "tree_id": "4eb935231d7e09f6b8e16e5b521c8c45c2c246ce",
+          "url": "https://github.com/structured-world/structured-zstd/commit/ac5f5fa4282e125c4e8e68ba2a6a51631586a8c9"
+        },
+        "date": 1779807368699,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.139,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 287.28,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 242.789,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.269,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.355,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.741,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.034,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 4.596,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.972,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.761,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.691,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.618,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.332,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.355,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.272,
             "unit": "ms"
           },
           {
