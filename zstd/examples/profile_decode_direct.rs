@@ -50,11 +50,11 @@ fn main() {
         std::hint::black_box(&target[..n]);
     }
     let elapsed = t0.elapsed();
+    // Compute per-iter time as f64 nanoseconds: `Duration / u32` would
+    // truncate `iters` on 64-bit platforms (and produce a divide-by-0
+    // panic when `iters % 2^32 == 0`).
+    let per_iter_ns = elapsed.as_nanos() as f64 / iters as f64;
     eprintln!(
-        "iters={} elapsed={:.3?} per_iter={:.3?} total_written={}",
-        iters,
-        elapsed,
-        elapsed / iters as u32,
-        written_total
+        "iters={iters} elapsed={elapsed:.3?} per_iter={per_iter_ns:.1}ns total_written={written_total}"
     );
 }

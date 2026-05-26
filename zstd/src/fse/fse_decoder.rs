@@ -413,7 +413,11 @@ impl FSETable {
         let table_size = 1u32 << acc_log;
         for &p in probs {
             if p < -1 || p > table_size as i32 {
-                return Err(FSETableError::InvalidProbability { value: p });
+                return Err(FSETableError::InvalidProbability {
+                    value: p,
+                    table_size,
+                    accuracy_log: acc_log,
+                });
             }
         }
         // Sum the validated probs in u32. Per-element validation
@@ -842,8 +846,11 @@ mod tests {
         let probs: [i32; 4] = [-2, 8, 4, 4];
         let result = t.build_from_probabilities(4, &probs);
         assert!(
-            matches!(result, Err(FSETableError::InvalidProbability { value: -2 })),
-            "expected InvalidProbability{{-2}}, got {result:?}",
+            matches!(
+                result,
+                Err(FSETableError::InvalidProbability { value: -2, .. })
+            ),
+            "expected InvalidProbability{{value: -2, ..}}, got {result:?}",
         );
     }
 

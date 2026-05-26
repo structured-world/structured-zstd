@@ -1398,11 +1398,13 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 //
 // The default distributions are static — the tables they produce
 // are byte-identical across calls. Pre-build once via OnceLock,
-// then `clone_from` the cached table into the per-frame scratch.
-// `Vec::clone_from` reuses the existing scratch allocation when the
+// then `reinit_from` the cached table into the per-frame scratch.
+// `reinit_from` reuses the existing `decode` Vec allocation when the
 // capacity already fits (it does, the scratch is re-used across
-// frames), so each call is a fixed-size memcpy plus a few scalar
-// field copies.
+// frames), copying only the `decode` entries + `accuracy_log` +
+// `symbol_probabilities` content. The build-only `symbol_spread_buffer`
+// is NOT copied — `reinit_from` only `reserve`s capacity for it —
+// shaving the spread-buffer memcpy that the prior `clone_from` did.
 //
 // Std-only because `OnceLock` lives in `std::sync` — there is no
 // `core::sync::OnceLock` (the only stable OnceLock-style API
