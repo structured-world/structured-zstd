@@ -39,35 +39,33 @@ impl<'t> FSEDecoder<'t> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
-        // Externally-constructible-table guard: when
-        // `feature = "fuzz_exports"` is on, `FSETable.decode` /
-        // `FSETable.accuracy_log` are settable from outside the crate,
-        // so a fuzz harness can hand the decoder a mis-shaped table
-        // that skips `build_decoding_table`'s invariants. Validate the
-        // table-shape invariant `decode.len() == 1 << accuracy_log`
-        // up-front and surface as a typed `InvalidTableShape` error
-        // (distinct from `TableIsUninitialized` to keep fuzz triage
-        // unambiguous) — without this, `read_entry`'s bounds-checked
-        // indexing under the same cfg would panic on a malformed
-        // table, which fuzz harnesses cannot distinguish from a
-        // legitimate decoder failure. `checked_shl` covers the
-        // pathological case where `accuracy_log >= usize::BITS`.
-        #[cfg(feature = "fuzz_exports")]
-        {
-            let accuracy_log = self.table.accuracy_log;
-            let decode_len = self.table.decode.len();
-            let expected = 1usize.checked_shl(accuracy_log.into()).ok_or(
-                FSEDecoderError::InvalidTableShape {
+        // Externally-constructible-table guard: `FSETable::decode`
+        // and `FSETable::accuracy_log` are `pub` fields, so safe
+        // external callers (not just `fuzz_exports` harnesses) can
+        // hand the decoder a table whose `decode.len()` doesn't match
+        // `1 << accuracy_log`. Validate the shape invariant up-front
+        // and surface as a typed `InvalidTableShape` error (distinct
+        // from `TableIsUninitialized` to keep error triage
+        // unambiguous) — without this, `read_entry`'s unchecked
+        // indexing (the `cfg(not(fuzz_exports))` arm) hits UB in
+        // release builds on a malformed table. `checked_shl` covers
+        // the pathological case where `accuracy_log >= usize::BITS`.
+        // Branch cost is a single per-call check; the per-sequence
+        // hot path (`update_state_fast`) is unaffected.
+        let accuracy_log = self.table.accuracy_log;
+        let decode_len = self.table.decode.len();
+        let expected =
+            1usize
+                .checked_shl(accuracy_log.into())
+                .ok_or(FSEDecoderError::InvalidTableShape {
                     decode_len,
                     accuracy_log,
-                },
-            )?;
-            if decode_len != expected {
-                return Err(FSEDecoderError::InvalidTableShape {
-                    decode_len,
-                    accuracy_log,
-                });
-            }
+                })?;
+        if decode_len != expected {
+            return Err(FSEDecoderError::InvalidTableShape {
+                decode_len,
+                accuracy_log,
+            });
         }
         let new_state = bits.get_bits(self.table.accuracy_log);
         // SAFETY: `accuracy_log` bits read from the bitstream produce
@@ -455,10 +453,23 @@ impl FSETable {
     /// path (success OR error) — otherwise an early `Err` from the
     /// inner pass would drop the taken buffer and force a fresh
     /// allocation on the next build.
+    ///
+    /// On `Err` the table is also fully `reset()` after the buffer
+    /// restore: the inner pass mutates `self.decode` (partial push)
+    /// while `self.accuracy_log` / `self.symbol_probabilities` were
+    /// already set by the caller (`build_from_probabilities`); leaving
+    /// that inconsistency in place would let a subsequent `init_state`
+    /// pass the `accuracy_log != 0` gate and read from a partial
+    /// `decode` vec — UB. After `reset()` the table is in the same
+    /// well-defined empty state a freshly-constructed `FSETable` has;
+    /// any subsequent `init_state` returns `TableIsUninitialized`.
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
         let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
         let result = self.build_decoding_table_inner(&mut spread);
         self.symbol_spread_buffer = spread;
+        if result.is_err() {
+            self.reset();
+        }
         result
     }
 

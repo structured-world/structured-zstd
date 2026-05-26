@@ -33,16 +33,34 @@ fn main() {
         .max(1);
 
     let compressed = fs::read(path).expect("read");
-    let mut target = vec![0u8; expected + WILDCOPY_OVERLENGTH];
+    // checked_add to reject adversarial `expected_size` inputs that
+    // would wrap `usize` when added to `WILDCOPY_OVERLENGTH`.
+    let target_len = expected
+        .checked_add(WILDCOPY_OVERLENGTH)
+        .expect("expected_size + WILDCOPY_OVERLENGTH overflows usize");
+    let mut target = vec![0u8; target_len];
     // Pre-touch pages so kernel zero-init isn't in the flamegraph.
     for slot in target.iter_mut().step_by(4096) {
         *slot = 0;
     }
 
     let mut decoder = FrameDecoder::new();
+    // First iteration validates that the user's `expected_size` matches
+    // the actual decoded length — otherwise the timed loop below would
+    // silently profile a different workload than the user intended.
+    let first = decoder
+        .decode_all(compressed.as_slice(), &mut target)
+        .expect("decode_all");
+    assert_eq!(
+        first, expected,
+        "decoded size mismatch: expected {expected}, got {first} \
+         (compressed blob does not decode to the size argument passed)",
+    );
+
     let t0 = std::time::Instant::now();
-    let mut written_total = 0u64;
-    for _ in 0..iters {
+    let mut written_total = first as u64;
+    std::hint::black_box(&target[..first]);
+    for _ in 1..iters {
         let n = decoder
             .decode_all(compressed.as_slice(), &mut target)
             .expect("decode_all");
