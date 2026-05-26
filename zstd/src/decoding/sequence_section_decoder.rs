@@ -909,17 +909,29 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     // base_value / num_additional_bits reads.
     let ll_state = ll_dec.state;
     let ml_state = ml_dec.state;
-    let of_code = of_dec.state.symbol;
+    let of_state = of_dec.state;
 
     let ll_value = ll_state.base_value;
     let ll_num_bits = ll_state.num_additional_bits;
     let ml_value = ml_state.base_value;
     let ml_num_bits = ml_state.num_additional_bits;
+    // Donor-shape uniform read: OF uses `base_value` + `num_additional_bits`
+    // like LL/ML, dropping the `entry.symbol → 1 << symbol` shift. Both
+    // fields are already populated by `enrich_for_offsets` (`base_value
+    // = 1 << code`, `num_additional_bits = code`). On x86_64 the memory
+    // load is wash vs the shift since both fields share the same Entry
+    // cache line that was already touched for the bit-count read; the
+    // win is that the hot path no longer reads `state.symbol`, which
+    // unblocks dropping the field from `Entry` (donor's ZSTD_seqSymbol
+    // is 8 bytes vs our 12 — that would tighten the FSE table cache
+    // footprint by 4 bytes / entry).
+    let of_num_bits = of_state.num_additional_bits;
+    let of_base = of_state.base_value;
 
-    debug_assert!(of_code <= MAX_OFFSET_CODE);
+    debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
 
-    let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-    let offset = obits as u32 + (1u32 << of_code);
+    let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
+    let offset = obits as u32 + of_base;
 
     debug_assert_ne!(offset, 0);
 
