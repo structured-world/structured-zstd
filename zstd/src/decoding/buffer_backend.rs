@@ -115,10 +115,13 @@ pub(crate) trait BufferBackend: Sized {
     ///   bound fails — a future caller reusing this hook must
     ///   enforce the same gate or pad the literals buffer with 15
     ///   bytes of slack at allocation time.
-    /// - Caller is responsible for updating any DecodeBuffer-level
-    ///   counters (`total_output_counter`, hash) that mirror the
-    ///   bytes this method writes — see
-    ///   `decode_buffer::DecodeBuffer::advance_output_counter`.
+    /// - This method writes directly through the backend; the
+    ///   wrapper-level `DecodeBuffer::total_output_counter` is NOT
+    ///   maintained on this path. Callers that need a byte count for
+    ///   the inline-eligible path must read `BufferBackend::tail()`
+    ///   (see `FrameDecoder::run_direct_decode`'s post-block FCS
+    ///   check). Hash is likewise deferred to the post-block
+    ///   full-slice pass in `FrameDecoder::decode_all`.
     #[allow(unused_variables, unused_mut)]
     #[inline(always)]
     unsafe fn exec_sequence_inline(

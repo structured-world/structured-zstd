@@ -407,8 +407,9 @@ impl FSETable {
         //      2^31-1 times per such symbol (worst case: spread-array
         //      out-of-bounds panic, best case: minutes of CPU).
         //
-        // Reject any `p > table_size` upfront and compute the sum in
-        // `u64` so wrap is impossible.
+        // Reject any `p > table_size` upfront so the subsequent u32
+        // sum is bounded (see the sum's own comment for the
+        // wrap-impossibility argument).
         let table_size = 1u32 << acc_log;
         for &p in probs {
             if p < -1 || p > table_size as i32 {

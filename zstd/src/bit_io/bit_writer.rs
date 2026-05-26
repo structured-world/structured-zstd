@@ -344,6 +344,15 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             return;
         }
 
+        // Range gate: `num_bits > 64` would make the dirty-upper-bits
+        // shift below `bits >> num_bits` invoke IR-level shift overflow
+        // (panic in debug, UB in release-without-overflow-checks). The
+        // safe public API must reject this before the shift.
+        assert!(
+            num_bits <= 64,
+            "write_bits_64 num_bits={num_bits} exceeds u64 width",
+        );
+
         // Dirty-upper-bits contract: the caller MUST pre-mask `bits`
         // to the `num_bits` low-bit range. Violation silently corrupts
         // the output bitstream because subsequent `write_bits_64`
@@ -356,16 +365,15 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         // caller would produce a corrupt compressed blob with no
         // diagnostic signal).
         //
-        // `bits >> num_bits == 0` covers both the `num_bits == 64`
-        // edge (right-shift-by-64 on u64 is UB at the IR level but
-        // here we short-circuit via the leading `num_bits == 0`
-        // bail-out + this branch's `num_bits < 64` precondition — in
-        // practice every call site that reads up to 64 bits goes
-        // through `write_bits_64_no_check` instead) and the
-        // off-by-one trap that `bits.ilog2() <= num_bits` had: under
-        // the old `<=` form, `bits == 1 << num_bits` (which occupies
-        // `num_bits + 1` bits) would still pass. The shift form is
-        // also one ALU op vs `ilog2`'s LZCNT round-trip.
+        // The `num_bits == 64` arm short-circuits the shift entirely
+        // (right-shift-by-64 on u64 is IR-level UB even though the
+        // value is in range here) — the upper-bits check is trivially
+        // satisfied because `num_bits == 64` covers the whole u64.
+        // For `num_bits < 64`, `bits >> num_bits == 0` is the strict
+        // form (the prior `bits.ilog2() <= num_bits` was off-by-one:
+        // it accepted `bits == 1 << num_bits` which occupies
+        // `num_bits + 1` bits) and is one ALU op vs ilog2's LZCNT
+        // round-trip.
         assert!(
             num_bits == 64 || bits >> num_bits == 0,
             "write_bits_64 dirty upper bits: bits=0x{bits:x} occupies {} bits but num_bits={num_bits}",
