@@ -1102,6 +1102,19 @@ impl FrameDecoder {
             // mid-block instead of returning `Err(...)`. Direct-path
             // routing for safe APIs is tracked behind the fallible
             // `BufferBackend` refactor in issue #246.
+            let frame_start_total = total_bytes_written;
+            let content_size = self
+                .state
+                .as_ref()
+                .expect("init populated state")
+                .frame_header
+                .frame_content_size();
+            let fcs_declared = self
+                .state
+                .as_ref()
+                .expect("init populated state")
+                .frame_header
+                .fcs_declared();
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self
@@ -1114,6 +1127,26 @@ impl FrameDecoder {
                 }
                 if self.is_finished() {
                     break;
+                }
+            }
+            // Per-frame FCS validation: when the frame header
+            // declared a frame_content_size, the drained byte count
+            // for THIS frame must match it. Without this check a
+            // corrupt under-producing frame (last_block flag tripped
+            // early on a sub-FCS payload) would silently return
+            // `Ok(short_len)` here, even though
+            // `decode_single_frame_legacy_drain` maps the same
+            // shape to `FrameContentSizeMismatch`. Use
+            // `fcs_declared()` (NOT `content_size > 0`) so an empty
+            // frame with explicit FCS=0 on the wire still gets
+            // validated.
+            if fcs_declared {
+                let produced = (total_bytes_written - frame_start_total) as u64;
+                if produced != content_size {
+                    return Err(FrameDecoderError::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced,
+                    });
                 }
             }
         }
