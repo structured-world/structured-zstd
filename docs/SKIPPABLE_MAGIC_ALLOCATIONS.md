@@ -1,0 +1,46 @@
+# Skippable Frame Magic Allocations
+
+RFC 8878 reserves 16 magic numbers (`0x184D2A50..0x184D2A5F`) for "skippable
+frames" — opaque user-defined payloads that compliant zstd decoders skip
+past. The `structured-zstd` crate provides a typed `SkippableFrame` API
+(`zstd::skippable` module) for emitting and parsing these but **does not
+allocate any variant**.
+
+> **Feature gate:** the typed `SkippableFrame` API and adjacent
+> storage-format extensions require enabling the `lsm` Cargo feature:
+>
+> ```toml
+> [dependencies]
+> structured-zstd = { version = "0", features = ["lsm"] }
+> ```
+>
+> The C FFI `cdylib` build remains strict drop-in for donor `libzstd`
+> v1.5.7 regardless of which Rust features are enabled — magic-variant
+> allocations affect only Rust-side typed wrappers, not the cdylib
+> symbol surface.
+
+Allocations are an application-protocol concern. Downstream consumers
+embedding metadata in zstd streams should register their variants here
+to prevent collisions.
+
+## Allocated variants
+
+| Variant | Magic        | Consumer                    | Purpose                                        | Spec |
+|---------|--------------|-----------------------------|------------------------------------------------|------|
+| 0       | `0x184D2A50` | lsm-tree wire format v1     | MetadataFrame (AEAD header for encrypted blocks)| [LSM-T1](https://github.com/structured-world/coordinode-lsm-tree/issues/250) |
+| 1       | `0x184D2A51` | lsm-tree wire format v1     | BodyFrame (encrypted payload)                  | [LSM-T1](https://github.com/structured-world/coordinode-lsm-tree/issues/250) |
+| 2       | `0x184D2A52` | lsm-tree wire format v1     | EccFrame (reserved for future ECC layer)       | [LSM-T5](https://github.com/structured-world/coordinode-lsm-tree/issues/250) |
+| 3–15    | `0x184D2A53..5F` | reserved by lsm-tree v1 | future versions / extensions                   | — |
+
+## Allocation policy
+
+- A consumer wishing to use a previously-unallocated variant SHOULD file
+  a PR against this table referencing the downstream wire-format spec.
+- Variants allocated to a consumer are reserved as a contiguous range
+  owned by that consumer (e.g. lsm-tree owns `0x50..5F` in v1); the
+  consumer may sub-allocate inside that range without coordinating with
+  `structured-zstd`.
+- If a consumer abandons or supersedes a variant allocation, file a PR
+  to release it back to the unallocated pool.
+- `structured-zstd` is the registry steward but does not validate or
+  enforce semantics — that is the consumer's responsibility.

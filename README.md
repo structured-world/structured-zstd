@@ -150,6 +150,15 @@ let mut sink = Vec::new();
 stream.read_to_end(&mut sink).unwrap();
 ```
 
+## Storage-format extensions
+
+Behind the `lsm` Cargo feature, `structured-zstd` exposes a typed
+`SkippableFrame` API (`zstd::skippable`) for storage-format authors who
+need to interleave application metadata with zstd data. The ecosystem
+registry of allocated skippable-frame magic variants and the
+allocation policy live in
+[docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
+
 ## Project relationship
 
 Maintained fork of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by the [Structured World Foundation](https://sw.foundation). We sync periodically with upstream but maintain an independent development trajectory focused on the [CoordiNode](https://github.com/structured-world/coordinode) database engine's per-label dictionary needs.
