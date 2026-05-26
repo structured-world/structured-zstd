@@ -1077,7 +1077,6 @@ impl FrameDecoder {
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
-        use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
         while !input.is_empty() {
             match init_frame(self, &mut input) {
@@ -1092,30 +1091,17 @@ impl FrameDecoder {
                 }
                 Err(e) => return Err(e),
             };
-            // Per-frame direct-path dispatch. Eligibility mirrors
-            // `decode_to_slice_trusted`: FCS declared and > 0, no
-            // active dictionary, and the remaining `output` slice has
-            // room for FCS + WILDCOPY_OVERLENGTH slack. When all hold
-            // the frame decodes straight into `output[..content_size]`
-            // through `UserSliceBackend`, bypassing the FlatBuf/Ring
-            // -> `read()` drain copy that dominates throughput on
-            // poorly-compressed corpora. Ineligible frames (no FCS,
-            // active dict, output too small for slack, streaming
-            // multi-frame inputs where the next frame needs the
-            // current iteration's tail) fall through to the legacy
-            // `decode_blocks` + `read` drain loop below.
-            let state_ref = self.state.as_ref().expect("init populated state");
-            let content_size = state_ref.frame_header.frame_content_size();
-            let dict_active = state_ref.using_dict.is_some();
-            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-            let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
-            if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
-                output = &mut output[written..];
-                total_bytes_written += written;
-                continue;
-            }
+            // `decode_all` MUST stay on the per-block decode + read
+            // drain path: it's the safe public API and its
+            // `Result<_, FrameDecoderError>` contract requires
+            // structured errors on malformed input. The direct path
+            // (`run_direct_decode` + `UserSliceBackend`) is gated
+            // behind the `_trusted` suffix on `decode_to_slice_trusted`
+            // because its write surface uses release-mode `assert!`
+            // for capacity checks — corrupt frames would panic
+            // mid-block instead of returning `Err(...)`. Direct-path
+            // routing for safe APIs is tracked behind the fallible
+            // `BufferBackend` refactor in issue #246.
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
                 let bytes_written = self
@@ -1752,53 +1738,6 @@ mod tests {
                 .single_segment_flag(),
             "test precondition violated: frame is single-segment, rename or resize"
         );
-    }
-
-    #[test]
-    fn decode_all_routes_eligible_frame_through_direct_path() {
-        // Regression test for the per-frame direct-path dispatch in
-        // `decode_all_impl`. With a sized-with-slack output buffer
-        // the eligibility gate (FCS > 0, no dict, output.len() >=
-        // FCS + WILDCOPY_OVERLENGTH) holds, so `decode_all` must
-        // route through `run_direct_decode` and produce the same
-        // bytes the legacy drain path would.
-        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
-        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
-        compressor.set_source(payload.as_slice());
-        let mut compressed = Vec::new();
-        compressor.set_drain(&mut compressed);
-        compressor.compress();
-
-        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
-        let mut dec = FrameDecoder::new();
-        let mut out = alloc::vec![0u8; payload.len() + slack];
-        let n = dec
-            .decode_all(compressed.as_slice(), &mut out)
-            .expect("decode_all with WILDCOPY slack should succeed via direct path");
-        assert_eq!(n, payload.len());
-        assert_eq!(&out[..n], payload.as_slice());
-    }
-
-    #[test]
-    fn decode_all_with_tight_output_routes_through_legacy_drain() {
-        // Output sized to EXACTLY content_size (no slack) must
-        // fail the direct-path eligibility gate and fall back to
-        // the per-block decode + read drain loop. This covers
-        // callers that don't / can't pre-size with WILDCOPY slack.
-        let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
-        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
-        compressor.set_source(payload.as_slice());
-        let mut compressed = Vec::new();
-        compressor.set_drain(&mut compressed);
-        compressor.compress();
-
-        let mut dec = FrameDecoder::new();
-        let mut out = alloc::vec![0u8; payload.len()];
-        let n = dec
-            .decode_all(compressed.as_slice(), &mut out)
-            .expect("decode_all with tight output must succeed via legacy drain");
-        assert_eq!(n, payload.len());
-        assert_eq!(&out[..n], payload.as_slice());
     }
 
     #[cfg(feature = "hash")]

@@ -2,11 +2,7 @@
 //! caller's output slice" fast path.
 //!
 //! Selected by [`crate::decoding::FrameDecoder::decode_to_slice_trusted`]
-//! and by [`crate::decoding::FrameDecoder::decode_all`] (the latter
-//! routes per-frame through the same `run_direct_decode` helper when
-//! the frame is eligible; ineligible frames in a `decode_all` stream
-//! transparently fall through to the legacy `decode_blocks` +
-//! `read()` drain loop) when ALL of the following hold:
+//! when ALL of the following hold:
 //! - `frame_content_size > 0` — the header-derived content size
 //!   is non-zero. This is the actual eligibility condition (NOT
 //!   "FCS present"): an empty frame with an explicit FCS=0
