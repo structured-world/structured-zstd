@@ -103,6 +103,17 @@ pub struct FrameDecoder {
     /// with `found: None`.
     #[cfg(feature = "lsm")]
     expect_window_descriptor: Option<u8>,
+    /// When `true`, the per-block decode loop XXH64-hashes each
+    /// block's decompressed bytes and stores the low-32-bit digest in
+    /// [`Self::computed_block_checksums`]. Default `false` (zero
+    /// cost). Set via [`Self::enable_per_block_checksums`].
+    #[cfg(feature = "lsm")]
+    per_block_checksums_enabled: bool,
+    /// Per-block XXH64 (low 32 bits) digests captured during the
+    /// current frame's decode when `per_block_checksums_enabled` is
+    /// set. Reset at the start of every new frame.
+    #[cfg(feature = "lsm")]
+    computed_block_checksums: alloc::vec::Vec<u32>,
 }
 
 /// Backend-tagged decode scratch — chosen at frame-reset time based
@@ -177,6 +188,16 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => s.buffer.len(),
             Self::Flat(s) => s.buffer.len(),
+        }
+    }
+
+    /// Last `n` bytes of the visible buffer as `(s1, s2)` (wrap-aware).
+    /// Routes through whichever backend the current scratch holds.
+    #[cfg(feature = "lsm")]
+    fn last_n_as_slices(&self, n: usize) -> (&[u8], &[u8]) {
+        match self {
+            Self::Ring(s) => s.buffer.last_n_as_slices(n),
+            Self::Flat(s) => s.buffer.last_n_as_slices(n),
         }
     }
 
@@ -370,7 +391,38 @@ impl FrameDecoder {
             expect_dict_id: None,
             #[cfg(feature = "lsm")]
             expect_window_descriptor: None,
+            #[cfg(feature = "lsm")]
+            per_block_checksums_enabled: false,
+            #[cfg(feature = "lsm")]
+            computed_block_checksums: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Opt in to per-block XXH64 verification during decode.
+    /// Default off; zero cost when disabled. Each block's decompressed
+    /// bytes are XXH64-hashed (low 32 bits) and appended to
+    /// [`Self::computed_block_checksums`] as the decode progresses.
+    /// Callers compare the captured digests against externally-stored
+    /// expected values (e.g. from a per-block sidecar in the
+    /// containing application protocol).
+    ///
+    /// Behind the `lsm` Cargo feature.
+    #[cfg(feature = "lsm")]
+    pub fn enable_per_block_checksums(&mut self) {
+        self.per_block_checksums_enabled = true;
+    }
+
+    /// Per-block XXH64 (low 32 bits) digests captured during the
+    /// current frame's decode. Empty unless
+    /// [`Self::enable_per_block_checksums`] was called before
+    /// [`Self::decode_all`] / [`Self::reset`].
+    ///
+    /// Reset at the start of every new frame.
+    ///
+    /// Behind the `lsm` Cargo feature.
+    #[cfg(feature = "lsm")]
+    pub fn computed_block_checksums(&self) -> &[u32] {
+        &self.computed_block_checksums
     }
 
     /// Pin the expected `Dictionary_ID` for the next frame.
@@ -567,6 +619,11 @@ impl FrameDecoder {
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        // Fresh frame → start with an empty per-block checksum vec so
+        // the values for the next frame don't carry over from the
+        // previous one.
+        #[cfg(feature = "lsm")]
+        self.computed_block_checksums.clear();
         let magicless = self.magicless;
         let dict_id = match &mut self.state {
             Some(s) => {
@@ -835,11 +892,27 @@ impl FrameDecoder {
                 block_header.decompressed_size
             );
 
+            #[cfg(feature = "lsm")]
+            let len_before_block = state.decoder_scratch.buffer_len();
             let bytes_read_in_block_body = state
                 .decoder_scratch
                 .decode_block_content(&mut block_dec, &block_header, &mut source)
                 .map_err(err::FailedToReadBlockBody)?;
             state.bytes_read_counter += bytes_read_in_block_body;
+
+            // Per-block XXH64 (low 32 bits) of the just-decompressed
+            // bytes. Hashed from `last_n_as_slices` so RingBuffer wrap
+            // is handled in-place — no extra copy.
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if self.per_block_checksums_enabled {
+                let added = state.decoder_scratch.buffer_len() - len_before_block;
+                let (s1, s2) = state.decoder_scratch.last_n_as_slices(added);
+                let mut h = twox_hash::XxHash64::with_seed(0);
+                use core::hash::Hasher;
+                h.write(s1);
+                h.write(s2);
+                self.computed_block_checksums.push(h.finish() as u32);
+            }
 
             state.block_counter += 1;
 
@@ -2360,5 +2433,100 @@ mod tests {
             .expect("decode_all should succeed on skippable + zstd stream");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn frame_emit_info_describes_emitted_block_layout() {
+        // Encode a payload large enough to force >1 block, fetch
+        // FrameEmitInfo, walk blocks[] and verify each block's
+        // (offset_in_frame, header_size, body_size) matches the bytes
+        // actually emitted into the drain buffer.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let info = compressor
+            .last_frame_emit_info()
+            .expect("last_frame_emit_info populated after compress")
+            .clone();
+        drop(compressor);
+
+        // Frame header range starts at 0 and is non-empty.
+        assert_eq!(info.frame_header_range.start, 0);
+        assert!(info.frame_header_range.end > 0);
+        // Total size matches what was written to the drain.
+        assert_eq!(info.total_size as usize, compressed.len());
+        // At least one block, and the last entry has last_block=true.
+        assert!(!info.blocks.is_empty());
+        assert!(info.blocks.last().unwrap().last_block);
+        // All non-final blocks have last_block=false.
+        for b in &info.blocks[..info.blocks.len() - 1] {
+            assert!(!b.last_block);
+        }
+        // Walk and verify each block's header bytes match the
+        // recorded type / size by re-decoding the 3-byte header.
+        for b in &info.blocks {
+            let off = b.offset_in_frame as usize;
+            assert_eq!(b.header_size, 3);
+            let mut hdr = [0u8; 4];
+            hdr[..3].copy_from_slice(&compressed[off..off + 3]);
+            let raw = u32::from_le_bytes(hdr);
+            let last = (raw & 1) != 0;
+            let ty = (raw >> 1) & 0b11;
+            let sz = raw >> 3;
+            assert_eq!(last, b.last_block);
+            assert_eq!(sz, b.body_size);
+            let expected_ty = match b.block_type {
+                crate::encoding::frame_emit_info::BlockType::Raw => 0,
+                crate::encoding::frame_emit_info::BlockType::RLE => 1,
+                crate::encoding::frame_emit_info::BlockType::Compressed => 2,
+                crate::encoding::frame_emit_info::BlockType::Reserved => 3,
+            };
+            assert_eq!(ty, expected_ty);
+        }
+        // Checksum range present iff `feature = "hash"` is enabled.
+        assert_eq!(info.checksum_range.is_some(), cfg!(feature = "hash"));
+    }
+
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    #[test]
+    fn per_block_checksum_round_trip() {
+        // Encode with per-block checksums enabled. Decode with
+        // per-block verification. Encoder produces 1 checksum per
+        // input chunk; decoder produces 1 checksum per physical
+        // block. For levels without post-split (Default = L3, no
+        // multi-physical-block path) the two should match
+        // element-wise.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        compressor.enable_per_block_checksums();
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let encoder_checksums = compressor
+            .last_frame_block_checksums()
+            .expect("checksums populated after enable + compress")
+            .to_vec();
+        drop(compressor);
+        assert!(!encoder_checksums.is_empty());
+
+        // Decode side: enable verification, decode, compare.
+        let mut decoder = FrameDecoder::new();
+        decoder.enable_per_block_checksums();
+        let mut output = alloc::vec![0u8; payload.len()];
+        let n = decoder
+            .decode_all(compressed.as_slice(), &mut output)
+            .expect("decode_all should succeed");
+        assert_eq!(n, payload.len());
+        assert_eq!(&output[..n], payload.as_slice());
+
+        let decoder_checksums = decoder.computed_block_checksums();
+        assert_eq!(decoder_checksums, encoder_checksums.as_slice());
     }
 }

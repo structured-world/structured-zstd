@@ -52,6 +52,21 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     magicless: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
+    /// Block-layout introspection populated at the end of every
+    /// successful `compress()`. `None` until the first call.
+    /// Behind the `lsm` feature gate.
+    #[cfg(feature = "lsm")]
+    frame_emit_info: Option<crate::encoding::frame_emit_info::FrameEmitInfo>,
+    /// When `true`, `compress()` XXH64-hashes each block's
+    /// uncompressed bytes and appends the low-32-bit digest to
+    /// `block_checksums`. Default `false` (zero cost).
+    #[cfg(feature = "lsm")]
+    per_block_checksums_enabled: bool,
+    /// Per-block XXH64 (low 32 bits) digests captured during
+    /// `compress()` when `per_block_checksums_enabled` is set. Ordered
+    /// by block-emit order. `None` until the first call after enabling.
+    #[cfg(feature = "lsm")]
+    block_checksums: Option<alloc::vec::Vec<u32>>,
 }
 
 #[derive(Clone, Default)]
@@ -464,6 +479,12 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             magicless: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
+            #[cfg(feature = "lsm")]
+            frame_emit_info: None,
+            #[cfg(feature = "lsm")]
+            per_block_checksums_enabled: false,
+            #[cfg(feature = "lsm")]
+            block_checksums: None,
         }
     }
 }
@@ -491,6 +512,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             magicless: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
+            #[cfg(feature = "lsm")]
+            frame_emit_info: None,
+            #[cfg(feature = "lsm")]
+            per_block_checksums_enabled: false,
+            #[cfg(feature = "lsm")]
+            block_checksums: None,
         }
     }
 
@@ -542,6 +569,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
+        // Reset per-frame introspection state so a re-used compressor
+        // doesn't carry over the previous frame's layout/checksums.
+        #[cfg(feature = "lsm")]
+        {
+            self.frame_emit_info = None;
+            if self.per_block_checksums_enabled {
+                self.block_checksums = Some(alloc::vec::Vec::new());
+            } else {
+                self.block_checksums = None;
+            }
+        }
         let initial_size_hint = self.source_size_hint;
         let source_size_hint_known = initial_size_hint.is_some();
         let use_dictionary_state =
@@ -733,6 +771,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // As we read, hash that data too
             #[cfg(feature = "hash")]
             self.hasher.write(&uncompressed_data);
+            // Per-input-chunk XXH64 (low 32 bits) for the optional
+            // per-block checksum sidecar. Chunk-level granularity
+            // matches the forensic-ECC use case (one digest per input
+            // chunk passed to the block emitter); see
+            // `enable_per_block_checksums` rustdoc for the post-split
+            // semantics. Hashed BEFORE the block-emit call below so
+            // we capture the input bytes regardless of which physical
+            // block type (Raw / RLE / Compressed) the emitter chooses.
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if let Some(checksums) = self.block_checksums.as_mut() {
+                let mut h = XxHash64::with_seed(0);
+                h.write(&uncompressed_data);
+                checksums.push(h.finish() as u32);
+            }
             // Special handling is needed for compression of a totally empty file
             if uncompressed_data.is_empty() {
                 let header = BlockHeader {
@@ -819,6 +871,109 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .write_all(&(content_checksum as u32).to_le_bytes())
                 .unwrap();
         }
+
+        // FrameEmitInfo population (lsm feature): walk all_blocks to
+        // recover per-block layout. Each Block_Header is 3 bytes LE
+        // packing `(block_size << 3) | (block_type << 1) | last_block`.
+        // Physical body size differs by type: RLE bodies are always 1
+        // byte (the repeated byte), Raw/Compressed bodies span
+        // `block_size` bytes.
+        #[cfg(feature = "lsm")]
+        {
+            use crate::blocks::block::BlockType as BT;
+            use crate::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo};
+            let frame_header_len = header_buf.len() as u32;
+            let mut blocks: Vec<FrameBlock> = Vec::new();
+            let mut cursor: usize = 0;
+            while cursor + 3 <= all_blocks.len() {
+                let mut header_u32 = [0u8; 4];
+                header_u32[..3].copy_from_slice(&all_blocks[cursor..cursor + 3]);
+                let raw = u32::from_le_bytes(header_u32);
+                let last_block = (raw & 1) != 0;
+                let block_type = match (raw >> 1) & 0b11 {
+                    0 => BT::Raw,
+                    1 => BT::RLE,
+                    2 => BT::Compressed,
+                    _ => BT::Reserved,
+                };
+                let logical_size = raw >> 3;
+                let physical_body = match block_type {
+                    BT::RLE => 1,
+                    _ => logical_size as usize,
+                };
+                blocks.push(FrameBlock {
+                    offset_in_frame: frame_header_len + cursor as u32,
+                    header_size: 3,
+                    body_size: logical_size,
+                    block_type,
+                    last_block,
+                });
+                cursor += 3 + physical_body;
+                if last_block {
+                    break;
+                }
+            }
+            let checksum_range = if cfg!(feature = "hash") {
+                let cs_start = frame_header_len + all_blocks.len() as u32;
+                Some(cs_start..cs_start + 4)
+            } else {
+                None
+            };
+            let total_size = frame_header_len
+                + all_blocks.len() as u32
+                + if checksum_range.is_some() { 4 } else { 0 };
+            self.frame_emit_info = Some(FrameEmitInfo {
+                frame_header_range: 0..frame_header_len,
+                blocks,
+                checksum_range,
+                total_size,
+            });
+        }
+    }
+
+    /// Layout of the most recently emitted frame.
+    ///
+    /// Returns `None` if [`compress`](Self::compress) has not been
+    /// called yet on this compressor. After a successful `compress()`
+    /// the returned `FrameEmitInfo` describes the frame header range,
+    /// every emitted block's offset / size / type, and the optional
+    /// trailing content-checksum range — all in frame-absolute byte
+    /// offsets matching the bytes written to the drain.
+    ///
+    /// Behind the `lsm` Cargo feature.
+    #[cfg(feature = "lsm")]
+    pub fn last_frame_emit_info(&self) -> Option<&crate::encoding::frame_emit_info::FrameEmitInfo> {
+        self.frame_emit_info.as_ref()
+    }
+
+    /// Opt in to per-block XXH64 checksum computation during
+    /// [`compress`](Self::compress). Default off; zero cost when
+    /// disabled. The captured digests are accessible via
+    /// [`last_frame_block_checksums`](Self::last_frame_block_checksums).
+    ///
+    /// One checksum is emitted per input chunk passed to the block
+    /// emitter; on the post-split optimization path (Level 16-22 with
+    /// large window) a single input chunk can produce multiple
+    /// physical FrameBlocks and the checksums vector will have fewer
+    /// entries than `FrameEmitInfo.blocks`. The chunk-level
+    /// granularity matches the forensic-ECC use case (hash the
+    /// recovered plaintext chunk, compare to the stored digest).
+    ///
+    /// Behind the `lsm` Cargo feature.
+    #[cfg(feature = "lsm")]
+    pub fn enable_per_block_checksums(&mut self) {
+        self.per_block_checksums_enabled = true;
+    }
+
+    /// Per-block XXH64 (low 32 bits) digests captured during the most
+    /// recent `compress()` call. `None` unless
+    /// [`enable_per_block_checksums`](Self::enable_per_block_checksums)
+    /// was called before `compress()`.
+    ///
+    /// Behind the `lsm` Cargo feature.
+    #[cfg(feature = "lsm")]
+    pub fn last_frame_block_checksums(&self) -> Option<&[u32]> {
+        self.block_checksums.as_deref()
     }
 
     /// Get a mutable reference to the source

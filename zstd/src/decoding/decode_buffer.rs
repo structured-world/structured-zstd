@@ -122,6 +122,26 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.len()
     }
 
+    /// Return the last `n` bytes of the visible buffer as two
+    /// contiguous slices (`(s1, s2)` matching the wrap semantics of
+    /// the underlying backend). `n` must be `<= self.len()`. Used by
+    /// the per-block checksum path to hash bytes that were appended
+    /// during the most recent block decode without copying.
+    ///
+    /// Returns empty slices if `n == 0`.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn last_n_as_slices(&self, n: usize) -> (&[u8], &[u8]) {
+        let (s1, s2) = self.buffer.as_slices();
+        let total = s1.len() + s2.len();
+        debug_assert!(n <= total);
+        let start = total - n;
+        if start >= s1.len() {
+            (&[][..], &s2[start - s1.len()..])
+        } else {
+            (&s1[start..], s2)
+        }
+    }
+
     /// Capture a rollback point covering the buffer's write cursor and the
     /// total-output counter. Pair with [`restore_checkpoint`] to undo
     /// speculative pushes/repeats made after the capture — used by the fused
