@@ -1224,13 +1224,21 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
-            scratch.literal_lengths.build_from_probabilities(
-                LL_DEFAULT_ACC_LOG,
-                &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch
-                .literal_lengths
-                .enrich_with_packed_seq_meta(&LL_META);
+            // Default LL distribution → cached table memcpy.
+            #[cfg(feature = "std")]
+            {
+                scratch.literal_lengths.clone_from(predefined_ll_table());
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch.literal_lengths.build_from_probabilities(
+                    LL_DEFAULT_ACC_LOG,
+                    &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+                )?;
+                scratch
+                    .literal_lengths
+                    .enrich_with_packed_seq_meta(&LL_META);
+            }
             scratch.ll_rle = None;
         }
         ModeType::Repeat => {
@@ -1264,13 +1272,23 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            scratch.offsets.build_from_probabilities(
-                OF_DEFAULT_ACC_LOG,
-                &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch.offsets.enrich_for_offsets();
+            // Default OF distribution → cached table + cached long-share.
+            #[cfg(feature = "std")]
+            {
+                let (cached, long_share) = predefined_of_table();
+                scratch.offsets.clone_from(cached);
+                scratch.offsets_long_share = long_share;
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch.offsets.build_from_probabilities(
+                    OF_DEFAULT_ACC_LOG,
+                    &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
+                )?;
+                scratch.offsets.enrich_for_offsets();
+                scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+            }
             scratch.of_rle = None;
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::Repeat => {
             vprintln!("Repeat of table");
@@ -1302,11 +1320,19 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            scratch.match_lengths.build_from_probabilities(
-                ML_DEFAULT_ACC_LOG,
-                &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            // Default ML distribution → cached table memcpy.
+            #[cfg(feature = "std")]
+            {
+                scratch.match_lengths.clone_from(predefined_ml_table());
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch.match_lengths.build_from_probabilities(
+                    ML_DEFAULT_ACC_LOG,
+                    &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+                )?;
+                scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            }
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {
@@ -1328,6 +1354,85 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
+
+// =====================================================================
+//                   Predefined FSE table cache
+// =====================================================================
+//
+// ModeType::Predefined fires whenever the encoder declares that an
+// LL / OF / ML symbol stream follows the RFC 8478 default
+// distribution (§3.1.1.3.2.1.1). On small-block fixtures this can
+// dominate the decode budget: building the table costs O(table_size)
+// per axis plus several `Vec::resize` round-trips, while the symbol
+// stream itself is only a few hundred bytes.
+//
+// Flamegraph on `small-4k-log-lines/c_stream/pure_rust` (i9, post
+// PR #263 merge) showed 66.72% of decode time in
+// `FSETable::build_decoding_table`, all of it inside the Predefined
+// branches.
+//
+// The default distributions are static — the tables they produce
+// are byte-identical across calls. Pre-build once via OnceLock,
+// then `clone_from` the cached table into the per-frame scratch.
+// `Vec::clone_from` reuses the existing scratch allocation when the
+// capacity already fits (it does, the scratch is re-used across
+// frames), so each call is a fixed-size memcpy plus a few scalar
+// field copies.
+//
+// `no_std` builds keep the original per-call rebuild path because
+// `std::sync::OnceLock` isn't available without `std`. Replacing it
+// with a portable `OnceBox` would require pulling in `once_cell` —
+// not worth a dep for a build that doesn't share the hot path with
+// the `std` benches anyway.
+#[cfg(feature = "std")]
+fn predefined_ll_table() -> &'static crate::fse::FSETable {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+        t.build_from_probabilities(
+            LL_DEFAULT_ACC_LOG,
+            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .expect("predefined LL distribution is well-formed");
+        t.enrich_with_packed_seq_meta(&LL_META);
+        t
+    })
+}
+
+#[cfg(feature = "std")]
+fn predefined_ml_table() -> &'static crate::fse::FSETable {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
+        t.build_from_probabilities(
+            ML_DEFAULT_ACC_LOG,
+            &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .expect("predefined ML distribution is well-formed");
+        t.enrich_with_packed_seq_meta(&ML_META);
+        t
+    })
+}
+
+#[cfg(feature = "std")]
+fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<(crate::fse::FSETable, u32)> = OnceLock::new();
+    let cache = CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
+        t.build_from_probabilities(
+            OF_DEFAULT_ACC_LOG,
+            &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
+        )
+        .expect("predefined OF distribution is well-formed");
+        t.enrich_for_offsets();
+        let share = compute_offsets_long_share(&t);
+        (t, share)
+    });
+    (&cache.0, cache.1)
+}
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
 const ML_DEFAULT_ACC_LOG: u8 = 6;
