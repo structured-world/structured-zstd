@@ -460,15 +460,30 @@ fn decode_and_execute_sequences_impl<
         // simpler shape wins. Inlined here (rather than a separate
         // function) so the cold tail-call cost of swapping decoders
         // mid-block stays at zero.
+        //
+        // Routes through `execute_one_sequence_pipelined` (resolving
+        // the actual offset against `offset_hist` upfront) so the
+        // inline donor-shape writer fires on backends that opt in
+        // (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true`).
+        // The legacy `execute_one_sequence` path went through
+        // `DecodeBuffer::repeat_match` → `total_output_counter +=
+        // match_length` (decode_buffer.rs:357), which perf annotate
+        // on z000033 L-3 fast attributed ~6% of decode time to (the
+        // RMW at `0x40(r8)` of the wrapper struct). The inline
+        // executor advances `tail` directly inside the backend, so
+        // the wrapper-level counter is bypassed entirely on this
+        // path; the post-block FCS check in `run_direct_decode`
+        // reads `tail()` instead.
         for i in 0..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            execute_one_sequence(
+            let resolved_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+            execute_one_sequence_pipelined(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                offset_hist,
                 seq,
+                resolved_offset,
             )?;
             seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
 
