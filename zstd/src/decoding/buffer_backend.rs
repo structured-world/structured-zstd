@@ -95,27 +95,26 @@ pub(crate) trait BufferBackend: Sized {
     /// - **Read-side slack on the parent literals buffer**: the donor
     ///   literal-copy path issues an unconditional `copy16` from
     ///   `lit_src` and, when `lit_length > 16`, a 16-byte-stride
-    ///   wildcopy that may load up to 15 bytes past
-    ///   `lit_src + lit_length` on its final iteration. Callers MUST
-    ///   satisfy two distinct slack bounds against the parent buffer
-    ///   length (`lit_len`):
+    ///   wildcopy whose final iteration's last byte read is at
+    ///   `lit_cur_before + lit_length.next_multiple_of(16) - 1`.
+    ///   Callers MUST satisfy two distinct slack bounds against the
+    ///   parent buffer length (`lit_len`):
     ///   - `lit_cur_before + 16 <= lit_len` ALWAYS (the
     ///     unconditional `copy16` reads 16 bytes regardless of
     ///     `lit_length`, including the `lit_length == 0` case).
-    ///   - `lit_cur_before + lit_length + 15 <= lit_len` ONLY when
-    ///     `lit_length > 16` (the wildcopy tail's final 16-byte
-    ///     load).
+    ///   - `lit_cur_before + lit_length.next_multiple_of(16) <=
+    ///     lit_len` ONLY when `lit_length > 16` (the wildcopy tail's
+    ///     final 16-byte load reaches through that exact offset).
     ///
     ///   The current dispatch site
     ///   (`sequence_section_decoder::execute_one_sequence_pipelined`)
     ///   enforces both via `donor_path_safe = lit_cur_before + 16 <=
-    ///   lit_len && (lit_length <= 16 || high + 15 <= lit_len)`
-    ///   (with `high = lit_cur_before + lit_length`, `lit_len` =
-    ///   parent literals-buffer length) and falls through to the
-    ///   legacy `push`/`repeat` chain when either bound fails — a
-    ///   future caller reusing this hook must enforce the same gate
-    ///   or pad the literals buffer with 15 bytes of slack at
-    ///   allocation time.
+    ///   lit_len && (lit_length <= 16 || lit_cur_before +
+    ///   lit_length.next_multiple_of(16) <= lit_len)` and falls
+    ///   through to the legacy `push`/`repeat` chain when either
+    ///   bound fails — a future caller reusing this hook must
+    ///   enforce the same gate or pad the literals buffer with 15
+    ///   bytes of slack at allocation time.
     /// - Caller is responsible for updating any DecodeBuffer-level
     ///   counters (`total_output_counter`, hash) that mirror the
     ///   bytes this method writes — see
