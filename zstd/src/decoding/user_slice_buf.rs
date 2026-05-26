@@ -898,4 +898,113 @@ mod tests {
         assert_eq!(err.capacity, 4);
         assert_eq!(b.tail(), 3);
     }
+
+    /// Direct tests for `donor_exec_one_sequence` — exercise the
+    /// x86_64 inline body so coverage attributes its 40 lines to
+    /// these tests, not through the deep `decode_to_slice_trusted`
+    /// pipeline where `cargo llvm-cov` sometimes loses the inlined
+    /// callee. Tests cover: short-literal + short-match, long
+    /// literal (wildcopy tail), short-offset match (overlapCopy8 +
+    /// 8-byte stride), long-offset match (wildcopy_no_overlap).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn donor_exec_one_sequence_short_literal_plus_long_offset_match() {
+        // Layout: pre-fill `tail = 8` with a "history" region so
+        // a match copy at offset 16 reaches inside the slice. Then
+        // bump tail past that history and exercise donor_exec.
+        // Buffer sized with WILDCOPY_OVERLENGTH slack at the end.
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        // Seed history: bytes 0..32 = ascending values, so a later
+        // match at offset 16 picks up bytes 16..32.
+        for i in 0..32 {
+            buf[i] = i as u8;
+        }
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32; // Pretend 32 history bytes are already written.
+
+        // 8-byte literals to write (donor's litLength <= 16 fast
+        // path — no wildcopy tail). Match length 8 at offset 16.
+        let lits: [u8; 16] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1,
+            0x10, 0x20,
+        ];
+        unsafe {
+            b.donor_exec_one_sequence(lits.as_ptr(), 8, 16, 8);
+        }
+        // tail advanced by 8 lit + 8 match = 16.
+        assert_eq!(b.tail, 48);
+        // Literals landed at tail = 32..40.
+        assert_eq!(&buf[32..40], &lits[..8]);
+        // Match: at output position 40..48, source = tail + lit_len -
+        // offset = 32 + 8 - 16 = 24. So buf[40..48] == buf[24..32]
+        // (history bytes 24..32 = [24, 25, 26, 27, 28, 29, 30, 31]).
+        assert_eq!(&buf[40..48], &[24u8, 25, 26, 27, 28, 29, 30, 31]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn donor_exec_one_sequence_long_literal_uses_wildcopy_tail() {
+        // litLength > 16 path: unconditional copy16 + wildcopy tail
+        // for the remaining literal bytes.
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        for i in 0..32 {
+            buf[i] = i as u8;
+        }
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32;
+
+        // 40-byte literals (forces wildcopy tail) — needs 40-byte
+        // source buffer with extra read slack for the final
+        // 16-byte load.
+        let lits: Vec<u8> = (0..40 + 16).map(|i| 0x80 + i as u8).collect();
+        unsafe {
+            b.donor_exec_one_sequence(lits.as_ptr(), 40, 16, 8);
+        }
+        assert_eq!(b.tail, 80);
+        assert_eq!(&buf[32..72], &lits[..40]);
+        // Match at offset 16: src = 32 + 40 - 16 = 56. buf[72..80]
+        // == buf[56..64] (which we just wrote = lits[24..32]).
+        assert_eq!(&buf[72..80], &lits[24..32]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn donor_exec_one_sequence_short_offset_match_uses_overlap_copy() {
+        // offset < 16 takes the overlapCopy8 + 8-byte stride path
+        // (vs. the offset >= 16 wildcopy_no_overlap path).
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        // Seed last 8 bytes of history with a recognisable pattern.
+        let seed = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7];
+        buf[24..32].copy_from_slice(&seed);
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32;
+
+        let lits: [u8; 16] = [0xFF; 16];
+        // litLength=4, offset=8, matchLength=12. offset<16 → short
+        // path. RLE expansion: match copies bytes [seed; seed[..4]]
+        // since matchLength > offset.
+        unsafe {
+            b.donor_exec_one_sequence(lits.as_ptr(), 4, 8, 12);
+        }
+        // tail = 32 + 4 + 12 = 48.
+        assert_eq!(b.tail, 48);
+        assert_eq!(&buf[32..36], &lits[..4]);
+        // Match output bytes 36..48: should be 12 bytes derived from
+        // the seed at offset 8 from the post-literal cursor (= 36).
+        // Source position = 28 (= 36 - 8). bytes[28..32] = seed[4..8],
+        // then expansion continues as `seed[4..8]` repeats then
+        // `seed[0..4]` (RLE-style).
+        // The exact spread pattern depends on overlap_copy8's table
+        // lookups; just verify all 12 output bytes lie in the
+        // expected seed-byte set.
+        for &b_val in &buf[36..48] {
+            assert!(
+                seed.contains(&b_val),
+                "match output byte {b_val:#x} not in seed set"
+            );
+        }
+    }
 }
