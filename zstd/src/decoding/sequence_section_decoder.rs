@@ -1227,9 +1227,9 @@ fn maybe_update_fse_tables(
             // Default LL distribution → cached table memcpy.
             #[cfg(feature = "std")]
             {
-                scratch.literal_lengths.clone_from(predefined_ll_table());
+                scratch.literal_lengths.clone_from(predefined_ll_table()?);
             }
-            #[cfg(not(feature = "std"))]
+            #[cfg(not(target_has_atomic = "ptr"))]
             {
                 scratch.literal_lengths.build_from_probabilities(
                     LL_DEFAULT_ACC_LOG,
@@ -1275,11 +1275,11 @@ fn maybe_update_fse_tables(
             // Default OF distribution → cached table + cached long-share.
             #[cfg(feature = "std")]
             {
-                let (cached, long_share) = predefined_of_table();
+                let (cached, long_share) = predefined_of_table()?;
                 scratch.offsets.clone_from(cached);
                 scratch.offsets_long_share = long_share;
             }
-            #[cfg(not(feature = "std"))]
+            #[cfg(not(target_has_atomic = "ptr"))]
             {
                 scratch.offsets.build_from_probabilities(
                     OF_DEFAULT_ACC_LOG,
@@ -1323,9 +1323,9 @@ fn maybe_update_fse_tables(
             // Default ML distribution → cached table memcpy.
             #[cfg(feature = "std")]
             {
-                scratch.match_lengths.clone_from(predefined_ml_table());
+                scratch.match_lengths.clone_from(predefined_ml_table()?);
             }
-            #[cfg(not(feature = "std"))]
+            #[cfg(not(target_has_atomic = "ptr"))]
             {
                 scratch.match_lengths.build_from_probabilities(
                     ML_DEFAULT_ACC_LOG,
@@ -1379,59 +1379,77 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // frames), so each call is a fixed-size memcpy plus a few scalar
 // field copies.
 //
-// `no_std` builds keep the original per-call rebuild path because
-// `std::sync::OnceLock` isn't available without `std`. Replacing it
-// with a portable `OnceBox` would require pulling in `once_cell` —
-// not worth a dep for a build that doesn't share the hot path with
-// the `std` benches anyway.
+// Std-only because `OnceLock` lives in `std::sync` — there is no
+// `core::sync::OnceLock` (the only stable OnceLock-style API
+// requires std). `no_std` builds fall back to the per-call rebuild
+// path via the `#[cfg(feature = "std")]` gate. The
+// `critical-section` Cargo feature already flagged in the manifest
+// is the planned route to extend the cache to no-atomic targets
+// without pulling in `once_cell`.
+//
+// Errors from `build_from_probabilities` are propagated through a
+// manual `get` / `set` race pattern (`OnceLock::get_or_try_init` is
+// still unstable on the current MSRV). If two threads attempt the
+// first init concurrently both build the table, but only one wins
+// the `set` — the other observes the winner via the trailing
+// `get()`. The cost of the redundant build is paid at most once
+// per process and only under contention, so the race-write is
+// preferable to the unstable API or to a `Mutex` round-trip on
+// every call.
 #[cfg(feature = "std")]
-fn predefined_ll_table() -> &'static crate::fse::FSETable {
+fn predefined_ll_table()
+-> Result<&'static crate::fse::FSETable, crate::decoding::errors::FSETableError> {
     use std::sync::OnceLock;
     static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
-    CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
-        t.build_from_probabilities(
-            LL_DEFAULT_ACC_LOG,
-            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-        )
-        .expect("predefined LL distribution is well-formed");
-        t.enrich_with_packed_seq_meta(&LL_META);
-        t
-    })
+    if let Some(t) = CACHED.get() {
+        return Ok(t);
+    }
+    let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    t.build_from_probabilities(
+        LL_DEFAULT_ACC_LOG,
+        &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+    )?;
+    t.enrich_with_packed_seq_meta(&LL_META);
+    let _ = CACHED.set(t);
+    Ok(CACHED.get().expect("just set"))
 }
 
 #[cfg(feature = "std")]
-fn predefined_ml_table() -> &'static crate::fse::FSETable {
+fn predefined_ml_table()
+-> Result<&'static crate::fse::FSETable, crate::decoding::errors::FSETableError> {
     use std::sync::OnceLock;
     static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
-    CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
-        t.build_from_probabilities(
-            ML_DEFAULT_ACC_LOG,
-            &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-        )
-        .expect("predefined ML distribution is well-formed");
-        t.enrich_with_packed_seq_meta(&ML_META);
-        t
-    })
+    if let Some(t) = CACHED.get() {
+        return Ok(t);
+    }
+    let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
+    t.build_from_probabilities(
+        ML_DEFAULT_ACC_LOG,
+        &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+    )?;
+    t.enrich_with_packed_seq_meta(&ML_META);
+    let _ = CACHED.set(t);
+    Ok(CACHED.get().expect("just set"))
 }
 
 #[cfg(feature = "std")]
-fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
+fn predefined_of_table()
+-> Result<(&'static crate::fse::FSETable, u32), crate::decoding::errors::FSETableError> {
     use std::sync::OnceLock;
     static CACHED: OnceLock<(crate::fse::FSETable, u32)> = OnceLock::new();
-    let cache = CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
-        t.build_from_probabilities(
-            OF_DEFAULT_ACC_LOG,
-            &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-        )
-        .expect("predefined OF distribution is well-formed");
-        t.enrich_for_offsets();
-        let share = compute_offsets_long_share(&t);
-        (t, share)
-    });
-    (&cache.0, cache.1)
+    if let Some(cache) = CACHED.get() {
+        return Ok((&cache.0, cache.1));
+    }
+    let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
+    t.build_from_probabilities(
+        OF_DEFAULT_ACC_LOG,
+        &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
+    )?;
+    t.enrich_for_offsets();
+    let share = compute_offsets_long_share(&t);
+    let _ = CACHED.set((t, share));
+    let cache = CACHED.get().expect("just set");
+    Ok((&cache.0, cache.1))
 }
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
@@ -1454,6 +1472,116 @@ const OF_DEFAULT_ACC_LOG: u8 = 5;
 const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
+
+/// Regression gate for the predefined FSE table cache: every cached
+/// table must be byte-identical to the table the rebuild path would
+/// produce on the next call. If the cache ever drifts from the
+/// rebuild output (different `decode` entries, different
+/// `accuracy_log`, different `offsets_long_share` for OF) the
+/// dispatch in `maybe_update_fse_tables` would silently decode
+/// against a stale table — the bench delta would still look fine
+/// but cross-validation against the donor would diverge on the
+/// next ratio gate.
+#[cfg(feature = "std")]
+#[test]
+fn predefined_fse_caches_match_rebuild_output() {
+    use crate::fse::FSETable;
+
+    let mut ll_rebuild = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    ll_rebuild
+        .build_from_probabilities(
+            LL_DEFAULT_ACC_LOG,
+            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    ll_rebuild.enrich_with_packed_seq_meta(&LL_META);
+    let ll_cached = predefined_ll_table().unwrap();
+    assert_eq!(ll_rebuild.accuracy_log, ll_cached.accuracy_log);
+    assert_eq!(ll_rebuild.decode.len(), ll_cached.decode.len());
+    for (i, (a, b)) in ll_rebuild
+        .decode
+        .iter()
+        .zip(ll_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "LL entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "LL entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "LL entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "LL entry {i} num_additional_bits mismatch"
+        );
+    }
+
+    let mut ml_rebuild = FSETable::new(MAX_MATCH_LENGTH_CODE);
+    ml_rebuild
+        .build_from_probabilities(
+            ML_DEFAULT_ACC_LOG,
+            &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    ml_rebuild.enrich_with_packed_seq_meta(&ML_META);
+    let ml_cached = predefined_ml_table().unwrap();
+    assert_eq!(ml_rebuild.accuracy_log, ml_cached.accuracy_log);
+    assert_eq!(ml_rebuild.decode.len(), ml_cached.decode.len());
+    for (i, (a, b)) in ml_rebuild
+        .decode
+        .iter()
+        .zip(ml_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "ML entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "ML entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "ML entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "ML entry {i} num_additional_bits mismatch"
+        );
+    }
+
+    let mut of_rebuild = FSETable::new(MAX_OFFSET_CODE);
+    of_rebuild
+        .build_from_probabilities(
+            OF_DEFAULT_ACC_LOG,
+            &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    of_rebuild.enrich_for_offsets();
+    let of_rebuild_share = compute_offsets_long_share(&of_rebuild);
+    let (of_cached, of_cached_share) = predefined_of_table().unwrap();
+    assert_eq!(of_rebuild.accuracy_log, of_cached.accuracy_log);
+    assert_eq!(of_rebuild.decode.len(), of_cached.decode.len());
+    assert_eq!(
+        of_rebuild_share, of_cached_share,
+        "OF offsets_long_share mismatch"
+    );
+    for (i, (a, b)) in of_rebuild
+        .decode
+        .iter()
+        .zip(of_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "OF entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "OF entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "OF entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "OF entry {i} num_additional_bits mismatch"
+        );
+    }
+}
 
 #[test]
 fn test_ll_default() {

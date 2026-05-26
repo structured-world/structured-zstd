@@ -253,7 +253,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// `Block_Size` exceeds the caller's output slice surfaces as a
     /// structured error instead of panicking. Compressed-block
     /// sequence execution is a follow-up.
-    #[inline]
+    #[inline(always)]
     pub fn try_push(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
         self.buffer.try_extend(data)?;
         self.total_output_counter += data.len() as u64;
