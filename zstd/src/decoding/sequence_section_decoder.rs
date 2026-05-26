@@ -467,10 +467,11 @@ fn decode_and_execute_sequences_impl<
         // inline donor-shape writer fires on backends that opt in
         // (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true`).
         // The legacy `execute_one_sequence` path went through
-        // `DecodeBuffer::repeat_match` → `total_output_counter +=
-        // match_length` (decode_buffer.rs:357), which perf annotate
-        // on z000033 L-3 fast attributed ~6% of decode time to (the
-        // RMW at `0x40(r8)` of the wrapper struct). The inline
+        // `DecodeBuffer::repeat_inner` which incremented
+        // `total_output_counter += match_length` on every sequence —
+        // perf annotate on z000033 L-3 fast attributed ~6% of decode
+        // time to that RMW at offset `0x40(r8)` of the wrapper
+        // struct. The inline
         // executor advances `tail` directly inside the backend, so
         // the wrapper-level counter is bypassed entirely on this
         // path; the post-block FCS check in `run_direct_decode`
