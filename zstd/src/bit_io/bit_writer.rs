@@ -353,6 +353,22 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             "write_bits_64 num_bits={num_bits} exceeds u64 width",
         );
 
+        // Full-word fast path: when `num_bits == 64` AND the partial
+        // buffer is empty, write the whole u64 directly. Falls back to
+        // the normal path otherwise — that path's
+        // `write_bits_64_cold` does `bits >> bits_free_in_partial`
+        // where `bits_free_in_partial = 64 - bits_in_partial`. With
+        // `bits_in_partial == 0` and `num_bits == 64` the shift is by
+        // 64 (UB). Routing the empty-partial / num_bits==64 case
+        // through this fast path avoids the cold-path shift entirely;
+        // for `num_bits == 64` with non-empty partial, the cold path's
+        // shift is `<= 63` which is well-defined.
+        if num_bits == 64 && self.bits_in_partial == 0 {
+            self.output.as_mut().extend_from_slice(&bits.to_le_bytes());
+            self.bit_idx += 64;
+            return;
+        }
+
         // Dirty-upper-bits contract: the caller MUST pre-mask `bits`
         // to the `num_bits` low-bit range. Violation silently corrupts
         // the output bitstream because subsequent `write_bits_64`

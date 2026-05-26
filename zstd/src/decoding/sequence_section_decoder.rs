@@ -900,16 +900,14 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     // Reading `state` directly drops the previous `lookup_ll_code` /
     // `lookup_ml_code` indirections (those did a second cache touch
     // on the separate meta tables per sequence) — the active entry
-    // is already cache-hot.
-    //
-    // OF intentionally keeps the closed-form `1u32 << of_code`
-    // baseline computation instead of reading `of_dec.state.base_value`:
-    // the shift is a single ALU op vs a 4-byte memory load, both
-    // produce identical codegen with `obits + ...` add, and `of_code`
-    // is still required for `get_bits_triple` and the
-    // `debug_assert!(of_code <= MAX_OFFSET_CODE)` precondition. The
-    // 12-byte Entry layout still pays off here through LL / ML's
-    // base_value / num_additional_bits reads.
+    // is already cache-hot. OF reads from the same Entry layout via
+    // `base_value` / `num_additional_bits` written by
+    // `enrich_for_offsets` at build time; on x86_64 the codegen
+    // matches the prior `1u32 << of_code` shift form (both share the
+    // already-touched bit-count cache line) and the uniform read
+    // shape unblocks dropping `state.symbol` from the hot path so
+    // the 12-byte Entry can shrink to donor's 8-byte ZSTD_seqSymbol
+    // in a follow-up tightening of the FSE table cache footprint.
     let ll_state = ll_dec.state;
     let ml_state = ml_dec.state;
     let of_state = of_dec.state;
