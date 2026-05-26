@@ -39,17 +39,17 @@ impl<'t> FSEDecoder<'t> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
-        // Externally-constructible-table guard: `FSETable::decode`
-        // and `FSETable::accuracy_log` are `pub` fields, so safe
-        // external callers (not just `fuzz_exports` harnesses) can
-        // hand the decoder a table whose `decode.len()` doesn't match
-        // `1 << accuracy_log`. Validate the shape invariant up-front
-        // and surface as a typed `InvalidTableShape` error (distinct
-        // from `TableIsUninitialized` to keep error triage
-        // unambiguous) — without this, `read_entry`'s unchecked
-        // indexing (the `cfg(not(fuzz_exports))` arm) hits UB in
-        // release builds on a malformed table. `checked_shl` covers
-        // the pathological case where `accuracy_log >= usize::BITS`.
+        // Defense-in-depth internal-invariant guard: in normal builds
+        // `crate::fse` is not externally reachable, but malformed
+        // tables can still arise from internal misuse, future
+        // `feature = "fuzz_exports"`. Validate up-front that
+        // `decode.len() == 1 << accuracy_log` and surface a typed
+        // `InvalidTableShape` error (distinct from
+        // `TableIsUninitialized` to keep error triage unambiguous).
+        // Without this, `read_entry`'s unchecked indexing (the
+        // `cfg(not(fuzz_exports))` arm) could hit UB on a malformed
+        // table in release builds. `checked_shl` covers the
+        // pathological case where `accuracy_log >= usize::BITS`.
         // Branch cost is a single per-call check; the per-sequence
         // hot path (`update_state_fast`) is unaffected.
         let accuracy_log = self.table.accuracy_log;
