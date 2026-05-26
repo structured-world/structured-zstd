@@ -888,7 +888,25 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         {
             use crate::blocks::block::BlockType as BT;
             use crate::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo};
-            let frame_header_len = header_buf.len() as u32;
+            // All frame-offset arithmetic below is bounded by u32 on
+            // the wire (Block_Size is a 21-bit field, frames bounded
+            // by MAX_BLOCK_SIZE * #blocks). A pathologically large
+            // frame whose total emitted size exceeds u32::MAX would
+            // overflow the cast — bail out by leaving
+            // `frame_emit_info` at `None` rather than handing the
+            // caller a silently-truncated layout. Checked once for
+            // header / all_blocks / cursor up front + once per push;
+            // the overflow path is statically unreachable on every
+            // realistic frame so the predictor amortises the branch
+            // to zero cost on the hot path.
+            let frame_header_len: u32 = match u32::try_from(header_buf.len()) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let all_blocks_len_u32: u32 = match u32::try_from(all_blocks.len()) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
             let mut blocks: Vec<FrameBlock> = Vec::new();
             let mut cursor: usize = 0;
             while cursor + 3 <= all_blocks.len() {
@@ -915,8 +933,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     BT::RLE => 1,
                     _ => block_size_field,
                 };
+                let cursor_u32: u32 = match u32::try_from(cursor) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let offset_in_frame = match frame_header_len.checked_add(cursor_u32) {
+                    Some(v) => v,
+                    None => return,
+                };
                 blocks.push(FrameBlock {
-                    offset_in_frame: frame_header_len + cursor as u32,
+                    offset_in_frame,
                     header_size: 3,
                     body_size: physical_body,
                     block_size_field,
@@ -929,14 +955,30 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 }
             }
             let checksum_range = if cfg!(feature = "hash") {
-                let cs_start = frame_header_len + all_blocks.len() as u32;
-                Some(cs_start..cs_start + 4)
+                let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let cs_end = match cs_start.checked_add(4) {
+                    Some(v) => v,
+                    None => return,
+                };
+                Some(cs_start..cs_end)
             } else {
                 None
             };
-            let total_size = frame_header_len
-                + all_blocks.len() as u32
-                + if checksum_range.is_some() { 4 } else { 0 };
+            let body_total = match frame_header_len.checked_add(all_blocks_len_u32) {
+                Some(v) => v,
+                None => return,
+            };
+            let total_size = if checksum_range.is_some() {
+                match body_total.checked_add(4) {
+                    Some(v) => v,
+                    None => return,
+                }
+            } else {
+                body_total
+            };
             self.frame_emit_info = Some(FrameEmitInfo {
                 frame_header_range: 0..frame_header_len,
                 blocks,

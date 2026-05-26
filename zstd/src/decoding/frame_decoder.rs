@@ -700,6 +700,12 @@ impl FrameDecoder {
         dict: &DictionaryHandle,
     ) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        // Fresh frame → drop the previous frame's per-block checksum
+        // digests so the next decode starts with an empty vec.
+        // Mirrors the same clear in `reset()`; reset_with_dict_handle
+        // is a parallel entry point so it needs its own call.
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        self.computed_block_checksums.clear();
         Self::validate_registered_dictionary(dict.as_dict())?;
         let magicless = self.magicless;
         // Scope the &mut borrow of `self.state` to the header parse
@@ -1263,8 +1269,20 @@ impl FrameDecoder {
             let fcs_declared = state_ref.frame_header.fcs_declared();
             let dict_active = state_ref.using_dict.is_some();
             let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-            let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+            // Per-block checksum collection lives in `decode_blocks`;
+            // the direct decode fast path writes through
+            // `UserSliceBackend` directly and never enters that loop.
+            // Force the legacy drain path when the caller has opted in
+            // to per-block checksums so the digests vector stays
+            // consistent regardless of output-slice slack.
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            let per_block_checksums_on = self.per_block_checksums_enabled;
+            #[cfg(not(all(feature = "lsm", feature = "hash")))]
+            let per_block_checksums_on = false;
+            let direct_eligible = content_size > 0
+                && !dict_active
+                && (output.len() as u64) >= needed
+                && !per_block_checksums_on;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
