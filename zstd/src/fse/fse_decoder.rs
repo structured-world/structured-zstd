@@ -770,6 +770,22 @@ mod tests {
     }
 
     #[test]
+    fn build_from_probabilities_rejects_overflow_in_sum() {
+        // DoS-shaped exploit: two i32::MAX values + 0x42 cast to u32
+        // and summed wrapping wraps to 0x40 = 64 = 1 << acc_log. The
+        // pre-fix u32 sum check would accept the input, then
+        // build_decoding_table would run `for _ in 0..prob` against
+        // prob = i32::MAX, looping 2^31-1 times per such symbol.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 3] = [i32::MAX, i32::MAX, 0x42];
+        let result = t.build_from_probabilities(6, &probs);
+        assert!(
+            matches!(result, Err(FSETableError::InvalidProbability { .. })),
+            "expected InvalidProbability for overflow-shaped exploit, got {result:?}",
+        );
+    }
+
+    #[test]
     fn build_from_probabilities_rejects_negative_below_minus_one() {
         // RFC 8478 §4.1.1: probability values are in {-1, 0, positive}.
         // p = -2 is outside the spec; clamping to 0 silently is wrong.
