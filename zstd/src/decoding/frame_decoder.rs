@@ -1041,7 +1041,66 @@ impl FrameDecoder {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
-        self.decode_all_impl(input, output, |this, src| this.init(src))
+        #[cfg(not(feature = "lsm"))]
+        {
+            self.decode_all_impl(input, output, |this, src| this.init(src))
+        }
+        #[cfg(feature = "lsm")]
+        {
+            self.decode_all_impl(input, output, |this, src| this.init(src), None)
+        }
+    }
+
+    /// Decode multiple frames into the output slice, invoking `visitor`
+    /// for every skippable frame encountered before advancing past it.
+    ///
+    /// `input` must contain an exact number of frames. Skippable frames
+    /// (RFC 8878 §3.1.2 magic numbers `0x184D2A50..=0x184D2A5F`) are
+    /// allowed and will be both visited AND skipped: the visitor gets
+    /// `(magic_variant, payload)` where `magic_variant` is the low
+    /// nibble of the magic (`magic - 0x184D2A50`, range `0..=15`) and
+    /// `payload` is a borrowed slice of the on-wire payload bytes (the
+    /// skippable frame's `Frame_Size` field worth of data) into
+    /// `input` — no allocation.
+    ///
+    /// The visitor sees skippable frames in stream order; interleaved
+    /// regular zstd frames continue to decompress into `output` exactly
+    /// as `decode_all` does.
+    ///
+    /// `output` must be large enough to hold the decompressed data.
+    /// Returns the number of bytes written to `output`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// let mut decoder = FrameDecoder::new();
+    /// let mut output = vec![0u8; 1024];
+    /// let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
+    /// let n = decoder.decode_all_with_skippable_visitor(
+    ///     input,
+    ///     &mut output,
+    ///     |variant, payload| collected.push((variant, payload.to_vec())),
+    /// )?;
+    /// ```
+    #[cfg(feature = "lsm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+    pub fn decode_all_with_skippable_visitor<F>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        mut visitor: F,
+    ) -> Result<usize, FrameDecoderError>
+    where
+        F: FnMut(u8, &[u8]),
+    {
+        self.decode_all_impl(
+            input,
+            output,
+            |this, src| this.init(src),
+            Some(&mut visitor),
+        )
     }
 
     /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
@@ -1067,11 +1126,27 @@ impl FrameDecoder {
         output: &mut [u8],
         dict: &DictionaryHandle,
     ) -> Result<usize, FrameDecoderError> {
-        self.decode_all_impl(input, output, |this, src| {
-            this.init_with_dict_handle(src, dict)
-        })
+        #[cfg(not(feature = "lsm"))]
+        {
+            self.decode_all_impl(input, output, |this, src| {
+                this.init_with_dict_handle(src, dict)
+            })
+        }
+        #[cfg(feature = "lsm")]
+        {
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.init_with_dict_handle(src, dict),
+                None,
+            )
+        }
     }
 
+    /// Default-feature decode_all_impl: no visitor parameter so the
+    /// no-lsm build's call surface and codegen are byte-identical to
+    /// the pre-#172 implementation. Compiles only when `lsm` is OFF.
+    #[cfg(not(feature = "lsm"))]
     fn decode_all_impl(
         &mut self,
         mut input: &[u8],
@@ -1089,6 +1164,113 @@ impl FrameDecoder {
                     input = input
                         .get(length as usize..)
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            // Per-frame direct-path dispatch. Now safe to route the
+            // public `decode_all` here because
+            // `UserSliceBackend::exec_sequence_inline` returns
+            // `Result<(), ExecuteSequencesError>` instead of
+            // panicking on capacity overflow; the error propagates
+            // up as `FrameDecoderError`. Eligibility (FCS > 0, no
+            // active dict, remaining `output` slice has WILDCOPY
+            // slack) puts the frame on the fast path that bypasses
+            // the FlatBuf/Ring -> `read()` drain copy. Ineligible
+            // frames (no FCS, active dict, output too small for
+            // slack) fall through to the legacy `decode_blocks` +
+            // `read` drain loop below.
+            let state_ref = self.state.as_ref().expect("init populated state");
+            let content_size = state_ref.frame_header.frame_content_size();
+            let fcs_declared = state_ref.frame_header.fcs_declared();
+            let dict_active = state_ref.using_dict.is_some();
+            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+            let direct_eligible =
+                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+            if direct_eligible {
+                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                output = &mut output[written..];
+                total_bytes_written += written;
+                continue;
+            }
+            let frame_start_total = total_bytes_written;
+            loop {
+                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                let bytes_written = self
+                    .read(output)
+                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                output = &mut output[bytes_written..];
+                total_bytes_written += bytes_written;
+                if self.can_collect() != 0 {
+                    return Err(FrameDecoderError::TargetTooSmall);
+                }
+                if self.is_finished() {
+                    break;
+                }
+            }
+            // Per-frame FCS validation on the legacy fallback path.
+            // Use `fcs_declared()` (NOT `content_size > 0`) so an
+            // empty frame with explicit FCS=0 on the wire still gets
+            // validated.
+            if fcs_declared {
+                let produced = (total_bytes_written - frame_start_total) as u64;
+                if produced != content_size {
+                    return Err(FrameDecoderError::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced,
+                    });
+                }
+            }
+        }
+
+        Ok(total_bytes_written)
+    }
+
+    /// `lsm`-feature decode_all_impl: adds the optional skippable
+    /// visitor parameter consumed by
+    /// [`Self::decode_all_with_skippable_visitor`]. Mirrors the no-lsm
+    /// variant including the direct-path dispatch + FCS-validation
+    /// rationale comments, so the two functions stay in sync; the only
+    /// behavioral difference is the SkipFrame arm, which uses
+    /// `split_at(length)` (single bounds check) instead of two
+    /// separate `get(..length)` / `get(length..)` slices and invokes
+    /// the visitor (when `Some`) on the borrowed payload before
+    /// advancing past it.
+    #[cfg(feature = "lsm")]
+    fn decode_all_impl(
+        &mut self,
+        mut input: &[u8],
+        mut output: &mut [u8],
+        mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
+        mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
+    ) -> Result<usize, FrameDecoderError> {
+        use super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut total_bytes_written = 0;
+        while !input.is_empty() {
+            match init_frame(self, &mut input) {
+                Ok(_) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame {
+                        magic_number,
+                        length,
+                    },
+                )) => {
+                    let length = length as usize;
+                    // Visitor sees the payload slice BEFORE we advance
+                    // past it. Borrowed slice — no allocation. The
+                    // variant is the low nibble of the magic number
+                    // (RFC 8878 §3.1.2). `read_frame_header` only emits
+                    // SkipFrame for magic in 0x184D2A50..=0x184D2A5F, so
+                    // the subtraction fits in 0..=15.
+                    if input.len() < length {
+                        return Err(FrameDecoderError::FailedToSkipFrame);
+                    }
+                    let (payload, rest) = input.split_at(length);
+                    if let Some(visitor) = skippable_visitor.as_mut() {
+                        let variant = (magic_number - 0x184D2A50) as u8;
+                        visitor(variant, payload);
+                    }
+                    input = rest;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -2078,5 +2260,105 @@ mod tests {
                 .reset(compressed.as_slice())
                 .expect("retry after clearing expectation should succeed");
         }
+    }
+
+    /// Build a skippable frame on the wire: 4-byte LE magic + 4-byte LE
+    /// length + payload bytes. RFC 8878 §3.1.2 restricts the magic
+    /// variant to `0..=15`; assert here so accidental misuse of the
+    /// helper can't smuggle a non-skippable magic past the tests.
+    #[cfg(feature = "lsm")]
+    fn build_skippable_frame(variant: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(
+            variant <= 15,
+            "skippable-frame variant {variant} outside RFC 8878 0..=15 range",
+        );
+        let mut out = Vec::with_capacity(8 + payload.len());
+        let magic: u32 = 0x184D2A50 + u32::from(variant);
+        out.extend_from_slice(&magic.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_all_with_skippable_visitor_sees_payloads_in_order() {
+        // Build a stream: skippable(v0, "alpha") + zstd_frame +
+        // skippable(v3, "beta") + zstd_frame + skippable(v15, "")
+        // and verify the visitor is invoked exactly three times with
+        // the correct (variant, payload) pairs in stream order while
+        // the zstd frames decode normally.
+        let payload_a: Vec<u8> = (0..256u16).map(|i| i as u8).collect();
+        let payload_b: Vec<u8> = (0..256u16).map(|i| (i ^ 0xAA) as u8).collect();
+
+        let mut comp_a = Vec::new();
+        let mut c = FrameCompressor::new(CompressionLevel::Default);
+        c.set_source(payload_a.as_slice());
+        c.set_drain(&mut comp_a);
+        c.compress();
+
+        let mut comp_b = Vec::new();
+        let mut c = FrameCompressor::new(CompressionLevel::Default);
+        c.set_source(payload_b.as_slice());
+        c.set_drain(&mut comp_b);
+        c.compress();
+
+        let skip0 = build_skippable_frame(0, b"alpha");
+        let skip3 = build_skippable_frame(3, b"beta");
+        let skip15 = build_skippable_frame(15, &[]);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&skip0);
+        stream.extend_from_slice(&comp_a);
+        stream.extend_from_slice(&skip3);
+        stream.extend_from_slice(&comp_b);
+        stream.extend_from_slice(&skip15);
+
+        let mut decoder = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload_a.len() + payload_b.len()];
+        let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
+        let n = decoder
+            .decode_all_with_skippable_visitor(stream.as_slice(), &mut out, |variant, payload| {
+                collected.push((variant, payload.to_vec()));
+            })
+            .expect("decode_all_with_skippable_visitor should succeed");
+
+        // All three skippables visited in stream order.
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], (0u8, b"alpha".to_vec()));
+        assert_eq!(collected[1], (3u8, b"beta".to_vec()));
+        assert_eq!(collected[2], (15u8, Vec::<u8>::new()));
+
+        // Both zstd frames decoded into `out` back-to-back.
+        assert_eq!(n, payload_a.len() + payload_b.len());
+        assert_eq!(&out[..payload_a.len()], payload_a.as_slice());
+        assert_eq!(&out[payload_a.len()..n], payload_b.as_slice());
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_all_silently_skips_when_no_visitor() {
+        // Regression gate: plain decode_all must still silently skip
+        // skippable frames (RFC 8878 mandated behavior) with no
+        // behavioral change after the visitor refactor.
+        let payload: Vec<u8> = (0..512u16).map(|i| i as u8).collect();
+        let mut comp = Vec::new();
+        let mut c = FrameCompressor::new(CompressionLevel::Default);
+        c.set_source(payload.as_slice());
+        c.set_drain(&mut comp);
+        c.compress();
+
+        let skip = build_skippable_frame(7, b"ignored sidecar");
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&skip);
+        stream.extend_from_slice(&comp);
+
+        let mut decoder = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = decoder
+            .decode_all(stream.as_slice(), &mut out)
+            .expect("decode_all should succeed on skippable + zstd stream");
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], payload.as_slice());
     }
 }
