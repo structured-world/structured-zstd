@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779828476063,
+  "lastUpdate": 1779831025199,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48246,6 +48246,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
             "value": 1.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "390376fd5a9025e0a519cd3f18d9331108ab2f42",
+          "message": "feat(decoding): skippable-payload visitor callback on FrameDecoder (#271)\n\n* feat(decoding): skippable-payload visitor callback on FrameDecoder\n\nAdds 'FrameDecoder::decode_all_with_skippable_visitor' behind the\n'lsm' Cargo feature (default off). The visitor closure receives\n'(magic_variant, payload)' for every skippable frame encountered in\nthe stream BEFORE the decoder advances past it. The payload is a\nborrowed slice into the caller's input — no allocation.\n\nInternally, decode_all_impl is genericized over an\n'Option<V: FnMut(u8, &[u8])>' visitor parameter. The existing\n'decode_all' / 'decode_all_with_dict_handle' pass 'None' (and use a\nzero-sized 'fn(u8, &[u8])' placeholder to satisfy the V type), so\ntheir RFC-mandated silent-skip behaviour is preserved with no\nbehavioural change.\n\nUse cases the visitor unblocks (consumer-side):\n- Forensic / 'zstdcat'-style tooling that wants to surface\n  per-skippable metadata alongside the decoded payload.\n- Storage formats embedding sidecar metadata (variant 0..=15) per\n  RFC 8878 §3.1.2, where the application protocol carries\n  out-of-band information adjacent to the zstd data.\n\nTests (feature = 'lsm'):\n- decode_all_with_skippable_visitor_sees_payloads_in_order: stream\n  with five frames (skippable v0/v3/v15 interleaved with two zstd\n  data frames) — visitor invoked exactly three times in stream order\n  with correct (variant, payload) pairs; both zstd frames decode\n  into the output back-to-back.\n- decode_all_silently_skips_when_no_visitor: plain decode_all on a\n  skippable + zstd stream still produces the decompressed data and\n  drops the skippable payload silently (RFC 8878 compliance, no\n  regression after the refactor).\n\nCloses #172.\n\n* fix(decoding): visitor ergonomics + doc wording + test-helper variant guard\n\nCodeRabbit review on #271:\n\n#1: 'None::<&mut fn(u8, &[u8])>' placeholder type at every default-\nvisitor call site was ugly and coupled the impl's visitor\nrepresentation to caller ergonomics. Switch decode_all_impl to\n'Option<&mut dyn FnMut(u8, &[u8])>' so non-visitor entry points pass\na plain 'None' and the visitor entry point passes 'Some(&mut visitor)'\nwithout a generic placeholder.\n\n#2: rustdoc on decode_all_with_skippable_visitor said the payload\nslice has length 'frame_size'. The wire field is the skippable\nframe's payload-length 'length' (and the on-spec term is\n'Frame_Size' which can be confused with the frame-header field by\nthe same name). Rewrite as 'the skippable frame's Frame_Size field\nworth of data' for unambiguity.\n\n#3: 'build_skippable_frame' test helper accepted any 'variant: u8'\nand would produce a non-skippable magic for values > 15 (outside\nRFC 8878 0..=15). Add 'assert!(variant <= 15)' so misuse fails\nloudly instead of silently constructing invalid test inputs.\n\n* fix(decoding): split decode_all_impl + docsrs annotation for visitor API\n\nCodeRabbit review on #271:\n\n#4: PR description claimed byte-identical no-lsm build, but\n'decode_all_impl' was unconditionally refactored to take an\nOption<&mut dyn FnMut> visitor parameter. Split the function:\n- '#[cfg(not(feature = \"lsm\"))] fn decode_all_impl' keeps the\n  pre-#172 signature (3 params, no visitor branch) and the original\n  body, so the default-feature build's codegen for this function is\n  identical to main.\n- '#[cfg(feature = \"lsm\")] fn decode_all_impl' adds the\n  Option<&mut dyn FnMut(u8, &[u8])> param + visitor invocation in\n  the SkipFrame arm. Compiles only when the feature is on.\n\n'decode_all' / 'decode_all_with_dict_handle' route to the right\nvariant via cfg-blocks; their public signatures are unchanged.\n\n#5: 'decode_all_with_skippable_visitor' was '#[cfg(feature = \"lsm\")]'\nbut missing the 'docsrs' annotation that the surrounding\nlsm-gated API uses ('expect_dict_id', 'expect_window_descriptor').\nAdd '#[cfg_attr(docsrs, doc(cfg(feature = \"lsm\")))]' so the\nfeature gate is visible in rendered docs.rs output.\n\n* fix(decoding): copy direct-path rationale to lsm impl + split_at for SkipFrame slices\n\nCodeRabbit review on #271:\n\n#6: doc on the lsm-feature decode_all_impl claimed 'body is\nidentical to the no-lsm variant' but the lsm copy was missing the\ndirect-path dispatch rationale and the fcs_declared() validation\ncomment present in the no-lsm path. Copy those comments verbatim\nso the two cfg-gated variants stay in sync, and rephrase the\ndocstring to call out the actual behavioural difference (split_at\n+ visitor invocation in SkipFrame, not just the visitor).\n\n#7: SkipFrame arm did two bounds-checked slices ('get(..length)' +\n'get(length..)') for payload and rest. One up-front length check +\n'split_at(length)' is both shorter and guarantees the two slices\nstay consistent. Drop the now-redundant FailedToSkipFrame on the\nrest slice.",
+          "timestamp": "2026-05-26T23:45:58+03:00",
+          "tree_id": "940db99dd603035eb80022c8fd63b388ba5973b1",
+          "url": "https://github.com/structured-world/structured-zstd/commit/390376fd5a9025e0a519cd3f18d9331108ab2f42"
+        },
+        "date": 1779831019251,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 327.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.768,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.695,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.83,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.939,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.804,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.957,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.22,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.221,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.488,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.097,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.778,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.748,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.061,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.871,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.106,
             "unit": "ms"
           },
           {
