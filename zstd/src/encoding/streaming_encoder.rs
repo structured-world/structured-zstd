@@ -428,6 +428,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         last_block,
                         block,
                         &mut encoded,
+                        None,
                     );
                     moved_into_matcher = true;
                 }

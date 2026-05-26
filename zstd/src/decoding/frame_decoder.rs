@@ -1269,20 +1269,15 @@ impl FrameDecoder {
             let fcs_declared = state_ref.frame_header.fcs_declared();
             let dict_active = state_ref.using_dict.is_some();
             let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
-            // Per-block checksum collection lives in `decode_blocks`;
-            // the direct decode fast path writes through
-            // `UserSliceBackend` directly and never enters that loop.
-            // Force the legacy drain path when the caller has opted in
-            // to per-block checksums so the digests vector stays
-            // consistent regardless of output-slice slack.
-            #[cfg(all(feature = "lsm", feature = "hash"))]
-            let per_block_checksums_on = self.per_block_checksums_enabled;
-            #[cfg(not(all(feature = "lsm", feature = "hash")))]
-            let per_block_checksums_on = false;
-            let direct_eligible = content_size > 0
-                && !dict_active
-                && (output.len() as u64) >= needed
-                && !per_block_checksums_on;
+            // Per-block checksums collected inside `run_direct_decode`
+            // post-loop (over recorded (start, end) ranges of `output`)
+            // so the direct path stays eligible AND keeps the
+            // window-size cap (`drop_to_window_size`) between blocks
+            // that the spec relies on for `offset <= window_size`
+            // validation. Path choice no longer alters checksum
+            // semantics.
+            let direct_eligible =
+                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
@@ -1589,7 +1584,17 @@ impl FrameDecoder {
         // tracking would always count 0 for those blocks and
         // miscount frames that aren't pure Raw/RLE.
         let mut produced: u64 = 0;
+        // Per-block output ranges captured during the direct-path
+        // loop. After the loop we re-borrow `output` (post-drop of
+        // `direct`) and XXH64 each range into
+        // `self.computed_block_checksums`, so the digests vector
+        // stays consistent with the legacy `decode_blocks` path
+        // regardless of which dispatch the frame took.
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        let mut block_ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
         loop {
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            let produced_before = produced as usize;
             let (block_header, hsize) = block_dec
                 .read_block_header(&mut *input)
                 .map_err(err::FailedToReadBlockHeader)?;
@@ -1648,6 +1653,10 @@ impl FrameDecoder {
             }
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if self.per_block_checksums_enabled {
+                block_ranges.push((produced_before, produced as usize));
+            }
             // Cap the visible buffer at window_size between blocks
             // so the next block's match-offset validation matches
             // the spec's `offset <= window_size` rule.
@@ -1678,6 +1687,21 @@ impl FrameDecoder {
         // borrow on `output`) so we can re-borrow `output` for the
         // hash pass below.
         drop(direct);
+        // Per-block XXH64 (low 32 bits) over the captured ranges.
+        // Mirrors `decode_blocks`' per-block hashing so the digests
+        // vector stays identical regardless of which dispatch path
+        // the frame took. Ranges were recorded inside the loop while
+        // `direct` held a mutable borrow on `output`; now that the
+        // borrow is dropped we can read the slices directly.
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if self.per_block_checksums_enabled {
+            use core::hash::Hasher;
+            for (start, end) in &block_ranges {
+                let mut h = twox_hash::XxHash64::with_seed(0);
+                h.write(&output[*start..*end]);
+                self.computed_block_checksums.push(h.finish() as u32);
+            }
+        }
         #[cfg(feature = "hash")]
         {
             // Direct path bypasses the per-write hash accounting

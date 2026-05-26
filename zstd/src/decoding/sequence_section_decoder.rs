@@ -73,9 +73,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     literals_buffer: &[u8],
     rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
-    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
     #[cfg(target_arch = "aarch64")]
-    use crate::cpu_kernel::{NeonKernel, SveKernel};
+    use crate::cpu_kernel::NeonKernel;
+    #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
+    use crate::cpu_kernel::SveKernel;
+    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
 
     match detect_cpu_kernel() {
         CpuKernelTag::Scalar => decode_and_execute_sequences_impl::<B, ScalarKernel>(
@@ -149,7 +151,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             literals_buffer,
             rle_fallback_sequences,
         ),
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
         CpuKernelTag::Sve => decode_and_execute_sequences_impl::<B, SveKernel>(
             section,
             source,

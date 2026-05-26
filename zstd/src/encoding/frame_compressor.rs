@@ -380,6 +380,17 @@ fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
 /// through. Caller is responsible for passing exactly
 /// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
 /// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
+/// XXH64 (low 32 bits, seed 0) over `data`. Shared helper for the
+/// per-physical-block checksum sidecar so encoder and decoder hash
+/// the exact same byte ranges with the exact same parameters.
+#[cfg(feature = "hash")]
+#[inline]
+pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
+    let mut h = XxHash64::with_seed(0);
+    h.write(data);
+    h.finish() as u32
+}
+
 #[cfg(feature = "bench_internals")]
 pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
     assert_eq!(
@@ -777,20 +788,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // As we read, hash that data too
             #[cfg(feature = "hash")]
             self.hasher.write(&uncompressed_data);
-            // Per-input-chunk XXH64 (low 32 bits) for the optional
-            // per-block checksum sidecar. Chunk-level granularity
-            // matches the forensic-ECC use case (one digest per input
-            // chunk passed to the block emitter); see
-            // `enable_per_block_checksums` rustdoc for the post-split
-            // semantics. Hashed BEFORE the block-emit call below so
-            // we capture the input bytes regardless of which physical
-            // block type (Raw / RLE / Compressed) the emitter chooses.
-            #[cfg(all(feature = "lsm", feature = "hash"))]
-            if let Some(checksums) = self.block_checksums.as_mut() {
-                let mut h = XxHash64::with_seed(0);
-                h.write(&uncompressed_data);
-                checksums.push(h.finish() as u32);
-            }
+            // Per-physical-block XXH64 (low 32 bits) for the optional
+            // per-block checksum sidecar. Hashing happens INSIDE the
+            // block emitters (RLE / Raw fast-path / Compressed /
+            // post-split partitions), so the digests vector has
+            // exactly one entry per physical Block_Header written to
+            // `all_blocks` — 1:1 with `FrameEmitInfo.blocks`. See
+            // `enable_per_block_checksums` rustdoc.
             // Special handling is needed for compression of a totally empty file
             if uncompressed_data.is_empty() {
                 let header = BlockHeader {
@@ -799,6 +803,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     block_size: 0,
                 };
                 header.serialize(&mut all_blocks);
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                if let Some(checksums) = self.block_checksums.as_mut() {
+                    checksums.push(xxh64_block_low32(&[]));
+                }
                 break;
             }
 
@@ -810,6 +818,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_size: uncompressed_data.len().try_into().unwrap(),
                     };
                     header.serialize(&mut all_blocks);
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    if let Some(checksums) = self.block_checksums.as_mut() {
+                        checksums.push(xxh64_block_low32(&uncompressed_data));
+                    }
                     all_blocks.extend_from_slice(&uncompressed_data);
                     savings +=
                         uncompressed_data.len() as i64 - (3 + uncompressed_data.len()) as i64;
@@ -821,12 +833,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Level(_) => {
                     let before_len = all_blocks.len();
                     let block_len = uncompressed_data.len();
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    let checksum_sink = self.block_checksums.as_mut();
+                    #[cfg(not(all(feature = "lsm", feature = "hash")))]
+                    let checksum_sink: Option<&mut Vec<u32>> = None;
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         uncompressed_data,
                         &mut all_blocks,
+                        checksum_sink,
                     );
                     savings += block_len as i64 - (all_blocks.len() - before_len) as i64;
                 }
