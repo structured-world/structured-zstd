@@ -89,34 +89,34 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// allocation. The dispatch site in [`crate::decoding::FrameDecoder`]
 /// validates this precondition.
 ///
-/// # DoS surface on malformed Compressed blocks
+/// # Safety contract on malformed Compressed blocks
 ///
-/// The bounds checks on write entry points are uniformly
-/// release-mode `assert!` (for `extend`, `extend_and_fill`, and
-/// `extend_from_within_unchecked`). On adversarial input — a frame
-/// header that declares a small `frame_content_size` AND a
-/// Compressed block whose payload expands to more than the declared
-/// size — the burst's per-symbol writes can reach past `slice.len()`
-/// and panic via the `assert!` failure instead of returning a
-/// structured error. The frame-level `decode_all` checks
-/// `produced > content_size` AFTER each block; within a single block
-/// the panic-on-overshoot is the only stop.
+/// The safe public decode APIs ([`crate::decoding::FrameDecoder::decode_all`]
+/// and [`crate::decoding::FrameDecoder::decode_all_to_vec`]) route
+/// through the FALLIBLE write surface:
+/// [`Self::try_extend`] / [`Self::try_extend_and_fill`] /
+/// [`Self::try_extend_from_within`] for direct writes,
+/// [`super::buffer_backend::BufferBackend::try_reserve`] for the
+/// match-repeat pre-check inside `DecodeBuffer::repeat_inner`, and
+/// `exec_sequence_inline` (which returns
+/// `Result<(), ExecuteSequencesError>`). A malformed Compressed
+/// block whose payload expands past the declared
+/// `frame_content_size` surfaces as
+/// `ExecuteSequencesError::OutputBufferOverflow` (literal-push /
+/// donor-inline path) or `DecodeBufferError::OutputBufferOverflow`
+/// (match-repeat path), both of which propagate up the call stack
+/// as a structured `FrameDecoderError` instead of panicking.
 ///
-/// Callers handling untrusted input should use
-/// [`crate::decoding::FrameDecoder::decode_all`] which routes
-/// through `FlatBuf` / `RingBuffer` backends. Those backends grow
-/// via `Vec::reserve` — growth doesn't return errors (it succeeds
-/// or aborts on alloc failure), but the growable Vec capacity
-/// means a malformed block whose decompressed output exceeds FCS
-/// stays inside the allocation instead of writing OOB into a
-/// fixed-size user slice. The frame-level checks then catch the
-/// FCS mismatch and return `FrameContentSizeMismatch`.
-///
-/// Replacing the panics with `Result<_, _>`-returning writes (so
-/// `decode_all` itself can stay safe on adversarial input) is
-/// tracked in issue #246 — it requires extending the
-/// `BufferBackend` trait surface and would gate the direct path on
-/// the new fallible signatures.
+/// The INFALLIBLE entry points (`extend`, `extend_and_fill`,
+/// `extend_from_within_unchecked`) remain on the type as defense in
+/// depth and as the call shape for inner unsafe blocks where
+/// capacity has already been validated by the wrapping `try_*` call.
+/// Each retains a release-mode `assert!` so a future caller that
+/// invokes the infallible entry point directly with an OOB length
+/// fails with a clear diagnostic rather than letting the subsequent
+/// unsafe pointer math reach past `slice.len()`. The safe public
+/// APIs never reach these `assert!`s on malformed input — the
+/// fallible dispatch catches the overshoot one layer up.
 pub(crate) struct UserSliceBackend<'a> {
     slice: &'a mut [u8],
     /// Bytes in `slice[..head]` have been drained to the output

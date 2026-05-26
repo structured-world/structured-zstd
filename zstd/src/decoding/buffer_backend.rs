@@ -390,9 +390,14 @@ pub(crate) trait BufferBackend: Sized {
 ///
 /// All three modes return the same struct shape so the caller doesn't
 /// need to discriminate; `tail` / `requested` / `capacity` carry the
-/// diagnostic context. The decoder converts this into
-/// `FrameDecoderError::FrameContentSizeMismatch` at the
-/// `decode_all` boundary, so callers never see
+/// diagnostic context. The decoder converts this into one of two
+/// structured variants on the way out of `FrameDecoder`:
+/// `ExecuteSequencesError::OutputBufferOverflow` (literal-push and
+/// donor-inline paths inside the sequence executor) or
+/// `DecodeBufferError::OutputBufferOverflow` (the match-repeat
+/// `try_reserve` pre-check inside `DecodeBuffer::repeat_inner`).
+/// Both bubble up as a structured `FrameDecoderError` (typically
+/// wrapped in `FailedToReadBlockBody`) — callers never see
 /// `BackendOverflow` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackendOverflow {
