@@ -994,20 +994,24 @@ mod tests {
     fn donor_exec_one_sequence_short_offset_match_uses_overlap_copy() {
         // offset < 16 takes the overlapCopy8 + 8-byte stride path
         // (vs. the offset >= 16 wildcopy_no_overlap path).
-        // Cross-validate the donor inline path's offset < 16 branch
-        // against the reference legacy `extend`/`repeat_in_chunks`
-        // chain. Both backends decode the same sequence to the same
-        // bytes — donor parity holds when their outputs agree byte
-        // for byte. This is more robust than asserting a hand-derived
-        // pattern: the donor literal `copy16` may overshoot into the
-        // match-destination region, and the subsequent match copy
-        // reads from positions that include those overshoot bytes —
-        // the resulting output legitimately mixes literal-overshoot
-        // bytes with match-source bytes in a way that depends on
-        // ordering. The legacy path doesn't do the literal overshoot
-        // so it produces the "expected" RLE pattern. The cross-check
-        // therefore needs to compare two donor-path runs against
-        // each other, not against a hand-derived RLE expansion.
+        //
+        // What we actually assert here:
+        //   1. `tail` advances by `lit_length + match_length`.
+        //   2. The literal payload lands at `buf[tail..tail+ll]`.
+        //   3. The FIRST 4 match-output bytes match seed[4..8] —
+        //      that prefix of the match copy reads source bytes
+        //      that the literal `copy16` overshoot did NOT
+        //      overwrite (the donor `copy16` writes 16 bytes at
+        //      `tail`, so source bytes BEFORE `tail` survive).
+        //
+        // We do NOT cross-validate against the legacy `extend` +
+        // `repeat_in_chunks` chain: those paths don't perform the
+        // 16-byte literal overshoot, so they produce a different
+        // output for the same logical sequence (different bytes in
+        // positions where the donor's overshoot is consumed by the
+        // match copy). End-to-end parity is covered by the higher
+        // level `roundtrip_integrity::*` tests in lib.rs which
+        // decode whole frames and compare to the encoder input.
         const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut buf = vec![0u8; 256 + WILDCOPY];
         // Seed last 8 bytes of history with a recognisable pattern.
