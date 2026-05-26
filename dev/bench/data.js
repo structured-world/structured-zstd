@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779823321983,
+  "lastUpdate": 1779828476063,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48062,6 +48062,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69cb3f3f550668cedf406e40f16459e9f7babd95",
+          "message": "perf(decode): route short-block fallback through inline executor (z000033 −25%) (#269)\n\n* perf(decode): route short-block fallback through inline executor\n\nZ000033 L-3 fast flamegraph (426k samples on i9) showed the\nshort-block fallback path was hot on 'total_output_counter +=\nmatch_length' RMW at offset 0x40 of DecodeBuffer wrapper — ~6% of\nthe sequence-decode function's time (3.87% post-libc-call + 2.47%\npre-call accumulator updates).\n\nRoot cause: the fallback used 'execute_one_sequence', which routes\nmatch copies through 'DecodeBuffer::repeat_match' (decode_buffer.rs\nline 357) that maintains 'total_output_counter'. The pipelined-path\n'execute_one_sequence_pipelined' instead writes through\n'buffer_mut().exec_sequence_inline()' directly, advancing\n'UserSliceBackend::tail' inline and bypassing the wrapper counter\nentirely.\n\nFor z000033 L-3 fast specifically, the offsets_long_share gate\n(>= 7) rejects this fixture (fast-strategy emits short offsets) so\nthe WHOLE block goes through the fallback — the RMW penalty hits\nevery sequence. Unifying the fallback through the same inline\nexecutor as the pipelined path eliminates the RMW hot store on this\nclass of workload while keeping all the existing safety gates\n(inline_path_safe, prefix_end offset check) intact.\n\n* fix(decode): defer offset_hist mutation in short-block fallback (Err safety)\n\nPre-fix: the fallback loop called 'do_offset_history(seq.of, seq.ll,\noffset_hist)' mutating the real offset_hist BEFORE\n'execute_one_sequence_pipelined' could return Err (literal bounds\ncheck, inline-exec offset gate). The '?'-shaped early return then\nbypassed the post-loop rollback handler, leaving the caller with a\npartially-mutated offset_hist on Err - breaking the documented 'Err\nleaves no mutated repeat-history behind' contract.\n\nMirror the pipelined branch's shadow_hist + commit-on-success\npattern: per-iter mutations land in a local shadow_hist; on Err the\nfallback collects it in 'fallback_err: Option' and triggers an\nexplicit rollback arm (buffer checkpoint restore + early return) that\nmatches the pipelined run_pipelined_sequence_loop Err handling. On\nsuccess, one final '*offset_hist = shadow_hist' commit.\n\nUpdates the surrounding contract doc to reflect that both branches\nnow use shadow + commit (previously the doc still described the\nfallback as 'mutates inline').\n\n* fix(fse,decode): runtime FSE invariant check, drop dead execute_one_sequence, clarify counter doc\n\n#5: build_decoding_table downgraded the 'nb <= accuracy_log'\ninvariant to debug_assert!. Release builds rely on the unchecked\nread_entry hot path which assumes 'new_state + (1 << nb) - 1 <\ntable_size' (factoring through nb <= accuracy_log). The public\nbuild_from_probabilities surface could theoretically drive\ncalc_baseline_and_numbits to violate that invariant on a crafted\ninput. Upgrade to a runtime check that returns\nFSETableError::InvalidProbability so the safety contract holds in\nrelease as well as debug.\n\n#6: execute_one_sequence is now dead code after the short-block\nfallback rerouted through execute_one_sequence_pipelined. Remove\nthe unused function entirely (avoids dead_code warnings under\n-D warnings/clippy).\n\n#7: doc comment on the layered try_push + repeat_lookahead_prefetched\nfallback inside execute_one_sequence_pipelined claimed it 'keeps\ntotal_output_counter in sync'. Once any sequence in a block has\ntaken the inline-exec path, the wrapper counter is stale for the\nrest of the block — that claim was misleading. Rewrite the comment\nto state plainly that total_output_counter is NOT maintained on\ninline-exec paths; tail() is the authoritative byte count, which\nrun_direct_decode already uses.\n\n#4 (stale): the u32-overflow concern was already addressed by the\nprior commit; resolve as fixed.\n\n* docs(decode): fix stale repeat_match references → repeat_inner\n\nCodeRabbit thread #23 pointed out the comments still referenced\nDecodeBuffer::repeat_match which doesn't exist; the\ntotal_output_counter += match_length increment lives in\nDecodeBuffer::repeat_inner. Drop the misleading line-number\nreference too (decode_buffer.rs:357 doesn't track across edits) and\nkeep the structural reference (method name) only.\n\n* docs(decode): replace empty if-body with let _ + intent comment\n\nCodeRabbit #269 #24: 'if buffer.try_restore_checkpoint(cp) { }' had\nan empty body, so the call's bool return was evaluated but\ndiscarded. Replace with 'let _ = buffer.try_restore_checkpoint(cp)'\nand expand the comment to explain why the return value is\nintentionally ignored on this Err path (offset_hist already holds\nthe pre-loop value via shadow_hist, so neither branch needs the\nrestore-success signal).",
+          "timestamp": "2026-05-26T22:48:17+03:00",
+          "tree_id": "1738a822746243dc4fc41d30cca81aa74ad96306",
+          "url": "https://github.com/structured-world/structured-zstd/commit/69cb3f3f550668cedf406e40f16459e9f7babd95"
+        },
+        "date": 1779828470308,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 322.904,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 204.404,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.415,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.51,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 4.137,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.086,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.98,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.353,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.34,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.777,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.746,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.076,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.874,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
