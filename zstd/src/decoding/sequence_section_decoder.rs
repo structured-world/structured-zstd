@@ -294,6 +294,14 @@ fn decode_and_execute_sequences_impl<
     // the source maintenance for zero observed wins.
     if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
         decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
+        // `execute_sequences_fields` routes literal-pushes through
+        // `DecodeBuffer::try_push` (and match-repeats through
+        // `BufferBackend::try_reserve` inside `repeat_inner`), so a
+        // malformed RLE-driven sequence stream whose literal or match
+        // length overshoots a fixed-capacity backend (UserSliceBackend)
+        // surfaces as `ExecuteSequencesError::OutputBufferOverflow`
+        // rather than panicking via UserSliceBackend::extend's
+        // release-mode `assert!`.
         execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
         return Ok(());
     }
