@@ -416,10 +416,16 @@ fn decode_and_execute_sequences_impl<
     // Donor `ZSTD_decompressBlock_internal`: `usePrefetchDecoder` is
     // initialised from `dctx->ddictIsCold` so the first block of a
     // freshly-attached-dict frame engages the prefetch decoder
-    // unconditionally, then `ddictIsCold = 0` after the dispatch so
-    // subsequent blocks fall back to the `longOffsetShare` heuristic.
-    // The consume-once read/clear happens at function entry above so
-    // RLE-mode early returns don't leak the flag to a later block.
+    // regardless of long-offset share, then `ddictIsCold = 0` after
+    // the dispatch so subsequent blocks fall back to the
+    // `longOffsetShare` heuristic. The consume-once read/clear
+    // happens at function entry above so RLE-mode early returns
+    // don't leak the flag to a later block. Note the sequence-count
+    // guard `num_sequences >= ADVANCE * 2` ALWAYS applies — blocks
+    // too small for the 8-deep lookahead pipeline still go through
+    // the short-block fallback in both cold-dict and warm cases;
+    // the cold flag only bypasses the long-offset-share threshold,
+    // not the sequence-count threshold.
     let use_long_pipeline = num_sequences >= ADVANCE * 2
         && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
     // The format-level `isLongOffset` shortcut from donor is
