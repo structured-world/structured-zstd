@@ -387,7 +387,7 @@ impl FSETable {
         // overshoot `decode.len()` on the unchecked `read_entry`
         // hot path. Surface as a typed error so the caller can
         // distinguish a malformed input from an internal failure.
-        // Strict probability range validation: RFC 8478 §4.1.1 admits
+        // Strict probability range validation: RFC 8878 §4.1.1 admits
         // only `{-1, 0, 1..=table_size}` as probability values. The
         // wire-format parser never emits anything else, but
         // `build_from_probabilities` is a public entry point reachable
@@ -851,7 +851,7 @@ mod tests {
 
     #[test]
     fn build_from_probabilities_rejects_negative_below_minus_one() {
-        // RFC 8478 §4.1.1: probability values are in {-1, 0, positive}.
+        // RFC 8878 §4.1.1: probability values are in {-1, 0, positive}.
         // p = -2 is outside the spec; clamping to 0 silently is wrong.
         let mut t = FSETable::new(8);
         let probs: [i32; 4] = [-2, 8, 4, 4];

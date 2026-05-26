@@ -1129,7 +1129,7 @@ pub enum FSETableError {
     TooManySymbols {
         got: usize,
     },
-    /// Probability value outside the RFC 8478 §4.1.1 allowed set
+    /// Probability value outside the RFC 8878 §4.1.1 allowed set
     /// `{-1, 0, 1..=table_size}`. Carries the violating value, the
     /// table size (`1 << accuracy_log`) and `accuracy_log` so the
     /// caller can pinpoint the failure without re-deriving the bound.
@@ -1142,7 +1142,7 @@ pub enum FSETableError {
     /// width exceeds the table's accuracy log, violating the
     /// `new_state + (1 << num_bits) - 1 < table_size` invariant that
     /// the unchecked `read_entry` decode hot path relies on. The
-    /// triggering probability is in-range per RFC 8478 §4.1.1; the
+    /// triggering probability is in-range per RFC 8878 §4.1.1; the
     /// failure is an internal table-shape inconsistency surfaced
     /// against the public `build_from_probabilities` API.
     TableInvariantViolation {
@@ -1197,7 +1197,7 @@ impl core::fmt::Display for FSETableError {
             } => {
                 write!(
                     f,
-                    "FSE probability value {value} is outside the RFC 8478 allowed set (must be -1, 0, or in 1..={table_size}; accuracy_log={accuracy_log})",
+                    "FSE probability value {value} is outside the RFC 8878 allowed set (must be -1, 0, or in 1..={table_size}; accuracy_log={accuracy_log})",
                 )
             }
             FSETableError::TableInvariantViolation {

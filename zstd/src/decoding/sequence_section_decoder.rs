@@ -1385,7 +1385,7 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // =====================================================================
 //
 // ModeType::Predefined fires whenever the encoder declares that an
-// LL / OF / ML symbol stream follows the RFC 8478 default
+// LL / OF / ML symbol stream follows the RFC 8878 default
 // distribution (§3.1.1.3.2.1.1). On small-block fixtures this can
 // dominate the decode budget: building the table costs O(table_size)
 // per axis plus several `Vec::resize` round-trips, while the symbol
@@ -1416,7 +1416,7 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 //
 // The build step is infallible by construction: the source
 // distribution slices are compile-time constants verified against
-// the RFC 8478 reference, and `build_from_probabilities` only fails
+// the RFC 8878 reference, and `build_from_probabilities` only fails
 // on malformed input (sum mismatch, oversized acc_log, symbol >
 // max). Treating a failure here as a panic is correct — it would
 // mean a static array literal is mathematically broken, which is a
@@ -1431,7 +1431,7 @@ fn predefined_ll_table() -> &'static crate::fse::FSETable {
     CACHED.get_or_init(|| {
         let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
         t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
-            .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8478 constant");
+            .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&LL_META);
         t
     })
@@ -1444,7 +1444,7 @@ fn predefined_ml_table() -> &'static crate::fse::FSETable {
     CACHED.get_or_init(|| {
         let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
         t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
-            .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8478 constant");
+            .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&ML_META);
         t
     })
@@ -1457,7 +1457,7 @@ fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
     let cache = CACHED.get_or_init(|| {
         let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
-            .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8478 constant");
+            .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
         let share = compute_offsets_long_share(&t);
         (t, share)
