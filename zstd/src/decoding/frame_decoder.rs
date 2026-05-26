@@ -1333,14 +1333,6 @@ impl FrameDecoder {
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
             // persistent `block_content_buffer`.
-            // Read `tail` directly: the donor inline path no longer
-            // calls `advance_output_counter` so the separate
-            // `total_output_counter` would be stale on that path.
-            // `UserSliceBackend::tail` is advanced inside every
-            // `exec_sequence_inline` / `extend` / `try_extend`
-            // call, so it's the authoritative count of bytes the
-            // backend has written.
-            let before = direct.buffer.buffer_ref().tail() as u64;
             let body_consumed = match block_dec.decode_block_content_from_slice(
                 &block_header,
                 &mut direct,
@@ -1376,7 +1368,6 @@ impl FrameDecoder {
                     produced,
                 });
             }
-            let _ = before;
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
             // Cap the visible buffer at window_size between blocks

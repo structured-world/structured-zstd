@@ -375,6 +375,32 @@ impl FSETable {
                 max: ENTRY_MAX_ACCURACY_LOG,
             });
         }
+        // Probability sum check: `build_decoding_table` assumes the
+        // sum of positive probabilities plus the count of `-1`
+        // entries (each contributing one slot at the top of the
+        // table) equals exactly `1 << acc_log`. Without this guard
+        // the wire-format `parse_wire` path validates the sum
+        // upstream, but callers entering through
+        // `build_from_probabilities` directly (the Predefined cache
+        // and any fuzz / external user) would silently produce a
+        // table where `calc_baseline_and_numbits` is given
+        // `symbol_count` values exceeding the symbol's actual
+        // `prob`, yielding `new_state` / `num_bits` pairs that can
+        // overshoot `decode.len()` on the unchecked `read_entry`
+        // hot path. Surface as a typed error so the caller can
+        // distinguish a malformed input from an internal failure.
+        let table_size = 1u32 << acc_log;
+        let probability_sum: u32 = probs
+            .iter()
+            .map(|&p| if p == -1 { 1 } else { p.max(0) as u32 })
+            .sum();
+        if probability_sum != table_size {
+            return Err(FSETableError::ProbabilityCounterMismatch {
+                got: probability_sum,
+                expected_sum: table_size,
+                symbol_probabilities: probs.to_vec(),
+            });
+        }
         self.symbol_probabilities = probs.to_vec();
         self.accuracy_log = acc_log;
         self.build_decoding_table()
