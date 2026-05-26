@@ -853,8 +853,24 @@ impl From<HuffmanTableError> for DecompressLiteralsError {
 #[non_exhaustive]
 pub enum ExecuteSequencesError {
     DecodebufferError(DecodeBufferError),
-    NotEnoughBytesForSequence { wanted: usize, have: usize },
+    NotEnoughBytesForSequence {
+        wanted: usize,
+        have: usize,
+    },
     ZeroOffset,
+    /// A donor-shape inline sequence (`BufferBackend::donor_exec_one_sequence`)
+    /// would have written past the writable tail of a fixed-size backend
+    /// (`UserSliceBackend`). Indicates the frame is corrupt — its sequences
+    /// expand past the declared `frame_content_size` plus the caller-supplied
+    /// `WILDCOPY_OVERLENGTH` slack. The fast-path check is per-sequence; the
+    /// post-block FCS overflow check would also catch the same shape, but the
+    /// per-sequence guard is what keeps the unsafe write surface inside the
+    /// user-provided slice on the way to the post-block check.
+    DonorPathBufferOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 impl core::fmt::Display for ExecuteSequencesError {
@@ -871,6 +887,16 @@ impl core::fmt::Display for ExecuteSequencesError {
             }
             ExecuteSequencesError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
+            }
+            ExecuteSequencesError::DonorPathBufferOverflow {
+                tail,
+                requested,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "Donor-path sequence would write past fixed-size buffer: tail={tail}, requested={requested}, capacity={capacity}"
+                )
             }
         }
     }

@@ -127,7 +127,7 @@ pub(crate) trait BufferBackend: Sized {
         lit_length: usize,
         offset: usize,
         match_length: usize,
-    ) {
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
         // Default body is statically unreachable when the dispatch
         // site honours `SUPPORTS_INLINE_DONOR_EXEC`. Backends that
         // return `false` from that const never see this call resolved

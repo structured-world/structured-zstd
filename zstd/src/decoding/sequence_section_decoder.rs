@@ -828,12 +828,10 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         // `len()` regardless of the backing buffer's extra capacity.
         let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
         unsafe {
-            buffer.buffer_mut().donor_exec_one_sequence(
-                lit_src,
-                seq.ll as usize,
-                offset,
-                seq.ml as usize,
-            );
+            buffer
+                .buffer_mut()
+                .donor_exec_one_sequence(lit_src, seq.ll as usize, offset, seq.ml as usize)
+                .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
         buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
         return Ok(());

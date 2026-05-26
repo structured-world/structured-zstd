@@ -165,44 +165,52 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         lit_length: usize,
         offset: usize,
         match_length: usize,
-    ) {
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
         use super::exec_sequence_donor::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
-        // Release-mode capacity assert — covers the literal+match
-        // copies INCLUDING the wildcopy overshoot tail (up to 15
-        // bytes past `tail + total`). The caller-side
-        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice covers
-        // any value ≤ 32; the assert here makes the requirement
-        // explicit so a future caller that supplies a smaller slice
-        // fails immediately with a clear diagnostic instead of
-        // silently corrupting memory past the declared tail.
+        // Fallible capacity check — covers the literal+match copies
+        // INCLUDING the wildcopy overshoot tail (up to 15 bytes past
+        // `tail + total`). On a well-formed frame the caller-side
+        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice absorbs
+        // it; on a malformed frame whose sequences overproduce past
+        // `frame_content_size`, the check returns
+        // `ExecuteSequencesError::DonorPathBufferOverflow` so the
+        // safe public decode APIs (`decode_all`, `decode_all_to_vec`)
+        // surface a structured `FrameDecoderError` rather than
+        // panic on the unsafe write surface.
         //
-        // All sums use `checked_*` so adversarial / corrupt input
-        // that would wrap `usize` ends up as `None` → assert fires
-        // with a clean error instead of wrapping past the slice
-        // length and letting the subsequent unsafe pointer math go
-        // out of bounds.
+        // All sums use `checked_*` so adversarial input that would
+        // wrap `usize` produces the same error variant instead of
+        // wrapping past the slice length and letting the subsequent
+        // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
-        let total = lit_length
+        let cap = self.slice.len();
+        let cap_required = lit_length
             .checked_add(match_length)
-            .expect("UserSliceBackend::donor_exec_one_sequence: lit+ml overflow on corrupt frame");
-        let new_tail = self.tail.checked_add(total).expect(
-            "UserSliceBackend::donor_exec_one_sequence: tail+total overflow on corrupt frame",
-        );
-        let cap_required = new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT).expect(
-            "UserSliceBackend::donor_exec_one_sequence: overshoot bound overflow on corrupt frame",
-        );
-        assert!(
-            cap_required <= self.slice.len(),
-            "UserSliceBackend::donor_exec_one_sequence overflows slice \
-             (tail={} + total={} + {} overshoot = {}, cap={}) — corrupt frame or missing WILDCOPY_OVERLENGTH slack",
-            self.tail,
-            total,
-            MAX_WILDCOPY_OVERSHOOT,
-            cap_required,
-            self.slice.len()
-        );
+            .and_then(|total| self.tail.checked_add(total))
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        let cap_required = match cap_required {
+            Some(v) if v <= cap => v,
+            Some(v) => {
+                return Err(ExecuteSequencesError::DonorPathBufferOverflow {
+                    tail: self.tail,
+                    requested: v - self.tail,
+                    capacity: cap,
+                });
+            }
+            None => {
+                return Err(ExecuteSequencesError::DonorPathBufferOverflow {
+                    tail: self.tail,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let _ = cap_required;
+        let total = lit_length + match_length;
+        let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         // Match against the LIVE window (tail - head) per the trait
@@ -266,6 +274,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             }
         }
         self.tail = new_tail;
+        Ok(())
     }
 
     /// `new()` exists for trait conformance but is not used on the

@@ -350,35 +350,19 @@ fn bench_decompress_source(
 
     group.bench_function("pure_rust", |b| {
         let compressed = materialize();
-        let mut target = vec![0u8; expected_len];
-        pretouch_pages(&mut target);
-        let mut decoder = FrameDecoder::new();
-        b.iter(|| {
-            let written = decoder
-                .decode_all(black_box(compressed), &mut target)
-                .unwrap();
-            black_box(&target[..written]);
-            assert_eq!(written, expected_len);
-        })
-    });
-
-    // Direct-decode path (#244): target sized with WILDCOPY_OVERLENGTH
-    // slack so `decode_to_slice_trusted` takes the direct-write branch
-    // (decode straight into `target`, no FlatBuf drain copy).
-    // Exposed alongside `pure_rust` so dashboards can attribute the
-    // memory-traffic delta directly.
-    group.bench_function("pure_rust_direct", |b| {
-        let compressed = materialize();
-        // Sized to match the dispatcher's eligibility check —
-        // mirror the constant from the decoder instead of
-        // duplicating its value so the bench can't silently drift
-        // off the direct path if the slack changes.
+        // Target sized with WILDCOPY_OVERLENGTH slack so `decode_all`
+        // routes through the direct-write path (decode straight into
+        // `target`, no FlatBuf drain copy). The slack is the
+        // dispatcher's eligibility gate; without it the call falls
+        // back to the legacy per-block drain loop. The auto-reserve
+        // inside `decode_all_to_vec` provides the equivalent slack
+        // transparently for Vec-based callers.
         let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
         pretouch_pages(&mut target);
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder
-                .decode_to_slice_trusted(black_box(compressed), &mut target)
+                .decode_all(black_box(compressed), &mut target)
                 .unwrap();
             black_box(&target[..written]);
             assert_eq!(written, expected_len);
