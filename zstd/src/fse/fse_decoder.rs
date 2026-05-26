@@ -490,24 +490,46 @@ impl FSETable {
         spread.clear();
         spread.resize(table_size, 0);
 
-        // Pass 1: place -1 probability symbols at the top of the table.
+        // Donor `ZSTD_buildFSETable_body`-shape per-symbol counter
+        // (donor `symbolNext[]`). Indexed by symbol byte; initialised
+        // to `prob` for positive-probability symbols, `1` for `-1`
+        // (low-probability) symbols. The build loop below reads then
+        // increments `symbol_next[symbol]` per state placed, and
+        // derives `(num_bits, new_state)` from the running counter
+        // via pure shifts / `highest_bit_set` — NO division. This
+        // replaces the previous `calc_baseline_and_numbits` helper
+        // whose `num_states_total / num_state_slices` lowered to a
+        // runtime `divl` (~24 cycles, ~24% of FSE-build samples on
+        // z000033 L-5 fast — see perf annotate audit). Stack-only
+        // (256-symbol alphabet bounded by `u8`); zero-init covers
+        // every slot.
+        let mut symbol_next = [0u32; 256];
+
+        // Pass 1: place -1 probability symbols at the top of the
+        // table AND initialise `symbol_next` for them. Donor:
+        // `tableDecode[highThreshold--].baseValue = s; symbolNext[s]
+        // = 1;`.
         let mut negative_idx = table_size;
         for symbol in 0..nb_symbols {
             if self.symbol_probabilities[symbol] == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
+                symbol_next[symbol] = 1;
             }
         }
 
         // Pass 2: distribute positive-probability symbols across the
         // [0, negative_idx) range using the donor's `next_position`
-        // walker.
+        // walker, and initialise `symbol_next[s] = prob` so the
+        // build loop's counter reaches `2*prob - 1` over `prob`
+        // iterations (matching donor `symbolNext[s]++` semantics).
         let mut position = 0usize;
         for symbol in 0..nb_symbols {
             let prob = self.symbol_probabilities[symbol];
             if prob <= 0 {
                 continue;
             }
+            symbol_next[symbol] = prob as u32;
             let symbol_u8 = symbol as u8;
             for _ in 0..prob {
                 spread[position] = symbol_u8;
@@ -518,71 +540,75 @@ impl FSETable {
             }
         }
 
-        // === Build step ===
-        // Stack-allocated counter (max 256 symbols since the symbol
-        // alphabet is bounded by `u8`). Replaces the previous
-        // `Vec<u32>` field that was cleared + resized per call —
-        // about 200 bytes of heap-alloc churn dropped from the hot
-        // build path. Zero-init at declaration covers every slot.
-        let mut counter = [0u32; 256];
+        // === Build step (donor formula) ===
+        // For each state u in 0..tableSize, donor `ZSTD_buildFSETable_body`:
+        //   nextState = symbolNext[symbol]++
+        //   nbBits    = tableLog - ZSTD_highbit32(nextState)
+        //   newState  = (nextState << nbBits) - tableSize
+        //
+        // Identity with our previous `calc_baseline_and_numbits` was
+        // verified algebraically: for a symbol with positive prob N,
+        // `nextState` walks N..2N-1; `highest_bit_set(nextState)`
+        // partitions this range into "double-width" (high_bit ==
+        // ceil(log2(N))) and "single-width" (high_bit ==
+        // ceil(log2(N))+1) slices, matching the
+        // `num_double_width_state_slices` / `num_single_width...`
+        // split in the old code. For -1 prob, `symbol_next` is `1`,
+        // so `nextState == 1`, `high_bit == 1`, `nbBits ==
+        // accuracy_log`, `newState == 0` — exactly the -1 entry
+        // shape.
         let accuracy_log = self.accuracy_log;
-
-        // Single linear pass: write every entry exactly once. The
-        // previous impl had three passes (zero-init resize, symbol
-        // copy, build), all touching the same `Vec<Entry>` cache
-        // line — now collapsed into one.
+        let table_size_u32 = table_size as u32;
         self.decode.clear();
         self.decode.reserve(table_size);
-        for (idx, &symbol) in spread.iter().enumerate().take(table_size) {
-            if idx < negative_idx {
-                // Positive-probability slot.
-                let prob = self.symbol_probabilities[symbol as usize];
-                let symbol_count = counter[symbol as usize];
-                counter[symbol as usize] = symbol_count + 1;
-                let (bl, nb) =
-                    calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-                // FSE invariant gate (release-mode safety): the
-                // decoder's unchecked `read_entry` path relies on
-                // `new_state + (1 << num_bits) - 1 < table_size`,
-                // which factors through `nb <= accuracy_log`. The
-                // wire-format `parse_wire` path establishes this by
-                // construction, but `build_from_probabilities` is a
-                // public surface — a crafted but in-range probability
-                // vector could theoretically drive
-                // `calc_baseline_and_numbits` to violate the invariant.
-                // Reject at build time so the unchecked indexing
-                // contract holds in release as well as debug.
-                if nb > accuracy_log {
-                    return Err(FSETableError::TableInvariantViolation {
-                        prob,
-                        symbol,
-                        num_bits: nb,
-                        accuracy_log,
-                    });
-                }
-                let new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
-                    got: accuracy_log,
-                    max: ENTRY_MAX_ACCURACY_LOG,
-                })?;
-                self.decode.push(Entry {
-                    new_state,
+        for &symbol in spread.iter().take(table_size) {
+            let next_state = symbol_next[symbol as usize];
+            symbol_next[symbol as usize] = next_state + 1;
+            // `next_state >= 1` by construction (Pass 1 init for
+            // -1 probs, Pass 2 init for positive probs).
+            // `highest_bit_set(x)` returns `floor(log2(x)) + 1`.
+            let high_bit = highest_bit_set(next_state);
+            // nbBits = accuracy_log - floor(log2(next_state))
+            //        = accuracy_log - (high_bit - 1)
+            //        = (accuracy_log + 1) - high_bit
+            // For -1 prob: next_state = 1, high_bit = 1, nbBits =
+            // accuracy_log.
+            // For positive prob N: next_state in N..2N-1; max
+            // next_state = 2N-1 ≤ 2*table_size - 1, max high_bit
+            // = accuracy_log + 1 (when N == table_size), nbBits = 0.
+            // So nbBits ∈ [0, accuracy_log], satisfying the
+            // unchecked-read invariant in `FSEDecoder::read_entry`.
+            let nb = (accuracy_log as u32 + 1).wrapping_sub(high_bit) as u8;
+            // FSE invariant gate: keep the explicit `nb > accuracy_log`
+            // guard for `build_from_probabilities` (public surface) so
+            // a crafted probability vector can't silently violate
+            // `new_state + (1 << nb) - 1 < table_size`. With the donor
+            // formula `nb` derives from `high_bit` which is itself
+            // bounded by the table-size invariant, but a malformed
+            // probability accumulating beyond `table_size` could push
+            // high_bit > accuracy_log + 1 and wrap `nb` to a large
+            // u8. Reject so the unchecked indexing contract holds.
+            if nb > accuracy_log {
+                return Err(FSETableError::TableInvariantViolation {
+                    prob: self.symbol_probabilities[symbol as usize],
                     symbol,
                     num_bits: nb,
-                    base_value: 0,
-                    num_additional_bits: 0,
-                });
-            } else {
-                // -1 probability slot: no baseline, num_bits =
-                // accuracy_log (decoder takes the full state width on
-                // these slots, by zstd FSE spec).
-                self.decode.push(Entry {
-                    new_state: 0,
-                    symbol,
-                    num_bits: accuracy_log,
-                    base_value: 0,
-                    num_additional_bits: 0,
+                    accuracy_log,
                 });
             }
+            // `next_state << nb` ranges [table_size, 2*table_size - (1 << nb)];
+            // subtracting `table_size` gives `new_state ∈ [0, table_size - 1]`
+            // which fits u16 for any `accuracy_log ≤ 15` (the wire format
+            // caps `accuracy_log` at `FSE_MAX_TABLELOG = 9` for sequence
+            // tables, well below the u16 bound).
+            let new_state_u32 = (next_state << nb).wrapping_sub(table_size_u32);
+            self.decode.push(Entry {
+                new_state: new_state_u32 as u16,
+                symbol,
+                num_bits: nb,
+                base_value: 0,
+                num_additional_bits: 0,
+            });
         }
 
         Ok(())
@@ -752,34 +778,6 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
     p &= table_size - 1;
     p
-}
-
-fn calc_baseline_and_numbits(
-    num_states_total: u32,
-    num_states_symbol: u32,
-    state_number: u32,
-) -> (u32, u8) {
-    if num_states_symbol == 0 {
-        return (0, 0);
-    }
-    let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
-        num_states_symbol
-    } else {
-        1 << (highest_bit_set(num_states_symbol))
-    }; //always power of two
-
-    let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
-    let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
-    let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
-    let num_bits = highest_bit_set(slice_width) - 1; //number of bits needed to read for one slice
-
-    if state_number < num_double_width_state_slices {
-        let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
-        (baseline, num_bits as u8 + 1)
-    } else {
-        let index_shifted = state_number - num_double_width_state_slices;
-        ((index_shifted * slice_width), num_bits as u8)
-    }
 }
 
 #[cfg(test)]
