@@ -26,7 +26,15 @@ pub use crate::blocks::block::BlockType;
 /// `offset_in_frame` points at the first byte of the 3-byte
 /// `Block_Header`, and the block body lives at
 /// `offset_in_frame + header_size .. offset_in_frame + header_size +
-/// body_size`.
+/// body_size`. The arithmetic
+/// `offset_in_frame + header_size as u32 + body_size`
+/// is the byte offset of the next block (or, on the last block, of
+/// the trailing checksum / end of frame).
+///
+/// For RLE blocks the `body_size` is `1` (the single repeated byte
+/// on the wire); the spec's `Block_Size` field carries the logical
+/// repeat count instead and is surfaced separately as
+/// [`block_size_field`](Self::block_size_field).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameBlock {
     /// Byte offset of this block's `Block_Header` within the emitted
@@ -37,11 +45,21 @@ pub struct FrameBlock {
     /// as a field so the API stays forward-compatible with any future
     /// spec extension that widens the header.
     pub header_size: u8,
-    /// Length of this block's body in bytes (does NOT include
-    /// `header_size`). For Raw / Compressed blocks this is the
-    /// emitted bytes after the header; for RLE blocks this is `1`
-    /// (the repeated byte itself).
+    /// Physical length of this block's body in bytes on the wire (does
+    /// NOT include `header_size`). For Raw / Compressed blocks this is
+    /// the number of bytes after the header; for RLE blocks this is
+    /// always `1` (the repeated byte itself, while the spec's
+    /// `Block_Size` field encodes the logical repeat count — see
+    /// [`block_size_field`](Self::block_size_field)). The arithmetic
+    /// `offset_in_frame + header_size as u32 + body_size` always
+    /// lands on the next block boundary.
     pub body_size: u32,
+    /// Raw `Block_Size` value from the 3-byte `Block_Header`. For Raw
+    /// and Compressed blocks this equals `body_size`; for RLE blocks
+    /// it's the logical repeat count (how many bytes the single
+    /// physical body byte expands to during decode) and will differ
+    /// from `body_size` (which is `1`).
+    pub block_size_field: u32,
     /// Whether the block is Raw, RLE, or Compressed per RFC 8878
     /// §3.1.1.2.1 (`Block_Type`).
     pub block_type: BlockType,

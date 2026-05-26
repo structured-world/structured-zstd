@@ -59,13 +59,16 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     frame_emit_info: Option<crate::encoding::frame_emit_info::FrameEmitInfo>,
     /// When `true`, `compress()` XXH64-hashes each block's
     /// uncompressed bytes and appends the low-32-bit digest to
-    /// `block_checksums`. Default `false` (zero cost).
-    #[cfg(feature = "lsm")]
+    /// `block_checksums`. Default `false` (zero cost). Gated on
+    /// `all(lsm, hash)` because XXH64 lives behind the `hash`
+    /// feature; an `lsm`-only build has no way to compute digests.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     per_block_checksums_enabled: bool,
     /// Per-block XXH64 (low 32 bits) digests captured during
     /// `compress()` when `per_block_checksums_enabled` is set. Ordered
     /// by block-emit order. `None` until the first call after enabling.
-    #[cfg(feature = "lsm")]
+    /// Gated on `all(lsm, hash)` (see `per_block_checksums_enabled`).
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     block_checksums: Option<alloc::vec::Vec<u32>>,
 }
 
@@ -481,9 +484,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
             frame_emit_info: None,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             per_block_checksums_enabled: false,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
         }
     }
@@ -514,9 +517,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
             frame_emit_info: None,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             per_block_checksums_enabled: false,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
         }
     }
@@ -574,6 +577,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         #[cfg(feature = "lsm")]
         {
             self.frame_emit_info = None;
+        }
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        {
             if self.per_block_checksums_enabled {
                 self.block_checksums = Some(alloc::vec::Vec::new());
             } else {
@@ -896,19 +902,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     2 => BT::Compressed,
                     _ => BT::Reserved,
                 };
-                let logical_size = raw >> 3;
-                let physical_body = match block_type {
+                let block_size_field = raw >> 3;
+                // RLE bodies are always 1 byte physical on the wire
+                // (the single repeated byte); the spec's Block_Size
+                // field carries the logical repeat count. Raw and
+                // Compressed bodies physically span block_size_field
+                // bytes. Store the physical length in body_size so the
+                // 'offset + header + body_size' arithmetic always
+                // lands on the next block boundary, and surface the
+                // raw spec field separately as block_size_field.
+                let physical_body: u32 = match block_type {
                     BT::RLE => 1,
-                    _ => logical_size as usize,
+                    _ => block_size_field,
                 };
                 blocks.push(FrameBlock {
                     offset_in_frame: frame_header_len + cursor as u32,
                     header_size: 3,
-                    body_size: logical_size,
+                    body_size: physical_body,
+                    block_size_field,
                     block_type,
                     last_block,
                 });
-                cursor += 3 + physical_body;
+                cursor += 3 + physical_body as usize;
                 if last_block {
                     break;
                 }
@@ -959,8 +974,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// granularity matches the forensic-ECC use case (hash the
     /// recovered plaintext chunk, compare to the stored digest).
     ///
-    /// Behind the `lsm` Cargo feature.
-    #[cfg(feature = "lsm")]
+    /// Behind `all(feature = "lsm", feature = "hash")` — the XXH64
+    /// primitive lives behind the `hash` feature, so this method only
+    /// compiles when both are enabled.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     pub fn enable_per_block_checksums(&mut self) {
         self.per_block_checksums_enabled = true;
     }
@@ -970,8 +987,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// [`enable_per_block_checksums`](Self::enable_per_block_checksums)
     /// was called before `compress()`.
     ///
-    /// Behind the `lsm` Cargo feature.
-    #[cfg(feature = "lsm")]
+    /// Behind `all(feature = "lsm", feature = "hash")`.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     pub fn last_frame_block_checksums(&self) -> Option<&[u32]> {
         self.block_checksums.as_deref()
     }

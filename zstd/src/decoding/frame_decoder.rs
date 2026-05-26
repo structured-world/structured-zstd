@@ -106,13 +106,16 @@ pub struct FrameDecoder {
     /// When `true`, the per-block decode loop XXH64-hashes each
     /// block's decompressed bytes and stores the low-32-bit digest in
     /// [`Self::computed_block_checksums`]. Default `false` (zero
-    /// cost). Set via [`Self::enable_per_block_checksums`].
-    #[cfg(feature = "lsm")]
+    /// cost). Set via [`Self::enable_per_block_checksums`]. Gated on
+    /// `all(lsm, hash)` because XXH64 lives behind the `hash`
+    /// feature.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     per_block_checksums_enabled: bool,
     /// Per-block XXH64 (low 32 bits) digests captured during the
     /// current frame's decode when `per_block_checksums_enabled` is
-    /// set. Reset at the start of every new frame.
-    #[cfg(feature = "lsm")]
+    /// set. Reset at the start of every new frame. Gated on
+    /// `all(lsm, hash)` (see `per_block_checksums_enabled`).
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     computed_block_checksums: alloc::vec::Vec<u32>,
 }
 
@@ -193,7 +196,7 @@ impl DecoderScratchKind {
 
     /// Last `n` bytes of the visible buffer as `(s1, s2)` (wrap-aware).
     /// Routes through whichever backend the current scratch holds.
-    #[cfg(feature = "lsm")]
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     fn last_n_as_slices(&self, n: usize) -> (&[u8], &[u8]) {
         match self {
             Self::Ring(s) => s.buffer.last_n_as_slices(n),
@@ -391,9 +394,9 @@ impl FrameDecoder {
             expect_dict_id: None,
             #[cfg(feature = "lsm")]
             expect_window_descriptor: None,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             per_block_checksums_enabled: false,
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
         }
     }
@@ -406,8 +409,10 @@ impl FrameDecoder {
     /// expected values (e.g. from a per-block sidecar in the
     /// containing application protocol).
     ///
-    /// Behind the `lsm` Cargo feature.
-    #[cfg(feature = "lsm")]
+    /// Behind `all(feature = "lsm", feature = "hash")` — the XXH64
+    /// primitive lives behind the `hash` feature, so this method
+    /// only compiles when both are enabled.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     pub fn enable_per_block_checksums(&mut self) {
         self.per_block_checksums_enabled = true;
     }
@@ -419,8 +424,8 @@ impl FrameDecoder {
     ///
     /// Reset at the start of every new frame.
     ///
-    /// Behind the `lsm` Cargo feature.
-    #[cfg(feature = "lsm")]
+    /// Behind `all(feature = "lsm", feature = "hash")`.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     pub fn computed_block_checksums(&self) -> &[u32] {
         &self.computed_block_checksums
     }
@@ -622,7 +627,7 @@ impl FrameDecoder {
         // Fresh frame → start with an empty per-block checksum vec so
         // the values for the next frame don't carry over from the
         // previous one.
-        #[cfg(feature = "lsm")]
+        #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
         let magicless = self.magicless;
         let dict_id = match &mut self.state {
@@ -892,7 +897,7 @@ impl FrameDecoder {
                 block_header.decompressed_size
             );
 
-            #[cfg(feature = "lsm")]
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             let len_before_block = state.decoder_scratch.buffer_len();
             let bytes_read_in_block_body = state
                 .decoder_scratch
@@ -2469,7 +2474,10 @@ mod tests {
         }
         // Walk and verify each block's header bytes match the
         // recorded type / size by re-decoding the 3-byte header.
-        for b in &info.blocks {
+        // Walking arithmetic: offset_in_frame + header_size + body_size
+        // must land exactly on the next block's offset_in_frame (or,
+        // for the last block, on the checksum / end of frame).
+        for (i, b) in info.blocks.iter().enumerate() {
             let off = b.offset_in_frame as usize;
             assert_eq!(b.header_size, 3);
             let mut hdr = [0u8; 4];
@@ -2479,7 +2487,14 @@ mod tests {
             let ty = (raw >> 1) & 0b11;
             let sz = raw >> 3;
             assert_eq!(last, b.last_block);
-            assert_eq!(sz, b.body_size);
+            assert_eq!(sz, b.block_size_field);
+            // body_size is the PHYSICAL length on the wire: spec's
+            // Block_Size for Raw/Compressed, always 1 for RLE.
+            let expected_physical = match b.block_type {
+                crate::encoding::frame_emit_info::BlockType::RLE => 1,
+                _ => sz,
+            };
+            assert_eq!(b.body_size, expected_physical);
             let expected_ty = match b.block_type {
                 crate::encoding::frame_emit_info::BlockType::Raw => 0,
                 crate::encoding::frame_emit_info::BlockType::RLE => 1,
@@ -2487,6 +2502,24 @@ mod tests {
                 crate::encoding::frame_emit_info::BlockType::Reserved => 3,
             };
             assert_eq!(ty, expected_ty);
+            // Walking-arithmetic invariant.
+            let next_off = b.offset_in_frame + b.header_size as u32 + b.body_size;
+            if let Some(next) = info.blocks.get(i + 1) {
+                assert_eq!(
+                    next_off, next.offset_in_frame,
+                    "block {i} body_size doesn't reach next block's offset_in_frame",
+                );
+            } else if let Some(cs) = info.checksum_range.as_ref() {
+                assert_eq!(
+                    next_off, cs.start,
+                    "last block body_size doesn't reach checksum_range.start",
+                );
+            } else {
+                assert_eq!(
+                    next_off, info.total_size,
+                    "last block body_size doesn't reach total_size",
+                );
+            }
         }
         // Checksum range present iff `feature = "hash"` is enabled.
         assert_eq!(info.checksum_range.is_some(), cfg!(feature = "hash"));

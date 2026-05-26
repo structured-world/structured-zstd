@@ -129,7 +129,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// during the most recent block decode without copying.
     ///
     /// Returns empty slices if `n == 0`.
-    #[cfg(feature = "lsm")]
+    #[cfg(all(feature = "lsm", feature = "hash"))]
     pub(crate) fn last_n_as_slices(&self, n: usize) -> (&[u8], &[u8]) {
         let (s1, s2) = self.buffer.as_slices();
         let total = s1.len() + s2.len();
