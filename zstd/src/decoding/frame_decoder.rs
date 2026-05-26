@@ -1041,23 +1041,19 @@ impl FrameDecoder {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
-        self.decode_all_impl(
-            input,
-            output,
-            |this, src| this.init(src),
-            None::<&mut fn(u8, &[u8])>,
-        )
+        self.decode_all_impl(input, output, |this, src| this.init(src), None)
     }
 
     /// Decode multiple frames into the output slice, invoking `visitor`
     /// for every skippable frame encountered before advancing past it.
     ///
     /// `input` must contain an exact number of frames. Skippable frames
-    /// (RFC 8878 §3.1.2 magic numbers `0x184D2A50..0x184D2A5F`) are
+    /// (RFC 8878 §3.1.2 magic numbers `0x184D2A50..=0x184D2A5F`) are
     /// allowed and will be both visited AND skipped: the visitor gets
     /// `(magic_variant, payload)` where `magic_variant` is the low
     /// nibble of the magic (`magic - 0x184D2A50`, range `0..=15`) and
-    /// `payload` is a borrowed slice of length `frame_size` into
+    /// `payload` is a borrowed slice of the on-wire payload bytes (the
+    /// skippable frame's `Frame_Size` field worth of data) into
     /// `input` — no allocation.
     ///
     /// The visitor sees skippable frames in stream order; interleaved
@@ -1126,20 +1122,17 @@ impl FrameDecoder {
             input,
             output,
             |this, src| this.init_with_dict_handle(src, dict),
-            None::<&mut fn(u8, &[u8])>,
+            None,
         )
     }
 
-    fn decode_all_impl<V>(
+    fn decode_all_impl(
         &mut self,
         mut input: &[u8],
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
-        mut skippable_visitor: Option<V>,
-    ) -> Result<usize, FrameDecoderError>
-    where
-        V: FnMut(u8, &[u8]),
-    {
+        mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
+    ) -> Result<usize, FrameDecoderError> {
         use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
         while !input.is_empty() {
@@ -2160,9 +2153,15 @@ mod tests {
     }
 
     /// Build a skippable frame on the wire: 4-byte LE magic + 4-byte LE
-    /// length + payload bytes.
+    /// length + payload bytes. RFC 8878 §3.1.2 restricts the magic
+    /// variant to `0..=15`; assert here so accidental misuse of the
+    /// helper can't smuggle a non-skippable magic past the tests.
     #[cfg(feature = "lsm")]
     fn build_skippable_frame(variant: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(
+            variant <= 15,
+            "skippable-frame variant {variant} outside RFC 8878 0..=15 range",
+        );
         let mut out = Vec::with_capacity(8 + payload.len());
         let magic: u32 = 0x184D2A50 + u32::from(variant);
         out.extend_from_slice(&magic.to_le_bytes());
