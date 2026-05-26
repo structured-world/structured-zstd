@@ -63,8 +63,8 @@ pub(crate) trait BufferBackend: Sized {
     const SUPPORTS_INLINE_DONOR_EXEC: bool = false;
 
     /// Donor's `ZSTD_execSequence` body
-    /// (zstd_decompress_block.c:1008-1105). Writes `lits.len()` bytes
-    /// from `lits` at the current tail, then writes `match_length`
+    /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
+    /// from `lit_src` at the current tail, then writes `match_length`
     /// bytes via the donor offset-dispatch (offset ≥ 16 → wildcopy
     /// no-overlap; offset 1..=15 → overlapCopy8 + wildcopy
     /// overlap-src-before-dst).
@@ -76,18 +76,29 @@ pub(crate) trait BufferBackend: Sized {
     /// out (the compiler removes the call entirely).
     ///
     /// # Safety
-    /// - `lits.len() + match_length` must fit in the writable tail
+    /// - `lit_src` MUST be derived from the FULL parent literals
+    ///   buffer's `as_ptr()` (not a sub-slice). The donor body issues
+    ///   an unconditional 16-byte `_mm_loadu_si128` regardless of
+    ///   `lit_length`; reads through `lit_src` must stay within the
+    ///   parent buffer's allocated provenance even when
+    ///   `lit_length < 16`. Passing a sub-slice's `as_ptr()` whose
+    ///   `len() < 16` would be UB even when the bytes beyond
+    ///   `lit_length` happen to be valid memory in the backing
+    ///   allocation.
+    /// - `lit_length + match_length` must fit in the writable tail
     ///   slack (caller's upfront `reserve(MAX_BLOCK_SIZE)` covers
     ///   the regular case; for direct decode the slice's
     ///   `WILDCOPY_OVERLENGTH` slack covers the wildcopy overshoot).
-    /// - `offset >= 1` and `offset <= self.len() + lits.len()`
+    /// - `offset >= 1` and `offset <= self.len() + lit_length`
     ///   (donor's `oLitEnd - offset` precondition).
     /// - `match_length >= 1`.
-    /// - **Read-side slack on `lits`**: the donor literal-copy path
-    ///   issues an unconditional `copy16` from `lits.as_ptr()` and,
-    ///   when `lit_length > 16`, a 16-byte-stride wildcopy that may
-    ///   load up to 15 bytes past `lits.len()` on its final
-    ///   iteration. Callers MUST satisfy two distinct slack bounds:
+    /// - **Read-side slack on the parent literals buffer**: the donor
+    ///   literal-copy path issues an unconditional `copy16` from
+    ///   `lit_src` and, when `lit_length > 16`, a 16-byte-stride
+    ///   wildcopy that may load up to 15 bytes past
+    ///   `lit_src + lit_length` on its final iteration. Callers MUST
+    ///   satisfy two distinct slack bounds against the parent buffer
+    ///   length (`lit_len`):
     ///   - `lit_cur_before + 16 <= lit_len` ALWAYS (the
     ///     unconditional `copy16` reads 16 bytes regardless of
     ///     `lit_length`, including the `lit_length == 0` case).
@@ -111,7 +122,13 @@ pub(crate) trait BufferBackend: Sized {
     ///   `decode_buffer::DecodeBuffer::advance_output_counter`.
     #[allow(unused_variables, unused_mut)]
     #[inline(always)]
-    unsafe fn donor_exec_one_sequence(&mut self, lits: &[u8], offset: usize, match_length: usize) {
+    unsafe fn donor_exec_one_sequence(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) {
         // Default body is statically unreachable when the dispatch
         // site honours `SUPPORTS_INLINE_DONOR_EXEC`. Backends that
         // return `false` from that const never see this call resolved

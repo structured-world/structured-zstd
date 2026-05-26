@@ -159,11 +159,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// preconditions / contract.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn donor_exec_one_sequence(&mut self, lits: &[u8], offset: usize, match_length: usize) {
+    unsafe fn donor_exec_one_sequence(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) {
         use super::exec_sequence_donor::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
-        let lit_length = lits.len();
         // Release-mode capacity assert — covers the literal+match
         // copies INCLUDING the wildcopy overshoot tail (up to 15
         // bytes past `tail + total`). The caller-side
@@ -191,9 +196,11 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         assert!(
             cap_required <= self.slice.len(),
             "UserSliceBackend::donor_exec_one_sequence overflows slice \
-             (tail+={} + {} overshoot, cap={}) — corrupt frame or missing WILDCOPY_OVERLENGTH slack",
+             (tail={} + total={} + {} overshoot = {}, cap={}) — corrupt frame or missing WILDCOPY_OVERLENGTH slack",
+            self.tail,
             total,
             MAX_WILDCOPY_OVERSHOOT,
+            cap_required,
             self.slice.len()
         );
         debug_assert!(offset >= 1);
@@ -211,10 +218,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // SAFETY: capacity asserted above; pointer arithmetic stays
         // within `self.slice` for the writes (tail + total <=
         // slice.len()) and reads (match src = tail + lit_length -
-        // offset, bounded by `offset <= tail + lit_length`).
+        // offset, bounded by `offset <= tail + lit_length`). Literal
+        // reads use the caller-provided `lit_src` whose provenance
+        // covers the parent literals buffer (NOT a sub-slice), so
+        // the unconditional 16-byte load stays in-bounds even when
+        // `lit_length < 16`.
         unsafe {
             let base_mut = self.slice.as_mut_ptr();
-            let lit_src = lits.as_ptr();
 
             // ── Literal copy ──
             // Donor: ZSTD_copy16(op, *litPtr); if (litLength > 16)

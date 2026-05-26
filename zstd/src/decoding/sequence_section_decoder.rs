@@ -808,12 +808,25 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         //   guarantees the writable tail has room for
         //   `lit_length + match_length + 15` (max wildcopy
         //   overshoot is 15 bytes past the declared end).
+        // SAFETY: `literals.as_ptr().add(lit_cur_before)` has the
+        // provenance of the FULL `literals` slice (not `lits`, the
+        // sub-slice). The 16-byte unconditional `copy16` inside the
+        // donor body reads up to `lit_cur_before + 16` bytes from
+        // the parent buffer, which the `donor_path_safe` gate above
+        // bounded by `lit_cur_before + 16 <= lit_len`. Passing
+        // `lits.as_ptr()` directly would be UB when `lits.len() <
+        // 16` because the sub-slice's provenance ends at its own
+        // `len()` regardless of the backing buffer's extra capacity.
+        let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
         unsafe {
-            buffer
-                .buffer_mut()
-                .donor_exec_one_sequence(lits, offset, seq.ml as usize);
+            buffer.buffer_mut().donor_exec_one_sequence(
+                lit_src,
+                seq.ll as usize,
+                offset,
+                seq.ml as usize,
+            );
         }
-        buffer.advance_output_counter(lits.len() + seq.ml as usize);
+        buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
         return Ok(());
     }
 
