@@ -2571,11 +2571,12 @@ mod tests {
     #[test]
     fn per_block_checksum_round_trip() {
         // Encode with per-block checksums enabled. Decode with
-        // per-block verification. Encoder produces 1 checksum per
-        // input chunk; decoder produces 1 checksum per physical
-        // block. For levels without post-split (Default = L3, no
-        // multi-physical-block path) the two should match
-        // element-wise.
+        // per-block verification. Both sides emit exactly 1
+        // checksum per physical block written to / read from the
+        // wire (encoder hashes per emission site, including each
+        // post-split partition; decoder hashes each decoded block).
+        // Cardinality and element-wise contents must match
+        // round-trip.
         let payload: Vec<u8> = (0..200_000u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
         compressor.set_source(payload.as_slice());
