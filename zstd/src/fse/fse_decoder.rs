@@ -506,7 +506,20 @@ impl FSETable {
                 counter[symbol as usize] = symbol_count + 1;
                 let (bl, nb) =
                     calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-                debug_assert!(nb <= accuracy_log);
+                // FSE invariant gate (release-mode safety): the
+                // decoder's unchecked `read_entry` path relies on
+                // `new_state + (1 << num_bits) - 1 < table_size`,
+                // which factors through `nb <= accuracy_log`. The
+                // wire-format `parse_wire` path establishes this by
+                // construction, but `build_from_probabilities` is a
+                // public surface — a crafted but in-range probability
+                // vector could theoretically drive
+                // `calc_baseline_and_numbits` to violate the invariant.
+                // Reject at build time so the unchecked indexing
+                // contract holds in release as well as debug.
+                if nb > accuracy_log {
+                    return Err(FSETableError::InvalidProbability { value: prob });
+                }
                 let new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
                     got: accuracy_log,
                     max: ENTRY_MAX_ACCURACY_LOG,

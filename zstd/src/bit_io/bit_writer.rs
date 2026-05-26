@@ -344,8 +344,23 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             return;
         }
 
+        // Dirty-upper-bits contract: the caller MUST pre-mask `bits`
+        // to the `num_bits` low-bit range. Violation silently corrupts
+        // the output bitstream because subsequent `write_bits_64`
+        // calls would OR the spurious upper bits into the partial
+        // accumulator at the wrong position. Enforce in release too
+        // (was `debug_assert!`) — the per-call cost is one `ilog2`
+        // (LZCNT, 1 cycle on Skylake-X) + a predicted-not-taken
+        // branch, negligible vs the encoder's per-token shift/merge
+        // work, while the safety value is real (encoder call sites
+        // are internal but a wrong caller would produce a corrupt
+        // compressed blob with no diagnostic signal).
         if bits > 0 {
-            debug_assert!(bits.ilog2() <= num_bits as u32);
+            assert!(
+                bits.ilog2() <= num_bits as u32,
+                "write_bits_64 dirty upper bits: bits=0x{bits:x} occupies {} bits but num_bits={num_bits}",
+                u64::BITS - bits.leading_zeros(),
+            );
         }
 
         // fill partial byte first
