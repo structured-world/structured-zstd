@@ -1129,6 +1129,11 @@ pub enum FSETableError {
     TooManySymbols {
         got: usize,
     },
+    /// Probability value outside the RFC 8478 §4.1.1 allowed set
+    /// `{-1, 0, positive}`. Specifically a value `< -1`.
+    InvalidProbability {
+        value: i32,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -1166,6 +1171,12 @@ impl core::fmt::Display for FSETableError {
                 write!(
                     f,
                     "There are too many symbols in this distribution: {got}. Max: 256",
+                )
+            }
+            FSETableError::InvalidProbability { value } => {
+                write!(
+                    f,
+                    "FSE probability value {value} is outside the RFC 8478 allowed set (negatives below -1 are not permitted)",
                 )
             }
         }

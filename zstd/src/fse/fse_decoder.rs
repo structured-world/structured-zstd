@@ -757,6 +757,19 @@ mod tests {
     }
 
     #[test]
+    fn build_from_probabilities_rejects_negative_below_minus_one() {
+        // RFC 8478 §4.1.1: probability values are in {-1, 0, positive}.
+        // p = -2 is outside the spec; clamping to 0 silently is wrong.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [-2, 8, 4, 4];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(result, Err(FSETableError::InvalidProbability { value: -2 })),
+            "expected InvalidProbability{{-2}}, got {result:?}",
+        );
+    }
+
+    #[test]
     fn build_from_probabilities_accepts_exact_sum() {
         // Sum 4+4+4+4 = 16 = 1 << 4. No -1s.
         let mut t = FSETable::new(8);
