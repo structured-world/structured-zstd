@@ -1,8 +1,11 @@
 //! User-slice-backed output buffer for the "decode straight into the
 //! caller's output slice" fast path.
 //!
-//! Selected by [`crate::decoding::FrameDecoder::decode_to_slice_trusted`]
-//! when ALL of the following hold:
+//! Selected automatically by
+//! [`crate::decoding::FrameDecoder::decode_all`] (and
+//! [`crate::decoding::FrameDecoder::decode_all_to_vec`], which
+//! reserves the extra slack internally) when ALL of the following
+//! hold:
 //! - `frame_content_size > 0` — the header-derived content size
 //!   is non-zero. This is the actual eligibility condition (NOT
 //!   "FCS present"): an empty frame with an explicit FCS=0
@@ -950,7 +953,7 @@ mod tests {
             0x10, 0x20,
         ];
         unsafe {
-            b.donor_exec_one_sequence(lits.as_ptr(), 8, 16, 8);
+            b.donor_exec_one_sequence(lits.as_ptr(), 8, 16, 8).unwrap();
         }
         // tail advanced by 8 lit + 8 match = 16.
         assert_eq!(b.tail, 48);
@@ -980,7 +983,7 @@ mod tests {
         // 16-byte load.
         let lits: Vec<u8> = (0..40 + 16).map(|i| 0x80 + i as u8).collect();
         unsafe {
-            b.donor_exec_one_sequence(lits.as_ptr(), 40, 16, 8);
+            b.donor_exec_one_sequence(lits.as_ptr(), 40, 16, 8).unwrap();
         }
         assert_eq!(b.tail, 80);
         assert_eq!(&buf[32..72], &lits[..40]);
@@ -1024,7 +1027,7 @@ mod tests {
         // litLength=4, offset=8, matchLength=12. offset<16 → short
         // path (overlapCopy8 + 8-byte stride).
         unsafe {
-            b.donor_exec_one_sequence(lits.as_ptr(), 4, 8, 12);
+            b.donor_exec_one_sequence(lits.as_ptr(), 4, 8, 12).unwrap();
         }
         // tail = 32 + 4 + 12 = 48.
         assert_eq!(b.tail, 48);
