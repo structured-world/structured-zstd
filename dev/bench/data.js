@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779807375105,
+  "lastUpdate": 1779823321983,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -47853,6 +47853,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "750a5621e7dfbacbff43c63bb6d8c3ccb775e49a",
+          "message": "perf(decode): cache predefined FSE tables (small-4k-log-lines −69%) (#268)\n\n* perf(decode): cache predefined FSE tables to skip table rebuild on hot path\n\n* fix(decode): propagate FSETableError from predefined cache init + regression gate\n\nPrevious .expect() in the OnceLock init turned a structurable FSETableError into a process abort. Switch to a manual get/set race pattern (the stable substitute for the still-unstable OnceLock::get_or_try_init from rust-lang/rust#109737) so the error propagates as DecodeSequenceError through the existing ? chain. Add a regression test asserting cached LL / ML / OF tables (including OF's offsets_long_share) are byte-identical to the rebuild-path output across every Entry field. Doc clarification: no core::sync::OnceLock exists; std::sync::OnceLock is the only stable OnceLock-style API. no_std fallback stays on the per-call rebuild path until the critical-section follow-up.\n\n* perf(decode): single-pass FSE build_decoding_table + stack-allocated symbol counter\n\nFuses the previous 3 separate passes (zero-init Vec::resize, symbol\ncopy, baseline+num_bits compute) into a single linear write through\nself.decode.\n\nDrops the symbol_counter Vec<u32> field in favour of a\nstack-allocated [u32; 256] — the symbol alphabet is bounded by u8,\nso the array always covers the largest possible build. Eliminates\nthe per-call clear+resize heap churn on the hot block-init path.\n\nNet: same table output, ~half the writes through the Entry cache\nlines, no allocation.\n\n* perf(decode): drop per-sequence total_output_counter RMW on donor inline path\n\nPerf annotate on `decode_and_execute_sequences_avx2` (z000033 hot\nloop, i9) attributed ~9% of decode time to two `addq` instructions\nincrementing `DecodeBuffer::total_output_counter` per sequence:\n\n    5.19%  addq %r14, 0x40(%r9)   ; advance_output_counter(ll+ml)\n    4.04%  addq %r10, 0x40(%r9)   ; same site, second iter\n\nFor the donor inline path on `UserSliceBackend` the same\ninformation already lives in `tail` — `exec_sequence_inline`\nadvances `tail` directly as part of the inner SIMD write. The\nseparate counter is redundant on that path; the only reason it was\nmaintained was for the post-block FCS check in `run_direct_decode`.\n\nSwitch `run_direct_decode` to read `tail` via\n`DecodeBuffer::buffer_ref().tail() as u64`, drop the\n`advance_output_counter` call from the donor inline arm in\n`execute_one_sequence_pipelined`, and drop both\n`advance_output_counter` and `total_produced` (no remaining\ncallers). The legacy push+repeat fallback path still maintains\n`total_output_counter` through `DecodeBuffer::push` /\n`extend_and_fill` — needed for `repeat_from_dict`'s\nwindow-relative dict-repeat semantics, which the direct path\nsidesteps via its no-dict eligibility gate.\n\n* fix(decode): gate predefined FSE rebuild fallback on no-std, not no-atomic-ptr\n\nThe rebuild fallback branches were gated with\n`#[cfg(not(target_has_atomic = \"ptr\"))]` while the cached\nbranches use `#[cfg(feature = \"std\")]`. On a no_std build with\npointer atomics (the common embedded case — Cortex-M3+, RISC-V-A)\nneither branch compiled in: the match arm body for\nModeType::Predefined was empty, leaving the scratch FSE table\nstale and breaking Predefined-mode decoding entirely.\n\nAlign the rebuild gate to `#[cfg(not(feature = \"std\"))]` so\nthe std cached path and the no_std rebuild path are exact\nopposites.\n\nAlso: clamp `iters` to >= 1 in the profile_decode_direct example\nto avoid divide-by-zero in the per-iter timing print.\n\n* perf(decode): read OF base_value from Entry instead of runtime 1<<symbol shift\n\ndecode_one_sequence_inline previously did:\n\n    let of_code = of_dec.state.symbol;\n    offset = obits + (1u32 << of_code);\n\nOne memory load (symbol byte) + one shift + one add. Donor's\nZSTD_seqSymbol carries baseValue precomputed; reads it directly.\n\nMatch donor shape: read num_additional_bits + base_value from the\nOF entry. Both fields are populated by enrich_for_offsets\n(base_value = 1 << code, num_additional_bits = code), so the\nvalue is identical. The hot path now no longer touches\nEntry.symbol — canary toward dropping the field entirely (matches\ndonor's 8-byte ZSTD_seqSymbol vs our current 12-byte Entry,\nabout 33% tighter FSE table cache footprint).\n\n* perf(decode): pass predefined FSE distributions as slices (drop Vec allocation)\n\nbuild_from_probabilities accepts &[i32]; the &Vec::from(&CONST[..])\nwrappers heap-allocated + copied per call. The no_std fallback path\nran on every Predefined section without the OnceLock cache, so the\nallocation was hot. Pass the static constants directly.\n\n* fix(decode): switch predefined FSE cache to infallible get_or_init + fix stale buffer doc-comments\n\n#15: predefined LL/ML/OF distributions are static RFC 8478 constants\nverified at compile time. build_from_probabilities can only fail on\nmalformed input (sum mismatch, oversized acc_log, symbol > max),\nwhich for static arrays would be a compile-time bug not a runtime\ndata condition. Switch to OnceLock::get_or_init + expect, returning\n&'static FSETable — drops the manual get/set race pattern and the\nfallible-init shim.\n\n#16: buffer_mut and buffer_ref doc-comments still referenced\nadvance_output_counter which was removed earlier in this PR. Rewrote\nto describe the actual mechanism: inline executor writes through\nbuffer_mut, run_direct_decode reads tail() from buffer_ref because\ntotal_output_counter is not maintained on the inline path.\n\n* test(fse): regression tests for build_from_probabilities sum validation\n\nConfirms the bug raised in PR review: build_from_probabilities accepts\narbitrary probs without verifying they sum to 1 << acc_log. Two of\nfour tests fail on current code:\n- sum_too_small (8 vs 16): builds a malformed table instead of erroring\n- sum_too_large (20 vs 16): builds a malformed table instead of erroring\n\nThe other two confirm the expected behaviour (exact-sum, sum with -1s)\nthat must keep working after the fix.\n\n* fix(fse): validate probability sum in build_from_probabilities\n\nbuild_decoding_table assumes the sum of positive probs plus -1\nentries equals 1 << acc_log. Previously this was only checked on the\nwire-format parse_wire path; build_from_probabilities (used by the\nPredefined cache, fuzz harness, and any external caller) accepted\narbitrary probs and silently produced a malformed table where\ncalc_baseline_and_numbits saw symbol_count values exceeding the\nsymbol's prob, yielding new_state/num_bits pairs that could overshoot\ndecode.len() on the unchecked read_entry hot path.\n\nAdd a typed ProbabilityCounterMismatch error at the public entry\npoint so malformed input is rejected before any unchecked indexing.\n\nAlso drops a dead 'let before = ...; let _ = before;' debug helper\non the direct-decode block loop (PR review note #18).\n\n* test(fse): regression test for build_from_probabilities accepting p<-1\n\nbuild_from_probabilities currently uses 'p.max(0) as u32' in the sum\ncheck, which silently clamps any probability < -1 to 0. RFC 8478\n§4.1.1 only allows probabilities in {-1, 0, positive}; values like -2\nare malformed and should be rejected, not clamped.\n\nAdds FSETableError::InvalidProbability { value } variant and a\nregression test that constructs probs [-2, 8, 4, 4] (which clamps\nto [0, 8, 4, 4] under the current logic, sums to 16 = 1<<acc_log,\nand passes validation). Test fails on current code as expected.\n\n* fix(fse): explicitly reject p<-1 in build_from_probabilities\n\nReplace 'p.max(0) as u32' in the sum check with a dedicated upfront\nloop that returns FSETableError::InvalidProbability for any value\nbelow -1. RFC 8478 §4.1.1 admits only {-1, 0, positive} as\nprobability values; silently clamping invalid negatives to 0 let\nmalformed distributions whose remaining terms happen to satisfy the\nsum check build a quietly broken table.\n\n* test(fse): regression for build_from_probabilities u32 sum overflow\n\nDoS-shaped probability vector that exploits the wrapping u32 sum\ncheck: [i32::MAX, i32::MAX, 0x42] as u32 sums to wrap to 0x40 = 64 =\n1 << acc_log. The current validation accepts the input as\nsum-matched; build_decoding_table then panics inside\ncalc_baseline_and_numbits → highest_bit_set's 'assert!(x > 0)' guard\n(or, in release without that guard, loops 2^31-1 times in the spread\nwalk per i32::MAX symbol). Either way: a public-API DoS surface.\n\nTest fails on current code as expected; the follow-up fix tightens\nthe per-probability range check and computes the sum in u64.\n\n* fix(fse): close DoS overflow + tighten Predefined cache copy\n\n#20: probability sum overflow in u32. Validate per-probability range\n(must be in {-1, 0, 1..=table_size}) upfront and compute the sum in\nu64 so the wrap-around exploit (large positive i32 cast to u32 then\nsummed wrapping back to table_size) is impossible. Bump\nFSETableError::ProbabilityCounterMismatch.got to u64 to match the\nwidened sum type — wire-format parse path is unaffected (uses u32\ninternally then upcasts at the error site).\n\n#21/#22/#23: predefined LL/ML/OF cache hot-path used clone_from on\nFSETable, which also clones symbol_spread_buffer + symbol_probabilities\n(both build-only fields not touched on the decode path). Switch to\nreinit_from, which skips symbol_spread_buffer content copy (reserves\ncapacity only) and resets the buffer to empty. The decode Vec stays\nfully copied via extend_from_slice so the enriched Entry fields\n(base_value, num_additional_bits) carry through unchanged.\n\n* fix(bit-writer,fse): runtime assert for dirty-upper-bits + FSE nb invariant\n\nbit_writer: 'catches_dirty_upper_bits' regression test was failing in\nrelease because the dirty-upper-bits guard was a debug_assert! that\ngot stripped. Encoder call sites are internal (trusted) but a wrong\ncaller would silently corrupt the compressed bitstream — the test\nexists for a reason. Upgrade to runtime assert!. Cost: one ilog2\n(LZCNT, 1 cycle on Skylake-X) + a predicted-not-taken branch per\nwrite_bits call. Negligible vs the per-token shift/merge cost.\n\nfse: build_decoding_table's 'nb <= accuracy_log' invariant was a\ndebug_assert!; the decoder's unchecked read_entry fast path depends\non it. build_from_probabilities is a public surface — a crafted but\nin-range probability vector could violate the invariant.  Upgrade to\na runtime check that returns FSETableError::InvalidProbability so\nrelease builds enforce the unchecked-indexing safety contract.\n\n* fix(fse,bit-writer): off-by-one + error variant split + Err-safe scratch\n\nbit_writer #24: write_bits_64 dirty-upper-bits check used\n'bits.ilog2() <= num_bits', which let bits == (1 << num_bits)\n(occupies num_bits+1 bits) slip through and silently corrupt the\nbitstream. Replace with 'num_bits == 64 || bits >> num_bits == 0' —\nalso handles num_bits=0 (short-circuited above) and bits=0 correctly\nwithout a separate guard, and is one ALU op vs ilog2's LZCNT\nround-trip.\n\nerrors #26+#28+#9: FSETableError::InvalidProbability was overloaded\nfor two distinct conditions — value outside RFC range (p < -1 or\np > table_size) and the internal table-shape invariant violation\n(nb > accuracy_log). The latter case is misleading to surface as\n'invalid probability' because the input value is RFC-valid; the\nreal failure is in calc_baseline_and_numbits. Split:\n- InvalidProbability { value }: only for RFC-range violations\n- TableInvariantViolation { prob, symbol, num_bits, accuracy_log }:\n  for internal shape failures, with full diagnostic context\nDisplay messages updated to match.\n\nerrors #27: ProbabilityCounterMismatch.got was widened to u64 in the\nprior commit (public API break). Per-element validation bounds the\nsum by 256 * 65536 = 16M which fits u32 with 8 bits of headroom —\nrevert to u32, no overflow possible after the upfront range gate.\n\nerrors #29+#12: Display message for ProbabilityCounterMismatch said\n'counter ... exceeded the expected sum', which was wrong when\ngot < expected (sum-too-small). Reword to neutral 'sum mismatch:\ngot X, expected Y'.\n\nfse #8: build_decoding_table used mem::take(&mut symbol_spread_buffer)\nwithout restoring on the Err paths (TableInvariantViolation,\nAccLogTooBig from bl::try_into). Refactor into outer wrapper +\ninner fn taking &mut Vec<u8>; the wrapper unconditionally restores\nthe scratch buffer after the inner result, success or error.\n\nseq_decoder #25: stale 'OF intentionally keeps closed-form' wording\nin decode_one_sequence_inline doc comment — code now reads\nof_state.base_value uniformly with LL/ML. Rewrote the comment to\ndescribe the actual donor-shape uniform read.\n\ndecode_buffer #10: doc comments around DecodeBufferCheckpoint and\ntry_restore_checkpoint still referenced advance_output_counter\nwhich was removed earlier on main. Rewrote to describe the\ninline-exec-bypasses-wrapper-counter shape that actually holds.\n\n* fix: num_bits range guard + comment/doc alignment\n\nbit_writer #13: write_bits_64 with num_bits > 64 would invoke\nIR-level shift overflow on the dirty-upper-bits check\n(bits >> num_bits). Add an upfront assert!(num_bits <= 64) so the\nsafe public API rejects out-of-range widths before the shift.\n\nfse #14: comment claimed sum is computed in u64 to dodge wrap, but\nthe actual sum is u32 (bounded by upfront per-element validation).\nAlign the comment with the implementation; the u32-no-wrap\nrationale is documented inline at the sum site itself.\n\nbuffer_backend #15: BufferBackend::exec_sequence_inline doc still\npointed callers at DecodeBuffer::advance_output_counter (removed\nearlier on main) for counter bookkeeping. Rewrite the doc to state\nthat the inline-exec path bypasses the wrapper counter — callers\nread BufferBackend::tail() for the authoritative byte count, and\nhashing is deferred to the post-block full-slice pass.\n\n* fix(bit-writer,decode): num_bits=64 fast-path + OF comment + dict gate doc\n\nbit_writer #30: write_bits_64 with num_bits=64 and bits_in_partial=0\nroutes to write_bits_64_cold, where 'bits >> bits_free_in_partial =\nbits >> 64' invokes IR-level shift overflow (panic in debug, UB in\nrelease). Add an early return for the empty-partial + full-word\ncase that writes the u64 directly via extend_from_slice. For\nnum_bits=64 with non-empty partial, the cold path's shift is\nbits_in_partial..63 which is well-defined.\n\nseq_decoder #33: stale OF comment block ('OF intentionally keeps\nclosed-form 1u32 << of_code') was only partially updated in the\nprior pass — the bottom paragraph still claimed the closed-form\nshift even though decode_one_sequence_inline reads of_state.base_value\nuniformly with LL/ML. Replace with a single coherent paragraph\ndescribing the donor-shape uniform read.\n\ndecode_buffer #32: 'total_output_counter' is not maintained on the\ninline-exec (UserSliceBackend) path, leaving repeat_from_dict's\n'counter <= window_size' gate trivially satisfied there. Document\nthe invariant that makes this safe: run_direct_decode initializes\nDecodeBuffer with empty dict_content, so the subsequent\n'bytes_from_dict > dict_content.len()' check inside catches every\nwould-be dict-source match and returns NotEnoughBytesInDictionary.\nThe Ring/Flat paths still maintain the counter correctly via\npush/repeat_match.\n\n* fix: enrich InvalidProbability + reinit_from doc + per_iter f64 div\n\nerrors #16: InvalidProbability Display referenced 'table_size' without\nincluding the value, making the diagnostic hard to act on. Add\ntable_size and accuracy_log fields to the variant and print them.\nUpdates the build_from_probabilities callsite + the regression test\nmatcher (now uses { value: -2, .. } leniency).\n\nseq_decoder #17: cache design comment said the Predefined path uses\nclone_from, but the prior thread #21/22/23 fix already switched to\nreinit_from. Align the comment with the actual mechanism (and\nexplain the symbol_spread_buffer savings reinit_from enables).\n\nprofile_decode_direct #18: 'elapsed / iters as u32' would truncate\niters on 64-bit and panic on division by zero when iters % 2^32 == 0.\nReplace with an f64 nanoseconds-per-iter computation that uses the\nfull iters value.\n\n* fix: full table reset on build Err + checked_add + first-iter validation + ungate table-shape guard\n\nfse #21: build_decoding_table wrapper only restored\nsymbol_spread_buffer on Err; on a TableInvariantViolation /\nAccLogTooBig return, self.decode is partial while\nself.accuracy_log / self.symbol_probabilities are already set by\nthe caller (build_from_probabilities). That inconsistency let a\nsubsequent init_state pass the 'accuracy_log != 0' gate and read\nfrom a partial decode vec — UB. After the buffer restore, fully\nreset() the table on Err so it returns to the same well-defined\nempty state a freshly-constructed FSETable has.\n\nfse outside-diff (CodeRabbit Critical): the\nInvalidTableShape guard in init_state was gated on\n'cfg(feature = \"fuzz_exports\")', but FSETable::decode and\n::accuracy_log are 'pub' in normal builds — safe external callers\ncan construct a mis-shaped table without enabling fuzz_exports and\nthen trip unchecked indexing in the cfg(not(fuzz_exports)) arm of\nread_entry. Remove the cfg gate so the shape check is unconditional\n(per-call cost is a single branch; the per-sequence\nupdate_state_fast hot path is unaffected).\n\nprofile_decode_direct #19: 'expected + WILDCOPY_OVERLENGTH' wrapped\nusize on adversarial inputs. Switch to checked_add with a clear\npanic message.\n\nprofile_decode_direct #20: profiling loop silently ran against\nmisconfigured input if expected_size was wrong. Do one decode +\nassert_eq! against expected BEFORE the timed loop; subsequent iters\nin the loop reuse the validated configuration.\n\n* docs: RFC 8478 → 8878 (Zstandard spec)\n\n#34/#35/#36/#37: comments/docs/Display strings referenced 'RFC 8478'\nwhich is the Babel Routing Protocol — the Zstandard format spec is\nRFC 8878. Replace across fse_decoder.rs, sequence_section_decoder.rs\nand errors.rs so doc-comments, panic messages and the\nInvalidProbability Display string point to the correct specification.\n\n* docs(fse): rephrase InvalidTableShape guard as defense-in-depth\n\nCopilot flagged that the prior rationale ('FSETable::decode is pub\nso external callers can mutate') was incorrect: in normal builds\ncrate::fse is pub(crate) (lib.rs:75), so external callers cannot\nreach FSETable at all. The check still has value as defense-in-depth\nagainst internal misuse / future fuzz_exports builds where the\nfields ARE publicly mutable. Rewrite the comment to match actual\nvisibility; check semantics unchanged.",
+          "timestamp": "2026-05-26T21:29:49+03:00",
+          "tree_id": "cee30e55ead7605cf97dc5bb035a3bea777eba0e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/750a5621e7dfbacbff43c63bb6d8c3ccb775e49a"
+        },
+        "date": 1779823316908,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.136,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 302.823,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 206.612,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.316,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.509,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 5.251,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.086,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 5.085,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.02,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.813,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.699,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.65,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.298,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.102,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.14,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.264,
             "unit": "ms"
           },
           {
