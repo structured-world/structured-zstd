@@ -40,9 +40,11 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 /// `try_restore_checkpoint()` writes to `self.hash`:
 ///   * `push` and `extend_and_fill` only advance
 ///     `total_output_counter`.
-///   * `advance_output_counter` (donor inline path) only advances
-///     `total_output_counter` (hashing is deferred to the final
-///     full-slice pass in `FrameDecoder::decode_all`).
+///   * The inline sequence executor writes through `buffer_mut()`
+///     directly, bypassing the wrapper-level
+///     `total_output_counter` entirely (`UserSliceBackend::tail`
+///     carries the byte count on that path; hashing is deferred to
+///     the final full-slice pass in `FrameDecoder::decode_all`).
 ///   * `drain_to` / `read` DO write hash, but they run BETWEEN
 ///     blocks, never inside the fused sequence loop the checkpoint
 ///     guards.
@@ -165,8 +167,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // No hash restore: see `DecodeBufferCheckpoint` doc. No
         // mutation site between `checkpoint()` and this call writes
         // to `self.hash` (drain runs between blocks, not inside the
-        // fused sequence loop; the donor inline path's
-        // `advance_output_counter` advances only the counter).
+        // fused sequence loop; the inline sequence executor bypasses
+        // the wrapper counter entirely via `buffer_mut()`, leaving
+        // hashing for the post-block full-slice pass).
         true
     }
 

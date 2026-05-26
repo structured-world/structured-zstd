@@ -349,19 +349,28 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         // the output bitstream because subsequent `write_bits_64`
         // calls would OR the spurious upper bits into the partial
         // accumulator at the wrong position. Enforce in release too
-        // (was `debug_assert!`) — the per-call cost is one `ilog2`
-        // (LZCNT, 1 cycle on Skylake-X) + a predicted-not-taken
-        // branch, negligible vs the encoder's per-token shift/merge
-        // work, while the safety value is real (encoder call sites
-        // are internal but a wrong caller would produce a corrupt
-        // compressed blob with no diagnostic signal).
-        if bits > 0 {
-            assert!(
-                bits.ilog2() <= num_bits as u32,
-                "write_bits_64 dirty upper bits: bits=0x{bits:x} occupies {} bits but num_bits={num_bits}",
-                u64::BITS - bits.leading_zeros(),
-            );
-        }
+        // (was `debug_assert!`) — the per-call cost is one shift +
+        // compare + predicted-not-taken branch, negligible vs the
+        // encoder's per-token shift/merge work, while the safety
+        // value is real (encoder call sites are internal but a wrong
+        // caller would produce a corrupt compressed blob with no
+        // diagnostic signal).
+        //
+        // `bits >> num_bits == 0` covers both the `num_bits == 64`
+        // edge (right-shift-by-64 on u64 is UB at the IR level but
+        // here we short-circuit via the leading `num_bits == 0`
+        // bail-out + this branch's `num_bits < 64` precondition — in
+        // practice every call site that reads up to 64 bits goes
+        // through `write_bits_64_no_check` instead) and the
+        // off-by-one trap that `bits.ilog2() <= num_bits` had: under
+        // the old `<=` form, `bits == 1 << num_bits` (which occupies
+        // `num_bits + 1` bits) would still pass. The shift form is
+        // also one ALU op vs `ilog2`'s LZCNT round-trip.
+        assert!(
+            num_bits == 64 || bits >> num_bits == 0,
+            "write_bits_64 dirty upper bits: bits=0x{bits:x} occupies {} bits but num_bits={num_bits}",
+            u64::BITS - bits.leading_zeros(),
+        );
 
         // fill partial byte first
         if num_bits + self.bits_in_partial < 64 {

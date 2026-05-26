@@ -891,9 +891,12 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
-    // `Entry`. LL / ML are populated by `enrich_with_packed_seq_meta`
-    // from the packed `LL_META` / `ML_META` tables during build;
-    // OF is enriched closed-form (`1 << code`) by `enrich_for_offsets`.
+    // `Entry`. LL / ML / OF all use the same uniform shape: the
+    // build-time enrichment populates `state.base_value` and
+    // `state.num_additional_bits` for each axis (LL/ML via
+    // `enrich_with_packed_seq_meta` from the packed `LL_META` /
+    // `ML_META` tables; OF via `enrich_for_offsets` which writes
+    // `base_value = 1 << code` and `num_additional_bits = code`).
     // Reading `state` directly drops the previous `lookup_ll_code` /
     // `lookup_ml_code` indirections (those did a second cache touch
     // on the separate meta tables per sequence) — the active entry

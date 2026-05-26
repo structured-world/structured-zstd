@@ -1122,7 +1122,7 @@ pub enum FSETableError {
     },
     GetBitsError(GetBitsError),
     ProbabilityCounterMismatch {
-        got: u64,
+        got: u32,
         expected_sum: u32,
         symbol_probabilities: Vec<i32>,
     },
@@ -1130,9 +1130,23 @@ pub enum FSETableError {
         got: usize,
     },
     /// Probability value outside the RFC 8478 §4.1.1 allowed set
-    /// `{-1, 0, positive}`. Specifically a value `< -1`.
+    /// `{-1, 0, 1..=table_size}`. Carried verbatim from the input
+    /// vector for diagnostics.
     InvalidProbability {
         value: i32,
+    },
+    /// `calc_baseline_and_numbits` produced a state-entry whose bit
+    /// width exceeds the table's accuracy log, violating the
+    /// `new_state + (1 << num_bits) - 1 < table_size` invariant that
+    /// the unchecked `read_entry` decode hot path relies on. The
+    /// triggering probability is in-range per RFC 8478 §4.1.1; the
+    /// failure is an internal table-shape inconsistency surfaced
+    /// against the public `build_from_probabilities` API.
+    TableInvariantViolation {
+        prob: i32,
+        symbol: u8,
+        num_bits: u8,
+        accuracy_log: u8,
     },
 }
 
@@ -1164,7 +1178,7 @@ impl core::fmt::Display for FSETableError {
             } => {
                 write!(
                     f,
-                    "The counter ({got}) exceeded the expected sum: {expected_sum}. This means an error or corrupted data \n {symbol_probabilities:?}",
+                    "FSE probability sum mismatch: got {got}, expected {expected_sum}. Indicates corrupted data or an invalid distribution\n {symbol_probabilities:?}",
                 )
             }
             FSETableError::TooManySymbols { got } => {
@@ -1176,7 +1190,18 @@ impl core::fmt::Display for FSETableError {
             FSETableError::InvalidProbability { value } => {
                 write!(
                     f,
-                    "FSE probability value {value} is outside the RFC 8478 allowed set (negatives below -1 are not permitted)",
+                    "FSE probability value {value} is outside the RFC 8478 allowed set (must be -1, 0, or in 1..=table_size)",
+                )
+            }
+            FSETableError::TableInvariantViolation {
+                prob,
+                symbol,
+                num_bits,
+                accuracy_log,
+            } => {
+                write!(
+                    f,
+                    "FSE table invariant violation: symbol {symbol} (prob {prob}) produced num_bits {num_bits} > accuracy_log {accuracy_log}",
                 )
             }
         }
@@ -1526,7 +1551,7 @@ mod tests {
                 symbol_probabilities: vec![1, -1],
             }
             .to_string(),
-            "The counter (4) exceeded the expected sum: 3. This means an error or corrupted data \n [1, -1]"
+            "FSE probability sum mismatch: got 4, expected 3. Indicates corrupted data or an invalid distribution\n [1, -1]"
         );
         assert_eq!(
             HuffmanTableError::NotEnoughBytesForWeights {

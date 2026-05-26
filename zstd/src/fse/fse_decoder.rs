@@ -415,11 +415,18 @@ impl FSETable {
                 return Err(FSETableError::InvalidProbability { value: p });
             }
         }
-        let probability_sum: u64 = probs
+        // Sum the validated probs in u32. Per-element validation
+        // above bounds each non-`-1` value by `table_size <= 1 << 16`,
+        // and `probs.len() <= 256`, so the worst-case sum
+        // `256 * 65536 = 16M` fits u32 with 8 bits of headroom — no
+        // wrap possible. Keeps the public
+        // `ProbabilityCounterMismatch.got` field at u32 (no public
+        // API break).
+        let probability_sum: u32 = probs
             .iter()
-            .map(|&p| if p == -1 { 1u64 } else { p as u64 })
+            .map(|&p| if p == -1 { 1u32 } else { p as u32 })
             .sum();
-        if probability_sum != u64::from(table_size) {
+        if probability_sum != table_size {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_sum,
                 expected_sum: table_size,
@@ -437,7 +444,20 @@ impl FSETable {
     /// — no intermediate zero-init Vec::resize, no per-call heap
     /// allocation for the symbol counter (stack-allocated since the
     /// max symbol count is bounded by `u8::MAX + 1 = 256`).
+    ///
+    /// Wraps `build_decoding_table_inner` so the `symbol_spread_buffer`
+    /// scratch is unconditionally restored to `self` on every exit
+    /// path (success OR error) — otherwise an early `Err` from the
+    /// inner pass would drop the taken buffer and force a fresh
+    /// allocation on the next build.
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
+        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
+        let result = self.build_decoding_table_inner(&mut spread);
+        self.symbol_spread_buffer = spread;
+        result
+    }
+
+    fn build_decoding_table_inner(&mut self, spread: &mut Vec<u8>) -> Result<(), FSETableError> {
         let nb_symbols = self.symbol_probabilities.len();
         if nb_symbols > self.max_symbol as usize + 1 {
             return Err(FSETableError::TooManySymbols { got: nb_symbols });
@@ -451,7 +471,6 @@ impl FSETable {
         // build path now (previous impl also zero-init'd `decode`
         // through `Vec::resize` with a default `Entry`, doubling the
         // write traffic on the build path).
-        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
         spread.clear();
         spread.resize(table_size, 0);
 
@@ -518,7 +537,12 @@ impl FSETable {
                 // Reject at build time so the unchecked indexing
                 // contract holds in release as well as debug.
                 if nb > accuracy_log {
-                    return Err(FSETableError::InvalidProbability { value: prob });
+                    return Err(FSETableError::TableInvariantViolation {
+                        prob,
+                        symbol,
+                        num_bits: nb,
+                        accuracy_log,
+                    });
                 }
                 let new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
                     got: accuracy_log,
@@ -545,7 +569,6 @@ impl FSETable {
             }
         }
 
-        self.symbol_spread_buffer = spread;
         Ok(())
     }
 
@@ -622,7 +645,7 @@ impl FSETable {
 
         if probability_counter != probability_sum {
             return Err(FSETableError::ProbabilityCounterMismatch {
-                got: u64::from(probability_counter),
+                got: probability_counter,
                 expected_sum: probability_sum,
                 symbol_probabilities: self.symbol_probabilities.clone(),
             });
