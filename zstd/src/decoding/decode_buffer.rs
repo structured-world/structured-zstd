@@ -179,10 +179,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve(amount);
     }
 
-    /// Mutable backend handle — paired with
-    /// [`Self::advance_output_counter`] so the donor-shape inline
-    /// sequence executor can write straight into the backend's
-    /// physical storage and then update the buffer-level counters.
+    /// Mutable backend handle. Lets the inline sequence executor
+    /// write straight into the backend's physical storage; the
+    /// `tail()` cursor on the backend is the authoritative output
+    /// length, so no separate buffer-level counter update is needed.
     /// Crate-internal; gated to the
     /// `BufferBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true` dispatch
     /// site.
@@ -192,12 +192,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         &mut self.buffer
     }
 
-    /// Immutable backend handle. Used by `run_direct_decode`'s
-    /// post-block FCS check to read `tail` directly, bypassing the
-    /// `total_output_counter` field — the donor inline path skips
-    /// `advance_output_counter` (see
+    /// Immutable backend handle. `run_direct_decode`'s post-block FCS
+    /// check reads `tail()` straight from the backend rather than
+    /// going through `total_output_counter`: the inline sequence
+    /// executor (see
     /// `sequence_section_decoder::execute_one_sequence_pipelined`)
-    /// so the counter would be stale on that path.
+    /// writes directly through `buffer_mut`, so the
+    /// `total_output_counter` field on the wrapper is not maintained
+    /// on that path and `tail()` is the only accurate output length.
     #[inline(always)]
     pub(crate) fn buffer_ref(&self) -> &B {
         &self.buffer
