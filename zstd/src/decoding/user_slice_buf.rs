@@ -928,8 +928,8 @@ mod tests {
         let mut buf = vec![0u8; 256 + WILDCOPY];
         // Seed history: bytes 0..32 = ascending values, so a later
         // match at offset 16 picks up bytes 16..32.
-        for i in 0..32 {
-            buf[i] = i as u8;
+        for (i, slot) in buf.iter_mut().take(32).enumerate() {
+            *slot = i as u8;
         }
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.tail = 32; // Pretend 32 history bytes are already written.
@@ -960,8 +960,8 @@ mod tests {
         // for the remaining literal bytes.
         const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut buf = vec![0u8; 256 + WILDCOPY];
-        for i in 0..32 {
-            buf[i] = i as u8;
+        for (i, slot) in buf.iter_mut().take(32).enumerate() {
+            *slot = i as u8;
         }
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.tail = 32;
