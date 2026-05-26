@@ -1041,7 +1041,14 @@ impl FrameDecoder {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
-        self.decode_all_impl(input, output, |this, src| this.init(src), None)
+        #[cfg(not(feature = "lsm"))]
+        {
+            self.decode_all_impl(input, output, |this, src| this.init(src))
+        }
+        #[cfg(feature = "lsm")]
+        {
+            self.decode_all_impl(input, output, |this, src| this.init(src), None)
+        }
     }
 
     /// Decode multiple frames into the output slice, invoking `visitor`
@@ -1078,6 +1085,7 @@ impl FrameDecoder {
     /// )?;
     /// ```
     #[cfg(feature = "lsm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
     pub fn decode_all_with_skippable_visitor<F>(
         &mut self,
         input: &[u8],
@@ -1118,20 +1126,32 @@ impl FrameDecoder {
         output: &mut [u8],
         dict: &DictionaryHandle,
     ) -> Result<usize, FrameDecoderError> {
-        self.decode_all_impl(
-            input,
-            output,
-            |this, src| this.init_with_dict_handle(src, dict),
-            None,
-        )
+        #[cfg(not(feature = "lsm"))]
+        {
+            self.decode_all_impl(input, output, |this, src| {
+                this.init_with_dict_handle(src, dict)
+            })
+        }
+        #[cfg(feature = "lsm")]
+        {
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.init_with_dict_handle(src, dict),
+                None,
+            )
+        }
     }
 
+    /// Default-feature decode_all_impl: no visitor parameter so the
+    /// no-lsm build's call surface and codegen are byte-identical to
+    /// the pre-#172 implementation. Compiles only when `lsm` is OFF.
+    #[cfg(not(feature = "lsm"))]
     fn decode_all_impl(
         &mut self,
         mut input: &[u8],
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
-        mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
     ) -> Result<usize, FrameDecoderError> {
         use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
@@ -1139,27 +1159,10 @@ impl FrameDecoder {
             match init_frame(self, &mut input) {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(
-                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame {
-                        magic_number,
-                        length,
-                    },
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
                 )) => {
-                    let length = length as usize;
-                    // Visitor sees the payload slice BEFORE we advance
-                    // past it. Borrowed slice — no allocation. The
-                    // variant is the low nibble of the magic number
-                    // (RFC 8878 §3.1.2). `read_frame_header` only emits
-                    // SkipFrame for magic in 0x184D2A50..=0x184D2A5F, so
-                    // the subtraction fits in 0..=15.
-                    if let Some(visitor) = skippable_visitor.as_mut() {
-                        let payload = input
-                            .get(..length)
-                            .ok_or(FrameDecoderError::FailedToSkipFrame)?;
-                        let variant = (magic_number - 0x184D2A50) as u8;
-                        visitor(variant, payload);
-                    }
                     input = input
-                        .get(length..)
+                        .get(length as usize..)
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                     continue;
                 }
@@ -1209,6 +1212,94 @@ impl FrameDecoder {
             // Use `fcs_declared()` (NOT `content_size > 0`) so an
             // empty frame with explicit FCS=0 on the wire still gets
             // validated.
+            if fcs_declared {
+                let produced = (total_bytes_written - frame_start_total) as u64;
+                if produced != content_size {
+                    return Err(FrameDecoderError::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced,
+                    });
+                }
+            }
+        }
+
+        Ok(total_bytes_written)
+    }
+
+    /// `lsm`-feature decode_all_impl: adds the optional skippable
+    /// visitor parameter consumed by
+    /// [`Self::decode_all_with_skippable_visitor`]. Body is identical
+    /// to the no-lsm variant except for the SkipFrame arm, which
+    /// invokes the visitor (when `Some`) on the borrowed payload
+    /// slice before advancing past it.
+    #[cfg(feature = "lsm")]
+    fn decode_all_impl(
+        &mut self,
+        mut input: &[u8],
+        mut output: &mut [u8],
+        mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
+        mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
+    ) -> Result<usize, FrameDecoderError> {
+        use super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut total_bytes_written = 0;
+        while !input.is_empty() {
+            match init_frame(self, &mut input) {
+                Ok(_) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame {
+                        magic_number,
+                        length,
+                    },
+                )) => {
+                    let length = length as usize;
+                    // Visitor sees the payload slice BEFORE we advance
+                    // past it. Borrowed slice — no allocation. The
+                    // variant is the low nibble of the magic number
+                    // (RFC 8878 §3.1.2). `read_frame_header` only emits
+                    // SkipFrame for magic in 0x184D2A50..=0x184D2A5F, so
+                    // the subtraction fits in 0..=15.
+                    if let Some(visitor) = skippable_visitor.as_mut() {
+                        let payload = input
+                            .get(..length)
+                            .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                        let variant = (magic_number - 0x184D2A50) as u8;
+                        visitor(variant, payload);
+                    }
+                    input = input
+                        .get(length..)
+                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let state_ref = self.state.as_ref().expect("init populated state");
+            let content_size = state_ref.frame_header.frame_content_size();
+            let fcs_declared = state_ref.frame_header.fcs_declared();
+            let dict_active = state_ref.using_dict.is_some();
+            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+            let direct_eligible =
+                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+            if direct_eligible {
+                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                output = &mut output[written..];
+                total_bytes_written += written;
+                continue;
+            }
+            let frame_start_total = total_bytes_written;
+            loop {
+                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                let bytes_written = self
+                    .read(output)
+                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                output = &mut output[bytes_written..];
+                total_bytes_written += bytes_written;
+                if self.can_collect() != 0 {
+                    return Err(FrameDecoderError::TargetTooSmall);
+                }
+                if self.is_finished() {
+                    break;
+                }
+            }
             if fcs_declared {
                 let produced = (total_bytes_written - frame_start_total) as u64;
                 if produced != content_size {
