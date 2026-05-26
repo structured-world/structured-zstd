@@ -39,6 +39,10 @@
 //! per-variant constants are baked into the source — applications are
 //! responsible for documenting which variants they claim and
 //! coordinating with other ecosystem consumers to avoid collisions.
+//!
+//! The ecosystem registry of known allocations and the policy for
+//! claiming new ones lives in
+//! [`docs/SKIPPABLE_MAGIC_ALLOCATIONS.md`](https://github.com/structured-world/structured-zstd/blob/main/docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
 
 extern crate alloc;
 
