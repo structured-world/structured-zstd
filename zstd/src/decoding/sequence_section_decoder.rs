@@ -401,14 +401,19 @@ fn decode_and_execute_sequences_impl<
     const MIN_LONG_OFFSET_SHARE: u32 = 7;
     #[cfg(not(target_pointer_width = "64"))]
     const MIN_LONG_OFFSET_SHARE: u32 = 20;
-    let use_long_pipeline =
-        num_sequences >= ADVANCE * 2 && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE;
-    // Donor also engages the prefetch decoder when the dictionary is
-    // cold or when the format-level `isLongOffset` flag is set. We
-    // don't track dictionary-coldness on this decode path and the
-    // 32-bit `isLongOffset` shortcut is irrelevant on the
-    // u32-indexed decoder, so the FSE-share signal carries the
-    // whole decision.
+    // Donor `ZSTD_decompressBlock_internal`: `usePrefetchDecoder` is
+    // initialised from `dctx->ddictIsCold` so the first block of a
+    // freshly-attached-dict frame engages the prefetch decoder
+    // unconditionally, then `ddictIsCold = 0` after the dispatch so
+    // subsequent blocks fall back to the `longOffsetShare` heuristic.
+    // We mirror the consume-once semantics here.
+    let ddict_is_cold = fse.ddict_is_cold;
+    fse.ddict_is_cold = false;
+    let use_long_pipeline = num_sequences >= ADVANCE * 2
+        && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
+    // The format-level `isLongOffset` shortcut from donor is
+    // irrelevant on our u32-indexed decoder, so on top of the
+    // long-offset share the cold-dict signal is the only other gate.
 
     if use_long_pipeline {
         // The pipelined branch must roll `offset_hist` back to
