@@ -7,6 +7,7 @@
 use super::frame;
 use crate::decoding;
 use crate::decoding::block_decoder::BlockDecoder;
+use crate::decoding::buffer_backend::BufferBackend;
 use crate::decoding::decode_buffer::DecodeBuffer;
 use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::decoding::errors::{DecodeBlockContentError, FrameDecoderError};
@@ -1332,7 +1333,14 @@ impl FrameDecoder {
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
             // persistent `block_content_buffer`.
-            let before = direct.buffer.total_produced();
+            // Read `tail` directly: the donor inline path no longer
+            // calls `advance_output_counter` so the separate
+            // `total_output_counter` would be stale on that path.
+            // `UserSliceBackend::tail` is advanced inside every
+            // `exec_sequence_inline` / `extend` / `try_extend`
+            // call, so it's the authoritative count of bytes the
+            // backend has written.
+            let before = direct.buffer.buffer_ref().tail() as u64;
             let body_consumed = match block_dec.decode_block_content_from_slice(
                 &block_header,
                 &mut direct,
@@ -1360,7 +1368,7 @@ impl FrameDecoder {
                 }
                 Err(e) => return Err(err::FailedToReadBlockBody(e)),
             };
-            produced = direct.buffer.total_produced();
+            produced = direct.buffer.buffer_ref().tail() as u64;
             // Post-decode FCS overflow check.
             if produced > content_size {
                 return Err(err::FrameContentSizeMismatch {

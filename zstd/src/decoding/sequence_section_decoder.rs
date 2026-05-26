@@ -854,7 +854,20 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
                 .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
-        buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
+        // No `advance_output_counter` here: the donor inline path
+        // advances `UserSliceBackend::tail` directly inside
+        // `exec_sequence_inline`, and the post-block FCS check in
+        // `run_direct_decode` now reads `tail` (via
+        // `buffer_ref().tail() as u64`) instead of the separately
+        // maintained `DecodeBuffer::total_output_counter`. Skipping
+        // the per-sequence RMW drops the ~9% of decode time
+        // measured at `addq <ll+ml>, 0x40(%r9)` on z000033
+        // (perf annotate on
+        // `decode_and_execute_sequences_avx2`). The legacy
+        // push+repeat fallback below still goes through
+        // `DecodeBuffer::try_push` / `repeat_lookahead_prefetched`,
+        // which keep `total_output_counter` in sync for backends
+        // that need it.
         return Ok(());
     }
 

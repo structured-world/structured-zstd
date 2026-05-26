@@ -192,23 +192,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         &mut self.buffer
     }
 
-    /// Advance the `total_output_counter` by `n` bytes — pair with
-    /// [`super::buffer_backend::BufferBackend::exec_sequence_inline`]
-    /// which writes the actual bytes through the backend without
-    /// touching DecodeBuffer-level bookkeeping. Without this helper
-    /// the donor-shape path would leave `total_output_counter` stale
-    /// on every sequence executed through it.
-    ///
-    /// **Hash is NOT mutated here.** On the direct-decode path
-    /// `FrameDecoder::decode_all` walks the full output
-    /// slice once at end of decode and writes the result into
-    /// `self.hash`, overwriting any incremental state. Hashing per
-    /// sequence here would be wasted work whose result the final
-    /// pass discards. The legacy decode path likewise folds bytes
-    /// into the hash via `drain_to`, not at write time.
-    #[inline]
-    pub(crate) fn advance_output_counter(&mut self, n: usize) {
-        self.total_output_counter += n as u64;
+    /// Immutable backend handle. Used by `run_direct_decode`'s
+    /// post-block FCS check to read `tail` directly, bypassing the
+    /// `total_output_counter` field — the donor inline path skips
+    /// `advance_output_counter` (see
+    /// `sequence_section_decoder::execute_one_sequence_pipelined`)
+    /// so the counter would be stale on that path.
+    #[inline(always)]
+    pub(crate) fn buffer_ref(&self) -> &B {
+        &self.buffer
     }
 
     /// Fill `fill_length` bytes of the output with the literal `fill_with`,
@@ -699,23 +691,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             None => Ok(0),
             Some(can_drain) => self.drain_to(can_drain, |buf| write_all_bytes(&mut sink, buf)),
         }
-    }
-
-    /// Total bytes ever produced into the backend across this
-    /// `DecodeBuffer`'s lifetime. Incremented by `push` / `repeat` /
-    /// `extend_and_fill` / `extend_from_reader`. Survives across
-    /// `drop_to_window_size` and `drain_*` calls (those only narrow
-    /// the visible region; they don't roll back produced).
-    ///
-    /// Used by the direct-decode path (`FrameDecoder::decode_all`)
-    /// to track actual bytes written against the declared
-    /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
-    /// which is intentionally 0 for `BlockType::Compressed` (the
-    /// header parser doesn't decode the body), so per-block tracking
-    /// via the header field would always read 0 on compressed blocks
-    /// and miscount.
-    pub fn total_produced(&self) -> u64 {
-        self.total_output_counter
     }
 
     /// Advance the backend's head past any bytes beyond `window_size`
