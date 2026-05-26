@@ -23,6 +23,10 @@ Allocations are an application-protocol concern. Downstream consumers
 embedding metadata in zstd streams should register their variants here
 to prevent collisions.
 
+<!-- The variant table below uses single leading pipes per
+GitHub Flavored Markdown. Render-checked on github.com — does not
+produce a spurious empty column. -->
+
 ## Allocated variants
 
 | Variant | Magic        | Consumer                    | Purpose                                                                       | Spec |

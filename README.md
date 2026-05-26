@@ -172,6 +172,13 @@ structured-zstd = { version = "0", features = ["lsm"] }
 The ecosystem registry of allocated skippable-frame magic variants
 and the allocation policy live in
 [docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](https://github.com/structured-world/structured-zstd/blob/main/docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
+<!-- Absolute URL is intentional: this README is embedded into the
+crate's rustdoc via `#![doc = include_str!("../README.md")]` in
+zstd/src/lib.rs, where relative paths resolve under docs.rs and 404.
+The registry is also the canonical single source of truth on
+upstream `main`, so the link target is correct for forks too —
+fork consumers should point readers at the upstream registry
+rather than maintain divergent copies. -->
 
 ## Project relationship
 
