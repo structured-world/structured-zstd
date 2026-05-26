@@ -678,3 +678,64 @@ fn calc_baseline_and_numbits(
         ((index_shifted * slice_width), num_bits as u8)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoding::errors::FSETableError;
+
+    #[test]
+    fn build_from_probabilities_rejects_sum_too_small() {
+        // acc_log=4 → table_size=16. Valid sum (treating -1 as 1)
+        // is 16. Use a distribution that sums to 8 (probs sum 8,
+        // no -1s).
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [4, 2, 1, 1];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(
+                result,
+                Err(FSETableError::ProbabilityCounterMismatch { .. })
+            ),
+            "expected ProbabilityCounterMismatch for sum=8 vs expected=16, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_rejects_sum_too_large() {
+        // acc_log=4 → table_size=16. Probs summing to 20 (>16)
+        // would over-fill the spread.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [8, 6, 4, 2];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(
+                result,
+                Err(FSETableError::ProbabilityCounterMismatch { .. })
+            ),
+            "expected ProbabilityCounterMismatch for sum=20 vs expected=16, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_accepts_negative_one_in_sum() {
+        // acc_log=4 → table_size=16. Probs: 12 positive + 4 × -1
+        // (counted as 1 each) sum to 16. Should succeed.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 6] = [8, 4, -1, -1, -1, -1];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            result.is_ok(),
+            "expected Ok for sum=16 with -1s, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_accepts_exact_sum() {
+        // Sum 4+4+4+4 = 16 = 1 << 4. No -1s.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [4, 4, 4, 4];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
+    }
+}
