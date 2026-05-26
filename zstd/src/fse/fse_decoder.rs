@@ -39,35 +39,33 @@ impl<'t> FSEDecoder<'t> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
-        // Externally-constructible-table guard: when
-        // `feature = "fuzz_exports"` is on, `FSETable.decode` /
-        // `FSETable.accuracy_log` are settable from outside the crate,
-        // so a fuzz harness can hand the decoder a mis-shaped table
-        // that skips `build_decoding_table`'s invariants. Validate the
-        // table-shape invariant `decode.len() == 1 << accuracy_log`
-        // up-front and surface as a typed `InvalidTableShape` error
-        // (distinct from `TableIsUninitialized` to keep fuzz triage
-        // unambiguous) — without this, `read_entry`'s bounds-checked
-        // indexing under the same cfg would panic on a malformed
-        // table, which fuzz harnesses cannot distinguish from a
-        // legitimate decoder failure. `checked_shl` covers the
+        // Defense-in-depth internal-invariant guard: in normal builds
+        // `crate::fse` is not externally reachable, but malformed
+        // tables can still arise from internal misuse, future
+        // `feature = "fuzz_exports"`. Validate up-front that
+        // `decode.len() == 1 << accuracy_log` and surface a typed
+        // `InvalidTableShape` error (distinct from
+        // `TableIsUninitialized` to keep error triage unambiguous).
+        // Without this, `read_entry`'s unchecked indexing (the
+        // `cfg(not(fuzz_exports))` arm) could hit UB on a malformed
+        // table in release builds. `checked_shl` covers the
         // pathological case where `accuracy_log >= usize::BITS`.
-        #[cfg(feature = "fuzz_exports")]
-        {
-            let accuracy_log = self.table.accuracy_log;
-            let decode_len = self.table.decode.len();
-            let expected = 1usize.checked_shl(accuracy_log.into()).ok_or(
-                FSEDecoderError::InvalidTableShape {
+        // Branch cost is a single per-call check; the per-sequence
+        // hot path (`update_state_fast`) is unaffected.
+        let accuracy_log = self.table.accuracy_log;
+        let decode_len = self.table.decode.len();
+        let expected =
+            1usize
+                .checked_shl(accuracy_log.into())
+                .ok_or(FSEDecoderError::InvalidTableShape {
                     decode_len,
                     accuracy_log,
-                },
-            )?;
-            if decode_len != expected {
-                return Err(FSEDecoderError::InvalidTableShape {
-                    decode_len,
-                    accuracy_log,
-                });
-            }
+                })?;
+        if decode_len != expected {
+            return Err(FSEDecoderError::InvalidTableShape {
+                decode_len,
+                accuracy_log,
+            });
         }
         let new_state = bits.get_bits(self.table.accuracy_log);
         // SAFETY: `accuracy_log` bits read from the bitstream produce
@@ -233,9 +231,6 @@ pub struct FSETable {
     /// If a symbol probability is set to `-1`, it means that the probability of a symbol
     /// occurring in the data is less than one.
     pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
-    /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1) and so on
-    /// up until the highest possible symbol (255).
-    symbol_counter: Vec<u32>,
 }
 
 impl FSETable {
@@ -244,7 +239,6 @@ impl FSETable {
         FSETable {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
-            symbol_counter: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             symbol_spread_buffer: Vec::new(),
             decode: Vec::new(), //depending on acc_log.
             accuracy_log: 0,
@@ -254,7 +248,6 @@ impl FSETable {
     /// Reset `self` and update `self`'s state to mirror the provided table.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        self.symbol_counter.extend_from_slice(&other.symbol_counter);
         self.symbol_probabilities
             .extend_from_slice(&other.symbol_probabilities);
         self.symbol_spread_buffer
@@ -265,7 +258,6 @@ impl FSETable {
 
     /// Empty the table and clear all internal state.
     pub fn reset(&mut self) {
-        self.symbol_counter.clear();
         self.symbol_probabilities.clear();
         self.symbol_spread_buffer.clear();
         self.decode.clear();
@@ -381,138 +373,219 @@ impl FSETable {
                 max: ENTRY_MAX_ACCURACY_LOG,
             });
         }
+        // Probability sum check: `build_decoding_table` assumes the
+        // sum of positive probabilities plus the count of `-1`
+        // entries (each contributing one slot at the top of the
+        // table) equals exactly `1 << acc_log`. Without this guard
+        // the wire-format `parse_wire` path validates the sum
+        // upstream, but callers entering through
+        // `build_from_probabilities` directly (the Predefined cache
+        // and any fuzz / external user) would silently produce a
+        // table where `calc_baseline_and_numbits` is given
+        // `symbol_count` values exceeding the symbol's actual
+        // `prob`, yielding `new_state` / `num_bits` pairs that can
+        // overshoot `decode.len()` on the unchecked `read_entry`
+        // hot path. Surface as a typed error so the caller can
+        // distinguish a malformed input from an internal failure.
+        // Strict probability range validation: RFC 8878 §4.1.1 admits
+        // only `{-1, 0, 1..=table_size}` as probability values. The
+        // wire-format parser never emits anything else, but
+        // `build_from_probabilities` is a public entry point reachable
+        // from fuzz harnesses and external users — leaving the gate
+        // open invites two attack shapes:
+        //
+        //   1. Silent malformed table: clamping `p < -1` to 0 (the
+        //      previous `p.max(0)`) lets `[-2, ...]` satisfy a sum
+        //      check whose remaining terms happen to add up to
+        //      `table_size`, producing a quietly broken table.
+        //   2. DoS via probability-sum overflow: `[i32::MAX, i32::MAX,
+        //      0x42] as u32` wraps to `0x40 = 64 = 1 << 6`, satisfies
+        //      the sum check, then `build_decoding_table` runs
+        //      `for _ in 0..prob` against `prob = i32::MAX`, looping
+        //      2^31-1 times per such symbol (worst case: spread-array
+        //      out-of-bounds panic, best case: minutes of CPU).
+        //
+        // Reject any `p > table_size` upfront so the subsequent u32
+        // sum is bounded (see the sum's own comment for the
+        // wrap-impossibility argument).
+        let table_size = 1u32 << acc_log;
+        for &p in probs {
+            if p < -1 || p > table_size as i32 {
+                return Err(FSETableError::InvalidProbability {
+                    value: p,
+                    table_size,
+                    accuracy_log: acc_log,
+                });
+            }
+        }
+        // Sum the validated probs in u32. Per-element validation
+        // above bounds each non-`-1` value by `table_size <= 1 << 16`,
+        // and `probs.len() <= 256`, so the worst-case sum
+        // `256 * 65536 = 16M` fits u32 with 8 bits of headroom — no
+        // wrap possible. Keeps the public
+        // `ProbabilityCounterMismatch.got` field at u32 (no public
+        // API break).
+        let probability_sum: u32 = probs
+            .iter()
+            .map(|&p| if p == -1 { 1u32 } else { p as u32 })
+            .sum();
+        if probability_sum != table_size {
+            return Err(FSETableError::ProbabilityCounterMismatch {
+                got: probability_sum,
+                expected_sum: table_size,
+                symbol_probabilities: probs.to_vec(),
+            });
+        }
         self.symbol_probabilities = probs.to_vec();
         self.accuracy_log = acc_log;
         self.build_decoding_table()
     }
 
-    /// Build the actual decoding table after probabilities have been read into the table.
-    /// After this function is called, the decoding process can begin.
+    /// Build the actual decoding table after probabilities have been
+    /// read. Donor-shape single-pass build: spread symbols into the
+    /// scratch buffer, then write `decode` entries in one linear pass
+    /// — no intermediate zero-init Vec::resize, no per-call heap
+    /// allocation for the symbol counter (stack-allocated since the
+    /// max symbol count is bounded by `u8::MAX + 1 = 256`).
+    ///
+    /// Wraps `build_decoding_table_inner` so the `symbol_spread_buffer`
+    /// scratch is unconditionally restored to `self` on every exit
+    /// path (success OR error) — otherwise an early `Err` from the
+    /// inner pass would drop the taken buffer and force a fresh
+    /// allocation on the next build.
+    ///
+    /// On `Err` the table is also fully `reset()` after the buffer
+    /// restore: the inner pass mutates `self.decode` (partial push)
+    /// while `self.accuracy_log` / `self.symbol_probabilities` were
+    /// already set by the caller (`build_from_probabilities`); leaving
+    /// that inconsistency in place would let a subsequent `init_state`
+    /// pass the `accuracy_log != 0` gate and read from a partial
+    /// `decode` vec — UB. After `reset()` the table is in the same
+    /// well-defined empty state a freshly-constructed `FSETable` has;
+    /// any subsequent `init_state` returns `TableIsUninitialized`.
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
-            return Err(FSETableError::TooManySymbols {
-                got: self.symbol_probabilities.len(),
-            });
+        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
+        let result = self.build_decoding_table_inner(&mut spread);
+        self.symbol_spread_buffer = spread;
+        if result.is_err() {
+            self.reset();
         }
-
-        self.decode.clear();
-
-        let table_size = 1 << self.accuracy_log;
-        // After clear(), len == 0, so reserve(table_size) guarantees capacity
-        // ≥ table_size. The matching `set_len` runs later, right before
-        // `copy_symbols_into_decode`, so that any panic in the intervening
-        // table_symbols / symbol_spread_buffer allocations unwinds with
-        // `self.decode.len() == 0` instead of leaving uninitialized Entry
-        // slots reachable through `&mut self.decode[..]` on the next call.
-        self.decode.reserve(table_size);
-
-        let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
-        table_symbols.clear();
-        table_symbols.resize(table_size, 0);
-        let negative_idx = {
-            let table_symbols = &mut table_symbols;
-            let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
-
-            //first scan for all -1 probabilities and place them at the top of the table
-            for symbol in 0..self.symbol_probabilities.len() {
-                if self.symbol_probabilities[symbol] == -1 {
-                    negative_idx -= 1;
-                    table_symbols[negative_idx] = symbol as u8;
-                }
-            }
-
-            //then place in a semi-random order all of the other symbols
-            let mut position = 0;
-            for idx in 0..self.symbol_probabilities.len() {
-                let symbol = idx as u8;
-                if self.symbol_probabilities[idx] <= 0 {
-                    continue;
-                }
-
-                //for each probability point the symbol gets on slot
-                let prob = self.symbol_probabilities[idx];
-                for _ in 0..prob {
-                    table_symbols[position] = symbol;
-
-                    position = next_position(position, table_size);
-                    while position >= negative_idx {
-                        position = next_position(position, table_size);
-                        //everything above negative_idx is already taken
-                    }
-                }
-            }
-            negative_idx
-        };
-
-        // `copy_symbols_into_decode` is responsible for sizing
-        // `self.decode` AND writing every slot in 0..table_size before
-        // it returns. Keeping the set_len call adjacent to the init
-        // loop (rather than pre-extending here) is what guarantees no
-        // panic-able code can run between "tell Vec the length is
-        // table_size" and "every slot has a fully-initialized Entry".
-        // capacity is reserved earlier in this function.
-        self.copy_symbols_into_decode(&table_symbols, table_size);
-        self.symbol_spread_buffer = table_symbols;
-        for idx in negative_idx..table_size {
-            self.decode[idx].num_bits = self.accuracy_log;
-        }
-
-        // baselines and num_bits can only be calculated when all symbols have been spread
-        self.symbol_counter.clear();
-        self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
-        for idx in 0..negative_idx {
-            let entry = &mut self.decode[idx];
-            let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
-
-            entry.new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
-                got: self.accuracy_log,
-                max: ENTRY_MAX_ACCURACY_LOG,
-            })?;
-            entry.num_bits = nb;
-        }
-        Ok(())
+        result
     }
 
-    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8], table_size: usize) {
-        debug_assert_eq!(table_symbols.len(), table_size);
-        debug_assert!(table_size <= self.decode.capacity());
-
-        // Entry is now 12 bytes (header + base_value + num_additional_bits
-        // + tail padding). The previous LE fast path that packed two
-        // 4-byte entries into a single u64 store no longer applies.
-        // Zero-init through `resize` and then set per-slot `.symbol`
-        // — the per-block table build is not on the per-sequence hot
-        // path (this runs once per FSE-mode block, not per emit), so
-        // dropping the byte-packed write here keeps the layout change
-        // contained without measurable cost.
-        //
-        // The `base_value` / `num_additional_bits` fields stay at
-        // their zero default here; per-table enrichment for LL / ML /
-        // OF runs in `enrich_for_*` after the baseline / num_bits
-        // computation below populates the rest of each entry.
-        self.decode.resize(
-            table_size,
-            Entry {
-                new_state: 0,
-                symbol: 0,
-                num_bits: 0,
-                base_value: 0,
-                num_additional_bits: 0,
-            },
-        );
-        for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
-            entry.symbol = symbol;
+    fn build_decoding_table_inner(&mut self, spread: &mut Vec<u8>) -> Result<(), FSETableError> {
+        let nb_symbols = self.symbol_probabilities.len();
+        if nb_symbols > self.max_symbol as usize + 1 {
+            return Err(FSETableError::TooManySymbols { got: nb_symbols });
         }
+
+        let table_size = 1 << self.accuracy_log;
+
+        // === Spread step ===
+        // Reuse the persistent scratch buffer; clear then resize to
+        // table_size. The resize is the ONLY zero-init in the entire
+        // build path now (previous impl also zero-init'd `decode`
+        // through `Vec::resize` with a default `Entry`, doubling the
+        // write traffic on the build path).
+        spread.clear();
+        spread.resize(table_size, 0);
+
+        // Pass 1: place -1 probability symbols at the top of the table.
+        let mut negative_idx = table_size;
+        for symbol in 0..nb_symbols {
+            if self.symbol_probabilities[symbol] == -1 {
+                negative_idx -= 1;
+                spread[negative_idx] = symbol as u8;
+            }
+        }
+
+        // Pass 2: distribute positive-probability symbols across the
+        // [0, negative_idx) range using the donor's `next_position`
+        // walker.
+        let mut position = 0usize;
+        for symbol in 0..nb_symbols {
+            let prob = self.symbol_probabilities[symbol];
+            if prob <= 0 {
+                continue;
+            }
+            let symbol_u8 = symbol as u8;
+            for _ in 0..prob {
+                spread[position] = symbol_u8;
+                position = next_position(position, table_size);
+                while position >= negative_idx {
+                    position = next_position(position, table_size);
+                }
+            }
+        }
+
+        // === Build step ===
+        // Stack-allocated counter (max 256 symbols since the symbol
+        // alphabet is bounded by `u8`). Replaces the previous
+        // `Vec<u32>` field that was cleared + resized per call —
+        // about 200 bytes of heap-alloc churn dropped from the hot
+        // build path. Zero-init at declaration covers every slot.
+        let mut counter = [0u32; 256];
+        let accuracy_log = self.accuracy_log;
+
+        // Single linear pass: write every entry exactly once. The
+        // previous impl had three passes (zero-init resize, symbol
+        // copy, build), all touching the same `Vec<Entry>` cache
+        // line — now collapsed into one.
+        self.decode.clear();
+        self.decode.reserve(table_size);
+        for (idx, &symbol) in spread.iter().enumerate().take(table_size) {
+            if idx < negative_idx {
+                // Positive-probability slot.
+                let prob = self.symbol_probabilities[symbol as usize];
+                let symbol_count = counter[symbol as usize];
+                counter[symbol as usize] = symbol_count + 1;
+                let (bl, nb) =
+                    calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
+                // FSE invariant gate (release-mode safety): the
+                // decoder's unchecked `read_entry` path relies on
+                // `new_state + (1 << num_bits) - 1 < table_size`,
+                // which factors through `nb <= accuracy_log`. The
+                // wire-format `parse_wire` path establishes this by
+                // construction, but `build_from_probabilities` is a
+                // public surface — a crafted but in-range probability
+                // vector could theoretically drive
+                // `calc_baseline_and_numbits` to violate the invariant.
+                // Reject at build time so the unchecked indexing
+                // contract holds in release as well as debug.
+                if nb > accuracy_log {
+                    return Err(FSETableError::TableInvariantViolation {
+                        prob,
+                        symbol,
+                        num_bits: nb,
+                        accuracy_log,
+                    });
+                }
+                let new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
+                    got: accuracy_log,
+                    max: ENTRY_MAX_ACCURACY_LOG,
+                })?;
+                self.decode.push(Entry {
+                    new_state,
+                    symbol,
+                    num_bits: nb,
+                    base_value: 0,
+                    num_additional_bits: 0,
+                });
+            } else {
+                // -1 probability slot: no baseline, num_bits =
+                // accuracy_log (decoder takes the full state width on
+                // these slots, by zstd FSE spec).
+                self.decode.push(Entry {
+                    new_state: 0,
+                    symbol,
+                    num_bits: accuracy_log,
+                    base_value: 0,
+                    num_additional_bits: 0,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Read the accuracy log and the probability table from the source and return the number of bytes
@@ -706,5 +779,98 @@ fn calc_baseline_and_numbits(
     } else {
         let index_shifted = state_number - num_double_width_state_slices;
         ((index_shifted * slice_width), num_bits as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoding::errors::FSETableError;
+
+    #[test]
+    fn build_from_probabilities_rejects_sum_too_small() {
+        // acc_log=4 → table_size=16. Valid sum (treating -1 as 1)
+        // is 16. Use a distribution that sums to 8 (probs sum 8,
+        // no -1s).
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [4, 2, 1, 1];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(
+                result,
+                Err(FSETableError::ProbabilityCounterMismatch { .. })
+            ),
+            "expected ProbabilityCounterMismatch for sum=8 vs expected=16, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_rejects_sum_too_large() {
+        // acc_log=4 → table_size=16. Probs summing to 20 (>16)
+        // would over-fill the spread.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [8, 6, 4, 2];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(
+                result,
+                Err(FSETableError::ProbabilityCounterMismatch { .. })
+            ),
+            "expected ProbabilityCounterMismatch for sum=20 vs expected=16, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_accepts_negative_one_in_sum() {
+        // acc_log=4 → table_size=16. Probs: 12 positive + 4 × -1
+        // (counted as 1 each) sum to 16. Should succeed.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 6] = [8, 4, -1, -1, -1, -1];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            result.is_ok(),
+            "expected Ok for sum=16 with -1s, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_rejects_overflow_in_sum() {
+        // DoS-shaped exploit: two i32::MAX values + 0x42 cast to u32
+        // and summed wrapping wraps to 0x40 = 64 = 1 << acc_log. The
+        // pre-fix u32 sum check would accept the input, then
+        // build_decoding_table would run `for _ in 0..prob` against
+        // prob = i32::MAX, looping 2^31-1 times per such symbol.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 3] = [i32::MAX, i32::MAX, 0x42];
+        let result = t.build_from_probabilities(6, &probs);
+        assert!(
+            matches!(result, Err(FSETableError::InvalidProbability { .. })),
+            "expected InvalidProbability for overflow-shaped exploit, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_rejects_negative_below_minus_one() {
+        // RFC 8878 §4.1.1: probability values are in {-1, 0, positive}.
+        // p = -2 is outside the spec; clamping to 0 silently is wrong.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [-2, 8, 4, 4];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(
+            matches!(
+                result,
+                Err(FSETableError::InvalidProbability { value: -2, .. })
+            ),
+            "expected InvalidProbability{{value: -2, ..}}, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn build_from_probabilities_accepts_exact_sum() {
+        // Sum 4+4+4+4 = 16 = 1 << 4. No -1s.
+        let mut t = FSETable::new(8);
+        let probs: [i32; 4] = [4, 4, 4, 4];
+        let result = t.build_from_probabilities(4, &probs);
+        assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
     }
 }

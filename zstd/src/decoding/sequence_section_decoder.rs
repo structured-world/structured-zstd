@@ -854,7 +854,20 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
                 .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
-        buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
+        // No `advance_output_counter` here: the donor inline path
+        // advances `UserSliceBackend::tail` directly inside
+        // `exec_sequence_inline`, and the post-block FCS check in
+        // `run_direct_decode` now reads `tail` (via
+        // `buffer_ref().tail() as u64`) instead of the separately
+        // maintained `DecodeBuffer::total_output_counter`. Skipping
+        // the per-sequence RMW drops the ~9% of decode time
+        // measured at `addq <ll+ml>, 0x40(%r9)` on z000033
+        // (perf annotate on
+        // `decode_and_execute_sequences_avx2`). The legacy
+        // push+repeat fallback below still goes through
+        // `DecodeBuffer::try_push` / `repeat_lookahead_prefetched`,
+        // which keep `total_output_counter` in sync for backends
+        // that need it.
         return Ok(());
     }
 
@@ -878,35 +891,48 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
-    // `Entry`. LL / ML are populated by `enrich_with_packed_seq_meta`
-    // from the packed `LL_META` / `ML_META` tables during build;
-    // OF is enriched closed-form (`1 << code`) by `enrich_for_offsets`.
+    // `Entry`. LL / ML / OF all use the same uniform shape: the
+    // build-time enrichment populates `state.base_value` and
+    // `state.num_additional_bits` for each axis (LL/ML via
+    // `enrich_with_packed_seq_meta` from the packed `LL_META` /
+    // `ML_META` tables; OF via `enrich_for_offsets` which writes
+    // `base_value = 1 << code` and `num_additional_bits = code`).
     // Reading `state` directly drops the previous `lookup_ll_code` /
     // `lookup_ml_code` indirections (those did a second cache touch
     // on the separate meta tables per sequence) — the active entry
-    // is already cache-hot.
-    //
-    // OF intentionally keeps the closed-form `1u32 << of_code`
-    // baseline computation instead of reading `of_dec.state.base_value`:
-    // the shift is a single ALU op vs a 4-byte memory load, both
-    // produce identical codegen with `obits + ...` add, and `of_code`
-    // is still required for `get_bits_triple` and the
-    // `debug_assert!(of_code <= MAX_OFFSET_CODE)` precondition. The
-    // 12-byte Entry layout still pays off here through LL / ML's
-    // base_value / num_additional_bits reads.
+    // is already cache-hot. OF reads from the same Entry layout via
+    // `base_value` / `num_additional_bits` written by
+    // `enrich_for_offsets` at build time; on x86_64 the codegen
+    // matches the prior `1u32 << of_code` shift form (both share the
+    // already-touched bit-count cache line) and the uniform read
+    // shape unblocks dropping `state.symbol` from the hot path so
+    // the 12-byte Entry can shrink to donor's 8-byte ZSTD_seqSymbol
+    // in a follow-up tightening of the FSE table cache footprint.
     let ll_state = ll_dec.state;
     let ml_state = ml_dec.state;
-    let of_code = of_dec.state.symbol;
+    let of_state = of_dec.state;
 
     let ll_value = ll_state.base_value;
     let ll_num_bits = ll_state.num_additional_bits;
     let ml_value = ml_state.base_value;
     let ml_num_bits = ml_state.num_additional_bits;
+    // Donor-shape uniform read: OF uses `base_value` + `num_additional_bits`
+    // like LL/ML, dropping the `entry.symbol → 1 << symbol` shift. Both
+    // fields are already populated by `enrich_for_offsets` (`base_value
+    // = 1 << code`, `num_additional_bits = code`). On x86_64 the memory
+    // load is wash vs the shift since both fields share the same Entry
+    // cache line that was already touched for the bit-count read; the
+    // win is that the hot path no longer reads `state.symbol`, which
+    // unblocks dropping the field from `Entry` (donor's ZSTD_seqSymbol
+    // is 8 bytes vs our 12 — that would tighten the FSE table cache
+    // footprint by 4 bytes / entry).
+    let of_num_bits = of_state.num_additional_bits;
+    let of_base = of_state.base_value;
 
-    debug_assert!(of_code <= MAX_OFFSET_CODE);
+    debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
 
-    let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-    let offset = obits as u32 + (1u32 << of_code);
+    let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
+    let offset = obits as u32 + of_base;
 
     debug_assert_ne!(offset, 0);
 
@@ -1224,13 +1250,21 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
-            scratch.literal_lengths.build_from_probabilities(
-                LL_DEFAULT_ACC_LOG,
-                &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch
-                .literal_lengths
-                .enrich_with_packed_seq_meta(&LL_META);
+            // Default LL distribution → cached table memcpy.
+            #[cfg(feature = "std")]
+            {
+                scratch.literal_lengths.reinit_from(predefined_ll_table());
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch.literal_lengths.build_from_probabilities(
+                    LL_DEFAULT_ACC_LOG,
+                    &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
+                )?;
+                scratch
+                    .literal_lengths
+                    .enrich_with_packed_seq_meta(&LL_META);
+            }
             scratch.ll_rle = None;
         }
         ModeType::Repeat => {
@@ -1264,13 +1298,22 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            scratch.offsets.build_from_probabilities(
-                OF_DEFAULT_ACC_LOG,
-                &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch.offsets.enrich_for_offsets();
+            // Default OF distribution → cached table + cached long-share.
+            #[cfg(feature = "std")]
+            {
+                let (cached, long_share) = predefined_of_table();
+                scratch.offsets.reinit_from(cached);
+                scratch.offsets_long_share = long_share;
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch
+                    .offsets
+                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
+                scratch.offsets.enrich_for_offsets();
+                scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+            }
             scratch.of_rle = None;
-            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::Repeat => {
             vprintln!("Repeat of table");
@@ -1302,11 +1345,19 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            scratch.match_lengths.build_from_probabilities(
-                ML_DEFAULT_ACC_LOG,
-                &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
-            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            // Default ML distribution → cached table memcpy.
+            #[cfg(feature = "std")]
+            {
+                scratch.match_lengths.reinit_from(predefined_ml_table());
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                scratch.match_lengths.build_from_probabilities(
+                    ML_DEFAULT_ACC_LOG,
+                    &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
+                )?;
+                scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            }
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {
@@ -1329,6 +1380,91 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
     -1, -1, -1, -1,
 ];
 
+// =====================================================================
+//                   Predefined FSE table cache
+// =====================================================================
+//
+// ModeType::Predefined fires whenever the encoder declares that an
+// LL / OF / ML symbol stream follows the RFC 8878 default
+// distribution (§3.1.1.3.2.1.1). On small-block fixtures this can
+// dominate the decode budget: building the table costs O(table_size)
+// per axis plus several `Vec::resize` round-trips, while the symbol
+// stream itself is only a few hundred bytes.
+//
+// Flamegraph on `small-4k-log-lines/c_stream/pure_rust` (i9, post
+// PR #263 merge) showed 66.72% of decode time in
+// `FSETable::build_decoding_table`, all of it inside the Predefined
+// branches.
+//
+// The default distributions are static — the tables they produce
+// are byte-identical across calls. Pre-build once via OnceLock,
+// then `reinit_from` the cached table into the per-frame scratch.
+// `reinit_from` reuses the existing `decode` Vec allocation when the
+// capacity already fits (it does, the scratch is re-used across
+// frames), copying only the `decode` entries + `accuracy_log` +
+// `symbol_probabilities` content. The build-only `symbol_spread_buffer`
+// is NOT copied — `reinit_from` only `reserve`s capacity for it —
+// shaving the spread-buffer memcpy that the prior `clone_from` did.
+//
+// Std-only because `OnceLock` lives in `std::sync` — there is no
+// `core::sync::OnceLock` (the only stable OnceLock-style API
+// requires std). `no_std` builds fall back to the per-call rebuild
+// path via the `#[cfg(feature = "std")]` gate. The
+// `critical-section` Cargo feature already flagged in the manifest
+// is the planned route to extend the cache to no-atomic targets
+// without pulling in `once_cell`.
+//
+// The build step is infallible by construction: the source
+// distribution slices are compile-time constants verified against
+// the RFC 8878 reference, and `build_from_probabilities` only fails
+// on malformed input (sum mismatch, oversized acc_log, symbol >
+// max). Treating a failure here as a panic is correct — it would
+// mean a static array literal is mathematically broken, which is a
+// compile-time bug, not a runtime data condition. Returning
+// `&'static FSETable` (infallible) lets `OnceLock::get_or_init`
+// handle the cache primitive directly without a fallible-init
+// shim.
+#[cfg(feature = "std")]
+fn predefined_ll_table() -> &'static crate::fse::FSETable {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+        t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
+            .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
+        t.enrich_with_packed_seq_meta(&LL_META);
+        t
+    })
+}
+
+#[cfg(feature = "std")]
+fn predefined_ml_table() -> &'static crate::fse::FSETable {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
+        t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
+            .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
+        t.enrich_with_packed_seq_meta(&ML_META);
+        t
+    })
+}
+
+#[cfg(feature = "std")]
+fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<(crate::fse::FSETable, u32)> = OnceLock::new();
+    let cache = CACHED.get_or_init(|| {
+        let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
+        t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
+            .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
+        t.enrich_for_offsets();
+        let share = compute_offsets_long_share(&t);
+        (t, share)
+    });
+    (&cache.0, cache.1)
+}
+
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
 const ML_DEFAULT_ACC_LOG: u8 = 6;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
@@ -1349,6 +1485,116 @@ const OF_DEFAULT_ACC_LOG: u8 = 5;
 const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
+
+/// Regression gate for the predefined FSE table cache: every cached
+/// table must be byte-identical to the table the rebuild path would
+/// produce on the next call. If the cache ever drifts from the
+/// rebuild output (different `decode` entries, different
+/// `accuracy_log`, different `offsets_long_share` for OF) the
+/// dispatch in `maybe_update_fse_tables` would silently decode
+/// against a stale table — the bench delta would still look fine
+/// but cross-validation against the donor would diverge on the
+/// next ratio gate.
+#[cfg(feature = "std")]
+#[test]
+fn predefined_fse_caches_match_rebuild_output() {
+    use crate::fse::FSETable;
+
+    let mut ll_rebuild = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    ll_rebuild
+        .build_from_probabilities(
+            LL_DEFAULT_ACC_LOG,
+            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    ll_rebuild.enrich_with_packed_seq_meta(&LL_META);
+    let ll_cached = predefined_ll_table();
+    assert_eq!(ll_rebuild.accuracy_log, ll_cached.accuracy_log);
+    assert_eq!(ll_rebuild.decode.len(), ll_cached.decode.len());
+    for (i, (a, b)) in ll_rebuild
+        .decode
+        .iter()
+        .zip(ll_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "LL entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "LL entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "LL entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "LL entry {i} num_additional_bits mismatch"
+        );
+    }
+
+    let mut ml_rebuild = FSETable::new(MAX_MATCH_LENGTH_CODE);
+    ml_rebuild
+        .build_from_probabilities(
+            ML_DEFAULT_ACC_LOG,
+            &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    ml_rebuild.enrich_with_packed_seq_meta(&ML_META);
+    let ml_cached = predefined_ml_table();
+    assert_eq!(ml_rebuild.accuracy_log, ml_cached.accuracy_log);
+    assert_eq!(ml_rebuild.decode.len(), ml_cached.decode.len());
+    for (i, (a, b)) in ml_rebuild
+        .decode
+        .iter()
+        .zip(ml_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "ML entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "ML entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "ML entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "ML entry {i} num_additional_bits mismatch"
+        );
+    }
+
+    let mut of_rebuild = FSETable::new(MAX_OFFSET_CODE);
+    of_rebuild
+        .build_from_probabilities(
+            OF_DEFAULT_ACC_LOG,
+            &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
+        )
+        .unwrap();
+    of_rebuild.enrich_for_offsets();
+    let of_rebuild_share = compute_offsets_long_share(&of_rebuild);
+    let (of_cached, of_cached_share) = predefined_of_table();
+    assert_eq!(of_rebuild.accuracy_log, of_cached.accuracy_log);
+    assert_eq!(of_rebuild.decode.len(), of_cached.decode.len());
+    assert_eq!(
+        of_rebuild_share, of_cached_share,
+        "OF offsets_long_share mismatch"
+    );
+    for (i, (a, b)) in of_rebuild
+        .decode
+        .iter()
+        .zip(of_cached.decode.iter())
+        .enumerate()
+    {
+        assert_eq!(a.symbol, b.symbol, "OF entry {i} symbol mismatch");
+        assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
+        assert_eq!(a.new_state, b.new_state, "OF entry {i} new_state mismatch");
+        assert_eq!(
+            a.base_value, b.base_value,
+            "OF entry {i} base_value mismatch"
+        );
+        assert_eq!(
+            a.num_additional_bits, b.num_additional_bits,
+            "OF entry {i} num_additional_bits mismatch"
+        );
+    }
+}
 
 #[test]
 fn test_ll_default() {

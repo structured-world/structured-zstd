@@ -320,7 +320,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         self.tail = 0;
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_reserve(&mut self, n: usize) -> Result<(), super::buffer_backend::BackendOverflow> {
         // Fixed-capacity backend: linear `tail + n <= slice.len()`
         // check. Lets safe public decode APIs catch a malformed-frame
@@ -573,7 +573,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     // backend: a fixed-capacity output slice that cannot grow on
     // demand, so any overshoot must be reported instead of aborting.
 
-    #[inline]
+    #[inline(always)]
     fn try_extend(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
         let len = data.len();
         // Use `checked_add` to catch adversarial input where
@@ -615,7 +615,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_extend_and_fill(
         &mut self,
         fill_with: u8,
@@ -645,7 +645,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn try_extend_from_within(
         &mut self,
         start: usize,

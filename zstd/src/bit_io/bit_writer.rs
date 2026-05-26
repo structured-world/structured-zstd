@@ -344,9 +344,57 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             return;
         }
 
-        if bits > 0 {
-            debug_assert!(bits.ilog2() <= num_bits as u32);
+        // Range gate: `num_bits > 64` would make the dirty-upper-bits
+        // shift below `bits >> num_bits` invoke IR-level shift overflow
+        // (panic in debug, UB in release-without-overflow-checks). The
+        // safe public API must reject this before the shift.
+        assert!(
+            num_bits <= 64,
+            "write_bits_64 num_bits={num_bits} exceeds u64 width",
+        );
+
+        // Full-word fast path: when `num_bits == 64` AND the partial
+        // buffer is empty, write the whole u64 directly. Falls back to
+        // the normal path otherwise — that path's
+        // `write_bits_64_cold` does `bits >> bits_free_in_partial`
+        // where `bits_free_in_partial = 64 - bits_in_partial`. With
+        // `bits_in_partial == 0` and `num_bits == 64` the shift is by
+        // 64 (UB). Routing the empty-partial / num_bits==64 case
+        // through this fast path avoids the cold-path shift entirely;
+        // for `num_bits == 64` with non-empty partial, the cold path's
+        // shift is `<= 63` which is well-defined.
+        if num_bits == 64 && self.bits_in_partial == 0 {
+            self.output.as_mut().extend_from_slice(&bits.to_le_bytes());
+            self.bit_idx += 64;
+            return;
         }
+
+        // Dirty-upper-bits contract: the caller MUST pre-mask `bits`
+        // to the `num_bits` low-bit range. Violation silently corrupts
+        // the output bitstream because subsequent `write_bits_64`
+        // calls would OR the spurious upper bits into the partial
+        // accumulator at the wrong position. Enforce in release too
+        // (was `debug_assert!`) — the per-call cost is one shift +
+        // compare + predicted-not-taken branch, negligible vs the
+        // encoder's per-token shift/merge work, while the safety
+        // value is real (encoder call sites are internal but a wrong
+        // caller would produce a corrupt compressed blob with no
+        // diagnostic signal).
+        //
+        // The `num_bits == 64` arm short-circuits the shift entirely
+        // (right-shift-by-64 on u64 is IR-level UB even though the
+        // value is in range here) — the upper-bits check is trivially
+        // satisfied because `num_bits == 64` covers the whole u64.
+        // For `num_bits < 64`, `bits >> num_bits == 0` is the strict
+        // form (the prior `bits.ilog2() <= num_bits` was off-by-one:
+        // it accepted `bits == 1 << num_bits` which occupies
+        // `num_bits + 1` bits) and is one ALU op vs ilog2's LZCNT
+        // round-trip.
+        assert!(
+            num_bits == 64 || bits >> num_bits == 0,
+            "write_bits_64 dirty upper bits: bits=0x{bits:x} occupies {} bits but num_bits={num_bits}",
+            u64::BITS - bits.leading_zeros(),
+        );
 
         // fill partial byte first
         if num_bits + self.bits_in_partial < 64 {

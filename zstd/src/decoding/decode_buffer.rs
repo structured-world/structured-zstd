@@ -40,9 +40,11 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 /// `try_restore_checkpoint()` writes to `self.hash`:
 ///   * `push` and `extend_and_fill` only advance
 ///     `total_output_counter`.
-///   * `advance_output_counter` (donor inline path) only advances
-///     `total_output_counter` (hashing is deferred to the final
-///     full-slice pass in `FrameDecoder::decode_all`).
+///   * The inline sequence executor writes through `buffer_mut()`
+///     directly, bypassing the wrapper-level
+///     `total_output_counter` entirely (`UserSliceBackend::tail`
+///     carries the byte count on that path; hashing is deferred to
+///     the final full-slice pass in `FrameDecoder::decode_all`).
 ///   * `drain_to` / `read` DO write hash, but they run BETWEEN
 ///     blocks, never inside the fused sequence loop the checkpoint
 ///     guards.
@@ -165,8 +167,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // No hash restore: see `DecodeBufferCheckpoint` doc. No
         // mutation site between `checkpoint()` and this call writes
         // to `self.hash` (drain runs between blocks, not inside the
-        // fused sequence loop; the donor inline path's
-        // `advance_output_counter` advances only the counter).
+        // fused sequence loop; the inline sequence executor bypasses
+        // the wrapper counter entirely via `buffer_mut()`, leaving
+        // hashing for the post-block full-slice pass).
         true
     }
 
@@ -179,10 +182,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve(amount);
     }
 
-    /// Mutable backend handle — paired with
-    /// [`Self::advance_output_counter`] so the donor-shape inline
-    /// sequence executor can write straight into the backend's
-    /// physical storage and then update the buffer-level counters.
+    /// Mutable backend handle. Lets the inline sequence executor
+    /// write straight into the backend's physical storage; the
+    /// `tail()` cursor on the backend is the authoritative output
+    /// length, so no separate buffer-level counter update is needed.
     /// Crate-internal; gated to the
     /// `BufferBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true` dispatch
     /// site.
@@ -192,23 +195,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         &mut self.buffer
     }
 
-    /// Advance the `total_output_counter` by `n` bytes — pair with
-    /// [`super::buffer_backend::BufferBackend::exec_sequence_inline`]
-    /// which writes the actual bytes through the backend without
-    /// touching DecodeBuffer-level bookkeeping. Without this helper
-    /// the donor-shape path would leave `total_output_counter` stale
-    /// on every sequence executed through it.
-    ///
-    /// **Hash is NOT mutated here.** On the direct-decode path
-    /// `FrameDecoder::decode_all` walks the full output
-    /// slice once at end of decode and writes the result into
-    /// `self.hash`, overwriting any incremental state. Hashing per
-    /// sequence here would be wasted work whose result the final
-    /// pass discards. The legacy decode path likewise folds bytes
-    /// into the hash via `drain_to`, not at write time.
-    #[inline]
-    pub(crate) fn advance_output_counter(&mut self, n: usize) {
-        self.total_output_counter += n as u64;
+    /// Immutable backend handle. `run_direct_decode`'s post-block FCS
+    /// check reads `tail()` straight from the backend rather than
+    /// going through `total_output_counter`: the inline sequence
+    /// executor (see
+    /// `sequence_section_decoder::execute_one_sequence_pipelined`)
+    /// writes directly through `buffer_mut`, so the
+    /// `total_output_counter` field on the wrapper is not maintained
+    /// on that path and `tail()` is the only accurate output length.
+    #[inline(always)]
+    pub(crate) fn buffer_ref(&self) -> &B {
+        &self.buffer
     }
 
     /// Fill `fill_length` bytes of the output with the literal `fill_with`,
@@ -253,7 +250,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// `Block_Size` exceeds the caller's output slice surfaces as a
     /// structured error instead of panicking. Compressed-block
     /// sequence execution is a follow-up.
-    #[inline]
+    #[inline(always)]
     pub fn try_push(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
         self.buffer.try_extend(data)?;
         self.total_output_counter += data.len() as u64;
@@ -627,6 +624,20 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
+        // `total_output_counter` gate: dict-source matches are only
+        // valid while the dictionary content is still inside the
+        // visible window. On the inline-exec path
+        // (`UserSliceBackend`) `total_output_counter` is NOT
+        // maintained — it stays at 0 — so the gate is trivially
+        // satisfied. This does NOT cause incorrect behavior on that
+        // path because `dict_content` is always empty for the direct
+        // decode entry (`run_direct_decode`'s
+        // `DecodeBuffer::from_backend` initializes it to empty), so
+        // `bytes_from_dict > self.dict_content.len()` below catches
+        // every would-be dict-source match and returns
+        // `NotEnoughBytesInDictionary`. The
+        // `RingBuffer` / `FlatBuf` paths still maintain the counter
+        // via `push` / `repeat_match` and rely on it correctly.
         if self.total_output_counter <= self.window_size as u64 {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
@@ -699,23 +710,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             None => Ok(0),
             Some(can_drain) => self.drain_to(can_drain, |buf| write_all_bytes(&mut sink, buf)),
         }
-    }
-
-    /// Total bytes ever produced into the backend across this
-    /// `DecodeBuffer`'s lifetime. Incremented by `push` / `repeat` /
-    /// `extend_and_fill` / `extend_from_reader`. Survives across
-    /// `drop_to_window_size` and `drain_*` calls (those only narrow
-    /// the visible region; they don't roll back produced).
-    ///
-    /// Used by the direct-decode path (`FrameDecoder::decode_all`)
-    /// to track actual bytes written against the declared
-    /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
-    /// which is intentionally 0 for `BlockType::Compressed` (the
-    /// header parser doesn't decode the body), so per-block tracking
-    /// via the header field would always read 0 on compressed blocks
-    /// and miscount.
-    pub fn total_produced(&self) -> u64 {
-        self.total_output_counter
     }
 
     /// Advance the backend's head past any bytes beyond `window_size`
