@@ -107,7 +107,7 @@ impl<B: BufferBackend> Workspace for DecoderScratch<B> {
 /// that the owned-buffer path performs, by writing decoded bytes
 /// straight into the caller-provided output slice.
 ///
-/// Constructed inside `FrameDecoder::decode_to_slice_trusted` and dropped
+/// Constructed inside `FrameDecoder::decode_all` and dropped
 /// at function exit; never persisted across calls.
 pub struct DirectScratch<'o, 'p> {
     pub huf: &'p mut HuffmanScratch,

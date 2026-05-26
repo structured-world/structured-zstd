@@ -149,7 +149,7 @@ pub mod testing {
 /// matches that contract.
 ///
 /// Public so callers sizing an output slice for
-/// [`crate::decoding::FrameDecoder::decode_to_slice_trusted`] can size
+/// [`crate::decoding::FrameDecoder::decode_all`] can size
 /// `frame_content_size + WILDCOPY_OVERLENGTH` symbolically without
 /// duplicating the value. Use the const reference rather than a
 /// hardcoded literal — `simd_copy::copy_bytes_overshooting` already

@@ -431,17 +431,31 @@ pub enum DecodeBufferError {
     /// follow-up. Currently NOT surfaced from any production path —
     /// `extend_from_within_unchecked` on `UserSliceBackend` still
     /// panics on overshoot via its release-mode `assert!`. The
-    /// `_trusted` suffix on `decode_to_slice_trusted` is the
+    /// `_trusted` suffix on `decode_all` is the
     /// shipping contract until that follow-up wires
     /// `BufferBackend::try_extend_from_within` through
     /// `DecodeBuffer::repeat*` and maps `BackendOverflow` into
     /// `FrameDecoderError::FrameContentSizeMismatch`.
     ///
     /// The variant lives now (vs landing later with the
-    /// follow-up) so the typed conversion at the `decode_to_slice_trusted`
+    /// follow-up) so the typed conversion at the `decode_all`
     /// boundary is in place; only the constructor on the burst path
     /// is missing.
     BackendOverflow,
+    /// Repeat-side match copy would write past the writable tail of
+    /// a fixed-capacity backend (`UserSliceBackend`). Surfaced by
+    /// [`super::decode_buffer::DecodeBuffer::repeat`] / `_lookahead`
+    /// when the new `BufferBackend::try_reserve` rejects the
+    /// pre-write capacity check — keeping the safe public decode
+    /// APIs error-returning instead of panicking via the per-call
+    /// `assert!` inside `extend_from_within_unchecked`. Growable
+    /// backends (`FlatBuf`, `RingBuffer`) never produce this; their
+    /// `try_reserve` falls through to infallible `reserve`.
+    OutputBufferOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -466,6 +480,16 @@ impl core::fmt::Display for DecodeBufferError {
                 write!(
                     f,
                     "Match repeat would overflow the output buffer's fixed capacity"
+                )
+            }
+            DecodeBufferError::OutputBufferOverflow {
+                tail,
+                requested,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "Match repeat would write past fixed-capacity buffer: tail={tail}, requested={requested}, capacity={capacity}"
                 )
             }
         }
@@ -858,7 +882,7 @@ pub enum ExecuteSequencesError {
         have: usize,
     },
     ZeroOffset,
-    /// A donor-shape inline sequence (`BufferBackend::donor_exec_one_sequence`)
+    /// A donor-shape inline sequence (`BufferBackend::exec_sequence_inline`)
     /// would have written past the writable tail of a fixed-size backend
     /// (`UserSliceBackend`). Indicates the frame is corrupt — its sequences
     /// expand past the declared `frame_content_size` plus the caller-supplied
@@ -866,7 +890,7 @@ pub enum ExecuteSequencesError {
     /// post-block FCS overflow check would also catch the same shape, but the
     /// per-sequence guard is what keeps the unsafe write surface inside the
     /// user-provided slice on the way to the post-block check.
-    DonorPathBufferOverflow {
+    OutputBufferOverflow {
         tail: usize,
         requested: usize,
         capacity: usize,
@@ -888,7 +912,7 @@ impl core::fmt::Display for ExecuteSequencesError {
             ExecuteSequencesError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
             }
-            ExecuteSequencesError::DonorPathBufferOverflow {
+            ExecuteSequencesError::OutputBufferOverflow {
                 tail,
                 requested,
                 capacity,
@@ -915,6 +939,16 @@ impl std::error::Error for ExecuteSequencesError {
 impl From<DecodeBufferError> for ExecuteSequencesError {
     fn from(val: DecodeBufferError) -> Self {
         Self::DecodebufferError(val)
+    }
+}
+
+impl From<crate::decoding::buffer_backend::BackendOverflow> for ExecuteSequencesError {
+    fn from(val: crate::decoding::buffer_backend::BackendOverflow) -> Self {
+        Self::OutputBufferOverflow {
+            tail: val.tail,
+            requested: val.requested,
+            capacity: val.capacity,
+        }
     }
 }
 

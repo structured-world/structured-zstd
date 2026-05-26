@@ -17,7 +17,7 @@
 //! Helpers are private SSE2-baseline x86_64 ops (all supported
 //! x86_64 targets carry SSE2). Non-x86 paths fall back through the
 //! existing `BufferBackend::extend` + `DecodeBuffer::repeat` chain
-//! (`UserSliceBackend::SUPPORTS_INLINE_DONOR_EXEC` returns `false`
+//! (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC` returns `false`
 //! on those targets, so the dispatch site dead-eliminates this code
 //! at compile time per backend monomorphisation).
 
@@ -26,7 +26,7 @@
 // SSE2 intrinsics here are emitted without a `#[target_feature]`
 // gate, and 32-bit i386 / i486 / i586 targets do not always have
 // SSE2 in their baseline. The dispatch site
-// (`UserSliceBackend::SUPPORTS_INLINE_DONOR_EXEC`) mirrors this cfg
+// (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC`) mirrors this cfg
 // so the legacy chain handles non-x86_64 targets.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
@@ -146,7 +146,7 @@ pub(crate) mod x86 {
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
-mod donor_helper_tests {
+mod inline_helper_tests {
     use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
 
     #[test]

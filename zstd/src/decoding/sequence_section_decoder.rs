@@ -678,7 +678,7 @@ fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
     // (high = lit_cur + seq.ll, seq.ll >= 0).
     let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
     *lit_cur = high;
-    buffer.push(lits);
+    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
 
     let actual = do_offset_history(seq.of, seq.ll, offset_hist);
     if actual == 0 {
@@ -728,7 +728,7 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
 
     // Donor-shape inline dispatch — when the backend opts in
     // (`UserSliceBackend` on x86_64 today, per its
-    // `SUPPORTS_INLINE_DONOR_EXEC = true` const) we collapse the
+    // `SUPPORTS_INLINE_SEQUENCE_EXEC = true` const) we collapse the
     // literal copy + match copy into a single straight-line body
     // that mirrors donor `ZSTD_execSequence`
     // (zstd_decompress_block.c:1008-1105). The const branch is
@@ -764,13 +764,13 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
     // 16 != 1` — keeping the donor inline path active on more
     // sequences near the end of the literals buffer.
-    let donor_path_safe = B::SUPPORTS_INLINE_DONOR_EXEC
+    let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before
                 .checked_add((seq.ll as usize).next_multiple_of(16))
                 .is_some_and(|b| b <= lit_len));
-    if donor_path_safe {
+    if inline_path_safe {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
         // gate). Donor inline path stays on the prefix-resident
@@ -790,7 +790,7 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
             // frame — donor's `extDict` arm. Punt back to the slow
             // `repeat()` path; that path already routes through
             // `repeat_from_dict` for these offsets.
-            buffer.push(lits);
+            buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
             buffer
                 .repeat_lookahead_prefetched(offset, seq.ml as usize)
                 .map_err(ExecuteSequencesError::from)?;
@@ -821,7 +821,7 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         // provenance of the FULL `literals` slice (not `lits`, the
         // sub-slice). The 16-byte unconditional `copy16` inside the
         // donor body reads up to `lit_cur_before + 16` bytes from
-        // the parent buffer, which the `donor_path_safe` gate above
+        // the parent buffer, which the `inline_path_safe` gate above
         // bounded by `lit_cur_before + 16 <= lit_len`. Passing
         // `lits.as_ptr()` directly would be UB when `lits.len() <
         // 16` because the sub-slice's provenance ends at its own
@@ -830,7 +830,7 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         unsafe {
             buffer
                 .buffer_mut()
-                .donor_exec_one_sequence(lit_src, seq.ll as usize, offset, seq.ml as usize)
+                .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
         buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
@@ -838,7 +838,7 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     }
 
     // Fallback: the legacy push + repeat chain.
-    buffer.push(lits);
+    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
         .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;

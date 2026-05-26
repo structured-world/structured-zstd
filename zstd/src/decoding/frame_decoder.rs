@@ -1094,7 +1094,7 @@ impl FrameDecoder {
             };
             // Per-frame direct-path dispatch. Now safe to route the
             // public `decode_all` here because
-            // `UserSliceBackend::donor_exec_one_sequence` returns
+            // `UserSliceBackend::exec_sequence_inline` returns
             // `Result<(), ExecuteSequencesError>` instead of
             // panicking on capacity overflow; the error propagates
             // up as `FrameDecoderError`. Eligibility (FCS > 0, no
@@ -1173,22 +1173,24 @@ impl FrameDecoder {
     /// `input` must contain an exact number of frames.
     ///
     /// `output` must have enough extra capacity to hold the decompressed data.
-    /// This function will not reallocate or grow the vector. If you don't know
-    /// how large the output will be, use [`FrameDecoder::decode_blocks`] instead.
+    /// This function reserves an additional [`WILDCOPY_OVERLENGTH`]
+    /// bytes on top of the caller's capacity so the per-frame direct
+    /// decode path stays eligible — that may grow the vector by up
+    /// to that fixed amount via `Vec::reserve`. It will NOT grow
+    /// further to fit the decompressed payload itself; the caller's
+    /// pre-allocated capacity must already cover the data. If you
+    /// don't know how large the output will be, use
+    /// [`FrameDecoder::decode_blocks`] instead.
     ///
     /// This calls [`FrameDecoder::init`], and all bytes currently in the decoder will be lost.
     ///
     /// The length of the output vector is updated to include the decompressed data.
-    /// The length is not changed if an error occurs.
-    ///
-    /// As an internal optimisation this method reserves an extra
-    /// [`WILDCOPY_OVERLENGTH`] bytes beyond the requested capacity
-    /// so `decode_all` can route each frame through the direct
-    /// (UserSliceBackend) decode path, which bypasses the per-block
-    /// drain copy. The slack bytes are NOT part of the returned
-    /// `output.len()` — `output` is truncated to the actual
-    /// decompressed size on return. Callers who pre-sized the Vec
-    /// with `Vec::with_capacity(fcs)` see no functional change.
+    /// The length is not changed if an error occurs. The
+    /// `WILDCOPY_OVERLENGTH` slack is internal — `output.len()` on
+    /// return is the actual decompressed size, NOT the inflated
+    /// capacity. Callers who pre-sized the Vec with
+    /// `Vec::with_capacity(fcs)` see no functional change beyond
+    /// the small one-time capacity bump.
     pub fn decode_all_to_vec(
         &mut self,
         input: &[u8],
@@ -1445,9 +1447,9 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
-    fn decode_to_slice_trusted_matches_decode_all_on_single_segment_frame() {
+    fn decode_all_matches_decode_all_on_single_segment_frame() {
         // Roundtrip a small payload through the encoder, then decode
-        // it via both `decode_all` and `decode_to_slice_trusted`. Both paths
+        // it via both `decode_all` and `decode_all`. Both paths
         // must produce identical output bytes — the only difference
         // is the internal buffer/drain shape, not the decoded
         // semantics. This is the regression gate for the
@@ -1468,13 +1470,13 @@ mod tests {
         assert_eq!(n_a, payload.len());
         assert_eq!(&out_a[..n_a], payload.as_slice());
 
-        // Direct: decode_to_slice_trusted with WILDCOPY slack.
+        // Direct: decode_all with WILDCOPY slack.
         let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut dec_b = FrameDecoder::new();
         let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
             .decode_all(compressed.as_slice(), &mut out_b)
-            .expect("decode_to_slice_trusted should succeed");
+            .expect("decode_all should succeed");
         assert_eq!(
             n_b,
             payload.len(),
@@ -1484,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_trusted_multi_segment_frame_decodes_correctly() {
+    fn decode_all_multi_segment_frame_decodes_correctly() {
         // Multi-segment frame: payload large enough that the
         // encoder's default frame layout has `single_segment_flag =
         // false` and `window_size < frame_content_size`. The direct
@@ -1523,7 +1525,7 @@ mod tests {
         let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
             .decode_all(compressed.as_slice(), &mut out_b)
-            .expect("decode_to_slice_trusted should succeed on multi-segment frame");
+            .expect("decode_all should succeed on multi-segment frame");
         assert_eq!(n_b, payload.len(), "wrong byte count on direct path");
         assert_eq!(&out_b[..n_b], payload.as_slice());
 
@@ -1547,11 +1549,11 @@ mod tests {
 
     #[cfg(feature = "hash")]
     #[test]
-    fn decode_to_slice_trusted_propagates_checksum_into_persistent_scratch() {
+    fn decode_all_propagates_checksum_into_persistent_scratch() {
         // Direct path on a checksum-flagged frame: the FrameCompressor
         // under `feature = "hash"` sets content_checksum_flag, so the
         // decoded frame has a recorded checksum. After
-        // decode_to_slice_trusted we must be able to verify it matches via
+        // decode_all we must be able to verify it matches via
         // the public get_calculated_checksum() accessor — the digest
         // is computed by walking output at end of decode and stored
         // into the persistent scratch's hasher.
@@ -1567,7 +1569,7 @@ mod tests {
         let mut out = alloc::vec![0u8; payload.len() + slack];
         let n = dec
             .decode_all(compressed.as_slice(), &mut out)
-            .expect("decode_to_slice_trusted with checksum must succeed");
+            .expect("decode_all with checksum must succeed");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
 
@@ -1588,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_trusted_fcs_overflow_via_corrupt_frame_returns_structured_error() {
+    fn decode_all_fcs_overflow_via_corrupt_frame_returns_structured_error() {
         // Hand-build a corrupt frame that declares
         // frame_content_size = 4 but the (last) block carries a
         // larger Raw payload. The pre-flight FCS check inside the
@@ -1639,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_trusted_falls_back_when_output_too_small_for_wildcopy_slack() {
+    fn decode_all_falls_back_when_output_too_small_for_wildcopy_slack() {
         // Output sized exactly to frame_content_size (no
         // WILDCOPY_OVERLENGTH slack) must NOT trigger the direct
         // path — the burst's `extend_from_within_unchecked` writes
@@ -1660,13 +1662,13 @@ mod tests {
         let mut out = alloc::vec![0u8; payload.len()];
         let n = dec
             .decode_all(compressed.as_slice(), &mut out)
-            .expect("decode_to_slice_trusted should still succeed via fallback");
+            .expect("decode_all should still succeed via fallback");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
     }
 
     #[test]
-    fn decode_to_slice_trusted_fallback_validates_fcs_against_total_output() {
+    fn decode_all_fallback_validates_fcs_against_total_output() {
         // Synthetic single-segment frame: FCS = 20 bytes, but the
         // last-block flag fires after only 4 bytes of raw payload.
         // On the direct path this would trip the post-block
@@ -1711,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_trusted_fallback_treats_explicit_fcs_zero_as_declared() {
+    fn decode_all_fallback_treats_explicit_fcs_zero_as_declared() {
         // Synthetic multi-segment frame with FCS_flag=2 (4-byte
         // FCS) explicitly set to 0. The header DECLARES zero
         // content, but the body carries a 5-byte raw last-block.
@@ -1765,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_slice_trusted_fallback_accepts_honest_explicit_fcs_zero() {
+    fn decode_all_fallback_accepts_honest_explicit_fcs_zero() {
         // Companion to the corrupt-FCS=0 test above: an HONEST
         // empty frame with FCS_flag=2 (4-byte FCS) explicitly set
         // to 0 AND a 0-byte raw last-block. `fcs_declared()`

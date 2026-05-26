@@ -47,7 +47,7 @@ pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 /// impl is the no-wrap shape of the same contract.
 pub(crate) trait BufferBackend: Sized {
     /// `true` when the backend can execute a single sequence via the
-    /// donor-shape inline `donor_exec_one_sequence` path (literal
+    /// donor-shape inline `exec_sequence_inline` path (literal
     /// copy + match copy in one straight-line body, no per-call
     /// dispatch through `extend` / `repeat`). Defaults to `false`;
     /// `UserSliceBackend` overrides to `true` on `x86_64` only —
@@ -60,7 +60,7 @@ pub(crate) trait BufferBackend: Sized {
     /// (donor body on `FlatBuf` / `RingBuffer`, existing
     /// `push`/`repeat` body on `UserSliceBackend`) carries no runtime
     /// cost.
-    const SUPPORTS_INLINE_DONOR_EXEC: bool = false;
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = false;
 
     /// Donor's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
@@ -70,7 +70,7 @@ pub(crate) trait BufferBackend: Sized {
     /// overlap-src-before-dst).
     ///
     /// Default impl is `unreachable!`; the dispatch site only routes
-    /// here when [`Self::SUPPORTS_INLINE_DONOR_EXEC`] is `true`,
+    /// here when [`Self::SUPPORTS_INLINE_SEQUENCE_EXEC`] is `true`,
     /// which is fixed at compile time per backend type. The
     /// `unreachable!` body costs nothing on backends that gate it
     /// out (the compiler removes the call entirely).
@@ -108,7 +108,7 @@ pub(crate) trait BufferBackend: Sized {
     ///
     ///   The current dispatch site
     ///   (`sequence_section_decoder::execute_one_sequence_pipelined`)
-    ///   enforces both via `donor_path_safe = lit_cur_before + 16 <=
+    ///   enforces both via `inline_path_safe = lit_cur_before + 16 <=
     ///   lit_len && (lit_length <= 16 || lit_cur_before +
     ///   lit_length.next_multiple_of(16) <= lit_len)` and falls
     ///   through to the legacy `push`/`repeat` chain when either
@@ -121,7 +121,7 @@ pub(crate) trait BufferBackend: Sized {
     ///   `decode_buffer::DecodeBuffer::advance_output_counter`.
     #[allow(unused_variables, unused_mut)]
     #[inline(always)]
-    unsafe fn donor_exec_one_sequence(
+    unsafe fn exec_sequence_inline(
         &mut self,
         lit_src: *const u8,
         lit_length: usize,
@@ -129,12 +129,12 @@ pub(crate) trait BufferBackend: Sized {
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
         // Default body is statically unreachable when the dispatch
-        // site honours `SUPPORTS_INLINE_DONOR_EXEC`. Backends that
+        // site honours `SUPPORTS_INLINE_SEQUENCE_EXEC`. Backends that
         // return `false` from that const never see this call resolved
         // — the optimiser dead-eliminates the calling branch in the
         // monomorphised caller.
         unreachable!(
-            "donor_exec_one_sequence called on backend whose SUPPORTS_INLINE_DONOR_EXEC is false"
+            "exec_sequence_inline called on backend whose SUPPORTS_INLINE_SEQUENCE_EXEC is false"
         );
     }
 
@@ -149,6 +149,21 @@ pub(crate) trait BufferBackend: Sized {
     /// Reserve at least `n` bytes of additional writable capacity.
     /// May or may not allocate depending on current free space.
     fn reserve(&mut self, n: usize);
+
+    /// Fallible variant of [`Self::reserve`] for fixed-capacity
+    /// backends. Growable backends (`FlatBuf`, `RingBuffer`) call
+    /// `reserve` which always succeeds (or aborts on alloc failure)
+    /// and return `Ok`. Fixed-capacity backends (`UserSliceBackend`)
+    /// override with a linear `tail + n <= cap` check and return
+    /// `Err(BackendOverflow)` when the requested write would land
+    /// past the end of the user's slice — letting the safe public
+    /// decode APIs surface a structured error instead of panicking
+    /// from the per-call `assert!` inside
+    /// `extend_from_within_unchecked`.
+    fn try_reserve(&mut self, n: usize) -> Result<(), BackendOverflow> {
+        self.reserve(n);
+        Ok(())
+    }
 
     /// Live byte count: bytes between the logical head and tail.
     fn len(&self) -> usize;
@@ -230,7 +245,7 @@ pub(crate) trait BufferBackend: Sized {
     // capacity. Currently wired on Raw and RLE block paths only;
     // Compressed-block sequence execution still uses the panic-on-
     // overflow unchecked writes and will be migrated in a follow-up.
-    // Used by the direct-decode path (`decode_to_slice_trusted` +
+    // Used by the direct-decode path (`decode_all` +
     // descendants) so a malformed Raw/RLE block whose declared
     // decompressed payload exceeds the caller-provided output slice
     // surfaces as a structured `FrameDecoderError::FrameContentSizeMismatch`
@@ -377,7 +392,7 @@ pub(crate) trait BufferBackend: Sized {
 /// need to discriminate; `tail` / `requested` / `capacity` carry the
 /// diagnostic context. The decoder converts this into
 /// `FrameDecoderError::FrameContentSizeMismatch` at the
-/// `decode_to_slice_trusted` boundary, so callers never see
+/// `decode_all` boundary, so callers never see
 /// `BackendOverflow` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackendOverflow {

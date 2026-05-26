@@ -42,7 +42,7 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 ///     `total_output_counter`.
 ///   * `advance_output_counter` (donor inline path) only advances
 ///     `total_output_counter` (hashing is deferred to the final
-///     full-slice pass in `FrameDecoder::decode_to_slice_trusted`).
+///     full-slice pass in `FrameDecoder::decode_all`).
 ///   * `drain_to` / `read` DO write hash, but they run BETWEEN
 ///     blocks, never inside the fused sequence loop the checkpoint
 ///     guards.
@@ -184,7 +184,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// sequence executor can write straight into the backend's
     /// physical storage and then update the buffer-level counters.
     /// Crate-internal; gated to the
-    /// `BufferBackend::SUPPORTS_INLINE_DONOR_EXEC = true` dispatch
+    /// `BufferBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true` dispatch
     /// site.
     #[inline]
     #[allow(dead_code)]
@@ -193,14 +193,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     /// Advance the `total_output_counter` by `n` bytes — pair with
-    /// [`super::buffer_backend::BufferBackend::donor_exec_one_sequence`]
+    /// [`super::buffer_backend::BufferBackend::exec_sequence_inline`]
     /// which writes the actual bytes through the backend without
     /// touching DecodeBuffer-level bookkeeping. Without this helper
     /// the donor-shape path would leave `total_output_counter` stale
     /// on every sequence executed through it.
     ///
     /// **Hash is NOT mutated here.** On the direct-decode path
-    /// `FrameDecoder::decode_to_slice_trusted` walks the full output
+    /// `FrameDecoder::decode_all` walks the full output
     /// slice once at end of decode and writes the result into
     /// `self.hash`, overwriting any incremental state. Hashing per
     /// sequence here would be wasted work whose result the final
@@ -325,10 +325,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // assumes the required free capacity exists; skipping it
             // would turn a malformed block (match_length past the
             // upfront `reserve(MAX_BLOCK_SIZE)`) into release-build
-            // UB. The pipelined caller already reserved MAX_BLOCK_SIZE
-            // up front, so this is a cheap no-op branch in the hot
-            // path.
-            self.buffer.reserve(match_length);
+            // UB. Use the fallible variant so fixed-capacity backends
+            // (`UserSliceBackend`) surface a structured error instead
+            // of panicking via the per-call `assert!` inside
+            // `extend_from_within_unchecked`. Growable backends'
+            // default impl never fails (allocation succeeds or
+            // aborts), so the conversion is a cheap no-op there.
+            self.buffer.try_reserve(match_length).map_err(|o| {
+                DecodeBufferError::OutputBufferOverflow {
+                    tail: o.tail,
+                    requested: o.requested,
+                    capacity: o.capacity,
+                }
+            })?;
             if !SKIP_PREFETCH {
                 self.prefetch_match_source(start_idx, match_length);
             }
@@ -698,7 +707,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// `drop_to_window_size` and `drain_*` calls (those only narrow
     /// the visible region; they don't roll back produced).
     ///
-    /// Used by the direct-decode path (`FrameDecoder::decode_to_slice_trusted`)
+    /// Used by the direct-decode path (`FrameDecoder::decode_all`)
     /// to track actual bytes written against the declared
     /// `frame_content_size`. Sidesteps `BlockHeader.decompressed_size`
     /// which is intentionally 0 for `BlockType::Compressed` (the
@@ -721,7 +730,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// window-size rule (`offset <= window_size`).
     ///
     /// Does NOT update the rolling content checksum. On the direct
-    /// path the caller (`FrameDecoder::decode_to_slice_trusted`) hashes the
+    /// path the caller (`FrameDecoder::decode_all`) hashes the
     /// final `output[..content_size]` slice ONCE at end of decode
     /// (single sequential xxhash pass over cache-hot data) and
     /// propagates the digest into the persistent scratch's hasher.
