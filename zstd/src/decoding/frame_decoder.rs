@@ -1228,10 +1228,14 @@ impl FrameDecoder {
 
     /// `lsm`-feature decode_all_impl: adds the optional skippable
     /// visitor parameter consumed by
-    /// [`Self::decode_all_with_skippable_visitor`]. Body is identical
-    /// to the no-lsm variant except for the SkipFrame arm, which
-    /// invokes the visitor (when `Some`) on the borrowed payload
-    /// slice before advancing past it.
+    /// [`Self::decode_all_with_skippable_visitor`]. Mirrors the no-lsm
+    /// variant including the direct-path dispatch + FCS-validation
+    /// rationale comments, so the two functions stay in sync; the only
+    /// behavioral difference is the SkipFrame arm, which uses
+    /// `split_at(length)` (single bounds check) instead of two
+    /// separate `get(..length)` / `get(length..)` slices and invokes
+    /// the visitor (when `Some`) on the borrowed payload before
+    /// advancing past it.
     #[cfg(feature = "lsm")]
     fn decode_all_impl(
         &mut self,
@@ -1258,20 +1262,31 @@ impl FrameDecoder {
                     // (RFC 8878 §3.1.2). `read_frame_header` only emits
                     // SkipFrame for magic in 0x184D2A50..=0x184D2A5F, so
                     // the subtraction fits in 0..=15.
+                    if input.len() < length {
+                        return Err(FrameDecoderError::FailedToSkipFrame);
+                    }
+                    let (payload, rest) = input.split_at(length);
                     if let Some(visitor) = skippable_visitor.as_mut() {
-                        let payload = input
-                            .get(..length)
-                            .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                         let variant = (magic_number - 0x184D2A50) as u8;
                         visitor(variant, payload);
                     }
-                    input = input
-                        .get(length..)
-                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    input = rest;
                     continue;
                 }
                 Err(e) => return Err(e),
             };
+            // Per-frame direct-path dispatch. Now safe to route the
+            // public `decode_all` here because
+            // `UserSliceBackend::exec_sequence_inline` returns
+            // `Result<(), ExecuteSequencesError>` instead of
+            // panicking on capacity overflow; the error propagates
+            // up as `FrameDecoderError`. Eligibility (FCS > 0, no
+            // active dict, remaining `output` slice has WILDCOPY
+            // slack) puts the frame on the fast path that bypasses
+            // the FlatBuf/Ring -> `read()` drain copy. Ineligible
+            // frames (no FCS, active dict, output too small for
+            // slack) fall through to the legacy `decode_blocks` +
+            // `read` drain loop below.
             let state_ref = self.state.as_ref().expect("init populated state");
             let content_size = state_ref.frame_header.frame_content_size();
             let fcs_declared = state_ref.frame_header.fcs_declared();
@@ -1300,6 +1315,10 @@ impl FrameDecoder {
                     break;
                 }
             }
+            // Per-frame FCS validation on the legacy fallback path.
+            // Use `fcs_declared()` (NOT `content_size > 0`) so an
+            // empty frame with explicit FCS=0 on the wire still gets
+            // validated.
             if fcs_declared {
                 let produced = (total_bytes_written - frame_start_total) as u64;
                 if produced != content_size {
