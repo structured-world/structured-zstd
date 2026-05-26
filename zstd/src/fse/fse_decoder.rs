@@ -563,9 +563,28 @@ impl FSETable {
         self.decode.reserve(table_size);
         for &symbol in spread.iter().take(table_size) {
             let next_state = symbol_next[symbol as usize];
+            // Defensive guard against malformed input on the
+            // `build_from_probabilities` public surface: if the
+            // caller passes a probability vector whose positive
+            // entries don't fully cover `[0, negative_idx)` (e.g.
+            // sum-of-positive-probs < table_size - count(-1)),
+            // `spread.resize(table_size, 0)` leaves the unfilled
+            // tail at the default zero, so this loop reads
+            // `spread[u] == 0` for some `u`, looks up
+            // `symbol_next[0]`, and if symbol 0 had `prob == 0`
+            // the counter was never initialised → still 0. Calling
+            // `highest_bit_set(0)` panics. Reject explicitly so
+            // the public API surfaces a typed error instead.
+            if next_state == 0 {
+                return Err(FSETableError::TableInvariantViolation {
+                    prob: self.symbol_probabilities[symbol as usize],
+                    symbol,
+                    num_bits: 0,
+                    accuracy_log,
+                });
+            }
             symbol_next[symbol as usize] = next_state + 1;
-            // `next_state >= 1` by construction (Pass 1 init for
-            // -1 probs, Pass 2 init for positive probs).
+            // `next_state >= 1` by construction now (guarded above).
             // `highest_bit_set(x)` returns `floor(log2(x)) + 1`.
             let high_bit = highest_bit_set(next_state);
             // nbBits = accuracy_log - floor(log2(next_state))
@@ -598,9 +617,10 @@ impl FSETable {
             }
             // `next_state << nb` ranges [table_size, 2*table_size - (1 << nb)];
             // subtracting `table_size` gives `new_state ∈ [0, table_size - 1]`
-            // which fits u16 for any `accuracy_log ≤ 15` (the wire format
-            // caps `accuracy_log` at `FSE_MAX_TABLELOG = 9` for sequence
-            // tables, well below the u16 bound).
+            // which fits u16 for any `accuracy_log <= 16`
+            // (`ENTRY_MAX_ACCURACY_LOG`). The wire format caps
+            // `accuracy_log` at `FSE_MAX_TABLELOG = 9` for sequence
+            // tables, well below the u16 bound.
             let new_state_u32 = (next_state << nb).wrapping_sub(table_size_u32);
             self.decode.push(Entry {
                 new_state: new_state_u32 as u16,
