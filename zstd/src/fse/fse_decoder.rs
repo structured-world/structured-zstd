@@ -510,8 +510,13 @@ impl FSETable {
         // `tableDecode[highThreshold--].baseValue = s; symbolNext[s]
         // = 1;`.
         let mut negative_idx = table_size;
-        for symbol in 0..nb_symbols {
-            if self.symbol_probabilities[symbol] == -1 {
+        for (symbol, &prob) in self
+            .symbol_probabilities
+            .iter()
+            .enumerate()
+            .take(nb_symbols)
+        {
+            if prob == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
                 symbol_next[symbol] = 1;
@@ -524,8 +529,12 @@ impl FSETable {
         // build loop's counter reaches `2*prob - 1` over `prob`
         // iterations (matching donor `symbolNext[s]++` semantics).
         let mut position = 0usize;
-        for symbol in 0..nb_symbols {
-            let prob = self.symbol_probabilities[symbol];
+        for (symbol, &prob) in self
+            .symbol_probabilities
+            .iter()
+            .enumerate()
+            .take(nb_symbols)
+        {
             if prob <= 0 {
                 continue;
             }
