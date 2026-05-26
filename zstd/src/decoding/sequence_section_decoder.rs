@@ -758,9 +758,18 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     // (`lit_cur_before + 16 <= lit_len`) but whose `high + 15`
     // exceeds it. Apply (2) only in the wildcopy regime.
     // `checked_add` covers adversarial overflow.
+    // For seq.ll > 16 the wildcopy tail's final 16-byte iteration
+    // reads through `lit_cur_before + seq.ll.next_multiple_of(16)
+    // - 1`. Use that exact bound rather than `high + 15`, which
+    // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
+    // 16 != 1` — keeping the donor inline path active on more
+    // sequences near the end of the literals buffer.
     let donor_path_safe = B::SUPPORTS_INLINE_DONOR_EXEC
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
-        && (seq.ll as usize <= 16 || high.checked_add(15).is_some_and(|b| b <= lit_len));
+        && (seq.ll as usize <= 16
+            || lit_cur_before
+                .checked_add((seq.ll as usize).next_multiple_of(16))
+                .is_some_and(|b| b <= lit_len));
     if donor_path_safe {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path

@@ -205,14 +205,23 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
+        // Match against the LIVE window (tail - head) per the trait
+        // contract, not `tail`. On single-segment frames head stays
+        // at 0 so the two are equivalent; on multi-segment frames
+        // `drop_to_window_size` advances `head` and asserting
+        // against raw `tail` would mask offsets that reach past the
+        // window boundary into dropped history.
+        let live_len = self.tail - self.head;
         debug_assert!(
-            self.tail
+            live_len
                 .checked_add(lit_length)
                 .is_some_and(|end| offset <= end),
-            "donor_exec_one_sequence: offset ({}) exceeds output start (tail={} + lit={})",
+            "donor_exec_one_sequence: offset ({}) exceeds live window (len={} + lit={}, head={}, tail={})",
             offset,
-            self.tail,
+            live_len,
             lit_length,
+            self.head,
+            self.tail,
         );
 
         // SAFETY: capacity asserted above; pointer arithmetic stays
@@ -676,6 +685,8 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::vec;
+    #[cfg(target_arch = "x86_64")]
+    use alloc::vec::Vec;
 
     #[test]
     fn extend_writes_at_tail() {
