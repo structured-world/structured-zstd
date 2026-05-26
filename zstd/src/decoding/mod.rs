@@ -41,6 +41,7 @@ pub(crate) mod block_decoder;
 pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
+pub(crate) mod exec_sequence_inline;
 // FlatBuf is the compile-time-monomorphised "frame fits in window"
 // backend selected via `DecodeBuffer<FlatBuf>`. `FrameDecoder`'s
 // `DecoderScratchKind` picks it when the frame header has
@@ -59,7 +60,7 @@ pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
 // `UserSliceBackend` is the compile-time-monomorphised backend that
 // writes directly into the caller's `&mut [u8]` output slice, used
-// by the `FrameDecoder::decode_to_slice_trusted` direct-decode path. It
+// by the `FrameDecoder::decode_all` direct-decode path. It
 // eliminates the `FlatBuf` drain copy + anonymous-page-fault cost
 // on large literal sections. Wiring happens via
 // `DecodeBuffer<UserSliceBackend<'a>>`; the lifetime binds the

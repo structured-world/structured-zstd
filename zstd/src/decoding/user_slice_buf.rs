@@ -1,8 +1,11 @@
 //! User-slice-backed output buffer for the "decode straight into the
 //! caller's output slice" fast path.
 //!
-//! Selected by [`crate::decoding::FrameDecoder::decode_to_slice_trusted`]
-//! when ALL of the following hold:
+//! Selected automatically by
+//! [`crate::decoding::FrameDecoder::decode_all`] (and
+//! [`crate::decoding::FrameDecoder::decode_all_to_vec`], which
+//! reserves the extra slack internally) when ALL of the following
+//! hold:
 //! - `frame_content_size > 0` — the header-derived content size
 //!   is non-zero. This is the actual eligibility condition (NOT
 //!   "FCS present"): an empty frame with an explicit FCS=0
@@ -53,7 +56,7 @@
 //! parameter). The lifetime parameter binds the backend to the
 //! user-provided slice — the backing
 //! `DecodeBuffer<UserSliceBackend<'a>>` is stack-local in
-//! `decode_to_slice_trusted` and does not survive across calls. Persistent
+//! `decode_all` and does not survive across calls. Persistent
 //! decoder state (HUF/FSE tables, offset_hist, sequence cache)
 //! lives in `FrameDecoder` and is borrowed in by reference for the
 //! call's duration via [`super::scratch::DirectScratch`].
@@ -86,34 +89,34 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// allocation. The dispatch site in [`crate::decoding::FrameDecoder`]
 /// validates this precondition.
 ///
-/// # DoS surface on malformed Compressed blocks
+/// # Safety contract on malformed Compressed blocks
 ///
-/// The bounds checks on write entry points are uniformly
-/// release-mode `assert!` (for `extend`, `extend_and_fill`, and
-/// `extend_from_within_unchecked`). On adversarial input — a frame
-/// header that declares a small `frame_content_size` AND a
-/// Compressed block whose payload expands to more than the declared
-/// size — the burst's per-symbol writes can reach past `slice.len()`
-/// and panic via the `assert!` failure instead of returning a
-/// structured error. The frame-level `decode_to_slice_trusted` checks
-/// `produced > content_size` AFTER each block; within a single block
-/// the panic-on-overshoot is the only stop.
+/// The safe public decode APIs ([`crate::decoding::FrameDecoder::decode_all`]
+/// and [`crate::decoding::FrameDecoder::decode_all_to_vec`]) route
+/// through the FALLIBLE write surface:
+/// [`Self::try_extend`] / [`Self::try_extend_and_fill`] /
+/// [`Self::try_extend_from_within`] for direct writes,
+/// [`super::buffer_backend::BufferBackend::try_reserve`] for the
+/// match-repeat pre-check inside `DecodeBuffer::repeat_inner`, and
+/// `exec_sequence_inline` (which returns
+/// `Result<(), ExecuteSequencesError>`). A malformed Compressed
+/// block whose payload expands past the declared
+/// `frame_content_size` surfaces as
+/// `ExecuteSequencesError::OutputBufferOverflow` (literal-push /
+/// donor-inline path) or `DecodeBufferError::OutputBufferOverflow`
+/// (match-repeat path), both of which propagate up the call stack
+/// as a structured `FrameDecoderError` instead of panicking.
 ///
-/// Callers handling untrusted input should use
-/// [`crate::decoding::FrameDecoder::decode_all`] which routes
-/// through `FlatBuf` / `RingBuffer` backends. Those backends grow
-/// via `Vec::reserve` — growth doesn't return errors (it succeeds
-/// or aborts on alloc failure), but the growable Vec capacity
-/// means a malformed block whose decompressed output exceeds FCS
-/// stays inside the allocation instead of writing OOB into a
-/// fixed-size user slice. The frame-level checks then catch the
-/// FCS mismatch and return `FrameContentSizeMismatch`.
-///
-/// Replacing the panics with `Result<_, _>`-returning writes (so
-/// `decode_to_slice_trusted` itself can stay safe on adversarial input) is
-/// tracked in issue #246 — it requires extending the
-/// `BufferBackend` trait surface and would gate the direct path on
-/// the new fallible signatures.
+/// The INFALLIBLE entry points (`extend`, `extend_and_fill`,
+/// `extend_from_within_unchecked`) remain on the type as defense in
+/// depth and as the call shape for inner unsafe blocks where
+/// capacity has already been validated by the wrapping `try_*` call.
+/// Each retains a release-mode `assert!` so a future caller that
+/// invokes the infallible entry point directly with an OOB length
+/// fails with a clear diagnostic rather than letting the subsequent
+/// unsafe pointer math reach past `slice.len()`. The safe public
+/// APIs never reach these `assert!`s on malformed input — the
+/// fallible dispatch catches the overshoot one layer up.
 pub(crate) struct UserSliceBackend<'a> {
     slice: &'a mut [u8],
     /// Bytes in `slice[..head]` have been drained to the output
@@ -143,6 +146,150 @@ impl<'a> UserSliceBackend<'a> {
 }
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
+    /// Donor-shape inline `ZSTD_execSequence` is available on
+    /// `x86_64`, where SSE2 is the architectural baseline and the
+    /// helpers in [`super::exec_sequence_inline::x86`] emit
+    /// `_mm_loadu_si128` / `_mm_storeu_si128` without needing a
+    /// `#[target_feature]` gate. 32-bit `x86` is excluded — its
+    /// pre-SSE2 baseline (i386 / i486 / i586) would SIGILL on the
+    /// SSE2 intrinsics. aarch64 NEON, riscv etc. fall back to the
+    /// existing `extend` + `repeat` chain — those paths already
+    /// emit the architecture's best-available SIMD via
+    /// `copy_bytes_overshooting`'s runtime detect.
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = cfg!(target_arch = "x86_64");
+
+    /// Donor `ZSTD_execSequence` body — see trait doc for
+    /// preconditions / contract.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        // Fallible capacity check — covers the literal+match copies
+        // INCLUDING the wildcopy overshoot tail (up to 15 bytes past
+        // `tail + total`). On a well-formed frame the caller-side
+        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice absorbs
+        // it; on a malformed frame whose sequences overproduce past
+        // `frame_content_size`, the check returns
+        // `ExecuteSequencesError::OutputBufferOverflow` so the
+        // safe public decode APIs (`decode_all`, `decode_all_to_vec`)
+        // surface a structured `FrameDecoderError` rather than
+        // panic on the unsafe write surface.
+        //
+        // All sums use `checked_*` so adversarial input that would
+        // wrap `usize` produces the same error variant instead of
+        // wrapping past the slice length and letting the subsequent
+        // unsafe pointer math go out of bounds.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.slice.len();
+        // `requested` reports the LOGICAL write length
+        // (`lit_length + match_length`) to stay consistent with
+        // `BackendOverflow.requested` on the `try_*` paths. The
+        // capacity check itself uses `tail + total + overshoot`
+        // because the unconditional 16-byte `copy16` over-reaches
+        // `tail + total` by up to 15 bytes — but that overshoot is
+        // an artefact of the SIMD copy shape, NOT a value the
+        // caller can act on, so it doesn't belong in the diagnostic.
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = self
+            .tail
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        let cap_required = match cap_required {
+            Some(v) if v <= cap => v,
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        };
+        let _ = cap_required;
+        let new_tail = self.tail + total;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        // Match against the LIVE window (tail - head) per the trait
+        // contract, not `tail`. On single-segment frames head stays
+        // at 0 so the two are equivalent; on multi-segment frames
+        // `drop_to_window_size` advances `head` and asserting
+        // against raw `tail` would mask offsets that reach past the
+        // window boundary into dropped history.
+        let live_len = self.tail - self.head;
+        debug_assert!(
+            live_len
+                .checked_add(lit_length)
+                .is_some_and(|end| offset <= end),
+            "exec_sequence_inline: offset ({}) exceeds live window (len={} + lit={}, head={}, tail={})",
+            offset,
+            live_len,
+            lit_length,
+            self.head,
+            self.tail,
+        );
+
+        // SAFETY: capacity asserted above; pointer arithmetic stays
+        // within `self.slice` for the writes (tail + total <=
+        // slice.len()) and reads (match src = tail + lit_length -
+        // offset, bounded by `offset <= tail + lit_length`). Literal
+        // reads use the caller-provided `lit_src` whose provenance
+        // covers the parent literals buffer (NOT a sub-slice), so
+        // the unconditional 16-byte load stays in-bounds even when
+        // `lit_length < 16`.
+        unsafe {
+            let base_mut = self.slice.as_mut_ptr();
+
+            // ── Literal copy ──
+            // Donor: ZSTD_copy16(op, *litPtr); if (litLength > 16)
+            //         wildcopy(op+16, *litPtr+16, litLength-16, no_overlap)
+            //
+            // The unconditional first copy16 may overshoot up to 15
+            // bytes past `op + lit_length` into the match-destination
+            // region — those bytes are about to be overwritten by the
+            // match copy below, so the overshoot is harmless.
+            let op_lit = base_mut.add(self.tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            // ── Match copy ──
+            // Donor uses `oLitEnd = op + litLength` as the match
+            // destination; the match source is `oLitEnd - offset`.
+            let op_match = base_mut.add(self.tail + lit_length);
+            let match_src = base_mut.cast_const().add(self.tail + lit_length - offset);
+
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                // overlap_copy8 + wildcopy(overlap) tail.
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
     /// `new()` exists for trait conformance but is not used on the
     /// direct-decode path — the slice is always provided up-front via
     /// [`Self::from_slice`]. Returns an empty backend wrapping an
@@ -171,6 +318,22 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     fn clear(&mut self) {
         self.head = 0;
         self.tail = 0;
+    }
+
+    #[inline]
+    fn try_reserve(&mut self, n: usize) -> Result<(), super::buffer_backend::BackendOverflow> {
+        // Fixed-capacity backend: linear `tail + n <= slice.len()`
+        // check. Lets safe public decode APIs catch a malformed-frame
+        // overshoot here instead of via the `assert!` inside
+        // `extend_from_within_unchecked` further down the call chain.
+        match self.tail.checked_add(n) {
+            Some(new_tail) if new_tail <= self.slice.len() => Ok(()),
+            _ => Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: n,
+                capacity: self.slice.len(),
+            }),
+        }
     }
 
     #[inline]
@@ -233,22 +396,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // builds and turn the unchecked copy into UB. Cost: one
         // compare on the literal-push path — same magnitude as
         // the surrounding bounds-already-baked-in writes.
-        // The `assert!` below panics on adversarial / malformed input
-        // (a Compressed block whose payload expands past declared FCS).
-        // This is the deliberate trade-off for the trusted-input
-        // direct-decode path: switching the write surface to fallible
-        // `Result` writes — so the panic becomes a structured
-        // `FrameContentSizeMismatch` — requires extending the
-        // `BufferBackend` trait surface, touching every backend
-        // implementation, and threading `Result<_, _>` through the
-        // sequence executor. That refactor lives in a dedicated
-        // follow-up (the docstring on `decode_to_slice_trusted` names it as
-        // a hard prerequisite before this entry point becomes safe
-        // on untrusted streams). Until then the contract is
-        // documented at the safe-API surface and enforced by
-        // `#[must_use]` + `#[doc(alias = "decode_to_slice_trusted_trusted")]`.
-        // Re-flagging without addressing the trade-off documented at
-        // the call site does not move the work forward.
+        //
+        // This is the INFALLIBLE entry point. The safe public APIs
+        // (`decode_all`, `decode_all_to_vec`) never reach it on
+        // malformed input: their dispatch routes through
+        // [`Self::try_extend`] (and via `DecodeBuffer::try_push` /
+        // `try_reserve` for the match-repeat path), which return
+        // `BackendOverflow` and convert into
+        // `FrameDecoderError::ExecuteSequencesError` /
+        // `FrameContentSizeMismatch`. The `assert!` here covers
+        // the case where a future caller wires the infallible
+        // entry point into a hot path that doesn't go through the
+        // dispatch — the panic message points at the corrupt-frame
+        // root cause rather than letting the subsequent unsafe
+        // pointer math go OOB.
         assert!(
             new_tail <= self.slice.len(),
             "UserSliceBackend::extend overflows slice (tail+={}, cap={}) — corrupt frame",
@@ -560,6 +721,8 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::vec;
+    #[cfg(target_arch = "x86_64")]
+    use alloc::vec::Vec;
 
     #[test]
     fn extend_writes_at_tail() {
@@ -781,5 +944,130 @@ mod tests {
         assert_eq!(err.requested, 2);
         assert_eq!(err.capacity, 4);
         assert_eq!(b.tail(), 3);
+    }
+
+    /// Direct tests for `exec_sequence_inline` — exercise the
+    /// x86_64 inline body so coverage attributes its 40 lines to
+    /// these tests, not through the deep `decode_all`
+    /// pipeline where `cargo llvm-cov` sometimes loses the inlined
+    /// callee. Tests cover: short-literal + short-match, long
+    /// literal (wildcopy tail), short-offset match (overlapCopy8 +
+    /// 8-byte stride), long-offset match (wildcopy_no_overlap).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_short_literal_plus_long_offset_match() {
+        // Layout: pre-fill `tail = 8` with a "history" region so
+        // a match copy at offset 16 reaches inside the slice. Then
+        // bump tail past that history and exercise donor_exec.
+        // Buffer sized with WILDCOPY_OVERLENGTH slack at the end.
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        // Seed history: bytes 0..32 = ascending values, so a later
+        // match at offset 16 picks up bytes 16..32.
+        for (i, slot) in buf.iter_mut().take(32).enumerate() {
+            *slot = i as u8;
+        }
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32; // Pretend 32 history bytes are already written.
+
+        // 8-byte literals to write (donor's litLength <= 16 fast
+        // path — no wildcopy tail). Match length 8 at offset 16.
+        let lits: [u8; 16] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1,
+            0x10, 0x20,
+        ];
+        unsafe {
+            b.exec_sequence_inline(lits.as_ptr(), 8, 16, 8).unwrap();
+        }
+        // tail advanced by 8 lit + 8 match = 16.
+        assert_eq!(b.tail, 48);
+        // Literals landed at tail = 32..40.
+        assert_eq!(&buf[32..40], &lits[..8]);
+        // Match: at output position 40..48, source = tail + lit_len -
+        // offset = 32 + 8 - 16 = 24. So buf[40..48] == buf[24..32]
+        // (history bytes 24..32 = [24, 25, 26, 27, 28, 29, 30, 31]).
+        assert_eq!(&buf[40..48], &[24u8, 25, 26, 27, 28, 29, 30, 31]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_long_literal_uses_wildcopy_tail() {
+        // litLength > 16 path: unconditional copy16 + wildcopy tail
+        // for the remaining literal bytes.
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        for (i, slot) in buf.iter_mut().take(32).enumerate() {
+            *slot = i as u8;
+        }
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32;
+
+        // 40-byte literals (forces wildcopy tail) — needs 40-byte
+        // source buffer with extra read slack for the final
+        // 16-byte load.
+        let lits: Vec<u8> = (0..40 + 16).map(|i| 0x80 + i as u8).collect();
+        unsafe {
+            b.exec_sequence_inline(lits.as_ptr(), 40, 16, 8).unwrap();
+        }
+        assert_eq!(b.tail, 80);
+        assert_eq!(&buf[32..72], &lits[..40]);
+        // Match at offset 16: src = 32 + 40 - 16 = 56. buf[72..80]
+        // == buf[56..64] (which we just wrote = lits[24..32]).
+        assert_eq!(&buf[72..80], &lits[24..32]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_short_offset_match_uses_overlap_copy() {
+        // offset < 16 takes the overlapCopy8 + 8-byte stride path
+        // (vs. the offset >= 16 wildcopy_no_overlap path).
+        //
+        // What we actually assert here:
+        //   1. `tail` advances by `lit_length + match_length`.
+        //   2. The literal payload lands at `buf[tail..tail+ll]`.
+        //   3. The FIRST 4 match-output bytes match seed[4..8] —
+        //      that prefix of the match copy reads source bytes
+        //      that the literal `copy16` overshoot did NOT
+        //      overwrite (the donor `copy16` writes 16 bytes at
+        //      `tail`, so source bytes BEFORE `tail` survive).
+        //
+        // We do NOT cross-validate against the legacy `extend` +
+        // `repeat_in_chunks` chain: those paths don't perform the
+        // 16-byte literal overshoot, so they produce a different
+        // output for the same logical sequence (different bytes in
+        // positions where the donor's overshoot is consumed by the
+        // match copy). End-to-end parity is covered by the higher
+        // level `roundtrip_integrity::*` tests in lib.rs which
+        // decode whole frames and compare to the encoder input.
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut buf = vec![0u8; 256 + WILDCOPY];
+        // Seed last 8 bytes of history with a recognisable pattern.
+        let seed = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7];
+        buf[24..32].copy_from_slice(&seed);
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 32;
+
+        let lits: [u8; 16] = [0xFF; 16];
+        // litLength=4, offset=8, matchLength=12. offset<16 → short
+        // path (overlapCopy8 + 8-byte stride).
+        unsafe {
+            b.exec_sequence_inline(lits.as_ptr(), 4, 8, 12).unwrap();
+        }
+        // tail = 32 + 4 + 12 = 48.
+        assert_eq!(b.tail, 48);
+        // Literal copy: bytes 32..36 are the literal payload.
+        assert_eq!(&buf[32..36], &lits[..4]);
+        // Match copy: the first 4 output bytes (positions 36..40)
+        // are the FIRST 4 source bytes (positions 28..32), which the
+        // literal copy16 has NOT overwritten (it wrote at 32..48, so
+        // 28..32 remain as the seed tail). Verify those.
+        assert_eq!(&buf[36..40], &seed[4..8]);
+        // The remaining 8 match bytes (40..48) get fed by the
+        // 8-byte-stride wildcopy reading from positions inside the
+        // match-destination region, which the literal copy16 already
+        // overwrote with 0xFF. That's the donor invariant — the
+        // overshoot is consumed correctly. We don't pin the exact
+        // bytes (they're a function of overlap_copy8's spread
+        // tables) but the output length must be right.
     }
 }

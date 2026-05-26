@@ -423,25 +423,32 @@ pub enum DecodeBufferError {
         buf_len: usize,
     },
     ZeroOffset,
-    /// Match repeat would overflow a fixed-capacity backend
-    /// (`UserSliceBackend`). Growable backends (FlatBuf/RingBuffer)
-    /// grow on demand and never produce this.
-    ///
-    /// Reserved for the Compressed-block sequence-executor hardening
-    /// follow-up. Currently NOT surfaced from any production path —
-    /// `extend_from_within_unchecked` on `UserSliceBackend` still
-    /// panics on overshoot via its release-mode `assert!`. The
-    /// `_trusted` suffix on `decode_to_slice_trusted` is the
-    /// shipping contract until that follow-up wires
-    /// `BufferBackend::try_extend_from_within` through
-    /// `DecodeBuffer::repeat*` and maps `BackendOverflow` into
-    /// `FrameDecoderError::FrameContentSizeMismatch`.
-    ///
-    /// The variant lives now (vs landing later with the
-    /// follow-up) so the typed conversion at the `decode_to_slice_trusted`
-    /// boundary is in place; only the constructor on the burst path
-    /// is missing.
+    /// Legacy unit variant kept for binary compatibility with earlier
+    /// snapshots of this enum. Not surfaced from any current
+    /// production path — `BufferBackend::try_extend` /
+    /// `try_extend_from_within` and the new `try_reserve` (used by
+    /// `DecodeBuffer::repeat`) carry their failures through the
+    /// richer [`Self::OutputBufferOverflow`] variant below, which
+    /// reports the offending `tail` / `requested` / `capacity`
+    /// triple. New code should pattern-match on
+    /// `OutputBufferOverflow`; this unit variant is retained to keep
+    /// the `#[non_exhaustive]` enum's existing discriminant set
+    /// stable.
     BackendOverflow,
+    /// Repeat-side match copy would write past the writable tail of
+    /// a fixed-capacity backend (`UserSliceBackend`). Surfaced by
+    /// [`super::decode_buffer::DecodeBuffer::repeat`] / `_lookahead`
+    /// when the new `BufferBackend::try_reserve` rejects the
+    /// pre-write capacity check — keeping the safe public decode
+    /// APIs error-returning instead of panicking via the per-call
+    /// `assert!` inside `extend_from_within_unchecked`. Growable
+    /// backends (`FlatBuf`, `RingBuffer`) never produce this; their
+    /// `try_reserve` falls through to infallible `reserve`.
+    OutputBufferOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -466,6 +473,16 @@ impl core::fmt::Display for DecodeBufferError {
                 write!(
                     f,
                     "Match repeat would overflow the output buffer's fixed capacity"
+                )
+            }
+            DecodeBufferError::OutputBufferOverflow {
+                tail,
+                requested,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "Match repeat would write past fixed-capacity buffer: tail={tail}, requested={requested}, capacity={capacity}"
                 )
             }
         }
@@ -853,8 +870,24 @@ impl From<HuffmanTableError> for DecompressLiteralsError {
 #[non_exhaustive]
 pub enum ExecuteSequencesError {
     DecodebufferError(DecodeBufferError),
-    NotEnoughBytesForSequence { wanted: usize, have: usize },
+    NotEnoughBytesForSequence {
+        wanted: usize,
+        have: usize,
+    },
     ZeroOffset,
+    /// A donor-shape inline sequence (`BufferBackend::exec_sequence_inline`)
+    /// would have written past the writable tail of a fixed-size backend
+    /// (`UserSliceBackend`). Indicates the frame is corrupt — its sequences
+    /// expand past the declared `frame_content_size` plus the caller-supplied
+    /// `WILDCOPY_OVERLENGTH` slack. The fast-path check is per-sequence; the
+    /// post-block FCS overflow check would also catch the same shape, but the
+    /// per-sequence guard is what keeps the unsafe write surface inside the
+    /// user-provided slice on the way to the post-block check.
+    OutputBufferOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 impl core::fmt::Display for ExecuteSequencesError {
@@ -871,6 +904,16 @@ impl core::fmt::Display for ExecuteSequencesError {
             }
             ExecuteSequencesError::ZeroOffset => {
                 write!(f, "Illegal offset: 0 found")
+            }
+            ExecuteSequencesError::OutputBufferOverflow {
+                tail,
+                requested,
+                capacity,
+            } => {
+                write!(
+                    f,
+                    "Donor-path sequence would write past fixed-size buffer: tail={tail}, requested={requested}, capacity={capacity}"
+                )
             }
         }
     }
@@ -889,6 +932,16 @@ impl std::error::Error for ExecuteSequencesError {
 impl From<DecodeBufferError> for ExecuteSequencesError {
     fn from(val: DecodeBufferError) -> Self {
         Self::DecodebufferError(val)
+    }
+}
+
+impl From<crate::decoding::buffer_backend::BackendOverflow> for ExecuteSequencesError {
+    fn from(val: crate::decoding::buffer_backend::BackendOverflow) -> Self {
+        Self::OutputBufferOverflow {
+            tail: val.tail,
+            requested: val.requested,
+            capacity: val.capacity,
+        }
     }
 }
 

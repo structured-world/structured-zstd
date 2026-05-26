@@ -40,7 +40,221 @@ const _: () = assert!(
 /// Falls back to the legacy two-pass pipeline (`decode_sequences` +
 /// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
 /// is rare on perf-relevant corpora and not worth duplicating.
+/// Public entry. Resolves the CPU kernel — `OnceLock`-cached
+/// runtime detect under `feature = "std"`, compile-time
+/// `cfg(target_feature)` under `no_std` — then dispatches to a
+/// kernel-monomorphised body so the inner pipeline's
+/// `BitReaderReversed<K>` resolves `K::mask_lower_bits` at compile
+/// time (one BMI2 `bzhi` codegen per bit-mask call, no per-call
+/// kernel-selection dispatch). The per-call dispatch cost is one
+/// `OnceLock::get` (std) or zero (no_std) plus a small `match` —
+/// amortised over the whole block.
+///
+/// (Note: `BitReaderReversed::peek_bits_triple` still carries a
+/// per-call `if self.use_pext_triple` branch under
+/// `feature = "std"` + `target_arch = "x86_64"`, choosing between
+/// scalar mask and PEXT extract. That branch is **independent** of
+/// the kernel cascade and is left as-is — folding it into the
+/// kernel type would force VBMI2/Avx2/Bmi2 to commit to PEXT-only
+/// codegen, which is not always the fastest choice on the FSE
+/// state-update extracts.)
+///
+/// The BMI2/AVX2/VBMI2 arms route through `#[target_feature]`-wrapped
+/// trampolines so LLVM can inline the kernel's `_bzhi_u64` / pext
+/// instructions across the `K::mask_lower_bits` call boundary inside
+/// the impl body — otherwise the per-call target_feature boundary
+/// would keep a function-call trampoline at every BitReader op.
 pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+    #[cfg(target_arch = "aarch64")]
+    use crate::cpu_kernel::{NeonKernel, SveKernel};
+
+    match detect_cpu_kernel() {
+        CpuKernelTag::Scalar => decode_and_execute_sequences_impl::<B, ScalarKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Bmi2 => {
+            // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
+            // `is_x86_feature_detected!("bmi2")` confirmed BMI2 is
+            // available. The `#[target_feature(enable = "bmi2")]`
+            // wrapper lets LLVM emit `bzhi` directly at every
+            // `K::mask_lower_bits` call site inside the impl,
+            // bypassing the per-call target_feature trampoline that
+            // would otherwise survive.
+            unsafe {
+                decode_and_execute_sequences_bmi2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    rle_fallback_sequences,
+                )
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Avx2 => {
+            // SAFETY: detect confirmed BMI2 + AVX2.
+            unsafe {
+                decode_and_execute_sequences_avx2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    rle_fallback_sequences,
+                )
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Vbmi2 => {
+            // SAFETY: detect confirmed AVX-512 VBMI2 + AVX2 + BMI2
+            // (see `select_x86_kernel` precedence rules).
+            unsafe {
+                decode_and_execute_sequences_vbmi2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    rle_fallback_sequences,
+                )
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelTag::Neon => decode_and_execute_sequences_impl::<B, NeonKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+        #[cfg(target_arch = "aarch64")]
+        CpuKernelTag::Sve => decode_and_execute_sequences_impl::<B, SveKernel>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            rle_fallback_sequences,
+        ),
+    }
+}
+
+/// `#[target_feature(enable = "bmi2")]` trampoline for the BMI2 arm
+/// — wraps `decode_and_execute_sequences_impl::<B, Bmi2Kernel>` so
+/// LLVM can inline `_bzhi_u64` at every `K::mask_lower_bits` call
+/// across the target_feature boundary.
+///
+/// # Safety
+/// Caller must ensure BMI2 is available on the runtime CPU; the
+/// dispatcher above gates on `detect_cpu_kernel() == Bmi2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn decode_and_execute_sequences_bmi2<B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Bmi2Kernel>(
+        section,
+        source,
+        fse,
+        buffer,
+        offset_hist,
+        literals_buffer,
+        rle_fallback_sequences,
+    )
+}
+
+/// `#[target_feature(enable = "bmi2,avx2")]` trampoline for the
+/// Avx2 arm. Same shape as the BMI2 trampoline; the AVX2 enable
+/// piles onto the BMI2 feature set so any AVX2-gated codegen
+/// (chunked SIMD copy via `_mm256_*`) also benefits.
+///
+/// # Safety
+/// Caller must ensure BMI2 + AVX2 are available; gated by
+/// `detect_cpu_kernel() == Avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,avx2")]
+unsafe fn decode_and_execute_sequences_avx2<B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Avx2Kernel>(
+        section,
+        source,
+        fse,
+        buffer,
+        offset_hist,
+        literals_buffer,
+        rle_fallback_sequences,
+    )
+}
+
+/// `#[target_feature(enable = "...AVX-512 VBMI2 family + BMI2 + AVX2")]`
+/// trampoline for the Vbmi2 arm. Enables the full feature set the
+/// `select_x86_kernel` precedence requires.
+///
+/// # Safety
+/// Caller must ensure the entire feature set is available; gated by
+/// `detect_cpu_kernel() == Vbmi2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
+unsafe fn decode_and_execute_sequences_vbmi2<B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    rle_fallback_sequences: &mut Vec<Sequence>,
+) -> Result<(), DecompressBlockError> {
+    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Vbmi2Kernel>(
+        section,
+        source,
+        fse,
+        buffer,
+        offset_hist,
+        literals_buffer,
+        rle_fallback_sequences,
+    )
+}
+
+fn decode_and_execute_sequences_impl<
+    B: super::buffer_backend::BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
@@ -59,7 +273,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     vprintln!("Updating tables used {} bytes", bytes_read);
 
     let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::new(bit_stream);
+    let mut br = BitReaderReversed::<K>::new(bit_stream);
 
     // Skip the 0-padding at the end of the last byte and consume the
     // start-of-stream `1` bit.
@@ -80,6 +294,14 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     // the source maintenance for zero observed wins.
     if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
         decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
+        // `execute_sequences_fields` routes literal-pushes through
+        // `DecodeBuffer::try_push` (and match-repeats through
+        // `BufferBackend::try_reserve` inside `repeat_inner`), so a
+        // malformed RLE-driven sequence stream whose literal or match
+        // length overshoots a fixed-capacity backend (UserSliceBackend)
+        // surfaces as `ExecuteSequencesError::OutputBufferOverflow`
+        // rather than panicking via UserSliceBackend::extend's
+        // release-mode `assert!`.
         execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
         return Ok(());
     }
@@ -293,10 +515,15 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     }
 
     // Tail literals: any bytes in the literals_buffer that no sequence
-    // claimed get pushed after the last sequence.
+    // claimed get pushed after the last sequence. Routed through
+    // `try_push` so a malformed block whose tail-literal length
+    // overshoots the fixed-capacity backend (UserSliceBackend) surfaces
+    // as `OutputBufferOverflow` instead of panicking via the per-call
+    // `assert!` inside `BufferBackend::extend`. Growable backends
+    // (FlatBuf, RingBuffer) accept the write infallibly.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..];
-        buffer.push(rest);
+        buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }
 
@@ -326,8 +553,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 /// Grouping into a struct would push pressure off the argument
 /// registers and onto memory loads, undoing the extraction's win.
 #[allow(clippy::too_many_arguments)]
-fn run_pipelined_sequence_loop<B: super::buffer_backend::BufferBackend>(
-    br: &mut BitReaderReversed<'_>,
+fn run_pipelined_sequence_loop<
+    B: super::buffer_backend::BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+>(
+    br: &mut BitReaderReversed<'_, K>,
     ll_dec: &mut FSEDecoder<'_>,
     ml_dec: &mut FSEDecoder<'_>,
     of_dec: &mut FSEDecoder<'_>,
@@ -449,19 +679,23 @@ fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
     offset_hist: &mut [u32; 3],
     seq: Sequence,
 ) -> Result<(), DecompressBlockError> {
-    let high = *lit_cur + seq.ll as usize;
-    if high > lit_len {
-        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: high,
+    // `checked_add` on the literal cursor + sequence ll. On 32-bit
+    // targets a malformed stream can push `*lit_cur + seq.ll as usize`
+    // past `usize::MAX`; without the checked path the wrap would
+    // produce `high < *lit_cur` and the subsequent `get_unchecked`
+    // would slice into arbitrary memory (UB).
+    let high = (*lit_cur)
+        .checked_add(seq.ll as usize)
+        .filter(|&h| h <= lit_len)
+        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: (*lit_cur).saturating_add(seq.ll as usize),
             have: lit_len,
-        }
-        .into());
-    }
-    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
-    // (high = lit_cur + seq.ll, seq.ll >= 0).
+        })?;
+    // SAFETY: high <= lit_len (verified by the `filter` above) and
+    // *lit_cur <= high (the `checked_add` succeeded, so no wrap).
     let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
     *lit_cur = high;
-    buffer.push(lits);
+    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
 
     let actual = do_offset_history(seq.of, seq.ll, offset_hist);
     if actual == 0 {
@@ -492,22 +726,140 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     seq: Sequence,
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
-    let high = *lit_cur + seq.ll as usize;
-    if high > lit_len {
-        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: high,
+    let lit_cur_before = *lit_cur;
+    // `checked_add` guards against `usize` wrap on 32-bit targets
+    // when a malformed stream pushes `lit_cur_before + seq.ll` past
+    // `usize::MAX`; without it the wrap produces `high < lit_cur_before`
+    // and the subsequent `get_unchecked` would slice OOB (UB).
+    let high = lit_cur_before
+        .checked_add(seq.ll as usize)
+        .filter(|&h| h <= lit_len)
+        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: lit_cur_before.saturating_add(seq.ll as usize),
             have: lit_len,
-        }
-        .into());
-    }
-    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
-    let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
+        })?;
+    // SAFETY: high <= lit_len (verified above) and lit_cur_before <= high
+    // (the `checked_add` succeeded, so no wrap).
+    let lits = unsafe { literals.get_unchecked(lit_cur_before..high) };
     *lit_cur = high;
-    buffer.push(lits);
 
     if resolved_offset == 0 {
         return Err(ExecuteSequencesError::ZeroOffset.into());
     }
+
+    // Donor-shape inline dispatch — when the backend opts in
+    // (`UserSliceBackend` on x86_64 today, per its
+    // `SUPPORTS_INLINE_SEQUENCE_EXEC = true` const) we collapse the
+    // literal copy + match copy into a single straight-line body
+    // that mirrors donor `ZSTD_execSequence`
+    // (zstd_decompress_block.c:1008-1105). The const branch is
+    // compile-time per backend monomorphisation, so the dead arm
+    // carries no runtime cost on either side.
+    //
+    // **Literal-source slack guard** (the read-side donor-port
+    // safety contract): donor's `ZSTD_copy16` reads 16 bytes
+    // unconditionally regardless of `litLength`; on truncated
+    // literals (the closing sequences of a block) that would read
+    // past the end of the literals buffer slice — UB even when the
+    // bytes happen to be valid memory inside the backing `Vec`.
+    // Donor guards with `iLitEnd > litLimit` → slow path. We mirror
+    // the same gate. The donor inline path issues two distinct reads
+    // past the declared literal end:
+    //   (1) Unconditional first `ZSTD_copy16` from `lit_cur_before`
+    //       — needs `lit_cur_before + 16 <= lit_len`. THIS GATE
+    //       MATTERS EVEN WHEN `seq.ll == 0`: the copy still happens,
+    //       overwriting the dst region the match copy will rewrite.
+    //   (2) Tail wildcopy's final 16-byte chunk — ONLY when
+    //       `lit_length > 16` (the donor inline path gates the
+    //       wildcopy call on that same threshold). Reads up to
+    //       `lit_cur_before + lit_length + 15`, i.e. `high + 15`.
+    // For `lit_length ∈ 0..=16` only (1) fires; gate (2) would
+    // unnecessarily reject short-literal-tail sequences near
+    // `lit_len` whose `copy16` over-read fits inside the buffer
+    // (`lit_cur_before + 16 <= lit_len`) but whose `high + 15`
+    // exceeds it. Apply (2) only in the wildcopy regime.
+    // `checked_add` covers adversarial overflow.
+    // For seq.ll > 16 the wildcopy tail's final 16-byte iteration
+    // reads through `lit_cur_before + seq.ll.next_multiple_of(16)
+    // - 1`. Use that exact bound rather than `high + 15`, which
+    // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
+    // 16 != 1` — keeping the donor inline path active on more
+    // sequences near the end of the literals buffer.
+    let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+        && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
+        && (seq.ll as usize <= 16
+            || lit_cur_before
+                .checked_add((seq.ll as usize).next_multiple_of(16))
+                .is_some_and(|b| b <= lit_len));
+    if inline_path_safe {
+        // Validate match-copy offset against the live region
+        // (matches `repeat()`'s `offset > buffer.len()` → dict path
+        // gate). Donor inline path stays on the prefix-resident
+        // case; offsets that step into dict / extDict territory fall
+        // back to the layered path below.
+        let buf_len = buffer.len();
+        let offset = resolved_offset as usize;
+        // `checked_add` against adversarial input: if `buf_len +
+        // lits.len()` would wrap `usize`, treat the offset as
+        // out-of-range and fall back to the layered path. Without
+        // the check, wrapping addition could classify a wildly
+        // out-of-range `offset` as in-range and feed the donor
+        // inline path an OOB match-source pointer.
+        let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
+        if prefix_end.is_none() {
+            // Match source reaches outside what's been written in this
+            // frame — donor's `extDict` arm. Punt back to the slow
+            // `repeat()` path; that path already routes through
+            // `repeat_from_dict` for these offsets.
+            buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
+            buffer
+                .repeat_lookahead_prefetched(offset, seq.ml as usize)
+                .map_err(ExecuteSequencesError::from)?;
+            return Ok(());
+        }
+        // SAFETY:
+        // - Backend opted in (compile-time const).
+        // - `lits` is a non-aliased slice of the literals block.
+        // - Source-side slack: `lit_cur_before + 16 <= lit_len`
+        //   (gated above), so `lits.as_ptr().add(16)` reads stay
+        //   inside the literals buffer. Donor unconditional
+        //   `ZSTD_copy16` over-read of up to 16 bytes past
+        //   `lits.len()` is bounded by the slack we just asserted.
+        // - Offset is within the live region (prefix-resident,
+        //   asserted above), so the match-copy source pointer
+        //   `base + tail + lit_length - offset` is in-bounds.
+        // - Match length is `>= 1` by zstd spec invariant (a
+        //   sequence with `matchLength = 0` is malformed; the FSE
+        //   decode produces baseline values starting at 3 for ml
+        //   codes 0..3, so `seq.ml >= 3` for any valid sequence).
+        //   The wildcopy helpers assert this in debug builds.
+        // - Caller's upfront `reserve(MAX_BLOCK_SIZE)` plus the
+        //   `WILDCOPY_OVERLENGTH = 32` slack on the user slice
+        //   guarantees the writable tail has room for
+        //   `lit_length + match_length + 15` (max wildcopy
+        //   overshoot is 15 bytes past the declared end).
+        // SAFETY: `literals.as_ptr().add(lit_cur_before)` has the
+        // provenance of the FULL `literals` slice (not `lits`, the
+        // sub-slice). The 16-byte unconditional `copy16` inside the
+        // donor body reads up to `lit_cur_before + 16` bytes from
+        // the parent buffer, which the `inline_path_safe` gate above
+        // bounded by `lit_cur_before + 16 <= lit_len`. Passing
+        // `lits.as_ptr()` directly would be UB when `lits.len() <
+        // 16` because the sub-slice's provenance ends at its own
+        // `len()` regardless of the backing buffer's extra capacity.
+        let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
+        unsafe {
+            buffer
+                .buffer_mut()
+                .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
+                .map_err(DecompressBlockError::ExecuteSequencesError)?;
+        }
+        buffer.advance_output_counter(seq.ll as usize + seq.ml as usize);
+        return Ok(());
+    }
+
+    // Fallback: the legacy push + repeat chain.
+    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
         .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;
@@ -519,11 +871,11 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
 /// `decode_sequences_without_rle` — separate copy because Rust does not
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
-fn decode_one_sequence_inline(
+fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     ll_dec: &mut FSEDecoder<'_>,
     ml_dec: &mut FSEDecoder<'_>,
     of_dec: &mut FSEDecoder<'_>,
-    br: &mut BitReaderReversed<'_>,
+    br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
     // `Entry`. LL / ML are populated by `enrich_with_packed_seq_meta`
@@ -565,9 +917,9 @@ fn decode_one_sequence_inline(
     }
 }
 
-fn decode_sequences_with_rle(
+fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
+    br: &mut BitReaderReversed<'_, K>,
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {

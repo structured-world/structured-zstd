@@ -33,7 +33,13 @@ pub(crate) fn execute_sequences_fields<B: super::buffer_backend::BufferBackend>(
         // SAFETY: literals_copy_counter <= high <= literals_buffer_len.
         let literals = unsafe { literals_buffer.get_unchecked(literals_copy_counter..high) };
         literals_copy_counter = high;
-        buffer.push(literals);
+        // `try_push` routes a fixed-capacity backend overshoot
+        // (UserSliceBackend) into a structured
+        // `ExecuteSequencesError::OutputBufferOverflow` instead of
+        // panicking via the per-call `assert!` inside
+        // `BufferBackend::extend`. Growable backends accept the write
+        // infallibly via the default trait impl.
+        buffer.try_push(literals)?;
 
         let actual_offset = do_offset_history(seq.of, seq.ll, offset_hist);
         if actual_offset == 0 {
@@ -45,7 +51,7 @@ pub(crate) fn execute_sequences_fields<B: super::buffer_backend::BufferBackend>(
     }
     if literals_copy_counter < literals_buffer_len {
         let rest_literals = &literals_buffer[literals_copy_counter..];
-        buffer.push(rest_literals);
+        buffer.try_push(rest_literals)?;
         seq_sum = seq_sum.wrapping_add(rest_literals.len() as u32);
     }
 
