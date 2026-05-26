@@ -153,11 +153,11 @@ stream.read_to_end(&mut sink).unwrap();
 ## Storage-format extensions
 
 Behind the `lsm` Cargo feature, `structured-zstd` exposes a typed
-`SkippableFrame` API (`zstd::skippable`) for storage-format authors who
-need to interleave application metadata with zstd data. The ecosystem
-registry of allocated skippable-frame magic variants and the
-allocation policy live in
-[docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
+`SkippableFrame` API (`structured_zstd::skippable`) for storage-format
+authors who need to interleave application metadata with zstd data.
+The ecosystem registry of allocated skippable-frame magic variants
+and the allocation policy live in
+[docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](https://github.com/structured-world/structured-zstd/blob/main/docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
 
 ## Project relationship
 
