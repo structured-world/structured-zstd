@@ -190,19 +190,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.slice.len();
-        let cap_required = lit_length
-            .checked_add(match_length)
-            .and_then(|total| self.tail.checked_add(total))
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        let cap_required = match cap_required {
-            Some(v) if v <= cap => v,
-            Some(v) => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: v - self.tail,
-                    capacity: cap,
-                });
-            }
+        // `requested` reports the LOGICAL write length
+        // (`lit_length + match_length`) to stay consistent with
+        // `BackendOverflow.requested` on the `try_*` paths. The
+        // capacity check itself uses `tail + total + overshoot`
+        // because the unconditional 16-byte `copy16` over-reaches
+        // `tail + total` by up to 15 bytes — but that overshoot is
+        // an artefact of the SIMD copy shape, NOT a value the
+        // caller can act on, so it doesn't belong in the diagnostic.
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
             None => {
                 return Err(ExecuteSequencesError::OutputBufferOverflow {
                     tail: self.tail,
@@ -211,8 +208,21 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 });
             }
         };
+        let cap_required = self
+            .tail
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        let cap_required = match cap_required {
+            Some(v) if v <= cap => v,
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        };
         let _ = cap_required;
-        let total = lit_length + match_length;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);

@@ -65,9 +65,9 @@ pub(crate) mod x86 {
 
     /// Donor's `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` for
     /// the `diff < WILDCOPY_VECLEN` (= < 16) arm: 8-byte unaligned
-    /// loop. Each iter reads `src + off + 8` which may be in the
-    /// just-written destination region — correct for RLE expansion
-    /// once the source/dest gap is ≥ 8.
+    /// loop. Each iter reads `src + off` (8 bytes) which may be in
+    /// the just-written destination region — correct for RLE
+    /// expansion once the source/dest gap is ≥ 8.
     #[inline(always)]
     pub(crate) unsafe fn wildcopy_overlap_8byte_stride(
         dst: *mut u8,
