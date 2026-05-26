@@ -389,10 +389,23 @@ impl FSETable {
         // overshoot `decode.len()` on the unchecked `read_entry`
         // hot path. Surface as a typed error so the caller can
         // distinguish a malformed input from an internal failure.
+        // Strict probability validation: RFC 8478 §4.1.1 admits only
+        // {-1, 0, positive} as probability values. The wire-format
+        // parser never emits anything else, but `build_from_probabilities`
+        // is a public entry point reachable from fuzz harnesses and
+        // external users — rejecting `p < -1` here keeps the API
+        // contract tight (clamping silently to 0 would let `[-2, ...]`
+        // satisfy a sum check whose remaining terms happen to add up
+        // to `table_size`, producing a quietly malformed table).
+        for &p in probs {
+            if p < -1 {
+                return Err(FSETableError::InvalidProbability { value: p });
+            }
+        }
         let table_size = 1u32 << acc_log;
         let probability_sum: u32 = probs
             .iter()
-            .map(|&p| if p == -1 { 1 } else { p.max(0) as u32 })
+            .map(|&p| if p == -1 { 1 } else { p as u32 })
             .sum();
         if probability_sum != table_size {
             return Err(FSETableError::ProbabilityCounterMismatch {
