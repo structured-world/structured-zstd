@@ -1252,7 +1252,7 @@ fn maybe_update_fse_tables(
             // Default LL distribution → cached table memcpy.
             #[cfg(feature = "std")]
             {
-                scratch.literal_lengths.clone_from(predefined_ll_table());
+                scratch.literal_lengths.reinit_from(predefined_ll_table());
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1301,7 +1301,7 @@ fn maybe_update_fse_tables(
             #[cfg(feature = "std")]
             {
                 let (cached, long_share) = predefined_of_table();
-                scratch.offsets.clone_from(cached);
+                scratch.offsets.reinit_from(cached);
                 scratch.offsets_long_share = long_share;
             }
             #[cfg(not(feature = "std"))]
@@ -1347,7 +1347,7 @@ fn maybe_update_fse_tables(
             // Default ML distribution → cached table memcpy.
             #[cfg(feature = "std")]
             {
-                scratch.match_lengths.clone_from(predefined_ml_table());
+                scratch.match_lengths.reinit_from(predefined_ml_table());
             }
             #[cfg(not(feature = "std"))]
             {

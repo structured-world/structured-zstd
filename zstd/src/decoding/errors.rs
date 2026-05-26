@@ -1122,7 +1122,7 @@ pub enum FSETableError {
     },
     GetBitsError(GetBitsError),
     ProbabilityCounterMismatch {
-        got: u32,
+        got: u64,
         expected_sum: u32,
         symbol_probabilities: Vec<i32>,
     },

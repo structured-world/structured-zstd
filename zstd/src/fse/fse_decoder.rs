@@ -389,25 +389,37 @@ impl FSETable {
         // overshoot `decode.len()` on the unchecked `read_entry`
         // hot path. Surface as a typed error so the caller can
         // distinguish a malformed input from an internal failure.
-        // Strict probability validation: RFC 8478 §4.1.1 admits only
-        // {-1, 0, positive} as probability values. The wire-format
-        // parser never emits anything else, but `build_from_probabilities`
-        // is a public entry point reachable from fuzz harnesses and
-        // external users — rejecting `p < -1` here keeps the API
-        // contract tight (clamping silently to 0 would let `[-2, ...]`
-        // satisfy a sum check whose remaining terms happen to add up
-        // to `table_size`, producing a quietly malformed table).
+        // Strict probability range validation: RFC 8478 §4.1.1 admits
+        // only `{-1, 0, 1..=table_size}` as probability values. The
+        // wire-format parser never emits anything else, but
+        // `build_from_probabilities` is a public entry point reachable
+        // from fuzz harnesses and external users — leaving the gate
+        // open invites two attack shapes:
+        //
+        //   1. Silent malformed table: clamping `p < -1` to 0 (the
+        //      previous `p.max(0)`) lets `[-2, ...]` satisfy a sum
+        //      check whose remaining terms happen to add up to
+        //      `table_size`, producing a quietly broken table.
+        //   2. DoS via probability-sum overflow: `[i32::MAX, i32::MAX,
+        //      0x42] as u32` wraps to `0x40 = 64 = 1 << 6`, satisfies
+        //      the sum check, then `build_decoding_table` runs
+        //      `for _ in 0..prob` against `prob = i32::MAX`, looping
+        //      2^31-1 times per such symbol (worst case: spread-array
+        //      out-of-bounds panic, best case: minutes of CPU).
+        //
+        // Reject any `p > table_size` upfront and compute the sum in
+        // `u64` so wrap is impossible.
+        let table_size = 1u32 << acc_log;
         for &p in probs {
-            if p < -1 {
+            if p < -1 || p > table_size as i32 {
                 return Err(FSETableError::InvalidProbability { value: p });
             }
         }
-        let table_size = 1u32 << acc_log;
-        let probability_sum: u32 = probs
+        let probability_sum: u64 = probs
             .iter()
-            .map(|&p| if p == -1 { 1 } else { p as u32 })
+            .map(|&p| if p == -1 { 1u64 } else { p as u64 })
             .sum();
-        if probability_sum != table_size {
+        if probability_sum != u64::from(table_size) {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_sum,
                 expected_sum: table_size,
@@ -597,7 +609,7 @@ impl FSETable {
 
         if probability_counter != probability_sum {
             return Err(FSETableError::ProbabilityCounterMismatch {
-                got: probability_counter,
+                got: u64::from(probability_counter),
                 expected_sum: probability_sum,
                 symbol_probabilities: self.symbol_probabilities.clone(),
             });
