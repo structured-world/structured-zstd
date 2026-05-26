@@ -345,19 +345,20 @@ fn decode_and_execute_sequences_impl<
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
-    // `offset_hist` mutation on the in-band success path:
-    //   * Pipelined branch (long pipeline): real `offset_hist` is NOT
-    //     touched per-sequence — repcodes are resolved against the
-    //     local `shadow_hist`, and the resolved offset is stored in
-    //     the ring alongside the decoded sequence. After successful
-    //     drain we copy `shadow_hist` back into `*offset_hist` once.
-    //   * Non-pipelined branch (short-block fallback): real
-    //     `offset_hist` IS mutated inline via `do_offset_history` in
-    //     `execute_one_sequence`.
-    //   * Rollback path (post-loop bitstream check fails): restore
-    //     `*offset_hist = saved_offset_hist`. Cheap no-op on the
-    //     pipelined branch (real hist was never touched mid-loop),
-    //     correct rewind on the non-pipelined branch.
+    // `offset_hist` mutation on the in-band success path: both
+    // pipelined and short-block fallback resolve repcodes against a
+    // local `shadow_hist` and commit `*offset_hist = shadow_hist`
+    // ONLY after the last sequence executes successfully. Mid-loop
+    // mutation of the real `offset_hist` would leak partial state on
+    // an `Err` from `execute_one_sequence*` (literal bounds check,
+    // inline-exec offset gate), and the `?`-shaped early returns in
+    // the fallback path bypass the post-loop rollback below — the
+    // shadow + commit-on-success shape mirrors the pipelined branch
+    // exactly so an `Err` ANYWHERE in the loop leaves the caller's
+    // offset_hist untouched. The post-loop `*offset_hist =
+    // saved_offset_hist` rollback handler still fires if the
+    // bitstream-tail validation fails, covering the edge case where
+    // every sequence succeeds but the bitstream has leftover bits.
 
     let num_sequences = section.num_sequences as usize;
 
@@ -460,16 +461,45 @@ fn decode_and_execute_sequences_impl<
         // simpler shape wins. Inlined here (rather than a separate
         // function) so the cold tail-call cost of swapping decoders
         // mid-block stays at zero.
+        //
+        // Routes through `execute_one_sequence_pipelined` (resolving
+        // the actual offset against a `shadow_hist` upfront) so the
+        // inline donor-shape writer fires on backends that opt in
+        // (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true`).
+        // The legacy `execute_one_sequence` path went through
+        // `DecodeBuffer::repeat_inner` which incremented
+        // `total_output_counter += match_length` on every sequence —
+        // perf annotate on z000033 L-3 fast attributed ~6% of decode
+        // time to that RMW at offset `0x40(r8)` of the wrapper
+        // struct. The inline
+        // executor advances `tail` directly inside the backend, so
+        // the wrapper-level counter is bypassed entirely on this
+        // path; the post-block FCS check in `run_direct_decode`
+        // reads `tail()` instead.
+        //
+        // `shadow_hist` mirrors the pipelined-branch pattern: the
+        // real `offset_hist` is NOT mutated mid-loop, so an early
+        // `Err` from `execute_one_sequence_pipelined` (literal bounds
+        // check, inline-exec offset gate, etc.) propagating through
+        // the explicit Err arm below leaves the caller's offset_hist
+        // untouched. On the success path we commit `shadow_hist`
+        // back to `*offset_hist` once, after the loop.
+        let mut shadow_hist = *offset_hist;
+        let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
             let seq = decode_one_sequence_inline(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            execute_one_sequence(
+            let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+            if let Err(e) = execute_one_sequence_pipelined(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                offset_hist,
                 seq,
-            )?;
+                resolved_offset,
+            ) {
+                fallback_err = Some(e);
+                break;
+            }
             seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
 
             if i + 1 < num_sequences {
@@ -479,6 +509,29 @@ fn decode_and_execute_sequences_impl<
                 of_dec.update_state_fast(&mut br);
             }
         }
+        if let Some(e) = fallback_err {
+            // Mirrors the pipelined branch's Err handler: roll the
+            // buffer back to the pre-loop checkpoint; offset_hist
+            // was never mutated mid-loop (shadow only), so no
+            // restore needed there. Buffer might have absorbed
+            // literal pushes / partial inline writes from the
+            // failing sequence — try_restore_checkpoint handles
+            // both cases via the captured tail snapshot.
+            //
+            // offset_hist intentionally NOT touched here regardless
+            // of the rollback outcome: it still holds the pre-loop
+            // value because shadow_hist absorbed all the in-band
+            // mutations. The bool return from `try_restore_checkpoint`
+            // is therefore irrelevant on this path — `false` means
+            // an intervening reallocation invalidated the captured
+            // tail, in which case the frame is already corrupted and
+            // the caller surfaces the original `Err` below. We drop
+            // the return value via `let _` to make the
+            // intentional-discard explicit.
+            let _ = buffer.try_restore_checkpoint(buffer_checkpoint);
+            return Err(e);
+        }
+        *offset_hist = shadow_hist;
     }
 
     // Post-loop bitstream validation. On failure roll back the buffer
@@ -666,47 +719,6 @@ fn run_pipelined_sequence_loop<
     Ok(())
 }
 
-/// Per-sequence executor for the non-pipelined (short-block) fallback
-/// path. Mutates the real `offset_hist` in lockstep with the sequence
-/// being executed — preserving the legacy "Err leaves partial output +
-/// pre-mutation hist" rollback contract.
-#[inline(always)]
-fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    literals: &[u8],
-    lit_cur: &mut usize,
-    lit_len: usize,
-    offset_hist: &mut [u32; 3],
-    seq: Sequence,
-) -> Result<(), DecompressBlockError> {
-    // `checked_add` on the literal cursor + sequence ll. On 32-bit
-    // targets a malformed stream can push `*lit_cur + seq.ll as usize`
-    // past `usize::MAX`; without the checked path the wrap would
-    // produce `high < *lit_cur` and the subsequent `get_unchecked`
-    // would slice into arbitrary memory (UB).
-    let high = (*lit_cur)
-        .checked_add(seq.ll as usize)
-        .filter(|&h| h <= lit_len)
-        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: (*lit_cur).saturating_add(seq.ll as usize),
-            have: lit_len,
-        })?;
-    // SAFETY: high <= lit_len (verified by the `filter` above) and
-    // *lit_cur <= high (the `checked_add` succeeded, so no wrap).
-    let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
-    *lit_cur = high;
-    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
-
-    let actual = do_offset_history(seq.of, seq.ll, offset_hist);
-    if actual == 0 {
-        return Err(ExecuteSequencesError::ZeroOffset.into());
-    }
-    buffer
-        .repeat(actual as usize, seq.ml as usize)
-        .map_err(ExecuteSequencesError::from)?;
-    Ok(())
-}
-
 /// Pipelined-path executor variant: takes the offset already resolved
 /// by the decode-ahead `shadow_hist` walk, so `do_offset_history` is
 /// NOT called here (caller mutated only the shadow). Routes the match
@@ -860,14 +872,20 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
         // `run_direct_decode` now reads `tail` (via
         // `buffer_ref().tail() as u64`) instead of the separately
         // maintained `DecodeBuffer::total_output_counter`. Skipping
-        // the per-sequence RMW drops the ~9% of decode time
-        // measured at `addq <ll+ml>, 0x40(%r9)` on z000033
-        // (perf annotate on
-        // `decode_and_execute_sequences_avx2`). The legacy
-        // push+repeat fallback below still goes through
-        // `DecodeBuffer::try_push` / `repeat_lookahead_prefetched`,
-        // which keep `total_output_counter` in sync for backends
-        // that need it.
+        // the per-sequence RMW drops the ~9% of decode time measured
+        // at `addq <ll+ml>, 0x40(%r9)` on z000033 (perf annotate on
+        // `decode_and_execute_sequences_avx2`).
+        //
+        // `total_output_counter` is intentionally NOT maintained on
+        // the inline-exec path. Once any sequence in a block takes
+        // this path, the wrapper-level counter is stale for the
+        // remainder of the block — the legacy
+        // `try_push`/`repeat_lookahead_prefetched` arm below only
+        // accounts for its own bytes, NOT a running total. The
+        // authoritative byte count for the inline-eligible path is
+        // `UserSliceBackend::tail()`; any caller that previously
+        // read `total_output_counter` on this path is migrated to
+        // `buffer_ref().tail()` (see `run_direct_decode`).
         return Ok(());
     }
 

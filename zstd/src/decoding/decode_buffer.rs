@@ -637,7 +637,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // every would-be dict-source match and returns
         // `NotEnoughBytesInDictionary`. The
         // `RingBuffer` / `FlatBuf` paths still maintain the counter
-        // via `push` / `repeat_match` and rely on it correctly.
+        // via `push` / `repeat_inner` and rely on it correctly.
         if self.total_output_counter <= self.window_size as u64 {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
