@@ -1242,7 +1242,7 @@ fn maybe_update_fse_tables(
             {
                 scratch.literal_lengths.clone_from(predefined_ll_table()?);
             }
-            #[cfg(not(target_has_atomic = "ptr"))]
+            #[cfg(not(feature = "std"))]
             {
                 scratch.literal_lengths.build_from_probabilities(
                     LL_DEFAULT_ACC_LOG,
@@ -1292,7 +1292,7 @@ fn maybe_update_fse_tables(
                 scratch.offsets.clone_from(cached);
                 scratch.offsets_long_share = long_share;
             }
-            #[cfg(not(target_has_atomic = "ptr"))]
+            #[cfg(not(feature = "std"))]
             {
                 scratch.offsets.build_from_probabilities(
                     OF_DEFAULT_ACC_LOG,
@@ -1338,7 +1338,7 @@ fn maybe_update_fse_tables(
             {
                 scratch.match_lengths.clone_from(predefined_ml_table()?);
             }
-            #[cfg(not(target_has_atomic = "ptr"))]
+            #[cfg(not(feature = "std"))]
             {
                 scratch.match_lengths.build_from_probabilities(
                     ML_DEFAULT_ACC_LOG,

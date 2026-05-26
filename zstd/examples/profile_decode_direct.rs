@@ -26,7 +26,11 @@ fn main() {
         .expect("expected_size required")
         .parse()
         .expect("expected_size parse");
-    let iters: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(50_000);
+    let iters: usize = args
+        .get(3)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(50_000)
+        .max(1);
 
     let compressed = fs::read(path).expect("read");
     let mut target = vec![0u8; expected + WILDCOPY_OVERLENGTH];
