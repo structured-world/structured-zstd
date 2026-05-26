@@ -224,6 +224,14 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // (or vice versa: skip the pipeline when the new frame
         // actually has long offsets).
         self.fse.offsets_long_share = 0;
+        // Pair the one-shot cold-dict flag with `reset`: a scratch
+        // reused from a dictionary-attached frame whose blocks never
+        // entered sequence decoding (raw-/RLE-only blocks, zero-seq
+        // compressed blocks) would otherwise carry the flag into the
+        // next frame and mis-apply the cold-dict gate there. Cleared
+        // alongside `offsets_long_share` so the no-dict path keeps
+        // the documented "no behaviour change" property.
+        self.fse.ddict_is_cold = false;
 
         self.huf.table.reset();
     }

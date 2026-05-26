@@ -269,6 +269,18 @@ fn decode_and_execute_sequences_impl<
     // any external caller that inspects scratch.sequences after decode.
     rle_fallback_sequences.clear();
 
+    // Consume the one-shot `ddict_is_cold` flag at function entry,
+    // BEFORE any early returns (RLE-mode fallback below, padding-bit
+    // validation). Donor `ZSTD_decompressBlock_internal` clears
+    // `dctx->ddictIsCold = 0` unconditionally after the
+    // sequence-section dispatch decision; if the early-return paths
+    // left the flag set, a later block's gate would mis-apply the
+    // cold-dict signal that no longer holds (FSE/HUF tables are now
+    // warm regardless of whether the previous block decoded
+    // sequences or fell back to RLE).
+    let ddict_is_cold = fse.ddict_is_cold;
+    fse.ddict_is_cold = false;
+
     let bytes_read = maybe_update_fse_tables(section, source, fse)?;
     vprintln!("Updating tables used {} bytes", bytes_read);
 
@@ -406,9 +418,8 @@ fn decode_and_execute_sequences_impl<
     // freshly-attached-dict frame engages the prefetch decoder
     // unconditionally, then `ddictIsCold = 0` after the dispatch so
     // subsequent blocks fall back to the `longOffsetShare` heuristic.
-    // We mirror the consume-once semantics here.
-    let ddict_is_cold = fse.ddict_is_cold;
-    fse.ddict_is_cold = false;
+    // The consume-once read/clear happens at function entry above so
+    // RLE-mode early returns don't leak the flag to a later block.
     let use_long_pipeline = num_sequences >= ADVANCE * 2
         && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
     // The format-level `isLongOffset` shortcut from donor is
