@@ -1258,7 +1258,7 @@ fn maybe_update_fse_tables(
             {
                 scratch.literal_lengths.build_from_probabilities(
                     LL_DEFAULT_ACC_LOG,
-                    &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+                    &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch
                     .literal_lengths
@@ -1306,10 +1306,9 @@ fn maybe_update_fse_tables(
             }
             #[cfg(not(feature = "std"))]
             {
-                scratch.offsets.build_from_probabilities(
-                    OF_DEFAULT_ACC_LOG,
-                    &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-                )?;
+                scratch
+                    .offsets
+                    .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
                 scratch.offsets.enrich_for_offsets();
                 scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
             }
@@ -1354,7 +1353,7 @@ fn maybe_update_fse_tables(
             {
                 scratch.match_lengths.build_from_probabilities(
                     ML_DEFAULT_ACC_LOG,
-                    &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
+                    &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
             }
@@ -1430,10 +1429,7 @@ fn predefined_ll_table()
         return Ok(t);
     }
     let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
-    t.build_from_probabilities(
-        LL_DEFAULT_ACC_LOG,
-        &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-    )?;
+    t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)?;
     t.enrich_with_packed_seq_meta(&LL_META);
     let _ = CACHED.set(t);
     Ok(CACHED.get().expect("just set"))
@@ -1448,10 +1444,7 @@ fn predefined_ml_table()
         return Ok(t);
     }
     let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
-    t.build_from_probabilities(
-        ML_DEFAULT_ACC_LOG,
-        &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-    )?;
+    t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)?;
     t.enrich_with_packed_seq_meta(&ML_META);
     let _ = CACHED.set(t);
     Ok(CACHED.get().expect("just set"))
@@ -1466,10 +1459,7 @@ fn predefined_of_table()
         return Ok((&cache.0, cache.1));
     }
     let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
-    t.build_from_probabilities(
-        OF_DEFAULT_ACC_LOG,
-        &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-    )?;
+    t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
     t.enrich_for_offsets();
     let share = compute_offsets_long_share(&t);
     let _ = CACHED.set((t, share));
