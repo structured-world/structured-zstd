@@ -386,22 +386,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // builds and turn the unchecked copy into UB. Cost: one
         // compare on the literal-push path — same magnitude as
         // the surrounding bounds-already-baked-in writes.
-        // The `assert!` below panics on adversarial / malformed input
-        // (a Compressed block whose payload expands past declared FCS).
-        // This is the deliberate trade-off for the trusted-input
-        // direct-decode path: switching the write surface to fallible
-        // `Result` writes — so the panic becomes a structured
-        // `FrameContentSizeMismatch` — requires extending the
-        // `BufferBackend` trait surface, touching every backend
-        // implementation, and threading `Result<_, _>` through the
-        // sequence executor. That refactor lives in a dedicated
-        // follow-up (the docstring on `decode_all` names it as
-        // a hard prerequisite before this entry point becomes safe
-        // on untrusted streams). Until then the contract is
-        // documented at the safe-API surface and enforced by
-        // `#[must_use]` + `#[doc(alias = "decode_all_trusted")]`.
-        // Re-flagging without addressing the trade-off documented at
-        // the call site does not move the work forward.
+        //
+        // This is the INFALLIBLE entry point. The safe public APIs
+        // (`decode_all`, `decode_all_to_vec`) never reach it on
+        // malformed input: their dispatch routes through
+        // [`Self::try_extend`] (and via `DecodeBuffer::try_push` /
+        // `try_reserve` for the match-repeat path), which return
+        // `BackendOverflow` and convert into
+        // `FrameDecoderError::ExecuteSequencesError` /
+        // `FrameContentSizeMismatch`. The `assert!` here covers
+        // the case where a future caller wires the infallible
+        // entry point into a hot path that doesn't go through the
+        // dispatch — the panic message points at the corrupt-frame
+        // root cause rather than letting the subsequent unsafe
+        // pointer math go OOB.
         assert!(
             new_tail <= self.slice.len(),
             "UserSliceBackend::extend overflows slice (tail+={}, cap={}) — corrupt frame",

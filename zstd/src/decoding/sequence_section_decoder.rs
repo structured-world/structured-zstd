@@ -507,10 +507,15 @@ fn decode_and_execute_sequences_impl<
     }
 
     // Tail literals: any bytes in the literals_buffer that no sequence
-    // claimed get pushed after the last sequence.
+    // claimed get pushed after the last sequence. Routed through
+    // `try_push` so a malformed block whose tail-literal length
+    // overshoots the fixed-capacity backend (UserSliceBackend) surfaces
+    // as `OutputBufferOverflow` instead of panicking via the per-call
+    // `assert!` inside `BufferBackend::extend`. Growable backends
+    // (FlatBuf, RingBuffer) accept the write infallibly.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..];
-        buffer.push(rest);
+        buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }
 
@@ -666,16 +671,20 @@ fn execute_one_sequence<B: super::buffer_backend::BufferBackend>(
     offset_hist: &mut [u32; 3],
     seq: Sequence,
 ) -> Result<(), DecompressBlockError> {
-    let high = *lit_cur + seq.ll as usize;
-    if high > lit_len {
-        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: high,
+    // `checked_add` on the literal cursor + sequence ll. On 32-bit
+    // targets a malformed stream can push `*lit_cur + seq.ll as usize`
+    // past `usize::MAX`; without the checked path the wrap would
+    // produce `high < *lit_cur` and the subsequent `get_unchecked`
+    // would slice into arbitrary memory (UB).
+    let high = (*lit_cur)
+        .checked_add(seq.ll as usize)
+        .filter(|&h| h <= lit_len)
+        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: (*lit_cur).saturating_add(seq.ll as usize),
             have: lit_len,
-        }
-        .into());
-    }
-    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high
-    // (high = lit_cur + seq.ll, seq.ll >= 0).
+        })?;
+    // SAFETY: high <= lit_len (verified by the `filter` above) and
+    // *lit_cur <= high (the `checked_add` succeeded, so no wrap).
     let lits = unsafe { literals.get_unchecked(*lit_cur..high) };
     *lit_cur = high;
     buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
@@ -710,15 +719,19 @@ fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
     let lit_cur_before = *lit_cur;
-    let high = lit_cur_before + seq.ll as usize;
-    if high > lit_len {
-        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: high,
+    // `checked_add` guards against `usize` wrap on 32-bit targets
+    // when a malformed stream pushes `lit_cur_before + seq.ll` past
+    // `usize::MAX`; without it the wrap produces `high < lit_cur_before`
+    // and the subsequent `get_unchecked` would slice OOB (UB).
+    let high = lit_cur_before
+        .checked_add(seq.ll as usize)
+        .filter(|&h| h <= lit_len)
+        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: lit_cur_before.saturating_add(seq.ll as usize),
             have: lit_len,
-        }
-        .into());
-    }
-    // SAFETY: high <= lit_len (just verified) and *lit_cur <= high.
+        })?;
+    // SAFETY: high <= lit_len (verified above) and lit_cur_before <= high
+    // (the `checked_add` succeeded, so no wrap).
     let lits = unsafe { literals.get_unchecked(lit_cur_before..high) };
     *lit_cur = high;
 

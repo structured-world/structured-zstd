@@ -1447,12 +1447,17 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
-    fn decode_all_matches_decode_all_on_single_segment_frame() {
+    fn decode_all_legacy_drain_matches_direct_path_on_single_segment_frame() {
         // Roundtrip a small payload through the encoder, then decode
-        // it via both `decode_all` and `decode_all`. Both paths
-        // must produce identical output bytes — the only difference
-        // is the internal buffer/drain shape, not the decoded
-        // semantics. This is the regression gate for the
+        // it via `decode_all` on two output shapes that select
+        // different internal paths:
+        //   1. Tight output (no WILDCOPY_OVERLENGTH slack) → legacy
+        //      `decode_blocks` + `read()` drain path.
+        //   2. Output with WILDCOPY slack → direct
+        //      `run_direct_decode` + `UserSliceBackend` path.
+        // Both paths must produce identical output bytes — the only
+        // difference is the internal buffer/drain shape, not the
+        // decoded semantics. This is the regression gate for the
         // direct-decode wiring.
         let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
@@ -1461,22 +1466,22 @@ mod tests {
         compressor.set_drain(&mut compressed);
         compressor.compress();
 
-        // Baseline: decode_all.
+        // Baseline: tight output → legacy drain path.
         let mut dec_a = FrameDecoder::new();
         let mut out_a = alloc::vec![0u8; payload.len()];
         let n_a = dec_a
             .decode_all(compressed.as_slice(), &mut out_a)
-            .expect("decode_all should succeed");
+            .expect("decode_all (legacy drain) should succeed");
         assert_eq!(n_a, payload.len());
         assert_eq!(&out_a[..n_a], payload.as_slice());
 
-        // Direct: decode_all with WILDCOPY slack.
+        // Direct: output with WILDCOPY slack → direct path.
         let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut dec_b = FrameDecoder::new();
         let mut out_b = alloc::vec![0u8; payload.len() + slack];
         let n_b = dec_b
             .decode_all(compressed.as_slice(), &mut out_b)
-            .expect("decode_all should succeed");
+            .expect("decode_all (direct path) should succeed");
         assert_eq!(
             n_b,
             payload.len(),

@@ -423,24 +423,17 @@ pub enum DecodeBufferError {
         buf_len: usize,
     },
     ZeroOffset,
-    /// Match repeat would overflow a fixed-capacity backend
-    /// (`UserSliceBackend`). Growable backends (FlatBuf/RingBuffer)
-    /// grow on demand and never produce this.
-    ///
-    /// Reserved for the Compressed-block sequence-executor hardening
-    /// follow-up. Currently NOT surfaced from any production path —
-    /// `extend_from_within_unchecked` on `UserSliceBackend` still
-    /// panics on overshoot via its release-mode `assert!`. The
-    /// `_trusted` suffix on `decode_all` is the
-    /// shipping contract until that follow-up wires
-    /// `BufferBackend::try_extend_from_within` through
-    /// `DecodeBuffer::repeat*` and maps `BackendOverflow` into
-    /// `FrameDecoderError::FrameContentSizeMismatch`.
-    ///
-    /// The variant lives now (vs landing later with the
-    /// follow-up) so the typed conversion at the `decode_all`
-    /// boundary is in place; only the constructor on the burst path
-    /// is missing.
+    /// Legacy unit variant kept for binary compatibility with earlier
+    /// snapshots of this enum. Not surfaced from any current
+    /// production path — `BufferBackend::try_extend` /
+    /// `try_extend_from_within` and the new `try_reserve` (used by
+    /// `DecodeBuffer::repeat`) carry their failures through the
+    /// richer [`Self::OutputBufferOverflow`] variant below, which
+    /// reports the offending `tail` / `requested` / `capacity`
+    /// triple. New code should pattern-match on
+    /// `OutputBufferOverflow`; this unit variant is retained to keep
+    /// the `#[non_exhaustive]` enum's existing discriminant set
+    /// stable.
     BackendOverflow,
     /// Repeat-side match copy would write past the writable tail of
     /// a fixed-capacity backend (`UserSliceBackend`). Surfaced by
