@@ -373,13 +373,6 @@ fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
     }
 }
 
-/// Bench-only entry point for the donor-parity comparator test in
-/// `tests/block_splitter_donor_parity.rs`. Dispatches to the same
-/// `_from_borders` (split_level == 0) / `_by_chunks` (split_level ∈
-/// 1..=4) ports that `donor_optimal_block_size` itself routes
-/// through. Caller is responsible for passing exactly
-/// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
-/// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
 /// XXH64 (low 32 bits, seed 0) over `data`. Shared helper for the
 /// per-physical-block checksum sidecar so encoder and decoder hash
 /// the exact same byte ranges with the exact same parameters.
@@ -391,6 +384,13 @@ pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
     h.finish() as u32
 }
 
+/// Bench-only entry point for the donor-parity comparator test in
+/// `tests/block_splitter_donor_parity.rs`. Dispatches to the same
+/// `_from_borders` (split_level == 0) / `_by_chunks` (split_level ∈
+/// 1..=4) ports that `donor_optimal_block_size` itself routes
+/// through. Caller is responsible for passing exactly
+/// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
+/// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
 #[cfg(feature = "bench_internals")]
 pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
     assert_eq!(
@@ -1025,13 +1025,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// disabled. The captured digests are accessible via
     /// [`last_frame_block_checksums`](Self::last_frame_block_checksums).
     ///
-    /// One checksum is emitted per input chunk passed to the block
-    /// emitter; on the post-split optimization path (Level 16-22 with
-    /// large window) a single input chunk can produce multiple
-    /// physical FrameBlocks and the checksums vector will have fewer
-    /// entries than `FrameEmitInfo.blocks`. The chunk-level
-    /// granularity matches the forensic-ECC use case (hash the
-    /// recovered plaintext chunk, compare to the stored digest).
+    /// One checksum is emitted per physical FrameBlock written to
+    /// the drain: 1:1 cardinality with
+    /// [`last_frame_emit_info`](Self::last_frame_emit_info)'s
+    /// `blocks` vector. On the post-split optimization path
+    /// (Level 16-22 with large window) the per-partition decompressed
+    /// range is hashed inside the partition loop so the digest count
+    /// still matches the emitted block count. The decoder collects
+    /// per-physical-block digests on the same granularity, so
+    /// element-wise equality holds round-trip.
     ///
     /// Behind `all(feature = "lsm", feature = "hash")` — the XXH64
     /// primitive lives behind the `hash` feature, so this method only
