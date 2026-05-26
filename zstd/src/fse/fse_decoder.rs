@@ -233,9 +233,6 @@ pub struct FSETable {
     /// If a symbol probability is set to `-1`, it means that the probability of a symbol
     /// occurring in the data is less than one.
     pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
-    /// The number of times each symbol occurs (The first entry being 0x0, the second being 0x1) and so on
-    /// up until the highest possible symbol (255).
-    symbol_counter: Vec<u32>,
 }
 
 impl FSETable {
@@ -244,7 +241,6 @@ impl FSETable {
         FSETable {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
-            symbol_counter: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             symbol_spread_buffer: Vec::new(),
             decode: Vec::new(), //depending on acc_log.
             accuracy_log: 0,
@@ -254,7 +250,6 @@ impl FSETable {
     /// Reset `self` and update `self`'s state to mirror the provided table.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        self.symbol_counter.extend_from_slice(&other.symbol_counter);
         self.symbol_probabilities
             .extend_from_slice(&other.symbol_probabilities);
         self.symbol_spread_buffer
@@ -265,7 +260,6 @@ impl FSETable {
 
     /// Empty the table and clear all internal state.
     pub fn reset(&mut self) {
-        self.symbol_counter.clear();
         self.symbol_probabilities.clear();
         self.symbol_spread_buffer.clear();
         self.decode.clear();
@@ -386,133 +380,109 @@ impl FSETable {
         self.build_decoding_table()
     }
 
-    /// Build the actual decoding table after probabilities have been read into the table.
-    /// After this function is called, the decoding process can begin.
+    /// Build the actual decoding table after probabilities have been
+    /// read. Donor-shape single-pass build: spread symbols into the
+    /// scratch buffer, then write `decode` entries in one linear pass
+    /// — no intermediate zero-init Vec::resize, no per-call heap
+    /// allocation for the symbol counter (stack-allocated since the
+    /// max symbol count is bounded by `u8::MAX + 1 = 256`).
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
-            return Err(FSETableError::TooManySymbols {
-                got: self.symbol_probabilities.len(),
-            });
+        let nb_symbols = self.symbol_probabilities.len();
+        if nb_symbols > self.max_symbol as usize + 1 {
+            return Err(FSETableError::TooManySymbols { got: nb_symbols });
         }
-
-        self.decode.clear();
 
         let table_size = 1 << self.accuracy_log;
-        // After clear(), len == 0, so reserve(table_size) guarantees capacity
-        // ≥ table_size. The matching `set_len` runs later, right before
-        // `copy_symbols_into_decode`, so that any panic in the intervening
-        // table_symbols / symbol_spread_buffer allocations unwinds with
-        // `self.decode.len() == 0` instead of leaving uninitialized Entry
-        // slots reachable through `&mut self.decode[..]` on the next call.
-        self.decode.reserve(table_size);
 
-        let mut table_symbols = core::mem::take(&mut self.symbol_spread_buffer);
-        table_symbols.clear();
-        table_symbols.resize(table_size, 0);
-        let negative_idx = {
-            let table_symbols = &mut table_symbols;
-            let mut negative_idx = table_size; //will point to the highest index with is already occupied by a negative-probability-symbol
+        // === Spread step ===
+        // Reuse the persistent scratch buffer; clear then resize to
+        // table_size. The resize is the ONLY zero-init in the entire
+        // build path now (previous impl also zero-init'd `decode`
+        // through `Vec::resize` with a default `Entry`, doubling the
+        // write traffic on the build path).
+        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
+        spread.clear();
+        spread.resize(table_size, 0);
 
-            //first scan for all -1 probabilities and place them at the top of the table
-            for symbol in 0..self.symbol_probabilities.len() {
-                if self.symbol_probabilities[symbol] == -1 {
-                    negative_idx -= 1;
-                    table_symbols[negative_idx] = symbol as u8;
-                }
+        // Pass 1: place -1 probability symbols at the top of the table.
+        let mut negative_idx = table_size;
+        for symbol in 0..nb_symbols {
+            if self.symbol_probabilities[symbol] == -1 {
+                negative_idx -= 1;
+                spread[negative_idx] = symbol as u8;
             }
+        }
 
-            //then place in a semi-random order all of the other symbols
-            let mut position = 0;
-            for idx in 0..self.symbol_probabilities.len() {
-                let symbol = idx as u8;
-                if self.symbol_probabilities[idx] <= 0 {
-                    continue;
-                }
-
-                //for each probability point the symbol gets on slot
-                let prob = self.symbol_probabilities[idx];
-                for _ in 0..prob {
-                    table_symbols[position] = symbol;
-
+        // Pass 2: distribute positive-probability symbols across the
+        // [0, negative_idx) range using the donor's `next_position`
+        // walker.
+        let mut position = 0usize;
+        for symbol in 0..nb_symbols {
+            let prob = self.symbol_probabilities[symbol];
+            if prob <= 0 {
+                continue;
+            }
+            let symbol_u8 = symbol as u8;
+            for _ in 0..prob {
+                spread[position] = symbol_u8;
+                position = next_position(position, table_size);
+                while position >= negative_idx {
                     position = next_position(position, table_size);
-                    while position >= negative_idx {
-                        position = next_position(position, table_size);
-                        //everything above negative_idx is already taken
-                    }
                 }
             }
-            negative_idx
-        };
-
-        // `copy_symbols_into_decode` is responsible for sizing
-        // `self.decode` AND writing every slot in 0..table_size before
-        // it returns. Keeping the set_len call adjacent to the init
-        // loop (rather than pre-extending here) is what guarantees no
-        // panic-able code can run between "tell Vec the length is
-        // table_size" and "every slot has a fully-initialized Entry".
-        // capacity is reserved earlier in this function.
-        self.copy_symbols_into_decode(&table_symbols, table_size);
-        self.symbol_spread_buffer = table_symbols;
-        for idx in negative_idx..table_size {
-            self.decode[idx].num_bits = self.accuracy_log;
         }
 
-        // baselines and num_bits can only be calculated when all symbols have been spread
-        self.symbol_counter.clear();
-        self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
-        for idx in 0..negative_idx {
-            let entry = &mut self.decode[idx];
-            let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
+        // === Build step ===
+        // Stack-allocated counter (max 256 symbols since the symbol
+        // alphabet is bounded by `u8`). Replaces the previous
+        // `Vec<u32>` field that was cleared + resized per call —
+        // about 200 bytes of heap-alloc churn dropped from the hot
+        // build path. Zero-init at declaration covers every slot.
+        let mut counter = [0u32; 256];
+        let accuracy_log = self.accuracy_log;
 
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
-
-            entry.new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
-                got: self.accuracy_log,
-                max: ENTRY_MAX_ACCURACY_LOG,
-            })?;
-            entry.num_bits = nb;
+        // Single linear pass: write every entry exactly once. The
+        // previous impl had three passes (zero-init resize, symbol
+        // copy, build), all touching the same `Vec<Entry>` cache
+        // line — now collapsed into one.
+        self.decode.clear();
+        self.decode.reserve(table_size);
+        for (idx, &symbol) in spread.iter().enumerate().take(table_size) {
+            if idx < negative_idx {
+                // Positive-probability slot.
+                let prob = self.symbol_probabilities[symbol as usize];
+                let symbol_count = counter[symbol as usize];
+                counter[symbol as usize] = symbol_count + 1;
+                let (bl, nb) =
+                    calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
+                debug_assert!(nb <= accuracy_log);
+                let new_state = u16::try_from(bl).map_err(|_| FSETableError::AccLogTooBig {
+                    got: accuracy_log,
+                    max: ENTRY_MAX_ACCURACY_LOG,
+                })?;
+                self.decode.push(Entry {
+                    new_state,
+                    symbol,
+                    num_bits: nb,
+                    base_value: 0,
+                    num_additional_bits: 0,
+                });
+            } else {
+                // -1 probability slot: no baseline, num_bits =
+                // accuracy_log (decoder takes the full state width on
+                // these slots, by zstd FSE spec).
+                self.decode.push(Entry {
+                    new_state: 0,
+                    symbol,
+                    num_bits: accuracy_log,
+                    base_value: 0,
+                    num_additional_bits: 0,
+                });
+            }
         }
+
+        self.symbol_spread_buffer = spread;
         Ok(())
-    }
-
-    fn copy_symbols_into_decode(&mut self, table_symbols: &[u8], table_size: usize) {
-        debug_assert_eq!(table_symbols.len(), table_size);
-        debug_assert!(table_size <= self.decode.capacity());
-
-        // Entry is now 12 bytes (header + base_value + num_additional_bits
-        // + tail padding). The previous LE fast path that packed two
-        // 4-byte entries into a single u64 store no longer applies.
-        // Zero-init through `resize` and then set per-slot `.symbol`
-        // — the per-block table build is not on the per-sequence hot
-        // path (this runs once per FSE-mode block, not per emit), so
-        // dropping the byte-packed write here keeps the layout change
-        // contained without measurable cost.
-        //
-        // The `base_value` / `num_additional_bits` fields stay at
-        // their zero default here; per-table enrichment for LL / ML /
-        // OF runs in `enrich_for_*` after the baseline / num_bits
-        // computation below populates the rest of each entry.
-        self.decode.resize(
-            table_size,
-            Entry {
-                new_state: 0,
-                symbol: 0,
-                num_bits: 0,
-                base_value: 0,
-                num_additional_bits: 0,
-            },
-        );
-        for (entry, symbol) in self.decode.iter_mut().zip(table_symbols.iter().copied()) {
-            entry.symbol = symbol;
-        }
     }
 
     /// Read the accuracy log and the probability table from the source and return the number of bytes
