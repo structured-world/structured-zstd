@@ -30,6 +30,7 @@ use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
 };
+use structured_zstd::encoding::FrameCompressor;
 use support::{
     LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered,
 };
@@ -417,7 +418,33 @@ fn bench_dictionary(c: &mut Criterion) {
 
         let sample_count = training_sample_count(&scenario.bytes);
         let total_training_bytes = scenario.bytes.len();
-        let ffi_samples = [scenario.bytes.as_slice()];
+        // FastCOVER (both ours and FFI's) needs MULTIPLE training
+        // samples to find cross-sample redundancy — passing the
+        // whole scenario as a single slice (the previous shape
+        // `[scenario.bytes.as_slice()]`) was rejected by FFI as
+        // "samples=1, training failed" for every scenario, which
+        // skipped the dictionary loop entirely (no compress-dict /
+        // decompress-dict bench ever ran). `build_training_samples`
+        // mirrors `training_sample_count` exactly — same
+        // chunking AND the 2-sample midpoint-split fallback for
+        // tiny inputs where chunking yields only 1 sample. Without
+        // the fallback, small scenarios would still hit `samples=1`
+        // on the FFI side and `ffi_samples.len()` would diverge
+        // from `sample_count` (the value reported in BENCH_WARN).
+        let ffi_samples = build_training_samples(scenario.bytes.as_slice());
+        // Lockstep gate: `ffi_samples.len()` is what gets reported in
+        // BENCH_WARN below and `sample_count` is what the
+        // `training_sample_count` helper computes — both walk the
+        // same chunking + 2-sample fallback ladder. Future drift in
+        // either helper would silently desync the diagnostic
+        // numbers; debug_assert catches that during development with
+        // zero cost in optimised bench runs.
+        debug_assert_eq!(
+            ffi_samples.len(),
+            sample_count,
+            "build_training_samples and training_sample_count diverged for {}",
+            scenario.id
+        );
         let max_dict_size = total_training_bytes.saturating_sub(64);
         let dict_size = dictionary_size_for(scenario.len())
             .max(256)
@@ -568,17 +595,90 @@ fn bench_dictionary(c: &mut Criterion) {
             configure_group(&mut group, scenario);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
+            // Construct the FFI compressor INSIDE `b.iter` to match the
+            // per-iter setup shape used by both *_with_dict arms below.
+            // Reusing one compressor outside the loop here biased the
+            // baseline: `c_ffi_with_dict` paid CCtx-create + CDict attach
+            // every iter, but `c_ffi_without_dict` paid only the compress
+            // call, making the dict-vs-nodict delta look larger than the
+            // real attach cost.
             group.bench_function("c_ffi_without_dict", |b| {
-                let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
-                b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
+                b.iter(|| {
+                    let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
+                    black_box(compressor.compress(&scenario.bytes).unwrap())
+                })
             });
 
+            // c_ffi_with_dict + pure_rust_with_dict: both construct
+            // their compressor + attach dict INSIDE `b.iter` so the
+            // measurement covers the same shape on both sides.
+            // Asymmetric setup-vs-iter placement was flagged in
+            // PR #277 review (Copilot threads #2/#3/#4): the Rust
+            // FrameCompressor API stores `set_drain`'s `&mut Vec<u8>`
+            // inside the compressor for its full lifetime, so a
+            // "compressor outside b.iter, fresh Vec inside" pattern
+            // doesn't type-check. Rather than gymnast around that,
+            // match the per-iter shape on both arms — the FFI per-
+            // iter construction cost is small (`Compressor::with_
+            // dictionary` is a single CDict reference attach into a
+            // freshly-allocated CCtx) and stays comparable to the
+            // Rust per-iter `FrameCompressor::new +
+            // set_dictionary_from_bytes`.
             group.bench_function("c_ffi_with_dict", |b| {
-                let mut compressor =
-                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
-                        .unwrap();
-                b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
+                b.iter(|| {
+                    let mut compressor =
+                        zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
+                            .unwrap();
+                    black_box(compressor.compress(&scenario.bytes).unwrap())
+                })
             });
+
+            // Gate pure_rust_with_dict registration on the same
+            // `rust_dict_handle.is_some()` signal that
+            // decompress-dict uses below — if DictionaryHandle::
+            // decode_dict failed earlier (the per-scenario parse
+            // above), FrameCompressor::set_dictionary_from_bytes
+            // routes through the same Dictionary::decode_dict and
+            // would fail identically. An `.expect()` panic inside
+            // b.iter would abort the whole bench suite.
+            if rust_dict_handle.is_some() {
+                // One-time pre-compress (outside b.iter) to learn the
+                // Rust encoder's actual output size at this (scenario,
+                // level, dict). Using `with_dict_bytes.len()` here —
+                // the FFI-side compressed size — would under-allocate
+                // when Rust emits a slightly larger frame, forcing
+                // `Vec` reallocations inside the timing loop and
+                // skewing the measurement vs FFI (which always
+                // allocates exact output size internally). Doing one
+                // setup compress matches `Compressor::compress`'s
+                // up-front allocation shape on both sides.
+                let preallocated_capacity = {
+                    let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                    warmup_compressor
+                        .set_dictionary_from_bytes(&ffi_dictionary)
+                        .expect("dictionary should attach");
+                    warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                    warmup_compressor.set_source(scenario.bytes.as_slice());
+                    let mut warmup_output = Vec::new();
+                    warmup_compressor.set_drain(&mut warmup_output);
+                    warmup_compressor.compress();
+                    warmup_output.len()
+                };
+                group.bench_function("pure_rust_with_dict", |b| {
+                    b.iter(|| {
+                        let mut compressor = FrameCompressor::new(level.rust_level);
+                        compressor
+                            .set_dictionary_from_bytes(&ffi_dictionary)
+                            .expect("dictionary should attach");
+                        compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                        compressor.set_source(scenario.bytes.as_slice());
+                        let mut compressed = Vec::with_capacity(preallocated_capacity);
+                        compressor.set_drain(&mut compressed);
+                        compressor.compress();
+                        black_box(compressed)
+                    })
+                });
+            }
 
             group.finish();
 
@@ -948,6 +1048,39 @@ fn training_sample_count(source: &[u8]) -> usize {
     } else {
         samples
     }
+}
+
+/// Build the same byte-slice samples that `training_sample_count`
+/// counts, for passing into FFI's `zstd::dict::from_samples`. Keeps
+/// the two functions in lockstep: primary chunk-by-`sample_size`,
+/// 2-sample midpoint-split fallback for tiny inputs, single-sample
+/// last-resort fallback. Returning `Vec<&[u8]>` borrows from
+/// `source` for zero-copy.
+fn build_training_samples(source: &[u8]) -> Vec<&[u8]> {
+    let sample_size = source.len().div_ceil(16).clamp(256, 8192);
+    let samples: Vec<&[u8]> = source
+        .chunks(sample_size)
+        .take(64)
+        .filter(|chunk| chunk.len() >= 64)
+        .collect();
+    if samples.len() >= 2 {
+        return samples;
+    }
+    let midpoint = source.len() / 2;
+    let left = &source[..midpoint];
+    let right = &source[midpoint..];
+    if left.len() >= 64 && right.len() >= 64 {
+        return vec![left, right];
+    }
+    // Single-sample last resort — matches the BENCH_WARN path in
+    // `training_sample_count`. FFI rejects this and the caller hits
+    // BENCH_WARN, which is the correct behaviour: tiny inputs can't
+    // train a meaningful dictionary regardless of bench-shape
+    // gymnastics. Return the source even for <64-byte inputs so
+    // `samples.len() == training_sample_count(source)` invariant
+    // holds — the diagnostic value reported in the BENCH_WARN line
+    // stays in lockstep across both helpers.
+    vec![source]
 }
 
 fn dictionary_size_for(input_len: usize) -> usize {
