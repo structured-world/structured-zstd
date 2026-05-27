@@ -2304,41 +2304,76 @@ mod tests {
     #[test]
     fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
         use super::{decide_huff_reuse_like_encoder, huff0_encoder};
-        // Build a previous huff table from a fixed sample and the
-        // "new" table from the same data so the size-comparison
-        // path would normally split somewhere mid-tier. The
-        // preferRepeat gate must override that and force reuse
-        // (return false) for Fast/Dfast/Greedy at
-        // literals.len() <= 1024.
-        let sample: Vec<u8> = (0..512u32).map(|i| ((i * 13 + 7) % 251) as u8).collect();
-        let prev = huff0_encoder::HuffmanTable::build_from_data(&sample);
-        let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&sample);
+        // Fixture chosen so size-comparison heuristic and the
+        // preferRepeat short-circuit DISAGREE: `prev` is built
+        // from a broad uniform sweep so it can encode any byte;
+        // the literals payload is heavily skewed (240 zeros + 16
+        // outliers) so a freshly-built `new_tbl` would compress
+        // strictly better than `prev`. Without preferRepeat, the
+        // heuristic picks `new` (returns true); WITH preferRepeat
+        // the fast-band gate forces reuse (returns false).
+        // Removing the short-circuit flips Fast/Dfast/Greedy to
+        // true and breaks this test — that's the regression gate.
+        let prev_training: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
+        let prev = huff0_encoder::HuffmanTable::build_from_data(&prev_training);
+        let mut skewed_literals: Vec<u8> = Vec::new();
+        skewed_literals.resize(240, 0u8);
+        skewed_literals.extend((0..16u8).map(|i| 200 + i));
+        let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
         let new_desc = new_tbl
             .writeable_table_description_size()
             .expect("non-empty table emits a description");
 
-        // Eligible band: must return false (reuse) regardless of
-        // size comparison outcome.
+        // Distinguishing precondition: WITHOUT preferRepeat the
+        // size comparison must prefer new (else the test isn't
+        // exercising the override). Verify by running with a
+        // strategy outside the eligible band: Lazy returns
+        // true (=new) on this fixture.
+        assert!(
+            decide_huff_reuse_like_encoder(
+                &new_tbl,
+                Some(&prev),
+                new_desc,
+                &skewed_literals,
+                StrategyTag::Lazy,
+            ),
+            "fixture precondition: size-comparison must prefer new for Lazy on skewed literals"
+        );
+
+        // Eligible fast band: preferRepeat forces reuse (=false)
+        // despite size-comparison preferring new.
         for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
             assert!(
-                !decide_huff_reuse_like_encoder(&new_tbl, Some(&prev), new_desc, &sample, strategy,),
-                "{strategy:?} <= 1024 must short-circuit to reuse"
+                !decide_huff_reuse_like_encoder(
+                    &new_tbl,
+                    Some(&prev),
+                    new_desc,
+                    &skewed_literals,
+                    strategy,
+                ),
+                "{strategy:?} <= 1024 must short-circuit to reuse despite size-comparison favouring new"
             );
         }
-        // Outside the band the gate stays off — falls through to
-        // the size-comparison heuristic. We don't assert the
-        // boolean outcome (the heuristic's verdict depends on
-        // table sizes), only that the call doesn't panic on the
-        // non-fast-band path.
-        for strategy in [
-            StrategyTag::Lazy,
-            StrategyTag::BtOpt,
-            StrategyTag::BtUltra,
-            StrategyTag::BtUltra2,
-        ] {
-            let _ =
-                decide_huff_reuse_like_encoder(&new_tbl, Some(&prev), new_desc, &sample, strategy);
-        }
+
+        // Above the 1024-byte threshold the gate stays off even
+        // for Fast/Dfast/Greedy — falls through to the size
+        // heuristic, which on this fixture prefers new.
+        let mut big_skewed = skewed_literals.clone();
+        big_skewed.extend(std::iter::repeat_n(0u8, 1024));
+        assert!(
+            big_skewed.len() > 1024,
+            "fixture must exceed 1024 to disable preferRepeat"
+        );
+        assert!(
+            decide_huff_reuse_like_encoder(
+                &new_tbl,
+                Some(&prev),
+                new_desc,
+                &big_skewed,
+                StrategyTag::Fast,
+            ),
+            "Fast at len > 1024 must NOT short-circuit (gate disabled), falls through to size heuristic"
+        );
     }
 
     #[test]
