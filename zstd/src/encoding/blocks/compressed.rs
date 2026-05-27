@@ -2376,7 +2376,7 @@ mod tests {
         // for Fast/Dfast/Greedy — falls through to the size
         // heuristic, which on this fixture prefers new.
         let mut big_skewed = skewed_literals.clone();
-        big_skewed.extend(std::iter::repeat_n(0u8, 1024));
+        big_skewed.extend(core::iter::repeat_n(0u8, 1024));
         assert!(
             big_skewed.len() > 1024,
             "fixture must exceed 1024 to disable preferRepeat"
