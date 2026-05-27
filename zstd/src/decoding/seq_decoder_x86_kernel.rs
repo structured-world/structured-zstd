@@ -37,6 +37,7 @@ macro_rules! define_x86_seq_decoder_tier {
         ///
         /// # Safety
         /// Caller's target_feature must include BMI2.
+        #[inline]
         #[target_feature(enable = $tf)]
         #[allow(dead_code)]
         unsafe fn $decode_one_fn<'a, 'b>(
@@ -102,6 +103,7 @@ macro_rules! define_x86_seq_decoder_tier {
         /// Caller's target_feature must include BMI2 (and any
         /// additional features advertised by `$tf`).
         #[allow(clippy::too_many_arguments)]
+        #[inline]
         #[target_feature(enable = $tf)]
         unsafe fn $loop_fn<'a, 'b, B: $crate::decoding::buffer_backend::BufferBackend>(
             br: &mut $crate::bit_io::BitReaderReversed<'b, $kernel>,

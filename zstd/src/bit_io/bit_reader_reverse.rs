@@ -445,6 +445,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "bmi2")]
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn peek_bits_bmi2(&mut self, n: u8) -> u64 {
         debug_assert!(
             n == 0 || self.bits_consumed + n <= 64,
@@ -497,7 +498,9 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         );
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
-        extract_triple_pext(all_three, n1, n2, n3)
+        // SAFETY: caller's target_feature includes BMI2 per `# Safety`
+        // contract; same scope as the enclosing fn.
+        unsafe { extract_triple_pext(all_three, n1, n2, n3) }
     }
 
     /// Consume `n` bits from the source.
