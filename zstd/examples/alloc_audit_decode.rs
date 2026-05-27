@@ -21,15 +21,13 @@ static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 const TRACE_CAP: usize = 256;
 static TRACE_LEN: AtomicUsize = AtomicUsize::new(0);
-static TRACE_SIZES: [AtomicUsize; TRACE_CAP] = {
-    // Sad const-init: array of AtomicUsize with default value 0.
-    const ZERO: AtomicUsize = AtomicUsize::new(0);
-    [ZERO; TRACE_CAP]
-};
-static TRACE_PEAK_AFTER: [AtomicUsize; TRACE_CAP] = {
-    const ZERO: AtomicUsize = AtomicUsize::new(0);
-    [ZERO; TRACE_CAP]
-};
+// Inline-const-expression repeat (`[const { ... }; N]`) builds the
+// array directly without requiring `AtomicUsize: Copy`. The named-const
+// form (`const ZERO: ...; [ZERO; N]`) historically required Copy, which
+// `AtomicUsize` does not implement; the inline-const variant has been
+// stable since 1.79 and is the modern idiom.
+static TRACE_SIZES: [AtomicUsize; TRACE_CAP] = [const { AtomicUsize::new(0) }; TRACE_CAP];
+static TRACE_PEAK_AFTER: [AtomicUsize; TRACE_CAP] = [const { AtomicUsize::new(0) }; TRACE_CAP];
 
 unsafe impl GlobalAlloc for AuditAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
