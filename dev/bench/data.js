@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779831025199,
+  "lastUpdate": 1779866718195,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48470,6 +48470,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c49ea9efc7bf728a2ecf04c4fd29af2495d60b3a",
+          "message": "perf(fse): rewrite build_decoding_table per donor ZSTD_buildFSETable_body shape (#276)\n\n* perf(fse): rewrite build_decoding_table per donor ZSTD_buildFSETable_body shape\n\nReplace calc_baseline_and_numbits + per-state arithmetic with the\ndonor's pure shift formula (no division anywhere):\n\n  nextState = symbolNext[symbol]++\n  nbBits    = tableLog - highbit32(nextState)\n  newState  = (nextState << nbBits) - tableSize\n\nInit mirrors donor: symbolNext[s] = prob for positive-probability\nsymbols, 1 for -1 (low-probability) symbols. The build loop then\nwalks spread[] once and derives (nb, new_state) per state.\n\nEliminates the divl that perf annotate on z000033 L-5 fast\nattributed to 24.67% of FSETable::build_decoding_table samples\n(num_states_total / num_state_slices in the old helper). The\nhelper itself is now dead code, removed.\n\nAlgebraic equivalence verified: for a symbol with positive prob N,\nnextState walks N..2N-1 across N occurrences; highbit32(nextState)\npartitions this range exactly the way the old\n'num_double_width_state_slices / num_single_width_state_slices'\nsplit did. For -1 prob, nextState = 1, high_bit = 1, nbBits =\naccuracy_log, newState = 0 — matches the old -1 entry shape.\n\n644/644 default tests pass.\n\n* fix(fse): guard build_decoding_table against zero-default spread slot + correct accuracy_log doc\n\nCR review on #276:\n\n#1: highest_bit_set(0) panics. The new donor-formula build loop\nreads symbol_next[spread[u]] then calls highest_bit_set on the\ncounter — but if a malformed probability vector passed to\nbuild_from_probabilities leaves spread.resize zero defaults\nunfilled (Pass 2 walker didn't cover all [0, negative_idx) slots\nbecause positive-prob sum < negative_idx), the loop reads\nspread[u] == 0 and symbol_next[0] == 0, panicking on the next\nhighest_bit_set(0) inside the public-surface call. Reject\nexplicitly with TableInvariantViolation so the public API\nsurfaces a typed error.\n\n#2: the new doc comment said new_state fits u16 only for\naccuracy_log <= 15, but ENTRY_MAX_ACCURACY_LOG is 16 and\ntable_size=2^16 still produces new_state in [0, 65535] which\nfits u16. Correct the bound and tie it to ENTRY_MAX_ACCURACY_LOG.\n\n644/644 default tests pass.\n\n* fix(fse): satisfy clippy needless_range_loop in build_decoding_table init passes\n\nCR (CodeRabbit) on #276:\n\nBoth Pass 1 (-1 prob top-placement) and Pass 2 (positive prob\nspread) iterated 'for symbol in 0..nb_symbols' then indexed\nself.symbol_probabilities[symbol] — clippy::needless_range_loop\nflags the pattern. Switch both to iterating\nself.symbol_probabilities.iter().enumerate().take(nb_symbols);\nthe loop variable remains 'symbol' (still used to write\nsymbol_next[symbol] and as a u8 cast for spread[]), but the lookup\nof the iterated array is now through the enumerate value so the\nlint clears.\n\n644/644 default tests pass; cargo clippy clean.\n\n* fix(fse): remove unreachable guard + use checked subtraction in build_decoding_table\n\nCopilot review on #276:\n\n#5: the per-state next_state == 0 guard added in the previous\nround (CR thread #1) is unreachable. read_probabilities /\nbuild_from_probabilities both enforce sum(probs, -1 counted as\n1) == table_size BEFORE calling build_decoding_table, so\nPass 1 + Pass 2 fully populate spread[] (no zero-default slot\nsurvives spread.resize) and every symbol that lands in spread\nhas symbol_next[s] >= 1. The defensive branch added overhead in\nthe hot per-state loop without protecting any reachable path.\nDrop it.\n\n#4: new_state_u32 used wrapping_sub which would silently\nunderflow if a future bug broke the (next_state << nb) >=\ntable_size invariant, producing a malformed table entry and\nlater UB on the unchecked-indexed read path. Use normal\nsubtraction so the implicit-overflow debug_assert catches the\nviolation in debug builds. The invariant itself is documented\nin the surrounding comment.\n\n644/644 default tests pass; cargo clippy clean.",
+          "timestamp": "2026-05-27T09:40:38+03:00",
+          "tree_id": "3e333d420b454bd1f1e41ddc03c8752ef34b0d68",
+          "url": "https://github.com/structured-world/structured-zstd/commit/c49ea9efc7bf728a2ecf04c4fd29af2495d60b3a"
+        },
+        "date": 1779866713495,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.133,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 308.562,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 211.702,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.33,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.527,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.968,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.063,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.838,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.011,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.941,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.605,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.641,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.667,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.092,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.768,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.264,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.264,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
