@@ -84,16 +84,17 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     do_offset_history_repcode(offset_value, lit_len, scratch)
 }
 
-// Kept `#[cold]` + `#[inline(never)]` despite the helper firing at
-// ~2% of decode time on the i9 primary bench. An earlier experiment
-// dropping both annotations (audit row #18) regressed +1.68% — the
-// out-of-line placement plus branch-prediction bias for the common
-// non-repcode fallthrough are worth more than the saved push/pop
-// observed in perf annotate. Removing the annotations let LLVM either
-// inline too aggressively (caller bloat / icache pressure) or pick a
-// worse code layout. Hands-off LLVM heuristic is the wrong call here.
+// `#[cold]` keeps the body out of caller hot layout and biases icache
+// against pulling it unless hit. Earlier the helper was also
+// `#[inline(never)]`; round-1 findings on issue #279 (branch-mispredict
+// diagnostic) attributed 15.42% of decoder mispredicts to this function,
+// with 27.80% landing on the `pushq %rax` fn entry — call/ret BTB
+// pressure from the never-inlined boundary. Dropping `#[inline(never)]`
+// while keeping `#[cold]` lets LLVM inline at hot call sites where the
+// boundary cost outweighs body duplication; cold paths (low-entropy
+// blocks where the previous "drop both" variant regressed +15.9% on
+// L14) keep the out-of-line shape via the cold attribute.
 #[cold]
-#[inline(never)]
 fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
