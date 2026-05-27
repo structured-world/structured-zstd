@@ -642,18 +642,28 @@ fn bench_dictionary(c: &mut Criterion) {
             // would fail identically. An `.expect()` panic inside
             // b.iter would abort the whole bench suite.
             if rust_dict_handle.is_some() {
-                // Pre-size the drain to `with_dict_bytes.len()` —
-                // that's the known compressed size of `scenario.bytes`
-                // at this level WITH the dict attached (computed once
-                // above for the verification block + c_ffi_with_dict
-                // setup). FFI `Compressor::compress()` allocates the
-                // full output buffer up-front; matching that here
-                // keeps the measurement on the actual compression hot
-                // path rather than per-iter Vec growth via two-or-more
-                // realloc steps (`FrameCompressor::compress` does
-                // header `write_all` then per-block `write_all` so an
-                // empty starting Vec reallocates at least twice).
-                let preallocated_capacity = with_dict_bytes.len();
+                // One-time pre-compress (outside b.iter) to learn the
+                // Rust encoder's actual output size at this (scenario,
+                // level, dict). Using `with_dict_bytes.len()` here —
+                // the FFI-side compressed size — would under-allocate
+                // when Rust emits a slightly larger frame, forcing
+                // `Vec` reallocations inside the timing loop and
+                // skewing the measurement vs FFI (which always
+                // allocates exact output size internally). Doing one
+                // setup compress matches `Compressor::compress`'s
+                // up-front allocation shape on both sides.
+                let preallocated_capacity = {
+                    let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                    warmup_compressor
+                        .set_dictionary_from_bytes(&ffi_dictionary)
+                        .expect("dictionary should attach");
+                    warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                    warmup_compressor.set_source(scenario.bytes.as_slice());
+                    let mut warmup_output = Vec::new();
+                    warmup_compressor.set_drain(&mut warmup_output);
+                    warmup_compressor.compress();
+                    warmup_output.len()
+                };
                 group.bench_function("pure_rust_with_dict", |b| {
                     b.iter(|| {
                         let mut compressor = FrameCompressor::new(level.rust_level);

@@ -217,10 +217,11 @@ def normalize_impl(impl):
         return "ffi"
     # Dict-bench implementations: collapse the with-dict pair to the same
     # (rust, ffi) key shape the rest of the dashboard uses so the dict
-    # stage row produces a comparable ratio/speed pair. `c_ffi_without_dict`
-    # stays distinct — it's the no-dict baseline measured inside the same
-    # compress-dict group on purpose, and the loop downstream needs to see
-    # all three to compute the with-dict-vs-without-dict ratio.
+    # stage row produces a comparable ratio/speed pair.
+    # `c_ffi_without_dict` keeps its raw name as a third series: the
+    # current aggregation loop only computes rust-vs-ffi deltas, so it's
+    # carried through for visual inspection / future use rather than
+    # entering a ratio.
     if impl == "pure_rust_with_dict":
         return "rust"
     if impl == "c_ffi_with_dict":
