@@ -1021,12 +1021,12 @@ fn build_training_samples(source: &[u8]) -> Vec<&[u8]> {
     // Single-sample last resort — matches the BENCH_WARN path in
     // `training_sample_count`. FFI rejects this and the caller hits
     // BENCH_WARN, which is the correct behaviour: tiny inputs can't
-    // train a meaningful dictionary regardless of bench-shape gymnastics.
-    if source.len() >= 64 {
-        vec![source]
-    } else {
-        Vec::new()
-    }
+    // train a meaningful dictionary regardless of bench-shape
+    // gymnastics. Return the source even for <64-byte inputs so
+    // `samples.len() == training_sample_count(source)` invariant
+    // holds — the diagnostic value reported in the BENCH_WARN line
+    // stays in lockstep across both helpers.
+    vec![source]
 }
 
 fn dictionary_size_for(input_len: usize) -> usize {
