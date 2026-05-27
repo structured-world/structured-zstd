@@ -35,11 +35,18 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     last_block: bool,
     uncompressed_data: Vec<u8>,
     output: &mut Vec<u8>,
+    #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
     let block_size = uncompressed_data.len() as u32;
     // First check to see if run length encoding can be used for the entire block
     if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
         let rle_byte = uncompressed_data[0];
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
+                &uncompressed_data,
+            ));
+        }
         state.matcher.commit_space(uncompressed_data);
         state.matcher.skip_matching_with_hint(Some(false));
         let header = BlockHeader {
@@ -56,6 +63,12 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         state.matcher.window_size(),
         &uncompressed_data,
     ) {
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
+                &uncompressed_data,
+            ));
+        }
         state.matcher.commit_space(uncompressed_data);
         state.matcher.skip_matching_with_hint(Some(true));
         let header = BlockHeader {
@@ -69,16 +82,33 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     } else {
         // Compress as a standard compressed block
         let mut compressed = Vec::new();
+        let uncompressed_len = uncompressed_data.len();
         state.matcher.commit_space(uncompressed_data);
         if matches!(compression_level, CompressionLevel::Level(16..=22))
             && state.matcher.window_size() >= (1 << 17)
         {
             // This helper may emit multiple physical blocks (compressed or raw)
-            // into `output`; this function's return value remains a coarse
-            // "compressed-path selected" signal for caller accounting.
+            // into `output`; checksums (if requested) are pushed per physical
+            // block from inside the partition loop so the cardinality matches
+            // the decoder's per-block hash count exactly.
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            compress_block_with_post_split(state, last_block, output, block_checksums);
+            #[cfg(not(all(feature = "lsm", feature = "hash")))]
             compress_block_with_post_split(state, last_block, output);
             return BlockType::Compressed;
         }
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            // Pull the just-committed input back from the matcher so we can
+            // hash the same bytes the decoder will see for this single block.
+            let space = state.matcher.get_last_space();
+            let start = space.len() - uncompressed_len;
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
+                &space[start..],
+            ));
+        }
+        #[cfg(not(all(feature = "lsm", feature = "hash")))]
+        let _ = uncompressed_len;
 
         // Keep rollback snapshots for the oversize fallback path below:
         // `compress_block` can mutate entropy/history state before we know
@@ -196,6 +226,8 @@ mod tests {
             true,
             vec![0xAB; 1024],
             &mut output,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            None,
         );
         assert_eq!(emitted, BlockType::RLE);
 
@@ -237,6 +269,8 @@ mod tests {
             true,
             block.clone(),
             &mut output,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            None,
         );
         assert_eq!(emitted, BlockType::Raw);
 

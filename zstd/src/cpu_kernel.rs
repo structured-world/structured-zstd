@@ -253,7 +253,12 @@ pub(crate) enum CpuKernelTag {
     Vbmi2,
     #[cfg(target_arch = "aarch64")]
     Neon,
-    #[cfg(target_arch = "aarch64")]
+    // Both constructors of `Sve` need a reachable feature: runtime
+    // detection via `std::arch::is_aarch64_feature_detected!` (so
+    // `feature = "std"`) or compile-time `target_feature = "sve"` in
+    // RUSTFLAGS. Without either, the variant is unreachable and a
+    // `match` arm referencing it warns as dead.
+    #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
     Sve,
 }
 

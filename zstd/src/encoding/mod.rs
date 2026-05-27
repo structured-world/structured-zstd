@@ -81,11 +81,15 @@ pub(crate) mod simple;
 pub(crate) mod strategy;
 
 pub(crate) mod frame_compressor;
+#[cfg(feature = "lsm")]
+pub mod frame_emit_info;
 mod levels;
 #[cfg(feature = "bench_internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
 pub use frame_compressor::FrameCompressor;
+#[cfg(feature = "lsm")]
+pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
 pub use match_generator::MatchGeneratorDriver;
 pub use streaming_encoder::StreamingEncoder;
 
