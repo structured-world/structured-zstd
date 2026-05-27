@@ -523,7 +523,7 @@ mod tests {
             let base = f.len();
             let match_length = 96usize;
             // Reference: byte-by-byte repeat starting at base, sourced from base-offset.
-            let mut reference = vec![0u8; base + match_length];
+            let mut reference = alloc::vec![0u8; base + match_length];
             reference[..base].copy_from_slice(&seed);
             for i in 0..match_length {
                 reference[base + i] = reference[base + i - offset];
@@ -566,7 +566,7 @@ mod tests {
             f.extend(&seed);
             let base = f.len();
             let match_length = 96usize;
-            let mut reference = vec![0u8; base + match_length];
+            let mut reference = alloc::vec![0u8; base + match_length];
             reference[..base].copy_from_slice(&seed);
             for i in 0..match_length {
                 reference[base + i] = reference[base + i - offset];
