@@ -73,7 +73,8 @@ macro_rules! define_x86_seq_decoder_tier {
                 // which includes BMI2; runtime CPU presence of BMI2 is
                 // gated by the dispatcher at
                 // `decode_and_execute_sequences::detect_cpu_kernel`.
-                let triple = br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits);
+                let triple =
+                    unsafe { br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) };
                 br.consume(sum);
                 triple
             } else {
@@ -132,7 +133,7 @@ macro_rules! define_x86_seq_decoder_tier {
             }; ADVANCE];
 
             for slot in ring.iter_mut() {
-                let seq = $decode_one_fn(ll_dec, ml_dec, of_dec, br);
+                let seq = unsafe { $decode_one_fn(ll_dec, ml_dec, of_dec, br) };
                 let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
                 let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
                 let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -150,7 +151,7 @@ macro_rules! define_x86_seq_decoder_tier {
             }
 
             for i in ADVANCE..num_sequences {
-                let seq = $decode_one_fn(ll_dec, ml_dec, of_dec, br);
+                let seq = unsafe { $decode_one_fn(ll_dec, ml_dec, of_dec, br) };
                 let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
                 let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
                 let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -310,21 +311,25 @@ macro_rules! define_x86_seq_decoder_tier {
                 && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
 
             if use_long_pipeline {
-                let pipeline_result = $loop_fn(
-                    &mut br,
-                    &mut ll_dec,
-                    &mut ml_dec,
-                    &mut of_dec,
-                    buffer,
-                    offset_hist,
-                    literals_buffer,
-                    &mut lit_cur,
-                    literals_buffer_len,
-                    num_sequences,
-                    old_buffer_size,
-                    max_update_bits,
-                    &mut seq_sum,
-                );
+                // SAFETY: $loop_fn carries the same target_feature as
+                // this caller, invoked from inside that scope.
+                let pipeline_result = unsafe {
+                    $loop_fn(
+                        &mut br,
+                        &mut ll_dec,
+                        &mut ml_dec,
+                        &mut of_dec,
+                        buffer,
+                        offset_hist,
+                        literals_buffer,
+                        &mut lit_cur,
+                        literals_buffer_len,
+                        num_sequences,
+                        old_buffer_size,
+                        max_update_bits,
+                        &mut seq_sum,
+                    )
+                };
                 if let Err(e) = pipeline_result {
                     if buffer.try_restore_checkpoint(buffer_checkpoint) {
                         *offset_hist = saved_offset_hist;
@@ -335,7 +340,8 @@ macro_rules! define_x86_seq_decoder_tier {
                 let mut shadow_hist = *offset_hist;
                 let mut fallback_err: Option<DecompressBlockError> = None;
                 for i in 0..num_sequences {
-                    let seq = $decode_one_fn(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+                    let seq =
+                        unsafe { $decode_one_fn(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br) };
                     let resolved_offset = $crate::decoding::sequence_execution::do_offset_history(
                         seq.of,
                         seq.ll,
