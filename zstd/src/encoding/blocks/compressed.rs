@@ -249,7 +249,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
     output: &mut Vec<u8>,
-    mut block_checksums: Option<&mut Vec<u32>>,
+    #[cfg(all(feature = "lsm", feature = "hash"))] mut block_checksums: Option<&mut Vec<u32>>,
 ) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
@@ -261,14 +261,12 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         // `Target = T`, so the deref chain does NOT cascade into
         // `Vec<u32>::Target = [u32]`). Hence `sink: &mut Vec<u32>` and
         // `Vec::push` is in scope.
-        #[cfg(feature = "hash")]
+        #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums.as_deref_mut() {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
                 state.matcher.get_last_space(),
             ));
         }
-        #[cfg(not(feature = "hash"))]
-        let _ = block_checksums.as_deref_mut();
         scratch.compressed.clear();
         let mut emit_buffers = SingleSequenceEmitBuffers {
             output,
@@ -336,7 +334,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         } else {
             chunk_lit_len + chunk_match_len
         };
-        #[cfg(feature = "hash")]
+        #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums.as_deref_mut() {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
                 &state.matcher.get_last_space()[src_start..src_start + src_size],

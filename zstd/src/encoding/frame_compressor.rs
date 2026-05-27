@@ -375,8 +375,11 @@ fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
 
 /// XXH64 (low 32 bits, seed 0) over `data`. Shared helper for the
 /// per-physical-block checksum sidecar so encoder and decoder hash
-/// the exact same byte ranges with the exact same parameters.
-#[cfg(feature = "hash")]
+/// the exact same byte ranges with the exact same parameters. Gated
+/// at `all(lsm, hash)` because the only consumer is the lsm-side
+/// `block_checksums` sidecar; non-lsm builds carry no reference to
+/// this helper at all.
+#[cfg(all(feature = "lsm", feature = "hash"))]
 #[inline]
 pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
     let mut h = XxHash64::with_seed(0);
@@ -833,17 +836,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Level(_) => {
                     let before_len = all_blocks.len();
                     let block_len = uncompressed_data.len();
-                    #[cfg(all(feature = "lsm", feature = "hash"))]
-                    let checksum_sink = self.block_checksums.as_mut();
-                    #[cfg(not(all(feature = "lsm", feature = "hash")))]
-                    let checksum_sink: Option<&mut Vec<u32>> = None;
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         uncompressed_data,
                         &mut all_blocks,
-                        checksum_sink,
+                        #[cfg(all(feature = "lsm", feature = "hash"))]
+                        self.block_checksums.as_mut(),
                     );
                     savings += block_len as i64 - (all_blocks.len() - before_len) as i64;
                 }

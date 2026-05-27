@@ -1332,6 +1332,7 @@ impl FrameDecoder {
     /// the visitor (when `Some`) on the borrowed payload before
     /// advancing past it.
     #[cfg(feature = "lsm")]
+    #[allow(clippy::type_complexity)]
     fn decode_all_impl(
         &mut self,
         mut input: &[u8],
