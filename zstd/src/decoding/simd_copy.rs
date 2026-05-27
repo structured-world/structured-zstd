@@ -172,6 +172,101 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     debug_assert_eq_copy(src, dst, copy_at_least);
 }
 
+/// AVX2-tier wildcopy variant: same shape as [`copy_bytes_overshooting`]
+/// but the chunked-SIMD path goes DIRECT to `copy_avx2` (32-byte
+/// chunks) without consulting `detect_x86_caps()`. Issue #279 round 3
+/// Phase 4: when called from inside a target_feature(avx2,bmi2)-scoped
+/// caller, the inlined `copy_avx2` body emits `_mm256_storeu_si256`
+/// ymm stores directly; the runtime dispatch branch + cached-OnceLock
+/// load that `copy_bytes_overshooting` paid per call is gone.
+///
+/// Small-request paths (≤16 fast, ≤32 exact-length) are identical to
+/// the dispatcher version — they don't need a chunk kernel and stay
+/// inline. The AVX-512 chunk path is omitted (this variant targets
+/// the AVX2-tier scope, which is the strict subset).
+///
+/// # Safety
+/// `src` and `dst` must each point to at least `src.1` / `dst.1`
+/// readable / writable bytes, regions must not overlap, and the
+/// caller MUST itself be in `target_feature(enable = "avx2,bmi2")`
+/// scope (which the only call site — `execute_one_sequence_pipelined_avx2`
+/// — guarantees via its own attribute).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(dead_code)]
+pub(crate) unsafe fn copy_bytes_overshooting_avx2(
+    src: (*const u8, usize),
+    dst: (*mut u8, usize),
+    copy_at_least: usize,
+) {
+    if copy_at_least == 0 {
+        return;
+    }
+
+    let min_buffer_size = core::cmp::min(src.1, dst.1);
+
+    if copy_at_least <= 16 && min_buffer_size >= 16 {
+        unsafe { single_op_copy_16(src.0, dst.0, copy_at_least) };
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    if copy_at_least <= 32 {
+        unsafe {
+            if copy_at_least <= 8 {
+                let mut i = 0;
+                while i < copy_at_least {
+                    dst.0.add(i).write(src.0.add(i).read());
+                    i += 1;
+                }
+            } else if copy_at_least <= 16 {
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi_offset = copy_at_least - 8;
+                let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
+            } else {
+                let lo: u64 = src.0.cast::<u64>().read_unaligned();
+                let hi: u64 = src.0.add(8).cast::<u64>().read_unaligned();
+                dst.0.cast::<u64>().write_unaligned(lo);
+                dst.0.add(8).cast::<u64>().write_unaligned(hi);
+                let tail_off = copy_at_least - 16;
+                let tail_lo: u64 = src.0.add(tail_off).cast::<u64>().read_unaligned();
+                let tail_hi: u64 = src.0.add(copy_at_least - 8).cast::<u64>().read_unaligned();
+                dst.0.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
+                dst.0
+                    .add(copy_at_least - 8)
+                    .cast::<u64>()
+                    .write_unaligned(tail_hi);
+            }
+        }
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    // Direct AVX2 chunk path: rounds up to 32-byte multiple, calls
+    // copy_avx2 if slack permits. No dispatcher, no detect_x86_caps —
+    // target_feature(avx2) on this fn guarantees the kernel is
+    // callable.
+    let rounded = copy_at_least.next_multiple_of(32);
+    if min_buffer_size >= rounded {
+        unsafe { copy_avx2(src.0, dst.0, rounded) };
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    // Slack-less tail: scalar 8-byte chunk loop if alignment permits,
+    // else exact byte copy. Same fallback as `copy_bytes_overshooting`.
+    let scalar_chunk = core::mem::size_of::<usize>();
+    let rounded_scalar = copy_at_least.next_multiple_of(scalar_chunk);
+    if min_buffer_size >= rounded_scalar {
+        unsafe { copy_scalar(src.0, dst.0, rounded_scalar) };
+    } else {
+        unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
+    }
+    debug_assert_eq_copy(src, dst, copy_at_least);
+}
+
 /// Single 16-byte transfer covering any 1..=16 byte request. The caller
 /// guarantees 16 bytes of readable / writable slack on both sides so a full
 /// vector store is safe even when only the first `len` bytes are required —
