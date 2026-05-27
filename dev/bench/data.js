@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779871125594,
+  "lastUpdate": 1779874654787,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48878,6 +48878,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d08ec3f241bd77be4fc6409f081bc6ecb21f8cd3",
+          "message": "test(bench): unblock dict-driven bench matrix + add pure_rust_with_dict compress arm (#277)\n\n* test(bench): add pure_rust_with_dict arm to compress-dict bench matrix\n\nCloses the rust-vs-FFI gap in the compress-dict bench group.\nbench_dictionary already covered:\n  - dict-train/na/{scenario}/matrix      pure_rust + c_ffi (training)\n  - decompress-dict/{level}/.../matrix   pure_rust_with_dict + c_ffi_with_dict\n\nBut compress-dict/{level}/{scenario}/matrix only had c_ffi_without_dict\nand c_ffi_with_dict — no Rust-side dictionary-driven compress arm. A\nregression in FrameCompressor's dict-attach hot path would land\nsilently because the dashboard tracks the FFI-only c_ffi_with_dict\narm, not the structured-zstd encoder under the same dict.\n\nAdd pure_rust_with_dict arm using FrameCompressor::set_dictionary_from_bytes\nin the bench loop (per-iter parse, mirrors c_ffi_with_dict's\nCompressor::with_dictionary which also re-constructs per iter — apples-\nto-apples vs the FFI side).\n\nDashboard wiring (issue #230 'Dashboard wiring' section) deferred to\nfollow-up — that touches .github/scripts/run-benchmarks.sh and\nbench-dashboard/index.html which are CI infra outside this PR's scope.\nThe bench data lands in criterion's JSON output unchanged.\n\nCompiles + cargo clippy --benches clean.\n\n* fix(bench): chunk scenario bytes for FastCOVER training in compare_ffi\n\nPre-existing bug in bench_dictionary: ffi_samples was constructed\nas a single-element array [scenario.bytes.as_slice()] containing\nthe WHOLE scenario as one sample. FastCOVER (both ours and FFI's\nZSTD_trainFromBuffer_fastCover) needs MULTIPLE samples to find\ncross-sample redundancy — single-sample input is rejected with a\ntraining error.\n\nAs a result, every scenario hit BENCH_WARN at the FFI training\nstep and was skipped with 'continue;', so the entire\ncompress-dict, decompress-dict, and dict-train benchmark matrices\nnever actually ran — the FFI side reported timing for ZERO\nscenarios on every CI run since the bench was added.\n\nChunk scenario.bytes into the same sample shape that\ntraining_sample_count expects: sample_size =\nceil(len / 16).clamp(256, 8192), up to 64 samples, each at least\n64 bytes. Single sub-sample budget mirrors the existing logic at\nthe top of bench_dictionary so 'sample_count' and 'ffi_samples.len()'\nagree per scenario.\n\nVerified locally: 'compress-dict/level_3_dfast/decodecorpus-z000033'\nnow runs all three arms (c_ffi_without_dict, c_ffi_with_dict,\npure_rust_with_dict) where it previously was BENCH_WARN'd off.\n\n* fix(bench): symmetric per-iter compressor construction for dict bench arms\n\nCR (Copilot) review on #277:\n\n#1: build_training_samples missed the 2-sample midpoint-split\nfallback that training_sample_count uses for tiny inputs.\nExtract the sample construction into a dedicated\nbuild_training_samples() helper that mirrors training_sample_count\nexactly — same chunk-by-sample_size primary path, same midpoint\n2-sample fallback, same single-sample last resort. ffi_samples\nnow stays in lockstep with sample_count.\n\n#2/#3/#4: the pure_rust_with_dict arm built FrameCompressor inside\nb.iter while c_ffi_with_dict built Compressor::with_dictionary\nONCE outside — asymmetric measurement under-reported Rust steady\nstate. FrameCompressor's set_drain stores '&mut Vec<u8>' for the\ncompressor's full lifetime, blocking the 'compressor outside,\nfresh Vec inside' pattern at the type level. Rather than work\naround that with custom Drain wrappers, match the per-iter shape\non BOTH arms — c_ffi_with_dict moves Compressor construction\ninside b.iter too. Apples-to-apples at the cost of including dict\nparse + CCtx alloc per iter on both sides; the actual\nencoder hot path dominates for any meaningful payload size.\n\nLocal verification on M1 (compress-dict/level_3_dfast/decodecorpus-z000033):\n  c_ffi_without_dict   3.44 ms (290 MiB/s)\n  c_ffi_with_dict      4.51 ms (220 MiB/s)\n  pure_rust_with_dict  8.64 ms (115 MiB/s)\nThree arms emit non-zero timing; both per-iter shapes are\nsymmetric.\n\n* fix(bench): align tiny-input fallback with training_sample_count lockstep\n\nCR (CodeRabbit) on #277: build_training_samples returned\nVec::new() for sources <64 bytes while training_sample_count\nreturns 1 in the same case (with BENCH_WARN logged). Return\nvec![source] unconditionally so 'samples.len() ==\ntraining_sample_count(source)' invariant holds across both\nhelpers — the diagnostic value in BENCH_WARN messages stays\nconsistent.\n\n* fix(bench): gate pure_rust_with_dict on dict_handle parse + lockstep debug_assert\n\nCR (Copilot) on #277:\n\n#6: pure_rust_with_dict called set_dictionary_from_bytes with\n.expect inside b.iter, so if DictionaryHandle::decode_dict failed\nearlier (the per-scenario parse upstream), FrameCompressor's\nidentical Dictionary::decode_dict path would also fail and the\n.expect would abort the whole bench suite. Gate the arm\nregistration on rust_dict_handle.is_some() — same skip pattern\ndecompress-dict already uses.\n\n#7: Add debug_assert_eq!(ffi_samples.len(), sample_count) right\nafter build_training_samples so future drift between\nbuild_training_samples and training_sample_count is caught\nduring development with zero cost in optimised bench runs.\n\nBuilds clean, cargo clippy --benches --features dict_builder\nclean.\n\n* fix(bench): pre-size pure_rust_with_dict drain to match FFI allocation (#277 CR)\n\nCR (Copilot) on #277: pure_rust_with_dict bench used Vec::new()\nfor the drain. FrameCompressor::compress writes the frame header\nvia write_all then per-block via write_all again, so an empty Vec\nreallocates at least twice per iteration. FFI Compressor::compress\nallocates the output buffer up-front; the comparison was\nmeasuring allocator growth on the Rust side that the FFI arm\ndoesn't pay for.\n\nPre-size the Rust drain to with_dict_bytes.len() — the known\ncompressed-output size at this (level, dict, scenario) tuple\n(already computed above for the verification block and c_ffi\nsetup). Bench loop now amortises the same per-iter alloc cost on\nboth arms; the timing reflects actual compression hot-path work.\n\n* ci(bench): parse decompress-dict group name in run-benchmarks.sh\n\nPR #277 added a `decompress-dict/<level>/<scenario>/matrix/<sample>`\ngroup alongside the existing `compress-dict` and `dict-train` groups,\nbut the parser only knew the first two. Result: CI ran the benches\nsuccessfully then crashed in the post-processing step with\n`ValueError: Unsupported benchmark name format`.\n\nAdd a fifth arm mirroring `compress-dict`. Downstream stage handling\n(key_meta, speed_index, ratio rollups) is generic per-stage, so no\nother change is needed; the new stage is non-regression-alerting,\nwhich is correct (decompression-with-dict alerts would just amplify\nthe existing FFI/Rust seq decoder gap).\n\n* fix(decoding): rephrase ddict_is_cold doc to avoid clippy::doc_lazy_continuation\n\nclippy 1.95 in CI parses `* 2` at line start as a markdown list bullet,\nthen flags subsequent lines as \"doc list item without indentation\".\nMove the `num_sequences >= ADVANCE * 2` constraint onto a single line\nand drop the parenthetical `(cache state... considered \"cold\"...)` line\nbreak that triggered the same lint. Comment intent unchanged.\n\n* test(bench): symmetrize c_ffi_without_dict per-iter + normalize with-dict impls in dashboard\n\nTwo CR threads fixed:\n\n- compare_ffi.rs:607 — c_ffi_without_dict now constructs the FFI\n  Compressor INSIDE b.iter to match the per-iter shape of\n  c_ffi_with_dict / pure_rust_with_dict. Reusing one compressor outside\n  the loop biased the no-dict baseline (it paid only compress while the\n  with-dict arms paid CCtx-create + CDict-attach every iter).\n\n- run-benchmarks.sh:196 — normalize_impl() now maps\n  pure_rust_with_dict → rust and c_ffi_with_dict → ffi so the with-dict\n  pair produces a comparable (rust, ffi) key, surfacing dict stages in\n  benchmark-delta.json / benchmark-relative.json. c_ffi_without_dict\n  stays distinct so the no-dict baseline can be diffed against the\n  dict pair inside the same compress-dict group.\n\n* test(bench): pre-compress in setup for pure_rust_with_dict capacity\n\n- compare_ffi.rs:656 — preallocated_capacity was derived from the\n  FFI compressed size (with_dict_bytes.len), under-allocating when\n  the Rust encoder emits a larger frame. Replace with a one-time\n  Rust pre-compress (outside b.iter) that captures the actual Rust\n  output size for this (scenario, level, dict). Eliminates per-iter\n  realloc skew while still matching FFI up-front allocation shape.\n\n- run-benchmarks.sh:223 — reword stale comment around\n  c_ffi_without_dict normalization to reflect that it is a third\n  series for inspection, not part of the rust-vs-ffi ratio.",
+          "timestamp": "2026-05-27T11:01:24+03:00",
+          "tree_id": "59355132215a53159543735adacccfa7d132763e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d08ec3f241bd77be4fc6409f081bc6ecb21f8cd3"
+        },
+        "date": 1779874648903,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.072,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.047,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 165.922,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 114.432,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.642,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 0.711,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.47,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.219,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.417,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.758,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.699,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.333,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.042,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.223,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.07,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.217,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.218,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
