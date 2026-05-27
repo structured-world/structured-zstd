@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.26](https://github.com/structured-world/structured-zstd/compare/v0.0.25...v0.0.26) - 2026-05-27
+
+### Added
+
+- *(encoding+decoding)* FrameEmitInfo + opt-in per-block XXH64 sidecar ([#272](https://github.com/structured-world/structured-zstd/pull/272))
+- *(decoding)* skippable-payload visitor callback on FrameDecoder ([#271](https://github.com/structured-world/structured-zstd/pull/271))
+
+### Documentation
+
+- *(#176)* Skippable Frame Magic Allocations registry (#270)
+
+### Performance
+
+- *(decode)* drop inline_never on repcode resolver, keep cold attr ([#281](https://github.com/structured-world/structured-zstd/pull/281))
+- *(encoding)* HUF_flags_preferRepeat for fast strategies + small literals (#23 G6) ([#278](https://github.com/structured-world/structured-zstd/pull/278))
+- *(decoding)* mirror donor ddictIsCold signal for pipelined dispatch ([#274](https://github.com/structured-world/structured-zstd/pull/274))
+- *(fse)* rewrite build_decoding_table per donor ZSTD_buildFSETable_body shape ([#276](https://github.com/structured-world/structured-zstd/pull/276))
+- *(decode)* route short-block fallback through inline executor (z000033 −25%) ([#269](https://github.com/structured-world/structured-zstd/pull/269))
+- *(decode)* cache predefined FSE tables (small-4k-log-lines −69%) ([#268](https://github.com/structured-world/structured-zstd/pull/268))
+- *(decode)* inline sequence executor for direct path + auto-route decode_all (z000033 −24%, high-entropy-1m parity) ([#263](https://github.com/structured-world/structured-zstd/pull/263))
+- *(bench)* pre-touch decompress output Vec to kill page-fault artifact ([#260](https://github.com/structured-world/structured-zstd/pull/260))
+- *(decode)* bump WILDCOPY_OVERLENGTH 16 → 32 for AVX2 chunked kernel reach ([#261](https://github.com/structured-world/structured-zstd/pull/261))
+- *(decode)* RingBuffer % cap → branchless wrap helper (kills divl on i686, divq on x86_64) ([#255](https://github.com/structured-world/structured-zstd/pull/255))
+- *(decode)* #247 Part 2 — kill divb in repeat_short_offset + force-inline UserSliceBackend::extend ([#254](https://github.com/structured-world/structured-zstd/pull/254))
+- *(decode)* #247 Part 1 — expand FSE Entry to ZSTD_seqSymbol shape ([#252](https://github.com/structured-world/structured-zstd/pull/252))
+
+### Testing
+
+- *(bench)* unblock dict-driven bench matrix + add pure_rust_with_dict compress arm ([#277](https://github.com/structured-world/structured-zstd/pull/277))
+
+### Harden
+
+- *(decode)* fallible BufferBackend writes for RLE/Raw direct path ([#251](https://github.com/structured-world/structured-zstd/pull/251))
+
 ## [0.0.25](https://github.com/structured-world/structured-zstd/compare/v0.0.24...v0.0.25) - 2026-05-24
 
 ### Added
