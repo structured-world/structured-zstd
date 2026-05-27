@@ -310,7 +310,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// which is itself target_feature-tagged.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    #[inline(always)]
+    #[inline]
     unsafe fn exec_sequence_inline_avx2(
         &mut self,
         lit_src: *const u8,
