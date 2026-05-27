@@ -27,7 +27,9 @@ macro_rules! define_x86_seq_decoder_tier {
         target_feature = $tf:literal,
         decode_fn = $decode_fn:ident,
         loop_fn = $loop_fn:ident,
-        decode_one_fn = $decode_one_fn:ident $(,)?
+        decode_one_fn = $decode_one_fn:ident,
+        exec_one_fn = $exec_one_fn:path,
+        exec_one_resolved_fn = $exec_one_resolved_fn:path $(,)?
     ) => {
         /// Per-tier `decode_one_sequence_inline`. Hot site uses
         /// `peek_bits_triple_bmi2` directly (target_feature scope
@@ -121,9 +123,7 @@ macro_rules! define_x86_seq_decoder_tier {
             seq_sum: &mut u32,
         ) -> Result<(), $crate::decoding::errors::DecompressBlockError> {
             use $crate::decoding::sequence_execution::do_offset_history;
-            use $crate::decoding::sequence_section_decoder::{
-                ADVANCE, ADVANCE_MASK, ExecSeq, execute_one_sequence_pipelined_resolved,
-            };
+            use $crate::decoding::sequence_section_decoder::{ADVANCE, ADVANCE_MASK, ExecSeq};
 
             let mut prefetch_pos: usize = old_buffer_size;
             let mut shadow_hist: [u32; 3] = *offset_hist;
@@ -167,13 +167,18 @@ macro_rules! define_x86_seq_decoder_tier {
                     actual_offset,
                 };
 
-                execute_one_sequence_pipelined_resolved(
-                    buffer,
-                    literals_buffer,
-                    lit_cur,
-                    literals_buffer_len,
-                    exec_seq,
-                )?;
+                // SAFETY: per-tier exec_one_resolved is target_feature-tagged
+                // matching the enclosing $loop_fn scope (or it's the
+                // K-agnostic safe variant for tiers that pass that).
+                unsafe {
+                    $exec_one_resolved_fn(
+                        buffer,
+                        literals_buffer,
+                        lit_cur,
+                        literals_buffer_len,
+                        exec_seq,
+                    )?;
+                }
                 *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
                 if i + 1 < num_sequences {
@@ -187,13 +192,16 @@ macro_rules! define_x86_seq_decoder_tier {
             for k in 0..ADVANCE {
                 let slot = (num_sequences + k) & ADVANCE_MASK;
                 let exec_seq = ring[slot];
-                execute_one_sequence_pipelined_resolved(
-                    buffer,
-                    literals_buffer,
-                    lit_cur,
-                    literals_buffer_len,
-                    exec_seq,
-                )?;
+                // SAFETY: same target_feature scope as the loop body above.
+                unsafe {
+                    $exec_one_resolved_fn(
+                        buffer,
+                        literals_buffer,
+                        lit_cur,
+                        literals_buffer_len,
+                        exec_seq,
+                    )?;
+                }
                 *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
             }
 
@@ -233,8 +241,7 @@ macro_rules! define_x86_seq_decoder_tier {
             };
             use $crate::decoding::sequence_execution::execute_sequences_fields;
             use $crate::decoding::sequence_section_decoder::{
-                ADVANCE, decode_sequences_with_rle, execute_one_sequence_pipelined,
-                maybe_update_fse_tables,
+                ADVANCE, decode_sequences_with_rle, maybe_update_fse_tables,
             };
             use $crate::fse::FSEDecoder;
 
@@ -348,14 +355,19 @@ macro_rules! define_x86_seq_decoder_tier {
                         seq.ll,
                         &mut shadow_hist,
                     );
-                    if let Err(e) = execute_one_sequence_pipelined(
-                        buffer,
-                        literals_buffer,
-                        &mut lit_cur,
-                        literals_buffer_len,
-                        seq,
-                        resolved_offset,
-                    ) {
+                    // SAFETY: $exec_one_fn carries the same target_feature
+                    // as this enclosing $decode_fn (or is safe scalar).
+                    let exec_result = unsafe {
+                        $exec_one_fn(
+                            buffer,
+                            literals_buffer,
+                            &mut lit_cur,
+                            literals_buffer_len,
+                            seq,
+                            resolved_offset,
+                        )
+                    };
+                    if let Err(e) = exec_result {
                         fallback_err = Some(e);
                         break;
                     }

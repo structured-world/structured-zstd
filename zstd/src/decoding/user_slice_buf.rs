@@ -290,6 +290,128 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
+    /// AVX2-tier override of [`BufferBackend::exec_sequence_inline_avx2`].
+    /// Issue #279 round 3 Phase 4: divergent only at the
+    /// match-copy no-overlap path (`offset >= 16`), where the 16-byte
+    /// SSE2 `wildcopy_no_overlap` is replaced by the 32-byte ymm
+    /// `wildcopy_no_overlap_avx2`. Literal copy + short-offset
+    /// match path stay on the SSE2 helpers — they're capped by the
+    /// caller-side `inline_path_safe` gate at 16-byte slack and
+    /// changing them would require re-tightening that gate. Match
+    /// copy slack is bounded by `UserSliceBackend`'s
+    /// `WILDCOPY_OVERLENGTH = 32` byte padding at the slice tail,
+    /// which accommodates the 31-byte AVX2 stride overshoot.
+    ///
+    /// # Safety
+    /// Same preconditions as [`Self::exec_sequence_inline`] plus
+    /// caller in `#[target_feature(enable = "avx2,bmi2")]` scope —
+    /// the only call site is
+    /// `sequence_section_decoder::execute_one_sequence_pipelined_avx2`
+    /// which is itself target_feature-tagged.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_avx2(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        // 31-byte tail overshoot bound: the AVX2 no-overlap match
+        // wildcopy may write up to 31 bytes past `tail + total`.
+        // UserSliceBackend's slice carries `WILDCOPY_OVERLENGTH = 32`
+        // slack at construction (see `from_slice`), which accommodates
+        // this overshoot for well-formed frames.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let cap = self.slice.len();
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = self
+            .tail
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        let cap_required = match cap_required {
+            Some(v) if v <= cap => v,
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        };
+        let _ = cap_required;
+        let new_tail = self.tail + total;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        let live_len = self.tail - self.head;
+        debug_assert!(
+            live_len
+                .checked_add(lit_length)
+                .is_some_and(|end| offset <= end),
+            "exec_sequence_inline_avx2: offset ({}) exceeds live window (len={} + lit={}, head={}, tail={})",
+            offset,
+            live_len,
+            lit_length,
+            self.head,
+            self.tail,
+        );
+
+        unsafe {
+            let base_mut = self.slice.as_mut_ptr();
+
+            // Literal copy — UNCHANGED from SSE2 default. 16-byte
+            // copy16 + optional 16-byte-stride wildcopy. Donor's
+            // literal copy is the smaller portion (~24 bytes typical);
+            // the AVX2 win lives entirely in the match copy below.
+            let op_lit = base_mut.add(self.tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            // Match copy — divergent on no-overlap fast path.
+            let op_match = base_mut.add(self.tail + lit_length);
+            let match_src = base_mut.cast_const().add(self.tail + lit_length - offset);
+
+            if offset >= 16 {
+                // ✨ AVX2 32-byte stride. Each ymm store is 2× the
+                // SSE2 throughput; for typical match lengths (32-256
+                // bytes) this halves the iteration count of the
+                // wildcopy loop. The 31-byte overshoot is bounded by
+                // `MAX_WILDCOPY_OVERSHOOT` above.
+                wildcopy_no_overlap_avx2(op_match, match_src, match_length);
+            } else {
+                // Short-offset path unchanged: overlap_copy8 +
+                // 8-byte stride wildcopy. 32-byte SIMD doesn't fit
+                // the donor's overlap_src_before_dst semantics
+                // because the 8-byte spread step needs the source
+                // to lag the destination by less than the stride
+                // width.
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
     /// `new()` exists for trait conformance but is not used on the
     /// direct-decode path — the slice is always provided up-front via
     /// [`Self::from_slice`]. Returns an empty backend wrapping an

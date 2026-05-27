@@ -141,6 +141,45 @@ pub(crate) trait BufferBackend: Sized {
         );
     }
 
+    /// AVX2-tier variant of [`Self::exec_sequence_inline`]. Same
+    /// contract but the literal-copy and no-overlap match-copy paths
+    /// emit 32-byte ymm stores via `wildcopy_no_overlap_avx2`. Issue
+    /// #279 round 3 Phase 4: invoked only from
+    /// `execute_one_sequence_pipelined_avx2` which is itself
+    /// `#[target_feature(enable = "avx2,bmi2")]`. WILDCOPY overshoot
+    /// at destination grows from 15 to 31 bytes (32-byte stride
+    /// overshoots up to 31 bytes past `tail + total`); caller-side
+    /// slack contract must account.
+    ///
+    /// Default impl is `unreachable!` — only `UserSliceBackend`
+    /// overrides on x86_64, gated by `SUPPORTS_INLINE_SEQUENCE_EXEC`
+    /// (no separate const because runtime CPU AVX2 presence is gated
+    /// at the dispatcher in
+    /// `sequence_section_decoder::decode_and_execute_sequences` via
+    /// `detect_cpu_kernel() == Avx2`).
+    ///
+    /// # Safety
+    /// Same preconditions as [`Self::exec_sequence_inline`] plus:
+    /// caller MUST be in `#[target_feature(enable = "avx2,bmi2")]`
+    /// scope (the only call site is the AVX2-tier execute path which
+    /// satisfies this), and the destination slack at the writable
+    /// tail MUST be ≥ 31 bytes past `tail + total` (donor's 16-byte
+    /// SIMD-copy overshoot bound doubles for 32-byte ymm stride).
+    #[allow(unused_variables, unused_mut, dead_code)]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_avx2(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        unreachable!(
+            "exec_sequence_inline_avx2 called on backend that did not override the default \
+             (only UserSliceBackend overrides for the AVX2 tier execute path)"
+        );
+    }
+
     /// Construct an empty backend. Backend-specific sizing is done
     /// via `with_capacity` constructors on the concrete types (see
     /// [`super::flat_buf::FlatBuf::with_capacity`]).
