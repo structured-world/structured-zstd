@@ -64,6 +64,148 @@ impl FlatBuf {
 }
 
 impl BufferBackend for FlatBuf {
+    /// FlatBuf opts into the donor-shape inline `exec_sequence_inline`
+    /// path on x86_64 (same gate as `UserSliceBackend`). FlatBuf is
+    /// selected for single-segment frames (frame_content_size known
+    /// up-front, single block of literals+matches). Its
+    /// `with_capacity(cap + WILDCOPY_OVERLENGTH)` reserve already
+    /// carries the 32-byte SIMD overshoot slack the inline path
+    /// requires. Issue #279 round 4 track 1c (renamed track 5a):
+    /// opting FlatBuf in unlocks the AVX2 32-byte ymm match-copy
+    /// fast path for single-segment frames (decodecorpus-z000033 et
+    /// al), which previously fell through to the layered
+    /// `repeat_lookahead_prefetched` chain via the trait-method CALL
+    /// boundary.
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = cfg!(target_arch = "x86_64");
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        // FlatBuf is growable: capacity ≥ len + WILDCOPY_OVERLENGTH
+        // by invariant. Caller's per-block `reserve(MAX_BLOCK_SIZE)`
+        // guarantees the additional `lit_length + match_length +
+        // overshoot` fits. Asserting in debug; release trusts the
+        // caller to honour the contract.
+        let buf_len = self.buf.len();
+        let total = lit_length + match_length;
+        debug_assert!(
+            buf_len + total + 15 <= self.buf.capacity(),
+            "FlatBuf::exec_sequence_inline: insufficient capacity"
+        );
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        let live_len = buf_len - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "FlatBuf::exec_sequence_inline: offset {offset} exceeds live window",
+        );
+
+        unsafe {
+            let base_mut = self.buf.as_mut_ptr();
+
+            // Literal copy: donor `ZSTD_copy16` + optional wildcopy tail.
+            let op_lit = base_mut.add(buf_len);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            // Match copy.
+            let op_match = base_mut.add(buf_len + lit_length);
+            let match_src = base_mut.cast_const().add(buf_len + lit_length - offset);
+
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+
+            // Bump len. Capacity asserted above; this is safe.
+            self.buf.set_len(buf_len + total);
+        }
+        Ok(())
+    }
+
+    /// AVX2-tier override — same shape as [`Self::exec_sequence_inline`]
+    /// but the no-overlap match-copy uses 32-byte ymm wildcopy via
+    /// `wildcopy_no_overlap_avx2` when `offset >= 32`. Mid-offset range
+    /// (16..=31) keeps the SSE2 16-byte stride for correctness (32-byte
+    /// load at offset 16..31 would read uninitialised destination
+    /// bytes; same bound as the `UserSliceBackend::exec_sequence_inline_avx2`
+    /// override).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn exec_sequence_inline_avx2(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        let buf_len = self.buf.len();
+        let total = lit_length + match_length;
+        // AVX2 overshoot bound: 31 bytes. WILDCOPY_OVERLENGTH = 32
+        // baked into with_capacity covers it.
+        debug_assert!(
+            buf_len + total + 31 <= self.buf.capacity(),
+            "FlatBuf::exec_sequence_inline_avx2: insufficient capacity"
+        );
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        let live_len = buf_len - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "FlatBuf::exec_sequence_inline_avx2: offset {offset} exceeds live window",
+        );
+
+        unsafe {
+            let base_mut = self.buf.as_mut_ptr();
+
+            // Literal copy stays on SSE2 16-byte — caller-side
+            // inline-path slack gate is 16-byte literal bound.
+            let op_lit = base_mut.add(buf_len);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            // Match copy — divergent on no-overlap fast path.
+            let op_match = base_mut.add(buf_len + lit_length);
+            let match_src = base_mut.cast_const().add(buf_len + lit_length - offset);
+
+            if offset >= 32 {
+                wildcopy_no_overlap_avx2(op_match, match_src, match_length);
+            } else if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+
+            self.buf.set_len(buf_len + total);
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         Self {
             buf: Vec::new(),
