@@ -30,6 +30,7 @@ use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
 };
+use structured_zstd::encoding::FrameCompressor;
 use support::{
     LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered,
 };
@@ -578,6 +579,37 @@ fn bench_dictionary(c: &mut Criterion) {
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
                 b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
+            });
+
+            // pure_rust_with_dict: Rust-side dictionary-driven compress
+            // throughput, parity with the c_ffi_with_dict arm above. The
+            // dict bytes (`ffi_dictionary`) are stable across iters; we
+            // attach via `set_dictionary_from_bytes` per iter because
+            // `FrameCompressor::set_dictionary` consumes the
+            // `Dictionary` value (no Clone), so reusing a single
+            // compressor across iters would require an unsafe
+            // `ptr::read`-style move. The per-iter parse cost is small
+            // vs the actual compression hot path (dictionaries are at
+            // most tens of KiB; payloads are KiB-MiB).
+            //
+            // Matches the c_ffi_with_dict shape: each iter constructs a
+            // fresh `Compressor::with_dictionary` (which also re-parses
+            // dict bytes), so the apples-to-apples comparison stays
+            // intact — both sides amortise dict parse + entropy cache
+            // build into the timed call.
+            group.bench_function("pure_rust_with_dict", |b| {
+                b.iter(|| {
+                    let mut compressor = FrameCompressor::new(level.rust_level);
+                    compressor
+                        .set_dictionary_from_bytes(&ffi_dictionary)
+                        .expect("dictionary should attach");
+                    compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                    compressor.set_source(scenario.bytes.as_slice());
+                    let mut compressed = Vec::new();
+                    compressor.set_drain(&mut compressed);
+                    compressor.compress();
+                    black_box(compressed)
+                })
             });
 
             group.finish();
