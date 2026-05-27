@@ -87,20 +87,47 @@ impl BufferBackend for FlatBuf {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
-        // FlatBuf is growable: capacity ≥ len + WILDCOPY_OVERLENGTH
-        // by invariant. Caller's per-block `reserve(MAX_BLOCK_SIZE)`
-        // guarantees the additional `lit_length + match_length +
-        // overshoot` fits. Asserting in debug; release trusts the
-        // caller to honour the contract.
+        // Fallible capacity check. The caller's per-block
+        // `reserve(MAX_BLOCK_SIZE)` plus the `WILDCOPY_OVERLENGTH`
+        // slack baked into `with_capacity` covers well-formed frames,
+        // but a malformed sequence stream can produce a
+        // `lit_length + match_length` that exceeds the reserved
+        // headroom. Surface that as `OutputBufferOverflow` (mirrors
+        // `UserSliceBackend::exec_sequence_inline`) so the safe
+        // public decode APIs see a structured error instead of UB
+        // from writing past `Vec::capacity()`. All sums use
+        // `checked_*` against adversarial input that could wrap
+        // `usize`.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.buf.capacity();
         let buf_len = self.buf.len();
-        let total = lit_length + match_length;
-        debug_assert!(
-            buf_len + total + 15 <= self.buf.capacity(),
-            "FlatBuf::exec_sequence_inline: insufficient capacity"
-        );
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = buf_len
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        match cap_required {
+            Some(v) if v <= cap => {}
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        }
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         let live_len = buf_len - self.head;
@@ -155,18 +182,43 @@ impl BufferBackend for FlatBuf {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
         };
+        // Fallible capacity check. AVX2 32-byte stride overshoots up
+        // to 31 bytes past `tail + total`; FlatBuf's
+        // `with_capacity(... + WILDCOPY_OVERLENGTH = 32)` covers
+        // well-formed frames, but malformed inputs that exceed the
+        // reserved headroom surface as `OutputBufferOverflow` instead
+        // of UB.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let cap = self.buf.capacity();
         let buf_len = self.buf.len();
-        let total = lit_length + match_length;
-        // AVX2 overshoot bound: 31 bytes. WILDCOPY_OVERLENGTH = 32
-        // baked into with_capacity covers it.
-        debug_assert!(
-            buf_len + total + 31 <= self.buf.capacity(),
-            "FlatBuf::exec_sequence_inline_avx2: insufficient capacity"
-        );
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = buf_len
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        match cap_required {
+            Some(v) if v <= cap => {}
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        }
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         let live_len = buf_len - self.head;
