@@ -215,6 +215,16 @@ def normalize_impl(impl):
         return "rust"
     if impl == "c_ffi":
         return "ffi"
+    # Dict-bench implementations: collapse the with-dict pair to the same
+    # (rust, ffi) key shape the rest of the dashboard uses so the dict
+    # stage row produces a comparable ratio/speed pair. `c_ffi_without_dict`
+    # stays distinct — it's the no-dict baseline measured inside the same
+    # compress-dict group on purpose, and the loop downstream needs to see
+    # all three to compute the with-dict-vs-without-dict ratio.
+    if impl == "pure_rust_with_dict":
+        return "rust"
+    if impl == "c_ffi_with_dict":
+        return "ffi"
     return impl
 
 def include_in_regression_set(parsed_name, regression_levels):
