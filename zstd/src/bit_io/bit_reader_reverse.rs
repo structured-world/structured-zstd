@@ -429,6 +429,77 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         (val1, val2, val3)
     }
 
+    /// BMI2-scoped variant of [`peek_bits`]. The whole body executes
+    /// in `#[target_feature(enable = "bmi2")]` scope, so `_bzhi_u64`
+    /// inlines as a single `bzhi` instruction at the caller site
+    /// instead of crossing the `mask_lower_bits_bmi2_impl` CALL
+    /// boundary (the issue documented in #279 round 3).
+    ///
+    /// Use from any caller that is itself `#[target_feature(bmi2)]`-
+    /// scoped and has verified the runtime CPU supports BMI2.
+    ///
+    /// # Safety
+    /// Caller MUST ensure BMI2 is available on the running CPU. The
+    /// `bzhi` instruction faults with #UD on hardware that does not
+    /// advertise BMI2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "bmi2")]
+    #[inline]
+    pub(crate) unsafe fn peek_bits_bmi2(&mut self, n: u8) -> u64 {
+        debug_assert!(
+            n == 0 || self.bits_consumed + n <= 64,
+            "peek_bits_bmi2: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            n
+        );
+        let shift_by = (64u8 - self.bits_consumed).wrapping_sub(n);
+        core::arch::x86_64::_bzhi_u64(self.bit_container.wrapping_shr(shift_by as u32), n as u32)
+    }
+
+    /// BMI2-scoped variant of [`peek_bits_triple`]. Mirrors the
+    /// scalar/K-trait variant but inlines `_pext_u64` directly instead
+    /// of crossing the `extract_triple_pext` CALL boundary.
+    ///
+    /// On AMD Zen1/Zen2 (vendor=AuthenticAMD family=0x17) `_pext_u64`
+    /// goes through slow microcode; callers should still consult
+    /// `self.use_pext_triple` (populated at construction from the
+    /// global dispatch cache) and route to the scalar variant on
+    /// those CPUs. This method assumes the caller already gated on
+    /// `use_pext_triple == true`.
+    ///
+    /// # Safety
+    /// Caller MUST ensure BMI2 is available AND the running CPU
+    /// benefits from `_pext_u64` (i.e. not Zen1/Zen2).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "bmi2")]
+    #[inline]
+    pub(crate) unsafe fn peek_bits_triple_bmi2(
+        &mut self,
+        sum: u8,
+        n1: u8,
+        n2: u8,
+        n3: u8,
+    ) -> (u64, u64, u64) {
+        debug_assert_eq!(
+            u16::from(sum),
+            u16::from(n1) + u16::from(n2) + u16::from(n3),
+            "peek_bits_triple_bmi2: sum ({}) must equal n1+n2+n3 ({}+{}+{})",
+            sum,
+            n1,
+            n2,
+            n3
+        );
+        debug_assert!(
+            sum == 0 || self.bits_consumed + sum <= 64,
+            "peek_bits_triple_bmi2: not enough bits (consumed={}, requested={})",
+            self.bits_consumed,
+            sum
+        );
+        let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
+        let all_three = self.bit_container.wrapping_shr(shift_by as u32);
+        extract_triple_pext(all_three, n1, n2, n3)
+    }
+
     /// Consume `n` bits from the source.
     #[inline(always)]
     pub fn consume(&mut self, n: u8) {
@@ -661,6 +732,69 @@ mod test {
 
         assert_eq!((r1, r2, r3), (t1, t2, t3));
         assert_eq!(ref_br.bits_remaining(), triple_br.bits_remaining());
+    }
+
+    /// `peek_bits_bmi2` MUST produce the same value as scalar `peek_bits`
+    /// on every BMI2-capable CPU. Without parity the bmi2 fast-path
+    /// chain (when wired) would silently corrupt FSE state.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn peek_bits_bmi2_matches_scalar() {
+        if !is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let data: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01, 0x99, 0x88, 0x77, 0x66,
+            0x55, 0x44,
+        ];
+
+        for n in [0u8, 1, 5, 8, 13, 24, 32, 48, 56] {
+            let mut scalar =
+                super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+            let mut bmi2 = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+            scalar.ensure_bits(n);
+            bmi2.ensure_bits(n);
+            let s = scalar.peek_bits(n);
+            // SAFETY: gated on `is_x86_feature_detected!("bmi2")` above.
+            let b = unsafe { bmi2.peek_bits_bmi2(n) };
+            assert_eq!(s, b, "mismatch at n={}", n);
+        }
+    }
+
+    /// `peek_bits_triple_bmi2` MUST produce the same triple as the
+    /// scalar variant for every width combination the FSE/HUF decoders
+    /// can reach.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn peek_bits_triple_bmi2_matches_scalar() {
+        if !is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let data: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01, 0x99, 0x88, 0x77, 0x66,
+            0x55, 0x44,
+        ];
+
+        let widths = [
+            (0, 0, 0),
+            (1, 1, 1),
+            (3, 5, 7),
+            (8, 8, 8),
+            (15, 16, 17),
+            (5, 0, 4),
+        ];
+        for &(n1, n2, n3) in &widths {
+            let sum = n1 + n2 + n3;
+            let mut scalar =
+                super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+            let mut bmi2 = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+            scalar.ensure_bits(sum);
+            bmi2.ensure_bits(sum);
+            let s = scalar.peek_bits_triple(sum, n1, n2, n3);
+            // SAFETY: gated on `is_x86_feature_detected!("bmi2")` above.
+            let b = unsafe { bmi2.peek_bits_triple_bmi2(sum, n1, n2, n3) };
+            assert_eq!(s, b, "mismatch at widths=({},{},{})", n1, n2, n3);
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
