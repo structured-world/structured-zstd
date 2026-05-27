@@ -904,7 +904,11 @@ impl FrameDecoder {
             );
 
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            let len_before_block = state.decoder_scratch.buffer_len();
+            let len_before_block: Option<usize> = if self.per_block_checksums_enabled {
+                Some(state.decoder_scratch.buffer_len())
+            } else {
+                None
+            };
             let bytes_read_in_block_body = state
                 .decoder_scratch
                 .decode_block_content(&mut block_dec, &block_header, &mut source)
@@ -913,9 +917,9 @@ impl FrameDecoder {
 
             // Per-block XXH64 (low 32 bits) of the just-decompressed
             // bytes. Hashed from `last_n_as_slices` so RingBuffer wrap
-            // is handled in-place — no extra copy.
+            // is handled in-place, no extra copy.
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            if self.per_block_checksums_enabled {
+            if let Some(len_before_block) = len_before_block {
                 let added = state.decoder_scratch.buffer_len() - len_before_block;
                 let (s1, s2) = state.decoder_scratch.last_n_as_slices(added);
                 let mut h = twox_hash::XxHash64::with_seed(0);
@@ -1590,11 +1594,18 @@ impl FrameDecoder {
         // `self.computed_block_checksums`, so the digests vector
         // stays consistent with the legacy `decode_blocks` path
         // regardless of which dispatch the frame took.
+        // `Vec::new()` does not allocate, so this stays free when
+        // `per_block_checksums_enabled` is false: the `push` and the
+        // post-loop hashing loop are both gated by the same flag.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         let mut block_ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
         loop {
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            let produced_before = produced as usize;
+            let produced_before: Option<usize> = if self.per_block_checksums_enabled {
+                Some(produced as usize)
+            } else {
+                None
+            };
             let (block_header, hsize) = block_dec
                 .read_block_header(&mut *input)
                 .map_err(err::FailedToReadBlockHeader)?;
@@ -1654,7 +1665,7 @@ impl FrameDecoder {
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            if self.per_block_checksums_enabled {
+            if let Some(produced_before) = produced_before {
                 block_ranges.push((produced_before, produced as usize));
             }
             // Cap the visible buffer at window_size between blocks
