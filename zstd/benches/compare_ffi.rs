@@ -432,6 +432,19 @@ fn bench_dictionary(c: &mut Criterion) {
         // on the FFI side and `ffi_samples.len()` would diverge
         // from `sample_count` (the value reported in BENCH_WARN).
         let ffi_samples = build_training_samples(scenario.bytes.as_slice());
+        // Lockstep gate: `ffi_samples.len()` is what gets reported in
+        // BENCH_WARN below and `sample_count` is what the
+        // `training_sample_count` helper computes — both walk the
+        // same chunking + 2-sample fallback ladder. Future drift in
+        // either helper would silently desync the diagnostic
+        // numbers; debug_assert catches that during development with
+        // zero cost in optimised bench runs.
+        debug_assert_eq!(
+            ffi_samples.len(),
+            sample_count,
+            "build_training_samples and training_sample_count diverged for {}",
+            scenario.id
+        );
         let max_dict_size = total_training_bytes.saturating_sub(64);
         let dict_size = dictionary_size_for(scenario.len())
             .max(256)
@@ -611,20 +624,30 @@ fn bench_dictionary(c: &mut Criterion) {
                 })
             });
 
-            group.bench_function("pure_rust_with_dict", |b| {
-                b.iter(|| {
-                    let mut compressor = FrameCompressor::new(level.rust_level);
-                    compressor
-                        .set_dictionary_from_bytes(&ffi_dictionary)
-                        .expect("dictionary should attach");
-                    compressor.set_source_size_hint(scenario.bytes.len() as u64);
-                    compressor.set_source(scenario.bytes.as_slice());
-                    let mut compressed = Vec::new();
-                    compressor.set_drain(&mut compressed);
-                    compressor.compress();
-                    black_box(compressed)
-                })
-            });
+            // Gate pure_rust_with_dict registration on the same
+            // `rust_dict_handle.is_some()` signal that
+            // decompress-dict uses below — if DictionaryHandle::
+            // decode_dict failed earlier (the per-scenario parse
+            // above), FrameCompressor::set_dictionary_from_bytes
+            // routes through the same Dictionary::decode_dict and
+            // would fail identically. An `.expect()` panic inside
+            // b.iter would abort the whole bench suite.
+            if rust_dict_handle.is_some() {
+                group.bench_function("pure_rust_with_dict", |b| {
+                    b.iter(|| {
+                        let mut compressor = FrameCompressor::new(level.rust_level);
+                        compressor
+                            .set_dictionary_from_bytes(&ffi_dictionary)
+                            .expect("dictionary should attach");
+                        compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                        compressor.set_source(scenario.bytes.as_slice());
+                        let mut compressed = Vec::new();
+                        compressor.set_drain(&mut compressed);
+                        compressor.compress();
+                        black_box(compressed)
+                    })
+                });
+            }
 
             group.finish();
 
