@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779866718195,
+  "lastUpdate": 1779871125594,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -48674,6 +48674,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df032d4b462c5600092f64b425bb1e34744e3a38",
+          "message": "perf(encoding): HUF_flags_preferRepeat for fast strategies + small literals (#23 G6) (#278)\n\n* perf(encoding): HUF_flags_preferRepeat for fast strategies + small literals (#23 G6)\n\nDonor zstd_compress_literals.c:165 sets HUF_flags_preferRepeat\nwhen strategy < ZSTD_lazy (Fast / Dfast / Greedy) AND\nsrcSize <= 1024. Inside HUF_compress (huf_compress.c:1360-1364,\n1396-1400), the flag short-circuits the rebuild path when the\nprevious table is valid — fast-band tiny literal sections reuse\nthe prior tree instead of paying for a fresh tree-build +\ndescription-emit.\n\nOur compress_literals + estimate_literals_section_bytes both\nroute through decide_huff_reuse_like_encoder, which used only the\nsize-comparison heuristic. For small fast-band sections the\nestimated payload size is dominated by the tree-description\noverhead, so the rebuild path could occasionally win on raw\nestimate while losing once the description bytes are accounted\nfor in the actual wire output.\n\nMirror the donor preferRepeat semantics at the decision-helper:\nwhen strategy is Fast / Dfast / Greedy AND literals.len() <=\n1024 AND the previous table exists with a valid estimate,\nshort-circuit to reuse. Both call sites (splitter cost estimator\n+ encoder) get the same decision, no drift.\n\n644/644 default tests pass; cargo clippy clean. Closes #23 G6\n(one of 8 enumerated donor-parity gaps tracked in issue body).\n\n* perf(encoding): preferRepeat early fast-path + unit tests (#278 CR)\n\nCopilot review on #278:\n\n#1: the prefer_repeat short-circuit lived inside\ndecide_huff_reuse_like_encoder, so callers still paid the\nHuffmanTable::build_from_data / build_from_counts cost before\nthe gate fired. For fast-band tiny literal sections that hit\nthe reuse path, that's wasted work — donor's HUF_compress\nchecks the flag BEFORE the histogram + tree-build\n(huf_compress.c:1360-1364). Add an early fast-path in\ncompress_literals and estimate_literals_section_bytes: when\nprefer_repeat_eligible AND the prior table can encode the\nliterals (estimate_compressed_size returns Some), skip the\nbuild and route directly through the reuse emit / cost. The\nlate gate in decide_huff_reuse_like_encoder stays as a\ndefensive fallback for callers that bypass the early check.\n\nExtracted emit_reuse_literals helper to keep\ncompress_literals' fast-path body tight; it mirrors the\npost-decide reuse branch byte-for-byte (same size_format\nladder + min_gain raw-fallback gate) so wire output is\nidentical to the size-comparison reuse path when both would\npick reuse.\n\n#2: no test exercised the prefer_repeat branch (existing\nestimator/emit parity tests seed Lazy reuse, fast-band runs\nwith last_huff_table: None). Add two focused unit tests:\n  - prefer_repeat_eligible_matches_donor_gate: enum-by-enum\n    check that the strategy * size gate fires for\n    Fast/Dfast/Greedy at len <= 1024 and stays off for\n    Lazy/BtOpt/BtUltra*/len > 1024.\n  - decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band:\n    seed prev + new tables built from the same data, verify\n    Fast/Dfast/Greedy at len <= 1024 force reuse (return false)\n    via the short-circuit even when the size-comparison\n    heuristic alone might split.\n\n646/646 default tests pass; cargo clippy clean.\n\n* test(encoding): distinguishing fixture for preferRepeat override (#278 CR)\n\nCR (CodeRabbit) on #278: the prior test built both prev and new\ntables from the same sample, so the size-comparison heuristic\nalready preferred reuse and the test passed even with the\npreferRepeat short-circuit removed — failing to verify the\nnew behaviour.\n\nReplace the fixture with a deliberately disagreeing pair:\n  - prev: broad uniform sweep (256-symbol coverage)\n  - literals: heavily skewed (240 zeros + 16 outliers); a\n    freshly-built new_tbl on those literals concentrates\n    probability and yields lower estimate_compressed_size\n    than prev.\n\nNew test structure:\n  1. Precondition assert: Lazy (outside the eligible band)\n     must return true on this fixture — proves the\n     size-heuristic prefers new without preferRepeat.\n  2. Override assert: Fast/Dfast/Greedy at len <= 1024 must\n     return false (reuse), proving the gate overrides the\n     heuristic.\n  3. Threshold boundary: Fast at len > 1024 must NOT\n     short-circuit — fall through to the heuristic, which\n     prefers new on the extended fixture.\n\nIf the preferRepeat short-circuit is removed from\ndecide_huff_reuse_like_encoder, the override assert flips to\ntrue and the test fails — that's the regression gate.\n\n646/646 default tests pass; cargo clippy clean.\n\n* docs(encoding): full RFC 8878 treeless header field listing in emit_reuse_literals doc (#278 CR)\n\nCR (Copilot) on #278: doc comment listed 'size_format header\nbits, payload length, huf payload' but the function also writes\nthe regenerated (uncompressed) literals length field BEFORE the\ncompressed payload size. Donor + RFC 8878 §3.1.1.3.1.1 treeless\nliterals section actually has: type bits, size_format,\nregenerated_size, compressed_size, huf payload. Rewrite the doc\nto list all five fields so future readers comparing against the\nspec or compress_literals see the full shape.\n\n* docs(encoding): clarify preferRepeat is unconditional CPU-avoidance override, not size-based (#278 CR)\n\nCR (Copilot) on #278:\n\n#5: comment said the fast-path skips rebuild 'when the rebuild\nwould lose to reuse anyway' — but preferRepeat intentionally\noverrides the size comparison and picks reuse EVEN when a fresh\ntable would compress better (the regression test verifies this\ndisagreement). Rewrite to state donor's actual policy: CPU\navoidance bias on fast-band tiny sections, deliberate small\nratio trade-off, see decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band\ntest for proof.\n\n#6: prefer_repeat_eligible doc said 'Pure size-comparison\ndecide_huff_reuse_like_encoder is kept as the fallback', but\ndecide_huff_reuse_like_encoder now implements a MIXED policy\n(preferRepeat override first, size-comparison after). Rewrite\nto reflect the layered shape: override fires for fast band <=\n1024, size-comparison heuristic handles the warm-band / large-\ninput cases.\n\n* test: replace Vec::new()+resize with iterator extend (clippy slow-vector-initialization)\n\n`Vec::new()` followed by `resize(N, 0u8)` is flagged by clippy as a\nslow zero-filling pattern. Use `Vec::with_capacity` + `extend` with\n`core::iter::repeat_n` for the zero-prefix and the original `extend`\nfor the 200..216 tail. Functionally identical: same final 256-byte\nshape, same `prev_training` skew that drives the preferRepeat\nregression gate.\n\n* test(encoding): use core::iter::repeat_n in big_skewed setup (no-std-friendly)\n\nMirror the earlier `core::iter::repeat_n` use in the same test; the\n`std::` path made `cargo test --no-default-features` fail to compile\nthis `#[cfg(test)]` module because the crate only `extern crate std`\nunder the `std` feature.\n\n* fix(decoding): rephrase ddict_is_cold doc to avoid clippy doc_lazy_continuation\n\nclippy 1.95 parses `* 2` at line start as a markdown list bullet, then\nflags subsequent lines as \"doc list item without indentation\". Move the\n`num_sequences >= ADVANCE * 2` constraint onto a single line and drop\nthe parenthetical line break that triggered the same lint.",
+          "timestamp": "2026-05-27T10:44:50+03:00",
+          "tree_id": "ef2f46dcaa1cfa16c7f98814f1e57f1f0b123ac5",
+          "url": "https://github.com/structured-world/structured-zstd/commit/df032d4b462c5600092f64b425bb1e34744e3a38"
+        },
+        "date": 1779871120832,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.136,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 350.425,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 251.119,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.559,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.78,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.953,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.077,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.823,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.013,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.347,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.394,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.773,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.721,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.068,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.829,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
