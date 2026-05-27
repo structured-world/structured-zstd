@@ -656,9 +656,16 @@ fn estimate_literals_section_bytes(
     }
 
     // Donor preferRepeat fast-path: skip the histogram +
-    // `build_from_counts` cost when the rebuild would lose to
-    // reuse anyway. Mirrors `compress_literals` so both code
-    // paths agree byte-for-byte. The prev-table validation
+    // `build_from_counts` cost. Mirrors donor's
+    // `huf_compress.c:1360-1364` policy — when the prior table
+    // is valid for the input, REUSE unconditionally regardless
+    // of whether a freshly-built table would compress better.
+    // This is a deliberate CPU-avoidance bias on fast-band tiny
+    // sections; see `decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band`
+    // test which seeds a fixture where size-comparison would
+    // pick new and asserts the override still picks reuse.
+    // Mirrors `compress_literals` so both code paths agree
+    // byte-for-byte. The prev-table validation
     // (`estimate_compressed_size` returns Some) gates the
     // short-circuit so we still fall through to rebuild when the
     // prior table can't encode the current literals.
@@ -909,8 +916,14 @@ fn mode_table_description_bytes(mode: &FseTableMode<'_>) -> usize {
 /// the flag short-circuits the rebuild path when the prior table
 /// is valid; we mirror it at our caller layer so the wasted
 /// `HuffmanTable::build_from_data` work is also skipped on the
-/// fast-band reuse path. Pure size-comparison `decide_huff_reuse_
-/// like_encoder` is kept as the warm-band / large-input fallback.
+/// fast-band reuse path. Note this is an UNCONDITIONAL reuse
+/// override — donor intentionally picks reuse even when a fresh
+/// table would compress better, trading a small ratio loss on
+/// tiny sections for the CPU saved on the tree build. The
+/// `decide_huff_reuse_like_encoder` helper then implements a
+/// MIXED policy: the preferRepeat override fires first for the
+/// fast band; outside that band, the existing size-comparison
+/// heuristic decides reuse vs rebuild based on estimated bytes.
 #[inline]
 fn prefer_repeat_eligible(
     strategy: crate::encoding::strategy::StrategyTag,
