@@ -92,8 +92,7 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
 // observed in perf annotate. Removing the annotations let LLVM either
 // inline too aggressively (caller bloat / icache pressure) or pick a
 // worse code layout. Hands-off LLVM heuristic is the wrong call here.
-#[cold]
-#[inline(never)]
+#[inline]
 fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
