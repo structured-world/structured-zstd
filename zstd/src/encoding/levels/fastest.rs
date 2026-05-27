@@ -226,6 +226,7 @@ mod tests {
             true,
             vec![0xAB; 1024],
             &mut output,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
         assert_eq!(emitted, BlockType::RLE);
@@ -268,6 +269,7 @@ mod tests {
             true,
             block.clone(),
             &mut output,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
         assert_eq!(emitted, BlockType::Raw);
