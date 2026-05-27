@@ -752,16 +752,6 @@ fn run_pipelined_sequence_loop<
     Ok(())
 }
 
-/// Pipelined-path executor variant: takes the offset already resolved
-/// by the decode-ahead `shadow_hist` walk, so `do_offset_history` is
-/// NOT called here (caller mutated only the shadow). Routes the match
-/// copy through `repeat_lookahead_prefetched`, which skips only the
-/// in-loop `prefetch_match_source` (redundant because the lookahead
-/// pipeline already issued a PREFETCH_L1 ADVANCE iterations earlier).
-/// The per-call `buffer.reserve(match_length)` is preserved by that
-/// variant — required for memory safety against malformed inputs whose
-/// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
-/// headroom.
 /// Post-resolve sequence shape carried by the pipelined ring. Stores
 /// only the fields the executor actually reads: literal length, match
 /// length, and the resolved-via-offset-history match offset. The raw
@@ -771,12 +761,17 @@ fn run_pipelined_sequence_loop<
 /// per slot (12 bytes per `ExecSeq` vs 16 for the previous
 /// `(Sequence, u32)` tuple) and the matching ring write traffic.
 #[derive(Copy, Clone)]
-pub(crate) struct ExecSeq {
-    pub ll: u32,
-    pub ml: u32,
-    pub actual_offset: u32,
+struct ExecSeq {
+    ll: u32,
+    ml: u32,
+    actual_offset: u32,
 }
 
+/// Pipelined-path executor wrapper: unpacks an `ExecSeq` ring slot into
+/// the `(Sequence, resolved_offset)` shape that
+/// `execute_one_sequence_pipelined` expects. Lives next to `ExecSeq` so
+/// the post-resolve contract (raw `Sequence.of` is dead; only
+/// `actual_offset` reaches the executor) is visible at one site.
 #[inline(always)]
 fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
@@ -799,6 +794,16 @@ fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBacke
     )
 }
 
+/// Pipelined-path executor variant: takes the offset already resolved
+/// by the decode-ahead `shadow_hist` walk, so `do_offset_history` is
+/// NOT called here (caller mutated only the shadow). Routes the match
+/// copy through `repeat_lookahead_prefetched`, which skips only the
+/// in-loop `prefetch_match_source` (redundant because the lookahead
+/// pipeline already issued a PREFETCH_L1 ADVANCE iterations earlier).
+/// The per-call `buffer.reserve(match_length)` is preserved by that
+/// variant — required for memory safety against malformed inputs whose
+/// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
+/// headroom.
 #[inline(always)]
 fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
