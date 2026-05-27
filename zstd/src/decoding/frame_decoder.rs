@@ -133,8 +133,14 @@ enum DecoderScratchKind {
 
 impl DecoderScratchKind {
     fn new_ring(window_size: usize) -> Self {
-        let mut s = DecoderScratch::<RingBuffer>::new(window_size);
-        s.buffer.reserve(window_size);
+        // Lazy ring-buffer allocation: do NOT `reserve(window_size)` here.
+        // The direct-decode path (`run_direct_decode`) writes through
+        // `UserSliceBackend` and never touches the ring; allocating it
+        // eagerly wastes one full window of peak memory on the common
+        // direct-eligible frame. The non-direct `decode_blocks` path
+        // grows the buffer on demand via `RingBuffer::reserve_amortized`
+        // the first time a block writes into it. Issue #279 round 2.
+        let s = DecoderScratch::<RingBuffer>::new(window_size);
         Self::Ring(s)
     }
 
