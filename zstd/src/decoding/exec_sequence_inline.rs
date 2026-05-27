@@ -30,7 +30,53 @@
 // so the legacy chain handles non-x86_64 targets.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
-    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+    use core::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
+        _mm256_storeu_si256,
+    };
+
+    /// AVX2-tier `ZSTD_copy16`-equivalent: 32-byte ymm load/store. Used
+    /// by the AVX2-scoped wildcopy variant below. Caller must be in
+    /// target_feature(avx2) scope. Issue #279 round 3 Phase 4.
+    ///
+    /// # Safety
+    /// `dst` and `src` must each be valid for 32 bytes; regions
+    /// non-overlapping for the no-overlap caller; target_feature(avx2)
+    /// scope on caller.
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn copy32_avx2(dst: *mut u8, src: *const u8) {
+        unsafe {
+            let v = _mm256_loadu_si256(src as *const __m256i);
+            _mm256_storeu_si256(dst as *mut __m256i, v);
+        }
+    }
+
+    /// AVX2-tier `ZSTD_wildcopy(..., ZSTD_no_overlap)`: 32-byte ymm
+    /// loop until at least `length` bytes are written. May overshoot
+    /// up to 31 bytes past `dst + length`. Same caller contract as
+    /// [`wildcopy_no_overlap`] but doubled stride; AVX2 / WILDCOPY_OVERLENGTH
+    /// slack must accommodate ≥ 31 byte tail overshoot at the
+    /// destination. Issue #279 round 3 Phase 4.
+    ///
+    /// # Safety
+    /// Same as [`wildcopy_no_overlap`] plus caller in
+    /// target_feature(avx2) scope.
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn wildcopy_no_overlap_avx2(dst: *mut u8, src: *const u8, length: usize) {
+        debug_assert!(length > 0);
+        unsafe {
+            let mut off = 0usize;
+            loop {
+                copy32_avx2(dst.add(off), src.add(off));
+                off += 32;
+                if off >= length {
+                    break;
+                }
+            }
+        }
+    }
 
     /// Donor's `ZSTD_copy16`: one unaligned 16-byte SIMD store.
     /// SSE2 is the x86_64 baseline (and on x86 we gate via the

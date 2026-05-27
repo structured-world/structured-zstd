@@ -141,6 +141,64 @@ pub(crate) trait BufferBackend: Sized {
         );
     }
 
+    /// AVX2-tier variant of [`Self::exec_sequence_inline`]. Same
+    /// contract but the **no-overlap match-copy** path (`offset >= 32`)
+    /// emits 32-byte ymm stores via `wildcopy_no_overlap_avx2`. Issue
+    /// #279 round 3 Phase 4: invoked only from
+    /// `execute_one_sequence_pipelined_avx2` which is itself
+    /// `#[target_feature(enable = "avx2,bmi2")]`.
+    ///
+    /// **Literal copy stays on SSE2 16-byte** (`copy16` +
+    /// `wildcopy_no_overlap`) — the inline-path slack gate in
+    /// `execute_one_sequence_pipelined_avx2` is built around the
+    /// 16-byte literal over-read bound from the SSE2 default; widening
+    /// to 32-byte AVX2 stores on literals would require tightening
+    /// that gate to `lit_cur_before + 32 <= lit_len`, rejecting more
+    /// near-end-of-block sequences from the inline fast path. The
+    /// AVX2 divergence is therefore confined to the match-copy side,
+    /// where the per-block `reserve(MAX_BLOCK_SIZE)` plus the
+    /// `WILDCOPY_OVERLENGTH = 32` slack on `UserSliceBackend`
+    /// accommodates the 31-byte ymm overshoot without changing the
+    /// caller-side contract.
+    ///
+    /// Match-copy WILDCOPY overshoot at destination grows from 15 to
+    /// 31 bytes for the AVX2 path (32-byte stride overshoots up to 31
+    /// bytes past `tail + total`); the override raises
+    /// `MAX_WILDCOPY_OVERSHOOT` accordingly.
+    ///
+    /// Default impl is `unreachable!`. The x86_64 backends override:
+    /// `UserSliceBackend` (direct-decode path, fixed slice with
+    /// `WILDCOPY_OVERLENGTH` slack) and `FlatBuf` (single-segment
+    /// frames, Vec-backed with `with_capacity(+ WILDCOPY_OVERLENGTH)`
+    /// slack). Both gate via `SUPPORTS_INLINE_SEQUENCE_EXEC`; runtime
+    /// CPU AVX2 presence is gated at the dispatcher in
+    /// `sequence_section_decoder::decode_and_execute_sequences` via
+    /// `detect_cpu_kernel() == Avx2`. `RingBuffer` does NOT override
+    /// — multi-segment frames still go through the layered
+    /// `repeat()` chain that handles wrap correctly.
+    ///
+    /// # Safety
+    /// Same preconditions as [`Self::exec_sequence_inline`] plus:
+    /// caller MUST be in `#[target_feature(enable = "avx2,bmi2")]`
+    /// scope (the only call site is the AVX2-tier execute path which
+    /// satisfies this), and the destination slack at the writable
+    /// tail MUST be ≥ 31 bytes past `tail + total` (donor's 16-byte
+    /// SIMD-copy overshoot bound doubles for 32-byte ymm stride).
+    #[allow(unused_variables, unused_mut, dead_code)]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_avx2(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        unreachable!(
+            "exec_sequence_inline_avx2 called on backend that did not override the default \
+             (UserSliceBackend and FlatBuf override on x86_64)"
+        );
+    }
+
     /// Construct an empty backend. Backend-specific sizing is done
     /// via `with_capacity` constructors on the concrete types (see
     /// [`super::flat_buf::FlatBuf::with_capacity`]).
