@@ -63,6 +63,9 @@ pub(crate) mod scratch;
 // architectural plan; today the bodies still delegate into the
 // shared K-generic `decode_and_execute_sequences_impl`.
 #[cfg(target_arch = "x86_64")]
+#[macro_use]
+pub(crate) mod seq_decoder_x86_kernel;
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod seq_decoder_avx2;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod seq_decoder_bmi2;
