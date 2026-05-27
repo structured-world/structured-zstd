@@ -186,6 +186,14 @@ def parse_benchmark_name(name):
             "source": None,
             "implementation": parts[4],
         }
+    if len(parts) == 5 and parts[0] == "decompress-dict" and parts[3] == "matrix":
+        return {
+            "stage": "decompress-dict",
+            "level": parts[1],
+            "scenario": parts[2],
+            "source": None,
+            "implementation": parts[4],
+        }
     if len(parts) == 5 and parts[0] == "dict-train" and parts[3] == "matrix":
         return {
             "stage": "dict-train",
