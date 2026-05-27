@@ -37,14 +37,13 @@ macro_rules! define_x86_seq_decoder_tier {
         ///
         /// # Safety
         /// Caller's target_feature must include BMI2.
-        #[inline(always)]
         #[target_feature(enable = $tf)]
         #[allow(dead_code)]
-        unsafe fn $decode_one_fn<'a>(
+        unsafe fn $decode_one_fn<'a, 'b>(
             ll_dec: &mut $crate::fse::FSEDecoder<'a>,
             ml_dec: &mut $crate::fse::FSEDecoder<'a>,
             of_dec: &mut $crate::fse::FSEDecoder<'a>,
-            br: &mut $crate::bit_io::BitReaderReversed<'_, $kernel>,
+            br: &mut $crate::bit_io::BitReaderReversed<'b, $kernel>,
         ) -> $crate::blocks::sequence_section::Sequence {
             let ll_state = ll_dec.state;
             let ml_state = ml_dec.state;
@@ -104,11 +103,11 @@ macro_rules! define_x86_seq_decoder_tier {
         /// additional features advertised by `$tf`).
         #[allow(clippy::too_many_arguments)]
         #[target_feature(enable = $tf)]
-        unsafe fn $loop_fn<B: $crate::decoding::buffer_backend::BufferBackend>(
-            br: &mut $crate::bit_io::BitReaderReversed<'_, $kernel>,
-            ll_dec: &mut $crate::fse::FSEDecoder<'_>,
-            ml_dec: &mut $crate::fse::FSEDecoder<'_>,
-            of_dec: &mut $crate::fse::FSEDecoder<'_>,
+        unsafe fn $loop_fn<'a, 'b, B: $crate::decoding::buffer_backend::BufferBackend>(
+            br: &mut $crate::bit_io::BitReaderReversed<'b, $kernel>,
+            ll_dec: &mut $crate::fse::FSEDecoder<'a>,
+            ml_dec: &mut $crate::fse::FSEDecoder<'a>,
+            of_dec: &mut $crate::fse::FSEDecoder<'a>,
             buffer: &mut $crate::decoding::decode_buffer::DecodeBuffer<B>,
             offset_hist: &mut [u32; 3],
             literals_buffer: &[u8],
