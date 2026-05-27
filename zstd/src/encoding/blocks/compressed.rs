@@ -655,6 +655,28 @@ fn estimate_literals_section_bytes(
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
 
+    // Donor preferRepeat fast-path: skip the histogram +
+    // `build_from_counts` cost when the rebuild would lose to
+    // reuse anyway. Mirrors `compress_literals` so both code
+    // paths agree byte-for-byte. The prev-table validation
+    // (`estimate_compressed_size` returns Some) gates the
+    // short-circuit so we still fall through to rebuild when the
+    // prior table can't encode the current literals.
+    if prefer_repeat_eligible(strategy, literals.len())
+        && let Some(prev) = last_huff.as_ref()
+        && let Some(reuse_payload) = estimate_huff_payload_bytes_checked(prev, literals)
+    {
+        let compressed_header = compressed_literals_header_bytes(literals.len());
+        let total = compressed_header + reuse_payload; // no tree_desc on reuse
+        let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        let huf_section_size = total - compressed_header;
+        if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
+            *last_huff = None;
+            return raw_section_bytes;
+        }
+        return total;
+    }
+
     counts.fill(0);
     for &b in literals {
         counts[b as usize] += 1;
@@ -879,6 +901,28 @@ fn mode_table_description_bytes(mode: &FseTableMode<'_>) -> usize {
 /// size plus the single-stream payload estimate. A small-input guard
 /// (`new_desc + 12 >= literals.len()`) keeps the reuse path for tiny blocks
 /// where the description alone would exceed the literals.
+/// Donor `HUF_flags_preferRepeat` gate (`zstd_compress_literals.c:165`):
+/// fast-band strategies (`strategy < ZSTD_lazy` → Fast / Dfast /
+/// Greedy in our enum) with short literal sections (≤ 1024 bytes)
+/// prefer reusing the previous tree over rebuilding it. Inside
+/// donor's HUF_compress (`huf_compress.c:1360-1364, 1396-1400`),
+/// the flag short-circuits the rebuild path when the prior table
+/// is valid; we mirror it at our caller layer so the wasted
+/// `HuffmanTable::build_from_data` work is also skipped on the
+/// fast-band reuse path. Pure size-comparison `decide_huff_reuse_
+/// like_encoder` is kept as the warm-band / large-input fallback.
+#[inline]
+fn prefer_repeat_eligible(
+    strategy: crate::encoding::strategy::StrategyTag,
+    literals_len: usize,
+) -> bool {
+    use crate::encoding::strategy::StrategyTag;
+    matches!(
+        strategy,
+        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy
+    ) && literals_len <= 1024
+}
+
 fn decide_huff_reuse_like_encoder(
     new_table: &huff0_encoder::HuffmanTable,
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -886,32 +930,21 @@ fn decide_huff_reuse_like_encoder(
     literals: &[u8],
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> bool {
-    use crate::encoding::strategy::StrategyTag;
     let Some(prev) = last_table else {
         return true;
     };
     let Some(old_estimate) = prev.estimate_compressed_size(literals) else {
         return true;
     };
-    // Donor `HUF_flags_preferRepeat` gate
-    // (`zstd_compress_literals.c:165`): fast-band strategies
-    // (`strategy < ZSTD_lazy` → Fast / Dfast / Greedy in our enum)
-    // with short literal sections (≤ 1024 bytes) prefer reusing the
-    // previous tree over rebuilding it. Donor's HUF_compress
-    // implements the bias by short-circuiting the rebuild path when
-    // the flag is set AND the prior table is valid
-    // (`huf_compress.c:1360-1364, 1396-1400`); we mirror it at the
-    // decision-helper level here so the splitter cost estimator
-    // (`estimate_literals_section_bytes`) and the encoder
-    // (`compress_literals`) agree on the choice. Without the gate,
-    // the existing size-comparison heuristic occasionally rebuilds
-    // for marginal gains at fast levels — wasting table-emission
-    // overhead that's significant relative to the small payload.
-    let prefer_repeat = matches!(
-        strategy,
-        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy
-    ) && literals.len() <= 1024;
-    if prefer_repeat {
+    // Late-stage `HUF_flags_preferRepeat` mirror — kept here for
+    // any caller that bypasses the early fast-path in
+    // `compress_literals` / `estimate_literals_section_bytes`.
+    // The early fast-paths short-circuit BEFORE `build_from_data`
+    // / `build_from_counts` to skip wasted tree-build work; this
+    // late gate covers the (currently unreachable) shape where the
+    // new table is built first and the decision still wants to
+    // reuse.
+    if prefer_repeat_eligible(strategy, literals.len()) {
         return false;
     }
     let new_estimate = new_table
@@ -1921,6 +1954,58 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.append_bytes(&literals[..1]);
 }
 
+/// Reuse-only literals emit: writes the treeless variant
+/// (size_format header bits, payload length, huf payload) with
+/// `last_table`. Used by `compress_literals` when the donor
+/// preferRepeat gate short-circuits the rebuild path. Mirrors the
+/// post-decide branch at the bottom of `compress_literals`
+/// byte-for-byte (same size_format ladder, same min_gain
+/// raw-fallback gate) so the wire output is identical to the
+/// size-comparison reuse path when both would pick reuse.
+fn emit_reuse_literals(
+    literals: &[u8],
+    last_table: &huff0_encoder::HuffmanTable,
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    reset_idx: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+) -> HuffmanTableUpdate {
+    writer.write_bits(3u8, 2); // treeless compressed literals type
+    assert!(
+        literals.len() <= 262_143,
+        "literals exceed RFC 8878 18-bit size limit (262143)"
+    );
+    let (size_format, size_bits) = match literals.len() {
+        0..256 => (0b00u8, 10),
+        256..1024 => (0b01, 10),
+        1024..16384 => (0b10, 14),
+        _ => (0b11, 18),
+    };
+    writer.write_bits(size_format, 2);
+    writer.write_bits(literals.len() as u32, size_bits);
+    let size_index = writer.index();
+    writer.write_bits(0u32, size_bits);
+    let index_before = writer.index();
+    let mut encoder = huff0_encoder::HuffmanEncoder::new(last_table, writer);
+    if size_format == 0 {
+        encoder.encode(literals, false);
+    } else {
+        encoder.encode4x(literals, false);
+    }
+    let encoded_len = (writer.index() - index_before) / 8;
+    writer.change_bits(size_index, encoded_len as u64, size_bits);
+    let total_len = (writer.index() - reset_idx) / 8;
+
+    let compressed_header_len = compressed_literals_header_bytes(literals.len());
+    let huf_section_size = total_len - compressed_header_len;
+    if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
+        writer.reset_to(reset_idx);
+        raw_literals(literals, writer);
+        HuffmanTableUpdate::Cleared
+    } else {
+        HuffmanTableUpdate::Reused
+    }
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -1928,6 +2013,23 @@ fn compress_literals(
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
+
+    // Donor preferRepeat fast-path: when Fast/Dfast/Greedy on
+    // <=1024-byte literals AND the prior table can encode this
+    // input (`estimate_compressed_size` returns Some), skip the
+    // expensive `HuffmanTable::build_from_data` and route the
+    // emit straight through the reuse path. Mirrors donor's
+    // HUF_compress shape: `huf_compress.c:1360-1364` checks the
+    // flag BEFORE the histogram + tree-build, so the rebuild cost
+    // is avoided on fast-band tiny sections. Without this gate,
+    // we paid `build_from_data` then short-circuited at the
+    // decide-helper — wasted CPU on the hot fast-level path.
+    if prefer_repeat_eligible(strategy, literals.len())
+        && let Some(prev) = last_table
+        && prev.estimate_compressed_size(literals).is_some()
+    {
+        return emit_reuse_literals(literals, prev, writer, reset_idx, strategy);
+    }
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
 
@@ -2149,6 +2251,94 @@ mod tests {
         // Below the old threshold — both keep:
         assert!(!use_raw_literal_fallback(15, literals_len, strategy));
         assert!(!use_raw_literal_fallback(0, literals_len, strategy));
+    }
+
+    #[test]
+    fn prefer_repeat_eligible_matches_donor_gate() {
+        use super::prefer_repeat_eligible;
+        // Donor `zstd_compress_literals.c:165`:
+        //   strategy < ZSTD_lazy && srcSize <= 1024 -> HUF_flags_preferRepeat
+        // ZSTD_lazy == 4 in donor enum; our `< Lazy` set is
+        // {Fast, Dfast, Greedy}. Verify the gate fires for each
+        // and stays off for the rest.
+        for lit_len in [0usize, 1, 64, 256, 1024] {
+            assert!(
+                prefer_repeat_eligible(StrategyTag::Fast, lit_len),
+                "Fast/{lit_len}"
+            );
+            assert!(
+                prefer_repeat_eligible(StrategyTag::Dfast, lit_len),
+                "Dfast/{lit_len}"
+            );
+            assert!(
+                prefer_repeat_eligible(StrategyTag::Greedy, lit_len),
+                "Greedy/{lit_len}"
+            );
+            assert!(
+                !prefer_repeat_eligible(StrategyTag::Lazy, lit_len),
+                "Lazy/{lit_len}"
+            );
+            assert!(
+                !prefer_repeat_eligible(StrategyTag::BtOpt, lit_len),
+                "BtOpt/{lit_len}"
+            );
+            assert!(
+                !prefer_repeat_eligible(StrategyTag::BtUltra, lit_len),
+                "BtUltra/{lit_len}"
+            );
+            assert!(
+                !prefer_repeat_eligible(StrategyTag::BtUltra2, lit_len),
+                "BtUltra2/{lit_len}"
+            );
+        }
+        // Above the 1024-byte size threshold the gate stays off
+        // for ALL strategies (donor `srcSize <= 1024` is the
+        // closed upper bound).
+        for lit_len in [1025usize, 2048, 16384] {
+            assert!(!prefer_repeat_eligible(StrategyTag::Fast, lit_len));
+            assert!(!prefer_repeat_eligible(StrategyTag::Dfast, lit_len));
+            assert!(!prefer_repeat_eligible(StrategyTag::Greedy, lit_len));
+        }
+    }
+
+    #[test]
+    fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
+        use super::{decide_huff_reuse_like_encoder, huff0_encoder};
+        // Build a previous huff table from a fixed sample and the
+        // "new" table from the same data so the size-comparison
+        // path would normally split somewhere mid-tier. The
+        // preferRepeat gate must override that and force reuse
+        // (return false) for Fast/Dfast/Greedy at
+        // literals.len() <= 1024.
+        let sample: Vec<u8> = (0..512u32).map(|i| ((i * 13 + 7) % 251) as u8).collect();
+        let prev = huff0_encoder::HuffmanTable::build_from_data(&sample);
+        let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&sample);
+        let new_desc = new_tbl
+            .writeable_table_description_size()
+            .expect("non-empty table emits a description");
+
+        // Eligible band: must return false (reuse) regardless of
+        // size comparison outcome.
+        for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+            assert!(
+                !decide_huff_reuse_like_encoder(&new_tbl, Some(&prev), new_desc, &sample, strategy,),
+                "{strategy:?} <= 1024 must short-circuit to reuse"
+            );
+        }
+        // Outside the band the gate stays off — falls through to
+        // the size-comparison heuristic. We don't assert the
+        // boolean outcome (the heuristic's verdict depends on
+        // table sizes), only that the call doesn't panic on the
+        // non-fast-band path.
+        for strategy in [
+            StrategyTag::Lazy,
+            StrategyTag::BtOpt,
+            StrategyTag::BtUltra,
+            StrategyTag::BtUltra2,
+        ] {
+            let _ =
+                decide_huff_reuse_like_encoder(&new_tbl, Some(&prev), new_desc, &sample, strategy);
+        }
     }
 
     #[test]
