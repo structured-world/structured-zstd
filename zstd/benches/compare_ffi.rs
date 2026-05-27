@@ -633,6 +633,18 @@ fn bench_dictionary(c: &mut Criterion) {
             // would fail identically. An `.expect()` panic inside
             // b.iter would abort the whole bench suite.
             if rust_dict_handle.is_some() {
+                // Pre-size the drain to `with_dict_bytes.len()` —
+                // that's the known compressed size of `scenario.bytes`
+                // at this level WITH the dict attached (computed once
+                // above for the verification block + c_ffi_with_dict
+                // setup). FFI `Compressor::compress()` allocates the
+                // full output buffer up-front; matching that here
+                // keeps the measurement on the actual compression hot
+                // path rather than per-iter Vec growth via two-or-more
+                // realloc steps (`FrameCompressor::compress` does
+                // header `write_all` then per-block `write_all` so an
+                // empty starting Vec reallocates at least twice).
+                let preallocated_capacity = with_dict_bytes.len();
                 group.bench_function("pure_rust_with_dict", |b| {
                     b.iter(|| {
                         let mut compressor = FrameCompressor::new(level.rust_level);
@@ -641,7 +653,7 @@ fn bench_dictionary(c: &mut Criterion) {
                             .expect("dictionary should attach");
                         compressor.set_source_size_hint(scenario.bytes.len() as u64);
                         compressor.set_source(scenario.bytes.as_slice());
-                        let mut compressed = Vec::new();
+                        let mut compressed = Vec::with_capacity(preallocated_capacity);
                         compressor.set_drain(&mut compressed);
                         compressor.compress();
                         black_box(compressed)
