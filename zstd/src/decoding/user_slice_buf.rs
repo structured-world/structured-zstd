@@ -1210,4 +1210,65 @@ mod tests {
         // bytes (they're a function of overlap_copy8's spread
         // tables) but the output length must be right.
     }
+
+    /// `exec_sequence_inline_avx2` correctness across the
+    /// match-copy offset cases. Issue #279 round 4 regression:
+    /// the AVX2 32-byte ymm wildcopy threshold MUST be `offset >= 32`
+    /// (not >= 16). At offset 16..31 a 32-byte load from `match_src`
+    /// reads bytes inside the destination region BEFORE the first
+    /// store has written them; SSE2 16-byte fallback covers those
+    /// offsets safely. Test exercises:
+    /// - offset 20 (mid-range, must route to SSE2 fallback)
+    /// - offset 32 (boundary, AVX2 path)
+    /// - offset 64 (deep AVX2 path)
+    /// against a byte-by-byte reference of the same repeat semantics.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_avx2_offset_boundary_correctness() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+
+        for offset in [20usize, 32, 64] {
+            let mut buf = vec![0u8; 512 + WILDCOPY];
+            // Seed bytes 0..200 with a deterministic, byte-position-derived
+            // pattern so the reference match-copy is unambiguous.
+            for (i, slot) in buf.iter_mut().take(200).enumerate() {
+                *slot = ((i * 31 + 7) & 0xFF) as u8;
+            }
+            // Compute reference: byte-by-byte repeat from offset 100..(100+offset)
+            // up to match_length bytes, written at position 200.
+            let match_length = 96usize;
+            let mut reference = buf.clone();
+            for i in 0..match_length {
+                reference[200 + i] = reference[200 + i - offset];
+            }
+
+            // Now run the AVX2 inline executor on the actual buffer.
+            let mut b = UserSliceBackend::from_slice(&mut buf);
+            b.tail = 200;
+            let dummy_lits: [u8; 16] = [0xAA; 16];
+            unsafe {
+                b.exec_sequence_inline_avx2(dummy_lits.as_ptr(), 0, offset, match_length)
+                    .unwrap();
+            }
+            assert_eq!(b.tail, 200 + match_length);
+
+            // Compare match-copy region against the reference.
+            // Bytes 200..(200+match_length) must match the byte-by-byte
+            // repeat. The overshoot region past match_length is not pinned.
+            for i in 0..match_length {
+                assert_eq!(
+                    buf[200 + i],
+                    reference[200 + i],
+                    "exec_sequence_inline_avx2 offset={offset} byte {i}: \
+                     got {:#x}, expected {:#x} (regression: AVX2 wildcopy \
+                     reading past first-store boundary)",
+                    buf[200 + i],
+                    reference[200 + i],
+                );
+            }
+        }
+    }
 }

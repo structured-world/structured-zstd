@@ -5,7 +5,7 @@
 //! commits may add zmm 64-byte wildcopy once buffer-slack contracts
 //! are extended to WILDCOPY_OVERLENGTH = 64.
 
-crate::define_x86_seq_decoder_tier! {
+crate::decoding::seq_decoder_x86_kernel::define_x86_seq_decoder_tier! {
     kernel = crate::cpu_kernel::Vbmi2Kernel,
     target_feature = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw",
     decode_fn = decode_and_execute_sequences_vbmi2,

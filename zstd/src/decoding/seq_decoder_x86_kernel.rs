@@ -20,7 +20,13 @@
 /// `$decode_fn`, pipelined loop `$loop_fn`, and inner-sequence decoder
 /// `$decode_one_fn`. All three carry `#[target_feature(enable = $tf)]`
 /// and use `$kernel` as the BitReader's `K` parameter.
-#[macro_export]
+///
+/// Crate-private — the per-tier files (`seq_decoder_{bmi2,avx2,vbmi2}.rs`)
+/// invoke this via the `pub(crate) use` re-export below. NOT
+/// `#[macro_export]` because it's an internal decoder-generation
+/// shape; downstream crates have no reason to consume it and exposing
+/// it would lock in the macro syntax as part of the crate's public
+/// API surface.
 macro_rules! define_x86_seq_decoder_tier {
     (
         kernel = $kernel:ty,
@@ -427,3 +433,11 @@ macro_rules! define_x86_seq_decoder_tier {
         }
     };
 }
+
+// Crate-local re-export so per-tier modules
+// (`seq_decoder_{bmi2,avx2,vbmi2}.rs`) can invoke the macro via
+// `crate::decoding::seq_decoder_x86_kernel::define_x86_seq_decoder_tier!`
+// without `#[macro_export]` widening the API surface to downstream
+// crates.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use define_x86_seq_decoder_tier;
