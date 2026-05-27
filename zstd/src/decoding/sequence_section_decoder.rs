@@ -17,8 +17,8 @@ use alloc::vec::Vec;
 // 8-deep lookahead lets the prefetch issued at iteration `i`
 // resolve through L1/L2 by the time iteration `i + 8` consumes it,
 // whereas 4-deep often wasn't enough gap on long-distance workloads.
-pub(crate) const ADVANCE: usize = 8;
-pub(crate) const ADVANCE_MASK: usize = ADVANCE - 1;
+const ADVANCE: usize = 8;
+const ADVANCE_MASK: usize = ADVANCE - 1;
 // `i & ADVANCE_MASK` only equals `i % ADVANCE` when ADVANCE is a
 // power of two. Compile-time guard so a future ADVANCE tweak can't
 // silently corrupt the ring index.
@@ -169,7 +169,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 // and is called from the dispatch matcher above. See issue #279
 // round 3 for the per-kernel architecture rationale.
 
-#[inline(always)]
 pub(crate) fn decode_and_execute_sequences_impl<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
@@ -547,7 +546,6 @@ pub(crate) fn decode_and_execute_sequences_impl<
 /// Grouping into a struct would push pressure off the argument
 /// registers and onto memory loads, undoing the extraction's win.
 #[allow(clippy::too_many_arguments)]
-#[inline(always)]
 fn run_pipelined_sequence_loop<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
@@ -679,10 +677,10 @@ fn run_pipelined_sequence_loop<
 /// per slot (12 bytes per `ExecSeq` vs 16 for the previous
 /// `(Sequence, u32)` tuple) and the matching ring write traffic.
 #[derive(Copy, Clone)]
-pub(crate) struct ExecSeq {
-    pub(crate) ll: u32,
-    pub(crate) ml: u32,
-    pub(crate) actual_offset: u32,
+struct ExecSeq {
+    ll: u32,
+    ml: u32,
+    actual_offset: u32,
 }
 
 /// Pipelined-path executor wrapper: unpacks an `ExecSeq` ring slot into
@@ -691,7 +689,7 @@ pub(crate) struct ExecSeq {
 /// the post-resolve contract (raw `Sequence.of` is dead; only
 /// `actual_offset` reaches the executor) is visible at one site.
 #[inline(always)]
-pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
+fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
     lit_cur: &mut usize,
@@ -723,7 +721,7 @@ pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::
 /// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
 /// headroom.
 #[inline(always)]
-pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
+fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
     lit_cur: &mut usize,
@@ -954,7 +952,7 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     }
 }
 
-pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
+fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_, K>,
     scratch: &FSEScratch,
@@ -1225,7 +1223,7 @@ pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 
     raw << OFFSET_FSE_LOG.saturating_sub(table_log)
 }
 
-pub(crate) fn maybe_update_fse_tables(
+fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,
