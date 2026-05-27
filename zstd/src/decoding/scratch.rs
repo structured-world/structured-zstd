@@ -153,6 +153,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
                 offsets_long_share: 0,
+                ddict_is_cold: false,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -223,6 +224,14 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // (or vice versa: skip the pipeline when the new frame
         // actually has long offsets).
         self.fse.offsets_long_share = 0;
+        // Pair the one-shot cold-dict flag with `reset`: a scratch
+        // reused from a dictionary-attached frame whose blocks never
+        // entered sequence decoding (raw-/RLE-only blocks, zero-seq
+        // compressed blocks) would otherwise carry the flag into the
+        // next frame and mis-apply the cold-dict gate there. Cleared
+        // alongside `offsets_long_share` so the no-dict path keeps
+        // the documented "no behaviour change" property.
+        self.fse.ddict_is_cold = false;
 
         self.huf.table.reset();
     }
@@ -235,6 +244,13 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.buffer
             .dict_content
             .extend_from_slice(&dict.dict_content);
+        // Donor parity: `ZSTD_decompressBegin_usingDDict` sets
+        // `dctx->ddictIsCold = 1` so the first block of the frame
+        // engages the prefetch decoder regardless of long-offset
+        // share. We do the same here; the first
+        // `decode_and_execute_sequences` call consumes the flag and
+        // resets it to `false`.
+        self.fse.ddict_is_cold = true;
     }
 }
 
@@ -273,6 +289,19 @@ pub struct FSEScratch {
     /// The sequence-section pipeline gate reads this directly instead
     /// of re-walking `offsets.decode` per block.
     pub offsets_long_share: u32,
+    /// Mirrors donor `ZSTD_DCtx::ddictIsCold`. Set to `true` when a
+    /// dictionary is freshly attached (its FSE / HUF tables are not
+    /// yet in cache); the first sequence-section decode of the
+    /// resulting frame engages the pipelined prefetch decoder
+    /// regardless of long-offset share, then clears the flag so
+    /// subsequent blocks fall back to the `offsets_long_share`
+    /// heuristic. The sequence-count guard `num_sequences >= ADVANCE
+    /// * 2` still applies: blocks too small to fill the lookahead
+    /// pipeline take the short-block fallback in both the cold-dict
+    /// and warm cases. Without a dictionary the flag stays `false`
+    /// (cache state of the predefined / repeat tables is not
+    /// considered "cold" in the donor model).
+    pub ddict_is_cold: bool,
 }
 
 impl FSEScratch {
@@ -285,6 +314,7 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
             offsets_long_share: 0,
+            ddict_is_cold: false,
         }
     }
 
@@ -340,5 +370,34 @@ impl Deref for AlignedFSETable {
 impl DerefMut for AlignedFSETable {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoding::dictionary::Dictionary;
+
+    #[test]
+    fn init_from_dict_marks_fse_ddict_is_cold() {
+        // Donor parity: `ZSTD_decompressBegin_usingDDict` sets
+        // `dctx->ddictIsCold = 1`. Mirror: `init_from_dict` must
+        // leave `fse.ddict_is_cold = true` so the first
+        // sequence-section decode of the frame engages the prefetch
+        // pipeline regardless of `offsets_long_share`.
+        extern crate std;
+        let dict_raw =
+            std::fs::read("./dict_tests/dictionary").expect("dictionary fixture should load");
+        let dict = Dictionary::decode_dict(&dict_raw).expect("dictionary should parse");
+        let mut scratch: DecoderScratch = DecoderScratch::new(1024);
+        assert!(
+            !scratch.fse.ddict_is_cold,
+            "fresh DecoderScratch must not advertise a cold dict"
+        );
+        scratch.init_from_dict(&dict);
+        assert!(
+            scratch.fse.ddict_is_cold,
+            "init_from_dict must set ddict_is_cold = true"
+        );
     }
 }
