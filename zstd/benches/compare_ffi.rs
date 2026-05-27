@@ -418,7 +418,23 @@ fn bench_dictionary(c: &mut Criterion) {
 
         let sample_count = training_sample_count(&scenario.bytes);
         let total_training_bytes = scenario.bytes.len();
-        let ffi_samples = [scenario.bytes.as_slice()];
+        // FastCOVER (both ours and FFI's) needs MULTIPLE training
+        // samples to find cross-sample redundancy — passing the
+        // whole scenario as a single slice (the previous shape
+        // `[scenario.bytes.as_slice()]`) was rejected by FFI as
+        // "samples=1, training failed" for every scenario, which
+        // skipped the dictionary loop entirely (no compress-dict /
+        // decompress-dict bench ever ran). Chunk the scenario into
+        // `sample_count` equal-sized sub-samples — same shape
+        // `training_sample_count` computes for our own
+        // `train_fastcover_raw_from_slice` invocation below.
+        let sample_size = scenario.bytes.len().div_ceil(16).clamp(256, 8192);
+        let ffi_samples: Vec<&[u8]> = scenario
+            .bytes
+            .chunks(sample_size)
+            .take(64)
+            .filter(|chunk| chunk.len() >= 64)
+            .collect();
         let max_dict_size = total_training_bytes.saturating_sub(64);
         let dict_size = dictionary_size_for(scenario.len())
             .max(256)
