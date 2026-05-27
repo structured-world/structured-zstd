@@ -166,12 +166,16 @@ pub(crate) trait BufferBackend: Sized {
     /// bytes past `tail + total`); the override raises
     /// `MAX_WILDCOPY_OVERSHOOT` accordingly.
     ///
-    /// Default impl is `unreachable!` — only `UserSliceBackend`
-    /// overrides on x86_64, gated by `SUPPORTS_INLINE_SEQUENCE_EXEC`
-    /// (no separate const because runtime CPU AVX2 presence is gated
-    /// at the dispatcher in
+    /// Default impl is `unreachable!`. The x86_64 backends override:
+    /// `UserSliceBackend` (direct-decode path, fixed slice with
+    /// `WILDCOPY_OVERLENGTH` slack) and `FlatBuf` (single-segment
+    /// frames, Vec-backed with `with_capacity(+ WILDCOPY_OVERLENGTH)`
+    /// slack). Both gate via `SUPPORTS_INLINE_SEQUENCE_EXEC`; runtime
+    /// CPU AVX2 presence is gated at the dispatcher in
     /// `sequence_section_decoder::decode_and_execute_sequences` via
-    /// `detect_cpu_kernel() == Avx2`).
+    /// `detect_cpu_kernel() == Avx2`. `RingBuffer` does NOT override
+    /// — multi-segment frames still go through the layered
+    /// `repeat()` chain that handles wrap correctly.
     ///
     /// # Safety
     /// Same preconditions as [`Self::exec_sequence_inline`] plus:
@@ -191,7 +195,7 @@ pub(crate) trait BufferBackend: Sized {
     ) -> Result<(), super::errors::ExecuteSequencesError> {
         unreachable!(
             "exec_sequence_inline_avx2 called on backend that did not override the default \
-             (only UserSliceBackend overrides for the AVX2 tier execute path)"
+             (UserSliceBackend and FlatBuf override on x86_64)"
         );
     }
 

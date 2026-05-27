@@ -507,4 +507,114 @@ mod tests {
         assert_eq!(f.len(), 0);
         assert_eq!(f.tail(), 0);
     }
+
+    /// SSE2 inline executor — verify match-copy correctness against a
+    /// byte-by-byte reference. Exercises the non-overlap path
+    /// (offset >= 16), short-offset overlapCopy8 path (offset < 16),
+    /// and the literal copy16 + wildcopy tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_match_copy_correctness() {
+        for offset in [4usize, 8, 12, 20, 48, 96] {
+            let mut f = FlatBuf::with_capacity(512);
+            // Seed bytes 0..256 with deterministic pattern.
+            let seed: Vec<u8> = (0..256u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+            f.extend(&seed);
+            let base = f.len();
+            let match_length = 96usize;
+            // Reference: byte-by-byte repeat starting at base, sourced from base-offset.
+            let mut reference = vec![0u8; base + match_length];
+            reference[..base].copy_from_slice(&seed);
+            for i in 0..match_length {
+                reference[base + i] = reference[base + i - offset];
+            }
+
+            let lits = [0xAAu8; 16];
+            // SAFETY: lit_length = 0 so lit_src is unused beyond a 16-byte
+            // over-read into the literal scratch (in-bounds).
+            unsafe {
+                f.exec_sequence_inline(lits.as_ptr(), 0, offset, match_length)
+                    .unwrap();
+            }
+            assert_eq!(f.len(), base + match_length, "offset={offset}");
+            let (s1, _) = f.as_slices();
+            for i in 0..match_length {
+                assert_eq!(
+                    s1[base + i],
+                    reference[base + i],
+                    "offset={offset} byte {i}: got {:#x}, expected {:#x}",
+                    s1[base + i],
+                    reference[base + i],
+                );
+            }
+        }
+    }
+
+    /// AVX2 inline executor — verify match-copy correctness for
+    /// offsets across the SSE2/AVX2 threshold boundary
+    /// (offset 20 routes to SSE2 16-byte path, offset 32 to AVX2
+    /// 32-byte ymm path, offset 64 to deep AVX2 path).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_avx2_offset_boundary_correctness() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for offset in [20usize, 32, 64] {
+            let mut f = FlatBuf::with_capacity(512);
+            let seed: Vec<u8> = (0..256u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+            f.extend(&seed);
+            let base = f.len();
+            let match_length = 96usize;
+            let mut reference = vec![0u8; base + match_length];
+            reference[..base].copy_from_slice(&seed);
+            for i in 0..match_length {
+                reference[base + i] = reference[base + i - offset];
+            }
+
+            let lits = [0xAAu8; 16];
+            // SAFETY: AVX2 detected via runtime feature check above;
+            // lit_length = 0 → lit_src 16-byte over-read into scratch.
+            unsafe {
+                f.exec_sequence_inline_avx2(lits.as_ptr(), 0, offset, match_length)
+                    .unwrap();
+            }
+            assert_eq!(f.len(), base + match_length, "offset={offset}");
+            let (s1, _) = f.as_slices();
+            for i in 0..match_length {
+                assert_eq!(
+                    s1[base + i],
+                    reference[base + i],
+                    "offset={offset} byte {i}: got {:#x}, expected {:#x} \
+                     (regression: AVX2 wildcopy at offset < 32)",
+                    s1[base + i],
+                    reference[base + i],
+                );
+            }
+        }
+    }
+
+    /// Fallible capacity guard — `exec_sequence_inline` MUST return
+    /// `OutputBufferOverflow` instead of writing past `Vec::capacity()`
+    /// when the requested write + 15-byte SSE2 overshoot would
+    /// overflow. Mirrors the contract on `UserSliceBackend`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_capacity_overflow_returns_err() {
+        // Tiny capacity: 32 bytes + WILDCOPY_OVERLENGTH = 64 total.
+        let mut f = FlatBuf::with_capacity(32);
+        f.extend(&[0u8; 16]);
+        // Request `lit_length + match_length + 15 = 17 + 100 + 15 = 132`
+        // bytes past tail; well over the 64-byte allocation.
+        let lits = [0xAAu8; 16];
+        // SAFETY: error-returning path; no writes performed.
+        let result = unsafe { f.exec_sequence_inline(lits.as_ptr(), 17, 8, 100) };
+        assert!(
+            matches!(
+                result,
+                Err(super::super::errors::ExecuteSequencesError::OutputBufferOverflow { .. })
+            ),
+            "expected OutputBufferOverflow, got {result:?}"
+        );
+    }
 }
