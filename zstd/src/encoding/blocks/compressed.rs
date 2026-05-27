@@ -1954,14 +1954,18 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.append_bytes(&literals[..1]);
 }
 
-/// Reuse-only literals emit: writes the treeless variant
-/// (size_format header bits, payload length, huf payload) with
-/// `last_table`. Used by `compress_literals` when the donor
-/// preferRepeat gate short-circuits the rebuild path. Mirrors the
-/// post-decide branch at the bottom of `compress_literals`
-/// byte-for-byte (same size_format ladder, same min_gain
-/// raw-fallback gate) so the wire output is identical to the
-/// size-comparison reuse path when both would pick reuse.
+/// Reuse-only literals emit. Writes the full RFC 8878 §3.1.1.3.1.1
+/// treeless literals section: type bits (`0b11`), 2-bit
+/// size_format, the regenerated (uncompressed) literals length
+/// field, the compressed length field placeholder (patched after
+/// the huf payload is emitted), and the huf-encoded payload using
+/// `last_table` (no tree description, since the decoder reuses the
+/// previously-emitted one). Used by `compress_literals` when the
+/// donor preferRepeat gate short-circuits the rebuild path.
+/// Mirrors the post-decide reuse branch at the bottom of
+/// `compress_literals` byte-for-byte (same size_format ladder, same
+/// min_gain raw-fallback gate) so the wire output is identical to
+/// the size-comparison reuse path when both would pick reuse.
 fn emit_reuse_literals(
     literals: &[u8],
     last_table: &huff0_encoder::HuffmanTable,
