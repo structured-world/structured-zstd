@@ -388,13 +388,31 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             let op_match = base_mut.add(self.tail + lit_length);
             let match_src = base_mut.cast_const().add(self.tail + lit_length - offset);
 
-            if offset >= 16 {
-                // ✨ AVX2 32-byte stride. Each ymm store is 2× the
-                // SSE2 throughput; for typical match lengths (32-256
-                // bytes) this halves the iteration count of the
-                // wildcopy loop. The 31-byte overshoot is bounded by
-                // `MAX_WILDCOPY_OVERSHOOT` above.
+            if offset >= 32 {
+                // ✨ AVX2 32-byte stride no-overlap. Each ymm store is
+                // 2× the SSE2 throughput; for typical match lengths
+                // (32-256 bytes) this halves the iteration count of
+                // the wildcopy loop. The 31-byte overshoot is bounded
+                // by `MAX_WILDCOPY_OVERSHOOT` above.
+                //
+                // **Threshold `offset >= 32` (not 16) — correctness bound.**
+                // For `offset ∈ 16..=31`, a 32-byte ymm load from
+                // `match_src = dst - offset` would read bytes
+                // `dst..=dst + (32 - offset - 1)` which are part of
+                // the destination region BEFORE the first store has
+                // written them. That reads uninitialised destination
+                // bytes (or the previous block's tail) and silently
+                // corrupts the output. The donor SSE2 16-byte wildcopy
+                // is safe at `offset == 16` because the load reads
+                // exactly through `dst - 1`; the AVX2 ymm stride needs
+                // an extra 16-byte margin to maintain the same property.
                 wildcopy_no_overlap_avx2(op_match, match_src, match_length);
+            } else if offset >= 16 {
+                // Mid-offset range (16..=31): too small for safe AVX2
+                // 32-byte stride (see above), large enough for donor's
+                // SSE2 16-byte no-overlap wildcopy. Keep the
+                // SSE2 path for these offsets.
+                wildcopy_no_overlap(op_match, match_src, match_length);
             } else {
                 // Short-offset path unchanged: overlap_copy8 +
                 // 8-byte stride wildcopy. 32-byte SIMD doesn't fit

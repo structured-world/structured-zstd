@@ -142,14 +142,29 @@ pub(crate) trait BufferBackend: Sized {
     }
 
     /// AVX2-tier variant of [`Self::exec_sequence_inline`]. Same
-    /// contract but the literal-copy and no-overlap match-copy paths
-    /// emit 32-byte ymm stores via `wildcopy_no_overlap_avx2`. Issue
+    /// contract but the **no-overlap match-copy** path (`offset >= 32`)
+    /// emits 32-byte ymm stores via `wildcopy_no_overlap_avx2`. Issue
     /// #279 round 3 Phase 4: invoked only from
     /// `execute_one_sequence_pipelined_avx2` which is itself
-    /// `#[target_feature(enable = "avx2,bmi2")]`. WILDCOPY overshoot
-    /// at destination grows from 15 to 31 bytes (32-byte stride
-    /// overshoots up to 31 bytes past `tail + total`); caller-side
-    /// slack contract must account.
+    /// `#[target_feature(enable = "avx2,bmi2")]`.
+    ///
+    /// **Literal copy stays on SSE2 16-byte** (`copy16` +
+    /// `wildcopy_no_overlap`) — the inline-path slack gate in
+    /// `execute_one_sequence_pipelined_avx2` is built around the
+    /// 16-byte literal over-read bound from the SSE2 default; widening
+    /// to 32-byte AVX2 stores on literals would require tightening
+    /// that gate to `lit_cur_before + 32 <= lit_len`, rejecting more
+    /// near-end-of-block sequences from the inline fast path. The
+    /// AVX2 divergence is therefore confined to the match-copy side,
+    /// where the per-block `reserve(MAX_BLOCK_SIZE)` plus the
+    /// `WILDCOPY_OVERLENGTH = 32` slack on `UserSliceBackend`
+    /// accommodates the 31-byte ymm overshoot without changing the
+    /// caller-side contract.
+    ///
+    /// Match-copy WILDCOPY overshoot at destination grows from 15 to
+    /// 31 bytes for the AVX2 path (32-byte stride overshoots up to 31
+    /// bytes past `tail + total`); the override raises
+    /// `MAX_WILDCOPY_OVERSHOOT` accordingly.
     ///
     /// Default impl is `unreachable!` — only `UserSliceBackend`
     /// overrides on x86_64, gated by `SUPPORTS_INLINE_SEQUENCE_EXEC`

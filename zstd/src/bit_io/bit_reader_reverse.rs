@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 /// by the BMI2 PEXT triple-extract path on x86-64 (where the mask is
 /// constructed once per call and then fed to `_pext_u64`), and by the
 /// tests that verify mask values directly.
-#[cfg(any(test, all(feature = "std", target_arch = "x86_64")))]
+#[cfg(any(test, target_arch = "x86_64"))]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
@@ -147,7 +147,7 @@ fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Optio
     Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
     use core::arch::x86_64::_pext_u64;
@@ -232,6 +232,32 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// How many bits are left to read by the reader.
     pub fn bits_remaining(&self) -> isize {
         self.index as isize * 8 + (64 - self.bits_consumed as isize) - self.extra_bits as isize
+    }
+
+    /// Returns `true` when the cached vendor policy says PEXT is fast
+    /// on the running CPU (Intel + AMD Zen3+) and the bmi2-direct
+    /// triple-extract path should be used. AMD Zen1/Zen2 microcode
+    /// PEXT is slower than the scalar 3× shift+mask path, so
+    /// [`should_use_pext`] caches `false` for those vendors.
+    ///
+    /// `no_std` x86_64 builds lack the runtime detection (`use_pext_triple`
+    /// is std-gated), so this falls back to `true`: callers on
+    /// `no_std` rely on compile-time `target_feature = "bmi2"` and
+    /// implicitly trust that the chosen target CPU advertises fast
+    /// PEXT. Vendor-specific microcode regression remains a
+    /// build-time concern there — pin a known-good target with
+    /// `RUSTFLAGS="-C target-cpu=..."`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(crate) fn use_pext_triple_fast(&self) -> bool {
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        {
+            self.use_pext_triple
+        }
+        #[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+        {
+            true
+        }
     }
 
     pub fn new(source: &'s [u8]) -> BitReaderReversed<'s, K> {

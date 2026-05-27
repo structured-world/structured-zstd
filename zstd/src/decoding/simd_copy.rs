@@ -189,8 +189,18 @@ pub(crate) unsafe fn copy_bytes_overshooting(
 /// `src` and `dst` must each point to at least `src.1` / `dst.1`
 /// readable / writable bytes, regions must not overlap, and the
 /// caller MUST itself be in `target_feature(enable = "avx2,bmi2")`
-/// scope (which the only call site — `execute_one_sequence_pipelined_avx2`
-/// — guarantees via its own attribute).
+/// scope.
+///
+/// # Status
+/// Currently unused in production: the AVX2 match-copy inline path
+/// in PR #285 routes through `BufferBackend::exec_sequence_inline_avx2`
+/// which uses the 32-byte wildcopy helpers in
+/// `exec_sequence_inline::x86` directly. This standalone variant is
+/// the bottom-layer building block for the next iteration
+/// (`perf/#279-r4-1c-avx2-layered-chain`) — it will be wired into the
+/// per-tier `repeat_in_chunks_avx2` for the RingBuffer / FlatBuf
+/// (non-inline) backend paths. Keep the function until that work
+/// lands; remove if the layered-chain experiment ends up not retained.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]

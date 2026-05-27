@@ -62,11 +62,17 @@ macro_rules! define_x86_seq_decoder_tier {
             debug_assert!(of_num_bits <= $crate::blocks::sequence_section::MAX_OFFSET_CODE);
 
             // Replace `br.get_bits_triple(...)` with the inline form
-            // that bypasses (a) the `use_pext_triple` runtime branch
-            // inside `peek_bits_triple` and (b) the
-            // `extract_triple_pext` CALL boundary. The bmi2-tagged
-            // `peek_bits_triple_bmi2` inlines `_pext_u64` directly.
-            // The legacy fallback for `sum > 56` is preserved.
+            // that bypasses the `extract_triple_pext` CALL boundary,
+            // BUT preserves the `use_pext_triple` vendor-policy gate:
+            // AMD Zen1/Zen2 execute PEXT/PDEP through microcode and
+            // perform WORSE than the scalar 3× shift+mask path
+            // (`should_use_pext` policy returns false for those CPUs).
+            // Reading the cached flag is one load on the hot path
+            // versus the regression those CPUs would otherwise see.
+            // The bmi2-tagged `peek_bits_triple_bmi2` only fires when
+            // the policy permits; on slow-PEXT CPUs we fall through to
+            // `peek_bits_triple` which routes to the K-trait scalar
+            // path inside the same target_feature scope.
             let sum_wide = u16::from(of_num_bits) + u16::from(ml_num_bits) + u16::from(ll_num_bits);
             let (obits, ml_add, ll_add) = if sum_wide <= 56 {
                 let sum = sum_wide as u8;
@@ -75,8 +81,13 @@ macro_rules! define_x86_seq_decoder_tier {
                 // which includes BMI2; runtime CPU presence of BMI2 is
                 // gated by the dispatcher at
                 // `decode_and_execute_sequences::detect_cpu_kernel`.
-                let triple =
-                    unsafe { br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) };
+                // Vendor policy: only call the pext-direct variant on
+                // CPUs whose pext is fast (cached at BitReader::new).
+                let triple = if br.use_pext_triple_fast() {
+                    unsafe { br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
+                } else {
+                    br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
+                };
                 br.consume(sum);
                 triple
             } else {
