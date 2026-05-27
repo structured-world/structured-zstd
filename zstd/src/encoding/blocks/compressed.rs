@@ -681,8 +681,13 @@ fn estimate_literals_section_bytes(
     // Using the 4-stream `estimate_huff_payload_bytes_checked` here would
     // disagree with the encoder and bias the splitter to pick a different
     // table than the encoder ultimately emits.
-    let use_new =
-        decide_huff_reuse_like_encoder(&new_table, last_huff.as_ref(), new_desc, literals);
+    let use_new = decide_huff_reuse_like_encoder(
+        &new_table,
+        last_huff.as_ref(),
+        new_desc,
+        literals,
+        strategy,
+    );
     let reuse_payload = if !use_new {
         // Safe to recompute with 4-stream model now that the table is chosen:
         // the chosen-table path always returns the actual wire cost.
@@ -879,13 +884,36 @@ fn decide_huff_reuse_like_encoder(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     new_desc: usize,
     literals: &[u8],
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> bool {
+    use crate::encoding::strategy::StrategyTag;
     let Some(prev) = last_table else {
         return true;
     };
     let Some(old_estimate) = prev.estimate_compressed_size(literals) else {
         return true;
     };
+    // Donor `HUF_flags_preferRepeat` gate
+    // (`zstd_compress_literals.c:165`): fast-band strategies
+    // (`strategy < ZSTD_lazy` → Fast / Dfast / Greedy in our enum)
+    // with short literal sections (≤ 1024 bytes) prefer reusing the
+    // previous tree over rebuilding it. Donor's HUF_compress
+    // implements the bias by short-circuiting the rebuild path when
+    // the flag is set AND the prior table is valid
+    // (`huf_compress.c:1360-1364, 1396-1400`); we mirror it at the
+    // decision-helper level here so the splitter cost estimator
+    // (`estimate_literals_section_bytes`) and the encoder
+    // (`compress_literals`) agree on the choice. Without the gate,
+    // the existing size-comparison heuristic occasionally rebuilds
+    // for marginal gains at fast levels — wasting table-emission
+    // overhead that's significant relative to the small payload.
+    let prefer_repeat = matches!(
+        strategy,
+        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy
+    ) && literals.len() <= 1024;
+    if prefer_repeat {
+        return false;
+    }
     let new_estimate = new_table
         .estimate_compressed_size(literals)
         .unwrap_or(literals.len());
@@ -1917,6 +1945,7 @@ fn compress_literals(
         last_table,
         new_table_description_size,
         literals,
+        strategy,
     );
     let encoder_table = if new_table {
         &new_encoder_table
