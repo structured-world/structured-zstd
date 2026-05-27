@@ -93,13 +93,12 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
             // `is_x86_feature_detected!("bmi2")` confirmed BMI2 is
-            // available. The `#[target_feature(enable = "bmi2")]`
-            // wrapper lets LLVM emit `bzhi` directly at every
-            // `K::mask_lower_bits` call site inside the impl,
-            // bypassing the per-call target_feature trampoline that
-            // would otherwise survive.
+            // available. The per-tier trampoline lives in its own
+            // module (`seq_decoder_bmi2`) so future BMI2-specific
+            // divergence can be applied without touching the other
+            // kernels — see #279 round 3.
             unsafe {
-                decode_and_execute_sequences_bmi2::<B>(
+                super::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<B>(
                     section,
                     source,
                     fse,
@@ -114,7 +113,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
         CpuKernelTag::Avx2 => {
             // SAFETY: detect confirmed BMI2 + AVX2.
             unsafe {
-                decode_and_execute_sequences_avx2::<B>(
+                super::seq_decoder_avx2::decode_and_execute_sequences_avx2::<B>(
                     section,
                     source,
                     fse,
@@ -130,7 +129,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             // SAFETY: detect confirmed AVX-512 VBMI2 + AVX2 + BMI2
             // (see `select_x86_kernel` precedence rules).
             unsafe {
-                decode_and_execute_sequences_vbmi2::<B>(
+                super::seq_decoder_vbmi2::decode_and_execute_sequences_vbmi2::<B>(
                     section,
                     source,
                     fse,
@@ -164,96 +163,13 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     }
 }
 
-/// `#[target_feature(enable = "bmi2")]` trampoline for the BMI2 arm
-/// — wraps `decode_and_execute_sequences_impl::<B, Bmi2Kernel>` so
-/// LLVM can inline `_bzhi_u64` at every `K::mask_lower_bits` call
-/// across the target_feature boundary.
-///
-/// # Safety
-/// Caller must ensure BMI2 is available on the runtime CPU; the
-/// dispatcher above gates on `detect_cpu_kernel() == Bmi2`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn decode_and_execute_sequences_bmi2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader,
-    source: &[u8],
-    fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3],
-    literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Bmi2Kernel>(
-        section,
-        source,
-        fse,
-        buffer,
-        offset_hist,
-        literals_buffer,
-        rle_fallback_sequences,
-    )
-}
+// Per-tier x86 trampolines (`decode_and_execute_sequences_{bmi2,avx2,vbmi2}`)
+// live in `seq_decoder_bmi2.rs` / `seq_decoder_avx2.rs` /
+// `seq_decoder_vbmi2.rs`. Each owns its `#[target_feature]` attribute
+// and is called from the dispatch matcher above. See issue #279
+// round 3 for the per-kernel architecture rationale.
 
-/// `#[target_feature(enable = "bmi2,avx2")]` trampoline for the
-/// Avx2 arm. Same shape as the BMI2 trampoline; the AVX2 enable
-/// piles onto the BMI2 feature set so any AVX2-gated codegen
-/// (chunked SIMD copy via `_mm256_*`) also benefits.
-///
-/// # Safety
-/// Caller must ensure BMI2 + AVX2 are available; gated by
-/// `detect_cpu_kernel() == Avx2`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,avx2")]
-unsafe fn decode_and_execute_sequences_avx2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader,
-    source: &[u8],
-    fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3],
-    literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Avx2Kernel>(
-        section,
-        source,
-        fse,
-        buffer,
-        offset_hist,
-        literals_buffer,
-        rle_fallback_sequences,
-    )
-}
-
-/// `#[target_feature(enable = "...AVX-512 VBMI2 family + BMI2 + AVX2")]`
-/// trampoline for the Vbmi2 arm. Enables the full feature set the
-/// `select_x86_kernel` precedence requires.
-///
-/// # Safety
-/// Caller must ensure the entire feature set is available; gated by
-/// `detect_cpu_kernel() == Vbmi2`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
-unsafe fn decode_and_execute_sequences_vbmi2<B: super::buffer_backend::BufferBackend>(
-    section: &SequencesHeader,
-    source: &[u8],
-    fse: &mut FSEScratch,
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    offset_hist: &mut [u32; 3],
-    literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
-) -> Result<(), DecompressBlockError> {
-    decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Vbmi2Kernel>(
-        section,
-        source,
-        fse,
-        buffer,
-        offset_hist,
-        literals_buffer,
-        rle_fallback_sequences,
-    )
-}
-
-fn decode_and_execute_sequences_impl<
+pub(crate) fn decode_and_execute_sequences_impl<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
 >(

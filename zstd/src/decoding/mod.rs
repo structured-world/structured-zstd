@@ -55,6 +55,19 @@ pub(crate) mod prefetch;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;
+// Per-kernel sequence-section decoder entry points. Each module owns
+// its `#[target_feature]`-tagged trampoline so future kernel-specific
+// divergence (BMI2-only `_bzhi_u64` / `_pext_u64` inlining, AVX2 ymm
+// chunked copy, VBMI2 VPSHUFB tile lookup) can be applied IN PLACE
+// without touching the other tiers. See issue #279 round 3 for the
+// architectural plan; today the bodies still delegate into the
+// shared K-generic `decode_and_execute_sequences_impl`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod seq_decoder_avx2;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod seq_decoder_bmi2;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod seq_decoder_vbmi2;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
