@@ -921,6 +921,17 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
+        // Streaming entry point: pre-reserve the backing buffer to
+        // `window_size` so multi-block frames don't pay repeated
+        // `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
+        // window) as blocks accumulate. `decode_all` does the same up
+        // front in `decode_all_impl`; this mirrors it for callers
+        // driving `decode_blocks` directly. Idempotent — the
+        // backend's `reserve` early-returns when capacity is already
+        // sufficient.
+        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
+        state.decoder_scratch.reserve_buffer(window_size);
+
         let mut block_dec = decoding::block_decoder::new();
 
         let buffer_size_before = state.decoder_scratch.buffer_len();
