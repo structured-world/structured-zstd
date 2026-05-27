@@ -7,7 +7,7 @@
 //! the SSE2 16-byte default. AVX2-tier divergence on i9-class CPUs:
 //! 2× write throughput on the match-copy hot path.
 
-crate::define_x86_seq_decoder_tier! {
+crate::decoding::seq_decoder_x86_kernel::define_x86_seq_decoder_tier! {
     kernel = crate::cpu_kernel::Avx2Kernel,
     target_feature = "bmi2,avx2",
     decode_fn = decode_and_execute_sequences_avx2,

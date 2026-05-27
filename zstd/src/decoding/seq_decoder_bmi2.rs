@@ -7,7 +7,7 @@
 //! `peek_bits_triple_bmi2`) is already active via the macro-generated
 //! `decode_one_sequence_bmi2`.
 
-crate::define_x86_seq_decoder_tier! {
+crate::decoding::seq_decoder_x86_kernel::define_x86_seq_decoder_tier! {
     kernel = crate::cpu_kernel::Bmi2Kernel,
     target_feature = "bmi2",
     decode_fn = decode_and_execute_sequences_bmi2,
