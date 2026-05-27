@@ -137,9 +137,12 @@ impl DecoderScratchKind {
         // The direct-decode path (`run_direct_decode`) writes through
         // `UserSliceBackend` and never touches the ring; allocating it
         // eagerly wastes one full window of peak memory on the common
-        // direct-eligible frame. The non-direct `decode_blocks` path
-        // grows the buffer on demand via `RingBuffer::reserve_amortized`
-        // the first time a block writes into it. Issue #279 round 2.
+        // direct-eligible frame. On the non-direct path the window is
+        // pre-reserved once at frame entry (`decode_all_impl` and
+        // `decode_blocks` both call `DecoderScratchKind::reserve_buffer`
+        // before any block writes), so multi-block frames pay one
+        // amortised grow instead of repeated `reserve_amortized` steps
+        // per block. Issue #279 round 2.
         let s = DecoderScratch::<RingBuffer>::new(window_size);
         Self::Ring(s)
     }
