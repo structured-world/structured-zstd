@@ -655,14 +655,17 @@ fn run_pipelined_sequence_loop<
     // synchronised with where execute will eventually be.
     let mut prefetch_pos: usize = old_buffer_size;
     let mut shadow_hist: [u32; 3] = *offset_hist;
-    let mut ring: [(Sequence, u32); ADVANCE] = [(
-        Sequence {
-            ll: 0,
-            ml: 0,
-            of: 0,
-        },
-        0u32,
-    ); ADVANCE];
+    // ExecSeq is the post-resolve shape (ll, ml, actual_offset). The raw
+    // `Sequence.of` (offset_code) is dead after the pre-resolve step
+    // below — execute_one_sequence_pipelined uses only the actual
+    // offset. Store ExecSeq directly so each slot is 12 bytes instead
+    // of `(Sequence, u32) = 16` bytes (= 4 bytes per slot of dead data,
+    // 32 bytes saved across the 8-deep ring).
+    let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
+        ll: 0,
+        ml: 0,
+        actual_offset: 0,
+    }; ADVANCE];
 
     // Pre-fill the ring. Outer `num_sequences >= ADVANCE * 2` gate
     // guarantees `num_sequences > ADVANCE`, so the FSE state update
@@ -679,7 +682,11 @@ fn run_pipelined_sequence_loop<
         let source_idx = match_start.wrapping_sub(actual_offset as usize);
         buffer.prefetch_lookahead_match_source(source_idx);
         prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-        *slot = (seq, actual_offset);
+        *slot = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
         br.ensure_bits(max_update_bits);
         ll_dec.update_state_fast(br);
         ml_dec.update_state_fast(br);
@@ -697,16 +704,19 @@ fn run_pipelined_sequence_loop<
         prefetch_pos = match_start.wrapping_add(seq.ml as usize);
 
         let slot = i & ADVANCE_MASK;
-        let (exec_seq, exec_offset) = ring[slot];
-        ring[slot] = (seq, actual_offset);
+        let exec_seq = ring[slot];
+        ring[slot] = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
 
-        execute_one_sequence_pipelined(
+        execute_one_sequence_pipelined_resolved(
             buffer,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
             exec_seq,
-            exec_offset,
         )?;
         *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
@@ -723,14 +733,13 @@ fn run_pipelined_sequence_loop<
     // they occupy from the steady-state loop's final write.
     for k in 0..ADVANCE {
         let slot = (num_sequences + k) & ADVANCE_MASK;
-        let (exec_seq, exec_offset) = ring[slot];
-        execute_one_sequence_pipelined(
+        let exec_seq = ring[slot];
+        execute_one_sequence_pipelined_resolved(
             buffer,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
             exec_seq,
-            exec_offset,
         )?;
         *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
     }
@@ -753,6 +762,43 @@ fn run_pipelined_sequence_loop<
 /// variant — required for memory safety against malformed inputs whose
 /// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
 /// headroom.
+/// Post-resolve sequence shape carried by the pipelined ring. Stores
+/// only the fields the executor actually reads: literal length, match
+/// length, and the resolved-via-offset-history match offset. The raw
+/// `Sequence.of` (offset_code) is dead by the time a slot reaches the
+/// executor — `do_offset_history` already turned it into
+/// `actual_offset` — so omitting it from the ring shape saves 4 bytes
+/// per slot (12 bytes per `ExecSeq` vs 16 for the previous
+/// `(Sequence, u32)` tuple) and the matching ring write traffic.
+#[derive(Copy, Clone)]
+pub(crate) struct ExecSeq {
+    pub ll: u32,
+    pub ml: u32,
+    pub actual_offset: u32,
+}
+
+#[inline(always)]
+fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+    lit_cur: &mut usize,
+    lit_len: usize,
+    exec_seq: ExecSeq,
+) -> Result<(), DecompressBlockError> {
+    execute_one_sequence_pipelined(
+        buffer,
+        literals,
+        lit_cur,
+        lit_len,
+        Sequence {
+            ll: exec_seq.ll,
+            ml: exec_seq.ml,
+            of: 0,
+        },
+        exec_seq.actual_offset,
+    )
+}
+
 #[inline(always)]
 fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
