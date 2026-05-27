@@ -2333,8 +2333,8 @@ mod tests {
         // true and breaks this test — that's the regression gate.
         let prev_training: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
         let prev = huff0_encoder::HuffmanTable::build_from_data(&prev_training);
-        let mut skewed_literals: Vec<u8> = Vec::new();
-        skewed_literals.resize(240, 0u8);
+        let mut skewed_literals: Vec<u8> = Vec::with_capacity(256);
+        skewed_literals.extend(core::iter::repeat_n(0u8, 240));
         skewed_literals.extend((0..16u8).map(|i| 200 + i));
         let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
         let new_desc = new_tbl
