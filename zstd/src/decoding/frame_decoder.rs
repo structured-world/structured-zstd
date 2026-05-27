@@ -871,10 +871,17 @@ impl FrameDecoder {
     }
 
     /// Returns the checksum that was calculated while decoding.
-    /// Only a sensible value after all decoded bytes have been collected/read from the FrameDecoder
+    /// Only a sensible value after all decoded bytes have been collected/read from the FrameDecoder.
+    /// Returns `None` when the frame header has `content_checksum_flag = 0`:
+    /// no hash is computed for such frames (the post-decode XXH64 pass was a
+    /// 63 % decode-wall hotspot on flag-off frames; skipping it when the
+    /// frame format declares no trailing digest avoids that wasted work).
     #[cfg(feature = "hash")]
     pub fn get_calculated_checksum(&self) -> Option<u32> {
         let state = self.state.as_ref()?;
+        if !state.frame_header.descriptor.content_checksum_flag() {
+            return None;
+        }
         let cksum_64bit = state.decoder_scratch.hash_finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
@@ -1795,14 +1802,20 @@ impl FrameDecoder {
             }
         }
         #[cfg(feature = "hash")]
-        {
+        if state.frame_header.descriptor.content_checksum_flag() {
             // Direct path bypasses the per-write hash accounting
             // (DecodeBuffer hashes during drain; the direct path
             // never drains because the user slice IS the buffer).
             // Walk the decoded output once and propagate the
-            // resulting hasher state into the persistent scratch's
-            // buffer so `get_calculated_checksum()` returns the
-            // right value path-independently.
+            // resulting hasher state so the frame-tail XXH64 check
+            // (in the block loop above) can verify the digest.
+            //
+            // Gated on `content_checksum_flag`: frames without a
+            // trailing checksum byte have nothing to verify, and the
+            // 1 MiB+ second-pass scan dominated decode wall time
+            // (63 % of total on z000033 L-3 in the standalone perf
+            // loop). `get_calculated_checksum()` now returns `None`
+            // for flag-off frames, matching this skip.
             use core::hash::Hasher;
             let mut hasher = twox_hash::XxHash64::with_seed(0);
             hasher.write(&output[..written]);
