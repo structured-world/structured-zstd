@@ -428,6 +428,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         last_block,
                         block,
                         &mut encoded,
+                        #[cfg(all(feature = "lsm", feature = "hash"))]
+                        None,
                     );
                     moved_into_matcher = true;
                 }
