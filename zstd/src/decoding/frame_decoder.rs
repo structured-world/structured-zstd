@@ -377,16 +377,17 @@ impl FrameDecoderState {
     /// only via `FrameDecoder::reset`.
     ///
     /// `DecodeBuffer::reset` no longer reserves window_size for either
-    /// backend — ring and flat both grow lazily through their own
-    /// `reserve`/`Vec` paths. For ring-backed scratch, direct-eligible
-    /// frames pay zero allocation here and the non-direct fallback
-    /// reserves `window_size` once in `decode_all_impl` via
-    /// `DecoderScratchKind::reserve_buffer`. Flat-backed scratch is
-    /// sized to `frame_content_size` by `DecoderScratchKind::new_flat`
-    /// at first construction (and on Ring → Flat transition); a reused
-    /// flat scratch whose new frame fits within the prior FCS reuses
-    /// the existing capacity, and one whose new FCS is larger grows
-    /// the backing `Vec` on the first block write.
+    /// backend — capacity decisions live one layer up. For ring-backed
+    /// scratch, direct-eligible frames pay zero allocation here and
+    /// the non-direct path is pre-reserved by `decode_all_impl` /
+    /// `decode_blocks` via `DecoderScratchKind::reserve_buffer(window_size)`
+    /// before any block writes. Flat-backed scratch is sized to
+    /// `frame_content_size` by `DecoderScratchKind::new_flat` at first
+    /// construction (and on Ring → Flat transition); a reused flat
+    /// scratch whose new frame fits within the prior FCS reuses the
+    /// existing capacity, and one whose new FCS is larger is also
+    /// pre-reserved by the same `reserve_buffer(window_size)` call at
+    /// frame entry (single-segment frames have window_size == FCS).
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
