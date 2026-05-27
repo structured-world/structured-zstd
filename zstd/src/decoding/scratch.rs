@@ -295,12 +295,12 @@ pub struct FSEScratch {
     /// resulting frame engages the pipelined prefetch decoder
     /// regardless of long-offset share, then clears the flag so
     /// subsequent blocks fall back to the `offsets_long_share`
-    /// heuristic. The sequence-count guard `num_sequences >= ADVANCE
-    /// * 2` still applies: blocks too small to fill the lookahead
-    /// pipeline take the short-block fallback in both the cold-dict
-    /// and warm cases. Without a dictionary the flag stays `false`
-    /// (cache state of the predefined / repeat tables is not
-    /// considered "cold" in the donor model).
+    /// heuristic. The `num_sequences >= ADVANCE * 2` guard still
+    /// applies: blocks too small to fill the lookahead pipeline take
+    /// the short-block fallback in both the cold-dict and warm cases.
+    /// Without a dictionary the flag stays `false` (cache state of the
+    /// predefined and repeat tables is not considered "cold" in the
+    /// donor model).
     pub ddict_is_cold: bool,
 }
 
