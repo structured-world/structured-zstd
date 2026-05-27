@@ -292,15 +292,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
 
     /// AVX2-tier override of [`BufferBackend::exec_sequence_inline_avx2`].
     /// Issue #279 round 3 Phase 4: divergent only at the
-    /// match-copy no-overlap path (`offset >= 16`), where the 16-byte
-    /// SSE2 `wildcopy_no_overlap` is replaced by the 32-byte ymm
-    /// `wildcopy_no_overlap_avx2`. Literal copy + short-offset
-    /// match path stay on the SSE2 helpers — they're capped by the
-    /// caller-side `inline_path_safe` gate at 16-byte slack and
-    /// changing them would require re-tightening that gate. Match
-    /// copy slack is bounded by `UserSliceBackend`'s
-    /// `WILDCOPY_OVERLENGTH = 32` byte padding at the slice tail,
-    /// which accommodates the 31-byte AVX2 stride overshoot.
+    /// match-copy no-overlap path with `offset >= 32`, where the
+    /// SSE2 16-byte `wildcopy_no_overlap` is replaced by the 32-byte
+    /// ymm `wildcopy_no_overlap_avx2`. The mid-offset range `16..=31`
+    /// stays on the SSE2 16-byte path (a 32-byte ymm load at
+    /// `offset` < 32 would read uninitialised destination bytes
+    /// inside the match-copy region BEFORE the first store writes
+    /// them — see the threshold comment in the body). Literal copy +
+    /// short-offset (`offset < 16`) match path also stay on the
+    /// SSE2 helpers — they're capped by the caller-side
+    /// `inline_path_safe` gate at 16-byte slack and changing them
+    /// would require re-tightening that gate. Match copy slack is
+    /// bounded by `UserSliceBackend`'s `WILDCOPY_OVERLENGTH = 32`
+    /// byte padding at the slice tail, which accommodates the
+    /// 31-byte AVX2 stride overshoot.
     ///
     /// # Safety
     /// Same preconditions as [`Self::exec_sequence_inline`] plus
