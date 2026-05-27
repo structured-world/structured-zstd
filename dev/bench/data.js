@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779901608223,
+  "lastUpdate": 1779905302761,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -49694,6 +49694,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6de116fe989acd1b918422cd479582f1ea517ad2",
+          "message": "perf(decode): lazy ring-buffer allocation for direct-eligible frames (#282)\n\n* perf(decode): lazy ring-buffer allocation for direct-eligible frames\n\n* perf(decode): also defer ring reserve on FrameDecoder reuse + realloc audit\n\nTwo follow-ups to the lazy-ring change:\n\n1. `DecodeBuffer::reset` previously called `buffer.reserve(window_size)`\n   after `clear()`, which re-grew the RingBuffer on every subsequent\n   frame when a `FrameDecoder` was reused across multiple multi-segment\n   frames. That re-introduced the wasted window-sized allocation. The\n   non-direct `decode_blocks` path grows the buffer on demand via\n   `RingBuffer::reserve_amortized`, so removing the eager reserve from\n   `reset` is safe — direct-eligible reused frames now pay zero ring\n   alloc.\n\n2. `alloc_audit_decode` now overrides `GlobalAlloc::realloc` with delta\n   accounting. The default shim's `alloc(new) + copy + dealloc(old)`\n   flow would temporarily live-count both buffers during any `Vec`\n   growth in the measured window and inflate `PEAK_BYTES`. Delta\n   accounting tracks only the actual net live-bytes change.\n\n* fix(decode): scope reset doc to backend-generic + audit traces real peak\n\nCR #282 follow-ups:\n\n- decode_buffer.rs: reset doc cited `reserve_amortized` which is a\n  RingBuffer-specific helper; FlatBuf uses `Vec::reserve`. Reworded to\n  cover both backends generically so the reset contract is accurate for\n  every `B: BufferBackend`.\n- alloc_audit_decode: the trace `peak_after` column was storing the\n  live-after total at the moment of allocation. Live can dip below peak\n  when deallocations happen between two allocs, so the column did not\n  match its name. Now stores `PEAK_BYTES.load()` after the update on\n  both `alloc` and `realloc` paths so the column matches its label.\n\n* perf(decode): reserve window upfront on non-direct path + inline-const array init\n\nCR #282 follow-ups:\n\n- frame_decoder: non-direct fallback now reserves `window_size` once\n  via the new `DecoderScratchKind::reserve_buffer` helper, called right\n  after `direct_eligible` is ruled out. Without this, multi-segment\n  frames with window > 128 KiB paid repeated `reserve_amortized`\n  grow steps (128 KiB -> 256 KiB -> ... -> window) as each block\n  reserved only `MAX_BLOCK_SIZE`. Direct-eligible frames still pay zero\n  buffer allocation; the upfront reserve only fires when the direct\n  path is bypassed. Applied to both lsm-on and lsm-off impl variants.\n\n- alloc_audit_decode: switched `TRACE_*` array initializers to the\n  inline-const-expression form (`[const { ... }; N]`), which builds\n  arrays of non-Copy types without the named-const indirection that\n  the prior `const ZERO: ...; [ZERO; N]` form historically required\n  Copy for.\n\n* docs(decode): align frame_decoder docs with lazy ring + eager flat behavior\n\nCR / Copilot threads on #282 flagged stale pre-allocation claims:\n\n- new_with_format doc: claimed pre-allocation of decode buffer; reality\n  is ring-backed lazy + flat-backed eager-to-FCS. Updated to describe\n  per-backend behavior.\n- reset_with_format doc: claimed DecodeBuffer::reset reserves\n  window_size; that line was removed when reset became lazy. Replaced\n  with the actual contract — non-direct path reserves once in\n  decode_all_impl, flat resets stay eager.\n- DecoderScratchKind::reserve_buffer doc: scoped the \"zero buffer\n  allocation for the window\" guarantee to the ring path; flat-backed\n  single-segment frames already paid window-sized FlatBuf capacity at\n  new_flat time.\n\n* fix(decode): correct reset_with_format doc to match lazy backend grow\n\n* perf(decode): pre-reserve window at decode_blocks entry for streaming paths\n\nCR #282: the lazy-ring change pushed `window_size` reservation from\n`DecodeBuffer::reset` into `decode_all_impl`'s non-direct path. That\nleft the public `decode_blocks` / `decode_from_to` streaming\nentrypoints without the eager reserve — multi-block frames would\ngrow the ring through repeated `reserve_amortized` steps\n(128 KiB → 256 KiB → ... → window), each paying `alloc_zeroed +\nmemcpy`.\n\nAdd a single `decoder_scratch.reserve_buffer(window_size)` at\n`decode_blocks` entry, mirroring `decode_all_impl`'s pattern.\nIdempotent — the backend's `reserve` early-returns when capacity is\nalready sufficient, so repeated `decode_blocks` calls in the same\nframe remain a no-op after the first.\n\n* docs(decode): align ring + decode_buffer comments with pre-reserve path\n\nBoth Copilot threads on PR #282 flagged stale doc strings that still\ndescribed on-demand growth via reserve_amortized, while the non-direct\npath is now pre-reserved at decode_all_impl / decode_blocks entry via\nDecoderScratchKind::reserve_buffer(window_size). Reword to describe\nthe current pre-reserve behaviour without claiming first-write grow.\n\n* docs(decode): clarify reset_with_format pre-reserve for flat scratch too\n\nCopilot CR on PR #282 flagged the reset_with_format doc still\nsuggesting flat scratch grows on first block write. Reality post-#282:\nDecoderScratchKind::reserve_buffer(window_size) pre-reserves BOTH\nRing AND Flat backends (it dispatches on the enum kind and calls\nbuffer.reserve on either). For single-segment frames window_size ==\nframe_content_size, so the flat-scratch larger-FCS case is also\ncovered by the same pre-reserve hook at decode_all_impl /\ndecode_blocks entry.",
+          "timestamp": "2026-05-27T20:08:10+03:00",
+          "tree_id": "c22297afb7a6eb9d69a40f97c0aa90ff075d4666",
+          "url": "https://github.com/structured-world/structured-zstd/commit/6de116fe989acd1b918422cd479582f1ea517ad2"
+        },
+        "date": 1779905294252,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.146,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 314.681,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 271.435,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.507,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.515,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.695,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.031,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.579,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.971,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.081,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.797,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.314,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.043,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.22,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.076,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.218,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.218,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
