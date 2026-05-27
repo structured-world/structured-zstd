@@ -133,8 +133,17 @@ enum DecoderScratchKind {
 
 impl DecoderScratchKind {
     fn new_ring(window_size: usize) -> Self {
-        let mut s = DecoderScratch::<RingBuffer>::new(window_size);
-        s.buffer.reserve(window_size);
+        // Lazy ring-buffer allocation: do NOT `reserve(window_size)` here.
+        // The direct-decode path (`run_direct_decode`) writes through
+        // `UserSliceBackend` and never touches the ring; allocating it
+        // eagerly wastes one full window of peak memory on the common
+        // direct-eligible frame. On the non-direct path the window is
+        // pre-reserved once at frame entry (`decode_all_impl` and
+        // `decode_blocks` both call `DecoderScratchKind::reserve_buffer`
+        // before any block writes), so multi-block frames pay one
+        // amortised grow instead of repeated `reserve_amortized` steps
+        // per block. Issue #279 round 2.
+        let s = DecoderScratch::<RingBuffer>::new(window_size);
         Self::Ring(s)
     }
 
@@ -191,6 +200,27 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => s.buffer.len(),
             Self::Flat(s) => s.buffer.len(),
+        }
+    }
+
+    /// Pre-reserve the backing buffer to `window_size` in a single
+    /// allocation. Called once on the non-direct (`decode_blocks`) path
+    /// after direct-eligibility is ruled out, so multi-segment fallback
+    /// decodes don't pay repeated `reserve_amortized` grow steps
+    /// (128 KiB → 256 KiB → ... → window) as blocks accumulate.
+    ///
+    /// Direct-eligible ring-backed frames never call this and pay zero
+    /// ring allocation for the window. Flat-backed (single-segment)
+    /// frames eagerly size their `FlatBuf` to `frame_content_size` at
+    /// `new_flat` construction time, so a direct-eligible flat frame
+    /// already paid for that capacity before this helper is reachable;
+    /// the "zero buffer allocation" guarantee here applies to the
+    /// ring path only.
+    #[inline]
+    fn reserve_buffer(&mut self, window_size: usize) {
+        match self {
+            Self::Ring(s) => s.buffer.reserve(window_size),
+            Self::Flat(s) => s.buffer.reserve(window_size),
         }
     }
 
@@ -303,9 +333,14 @@ impl FrameDecoderState {
     /// from `source`. When `magicless` is `true`, the 4-byte magic
     /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
     /// Crate-internal — reached only via `FrameDecoder::init` /
-    /// `FrameDecoder::init_with_dict_handle`. Pre-allocates the
-    /// decode buffer to `window_size` so the first block does not
-    /// trigger incremental growth from zero capacity.
+    /// `FrameDecoder::init_with_dict_handle`. For multi-segment
+    /// (ring-backed) frames the decode buffer is allocated lazily —
+    /// direct-eligible frames pay zero buffer allocation, and the
+    /// non-direct fallback reserves `window_size` once in
+    /// `decode_all_impl` via `reserve_buffer`. Single-segment
+    /// (flat-backed) frames eagerly size the backing `FlatBuf` to
+    /// `frame_content_size` because the flat path writes the entire
+    /// output into the same buffer and cannot defer that allocation.
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
@@ -341,10 +376,18 @@ impl FrameDecoderState {
     /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
     /// only via `FrameDecoder::reset`.
     ///
-    /// `DecodeBuffer::reset` reserves `window_size` internally, so
-    /// no additional frame-level reservation is needed here.
-    /// Further buffer growth during decoding is performed on demand
-    /// by the active block path.
+    /// `DecodeBuffer::reset` no longer reserves window_size for either
+    /// backend — capacity decisions live one layer up. For ring-backed
+    /// scratch, direct-eligible frames pay zero allocation here and
+    /// the non-direct path is pre-reserved by `decode_all_impl` /
+    /// `decode_blocks` via `DecoderScratchKind::reserve_buffer(window_size)`
+    /// before any block writes. Flat-backed scratch is sized to
+    /// `frame_content_size` by `DecoderScratchKind::new_flat` at first
+    /// construction (and on Ring → Flat transition); a reused flat
+    /// scratch whose new frame fits within the prior FCS reuses the
+    /// existing capacity, and one whose new FCS is larger is also
+    /// pre-reserved by the same `reserve_buffer(window_size)` call at
+    /// frame entry (single-segment frames have window_size == FCS).
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
@@ -882,6 +925,17 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
+        // Streaming entry point: pre-reserve the backing buffer to
+        // `window_size` so multi-block frames don't pay repeated
+        // `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
+        // window) as blocks accumulate. `decode_all` does the same up
+        // front in `decode_all_impl`; this mirrors it for callers
+        // driving `decode_blocks` directly. Idempotent — the
+        // backend's `reserve` early-returns when capacity is already
+        // sufficient.
+        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
+        state.decoder_scratch.reserve_buffer(window_size);
+
         let mut block_dec = decoding::block_decoder::new();
 
         let buffer_size_before = state.decoder_scratch.buffer_len();
@@ -1268,10 +1322,15 @@ impl FrameDecoder {
             // frames (no FCS, active dict, output too small for
             // slack) fall through to the legacy `decode_blocks` +
             // `read` drain loop below.
-            let state_ref = self.state.as_ref().expect("init populated state");
-            let content_size = state_ref.frame_header.frame_content_size();
-            let fcs_declared = state_ref.frame_header.fcs_declared();
-            let dict_active = state_ref.using_dict.is_some();
+            let (content_size, fcs_declared, dict_active, window_size) = {
+                let state_ref = self.state.as_ref().expect("init populated state");
+                (
+                    state_ref.frame_header.frame_content_size(),
+                    state_ref.frame_header.fcs_declared(),
+                    state_ref.using_dict.is_some(),
+                    state_ref.frame_header.window_size().unwrap_or(0),
+                )
+            };
             let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
             // Per-block checksums collected inside `run_direct_decode`
             // post-loop (over recorded (start, end) ranges of `output`)
@@ -1287,6 +1346,16 @@ impl FrameDecoder {
                 output = &mut output[written..];
                 total_bytes_written += written;
                 continue;
+            }
+            // Non-direct fallback: pre-reserve the backing buffer to
+            // `window_size` in a single allocation before block decode
+            // starts, so multi-segment frames don't pay repeated
+            // `reserve_amortized` grow steps as blocks accumulate (each
+            // block only reserves MAX_BLOCK_SIZE = 128 KiB, so a window
+            // > 128 KiB otherwise grows through several intermediate
+            // sizes with `alloc_zeroed + memcpy` each time).
+            if let Some(state) = self.state.as_mut() {
+                state.decoder_scratch.reserve_buffer(window_size as usize);
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -1383,10 +1452,15 @@ impl FrameDecoder {
             // frames (no FCS, active dict, output too small for
             // slack) fall through to the legacy `decode_blocks` +
             // `read` drain loop below.
-            let state_ref = self.state.as_ref().expect("init populated state");
-            let content_size = state_ref.frame_header.frame_content_size();
-            let fcs_declared = state_ref.frame_header.fcs_declared();
-            let dict_active = state_ref.using_dict.is_some();
+            let (content_size, fcs_declared, dict_active, window_size) = {
+                let state_ref = self.state.as_ref().expect("init populated state");
+                (
+                    state_ref.frame_header.frame_content_size(),
+                    state_ref.frame_header.fcs_declared(),
+                    state_ref.using_dict.is_some(),
+                    state_ref.frame_header.window_size().unwrap_or(0),
+                )
+            };
             let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
             let direct_eligible =
                 content_size > 0 && !dict_active && (output.len() as u64) >= needed;
@@ -1395,6 +1469,12 @@ impl FrameDecoder {
                 output = &mut output[written..];
                 total_bytes_written += written;
                 continue;
+            }
+            // Non-direct fallback: pre-reserve the backing buffer to
+            // `window_size` once so the per-block growth cycle is
+            // skipped (see same comment on the no-lsm path above).
+            if let Some(state) = self.state.as_mut() {
+                state.decoder_scratch.reserve_buffer(window_size as usize);
             }
             let frame_start_total = total_bytes_written;
             loop {

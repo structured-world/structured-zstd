@@ -109,7 +109,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
         self.buffer.clear();
-        self.buffer.reserve(self.window_size);
+        // No reserve here: capacity decisions are pushed up to the frame
+        // layer. Direct-decode frames (`run_direct_decode`) write through
+        // `UserSliceBackend` and never touch this buffer, so a long-lived
+        // `FrameDecoder` reused across direct-eligible frames pays zero
+        // allocation for the window. The non-direct path is pre-reserved
+        // by `FrameDecoder::decode_all_impl` / `decode_blocks` via
+        // `DecoderScratchKind::reserve_buffer(window_size)` before any
+        // block writes — that is the only call site that knows whether
+        // the frame will actually hit this buffer.
         self.dict_content.clear();
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]
