@@ -54,6 +54,11 @@ fn main() {
         written,
         level
     );
+    eprintln!(
+        "FHD byte4=0x{:02x}, content_checksum_flag (bit 2) = {}",
+        compressed[4],
+        (compressed[4] >> 2) & 1
+    );
 
     let mut target = vec![0u8; n + WILDCOPY_OVERLENGTH];
     // Pre-touch pages so first iter doesn't pay anon-fault cost.
