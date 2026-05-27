@@ -54,7 +54,13 @@ unsafe impl GlobalAlloc for AuditAllocator {
                 let idx = TRACE_LEN.fetch_add(1, Ordering::Relaxed);
                 if idx < TRACE_CAP {
                     TRACE_SIZES[idx].store(size, Ordering::Relaxed);
-                    TRACE_PEAK_AFTER[idx].store(new_live, Ordering::Relaxed);
+                    // Store the current PEAK (not live-after) so the
+                    // column matches its label. Live-after can dip below
+                    // peak when deallocations precede a later alloc;
+                    // peak only ever rises, matching what the user reads
+                    // from the "peak_after" header.
+                    TRACE_PEAK_AFTER[idx]
+                        .store(PEAK_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
             }
         }
@@ -97,7 +103,10 @@ unsafe impl GlobalAlloc for AuditAllocator {
                 let idx = TRACE_LEN.fetch_add(1, Ordering::Relaxed);
                 if idx < TRACE_CAP {
                     TRACE_SIZES[idx].store(delta, Ordering::Relaxed);
-                    TRACE_PEAK_AFTER[idx].store(new_live, Ordering::Relaxed);
+                    // Store current PEAK to match column label — see
+                    // `alloc` for rationale.
+                    TRACE_PEAK_AFTER[idx]
+                        .store(PEAK_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
             }
         } else if new_size < old_size {

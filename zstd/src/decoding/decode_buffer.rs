@@ -109,13 +109,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
         self.buffer.clear();
-        // Lazy reserve: the backend grows on demand the first time a
-        // block writes into it. Direct-decode frames (`run_direct_decode`)
-        // write through `UserSliceBackend` and never touch this buffer,
-        // so a long-lived `FrameDecoder` reused across direct-eligible
-        // frames pays zero RingBuffer allocation for the window. The
-        // non-direct `decode_blocks` path grows via `reserve_amortized`
-        // on the first write.
+        // Lazy reserve: every `BufferBackend` grows on demand the first
+        // time a block writes into it (RingBuffer via
+        // `reserve_amortized`, FlatBuf via `Vec::reserve`). Direct-decode
+        // frames (`run_direct_decode`) write through `UserSliceBackend`
+        // and never touch this buffer, so a long-lived `FrameDecoder`
+        // reused across direct-eligible frames pays zero allocation for
+        // the window. The non-direct `decode_blocks` path triggers the
+        // backend's grow path on the first write.
         self.dict_content.clear();
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]
