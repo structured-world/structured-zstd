@@ -65,6 +65,47 @@ unsafe impl GlobalAlloc for AuditAllocator {
         unsafe { System.dealloc(ptr, layout) };
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Override the default `GlobalAlloc::realloc` shim
+        // (`alloc(new) + copy + dealloc(old)`) so peak accounting only
+        // sees the size delta, not a transient `old + new` live total.
+        // The default shim would double-count any `Vec` growth during
+        // the measured window and inflate `PEAK_BYTES`.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if new_ptr.is_null() {
+            return new_ptr;
+        }
+        let old_size = layout.size();
+        if new_size > old_size {
+            let delta = new_size - old_size;
+            let new_live = LIVE_BYTES.fetch_add(delta, Ordering::Relaxed) + delta;
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
+            while new_live > peak {
+                match PEAK_BYTES.compare_exchange_weak(
+                    peak,
+                    new_live,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => peak = actual,
+                }
+            }
+            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                let idx = TRACE_LEN.fetch_add(1, Ordering::Relaxed);
+                if idx < TRACE_CAP {
+                    TRACE_SIZES[idx].store(delta, Ordering::Relaxed);
+                    TRACE_PEAK_AFTER[idx].store(new_live, Ordering::Relaxed);
+                }
+            }
+        } else if new_size < old_size {
+            let delta = old_size - new_size;
+            LIVE_BYTES.fetch_sub(delta, Ordering::Relaxed);
+        }
+        new_ptr
+    }
 }
 
 #[global_allocator]
