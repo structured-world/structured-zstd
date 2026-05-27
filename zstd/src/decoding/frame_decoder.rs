@@ -373,14 +373,17 @@ impl FrameDecoderState {
     /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
     /// only via `FrameDecoder::reset`.
     ///
-    /// `DecodeBuffer::reset` no longer reserves window_size — the
-    /// ring-backed buffer is allocated lazily so direct-eligible
-    /// frames pay zero allocation here. The non-direct fallback
+    /// `DecodeBuffer::reset` no longer reserves window_size for either
+    /// backend — ring and flat both grow lazily through their own
+    /// `reserve`/`Vec` paths. For ring-backed scratch, direct-eligible
+    /// frames pay zero allocation here and the non-direct fallback
     /// reserves `window_size` once in `decode_all_impl` via
-    /// `DecoderScratchKind::reserve_buffer` after direct eligibility
-    /// is ruled out. Flat-backed scratch is re-sized eagerly inside
-    /// `DecoderScratchKind::reset` because the single-segment write
-    /// path needs the full capacity from the first block.
+    /// `DecoderScratchKind::reserve_buffer`. Flat-backed scratch is
+    /// sized to `frame_content_size` by `DecoderScratchKind::new_flat`
+    /// at first construction (and on Ring → Flat transition); a reused
+    /// flat scratch whose new frame fits within the prior FCS reuses
+    /// the existing capacity, and one whose new FCS is larger grows
+    /// the backing `Vec` on the first block write.
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
