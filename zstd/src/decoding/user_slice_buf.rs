@@ -1221,6 +1221,7 @@ mod tests {
     /// - offset 20 (mid-range, must route to SSE2 fallback)
     /// - offset 32 (boundary, AVX2 path)
     /// - offset 64 (deep AVX2 path)
+    ///
     /// against a byte-by-byte reference of the same repeat semantics.
     #[cfg(target_arch = "x86_64")]
     #[test]
