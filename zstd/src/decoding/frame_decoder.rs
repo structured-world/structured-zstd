@@ -205,8 +205,14 @@ impl DecoderScratchKind {
     /// after direct-eligibility is ruled out, so multi-segment fallback
     /// decodes don't pay repeated `reserve_amortized` grow steps
     /// (128 KiB → 256 KiB → ... → window) as blocks accumulate.
-    /// Direct-eligible frames never call this and pay zero buffer
-    /// allocation for the window.
+    ///
+    /// Direct-eligible ring-backed frames never call this and pay zero
+    /// ring allocation for the window. Flat-backed (single-segment)
+    /// frames eagerly size their `FlatBuf` to `frame_content_size` at
+    /// `new_flat` construction time, so a direct-eligible flat frame
+    /// already paid for that capacity before this helper is reachable;
+    /// the "zero buffer allocation" guarantee here applies to the
+    /// ring path only.
     #[inline]
     fn reserve_buffer(&mut self, window_size: usize) {
         match self {
@@ -324,9 +330,14 @@ impl FrameDecoderState {
     /// from `source`. When `magicless` is `true`, the 4-byte magic
     /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
     /// Crate-internal — reached only via `FrameDecoder::init` /
-    /// `FrameDecoder::init_with_dict_handle`. Pre-allocates the
-    /// decode buffer to `window_size` so the first block does not
-    /// trigger incremental growth from zero capacity.
+    /// `FrameDecoder::init_with_dict_handle`. For multi-segment
+    /// (ring-backed) frames the decode buffer is allocated lazily —
+    /// direct-eligible frames pay zero buffer allocation, and the
+    /// non-direct fallback reserves `window_size` once in
+    /// `decode_all_impl` via `reserve_buffer`. Single-segment
+    /// (flat-backed) frames eagerly size the backing `FlatBuf` to
+    /// `frame_content_size` because the flat path writes the entire
+    /// output into the same buffer and cannot defer that allocation.
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
@@ -362,10 +373,14 @@ impl FrameDecoderState {
     /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
     /// only via `FrameDecoder::reset`.
     ///
-    /// `DecodeBuffer::reset` reserves `window_size` internally, so
-    /// no additional frame-level reservation is needed here.
-    /// Further buffer growth during decoding is performed on demand
-    /// by the active block path.
+    /// `DecodeBuffer::reset` no longer reserves window_size — the
+    /// ring-backed buffer is allocated lazily so direct-eligible
+    /// frames pay zero allocation here. The non-direct fallback
+    /// reserves `window_size` once in `decode_all_impl` via
+    /// `DecoderScratchKind::reserve_buffer` after direct eligibility
+    /// is ruled out. Flat-backed scratch is re-sized eagerly inside
+    /// `DecoderScratchKind::reset` because the single-segment write
+    /// path needs the full capacity from the first block.
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
