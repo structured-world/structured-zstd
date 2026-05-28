@@ -514,9 +514,23 @@ struct LoopBounds {
 /// # Safety
 ///
 /// All four decoders must share the same table (holds by construction —
-/// built from `&scratch.table`). `target.len() >= base + regen`. Each
-/// `brs[s].source` must be the slice the corresponding decoder was
-/// initialised against.
+/// built from `&scratch.table`).
+///
+/// `target_ptr` must come from a `Vec<u8>` whose allocation is at least
+/// `base + regen` bytes (the caller guarantees this via
+/// `target.reserve(regen)` before deriving the pointer). The Vec must
+/// not be reallocated or moved while `target_ptr` is in use — the
+/// caller holds no other references during the burst+drain phase so
+/// this invariant is upheld trivially.
+///
+/// Writes go through raw `target_ptr.add(cursors[s]).write(byte)` so
+/// no Rust reference is ever constructed to the uninitialised tail
+/// (`target.len()` stays at `base` until the post-loop `set_len`
+/// commits initialisation). Cursor bounds `[base, base+regen)` are
+/// enforced by the `starts`/`ends` clamping in the caller.
+///
+/// Each `brs[s].source` must be the slice the corresponding decoder
+/// was initialised against.
 #[inline(always)]
 unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
