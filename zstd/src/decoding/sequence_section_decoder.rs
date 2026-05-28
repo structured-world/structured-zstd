@@ -111,18 +111,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     use crate::cpu_kernel::NeonKernel;
     #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
     use crate::cpu_kernel::SveKernel;
-    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+    use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
 
     match detect_cpu_kernel() {
-        CpuKernelTag::Scalar => decode_and_execute_sequences_impl::<B, ScalarKernel>(
-            section,
-            source,
-            fse,
-            buffer,
-            offset_hist,
-            literals_buffer,
-            rle_fallback_sequences,
-        ),
+        CpuKernelTag::Scalar => {
+            super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+                section,
+                source,
+                fse,
+                buffer,
+                offset_hist,
+                literals_buffer,
+                rle_fallback_sequences,
+            )
+        }
         #[cfg(target_arch = "x86_64")]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
