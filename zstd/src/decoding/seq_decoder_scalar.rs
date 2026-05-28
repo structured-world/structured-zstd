@@ -1,11 +1,9 @@
-//! BMI2-tier monolithic sequence-section decoder.
+//! Scalar-tier monolithic sequence-section decoder.
 //!
-//! Same shape as the AVX2 monolith: `macro_rules!` blocks expand the
-//! decode + execute bodies textually at every callsite inside one
-//! `#[target_feature(enable = "bmi2")]` function. Match copy uses the
-//! SSE2 16-byte `exec_sequence_inline` (no AVX2/VBMI2 widening).
-
-#![cfg(target_arch = "x86_64")]
+//! Same shape as the AVX2 / BMI2 / VBMI2 monoliths: `macro_rules!`
+//! blocks expand decode + execute bodies textually at every callsite
+//! inside one function. No target_feature; portable arithmetic and
+//! libc memmove fallback in the match-copy path.
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
@@ -17,14 +15,12 @@ use super::sequence_section_decoder::{
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader};
 use crate::common::MAX_BLOCK_SIZE;
-use crate::cpu_kernel::Bmi2Kernel;
+use crate::cpu_kernel::ScalarKernel;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
 use crate::fse::SeqFSEDecoder;
 use alloc::vec::Vec;
 
-/// Textual decode-one body. PEXT-direct via `peek_bits_triple_bmi2`
-/// when vendor cache enables it.
 macro_rules! decode_one_body {
     ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr) => {{
         let ll_state = $ll_dec.state;
@@ -40,25 +36,7 @@ macro_rules! decode_one_body {
 
         debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
 
-        let sum_wide = u16::from(of_num_bits) + u16::from(ml_num_bits) + u16::from(ll_num_bits);
-        let (obits, ml_add, ll_add) = if sum_wide <= 56 {
-            let sum = sum_wide as u8;
-            $br.ensure_bits(sum);
-            // SAFETY: enclosing fn is target_feature(bmi2).
-            let triple = if $br.use_pext_triple_fast() {
-                unsafe { $br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
-            } else {
-                $br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
-            };
-            $br.consume(sum);
-            triple
-        } else {
-            (
-                $br.get_bits(of_num_bits),
-                $br.get_bits(ml_num_bits),
-                $br.get_bits(ll_num_bits),
-            )
-        };
+        let (obits, ml_add, ll_add) = $br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
         let offset = obits as u32 + of_base;
         debug_assert_ne!(offset, 0);
 
@@ -70,8 +48,11 @@ macro_rules! decode_one_body {
     }};
 }
 
-/// Textual execute-one body. SSE2 16-byte match copy via
-/// `exec_sequence_inline`. Labeled-block early exits, no closure.
+/// Scalar-tier execute body. No backend-specific inline-exec path;
+/// always routes through `try_push` + `repeat_lookahead_prefetched`
+/// (the backend may or may not have an SSE2 inline path, but on the
+/// Scalar dispatch arm we don't gate on it — keep the body simple and
+/// portable).
 macro_rules! execute_one_body {
     (
         $buffer:expr,
@@ -109,37 +90,6 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && lit_cur_before
-                    .checked_add(16)
-                    .is_some_and(|b| b <= literals_buffer_len_v)
-                && (seq_ll_v as usize <= 16
-                    || lit_cur_before
-                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
-                        .is_some_and(|b| b <= literals_buffer_len_v));
-
-            if inline_path_safe {
-                let buf_len = $buffer.len();
-                let offset = resolved_offset_v as usize;
-                let prefix_end_ok = buf_len
-                    .checked_add(lits.len())
-                    .is_some_and(|end| offset <= end);
-                if prefix_end_ok {
-                    // SAFETY: parent-slice provenance; offset prefix-resident.
-                    let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    // SAFETY: enclosing fn carries target_feature(bmi2).
-                    let r = unsafe {
-                        $buffer.buffer_mut().exec_sequence_inline(
-                            lit_src,
-                            seq_ll_v as usize,
-                            offset,
-                            seq_ml_v as usize,
-                        )
-                    };
-                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
-                }
-            }
-
             if let Err(e) = $buffer.try_push(lits) {
                 break 'exec_inner Err(ExecuteSequencesError::from(e).into());
             }
@@ -153,13 +103,9 @@ macro_rules! execute_one_body {
     }};
 }
 
-/// BMI2-tier monolithic decode + execute.
-///
-/// # Safety
-/// Caller must have verified BMI2 availability.
-#[target_feature(enable = "bmi2")]
+/// Scalar-tier monolithic decode + execute.
 #[allow(clippy::too_many_lines)]
-pub(crate) unsafe fn decode_and_execute_sequences_bmi2<B: BufferBackend>(
+pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
@@ -175,7 +121,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_bmi2<B: BufferBackend>(
 
     let bytes_read = maybe_update_fse_tables(section, source, fse)?;
     let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::<Bmi2Kernel>::new(bit_stream);
+    let mut br = BitReaderReversed::<ScalarKernel>::new(bit_stream);
 
     let mut skipped_bits = 0;
     loop {
@@ -263,18 +209,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_bmi2<B: BufferBackend>(
             ll_dec.update_state_fast(&mut br);
             ml_dec.update_state_fast(&mut br);
             of_dec.update_state_fast(&mut br);
-        }
-
-        // SAFETY: alignment-only asm.
-        unsafe {
-            core::arch::asm!(
-                ".p2align 6",
-                "nop",
-                ".p2align 5",
-                "nop",
-                ".p2align 3",
-                options(nomem, nostack, preserves_flags)
-            );
         }
 
         let mut pipeline_err: Option<DecompressBlockError> = None;

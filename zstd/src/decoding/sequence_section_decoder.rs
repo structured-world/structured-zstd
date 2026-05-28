@@ -9,7 +9,7 @@ use crate::blocks::sequence_section::{
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
-use crate::fse::FSEDecoder;
+use crate::fse::SeqFSEDecoder;
 use alloc::vec::Vec;
 
 // 8-slot software pipeline mirroring donor
@@ -26,6 +26,40 @@ const _: () = assert!(
     ADVANCE.is_power_of_two(),
     "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
 );
+
+/// Donor `ZSTD_decompressBlock_internal` long-pipeline gate. Engages
+/// the 8-deep lookahead-ring decoder when (a) the block has enough
+/// sequences to amortise prefill+drain (`num_sequences >= ADVANCE * 2`)
+/// AND (b) either the dict is cold (first block after attach) OR total
+/// history exceeds 16 MB AND the FSE offset distribution carries
+/// enough long-distance codes to make prefetch worthwhile.
+///
+/// `MIN_LONG_OFFSET_SHARE`: donor `minShare = MEM_64bits() ? 7 : 20` —
+/// the 32-bit threshold is higher because the prefetch pipeline needs
+/// a stronger long-offset signal to outpace the narrower load window
+/// on those targets. `HISTORY_THRESHOLD_FOR_PREFETCH = 1 << 24` (16 MB):
+/// below that the history fits in L2/L3 and the hardware prefetcher
+/// handles short/medium offsets; engaging the ring is pure overhead.
+///
+/// Single source of truth for both the K-generic dispatcher and the
+/// per-tier x86 monoliths so the two paths can't diverge.
+#[inline]
+pub(crate) fn compute_use_long_pipeline(
+    num_sequences: usize,
+    ddict_is_cold: bool,
+    total_history: usize,
+    offsets_long_share: u32,
+) -> bool {
+    #[cfg(target_pointer_width = "64")]
+    const MIN_LONG_OFFSET_SHARE: u32 = 7;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_LONG_OFFSET_SHARE: u32 = 20;
+    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
+    num_sequences >= ADVANCE * 2
+        && (ddict_is_cold
+            || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
+                && offsets_long_share >= MIN_LONG_OFFSET_SHARE))
+}
 
 /// Fused decode + execute pipeline: decodes each sequence from the FSE
 /// bitstream and immediately executes it (literal copy + match copy)
@@ -77,18 +111,20 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     use crate::cpu_kernel::NeonKernel;
     #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
     use crate::cpu_kernel::SveKernel;
-    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+    use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
 
     match detect_cpu_kernel() {
-        CpuKernelTag::Scalar => decode_and_execute_sequences_impl::<B, ScalarKernel>(
-            section,
-            source,
-            fse,
-            buffer,
-            offset_hist,
-            literals_buffer,
-            rle_fallback_sequences,
-        ),
+        CpuKernelTag::Scalar => {
+            super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+                section,
+                source,
+                fse,
+                buffer,
+                offset_hist,
+                literals_buffer,
+                rle_fallback_sequences,
+            )
+        }
         #[cfg(target_arch = "x86_64")]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
@@ -169,6 +205,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 // and is called from the dispatch matcher above. See issue #279
 // round 3 for the per-kernel architecture rationale.
 
+// `dead_code` on x86_64 production: the per-kernel monoliths bypass
+// this shared body. Live on aarch64 (Neon/Sve dispatch arms) and on
+// every test build. Allowed because the function is conditionally
+// reachable per build configuration.
+#[allow(dead_code)]
 pub(crate) fn decode_and_execute_sequences_impl<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
@@ -236,9 +277,9 @@ pub(crate) fn decode_and_execute_sequences_impl<
         return Ok(());
     }
 
-    let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = FSEDecoder::new(&fse.offsets);
+    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
 
     ll_dec
         .init_state(&mut br)
@@ -327,25 +368,20 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // threshold is higher because the prefetch pipeline needs a
     // stronger long-offset signal to outpace the narrower load
     // window on those targets.
-    #[cfg(target_pointer_width = "64")]
-    const MIN_LONG_OFFSET_SHARE: u32 = 7;
-    #[cfg(not(target_pointer_width = "64"))]
-    const MIN_LONG_OFFSET_SHARE: u32 = 20;
-    // Donor `ZSTD_decompressBlock_internal`: `usePrefetchDecoder` is
-    // initialised from `dctx->ddictIsCold` so the first block of a
-    // freshly-attached-dict frame engages the prefetch decoder
-    // regardless of long-offset share, then `ddictIsCold = 0` after
-    // the dispatch so subsequent blocks fall back to the
-    // `longOffsetShare` heuristic. The consume-once read/clear
-    // happens at function entry above so RLE-mode early returns
-    // don't leak the flag to a later block. Note the sequence-count
-    // guard `num_sequences >= ADVANCE * 2` ALWAYS applies — blocks
-    // too small for the 8-deep lookahead pipeline still go through
-    // the short-block fallback in both cold-dict and warm cases;
-    // the cold flag only bypasses the long-offset-share threshold,
-    // not the sequence-count threshold.
-    let use_long_pipeline = num_sequences >= ADVANCE * 2
-        && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
+    // `saturating_add` to defuse the 32-bit `usize` overflow path: a
+    // pathological frame header could combine a 4 GiB-class window_size
+    // with a non-trivial dict to wrap on i686, silently flipping the
+    // long-pipeline gate around `HISTORY_THRESHOLD_FOR_PREFETCH`. The
+    // saturating variant pins the wrap result at `usize::MAX`, which
+    // crosses the 16 MiB threshold cleanly — gate decision matches the
+    // real (non-wrapped) value's intent.
+    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
+    let use_long_pipeline = compute_use_long_pipeline(
+        num_sequences,
+        ddict_is_cold,
+        total_history,
+        fse.offsets_long_share,
+    );
     // The format-level `isLongOffset` shortcut from donor is
     // irrelevant on our u32-indexed decoder, so on top of the
     // long-offset share the cold-dict signal is the only other gate.
@@ -545,15 +581,15 @@ pub(crate) fn decode_and_execute_sequences_impl<
 /// 13 parameters: the closure capture set the IIFE used implicitly.
 /// Grouping into a struct would push pressure off the argument
 /// registers and onto memory loads, undoing the extraction's win.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn run_pipelined_sequence_loop<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
 >(
     br: &mut BitReaderReversed<'_, K>,
-    ll_dec: &mut FSEDecoder<'_>,
-    ml_dec: &mut FSEDecoder<'_>,
-    of_dec: &mut FSEDecoder<'_>,
+    ll_dec: &mut SeqFSEDecoder<'_>,
+    ml_dec: &mut SeqFSEDecoder<'_>,
+    of_dec: &mut SeqFSEDecoder<'_>,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
@@ -564,36 +600,24 @@ fn run_pipelined_sequence_loop<
     max_update_bits: u8,
     seq_sum: &mut u32,
 ) -> Result<(), DecompressBlockError> {
-    // `prefetch_pos` is the logical buffer index (same frame as
-    // `buffer.len()`) at which the NEXT not-yet-decoded sequence
-    // will start pushing literals. We pre-decode `ADVANCE` ahead,
-    // accumulating (ll + ml) per decoded seq to keep this position
-    // synchronised with where execute will eventually be.
+    // Donor `ZSTD_decompressSequencesLong_body` shape: 8-deep
+    // lookahead ring with `prefetch_lookahead_match_source` per
+    // decoded seq, executing the OLDEST resolved sequence per
+    // iteration. Used ONLY when caller selected the long-pipeline
+    // arm — cold-dict / long-offset frames where DRAM prefetch
+    // matters. Common hot-cache path goes through the straight
+    // single-pass fused loop in `decode_and_execute_sequences_impl`.
     let mut prefetch_pos: usize = old_buffer_size;
     let mut shadow_hist: [u32; 3] = *offset_hist;
-    // ExecSeq is the post-resolve shape (ll, ml, actual_offset). The raw
-    // `Sequence.of` (offset_code) is dead after the pre-resolve step
-    // below — execute_one_sequence_pipelined uses only the actual
-    // offset. Store ExecSeq directly so each slot is 12 bytes instead
-    // of `(Sequence, u32) = 16` bytes (= 4 bytes per slot of dead data,
-    // 32 bytes saved across the 8-deep ring).
     let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
         ll: 0,
         ml: 0,
         actual_offset: 0,
     }; ADVANCE];
 
-    // Pre-fill the ring. Outer `num_sequences >= ADVANCE * 2` gate
-    // guarantees `num_sequences > ADVANCE`, so the FSE state update
-    // is needed after every prefill decode.
     for slot in ring.iter_mut() {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
         let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-        // wrapping_add: bitstream-derived values can overflow on
-        // malformed frames; `prefetch_lookahead_match_source` bound-
-        // checks against `buffer.len()` and drops wrap-derived
-        // indices, so the wrap is harmless while keeping the decoder
-        // fuzz-stable.
         let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
         let source_idx = match_start.wrapping_sub(actual_offset as usize);
         buffer.prefetch_lookahead_match_source(source_idx);
@@ -609,8 +633,18 @@ fn run_pipelined_sequence_loop<
         of_dec.update_state_fast(br);
     }
 
-    // Steady state: decode next, prefetch its source, execute the
-    // oldest slot in the ring (with its pre-resolved offset).
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: alignment-only asm, no memory or register clobbers.
+    unsafe {
+        core::arch::asm!(
+            ".p2align 6",
+            "nop",
+            ".p2align 5",
+            "nop",
+            ".p2align 3",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     for i in ADVANCE..num_sequences {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
         let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
@@ -644,9 +678,6 @@ fn run_pipelined_sequence_loop<
         }
     }
 
-    // Drain: execute remaining ADVANCE sequences with their
-    // pre-resolved offsets. Iteration order matches the ring slot
-    // they occupy from the steady-state loop's final write.
     for k in 0..ADVANCE {
         let slot = (num_sequences + k) & ADVANCE_MASK;
         let exec_seq = ring[slot];
@@ -660,10 +691,6 @@ fn run_pipelined_sequence_loop<
         *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
     }
 
-    // Single committing point for real offset history on the
-    // pipelined success path. Shadow walked every queued sequence;
-    // copy that state back so the next block sees the post-block
-    // repcodes. Caller rolls back on Err.
     *offset_hist = shadow_hist;
     Ok(())
 }
@@ -689,6 +716,7 @@ pub(crate) struct ExecSeq {
 /// the post-resolve contract (raw `Sequence.of` is dead; only
 /// `actual_offset` reaches the executor) is visible at one site.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
@@ -723,6 +751,7 @@ pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper; per-kernel monoliths now go through seq_decoder_bmi2 directly
 pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -745,6 +774,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -769,6 +799,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -800,6 +831,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -825,6 +857,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -862,6 +895,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 /// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
 /// headroom.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
@@ -1043,6 +1077,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -1118,10 +1153,11 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
 /// `decode_sequences_without_rle` — separate copy because Rust does not
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
-    ll_dec: &mut FSEDecoder<'_>,
-    ml_dec: &mut FSEDecoder<'_>,
-    of_dec: &mut FSEDecoder<'_>,
+    ll_dec: &mut SeqFSEDecoder<'_>,
+    ml_dec: &mut SeqFSEDecoder<'_>,
+    of_dec: &mut SeqFSEDecoder<'_>,
     br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
@@ -1183,9 +1219,9 @@ pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+    let mut ll_dec = SeqFSEDecoder::new(&scratch.literal_lengths);
+    let mut ml_dec = SeqFSEDecoder::new(&scratch.match_lengths);
+    let mut of_dec = SeqFSEDecoder::new(&scratch.offsets);
 
     if scratch.ll_rle.is_none() {
         ll_dec.init_state(br)?;
@@ -1220,48 +1256,34 @@ pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     );
 
     for _seq_idx in 0..section.num_sequences {
-        //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
-            ll_rle
-        } else {
-            ll_dec.decode_symbol()
-        };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
-            ml_rle
-        } else {
-            ml_dec.decode_symbol()
-        };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
-            of_rle
-        } else {
-            of_dec.decode_symbol()
-        };
-
-        // RLE-mode tables don't have an enriched FSE entry to read
-        // from — fall back to `lookup_ll_code` / `lookup_ml_code`
-        // for the RLE byte. FSE-mode tables read base / extra-bits
-        // directly off the active state's enriched `Entry`. The
-        // RLE-fallback path is the only place these `lookup_*`
-        // helpers are still used after #247 Part 1.
-        let (ll_value, ll_num_bits) = if scratch.ll_rle.is_some() {
-            lookup_ll_code(ll_code)
+        // RLE-mode tables don't carry an enriched FSE state — fall
+        // back to `lookup_ll_code` / `lookup_ml_code` on the RLE byte
+        // for LL / ML, and the closed-form `(1 << code, code)` shape
+        // for OF. FSE-mode tables read base / extra-bits directly
+        // off the active state's enriched `SeqSymbol`. `SeqSymbol`
+        // has no `symbol` byte; OF code is recoverable from
+        // `num_additional_bits` (== code for code < 32) but the hot
+        // path uses `base_value` / `num_additional_bits` directly.
+        let (ll_value, ll_num_bits) = if let Some(ll_rle) = scratch.ll_rle {
+            lookup_ll_code(ll_rle)
         } else {
             (ll_dec.state.base_value, ll_dec.state.num_additional_bits)
         };
-        let (ml_value, ml_num_bits) = if scratch.ml_rle.is_some() {
-            lookup_ml_code(ml_code)
+        let (ml_value, ml_num_bits) = if let Some(ml_rle) = scratch.ml_rle {
+            lookup_ml_code(ml_rle)
         } else {
             (ml_dec.state.base_value, ml_dec.state.num_additional_bits)
         };
+        let (of_value, of_num_bits) = if let Some(of_rle) = scratch.of_rle {
+            (1u32 << of_rle, of_rle)
+        } else {
+            (of_dec.state.base_value, of_dec.state.num_additional_bits)
+        };
 
-        // OF code / offset==0 checks dropped per FSE invariants (see comment
-        // in decode_sequences_without_rle). For RLE mode, the singleton
-        // of_rle byte is validated at maybe_update_fse_tables; for FSE mode,
-        // build_decoding_table caps symbols at MAX_OFFSET_CODE.
-        debug_assert!(of_code <= MAX_OFFSET_CODE);
+        debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
 
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + of_value;
 
         debug_assert_ne!(offset, 0);
 
@@ -1433,14 +1455,18 @@ pub const OF_MAX_LOG: u8 = 8;
 /// Called only when the offsets table is actually rebuilt (FSE /
 /// Predefined modes in `maybe_update_fse_tables`). Repeat-mode
 /// blocks reuse the cached value in `FSEScratch::offsets_long_share`.
-pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 {
+pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u32 {
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
     let table_log = offsets.accuracy_log as u32;
+    // `SeqSymbol` has no per-state byte; after `enrich_for_offsets`
+    // the source offset code lives in `num_additional_bits`
+    // (`code` for `code < 32`, `0` otherwise — long codes are
+    // bounded by the format spec at 31).
     let raw = offsets
         .decode
         .iter()
-        .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
+        .filter(|entry| u32::from(entry.num_additional_bits) > LONG_OFFSET_CODE_THRESHOLD)
         .count() as u32;
     // Format-spec bound `OF_MAX_LOG = 8` keeps `table_log <=
     // OFFSET_FSE_LOG` for every valid offsets stream, so the shift
@@ -1659,11 +1685,11 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // handle the cache primitive directly without a fallible-init
 // shim.
 #[cfg(feature = "std")]
-fn predefined_ll_table() -> &'static crate::fse::FSETable {
+fn predefined_ll_table() -> &'static crate::fse::SeqFSETable {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
         t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&LL_META);
@@ -1672,11 +1698,11 @@ fn predefined_ll_table() -> &'static crate::fse::FSETable {
 }
 
 #[cfg(feature = "std")]
-fn predefined_ml_table() -> &'static crate::fse::FSETable {
+fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
         t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&ML_META);
@@ -1685,11 +1711,11 @@ fn predefined_ml_table() -> &'static crate::fse::FSETable {
 }
 
 #[cfg(feature = "std")]
-fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
+fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<(crate::fse::FSETable, u32)> = OnceLock::new();
+    static CACHED: OnceLock<(crate::fse::SeqFSETable, u32)> = OnceLock::new();
     let cache = CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
             .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
@@ -1732,9 +1758,9 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 #[cfg(feature = "std")]
 #[test]
 fn predefined_fse_caches_match_rebuild_output() {
-    use crate::fse::FSETable;
+    use crate::fse::SeqFSETable;
 
-    let mut ll_rebuild = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    let mut ll_rebuild = SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
     ll_rebuild
         .build_from_probabilities(
             LL_DEFAULT_ACC_LOG,
@@ -1751,7 +1777,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(ll_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "LL entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "LL entry {i} new_state mismatch");
         assert_eq!(
@@ -1764,7 +1789,7 @@ fn predefined_fse_caches_match_rebuild_output() {
         );
     }
 
-    let mut ml_rebuild = FSETable::new(MAX_MATCH_LENGTH_CODE);
+    let mut ml_rebuild = SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
     ml_rebuild
         .build_from_probabilities(
             ML_DEFAULT_ACC_LOG,
@@ -1781,7 +1806,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(ml_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "ML entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "ML entry {i} new_state mismatch");
         assert_eq!(
@@ -1794,7 +1818,7 @@ fn predefined_fse_caches_match_rebuild_output() {
         );
     }
 
-    let mut of_rebuild = FSETable::new(MAX_OFFSET_CODE);
+    let mut of_rebuild = SeqFSETable::new(MAX_OFFSET_CODE);
     of_rebuild
         .build_from_probabilities(
             OF_DEFAULT_ACC_LOG,
@@ -1816,7 +1840,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(of_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "OF entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "OF entry {i} new_state mismatch");
         assert_eq!(
@@ -1832,7 +1855,7 @@ fn predefined_fse_caches_match_rebuild_output() {
 
 #[test]
 fn test_ll_default() {
-    let mut table = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    let mut table = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
         .build_from_probabilities(
             LL_DEFAULT_ACC_LOG,
@@ -1843,23 +1866,18 @@ fn test_ll_default() {
     assert!(table.decode.len() == 64);
 
     //just test a few values. TODO test all values
-    assert!(table.decode[0].symbol == 0);
     assert!(table.decode[0].num_bits == 4);
     assert!(table.decode[0].new_state == 0);
 
-    assert!(table.decode[19].symbol == 27);
     assert!(table.decode[19].num_bits == 6);
     assert!(table.decode[19].new_state == 0);
 
-    assert!(table.decode[39].symbol == 25);
     assert!(table.decode[39].num_bits == 4);
     assert!(table.decode[39].new_state == 16);
 
-    assert!(table.decode[60].symbol == 35);
     assert!(table.decode[60].num_bits == 6);
     assert!(table.decode[60].new_state == 0);
 
-    assert!(table.decode[59].symbol == 24);
     assert!(table.decode[59].num_bits == 5);
     assert!(table.decode[59].new_state == 32);
 }
@@ -1867,29 +1885,29 @@ fn test_ll_default() {
 #[cfg(test)]
 mod offsets_long_share_tests {
     use super::compute_offsets_long_share;
-    use crate::fse::{Entry, FSETable};
 
-    /// Construct a synthetic FSETable with the given symbol per entry
-    /// at the requested accuracy_log. Bypasses `build_from_probabilities`
-    /// — we only need `decode[*].symbol` and `accuracy_log` populated;
-    /// the long-share helper reads exactly those.
-    fn synthetic_offsets_table(accuracy_log: u8, symbols: &[u8]) -> FSETable {
+    /// Construct a synthetic offsets [`SeqFSETable`] with the given
+    /// offset code per entry. Mirrors the post-`enrich_for_offsets`
+    /// shape used by `compute_offsets_long_share`: each entry's
+    /// `num_additional_bits` holds the code (== source byte for
+    /// `code < 32`, the only range this helper reads).
+    fn synthetic_offsets_table(accuracy_log: u8, symbols: &[u8]) -> crate::fse::SeqFSETable {
+        use crate::fse::SeqSymbol;
         let size = 1usize << accuracy_log;
         assert_eq!(
             symbols.len(),
             size,
             "symbols.len() must equal 1 << accuracy_log"
         );
-        let mut t = FSETable::new(31);
+        let mut t = crate::fse::SeqFSETable::new(31);
         t.accuracy_log = accuracy_log;
         t.decode = symbols
             .iter()
-            .map(|&s| Entry {
+            .map(|&s| SeqSymbol {
                 new_state: 0,
-                symbol: s,
                 num_bits: 0,
+                num_additional_bits: s,
                 base_value: 0,
-                num_additional_bits: 0,
             })
             .collect();
         t
@@ -1953,5 +1971,84 @@ mod offsets_long_share_tests {
         symbols[0] = 23;
         let table = synthetic_offsets_table(8, &symbols);
         assert_eq!(compute_offsets_long_share(&table), 1);
+    }
+}
+
+#[cfg(test)]
+mod compute_use_long_pipeline_tests {
+    use super::{ADVANCE, compute_use_long_pipeline};
+
+    /// Per-target `MIN_LONG_OFFSET_SHARE` (mirrors the cfg in
+    /// `compute_use_long_pipeline`). Keep in sync with the constant
+    /// in production code so the tests follow target_pointer_width.
+    #[cfg(target_pointer_width = "64")]
+    const MIN_SHARE: u32 = 7;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_SHARE: u32 = 20;
+    const HISTORY_THRESHOLD: usize = 1 << 24;
+
+    #[test]
+    fn rejects_when_num_sequences_below_2x_advance() {
+        // Below `ADVANCE * 2` (= 16): never engage the long pipeline,
+        // regardless of cold-dict / history / share signals.
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2 - 1,
+            true,
+            HISTORY_THRESHOLD + 1,
+            u32::MAX
+        ));
+    }
+
+    #[test]
+    fn cold_dict_forces_long_pipeline_at_min_seq_count() {
+        // At the `ADVANCE * 2` boundary, `ddict_is_cold == true` is a
+        // sufficient override — history / share are not read.
+        assert!(compute_use_long_pipeline(ADVANCE * 2, true, 0, 0));
+    }
+
+    #[test]
+    fn history_at_threshold_does_not_engage() {
+        // Gate uses `>` not `>=`: history exactly at threshold fails.
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD,
+            MIN_SHARE,
+        ));
+    }
+
+    #[test]
+    fn history_just_above_threshold_engages_when_share_meets_min() {
+        // Strictly above threshold + share at the per-target min: engage.
+        assert!(compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD + 1,
+            MIN_SHARE,
+        ));
+    }
+
+    #[test]
+    fn share_below_min_blocks_engagement_even_with_large_history() {
+        // Even with the share one below the per-target minimum, no engage.
+        const _: () = assert!(MIN_SHARE > 0, "test invariant: MIN_SHARE > 0 required");
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD + 1,
+            MIN_SHARE - 1,
+        ));
+    }
+
+    #[test]
+    fn saturating_history_engages_when_share_meets_min() {
+        // `total_history = usize::MAX` (the saturating-add fallback path
+        // from the per-tier wrappers) is well above the threshold.
+        assert!(compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            usize::MAX,
+            MIN_SHARE,
+        ));
     }
 }
