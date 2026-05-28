@@ -473,13 +473,15 @@ impl<E: FseEntry> FSETableImpl<E> {
         // table AND initialise `symbol_next` for them. Donor:
         // `tableDecode[highThreshold--].baseValue = s; symbolNext[s]
         // = 1;`.
+        //
+        // Index loop (not `iter().enumerate().take()`) — LLVM emits
+        // a tighter scalar loop without the Iterator::next state
+        // machine. The enumerate+take iterator chain was visible as
+        // ~1.8% combined self-time on the decode flamegraph.
+        let probs = self.symbol_probabilities.as_slice();
         let mut negative_idx = table_size;
-        for (symbol, &prob) in self
-            .symbol_probabilities
-            .iter()
-            .enumerate()
-            .take(nb_symbols)
-        {
+        for symbol in 0..nb_symbols {
+            let prob = probs[symbol];
             if prob == -1 {
                 negative_idx -= 1;
                 spread[negative_idx] = symbol as u8;
@@ -493,12 +495,8 @@ impl<E: FseEntry> FSETableImpl<E> {
         // build loop's counter reaches `2*prob - 1` over `prob`
         // iterations (matching donor `symbolNext[s]++` semantics).
         let mut position = 0usize;
-        for (symbol, &prob) in self
-            .symbol_probabilities
-            .iter()
-            .enumerate()
-            .take(nb_symbols)
-        {
+        for symbol in 0..nb_symbols {
+            let prob = probs[symbol];
             if prob <= 0 {
                 continue;
             }
@@ -532,9 +530,20 @@ impl<E: FseEntry> FSETableImpl<E> {
         // shape.
         let accuracy_log = self.accuracy_log;
         let table_size_u32 = table_size as u32;
+        // Write entries into `spare_capacity_mut()` (typed as
+        // `&mut [MaybeUninit<E>]`) and only `set_len` AFTER all
+        // writes complete. This keeps the per-push bookkeeping out
+        // of the hot loop (the body becomes a flat strided
+        // `MaybeUninit::write` sequence) while staying sound: the
+        // `set_len` call only ever runs when every slot in
+        // 0..table_size is initialised. The error path returns Err
+        // with `decode.len() == 0` (the preceding `clear()`),
+        // exposing zero uninitialised entries.
         self.decode.clear();
         self.decode.reserve(table_size);
-        for &symbol in spread.iter().take(table_size) {
+        let slots = &mut self.decode.spare_capacity_mut()[..table_size];
+
+        for (state_idx, &symbol) in spread.iter().take(table_size).enumerate() {
             let next_state = symbol_next[symbol as usize];
             // `next_state >= 1` by construction: upstream
             // `read_probabilities` / `build_from_probabilities`
@@ -567,6 +576,12 @@ impl<E: FseEntry> FSETableImpl<E> {
             // high_bit > accuracy_log + 1 and wrap `nb` to a large
             // u8. Reject so the unchecked indexing contract holds.
             if nb > accuracy_log {
+                // `decode.len()` is still 0 (set by `clear()` above) —
+                // no `set_len` ran, so no uninitialised entry is
+                // observable to the outer `build_decoding_table`'s
+                // `reset()` path. The partially-filled `slots` buffer
+                // is dropped here harmlessly (`MaybeUninit<E>` has no
+                // Drop).
                 return Err(FSETableError::TableInvariantViolation {
                     prob: self.symbol_probabilities[symbol as usize],
                     symbol,
@@ -585,8 +600,16 @@ impl<E: FseEntry> FSETableImpl<E> {
             // formula bug instead of silently producing a
             // malformed entry.
             let new_state_u32 = (next_state << nb) - table_size_u32;
-            self.decode
-                .push(E::from_raw(new_state_u32 as u16, symbol, nb));
+            slots[state_idx].write(E::from_raw(new_state_u32 as u16, symbol, nb));
+        }
+
+        // SAFETY: the loop above ran `table_size` iterations and
+        // wrote `slots[state_idx]` for every `state_idx ∈
+        // [0, table_size)`. `reserve(table_size)` guaranteed capacity.
+        // Every Err exit happens BEFORE this `set_len`, so we only
+        // claim initialisation when every slot has been written.
+        unsafe {
+            self.decode.set_len(table_size);
         }
 
         Ok(())
