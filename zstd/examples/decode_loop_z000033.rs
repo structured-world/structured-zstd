@@ -18,17 +18,25 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50_000);
+    let mode: &str = args.get(3).map(|s| s.as_str()).unwrap_or("rust");
+    let corpus_path: Option<&str> = args.get(4).map(|s| s.as_str());
 
-    // Deterministic 1MB synthetic — LCG, repeatable across hosts.
-    let n = 1_048_576usize;
-    let mut src = Vec::with_capacity(n);
-    let mut state: u64 = 0x517cc1b727220a95;
-    while src.len() < n {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        src.push((state >> 56) as u8);
-    }
+    // Source: either a file from disk, or a deterministic 1MB LCG synthetic.
+    let src: Vec<u8> = if let Some(path) = corpus_path {
+        std::fs::read(path).expect("read corpus file")
+    } else {
+        let n = 1_048_576usize;
+        let mut src = Vec::with_capacity(n);
+        let mut state: u64 = 0x517cc1b727220a95;
+        while src.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            src.push((state >> 56) as u8);
+        }
+        src
+    };
+    let n = src.len();
 
     // FFI encode once at requested level.
     let dst_cap = unsafe { zstd_sys::ZSTD_compressBound(src.len()) };
@@ -65,23 +73,57 @@ fn main() {
     for chunk in target.chunks_mut(4096) {
         chunk[0] = 0;
     }
-    let mut decoder = FrameDecoder::new();
-
-    eprintln!("starting {} decode iters", iters);
+    eprintln!("starting {} decode iters in mode {}", iters, mode);
     let start = std::time::Instant::now();
     let mut total = 0usize;
-    for _ in 0..iters {
-        let wrote = decoder
-            .decode_all(std::hint::black_box(&compressed), &mut target)
-            .expect("decode_all");
-        total = total.wrapping_add(wrote);
+    match mode {
+        "ffi" => {
+            // Reuse one DCtx to mirror the c_ffi compare_ffi arm. RAII
+            // guard ensures `ZSTD_freeDCtx` runs even if the per-iter
+            // `assert_eq!` below panics on a corrupted fixture.
+            struct DCtxGuard(*mut zstd_sys::ZSTD_DCtx_s);
+            impl Drop for DCtxGuard {
+                fn drop(&mut self) {
+                    unsafe { zstd_sys::ZSTD_freeDCtx(self.0) };
+                }
+            }
+            let dctx = DCtxGuard(unsafe { zstd_sys::ZSTD_createDCtx() });
+            assert!(!dctx.0.is_null(), "ZSTD_createDCtx failed");
+            for _ in 0..iters {
+                let wrote = unsafe {
+                    zstd_sys::ZSTD_decompressDCtx(
+                        dctx.0,
+                        target.as_mut_ptr() as *mut _,
+                        target.len(),
+                        std::hint::black_box(compressed.as_ptr() as *const _),
+                        compressed.len(),
+                    )
+                };
+                assert_eq!(
+                    unsafe { zstd_sys::ZSTD_isError(wrote) },
+                    0,
+                    "ZSTD_decompressDCtx"
+                );
+                total = total.wrapping_add(wrote);
+            }
+        }
+        _ => {
+            let mut decoder = FrameDecoder::new();
+            for _ in 0..iters {
+                let wrote = decoder
+                    .decode_all(std::hint::black_box(&compressed), &mut target)
+                    .expect("decode_all");
+                total = total.wrapping_add(wrote);
+            }
+        }
     }
     let elapsed = start.elapsed();
     eprintln!(
-        "decoded {} iters, {} total bytes, {:?} wall, {:.0} ns/iter",
+        "decoded {} iters, {} total bytes, {:?} wall, {:.0} ns/iter ({})",
         iters,
         total,
         elapsed,
-        elapsed.as_nanos() as f64 / iters as f64
+        elapsed.as_nanos() as f64 / iters as f64,
+        mode
     );
 }
