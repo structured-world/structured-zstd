@@ -280,7 +280,24 @@ fn decompress_literals_impl<K: CpuKernel>(
         // decode directly into slices — no temporary Vec allocations.
         let seg = regen.div_ceil(4);
 
-        target.resize(base + regen, 0);
+        // Stream the burst + drain output through a raw `*mut u8` into
+        // `target`'s spare capacity, leaving `target.len()` at `base`
+        // until every byte in [base, base+regen) is written. Only then
+        // do we commit via `set_len(base + regen)`. This avoids the
+        // `__memset_avx2` zero-init pass that a `resize(base+regen, 0)`
+        // would emit (~0.5% of decode self-time on z000033 L-5) while
+        // staying sound: at no point does the code construct a
+        // `&mut [u8]` reference covering uninitialised bytes.
+        //
+        // SAFETY: `target.reserve(regen)` at the top of this function
+        // guarantees `capacity() >= base + regen`, so the raw pointer
+        // can safely address every index in [base, base+regen). Error
+        // paths exit BEFORE the final `set_len`, leaving `target.len()`
+        // at the pre-call `base` value — uninitialised bytes never
+        // become observable to any caller. `u8` has no Drop, so the
+        // raw uninitialised tail in spare capacity carries no
+        // teardown obligations.
+        let target_ptr: *mut u8 = target.as_mut_ptr();
         // Clamp every start/end into [base, base+regen] so cursors can
         // never index past the pre-allocated region, even with corrupted
         // frame headers that produce small regen (where N*seg > regen).
@@ -353,6 +370,7 @@ fn decompress_literals_impl<K: CpuKernel>(
             table_shift,
             cursor_burst_ceil,
             burst_eligible,
+            alloc_upper_bound: base + regen,
         };
 
         // Burst is identical across all kernels (donor parity: reads
@@ -360,29 +378,42 @@ fn decompress_literals_impl<K: CpuKernel>(
         // no SIMD intrinsics needed). Single un-genericised call.
         //
         // SAFETY: caller guarantees `brs[s].source` is the same as the
-        // stream slice each decoder was initialised against; the
-        // upfront `target.resize(base + regen, 0)` covers all cursor
-        // writes; `packed` length matches `1 << max_num_bits` by
-        // `HuffmanTable::build_decoder`'s `resize`.
+        // stream slice each decoder was initialised against; `target_ptr`
+        // addresses an allocation of at least `base + regen` bytes (via
+        // the `target.reserve(regen)` above), so cursor writes in
+        // [base, base+regen) are in-bounds; `packed` length matches
+        // `1 << max_num_bits` by `HuffmanTable::build_decoder`'s `resize`.
         unsafe {
             run_4stream_burst_loop(
                 &mut decoders,
                 &mut brs,
-                target,
+                target_ptr,
                 packed,
                 &mut cursors,
                 &bounds,
             );
         }
 
-        // Drain remaining symbols from each stream, bounded by segment end
+        // Drain remaining symbols from each stream, bounded by segment end.
+        // SAFETY: cursors[i] ∈ [base, base+regen) by `starts`/`ends` clamping
+        // earlier; `target_ptr.add(cursors[i])` is therefore within the
+        // reserved allocation. Each write initialises one previously-
+        // uninitialised byte; `target.len()` remains at `base` so no
+        // `&mut [u8]` reference is constructed to that byte before it is
+        // written. The error exits below DO NOT call `target.truncate(base)`
+        // — `target.len()` is still `base` already, so a truncate would be
+        // a no-op; eliding it also lets us hold `target_ptr` without an
+        // intervening `&mut Vec<u8>` borrow that invalidates the pointer
+        // under stacked-borrows.
         for i in 0..4 {
             while brs[i].bits_remaining() > -max_bits && cursors[i] < ends[i] {
-                target[cursors[i]] = decoders[i].decode_symbol_and_advance(&mut brs[i]);
+                let byte = decoders[i].decode_symbol_and_advance(&mut brs[i]);
+                unsafe {
+                    target_ptr.add(cursors[i]).write(byte);
+                }
                 cursors[i] += 1;
             }
             if brs[i].bits_remaining() != -max_bits {
-                target.truncate(base);
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
                     read_til: brs[i].bits_remaining(),
                     expected: -max_bits,
@@ -391,16 +422,21 @@ fn decompress_literals_impl<K: CpuKernel>(
         }
 
         // Verify total decoded count matches expected regenerated size.
-        // Return error immediately rather than deferring to the downstream check.
         let decoded: usize = cursors.iter().zip(starts.iter()).map(|(c, s)| c - s).sum();
         if decoded != regen {
-            // Truncate to base: segmented layout means partial decode left
-            // bytes scattered across segments, so only base is a clean boundary.
-            target.truncate(base);
             return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
                 decoded,
                 expected: regen,
             });
+        }
+
+        // Commit: every byte in [base, base+regen) was written above
+        // (cursors[s] reached ends[s] for all s, and the decoded total
+        // equals regen). `target.len()` was `base` until this point —
+        // exposing the freshly-initialised tail is now sound.
+        // SAFETY: see the `target_ptr` block above.
+        unsafe {
+            target.set_len(base + regen);
         }
 
         bytes_read += source.len() as u32;
@@ -463,6 +499,13 @@ struct LoopBounds {
     /// decodes ALL symbols via the single-symbol path. Setup-site
     /// safety rationale: adversarial / small-regen DoS guard.
     burst_eligible: bool,
+    /// Upper bound (exclusive) on cursor values written through
+    /// `target_ptr` — equals `base + regen` at the caller. Carried
+    /// here so the burst loop's SAFETY argument can be stated
+    /// purely in terms of values visible inside the function. The
+    /// caller guarantees the allocation behind `target_ptr` covers
+    /// `[0, alloc_upper_bound)` (via `target.reserve(regen)`).
+    alloc_upper_bound: usize,
 }
 
 /// Donor-parity 4-stream HUF decode burst loop. Single code path —
@@ -479,14 +522,28 @@ struct LoopBounds {
 /// # Safety
 ///
 /// All four decoders must share the same table (holds by construction —
-/// built from `&scratch.table`). `target.len() >= base + regen`. Each
-/// `brs[s].source` must be the slice the corresponding decoder was
-/// initialised against.
+/// built from `&scratch.table`).
+///
+/// `target_ptr` must come from a `Vec<u8>` whose allocation is at least
+/// `base + regen` bytes (the caller guarantees this via
+/// `target.reserve(regen)` before deriving the pointer). The Vec must
+/// not be reallocated or moved while `target_ptr` is in use — the
+/// caller holds no other references during the burst+drain phase so
+/// this invariant is upheld trivially.
+///
+/// Writes go through raw `target_ptr.add(cursors[s]).write(byte)` so
+/// no Rust reference is ever constructed to the uninitialised tail
+/// (`target.len()` stays at `base` until the post-loop `set_len`
+/// commits initialisation). Cursor bounds `[base, base+regen)` are
+/// enforced by the `starts`/`ends` clamping in the caller.
+///
+/// Each `brs[s].source` must be the slice the corresponding decoder
+/// was initialised against.
 #[inline(always)]
 unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
     brs: &mut [BitReaderReversed<'_, K>; 4],
-    target: &mut [u8],
+    target_ptr: *mut u8,
     packed: &[u16],
     cursors: &mut [usize; 4],
     bounds: &LoopBounds,
@@ -497,15 +554,36 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         table_shift,
         cursor_burst_ceil,
         burst_eligible,
+        alloc_upper_bound,
     } = *bounds;
     let max_num_bits = (64 - table_shift) as u8;
 
     // Skip burst entirely if min_seg_len < symbols_per_burst — drain
     // (the single-symbol tail outside this function) handles ALL
-    // symbols. See the `burst_eligible` doc on `LoopBounds`.
+    // symbols. See the `burst_eligible` doc on `LoopBounds`. Bailing
+    // here also covers the malformed-frame case where `regen` is
+    // smaller than a single burst's output (the caller's allocation
+    // is then too small to hold even one burst, but the drain path
+    // handles symbol-by-symbol decode within the segment ends).
     if !burst_eligible {
         return;
     }
+
+    // Caller-side cursor bound check, restated here so SAFETY reasoning
+    // below is self-contained against in-scope values only. The outer
+    // gate `cursors[0] <= cursor_burst_ceil` plus lockstep advance
+    // ensures every write index is `< cursor_burst_ceil + symbols_per_burst`;
+    // requiring that bound to fit inside the caller's allocation makes
+    // each `target_ptr.add(idx).write(_)` provably in-bounds. Only
+    // meaningful once `burst_eligible == true` (a malformed-frame
+    // small-regen path can leave `cursor_burst_ceil` saturated below
+    // `alloc_upper_bound - symbols_per_burst` — the burst skip above
+    // already bails on that case).
+    debug_assert!(
+        cursor_burst_ceil + symbols_per_burst <= alloc_upper_bound,
+        "caller must size the target allocation so the lockstep-advanced \
+         cursors stay within bounds across a full burst",
+    );
 
     // Donor-parity burst loop. `bits[s]` is the unified u64 register
     // that fuses state + unconsumed stream + sentinel:
@@ -597,38 +675,44 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         //   `[0, 1 << max_num_bits)`. `packed.len() == 1 << max_num_bits`
         //   by `HuffmanTable::build_decoder`'s upfront `resize`.
         //
-        // SAFETY for `target.get_unchecked_mut(cursors[s])`:
+        // SAFETY for `target_ptr.add(cursors[s]).write(...)`:
         //   The outer-loop gate `cursors[0] <= cursor_burst_ceil`
-        //   gives `cursors[0] + symbols_per_burst <= cursor_burst_ceil
-        //   + symbols_per_burst = starts[0] + min_seg_len`. By lockstep
-        //   advance, `cursors[s] - starts[s] == cursors[0] - starts[0]`
-        //   for all `s`, so `cursors[s] + symbols_per_burst - 1 <
-        //   starts[s] + min_seg_len <= ends[s] <= target.len()` —
-        //   every write in this iter (max index `cursors[s] +
-        //   symbols_per_burst - 1`) is strictly in-bounds.
-        debug_assert!(cursors[0] + symbols_per_burst <= cursor_burst_ceil + symbols_per_burst);
+        //   bounds the burst's first cursor. All four cursors advance
+        //   in lockstep (`cursors[s]` gains exactly 1 per inner iter
+        //   along with `cursors[0]`), so the invariant
+        //   `cursors[s] <= cursor_burst_ceil` holds across this burst's
+        //   start for every `s`. The maximum write index during the
+        //   `symbols_per_burst` inner iters is `cursors[s] + symbols_per_burst - 1`,
+        //   strictly less than `cursor_burst_ceil + symbols_per_burst`.
+        //   The function-entry `debug_assert!` ties that bound to
+        //   `alloc_upper_bound`, which the caller guarantees to cover
+        //   the allocation backing `target_ptr` (via
+        //   `target.reserve(regen)` before deriving the pointer).
+        //   `.write()` (raw store) is used instead of `&mut [u8]`
+        //   indexing so no Rust reference is ever formed to the
+        //   uninitialised tail before its byte is written.
         for _ in 0..symbols_per_burst {
             let idx0 = (bits[0] >> table_shift) as usize;
             let entry0 = unsafe { *packed.get_unchecked(idx0) };
-            unsafe { *target.get_unchecked_mut(cursors[0]) = (entry0 & 0xFF) as u8 };
+            unsafe { target_ptr.add(cursors[0]).write((entry0 & 0xFF) as u8) };
             cursors[0] += 1;
             bits[0] <<= (entry0 >> 8) & 0xFF;
 
             let idx1 = (bits[1] >> table_shift) as usize;
             let entry1 = unsafe { *packed.get_unchecked(idx1) };
-            unsafe { *target.get_unchecked_mut(cursors[1]) = (entry1 & 0xFF) as u8 };
+            unsafe { target_ptr.add(cursors[1]).write((entry1 & 0xFF) as u8) };
             cursors[1] += 1;
             bits[1] <<= (entry1 >> 8) & 0xFF;
 
             let idx2 = (bits[2] >> table_shift) as usize;
             let entry2 = unsafe { *packed.get_unchecked(idx2) };
-            unsafe { *target.get_unchecked_mut(cursors[2]) = (entry2 & 0xFF) as u8 };
+            unsafe { target_ptr.add(cursors[2]).write((entry2 & 0xFF) as u8) };
             cursors[2] += 1;
             bits[2] <<= (entry2 >> 8) & 0xFF;
 
             let idx3 = (bits[3] >> table_shift) as usize;
             let entry3 = unsafe { *packed.get_unchecked(idx3) };
-            unsafe { *target.get_unchecked_mut(cursors[3]) = (entry3 & 0xFF) as u8 };
+            unsafe { target_ptr.add(cursors[3]).write((entry3 & 0xFF) as u8) };
             cursors[3] += 1;
             bits[3] <<= (entry3 >> 8) & 0xFF;
         }
