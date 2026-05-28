@@ -609,8 +609,29 @@ fn run_pipelined_sequence_loop<
         of_dec.update_state_fast(br);
     }
 
-    // Steady state: decode next, prefetch its source, execute the
-    // oldest slot in the ring (with its pre-resolved offset).
+    // Force the steady-state loop's entry onto a 64-byte boundary so
+    // the body fits cleanly into the Skylake-X µop (DSB) cache window.
+    // Mirrors donor `ZSTD_decompressSequences_body_bmi2_noExt_rawLit`
+    // (zstd-pure-rs zstd_decompress_block.rs:2282-2290 / libzstd
+    // ZSTD_decompressSequences_internal): explicit `.p2align 6 / nop /
+    // .p2align 5 / nop / .p2align 3` triplet ahead of the hot loop.
+    // We diagnosed the underlying DSB2MITE penalty: hot loop is
+    // ~3000 µops vs the 1536-µop DSB capacity, and 40% of µops were
+    // arriving via the legacy MITE decoder. Aligning the loop entry
+    // gives the DSB the contiguous 32-byte fetch windows it needs to
+    // hold the body resident.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: alignment-only asm, no memory or register clobbers.
+    unsafe {
+        core::arch::asm!(
+            ".p2align 6",
+            "nop",
+            ".p2align 5",
+            "nop",
+            ".p2align 3",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     for i in ADVANCE..num_sequences {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
         let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
