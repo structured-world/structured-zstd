@@ -27,6 +27,40 @@ const _: () = assert!(
     "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
 );
 
+/// Donor `ZSTD_decompressBlock_internal` long-pipeline gate. Engages
+/// the 8-deep lookahead-ring decoder when (a) the block has enough
+/// sequences to amortise prefill+drain (`num_sequences >= ADVANCE * 2`)
+/// AND (b) either the dict is cold (first block after attach) OR total
+/// history exceeds 16 MB AND the FSE offset distribution carries
+/// enough long-distance codes to make prefetch worthwhile.
+///
+/// `MIN_LONG_OFFSET_SHARE`: donor `minShare = MEM_64bits() ? 7 : 20` —
+/// the 32-bit threshold is higher because the prefetch pipeline needs
+/// a stronger long-offset signal to outpace the narrower load window
+/// on those targets. `HISTORY_THRESHOLD_FOR_PREFETCH = 1 << 24` (16 MB):
+/// below that the history fits in L2/L3 and the hardware prefetcher
+/// handles short/medium offsets; engaging the ring is pure overhead.
+///
+/// Single source of truth for both the K-generic dispatcher and the
+/// per-tier x86 monoliths so the two paths can't diverge.
+#[inline]
+pub(crate) fn compute_use_long_pipeline(
+    num_sequences: usize,
+    ddict_is_cold: bool,
+    total_history: usize,
+    offsets_long_share: u32,
+) -> bool {
+    #[cfg(target_pointer_width = "64")]
+    const MIN_LONG_OFFSET_SHARE: u32 = 7;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_LONG_OFFSET_SHARE: u32 = 20;
+    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
+    num_sequences >= ADVANCE * 2
+        && (ddict_is_cold
+            || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
+                && offsets_long_share >= MIN_LONG_OFFSET_SHARE))
+}
+
 /// Fused decode + execute pipeline: decodes each sequence from the FSE
 /// bitstream and immediately executes it (literal copy + match copy)
 /// without materialising the intermediate `Vec<Sequence>` round-trip.
@@ -327,34 +361,13 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // threshold is higher because the prefetch pipeline needs a
     // stronger long-offset signal to outpace the narrower load
     // window on those targets.
-    #[cfg(target_pointer_width = "64")]
-    const MIN_LONG_OFFSET_SHARE: u32 = 7;
-    #[cfg(not(target_pointer_width = "64"))]
-    const MIN_LONG_OFFSET_SHARE: u32 = 20;
-    // 16 MB total-history threshold for engaging the prefetch
-    // decoder — donor parity (zstd_decompress_block.c
-    // `usePrefetchDecoder`). On 32-bit `usize` ≤ 4 GB so the literal
-    // `1 << 24` fits and the comparison is meaningful; defined
-    // unconditionally so both pointer widths share the gate shape.
-    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
     let total_history = buffer.window_size + buffer.dict_content.len();
-    // Donor `ZSTD_decompressBlock_internal`: `usePrefetchDecoder` is
-    // initialised from `dctx->ddictIsCold` so the first block of a
-    // freshly-attached-dict frame engages the prefetch decoder
-    // regardless of long-offset share, then `ddictIsCold = 0` after
-    // the dispatch so subsequent blocks fall back to the
-    // `longOffsetShare` heuristic. The consume-once read/clear
-    // happens at function entry above so RLE-mode early returns
-    // don't leak the flag to a later block. Note the sequence-count
-    // guard `num_sequences >= ADVANCE * 2` ALWAYS applies — blocks
-    // too small for the 8-deep lookahead pipeline still go through
-    // the short-block fallback in both cold-dict and warm cases;
-    // the cold flag only bypasses the long-offset-share threshold,
-    // not the sequence-count threshold.
-    let use_long_pipeline = num_sequences >= ADVANCE * 2
-        && (ddict_is_cold
-            || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
-                && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE));
+    let use_long_pipeline = compute_use_long_pipeline(
+        num_sequences,
+        ddict_is_cold,
+        total_history,
+        fse.offsets_long_share,
+    );
     // The format-level `isLongOffset` shortcut from donor is
     // irrelevant on our u32-indexed decoder, so on top of the
     // long-offset share the cold-dict signal is the only other gate.

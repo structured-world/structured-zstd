@@ -3,7 +3,7 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
-pub struct FSEDecoderImpl<'table, E: FseEntry> {
+pub(crate) struct FSEDecoderImpl<'table, E: FseEntry> {
     /// An FSE state value represents an index in the FSE table.
     pub state: E,
     /// A reference to the table used for decoding.
@@ -211,6 +211,7 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#fse-table-description>
 #[derive(Debug, Clone)]
+#[doc(hidden)]
 pub struct FSETableImpl<E: FseEntry> {
     /// The maximum symbol in the table (inclusive). Limits the probabilities length to max_symbol + 1.
     max_symbol: u8,
@@ -780,6 +781,7 @@ const _: [(); 12] = [(); core::mem::size_of::<Entry>()];
 /// init-state path can issue a single aligned 8-byte load.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
+#[doc(hidden)]
 pub struct SeqSymbol {
     /// Base index for the next state. Low bits read from the
     /// bitstream are added to this value to produce the final state.
@@ -817,6 +819,7 @@ const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
 /// the sequence-section entry derives `base_value` /
 /// `num_additional_bits` from caller-provided meta and discards
 /// `symbol`.
+#[doc(hidden)]
 pub trait FseEntry: Copy + Default {
     /// Bits to read on state transition. Hot-path access.
     fn num_bits(&self) -> u8;
