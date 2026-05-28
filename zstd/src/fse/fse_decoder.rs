@@ -780,6 +780,93 @@ const _: [(); 8] = [(); core::mem::offset_of!(Entry, num_additional_bits)];
 #[cfg(target_endian = "little")]
 const _: [(); 12] = [(); core::mem::size_of::<Entry>()];
 
+/// Compact sequence-section FSE entry, mirroring donor's
+/// `ZSTD_seqSymbol` exactly: no `symbol` field (the sequence-section
+/// decoder reads `base_value` / `num_additional_bits` directly off
+/// the active state and never needs the source byte). 8 bytes vs
+/// the 12-byte HUF-grade `Entry`. Field order matches donor so the
+/// init-state path can issue a single aligned 8-byte load.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SeqSymbol {
+    /// Base index for the next state. Low bits read from the
+    /// bitstream are added to this value to produce the final state.
+    pub new_state: u16,
+    /// Bits to read from the stream when transitioning out of this
+    /// state.
+    pub num_bits: u8,
+    /// Bits to read after the symbol decodes, to add to `base_value`.
+    /// Donor `ZSTD_seqSymbol::nbAdditionalBits`.
+    pub num_additional_bits: u8,
+    /// Pre-computed code baseline. `actual_value = base_value +
+    /// extra_bits_read`. Donor `ZSTD_seqSymbol::baseValue`.
+    pub base_value: u32,
+}
+
+#[cfg(target_endian = "little")]
+const _: [(); 0] = [(); core::mem::offset_of!(SeqSymbol, new_state)];
+#[cfg(target_endian = "little")]
+const _: [(); 2] = [(); core::mem::offset_of!(SeqSymbol, num_bits)];
+#[cfg(target_endian = "little")]
+const _: [(); 3] = [(); core::mem::offset_of!(SeqSymbol, num_additional_bits)];
+#[cfg(target_endian = "little")]
+const _: [(); 4] = [(); core::mem::offset_of!(SeqSymbol, base_value)];
+#[cfg(target_endian = "little")]
+const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
+
+/// Common interface every FSE-table entry type must provide to
+/// participate in [`FSETable`] / [`FSEDecoder`]. Both [`Entry`]
+/// (HUF-weight stream) and [`SeqSymbol`] (sequence-section LL / ML /
+/// OF) implement it.
+///
+/// `num_bits` / `new_state` are the state-transition fields read on
+/// the hot path; `from_raw` is the build-time constructor used by
+/// `build_decoding_table`. The HUF entry stores `symbol` directly,
+/// the sequence-section entry derives `base_value` /
+/// `num_additional_bits` from caller-provided meta and discards
+/// `symbol`.
+#[allow(dead_code)]
+pub trait FseEntry: Copy + Default {
+    /// Bits to read on state transition. Hot-path access.
+    fn num_bits(&self) -> u8;
+    /// Base index for next state. Hot-path access.
+    fn new_state(&self) -> u16;
+}
+
+impl FseEntry for Entry {
+    #[inline(always)]
+    fn num_bits(&self) -> u8 {
+        self.num_bits
+    }
+    #[inline(always)]
+    fn new_state(&self) -> u16 {
+        self.new_state
+    }
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Entry {
+            new_state: 0,
+            symbol: 0,
+            num_bits: 0,
+            base_value: 0,
+            num_additional_bits: 0,
+        }
+    }
+}
+
+impl FseEntry for SeqSymbol {
+    #[inline(always)]
+    fn num_bits(&self) -> u8 {
+        self.num_bits
+    }
+    #[inline(always)]
+    fn new_state(&self) -> u16 {
+        self.new_state
+    }
+}
+
 /// This value is added to the first 4 bits of the stream to determine the
 /// `Accuracy_Log`
 const ACC_LOG_OFFSET: u8 = 5;
