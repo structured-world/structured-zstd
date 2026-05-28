@@ -78,13 +78,21 @@ fn main() {
     let mut total = 0usize;
     match mode {
         "ffi" => {
-            // Reuse one DCtx to mirror the c_ffi compare_ffi arm.
-            let dctx = unsafe { zstd_sys::ZSTD_createDCtx() };
-            assert!(!dctx.is_null(), "ZSTD_createDCtx failed");
+            // Reuse one DCtx to mirror the c_ffi compare_ffi arm. RAII
+            // guard ensures `ZSTD_freeDCtx` runs even if the per-iter
+            // `assert_eq!` below panics on a corrupted fixture.
+            struct DCtxGuard(*mut zstd_sys::ZSTD_DCtx_s);
+            impl Drop for DCtxGuard {
+                fn drop(&mut self) {
+                    unsafe { zstd_sys::ZSTD_freeDCtx(self.0) };
+                }
+            }
+            let dctx = DCtxGuard(unsafe { zstd_sys::ZSTD_createDCtx() });
+            assert!(!dctx.0.is_null(), "ZSTD_createDCtx failed");
             for _ in 0..iters {
                 let wrote = unsafe {
                     zstd_sys::ZSTD_decompressDCtx(
-                        dctx,
+                        dctx.0,
                         target.as_mut_ptr() as *mut _,
                         target.len(),
                         std::hint::black_box(compressed.as_ptr() as *const _),
@@ -98,7 +106,6 @@ fn main() {
                 );
                 total = total.wrapping_add(wrote);
             }
-            unsafe { zstd_sys::ZSTD_freeDCtx(dctx) };
         }
         _ => {
             let mut decoder = FrameDecoder::new();
