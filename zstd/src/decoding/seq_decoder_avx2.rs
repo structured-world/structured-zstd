@@ -1,12 +1,17 @@
 //! AVX2-tier monolithic sequence-section decoder.
 //!
 //! One self-contained `#[target_feature(enable = "bmi2,avx2")]` function
-//! that inlines the entire decode + execute pipeline (outer init, RLE
-//! dispatch, FSE state init, both pipeline arms, sequence decode, and
-//! sequence execute) with no inner CALL boundaries on the hot path.
-//! BitReader is pinned to `Avx2Kernel`; the triple-bit extract goes
-//! directly through `peek_bits_triple_bmi2` (`_pext_u64` inline). The
-//! match copy routes to `BufferBackend::exec_sequence_inline_avx2`
+//! with the entire decode + execute pipeline as ONE body. Sequence-decode
+//! and sequence-execute logic lives in `macro_rules!` blocks that expand
+//! textually at every callsite — no inner function CALL boundaries, no
+//! reliance on the LLVM inline cost-model (which would not inline through
+//! `target_feature` + multiple callsites + `Result<>` panic landings).
+//! Macros expand BEFORE LLVM sees the code, guaranteeing zero call
+//! overhead regardless of cost-model decisions.
+//!
+//! BitReader pinned to `Avx2Kernel`; triple-bit extract goes directly
+//! through `peek_bits_triple_bmi2` (`_pext_u64` inline at every callsite).
+//! Match copy routes to `BufferBackend::exec_sequence_inline_avx2`
 //! (32-byte ymm wildcopy).
 
 #![cfg(target_arch = "x86_64")]
@@ -27,11 +32,154 @@ use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_f
 use crate::fse::SeqFSEDecoder;
 use alloc::vec::Vec;
 
-/// AVX2-tier monolithic decode + execute. The whole pipeline body is
-/// inlined here so LLVM sees one function from outer init through every
-/// sequence-decode + sequence-execute iteration to the post-loop
-/// validation — no per-tier wrapper, no K-generic dispatch, no helper
-/// CALL chain on the hot path.
+/// Textual expansion of per-sequence decode. Reads LL/ML/OF state,
+/// performs triple-bit extract via `peek_bits_triple_bmi2` (`_pext_u64`
+/// inline when vendor cache enables it), advances the bit cursor.
+/// Expands at every callsite inside the AVX2 monolith — no function
+/// boundary survives compilation.
+macro_rules! decode_one_body {
+    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr) => {{
+        let ll_state = $ll_dec.state;
+        let ml_state = $ml_dec.state;
+        let of_state = $of_dec.state;
+
+        let ll_value = ll_state.base_value;
+        let ll_num_bits = ll_state.num_additional_bits;
+        let ml_value = ml_state.base_value;
+        let ml_num_bits = ml_state.num_additional_bits;
+        let of_num_bits = of_state.num_additional_bits;
+        let of_base = of_state.base_value;
+
+        debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
+
+        let sum_wide = u16::from(of_num_bits) + u16::from(ml_num_bits) + u16::from(ll_num_bits);
+        let (obits, ml_add, ll_add) = if sum_wide <= 56 {
+            let sum = sum_wide as u8;
+            $br.ensure_bits(sum);
+            // SAFETY: enclosing fn is target_feature(bmi2,avx2); vendor
+            // policy cached at BitReader::new gates the PEXT-direct path.
+            let triple = if $br.use_pext_triple_fast() {
+                unsafe { $br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
+            } else {
+                $br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
+            };
+            $br.consume(sum);
+            triple
+        } else {
+            (
+                $br.get_bits(of_num_bits),
+                $br.get_bits(ml_num_bits),
+                $br.get_bits(ll_num_bits),
+            )
+        };
+        let offset = obits as u32 + of_base;
+        debug_assert_ne!(offset, 0);
+
+        Sequence {
+            ll: ll_value + ll_add as u32,
+            ml: ml_value + ml_add as u32,
+            of: offset,
+        }
+    }};
+}
+
+/// Textual expansion of per-sequence execute. Fast path:
+/// `exec_sequence_inline_avx2` (32-byte ymm wildcopy). Cold path: legacy
+/// try_push + repeat_lookahead_prefetched. Expands as a statement-block
+/// returning `Result<(), DecompressBlockError>` so the caller can `?`
+/// or branch on it as needed.
+macro_rules! execute_one_body {
+    (
+        $buffer:expr,
+        $literals_buffer:expr,
+        $lit_cur:expr,
+        $literals_buffer_len:expr,
+        $seq_ll:expr,
+        $seq_ml:expr,
+        $resolved_offset:expr
+    ) => {{
+        // Labeled-block expansion — every early exit is
+        // `break 'exec_inner Err(...)`, no closure, no `?` operator,
+        // so the macro body inlines into the caller with zero CALL
+        // boundary even at -Copt-level=0.
+        let _result: Result<(), DecompressBlockError> = 'exec_inner: {
+            let seq_ll_v: u32 = $seq_ll;
+            let seq_ml_v: u32 = $seq_ml;
+            let resolved_offset_v: u32 = $resolved_offset;
+            let literals_buffer_len_v: usize = $literals_buffer_len;
+            let lit_cur_before = *$lit_cur;
+            let high = match lit_cur_before
+                .checked_add(seq_ll_v as usize)
+                .filter(|&h| h <= literals_buffer_len_v)
+            {
+                Some(h) => h,
+                None => {
+                    break 'exec_inner Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                        wanted: lit_cur_before.saturating_add(seq_ll_v as usize),
+                        have: literals_buffer_len_v,
+                    }
+                    .into());
+                }
+            };
+            // SAFETY: high <= literals_buffer_len_v, lit_cur_before <= high.
+            let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
+            *$lit_cur = high;
+
+            if resolved_offset_v == 0 {
+                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
+            }
+
+            // Donor inline-eligibility gates.
+            let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+                && lit_cur_before
+                    .checked_add(16)
+                    .is_some_and(|b| b <= literals_buffer_len_v)
+                && (seq_ll_v as usize <= 16
+                    || lit_cur_before
+                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
+                        .is_some_and(|b| b <= literals_buffer_len_v));
+
+            if inline_path_safe {
+                let buf_len = $buffer.len();
+                let offset = resolved_offset_v as usize;
+                let prefix_end_ok = buf_len
+                    .checked_add(lits.len())
+                    .is_some_and(|end| offset <= end);
+                if prefix_end_ok {
+                    // SAFETY: parent-slice provenance; offset prefix-resident.
+                    let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                    // SAFETY: enclosing fn carries target_feature(bmi2,avx2).
+                    let r = unsafe {
+                        $buffer.buffer_mut().exec_sequence_inline_avx2(
+                            lit_src,
+                            seq_ll_v as usize,
+                            offset,
+                            seq_ml_v as usize,
+                        )
+                    };
+                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
+                }
+            }
+
+            // Cold fallback.
+            if let Err(e) = $buffer.try_push(lits) {
+                break 'exec_inner Err(ExecuteSequencesError::from(e).into());
+            }
+            match $buffer.repeat_lookahead_prefetched(resolved_offset_v as usize, seq_ml_v as usize)
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ExecuteSequencesError::from(e).into()),
+            }
+        };
+        _result
+    }};
+}
+
+/// AVX2-tier monolithic decode + execute. Outer init, RLE dispatch, FSE
+/// state init, both pipeline arms, sequence-decode (via
+/// `decode_one_body!`) and sequence-execute (via `execute_one_body!`)
+/// all live in one function body. Macros guarantee textual expansion
+/// at every callsite — no inner function boundaries.
 ///
 /// # Safety
 /// Caller must have verified that the runtime CPU advertises BMI2 + AVX2.
@@ -50,8 +198,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
 ) -> Result<(), DecompressBlockError> {
     rle_fallback_sequences.clear();
 
-    // Consume-once read of the cold-dict flag (mirrors the K-generic
-    // dispatcher); RLE early-return must not leak it to a later block.
     let ddict_is_cold = fse.ddict_is_cold;
     fse.ddict_is_cold = false;
 
@@ -59,7 +205,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
     let bit_stream = &source[bytes_read..];
     let mut br = BitReaderReversed::<Avx2Kernel>::new(bit_stream);
 
-    // Skip the 0-padding + the start-of-stream `1` bit.
     let mut skipped_bits = 0;
     loop {
         let val = br.get_bits(1);
@@ -72,7 +217,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
     }
 
-    // RLE-mode blocks: legacy two-pass pipeline. Rare on perf corpora.
     if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
         decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
         execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
@@ -129,8 +273,9 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
             actual_offset: 0,
         }; ADVANCE];
 
+        // Prefill ring with ADVANCE decoded+prefetched sequences.
         for slot in ring.iter_mut() {
-            let seq = decode_one_avx2(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -147,8 +292,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
             of_dec.update_state_fast(&mut br);
         }
 
-        // Steady-state entry alignment — keeps body inside one DSB window.
-        // SAFETY: alignment-only asm.
+        // SAFETY: alignment-only asm, no memory or register clobbers.
         unsafe {
             core::arch::asm!(
                 ".p2align 6",
@@ -162,7 +306,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
 
         let mut pipeline_err: Option<DecompressBlockError> = None;
         for i in ADVANCE..num_sequences {
-            let seq = decode_one_avx2(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -177,15 +321,16 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
                 actual_offset,
             };
 
-            if let Err(e) = execute_one_avx2(
+            let r = execute_one_body!(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
                 exec_seq.ll,
                 exec_seq.ml,
-                exec_seq.actual_offset,
-            ) {
+                exec_seq.actual_offset
+            );
+            if let Err(e) = r {
                 pipeline_err = Some(e);
                 break;
             }
@@ -199,19 +344,21 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
             }
         }
 
+        // Drain the remaining ADVANCE ring slots.
         if pipeline_err.is_none() {
             for k in 0..ADVANCE {
                 let slot = (num_sequences + k) & ADVANCE_MASK;
                 let exec_seq = ring[slot];
-                if let Err(e) = execute_one_avx2(
+                let r = execute_one_body!(
                     buffer,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
                     exec_seq.ll,
                     exec_seq.ml,
-                    exec_seq.actual_offset,
-                ) {
+                    exec_seq.actual_offset
+                );
+                if let Err(e) = r {
                     pipeline_err = Some(e);
                     break;
                 }
@@ -231,17 +378,18 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
-            let seq = decode_one_avx2(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-            if let Err(e) = execute_one_avx2(
+            let r = execute_one_body!(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
                 seq.ll,
                 seq.ml,
-                resolved_offset,
-            ) {
+                resolved_offset
+            );
+            if let Err(e) = r {
                 fallback_err = Some(e);
                 break;
             }
@@ -261,7 +409,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         *offset_hist = shadow_hist;
     }
 
-    // Post-loop bitstream-tail validation. Same transactional rollback.
     let remaining = br.bits_remaining();
     if remaining != 0 {
         if buffer.try_restore_checkpoint(buffer_checkpoint) {
@@ -287,134 +434,5 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         seq_sum as usize, diff,
         "seq_sum {seq_sum} != buffer growth {diff}"
     );
-    Ok(())
-}
-
-/// Inline per-sequence decode. Triple-bit extract via `peek_bits_triple_bmi2`
-/// (`_pext_u64` inline) when vendor policy enables it; scalar fallback
-/// inside same target_feature scope otherwise.
-///
-/// # Safety
-/// Caller must be in `#[target_feature(enable = "bmi2,avx2")]` scope.
-#[inline]
-#[target_feature(enable = "bmi2,avx2")]
-unsafe fn decode_one_avx2(
-    ll_dec: &mut SeqFSEDecoder<'_>,
-    ml_dec: &mut SeqFSEDecoder<'_>,
-    of_dec: &mut SeqFSEDecoder<'_>,
-    br: &mut BitReaderReversed<'_, Avx2Kernel>,
-) -> Sequence {
-    let ll_state = ll_dec.state;
-    let ml_state = ml_dec.state;
-    let of_state = of_dec.state;
-
-    let ll_value = ll_state.base_value;
-    let ll_num_bits = ll_state.num_additional_bits;
-    let ml_value = ml_state.base_value;
-    let ml_num_bits = ml_state.num_additional_bits;
-    let of_num_bits = of_state.num_additional_bits;
-    let of_base = of_state.base_value;
-
-    debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
-
-    let sum_wide = u16::from(of_num_bits) + u16::from(ml_num_bits) + u16::from(ll_num_bits);
-    let (obits, ml_add, ll_add) = if sum_wide <= 56 {
-        let sum = sum_wide as u8;
-        br.ensure_bits(sum);
-        // SAFETY: enclosing fn is target_feature(bmi2,avx2); vendor
-        // policy cached at BitReader::new gates the PEXT-direct path.
-        let triple = if br.use_pext_triple_fast() {
-            unsafe { br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
-        } else {
-            br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
-        };
-        br.consume(sum);
-        triple
-    } else {
-        (
-            br.get_bits(of_num_bits),
-            br.get_bits(ml_num_bits),
-            br.get_bits(ll_num_bits),
-        )
-    };
-    let offset = obits as u32 + of_base;
-    debug_assert_ne!(offset, 0);
-
-    Sequence {
-        ll: ll_value + ll_add as u32,
-        ml: ml_value + ml_add as u32,
-        of: offset,
-    }
-}
-
-/// Inline per-sequence execute. Fast path: `exec_sequence_inline_avx2`
-/// (32-byte ymm wildcopy). Cold: legacy try_push + repeat_lookahead.
-///
-/// # Safety
-/// Caller must be in `#[target_feature(enable = "bmi2,avx2")]` scope.
-#[inline]
-#[target_feature(enable = "bmi2,avx2")]
-unsafe fn execute_one_avx2<B: BufferBackend>(
-    buffer: &mut DecodeBuffer<B>,
-    literals_buffer: &[u8],
-    lit_cur: &mut usize,
-    literals_buffer_len: usize,
-    seq_ll: u32,
-    seq_ml: u32,
-    resolved_offset: u32,
-) -> Result<(), DecompressBlockError> {
-    let lit_cur_before = *lit_cur;
-    let high = lit_cur_before
-        .checked_add(seq_ll as usize)
-        .filter(|&h| h <= literals_buffer_len)
-        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: lit_cur_before.saturating_add(seq_ll as usize),
-            have: literals_buffer_len,
-        })?;
-    // SAFETY: high <= literals_buffer_len, lit_cur_before <= high.
-    let lits = unsafe { literals_buffer.get_unchecked(lit_cur_before..high) };
-    *lit_cur = high;
-
-    if resolved_offset == 0 {
-        return Err(ExecuteSequencesError::ZeroOffset.into());
-    }
-
-    // Donor `ZSTD_execSequence` inline-eligibility gates: backend opted
-    // in (compile-time), 16-byte literal slack, and tail wildcopy bound.
-    let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && lit_cur_before
-            .checked_add(16)
-            .is_some_and(|b| b <= literals_buffer_len)
-        && (seq_ll as usize <= 16
-            || lit_cur_before
-                .checked_add((seq_ll as usize).next_multiple_of(16))
-                .is_some_and(|b| b <= literals_buffer_len));
-
-    if inline_path_safe {
-        let buf_len = buffer.len();
-        let offset = resolved_offset as usize;
-        let prefix_end_ok = buf_len
-            .checked_add(lits.len())
-            .is_some_and(|end| offset <= end);
-        if prefix_end_ok {
-            // SAFETY: parent-slice provenance for the unconditional
-            // donor `copy16` over-read bounded by the slack gate above;
-            // offset prefix-resident per `prefix_end_ok`.
-            let lit_src = unsafe { literals_buffer.as_ptr().add(lit_cur_before) };
-            unsafe {
-                buffer
-                    .buffer_mut()
-                    .exec_sequence_inline_avx2(lit_src, seq_ll as usize, offset, seq_ml as usize)
-                    .map_err(DecompressBlockError::ExecuteSequencesError)?;
-            }
-            return Ok(());
-        }
-        // extDict territory — fall through to legacy.
-    }
-
-    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
-    buffer
-        .repeat_lookahead_prefetched(resolved_offset as usize, seq_ml as usize)
-        .map_err(ExecuteSequencesError::from)?;
     Ok(())
 }

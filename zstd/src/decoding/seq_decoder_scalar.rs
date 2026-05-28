@@ -1,18 +1,16 @@
 //! Scalar-tier monolithic sequence-section decoder.
 //!
-//! One self-contained function with the entire decode + execute
-//! pipeline inlined. BitReader pinned to `ScalarKernel` (no PEXT, no
-//! SIMD wildcopy — pure portable arithmetic + libc memmove fallback in
-//! the match-copy path). Used on any non-x86_64 target without the
-//! corresponding aarch64 monolith available, and on x86_64 when
-//! `detect_cpu_kernel()` falls through to Scalar (extremely old CPUs).
+//! Same shape as the AVX2 / BMI2 / VBMI2 monoliths: `macro_rules!`
+//! blocks expand decode + execute bodies textually at every callsite
+//! inside one function. No target_feature; portable arithmetic and
+//! libc memmove fallback in the match-copy path.
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, compute_use_long_pipeline, decode_sequences_with_rle,
-    execute_one_sequence_pipelined, maybe_update_fse_tables,
+    maybe_update_fse_tables,
 };
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader};
@@ -23,7 +21,90 @@ use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_f
 use crate::fse::SeqFSEDecoder;
 use alloc::vec::Vec;
 
+macro_rules! decode_one_body {
+    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr) => {{
+        let ll_state = $ll_dec.state;
+        let ml_state = $ml_dec.state;
+        let of_state = $of_dec.state;
+
+        let ll_value = ll_state.base_value;
+        let ll_num_bits = ll_state.num_additional_bits;
+        let ml_value = ml_state.base_value;
+        let ml_num_bits = ml_state.num_additional_bits;
+        let of_num_bits = of_state.num_additional_bits;
+        let of_base = of_state.base_value;
+
+        debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
+
+        let (obits, ml_add, ll_add) = $br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + of_base;
+        debug_assert_ne!(offset, 0);
+
+        Sequence {
+            ll: ll_value + ll_add as u32,
+            ml: ml_value + ml_add as u32,
+            of: offset,
+        }
+    }};
+}
+
+/// Scalar-tier execute body. No backend-specific inline-exec path;
+/// always routes through `try_push` + `repeat_lookahead_prefetched`
+/// (the backend may or may not have an SSE2 inline path, but on the
+/// Scalar dispatch arm we don't gate on it — keep the body simple and
+/// portable).
+macro_rules! execute_one_body {
+    (
+        $buffer:expr,
+        $literals_buffer:expr,
+        $lit_cur:expr,
+        $literals_buffer_len:expr,
+        $seq_ll:expr,
+        $seq_ml:expr,
+        $resolved_offset:expr
+    ) => {{
+        let _result: Result<(), DecompressBlockError> = 'exec_inner: {
+            let seq_ll_v: u32 = $seq_ll;
+            let seq_ml_v: u32 = $seq_ml;
+            let resolved_offset_v: u32 = $resolved_offset;
+            let literals_buffer_len_v: usize = $literals_buffer_len;
+            let lit_cur_before = *$lit_cur;
+            let high = match lit_cur_before
+                .checked_add(seq_ll_v as usize)
+                .filter(|&h| h <= literals_buffer_len_v)
+            {
+                Some(h) => h,
+                None => {
+                    break 'exec_inner Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                        wanted: lit_cur_before.saturating_add(seq_ll_v as usize),
+                        have: literals_buffer_len_v,
+                    }
+                    .into());
+                }
+            };
+            // SAFETY: high <= literals_buffer_len_v, lit_cur_before <= high.
+            let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
+            *$lit_cur = high;
+
+            if resolved_offset_v == 0 {
+                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
+            }
+
+            if let Err(e) = $buffer.try_push(lits) {
+                break 'exec_inner Err(ExecuteSequencesError::from(e).into());
+            }
+            match $buffer.repeat_lookahead_prefetched(resolved_offset_v as usize, seq_ml_v as usize)
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ExecuteSequencesError::from(e).into()),
+            }
+        };
+        _result
+    }};
+}
+
 /// Scalar-tier monolithic decode + execute.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
@@ -110,7 +191,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
         }; ADVANCE];
 
         for slot in ring.iter_mut() {
-            let seq = decode_one_scalar(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -129,7 +210,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
 
         let mut pipeline_err: Option<DecompressBlockError> = None;
         for i in ADVANCE..num_sequences {
-            let seq = decode_one_scalar(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
             let source_idx = match_start.wrapping_sub(actual_offset as usize);
@@ -144,18 +225,16 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
                 actual_offset,
             };
 
-            if let Err(e) = execute_one_sequence_pipelined(
+            let r = execute_one_body!(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                Sequence {
-                    ll: exec_seq.ll,
-                    ml: exec_seq.ml,
-                    of: 0,
-                },
-                exec_seq.actual_offset,
-            ) {
+                exec_seq.ll,
+                exec_seq.ml,
+                exec_seq.actual_offset
+            );
+            if let Err(e) = r {
                 pipeline_err = Some(e);
                 break;
             }
@@ -173,18 +252,16 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
             for k in 0..ADVANCE {
                 let slot = (num_sequences + k) & ADVANCE_MASK;
                 let exec_seq = ring[slot];
-                if let Err(e) = execute_one_sequence_pipelined(
+                let r = execute_one_body!(
                     buffer,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
-                    Sequence {
-                        ll: exec_seq.ll,
-                        ml: exec_seq.ml,
-                        of: 0,
-                    },
-                    exec_seq.actual_offset,
-                ) {
+                    exec_seq.ll,
+                    exec_seq.ml,
+                    exec_seq.actual_offset
+                );
+                if let Err(e) = r {
                     pipeline_err = Some(e);
                     break;
                 }
@@ -203,16 +280,18 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
-            let seq = decode_one_scalar(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
             let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-            if let Err(e) = execute_one_sequence_pipelined(
+            let r = execute_one_body!(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                seq,
-                resolved_offset,
-            ) {
+                seq.ll,
+                seq.ml,
+                resolved_offset
+            );
+            if let Err(e) = r {
                 fallback_err = Some(e);
                 break;
             }
@@ -258,35 +337,4 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
         "seq_sum {seq_sum} != buffer growth {diff}"
     );
     Ok(())
-}
-
-#[inline]
-fn decode_one_scalar(
-    ll_dec: &mut SeqFSEDecoder<'_>,
-    ml_dec: &mut SeqFSEDecoder<'_>,
-    of_dec: &mut SeqFSEDecoder<'_>,
-    br: &mut BitReaderReversed<'_, ScalarKernel>,
-) -> Sequence {
-    let ll_state = ll_dec.state;
-    let ml_state = ml_dec.state;
-    let of_state = of_dec.state;
-
-    let ll_value = ll_state.base_value;
-    let ll_num_bits = ll_state.num_additional_bits;
-    let ml_value = ml_state.base_value;
-    let ml_num_bits = ml_state.num_additional_bits;
-    let of_num_bits = of_state.num_additional_bits;
-    let of_base = of_state.base_value;
-
-    debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
-
-    let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
-    let offset = obits as u32 + of_base;
-    debug_assert_ne!(offset, 0);
-
-    Sequence {
-        ll: ll_value + ll_add as u32,
-        ml: ml_value + ml_add as u32,
-        of: offset,
-    }
 }
