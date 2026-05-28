@@ -370,6 +370,7 @@ fn decompress_literals_impl<K: CpuKernel>(
             table_shift,
             cursor_burst_ceil,
             burst_eligible,
+            alloc_upper_bound: base + regen,
         };
 
         // Burst is identical across all kernels (donor parity: reads
@@ -498,6 +499,13 @@ struct LoopBounds {
     /// decodes ALL symbols via the single-symbol path. Setup-site
     /// safety rationale: adversarial / small-regen DoS guard.
     burst_eligible: bool,
+    /// Upper bound (exclusive) on cursor values written through
+    /// `target_ptr` — equals `base + regen` at the caller. Carried
+    /// here so the burst loop's SAFETY argument can be stated
+    /// purely in terms of values visible inside the function. The
+    /// caller guarantees the allocation behind `target_ptr` covers
+    /// `[0, alloc_upper_bound)` (via `target.reserve(regen)`).
+    alloc_upper_bound: usize,
 }
 
 /// Donor-parity 4-stream HUF decode burst loop. Single code path —
@@ -546,15 +554,36 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         table_shift,
         cursor_burst_ceil,
         burst_eligible,
+        alloc_upper_bound,
     } = *bounds;
     let max_num_bits = (64 - table_shift) as u8;
 
     // Skip burst entirely if min_seg_len < symbols_per_burst — drain
     // (the single-symbol tail outside this function) handles ALL
-    // symbols. See the `burst_eligible` doc on `LoopBounds`.
+    // symbols. See the `burst_eligible` doc on `LoopBounds`. Bailing
+    // here also covers the malformed-frame case where `regen` is
+    // smaller than a single burst's output (the caller's allocation
+    // is then too small to hold even one burst, but the drain path
+    // handles symbol-by-symbol decode within the segment ends).
     if !burst_eligible {
         return;
     }
+
+    // Caller-side cursor bound check, restated here so SAFETY reasoning
+    // below is self-contained against in-scope values only. The outer
+    // gate `cursors[0] <= cursor_burst_ceil` plus lockstep advance
+    // ensures every write index is `< cursor_burst_ceil + symbols_per_burst`;
+    // requiring that bound to fit inside the caller's allocation makes
+    // each `target_ptr.add(idx).write(_)` provably in-bounds. Only
+    // meaningful once `burst_eligible == true` (a malformed-frame
+    // small-regen path can leave `cursor_burst_ceil` saturated below
+    // `alloc_upper_bound - symbols_per_burst` — the burst skip above
+    // already bails on that case).
+    debug_assert!(
+        cursor_burst_ceil + symbols_per_burst <= alloc_upper_bound,
+        "caller must size the target allocation so the lockstep-advanced \
+         cursors stay within bounds across a full burst",
+    );
 
     // Donor-parity burst loop. `bits[s]` is the unified u64 register
     // that fuses state + unconsumed stream + sentinel:
@@ -648,19 +677,20 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         //
         // SAFETY for `target_ptr.add(cursors[s]).write(...)`:
         //   The outer-loop gate `cursors[0] <= cursor_burst_ceil`
-        //   gives `cursors[0] + symbols_per_burst <= cursor_burst_ceil
-        //   + symbols_per_burst = starts[0] + min_seg_len`. By lockstep
-        //   advance, `cursors[s] - starts[s] == cursors[0] - starts[0]`
-        //   for all `s`, so `cursors[s] + symbols_per_burst - 1 <
-        //   starts[s] + min_seg_len <= ends[s] <= base + regen`. The
-        //   caller passes `target_ptr = target.as_mut_ptr()` for a Vec
-        //   whose `reserve(regen)` ensures `capacity >= base + regen`,
-        //   so every write in this iter (max index `cursors[s] +
-        //   symbols_per_burst - 1`) is strictly within the allocation.
-        //   Using `.write()` (raw store) instead of `&mut [u8]` indexing
-        //   means no Rust reference is ever formed to the uninitialised
-        //   tail before its byte is written.
-        debug_assert!(cursors[0] + symbols_per_burst <= cursor_burst_ceil + symbols_per_burst);
+        //   bounds the burst's first cursor. All four cursors advance
+        //   in lockstep (`cursors[s]` gains exactly 1 per inner iter
+        //   along with `cursors[0]`), so the invariant
+        //   `cursors[s] <= cursor_burst_ceil` holds across this burst's
+        //   start for every `s`. The maximum write index during the
+        //   `symbols_per_burst` inner iters is `cursors[s] + symbols_per_burst - 1`,
+        //   strictly less than `cursor_burst_ceil + symbols_per_burst`.
+        //   The function-entry `debug_assert!` ties that bound to
+        //   `alloc_upper_bound`, which the caller guarantees to cover
+        //   the allocation backing `target_ptr` (via
+        //   `target.reserve(regen)` before deriving the pointer).
+        //   `.write()` (raw store) is used instead of `&mut [u8]`
+        //   indexing so no Rust reference is ever formed to the
+        //   uninitialised tail before its byte is written.
         for _ in 0..symbols_per_burst {
             let idx0 = (bits[0] >> table_shift) as usize;
             let entry0 = unsafe { *packed.get_unchecked(idx0) };
