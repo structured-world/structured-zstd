@@ -564,10 +564,39 @@ fn run_pipelined_sequence_loop<
     max_update_bits: u8,
     seq_sum: &mut u32,
 ) -> Result<(), DecompressBlockError> {
-    let _ = old_buffer_size;
+    // Donor `ZSTD_decompressSequencesLong_body` shape: 8-deep
+    // lookahead ring with `prefetch_lookahead_match_source` per
+    // decoded seq, executing the OLDEST resolved sequence per
+    // iteration. Used ONLY when caller selected the long-pipeline
+    // arm — cold-dict / long-offset frames where DRAM prefetch
+    // matters. Common hot-cache path goes through the straight
+    // single-pass fused loop in `decode_and_execute_sequences_impl`.
+    let mut prefetch_pos: usize = old_buffer_size;
+    let mut shadow_hist: [u32; 3] = *offset_hist;
+    let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
+        ll: 0,
+        ml: 0,
+        actual_offset: 0,
+    }; ADVANCE];
 
-    // Force the loop entry onto a 64-byte boundary so the body fits
-    // cleanly into the Skylake-X DSB µop cache window.
+    for slot in ring.iter_mut() {
+        let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
+        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+        let source_idx = match_start.wrapping_sub(actual_offset as usize);
+        buffer.prefetch_lookahead_match_source(source_idx);
+        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+        *slot = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
+        br.ensure_bits(max_update_bits);
+        ll_dec.update_state_fast(br);
+        ml_dec.update_state_fast(br);
+        of_dec.update_state_fast(br);
+    }
+
     #[cfg(target_arch = "x86_64")]
     // SAFETY: alignment-only asm, no memory or register clobbers.
     unsafe {
@@ -580,25 +609,30 @@ fn run_pipelined_sequence_loop<
             options(nomem, nostack, preserves_flags)
         );
     }
-
-    // Donor-shape straight loop: decode one sequence, execute it
-    // immediately, advance state, next. No lookahead ring, no
-    // shadow_hist, no prefetch_pos arithmetic — mirrors
-    // `ZSTD_decompressSequences_body_bmi2_noExt_rawLit`
-    // (zstd-pure-rs zstd_decompress_block.rs:2291-2344).
-    for i in 0..num_sequences {
+    for i in ADVANCE..num_sequences {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
-        let resolved_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+        let source_idx = match_start.wrapping_sub(actual_offset as usize);
+        buffer.prefetch_lookahead_match_source(source_idx);
+        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
 
-        execute_one_sequence_pipelined(
+        let slot = i & ADVANCE_MASK;
+        let exec_seq = ring[slot];
+        ring[slot] = ExecSeq {
+            ll: seq.ll,
+            ml: seq.ml,
+            actual_offset,
+        };
+
+        execute_one_sequence_pipelined_resolved(
             buffer,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
-            seq,
-            resolved_offset,
+            exec_seq,
         )?;
-        *seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
         if i + 1 < num_sequences {
             br.ensure_bits(max_update_bits);
@@ -607,6 +641,21 @@ fn run_pipelined_sequence_loop<
             of_dec.update_state_fast(br);
         }
     }
+
+    for k in 0..ADVANCE {
+        let slot = (num_sequences + k) & ADVANCE_MASK;
+        let exec_seq = ring[slot];
+        execute_one_sequence_pipelined_resolved(
+            buffer,
+            literals_buffer,
+            lit_cur,
+            literals_buffer_len,
+            exec_seq,
+        )?;
+        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+    }
+
+    *offset_hist = shadow_hist;
     Ok(())
 }
 

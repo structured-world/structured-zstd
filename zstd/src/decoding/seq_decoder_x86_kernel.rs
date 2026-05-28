@@ -140,30 +140,68 @@ macro_rules! define_x86_seq_decoder_tier {
             seq_sum: &mut u32,
         ) -> Result<(), $crate::decoding::errors::DecompressBlockError> {
             use $crate::decoding::sequence_execution::do_offset_history;
+            use $crate::decoding::sequence_section_decoder::{ADVANCE, ADVANCE_MASK, ExecSeq};
 
-            // Donor-shape straight loop: decode one sequence, execute
-            // it immediately, advance state, next. No lookahead ring,
-            // no shadow_hist, no prefetch_pos arithmetic. Mirrors
-            // `ZSTD_decompressSequences_body_bmi2_noExt_rawLit`
-            // (zstd-pure-rs zstd_decompress_block.rs:2291-2344).
-            let _ = old_buffer_size;
-            for i in 0..num_sequences {
+            // Donor `ZSTD_decompressSequencesLong_body` shape: 8-deep
+            // lookahead ring with `prefetch_lookahead_match_source` per
+            // decoded seq, executing the OLDEST resolved sequence per
+            // iteration. Used ONLY when `use_long_pipeline = true`
+            // (cold dict OR `offsets_long_share >= 7`) — caller
+            // `$decode_fn` gates this entry. For the common
+            // hot-cache case the dispatcher picks the straight-loop
+            // path below.
+            let mut prefetch_pos: usize = old_buffer_size;
+            let mut shadow_hist: [u32; 3] = *offset_hist;
+            let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
+                ll: 0,
+                ml: 0,
+                actual_offset: 0,
+            }; ADVANCE];
+
+            for slot in ring.iter_mut() {
                 let seq = unsafe { $decode_one_fn(ll_dec, ml_dec, of_dec, br) };
-                let resolved_offset = do_offset_history(seq.of, seq.ll, offset_hist);
+                let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+                let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+                let source_idx = match_start.wrapping_sub(actual_offset as usize);
+                buffer.prefetch_lookahead_match_source(source_idx);
+                prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+                *slot = ExecSeq {
+                    ll: seq.ll,
+                    ml: seq.ml,
+                    actual_offset,
+                };
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(br);
+                ml_dec.update_state_fast(br);
+                of_dec.update_state_fast(br);
+            }
 
-                // SAFETY: per-tier exec_one carries the same
-                // target_feature as the enclosing $loop_fn scope.
+            for i in ADVANCE..num_sequences {
+                let seq = unsafe { $decode_one_fn(ll_dec, ml_dec, of_dec, br) };
+                let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+                let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+                let source_idx = match_start.wrapping_sub(actual_offset as usize);
+                buffer.prefetch_lookahead_match_source(source_idx);
+                prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+
+                let slot = i & ADVANCE_MASK;
+                let exec_seq = ring[slot];
+                ring[slot] = ExecSeq {
+                    ll: seq.ll,
+                    ml: seq.ml,
+                    actual_offset,
+                };
+
                 unsafe {
-                    $exec_one_fn(
+                    $exec_one_resolved_fn(
                         buffer,
                         literals_buffer,
                         lit_cur,
                         literals_buffer_len,
-                        seq,
-                        resolved_offset,
+                        exec_seq,
                     )?;
                 }
-                *seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+                *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
                 if i + 1 < num_sequences {
                     br.ensure_bits(max_update_bits);
@@ -173,6 +211,22 @@ macro_rules! define_x86_seq_decoder_tier {
                 }
             }
 
+            for k in 0..ADVANCE {
+                let slot = (num_sequences + k) & ADVANCE_MASK;
+                let exec_seq = ring[slot];
+                unsafe {
+                    $exec_one_resolved_fn(
+                        buffer,
+                        literals_buffer,
+                        lit_cur,
+                        literals_buffer_len,
+                        exec_seq,
+                    )?;
+                }
+                *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+            }
+
+            *offset_hist = shadow_hist;
             Ok(())
         }
 
