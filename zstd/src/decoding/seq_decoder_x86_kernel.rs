@@ -173,7 +173,6 @@ macro_rules! define_x86_seq_decoder_tier {
                 }
             }
 
-            *offset_hist = shadow_hist;
             Ok(())
         }
 
