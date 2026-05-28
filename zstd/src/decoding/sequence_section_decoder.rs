@@ -1959,3 +1959,82 @@ mod offsets_long_share_tests {
         assert_eq!(compute_offsets_long_share(&table), 1);
     }
 }
+
+#[cfg(test)]
+mod compute_use_long_pipeline_tests {
+    use super::{ADVANCE, compute_use_long_pipeline};
+
+    /// Per-target `MIN_LONG_OFFSET_SHARE` (mirrors the cfg in
+    /// `compute_use_long_pipeline`). Keep in sync with the constant
+    /// in production code so the tests follow target_pointer_width.
+    #[cfg(target_pointer_width = "64")]
+    const MIN_SHARE: u32 = 7;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_SHARE: u32 = 20;
+    const HISTORY_THRESHOLD: usize = 1 << 24;
+
+    #[test]
+    fn rejects_when_num_sequences_below_2x_advance() {
+        // Below `ADVANCE * 2` (= 16): never engage the long pipeline,
+        // regardless of cold-dict / history / share signals.
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2 - 1,
+            true,
+            HISTORY_THRESHOLD + 1,
+            u32::MAX
+        ));
+    }
+
+    #[test]
+    fn cold_dict_forces_long_pipeline_at_min_seq_count() {
+        // At the `ADVANCE * 2` boundary, `ddict_is_cold == true` is a
+        // sufficient override — history / share are not read.
+        assert!(compute_use_long_pipeline(ADVANCE * 2, true, 0, 0));
+    }
+
+    #[test]
+    fn history_at_threshold_does_not_engage() {
+        // Gate uses `>` not `>=`: history exactly at threshold fails.
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD,
+            MIN_SHARE,
+        ));
+    }
+
+    #[test]
+    fn history_just_above_threshold_engages_when_share_meets_min() {
+        // Strictly above threshold + share at the per-target min: engage.
+        assert!(compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD + 1,
+            MIN_SHARE,
+        ));
+    }
+
+    #[test]
+    fn share_below_min_blocks_engagement_even_with_large_history() {
+        // Even with the share one below the per-target minimum, no engage.
+        assert!(MIN_SHARE > 0, "test invariant: MIN_SHARE > 0 required");
+        assert!(!compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            HISTORY_THRESHOLD + 1,
+            MIN_SHARE - 1,
+        ));
+    }
+
+    #[test]
+    fn saturating_history_engages_when_share_meets_min() {
+        // `total_history = usize::MAX` (the saturating-add fallback path
+        // from the per-tier wrappers) is well above the threshold.
+        assert!(compute_use_long_pipeline(
+            ADVANCE * 2,
+            false,
+            usize::MAX,
+            MIN_SHARE,
+        ));
+    }
+}
