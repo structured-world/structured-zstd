@@ -64,6 +64,16 @@ pub(crate) mod scratch;
 // and Sve still go through the K-generic
 // `decode_and_execute_sequences_impl` shared body until their own
 // monoliths land.
+//
+// The shared helpers (`decode_and_execute_sequences_impl`,
+// `run_pipelined_sequence_loop`, `decode_one_sequence_inline`, the
+// `execute_one_sequence_pipelined*` wrappers) are NOT dead on
+// x86_64 builds despite the per-kernel monoliths bypassing them in
+// production: the aarch64 Neon/Sve arms in
+// `decode_and_execute_sequences` still use them as the production
+// path for that arch, and the per-helper `#[cfg(test)]` units
+// exercise them on every target. `RUSTFLAGS="-D warnings"` builds
+// pass clean on x86_64.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod seq_decoder_avx2;
 #[cfg(target_arch = "x86_64")]
