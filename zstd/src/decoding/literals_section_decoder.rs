@@ -280,7 +280,27 @@ fn decompress_literals_impl<K: CpuKernel>(
         // decode directly into slices — no temporary Vec allocations.
         let seg = regen.div_ceil(4);
 
-        target.resize(base + regen, 0);
+        // Expose the [base, base+regen) tail without zero-init. The
+        // burst loop + drain phase below writes every byte in that
+        // range before this function returns Ok; every error path
+        // calls `target.truncate(base)` before returning Err, so a
+        // caller never observes uninitialised bytes.
+        //
+        // Replaces a `resize(base + regen, 0)` whose `__memset_avx2`
+        // showed up at ~0.5% of decode self-time on the z000033 L-5
+        // flamegraph — pure wasted work since HUF decode overwrites
+        // every byte it covers.
+        //
+        // SAFETY: `target.reserve(regen)` at the top of this function
+        // guarantees `capacity() >= base + regen`. `u8` has no Drop, so
+        // exposing uninitialised bytes via `set_len` cannot cause UB
+        // from the Vec itself. The downstream HUF burst writes every
+        // index in [base, base+regen) on the Ok path; on Err, target
+        // is truncated before return (truncating u8 is a `set_len`
+        // shrink, no destructors run, no uninit memory escapes).
+        unsafe {
+            target.set_len(base + regen);
+        }
         // Clamp every start/end into [base, base+regen] so cursors can
         // never index past the pre-allocated region, even with corrupted
         // frame headers that produce small regen (where N*seg > regen).
