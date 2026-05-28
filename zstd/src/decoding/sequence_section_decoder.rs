@@ -205,6 +205,11 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 // and is called from the dispatch matcher above. See issue #279
 // round 3 for the per-kernel architecture rationale.
 
+// `dead_code` on x86_64 production: the per-kernel monoliths bypass
+// this shared body. Live on aarch64 (Neon/Sve dispatch arms) and on
+// every test build. Allowed because the function is conditionally
+// reachable per build configuration.
+#[allow(dead_code)]
 pub(crate) fn decode_and_execute_sequences_impl<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
@@ -576,7 +581,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
 /// 13 parameters: the closure capture set the IIFE used implicitly.
 /// Grouping into a struct would push pressure off the argument
 /// registers and onto memory loads, undoing the extraction's win.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn run_pipelined_sequence_loop<
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
@@ -711,6 +716,7 @@ pub(crate) struct ExecSeq {
 /// the post-resolve contract (raw `Sequence.of` is dead; only
 /// `actual_offset` reaches the executor) is visible at one site.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
@@ -745,6 +751,7 @@ pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper; per-kernel monoliths now go through seq_decoder_bmi2 directly
 pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -767,6 +774,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -791,6 +799,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -822,6 +831,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -847,6 +857,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -884,6 +895,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 /// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
 /// headroom.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
@@ -1065,6 +1077,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi2")]
 #[inline]
+#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
 pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
@@ -1140,6 +1153,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
 /// `decode_sequences_without_rle` — separate copy because Rust does not
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
+#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     ll_dec: &mut SeqFSEDecoder<'_>,
     ml_dec: &mut SeqFSEDecoder<'_>,

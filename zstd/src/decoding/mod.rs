@@ -67,13 +67,16 @@ pub(crate) mod scratch;
 //
 // The shared helpers (`decode_and_execute_sequences_impl`,
 // `run_pipelined_sequence_loop`, `decode_one_sequence_inline`, the
-// `execute_one_sequence_pipelined*` wrappers) are NOT dead on
-// x86_64 builds despite the per-kernel monoliths bypassing them in
-// production: the aarch64 Neon/Sve arms in
-// `decode_and_execute_sequences` still use them as the production
-// path for that arch, and the per-helper `#[cfg(test)]` units
-// exercise them on every target. `RUSTFLAGS="-D warnings"` builds
-// pass clean on x86_64.
+// `execute_one_sequence_pipelined*` wrappers) live on aarch64
+// (Neon/Sve dispatch arms in `decode_and_execute_sequences`) and in
+// tests, but are orphan on x86_64 production builds where the
+// per-kernel monoliths bypass them entirely. Each carries
+// `#[allow(dead_code)]` so the `-D warnings` clippy gate stays green
+// on x86_64 without losing the cross-arch reuse. The vestigial
+// `_bmi2`/`_avx2`/`_vbmi2` variants are pre-R12 macro-dispatch
+// helpers with no remaining callers; they should be cleaned up in
+// a follow-up PR once the per-kernel monolithic shape is fully
+// settled.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod seq_decoder_avx2;
 #[cfg(target_arch = "x86_64")]
