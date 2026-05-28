@@ -149,7 +149,7 @@ impl<'t> HuffmanDecoder<'t> {
     #[cfg(feature = "fuzz_exports")]
     #[inline(always)]
     fn decode_symbol(&mut self) -> u8 {
-        self.table.decode[self.state as usize].symbol
+        self.table.packed_decode[self.state as usize] as u8
     }
 
     /// Fuzz-only shim for reading the symbol at the current state.
@@ -186,7 +186,7 @@ impl<'t> HuffmanDecoder<'t> {
     ) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
-        let num_bits = self.table.decode[self.state as usize].num_bits;
+        let num_bits = (self.table.packed_decode[self.state as usize] >> 8) as u8;
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
         // Shift and mask out the bits that identify the current symbol
@@ -252,10 +252,11 @@ impl<'t> HuffmanDecoder<'t> {
         &mut self,
         br: &mut BitReaderReversed<'_, K>,
     ) -> u8 {
-        let entry = self.table.decode[self.state as usize];
-        let new_bits = br.get_bits(entry.num_bits);
-        self.state = ((self.state << entry.num_bits) & self.table.state_mask) | new_bits;
-        entry.symbol
+        let packed = self.table.packed_decode[self.state as usize];
+        let num_bits = (packed >> 8) as u8;
+        let new_bits = br.get_bits(num_bits);
+        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+        packed as u8
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -264,10 +265,11 @@ impl<'t> HuffmanDecoder<'t> {
         &mut self,
         br: &mut BitReaderReversed<'_, K>,
     ) -> u8 {
-        let entry = self.table.decode[self.state as usize];
-        let new_bits = br.get_bits(entry.num_bits);
-        self.state = unsafe { self.advance_state_x86_bmi2(entry.num_bits, new_bits) };
-        entry.symbol
+        let packed = self.table.packed_decode[self.state as usize];
+        let num_bits = (packed >> 8) as u8;
+        let new_bits = br.get_bits(num_bits);
+        self.state = unsafe { self.advance_state_x86_bmi2(num_bits, new_bits) };
+        packed as u8
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -296,7 +298,6 @@ impl<'t> HuffmanDecoder<'t> {
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
-    decode: Vec<Entry>,
     /// Packed `symbol | (num_bits << 8)` per state index, exposed
     /// `pub(crate)` because the HUF 4-stream burst hot path in
     /// `literals_section_decoder::decode_literals` indexes it directly
@@ -339,7 +340,6 @@ impl HuffmanTable {
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {
-            decode: Vec::new(),
             packed_decode: Vec::new(),
 
             weights: Vec::with_capacity(256),
@@ -356,7 +356,6 @@ impl HuffmanTable {
     /// of `other`.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        self.decode.extend_from_slice(&other.decode);
         self.packed_decode.extend_from_slice(&other.packed_decode);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
@@ -368,7 +367,6 @@ impl HuffmanTable {
 
     /// Completely empty the table of all data.
     pub fn reset(&mut self) {
-        self.decode.clear();
         self.packed_decode.clear();
         self.weights.clear();
         self.max_num_bits = 0;
@@ -405,7 +403,7 @@ impl HuffmanTable {
     ///
     /// Returns the number of bytes read.
     pub fn build_decoder(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
-        self.decode.clear();
+        self.packed_decode.clear();
 
         let bytes_used = self.read_weights(source)?;
         self.build_table_from_weights()?;
@@ -624,13 +622,6 @@ impl HuffmanTable {
         }
 
         //fill with dummy symbols
-        self.decode.resize(
-            1 << self.max_num_bits,
-            Entry {
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
         self.packed_decode.resize(1 << self.max_num_bits, 0);
 
         //starting codes for each rank
@@ -644,10 +635,10 @@ impl HuffmanTable {
         }
 
         assert!(
-            self.rank_indexes[0] == self.decode.len(),
+            self.rank_indexes[0] == self.packed_decode.len(),
             "rank_idx[0]: {} should be: {}",
             self.rank_indexes[0],
-            self.decode.len()
+            self.packed_decode.len()
         );
 
         for symbol in 0..self.bits.len() {
@@ -655,19 +646,14 @@ impl HuffmanTable {
             if bits_for_symbol != 0 {
                 // allocate code for the symbol and set in the table
                 // a code ignores all max_bits - bits[symbol] bits, so it gets
-                // a range that spans all of those in the decoding table
-                let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1 << (max_bits - bits_for_symbol);
-                self.rank_indexes[bits_for_symbol as usize] += len;
-                let entry = Entry {
-                    symbol: symbol as u8,
-                    num_bits: bits_for_symbol,
-                };
-                self.decode[base_idx..base_idx + len].fill(entry);
+                // a range that spans all of those in the decoding table.
                 // Donor `HUF_DEltX1` packing: low byte = symbol, high
                 // byte = nbBits. `num_bits ≤ 11` always fits in the
                 // upper byte alongside an 8-bit symbol.
-                let packed = u16::from(entry.symbol) | (u16::from(entry.num_bits) << 8);
+                let base_idx = self.rank_indexes[bits_for_symbol as usize];
+                let len = 1 << (max_bits - bits_for_symbol);
+                self.rank_indexes[bits_for_symbol as usize] += len;
+                let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
                 self.packed_decode[base_idx..base_idx + len].fill(packed);
             }
         }
@@ -680,16 +666,6 @@ impl Default for HuffmanTable {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A single entry in the table contains the decoded symbol/literal and the
-/// size of the prefix code.
-#[derive(Copy, Clone, Debug)]
-pub struct Entry {
-    /// The byte that the prefix code replaces during encoding.
-    symbol: u8,
-    /// The number of bits the prefix code occupies.
-    num_bits: u8,
 }
 
 /// Assert that the provided value is greater than zero, and returns the
@@ -705,31 +681,15 @@ mod tests {
     use alloc::vec;
 
     fn test_table() -> HuffmanTable {
-        let decode = vec![
-            Entry {
-                symbol: b'A',
-                num_bits: 1,
-            },
-            Entry {
-                symbol: b'B',
-                num_bits: 2,
-            },
-            Entry {
-                symbol: b'C',
-                num_bits: 1,
-            },
-            Entry {
-                symbol: b'D',
-                num_bits: 2,
-            },
+        // Packed `symbol | (num_bits << 8)` per state index (donor `HUF_DEltX1`).
+        let packed_decode = vec![
+            u16::from(b'A') | (1u16 << 8),
+            u16::from(b'B') | (2u16 << 8),
+            u16::from(b'C') | (1u16 << 8),
+            u16::from(b'D') | (2u16 << 8),
         ];
-        let packed_decode = decode
-            .iter()
-            .map(|e| u16::from(e.symbol) | (u16::from(e.num_bits) << 8))
-            .collect::<Vec<_>>();
 
         HuffmanTable {
-            decode,
             packed_decode,
             weights: Vec::new(),
             max_num_bits: 2,
@@ -745,12 +705,14 @@ mod tests {
     fn decode_symbol_and_advance_scalar_matches_manual_transition() {
         let table = test_table();
         let initial_state = 1_u64;
-        let entry = table.decode[initial_state as usize];
+        let packed = table.packed_decode[initial_state as usize];
+        let entry_num_bits = (packed >> 8) as u8;
+        let entry_symbol = packed as u8;
         let mut manual_br =
             BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
-        let expected_new_bits = manual_br.get_bits(entry.num_bits);
+        let expected_new_bits = manual_br.get_bits(entry_num_bits);
         let expected_state =
-            ((initial_state << entry.num_bits) & table.state_mask) | expected_new_bits;
+            ((initial_state << entry_num_bits) & table.state_mask) | expected_new_bits;
 
         let mut decoder = HuffmanDecoder {
             table: &table,
@@ -761,7 +723,7 @@ mod tests {
             BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
         let symbol = decoder.decode_symbol_and_advance(&mut br);
 
-        assert_eq!(symbol, entry.symbol);
+        assert_eq!(symbol, entry_symbol);
         assert_eq!(decoder.state, expected_state);
     }
 
