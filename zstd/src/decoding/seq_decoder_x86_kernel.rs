@@ -336,8 +336,21 @@ macro_rules! define_x86_seq_decoder_tier {
             const MIN_LONG_OFFSET_SHARE: u32 = 7;
             #[cfg(not(target_pointer_width = "64"))]
             const MIN_LONG_OFFSET_SHARE: u32 = 20;
+            // Donor parity (zstd_decompress_block.rs:3231-3238):
+            // `usePrefetchDecoder` engages ONLY when total history
+            // size exceeds 16 MB (`> 1<<24`). On smaller frames the
+            // history fits in L2/L3 and hardware prefetch handles
+            // short/medium offsets — the in-loop prefetch issue is
+            // pure overhead. Without this gate our ring engaged on
+            // frames donor wouldn't touch (e.g. 1 MB z000033),
+            // costing ~16 µs per call vs the straight short-block
+            // path that handles those frames in donor.
+            const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
+            let total_history = buffer.window_size + buffer.dict_content.len();
             let use_long_pipeline = num_sequences >= ADVANCE * 2
-                && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
+                && (ddict_is_cold
+                    || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
+                        && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE));
 
             if use_long_pipeline {
                 // SAFETY: $loop_fn carries the same target_feature as

@@ -328,6 +328,8 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // stronger long-offset signal to outpace the narrower load
     // window on those targets.
     #[cfg(target_pointer_width = "64")]
+    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
+    let total_history = buffer.window_size + buffer.dict_content.len();
     const MIN_LONG_OFFSET_SHARE: u32 = 7;
     #[cfg(not(target_pointer_width = "64"))]
     const MIN_LONG_OFFSET_SHARE: u32 = 20;
@@ -345,7 +347,9 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // the cold flag only bypasses the long-offset-share threshold,
     // not the sequence-count threshold.
     let use_long_pipeline = num_sequences >= ADVANCE * 2
-        && (ddict_is_cold || fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE);
+        && (ddict_is_cold
+            || (total_history > HISTORY_THRESHOLD_FOR_PREFETCH
+                && fse.offsets_long_share >= MIN_LONG_OFFSET_SHARE));
     // The format-level `isLongOffset` shortcut from donor is
     // irrelevant on our u32-indexed decoder, so on top of the
     // long-offset share the cold-dict signal is the only other gate.
