@@ -3,33 +3,36 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
-pub struct FSEDecoder<'table> {
+pub struct FSEDecoderImpl<'table, E: FseEntry> {
     /// An FSE state value represents an index in the FSE table.
-    pub state: Entry,
+    pub state: E,
     /// A reference to the table used for decoding.
-    table: &'table FSETable,
+    table: &'table FSETableImpl<E>,
 }
 
-impl<'t> FSEDecoder<'t> {
+/// Type alias preserved for the HUF-weight-stream callers: the
+/// per-state byte (`decode_symbol`) lives on this alias's `Entry`-only
+/// inherent impl below.
+pub type FSEDecoder<'table> = FSEDecoderImpl<'table, Entry>;
+
+impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
     /// Initialize a new Finite State Entropy decoder.
-    pub fn new(table: &'t FSETable) -> FSEDecoder<'t> {
-        FSEDecoder {
-            state: table.decode.first().copied().unwrap_or(Entry {
-                new_state: 0,
-                symbol: 0,
-                num_bits: 0,
-                base_value: 0,
-                num_additional_bits: 0,
-            }),
+    pub fn new(table: &'t FSETableImpl<E>) -> FSEDecoderImpl<'t, E> {
+        FSEDecoderImpl {
+            state: table.decode.first().copied().unwrap_or_default(),
             table,
         }
     }
+}
 
+impl<'t> FSEDecoderImpl<'t, Entry> {
     /// Returns the byte associated with the symbol the internal cursor is pointing at.
     pub fn decode_symbol(&self) -> u8 {
         self.state.symbol
     }
+}
 
+impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
     pub fn init_state<K: CpuKernel>(
@@ -120,9 +123,9 @@ impl<'t> FSEDecoder<'t> {
                 "call init_state successfully before any update_state* call",
             ),
         );
-        let num_bits = self.state.num_bits;
+        let num_bits = self.state.num_bits();
         let add = bits.get_bits(num_bits);
-        let next_state = usize::from(self.state.new_state) + add as usize;
+        let next_state = usize::from(self.state.new_state()) + add as usize;
         // SAFETY: same invariant as `update_state_fast` below —
         // `new_state` and `num_bits` were paired by
         // `calc_baseline_and_numbits` during table construction such
@@ -144,7 +147,7 @@ impl<'t> FSEDecoder<'t> {
     /// when the fuzz binary is built in release mode (which makes
     /// `debug_assert!` a no-op and is the default for `cargo fuzz`).
     #[inline(always)]
-    fn read_entry(&self, idx: usize) -> Entry {
+    fn read_entry(&self, idx: usize) -> E {
         #[cfg(feature = "fuzz_exports")]
         {
             self.table.decode[idx]
@@ -186,9 +189,9 @@ impl<'t> FSEDecoder<'t> {
     /// [`update_state`]: Self::update_state
     #[inline(always)]
     pub(crate) fn update_state_fast<K: CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
-        let num_bits = self.state.num_bits;
+        let num_bits = self.state.num_bits();
         let add = bits.get_bits_unchecked(num_bits);
-        let next_state = usize::from(self.state.new_state) + add as usize;
+        let next_state = usize::from(self.state.new_state()) + add as usize;
         // SAFETY: `new_state` and `num_bits` were paired by
         // `calc_baseline_and_numbits` during table construction such that
         // `new_state + (2.pow(num_bits) - 1) < table_size = self.table.decode.len()`.
@@ -208,12 +211,12 @@ impl<'t> FSEDecoder<'t> {
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#fse-table-description>
 #[derive(Debug, Clone)]
-pub struct FSETable {
+pub struct FSETableImpl<E: FseEntry> {
     /// The maximum symbol in the table (inclusive). Limits the probabilities length to max_symbol + 1.
     max_symbol: u8,
     /// The actual table containing the decoded symbol and the compression data
     /// connected to that symbol.
-    pub decode: Vec<Entry>, //used to decode symbols, and calculate the next state
+    pub decode: Vec<E>, //used to decode symbols, and calculate the next state
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
     symbol_spread_buffer: Vec<u8>,
     /// The size of the table is stored in logarithm base 2 format,
@@ -233,10 +236,22 @@ pub struct FSETable {
     pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
 }
 
-impl FSETable {
+/// Type alias preserved for HUF-weight-stream callers and existing
+/// tests; the sequence-section variant is [`SeqFSETable`].
+pub type FSETable = FSETableImpl<Entry>;
+
+/// Compact sequence-section variant. Backed by 8-byte [`SeqSymbol`]
+/// entries instead of the 12-byte HUF [`Entry`] — matches donor
+/// `ZSTD_seqSymbol`. The per-entry `symbol` byte is dropped; the
+/// sequence-section build path emits `base_value` /
+/// `num_additional_bits` directly during table construction.
+#[allow(dead_code)]
+pub type SeqFSETable = FSETableImpl<SeqSymbol>;
+
+impl<E: FseEntry> FSETableImpl<E> {
     /// Initialize a new empty Finite State Entropy decoding table.
-    pub fn new(max_symbol: u8) -> FSETable {
-        FSETable {
+    pub fn new(max_symbol: u8) -> Self {
+        FSETableImpl {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             symbol_spread_buffer: Vec::new(),
@@ -285,77 +300,6 @@ impl FSETable {
         self.build_decoding_table()?;
 
         Ok(bytes_read)
-    }
-
-    /// Populate each entry's `base_value` and `num_additional_bits`
-    /// from a packed code-metadata table. The packed format matches
-    /// the donor-style `(baseline << 0) | (extra_bits << 24)` layout
-    /// used by the sequence section's `LL_META` / `ML_META`
-    /// constants. Call site indexes into `packed` by entry symbol.
-    ///
-    /// MUST be called after `build_decoding_table` for tables whose
-    /// per-sequence decode path expects pre-computed metadata (LL /
-    /// ML sub-tables of the sequence section). Tables that don't
-    /// (HUF-weight stream) skip the call and leave the new fields
-    /// at their zero default.
-    ///
-    /// Symbols outside `packed.len()` are treated as a corrupt
-    /// table — both fields stay at 0 for that entry. Upstream
-    /// `build_decoding_table` already caps symbols at
-    /// `max_symbol + 1`, so this branch is reachable only on
-    /// `feature = "fuzz_exports"` builds where external code can
-    /// stuff arbitrary entries; the safe default keeps the decode
-    /// hot path from observing UB even in that contrived case.
-    pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
-        for entry in self.decode.iter_mut() {
-            let idx = entry.symbol as usize;
-            if idx < packed.len() {
-                let meta = packed[idx];
-                entry.base_value = meta & 0x00FF_FFFF;
-                entry.num_additional_bits = (meta >> 24) as u8;
-            } else {
-                // Out-of-range symbol — reachable only on
-                // `feature = "fuzz_exports"` builds where external
-                // code can stuff arbitrary entries into the table.
-                // Explicitly zero both fields so the next decode
-                // pass observes a clean state instead of stale
-                // metadata from a previous (well-formed) enrich
-                // call. The downstream `decode_one_sequence_inline`
-                // hot path still surfaces the corruption via the
-                // existing bitstream checks; this clears prior
-                // values rather than introducing a new fast-fail.
-                entry.base_value = 0;
-                entry.num_additional_bits = 0;
-            }
-        }
-    }
-
-    /// Populate each entry's `base_value` and `num_additional_bits`
-    /// for the sequence section's offset table.
-    ///
-    /// Offset codes follow a different shape than LL / ML: each
-    /// offset code `c` decodes to `base = 1 << c`, with `c` extra
-    /// bits read from the stream. No external meta table — the
-    /// computation is closed-form on the symbol value.
-    ///
-    /// Per the format spec, valid offset codes are 0..=31 (offsets
-    /// up to 2³¹). Larger symbols would overflow the `1 << c` shift
-    /// — the entry's fields stay at zero so the decode path
-    /// surfaces the corruption downstream instead of producing a
-    /// wraparound shift here.
-    pub(crate) fn enrich_for_offsets(&mut self) {
-        for entry in self.decode.iter_mut() {
-            // Reset before the bound check so out-of-range
-            // symbols clear stale metadata instead of carrying it
-            // over from a previous enrich pass.
-            entry.base_value = 0;
-            entry.num_additional_bits = 0;
-            let code = entry.symbol;
-            if code < 32 {
-                entry.base_value = 1u32 << code;
-                entry.num_additional_bits = code;
-            }
-        }
     }
 
     /// Given the provided accuracy log, build a decoding table from that log.
@@ -621,13 +565,8 @@ impl FSETable {
             // formula bug instead of silently producing a
             // malformed entry.
             let new_state_u32 = (next_state << nb) - table_size_u32;
-            self.decode.push(Entry {
-                new_state: new_state_u32 as u16,
-                symbol,
-                num_bits: nb,
-                base_value: 0,
-                num_additional_bits: 0,
-            });
+            self.decode
+                .push(E::from_raw(new_state_u32 as u16, symbol, nb));
         }
 
         Ok(())
@@ -727,6 +666,60 @@ impl FSETable {
     }
 }
 
+impl FSETableImpl<Entry> {
+    /// Populate each entry's `base_value` and `num_additional_bits`
+    /// from a packed code-metadata table. The packed format matches
+    /// the donor-style `(baseline << 0) | (extra_bits << 24)` layout
+    /// used by the sequence section's `LL_META` / `ML_META`
+    /// constants. Call site indexes into `packed` by entry symbol.
+    ///
+    /// MUST be called after `build_decoding_table` for tables whose
+    /// per-sequence decode path expects pre-computed metadata (LL /
+    /// ML sub-tables of the sequence section). Tables that don't
+    /// (HUF-weight stream) skip the call and leave the new fields
+    /// at their zero default.
+    ///
+    /// Symbols outside `packed.len()` are treated as a corrupt
+    /// table — both fields stay at 0 for that entry. Upstream
+    /// `build_decoding_table` already caps symbols at
+    /// `max_symbol + 1`, so this branch is reachable only on
+    /// `feature = "fuzz_exports"` builds where external code can
+    /// stuff arbitrary entries; the safe default keeps the decode
+    /// hot path from observing UB even in that contrived case.
+    pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
+        for entry in self.decode.iter_mut() {
+            let idx = entry.symbol as usize;
+            if idx < packed.len() {
+                let meta = packed[idx];
+                entry.base_value = meta & 0x00FF_FFFF;
+                entry.num_additional_bits = (meta >> 24) as u8;
+            } else {
+                entry.base_value = 0;
+                entry.num_additional_bits = 0;
+            }
+        }
+    }
+
+    /// Populate each entry's `base_value` and `num_additional_bits`
+    /// for the sequence section's offset table.
+    ///
+    /// Offset codes follow a different shape than LL / ML: each
+    /// offset code `c` decodes to `base = 1 << c`, with `c` extra
+    /// bits read from the stream. No external meta table — the
+    /// computation is closed-form on the symbol value.
+    pub(crate) fn enrich_for_offsets(&mut self) {
+        for entry in self.decode.iter_mut() {
+            entry.base_value = 0;
+            entry.num_additional_bits = 0;
+            let code = entry.symbol;
+            if code < 32 {
+                entry.base_value = 1u32 << code;
+                entry.num_additional_bits = code;
+            }
+        }
+    }
+}
+
 /// A single entry in an FSE table.
 ///
 /// The first four bytes (`new_state`, `symbol`, `num_bits`) mirror the
@@ -742,7 +735,7 @@ impl FSETable {
 /// on the small HUF FSE table (≤ 64 entries) and the dominant
 /// savings live in the sequence section.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Entry {
     /// Base index for the next state. The low bits read from the bitstream are
     /// added to this value to produce the final state index.
@@ -825,12 +818,18 @@ const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
 /// the sequence-section entry derives `base_value` /
 /// `num_additional_bits` from caller-provided meta and discards
 /// `symbol`.
-#[allow(dead_code)]
 pub trait FseEntry: Copy + Default {
     /// Bits to read on state transition. Hot-path access.
     fn num_bits(&self) -> u8;
     /// Base index for next state. Hot-path access.
     fn new_state(&self) -> u16;
+    /// Build-time constructor from the raw (new_state, symbol, num_bits)
+    /// triple produced by `build_decoding_table`. Implementations may
+    /// drop `symbol` (e.g. [`SeqSymbol`] mirrors donor `ZSTD_seqSymbol`
+    /// which has no per-state byte) — the sequence-section decoder
+    /// fills `base_value` / `num_additional_bits` via a separate enrich
+    /// pass.
+    fn from_raw(new_state: u16, symbol: u8, num_bits: u8) -> Self;
 }
 
 impl FseEntry for Entry {
@@ -842,14 +841,12 @@ impl FseEntry for Entry {
     fn new_state(&self) -> u16 {
         self.new_state
     }
-}
-
-impl Default for Entry {
-    fn default() -> Self {
+    #[inline(always)]
+    fn from_raw(new_state: u16, symbol: u8, num_bits: u8) -> Self {
         Entry {
-            new_state: 0,
-            symbol: 0,
-            num_bits: 0,
+            new_state,
+            symbol,
+            num_bits,
             base_value: 0,
             num_additional_bits: 0,
         }
@@ -864,6 +861,19 @@ impl FseEntry for SeqSymbol {
     #[inline(always)]
     fn new_state(&self) -> u16 {
         self.new_state
+    }
+    #[inline(always)]
+    fn from_raw(new_state: u16, _symbol: u8, num_bits: u8) -> Self {
+        // `symbol` is intentionally dropped: the donor `ZSTD_seqSymbol`
+        // layout has no per-state byte. LL / ML / OF tables fill the
+        // `base_value` / `num_additional_bits` fields via the enrich
+        // post-pass that follows `build_decoder`.
+        SeqSymbol {
+            new_state,
+            num_bits,
+            num_additional_bits: 0,
+            base_value: 0,
+        }
     }
 }
 
