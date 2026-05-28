@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779994253611,
+  "lastUpdate": 1779997743248,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -50714,6 +50714,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.199,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71ba37d251c05c588749ce9cee82f37de0a81241",
+          "message": "perf(decode): skip zero-init of literals target — HUF overwrites everything (#295)\n\n* fix(fse): use spare_capacity_mut + MaybeUninit instead of premature set_len\n\nCopilot flagged the prior P2 change as UB: `set_len(table_size)`\nbefore the write loop made `self.decode` logically contain\n`table_size` initialised entries, but they were uninitialised\nmemory. The error path (`nb > accuracy_log`) returned with that\nbroken state, and the outer `reset()`/Drop would have run on\nuninit entries — unsound per the Vec contract.\n\nFix: write via `spare_capacity_mut()` (typed `&mut [MaybeUninit<E>]`)\nand call `set_len(table_size)` only AFTER the loop completes.\nError path returns with `decode.len() == 0` (set by the preceding\n`clear()`), so no uninitialised entry is observable. The hot-loop\ncodegen is unchanged — `MaybeUninit::write` lowers to the same\nstrided store sequence the raw pointer version was emitting; the\nsoundness is now machine-checkable.\n\n`E: FseEntry` has no `Drop` so the dropped `MaybeUninit` slice on\nthe error path is a no-op.\n\n* perf(decode): drop #[cold] on do_offset_history_repcode for hot workloads (#294)\n\nIssue #279 round-1 mispredict diagnosis attributed 15.42% of decoder\nmispredicts to `do_offset_history_repcode`, with 27.80% landing on\nthe `pushq %rax` function entry — call/ret BTB pressure from the\nnever-inlined boundary. `#[inline(never)]` was dropped in earlier\nrounds; `#[cold]` was kept to preserve out-of-line layout for\nlow-entropy blocks where the prior «drop both» variant regressed\n+15.9% on L14.\n\nThe z000033 L-5 decode flamegraph surfaces this helper at 1.93%\nself-time despite the `#[cold]` label — the cold-bias attribute\nitself blocks LLVM from inlining even at hot call sites where the\ncall/ret + BTB cost dominates the body work. The body is small (RULES\nlookup + 6 branchless cmov) and inlining duplicates a tight scalar\nsequence into the seq decoder's per-sequence loop.\n\nDrop `#[cold]` and let the inline cost-model see the full picture.\nCold callers don't pay anything they weren't paying before — their\ntotal cost was already dominated by surrounding rare-path work, not\nthis helper.\n\n* fix(fse): index slice instead of take() before unsafe set_len\n\n`spread.iter().take(table_size)` silently runs fewer iterations\nif `spread.len() < table_size` — which can only happen if a future\nrefactor breaks the upstream `spread.resize(table_size, 0)`\ninvariant, but the failure mode is severe: the loop body would\nleave the `[loop_count..table_size)` slots in `decode`'s spare\ncapacity uninitialised, and the post-loop `set_len(table_size)`\nwould then claim those uninitialised entries as initialised — UB.\n\nSwitch to `spread[..table_size].iter()`. A length mismatch now\npanics with a clear bounds-check error BEFORE the unsafe set_len\nruns, surfacing the broken invariant immediately instead of\nturning it into silent memory unsafety.\n\n* perf(decode): skip zero-init of literals target — HUF overwrites everything\n\nThe 4-stream HUF burst path pre-sized `target` to `base + regen` via\n`target.resize(base + regen, 0)` so subsequent cursor-based index\nwrites (`target[cursors[s]] = symbol`) could land in-bounds. The\nzero-init pass is pure wasted work: the burst loop + drain phase\nwrites every byte in [base, base+regen) before returning Ok, and\nevery Err path calls `target.truncate(base)` so callers never see\nthe uninitialised tail.\n\n`__memset_avx2_unaligned_erms` ran at ~0.5% of decode self-time on\nthe z000033 L-5 flamegraph, with the visible call chain going\nthrough `Vec::resize -> extend_with<u8>` from this exact site.\n\nReplace with `unsafe { target.set_len(base + regen) }`. Capacity is\nguaranteed by the `target.reserve(regen)` call at the top of\n`decompress_literals_impl`. u8 has no Drop, so exposing\nuninitialised bytes from set_len cannot cause UB from the Vec layer\nitself; the downstream contract (every byte written on Ok, truncate\non Err) is unchanged.\n\nTargets the P5 mechanical cleanup item from the decoder gap-closure\nplan; expected wall-time win is small (~0.3-0.5% on z000033) but\nthe change is mechanical and risk-free.\n\n* fix(decode): use raw pointer for HUF burst writes, set_len only on success\n\nCopilot flagged the prior P5 change as UB: `set_len(base + regen)`\nmade the [base, base+regen) tail logically initialised before the\nHUF burst wrote into it, then the code formed `&mut [u8]` views\nover that range (via `run_4stream_burst_loop`'s slice param and\nthe drain loop's `target[cursors[i]] = ...`). Constructing a\nreference to uninitialised `u8` is UB per the Rust memory model\n(Miri-detectable), even though u8 has no niche.\n\nFix: keep `target.len()` at `base` throughout the burst + drain\nphase. Pass `target_ptr: *mut u8 = target.as_mut_ptr()` to the\nburst loop (signature change: `target: &mut [u8]` → `target_ptr:\n*mut u8`) and the drain loop. Writes go through `target_ptr.add(\ncursors[s]).write(byte)` — raw stores that never form a reference\nto uninitialised memory. Only after all 4 cursors reach their\n`ends[]` AND the `decoded == regen` check passes do we commit\nvia `set_len(base + regen)`.\n\nError paths drop the per-byte truncate (`target.len()` was never\ngrown, so a truncate would be a no-op). Holding the raw pointer\nwithout an intervening `&mut Vec<u8>` borrow keeps\nstacked-borrows happy.\n\nBurst body codegen is unchanged: raw `*mut u8` store lowers to the\nsame `mov [rax+r8], r9b` the slice-indexed version was emitting.\nThe win from skipping the `__memset_avx2` zero-init pass is\npreserved with proven soundness.\n\n* docs(decode): update run_4stream_burst_loop SAFETY contract for raw pointer\n\nThe function signature changed from `target: &mut [u8]` to\n`target_ptr: *mut u8` (commit fa50c464), but the `# Safety` block\nstill claimed `target.len() >= base + regen` — which no longer\nholds because the caller now keeps `target.len()` at `base` until\nthe post-loop `set_len` commits initialisation.\n\nUpdate the contract to document the actual current requirements:\nthe pointer comes from a Vec whose allocation is at least\n`base + regen` bytes (via the caller's `target.reserve(regen)`),\nthe Vec must not be reallocated while the pointer is in use, and\nwrites use raw stores so no `&mut [u8]` view ever covers the\nuninitialised tail.\n\n* docs(decode): rewrite run_4stream_burst_loop SAFETY against in-scope values\n\nThe in-loop SAFETY block referenced `starts[s]`, `ends[s]`,\n`min_seg_len`, and `base + regen` — none of which exist inside\n`run_4stream_burst_loop` (all live at the caller). That made the\nsafety story hard to audit: a reader inside the function had no\nway to verify the bound it claimed.\n\nRewrite the contract using only values visible in the function:\n`cursors`, `cursor_burst_ceil`, `symbols_per_burst`, and the new\n`alloc_upper_bound` field on `LoopBounds`. The caller fills\n`alloc_upper_bound = base + regen` (the upper bound on legal\ncursor values backed by `target.reserve(regen)`). A function-entry\n`debug_assert!` (after the `burst_eligible` early-return so the\nmalformed-small-regen path still bails cleanly) ties\n`cursor_burst_ceil + symbols_per_burst` to `alloc_upper_bound`,\nturning the SAFETY chain into something a future maintainer can\nverify locally.\n\nDropped the tautological `debug_assert!(cursors[0] + symbols_per_burst\n<= cursor_burst_ceil + symbols_per_burst)` — proved nothing.",
+          "timestamp": "2026-05-28T21:41:21+03:00",
+          "tree_id": "1727cae00269430a8bce4fe3e6a0dbd100329305",
+          "url": "https://github.com/structured-world/structured-zstd/commit/71ba37d251c05c588749ce9cee82f37de0a81241"
+        },
+        "date": 1779997736838,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 325.891,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 210.927,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.394,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.507,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.934,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.072,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.813,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.805,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.711,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.656,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.296,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.683,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.093,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.764,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.271,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
