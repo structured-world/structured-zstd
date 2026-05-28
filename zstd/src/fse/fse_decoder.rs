@@ -543,7 +543,16 @@ impl<E: FseEntry> FSETableImpl<E> {
         self.decode.reserve(table_size);
         let slots = &mut self.decode.spare_capacity_mut()[..table_size];
 
-        for (state_idx, &symbol) in spread.iter().take(table_size).enumerate() {
+        // Slice index instead of `spread.iter().take(table_size)`:
+        // if `spread.len() < table_size` (a future refactor breaking
+        // the upstream `spread.resize(table_size, 0)` invariant), the
+        // slice indexing panics here BEFORE the unsafe `set_len`
+        // below would claim uninitialised entries. `take()` would
+        // silently shorten the loop and leave `slots` half-written,
+        // which the post-loop `set_len(table_size)` would then expose
+        // as UB. Indexing surfaces the invariant violation as a
+        // bounds-check panic instead.
+        for (state_idx, &symbol) in spread[..table_size].iter().enumerate() {
             let next_state = symbol_next[symbol as usize];
             // `next_state >= 1` by construction: upstream
             // `read_probabilities` / `build_from_probabilities`
