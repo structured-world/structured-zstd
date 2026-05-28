@@ -145,11 +145,13 @@ macro_rules! define_x86_seq_decoder_tier {
             // Donor `ZSTD_decompressSequencesLong_body` shape: 8-deep
             // lookahead ring with `prefetch_lookahead_match_source` per
             // decoded seq, executing the OLDEST resolved sequence per
-            // iteration. Used ONLY when `use_long_pipeline = true`
-            // (cold dict OR `offsets_long_share >= 7`) — caller
-            // `$decode_fn` gates this entry. For the common
-            // hot-cache case the dispatcher picks the straight-loop
-            // path below.
+            // iteration. Used ONLY when `use_long_pipeline = true`,
+            // i.e. `num_sequences >= ADVANCE * 2` AND either
+            // `ddict_is_cold` OR (`total_history > 1<<24` AND
+            // `offsets_long_share >= MIN_LONG_OFFSET_SHARE`, where
+            // MIN_LONG_OFFSET_SHARE = 7 on 64-bit / 20 on 32-bit).
+            // For the common hot-cache case (small frame, no dict)
+            // the dispatcher picks the straight-loop path below.
             let mut prefetch_pos: usize = old_buffer_size;
             let mut shadow_hist: [u32; 3] = *offset_hist;
             let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {

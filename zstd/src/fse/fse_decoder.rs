@@ -242,9 +242,13 @@ pub type FSETable = FSETableImpl<Entry>;
 
 /// Compact sequence-section variant. Backed by 8-byte [`SeqSymbol`]
 /// entries instead of the 12-byte HUF [`Entry`] — matches donor
-/// `ZSTD_seqSymbol`. The per-entry `symbol` byte is dropped; the
-/// sequence-section build path emits `base_value` /
-/// `num_additional_bits` directly during table construction.
+/// `ZSTD_seqSymbol`. The per-entry `symbol` byte is dropped. Build
+/// flow: [`FseEntry::from_raw`] zero-inits `base_value` /
+/// `num_additional_bits` on insert; the LL / ML / OF enrich passes
+/// ([`FSETableImpl::<SeqSymbol>::enrich_with_packed_seq_meta`] +
+/// [`FSETableImpl::<SeqSymbol>::enrich_for_offsets`]) populate them
+/// in a second walk over `decode[]`, reading the source byte from
+/// the persisted `symbol_spread_buffer`.
 #[allow(dead_code)]
 pub type SeqFSETable = FSETableImpl<SeqSymbol>;
 
@@ -671,8 +675,8 @@ impl FSETableImpl<SeqSymbol> {
     /// from a packed LL / ML meta table. [`SeqSymbol`] has no
     /// per-state byte; the source symbol for slot `i` is read from
     /// the persisted `symbol_spread_buffer` (still in place after
-    /// `build_decoding_table` finishes). Mirrors
-    /// [`FSETableImpl::<Entry>::enrich_with_packed_seq_meta`].
+    /// `build_decoding_table` finishes). Mirrors donor
+    /// `ZSTD_buildSeqTable` post-build enrich for LL / ML.
     pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
         debug_assert_eq!(self.decode.len(), self.symbol_spread_buffer.len());
         for i in 0..self.decode.len() {

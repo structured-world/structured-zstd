@@ -328,11 +328,16 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // stronger long-offset signal to outpace the narrower load
     // window on those targets.
     #[cfg(target_pointer_width = "64")]
-    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
-    let total_history = buffer.window_size + buffer.dict_content.len();
     const MIN_LONG_OFFSET_SHARE: u32 = 7;
     #[cfg(not(target_pointer_width = "64"))]
     const MIN_LONG_OFFSET_SHARE: u32 = 20;
+    // 16 MB total-history threshold for engaging the prefetch
+    // decoder — donor parity (zstd_decompress_block.c
+    // `usePrefetchDecoder`). On 32-bit `usize` ≤ 4 GB so the literal
+    // `1 << 24` fits and the comparison is meaningful; defined
+    // unconditionally so both pointer widths share the gate shape.
+    const HISTORY_THRESHOLD_FOR_PREFETCH: usize = 1 << 24;
+    let total_history = buffer.window_size + buffer.dict_content.len();
     // Donor `ZSTD_decompressBlock_internal`: `usePrefetchDecoder` is
     // initialised from `dctx->ddictIsCold` so the first block of a
     // freshly-attached-dict frame engages the prefetch decoder
