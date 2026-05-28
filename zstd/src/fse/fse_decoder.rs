@@ -266,7 +266,7 @@ impl<E: FseEntry> FSETableImpl<E> {
         self.symbol_probabilities
             .extend_from_slice(&other.symbol_probabilities);
         self.symbol_spread_buffer
-            .reserve(other.symbol_spread_buffer.len());
+            .extend_from_slice(&other.symbol_spread_buffer);
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
     }
@@ -666,31 +666,20 @@ impl<E: FseEntry> FSETableImpl<E> {
     }
 }
 
-impl FSETableImpl<Entry> {
-    /// Populate each entry's `base_value` and `num_additional_bits`
-    /// from a packed code-metadata table. The packed format matches
-    /// the donor-style `(baseline << 0) | (extra_bits << 24)` layout
-    /// used by the sequence section's `LL_META` / `ML_META`
-    /// constants. Call site indexes into `packed` by entry symbol.
-    ///
-    /// MUST be called after `build_decoding_table` for tables whose
-    /// per-sequence decode path expects pre-computed metadata (LL /
-    /// ML sub-tables of the sequence section). Tables that don't
-    /// (HUF-weight stream) skip the call and leave the new fields
-    /// at their zero default.
-    ///
-    /// Symbols outside `packed.len()` are treated as a corrupt
-    /// table — both fields stay at 0 for that entry. Upstream
-    /// `build_decoding_table` already caps symbols at
-    /// `max_symbol + 1`, so this branch is reachable only on
-    /// `feature = "fuzz_exports"` builds where external code can
-    /// stuff arbitrary entries; the safe default keeps the decode
-    /// hot path from observing UB even in that contrived case.
+impl FSETableImpl<SeqSymbol> {
+    /// Populate each entry's `base_value` / `num_additional_bits`
+    /// from a packed LL / ML meta table. [`SeqSymbol`] has no
+    /// per-state byte; the source symbol for slot `i` is read from
+    /// the persisted `symbol_spread_buffer` (still in place after
+    /// `build_decoding_table` finishes). Mirrors
+    /// [`FSETableImpl::<Entry>::enrich_with_packed_seq_meta`].
     pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
-        for entry in self.decode.iter_mut() {
-            let idx = entry.symbol as usize;
-            if idx < packed.len() {
-                let meta = packed[idx];
+        debug_assert_eq!(self.decode.len(), self.symbol_spread_buffer.len());
+        for i in 0..self.decode.len() {
+            let sym = self.symbol_spread_buffer[i] as usize;
+            let entry = &mut self.decode[i];
+            if sym < packed.len() {
+                let meta = packed[sym];
                 entry.base_value = meta & 0x00FF_FFFF;
                 entry.num_additional_bits = (meta >> 24) as u8;
             } else {
@@ -700,18 +689,15 @@ impl FSETableImpl<Entry> {
         }
     }
 
-    /// Populate each entry's `base_value` and `num_additional_bits`
-    /// for the sequence section's offset table.
-    ///
-    /// Offset codes follow a different shape than LL / ML: each
-    /// offset code `c` decodes to `base = 1 << c`, with `c` extra
-    /// bits read from the stream. No external meta table — the
-    /// computation is closed-form on the symbol value.
+    /// Closed-form offset-code enrich: `base = 1 << code`, `num_add = code`
+    /// for `code < 32`. Source byte read from spread buffer.
     pub(crate) fn enrich_for_offsets(&mut self) {
-        for entry in self.decode.iter_mut() {
+        debug_assert_eq!(self.decode.len(), self.symbol_spread_buffer.len());
+        for i in 0..self.decode.len() {
+            let code = self.symbol_spread_buffer[i];
+            let entry = &mut self.decode[i];
             entry.base_value = 0;
             entry.num_additional_bits = 0;
-            let code = entry.symbol;
             if code < 32 {
                 entry.base_value = 1u32 << code;
                 entry.num_additional_bits = code;
@@ -719,6 +705,9 @@ impl FSETableImpl<Entry> {
         }
     }
 }
+
+/// Sequence-section decoder alias: reads 8-byte [`SeqSymbol`] entries.
+pub type SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol>;
 
 /// A single entry in an FSE table.
 ///

@@ -5,7 +5,7 @@ use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::ringbuffer::RingBuffer;
 use crate::decoding::dictionary::Dictionary;
-use crate::fse::FSETable;
+use crate::fse::SeqFSETable;
 use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
@@ -351,16 +351,16 @@ impl Default for FSEScratch {
 // Note: this aligns the table containers, not the `Vec<Entry>` backing allocations.
 #[cfg_attr(target_arch = "aarch64", repr(align(128)))]
 #[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
-pub struct AlignedFSETable(FSETable);
+pub struct AlignedFSETable(SeqFSETable);
 
 impl AlignedFSETable {
     fn new(max_symbol: u8) -> Self {
-        Self(FSETable::new(max_symbol))
+        Self(SeqFSETable::new(max_symbol))
     }
 }
 
 impl Deref for AlignedFSETable {
-    type Target = FSETable;
+    type Target = SeqFSETable;
 
     fn deref(&self) -> &Self::Target {
         &self.0

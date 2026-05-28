@@ -9,7 +9,7 @@ use crate::blocks::sequence_section::{
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
-use crate::fse::FSEDecoder;
+use crate::fse::SeqFSEDecoder;
 use alloc::vec::Vec;
 
 // 8-slot software pipeline mirroring donor
@@ -236,9 +236,9 @@ pub(crate) fn decode_and_execute_sequences_impl<
         return Ok(());
     }
 
-    let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = FSEDecoder::new(&fse.offsets);
+    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
 
     ll_dec
         .init_state(&mut br)
@@ -551,9 +551,9 @@ fn run_pipelined_sequence_loop<
     K: crate::cpu_kernel::CpuKernel,
 >(
     br: &mut BitReaderReversed<'_, K>,
-    ll_dec: &mut FSEDecoder<'_>,
-    ml_dec: &mut FSEDecoder<'_>,
-    of_dec: &mut FSEDecoder<'_>,
+    ll_dec: &mut SeqFSEDecoder<'_>,
+    ml_dec: &mut SeqFSEDecoder<'_>,
+    of_dec: &mut SeqFSEDecoder<'_>,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
@@ -1119,9 +1119,9 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
 /// let us share a private fn-item across two outer functions cleanly.
 #[inline(always)]
 fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
-    ll_dec: &mut FSEDecoder<'_>,
-    ml_dec: &mut FSEDecoder<'_>,
-    of_dec: &mut FSEDecoder<'_>,
+    ll_dec: &mut SeqFSEDecoder<'_>,
+    ml_dec: &mut SeqFSEDecoder<'_>,
+    of_dec: &mut SeqFSEDecoder<'_>,
     br: &mut BitReaderReversed<'_, K>,
 ) -> Sequence {
     // Read base/extra-bits directly off the active FSE state's
@@ -1183,9 +1183,9 @@ pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+    let mut ll_dec = SeqFSEDecoder::new(&scratch.literal_lengths);
+    let mut ml_dec = SeqFSEDecoder::new(&scratch.match_lengths);
+    let mut of_dec = SeqFSEDecoder::new(&scratch.offsets);
 
     if scratch.ll_rle.is_none() {
         ll_dec.init_state(br)?;
@@ -1220,48 +1220,34 @@ pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
     );
 
     for _seq_idx in 0..section.num_sequences {
-        //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
-            ll_rle
-        } else {
-            ll_dec.decode_symbol()
-        };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
-            ml_rle
-        } else {
-            ml_dec.decode_symbol()
-        };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
-            of_rle
-        } else {
-            of_dec.decode_symbol()
-        };
-
-        // RLE-mode tables don't have an enriched FSE entry to read
-        // from — fall back to `lookup_ll_code` / `lookup_ml_code`
-        // for the RLE byte. FSE-mode tables read base / extra-bits
-        // directly off the active state's enriched `Entry`. The
-        // RLE-fallback path is the only place these `lookup_*`
-        // helpers are still used after #247 Part 1.
-        let (ll_value, ll_num_bits) = if scratch.ll_rle.is_some() {
-            lookup_ll_code(ll_code)
+        // RLE-mode tables don't carry an enriched FSE state — fall
+        // back to `lookup_ll_code` / `lookup_ml_code` on the RLE byte
+        // for LL / ML, and the closed-form `(1 << code, code)` shape
+        // for OF. FSE-mode tables read base / extra-bits directly
+        // off the active state's enriched `SeqSymbol`. `SeqSymbol`
+        // has no `symbol` byte; OF code is recoverable from
+        // `num_additional_bits` (== code for code < 32) but the hot
+        // path uses `base_value` / `num_additional_bits` directly.
+        let (ll_value, ll_num_bits) = if let Some(ll_rle) = scratch.ll_rle {
+            lookup_ll_code(ll_rle)
         } else {
             (ll_dec.state.base_value, ll_dec.state.num_additional_bits)
         };
-        let (ml_value, ml_num_bits) = if scratch.ml_rle.is_some() {
-            lookup_ml_code(ml_code)
+        let (ml_value, ml_num_bits) = if let Some(ml_rle) = scratch.ml_rle {
+            lookup_ml_code(ml_rle)
         } else {
             (ml_dec.state.base_value, ml_dec.state.num_additional_bits)
         };
+        let (of_value, of_num_bits) = if let Some(of_rle) = scratch.of_rle {
+            (1u32 << of_rle, of_rle)
+        } else {
+            (of_dec.state.base_value, of_dec.state.num_additional_bits)
+        };
 
-        // OF code / offset==0 checks dropped per FSE invariants (see comment
-        // in decode_sequences_without_rle). For RLE mode, the singleton
-        // of_rle byte is validated at maybe_update_fse_tables; for FSE mode,
-        // build_decoding_table caps symbols at MAX_OFFSET_CODE.
-        debug_assert!(of_code <= MAX_OFFSET_CODE);
+        debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
 
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + of_value;
 
         debug_assert_ne!(offset, 0);
 
@@ -1433,14 +1419,18 @@ pub const OF_MAX_LOG: u8 = 8;
 /// Called only when the offsets table is actually rebuilt (FSE /
 /// Predefined modes in `maybe_update_fse_tables`). Repeat-mode
 /// blocks reuse the cached value in `FSEScratch::offsets_long_share`.
-pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::FSETable) -> u32 {
+pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u32 {
     const OFFSET_FSE_LOG: u32 = 8;
     const LONG_OFFSET_CODE_THRESHOLD: u32 = 22;
     let table_log = offsets.accuracy_log as u32;
+    // `SeqSymbol` has no per-state byte; after `enrich_for_offsets`
+    // the source offset code lives in `num_additional_bits`
+    // (`code` for `code < 32`, `0` otherwise — long codes are
+    // bounded by the format spec at 31).
     let raw = offsets
         .decode
         .iter()
-        .filter(|entry| u32::from(entry.symbol) > LONG_OFFSET_CODE_THRESHOLD)
+        .filter(|entry| u32::from(entry.num_additional_bits) > LONG_OFFSET_CODE_THRESHOLD)
         .count() as u32;
     // Format-spec bound `OF_MAX_LOG = 8` keeps `table_log <=
     // OFFSET_FSE_LOG` for every valid offsets stream, so the shift
@@ -1659,11 +1649,11 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // handle the cache primitive directly without a fallible-init
 // shim.
 #[cfg(feature = "std")]
-fn predefined_ll_table() -> &'static crate::fse::FSETable {
+fn predefined_ll_table() -> &'static crate::fse::SeqFSETable {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
         t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&LL_META);
@@ -1672,11 +1662,11 @@ fn predefined_ll_table() -> &'static crate::fse::FSETable {
 }
 
 #[cfg(feature = "std")]
-fn predefined_ml_table() -> &'static crate::fse::FSETable {
+fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::FSETable> = OnceLock::new();
+    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_MATCH_LENGTH_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
         t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&ML_META);
@@ -1685,11 +1675,11 @@ fn predefined_ml_table() -> &'static crate::fse::FSETable {
 }
 
 #[cfg(feature = "std")]
-fn predefined_of_table() -> (&'static crate::fse::FSETable, u32) {
+fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<(crate::fse::FSETable, u32)> = OnceLock::new();
+    static CACHED: OnceLock<(crate::fse::SeqFSETable, u32)> = OnceLock::new();
     let cache = CACHED.get_or_init(|| {
-        let mut t = crate::fse::FSETable::new(MAX_OFFSET_CODE);
+        let mut t = crate::fse::SeqFSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
             .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
@@ -1732,9 +1722,9 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 #[cfg(feature = "std")]
 #[test]
 fn predefined_fse_caches_match_rebuild_output() {
-    use crate::fse::FSETable;
+    use crate::fse::SeqFSETable;
 
-    let mut ll_rebuild = FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    let mut ll_rebuild = SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
     ll_rebuild
         .build_from_probabilities(
             LL_DEFAULT_ACC_LOG,
@@ -1751,7 +1741,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(ll_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "LL entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "LL entry {i} new_state mismatch");
         assert_eq!(
@@ -1764,7 +1753,7 @@ fn predefined_fse_caches_match_rebuild_output() {
         );
     }
 
-    let mut ml_rebuild = FSETable::new(MAX_MATCH_LENGTH_CODE);
+    let mut ml_rebuild = SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
     ml_rebuild
         .build_from_probabilities(
             ML_DEFAULT_ACC_LOG,
@@ -1781,7 +1770,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(ml_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "ML entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "ML entry {i} new_state mismatch");
         assert_eq!(
@@ -1794,7 +1782,7 @@ fn predefined_fse_caches_match_rebuild_output() {
         );
     }
 
-    let mut of_rebuild = FSETable::new(MAX_OFFSET_CODE);
+    let mut of_rebuild = SeqFSETable::new(MAX_OFFSET_CODE);
     of_rebuild
         .build_from_probabilities(
             OF_DEFAULT_ACC_LOG,
@@ -1816,7 +1804,6 @@ fn predefined_fse_caches_match_rebuild_output() {
         .zip(of_cached.decode.iter())
         .enumerate()
     {
-        assert_eq!(a.symbol, b.symbol, "OF entry {i} symbol mismatch");
         assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
         assert_eq!(a.new_state, b.new_state, "OF entry {i} new_state mismatch");
         assert_eq!(
@@ -1832,7 +1819,7 @@ fn predefined_fse_caches_match_rebuild_output() {
 
 #[test]
 fn test_ll_default() {
-    let mut table = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
+    let mut table = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
         .build_from_probabilities(
             LL_DEFAULT_ACC_LOG,
@@ -1843,23 +1830,18 @@ fn test_ll_default() {
     assert!(table.decode.len() == 64);
 
     //just test a few values. TODO test all values
-    assert!(table.decode[0].symbol == 0);
     assert!(table.decode[0].num_bits == 4);
     assert!(table.decode[0].new_state == 0);
 
-    assert!(table.decode[19].symbol == 27);
     assert!(table.decode[19].num_bits == 6);
     assert!(table.decode[19].new_state == 0);
 
-    assert!(table.decode[39].symbol == 25);
     assert!(table.decode[39].num_bits == 4);
     assert!(table.decode[39].new_state == 16);
 
-    assert!(table.decode[60].symbol == 35);
     assert!(table.decode[60].num_bits == 6);
     assert!(table.decode[60].new_state == 0);
 
-    assert!(table.decode[59].symbol == 24);
     assert!(table.decode[59].num_bits == 5);
     assert!(table.decode[59].new_state == 32);
 }
@@ -1867,29 +1849,29 @@ fn test_ll_default() {
 #[cfg(test)]
 mod offsets_long_share_tests {
     use super::compute_offsets_long_share;
-    use crate::fse::{Entry, FSETable};
 
-    /// Construct a synthetic FSETable with the given symbol per entry
-    /// at the requested accuracy_log. Bypasses `build_from_probabilities`
-    /// — we only need `decode[*].symbol` and `accuracy_log` populated;
-    /// the long-share helper reads exactly those.
-    fn synthetic_offsets_table(accuracy_log: u8, symbols: &[u8]) -> FSETable {
+    /// Construct a synthetic offsets [`SeqFSETable`] with the given
+    /// offset code per entry. Mirrors the post-`enrich_for_offsets`
+    /// shape used by `compute_offsets_long_share`: each entry's
+    /// `num_additional_bits` holds the code (== source byte for
+    /// `code < 32`, the only range this helper reads).
+    fn synthetic_offsets_table(accuracy_log: u8, symbols: &[u8]) -> crate::fse::SeqFSETable {
+        use crate::fse::SeqSymbol;
         let size = 1usize << accuracy_log;
         assert_eq!(
             symbols.len(),
             size,
             "symbols.len() must equal 1 << accuracy_log"
         );
-        let mut t = FSETable::new(31);
+        let mut t = crate::fse::SeqFSETable::new(31);
         t.accuracy_log = accuracy_log;
         t.decode = symbols
             .iter()
-            .map(|&s| Entry {
+            .map(|&s| SeqSymbol {
                 new_state: 0,
-                symbol: s,
                 num_bits: 0,
+                num_additional_bits: s,
                 base_value: 0,
-                num_additional_bits: 0,
             })
             .collect();
         t

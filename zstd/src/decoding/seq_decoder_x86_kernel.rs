@@ -49,9 +49,9 @@ macro_rules! define_x86_seq_decoder_tier {
         #[target_feature(enable = $tf)]
         #[allow(dead_code)]
         unsafe fn $decode_one_fn<'a, 'b>(
-            ll_dec: &mut $crate::fse::FSEDecoder<'a>,
-            ml_dec: &mut $crate::fse::FSEDecoder<'a>,
-            of_dec: &mut $crate::fse::FSEDecoder<'a>,
+            ll_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
+            ml_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
+            of_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
             br: &mut $crate::bit_io::BitReaderReversed<'b, $kernel>,
         ) -> $crate::blocks::sequence_section::Sequence {
             let ll_state = ll_dec.state;
@@ -126,9 +126,9 @@ macro_rules! define_x86_seq_decoder_tier {
         #[target_feature(enable = $tf)]
         unsafe fn $loop_fn<'a, 'b, B: $crate::decoding::buffer_backend::BufferBackend>(
             br: &mut $crate::bit_io::BitReaderReversed<'b, $kernel>,
-            ll_dec: &mut $crate::fse::FSEDecoder<'a>,
-            ml_dec: &mut $crate::fse::FSEDecoder<'a>,
-            of_dec: &mut $crate::fse::FSEDecoder<'a>,
+            ll_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
+            ml_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
+            of_dec: &mut $crate::fse::SeqFSEDecoder<'a>,
             buffer: &mut $crate::decoding::decode_buffer::DecodeBuffer<B>,
             offset_hist: &mut [u32; 3],
             literals_buffer: &[u8],
@@ -260,7 +260,7 @@ macro_rules! define_x86_seq_decoder_tier {
             use $crate::decoding::sequence_section_decoder::{
                 ADVANCE, decode_sequences_with_rle, maybe_update_fse_tables,
             };
-            use $crate::fse::FSEDecoder;
+            use $crate::fse::SeqFSEDecoder;
 
             rle_fallback_sequences.clear();
 
@@ -296,9 +296,9 @@ macro_rules! define_x86_seq_decoder_tier {
                 return Ok(());
             }
 
-            let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
-            let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
-            let mut of_dec = FSEDecoder::new(&fse.offsets);
+            let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
+            let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
+            let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
 
             ll_dec
                 .init_state(&mut br)
