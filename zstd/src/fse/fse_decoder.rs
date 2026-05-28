@@ -3,7 +3,15 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
-pub(crate) struct FSEDecoderImpl<'table, E: FseEntry> {
+// Visibility = `pub` so the `pub type FSEDecoder` / `pub type
+// SeqFSEDecoder` aliases below don't expose a more-private struct
+// (compiler `private_interfaces` warning). External reachability is
+// gated by `crate::fse` module visibility: `pub(crate) mod fse` in
+// the default build keeps everything crate-internal; under
+// `feature = "fuzz_exports"` the module becomes `pub mod fse` and
+// the struct becomes externally accessible — which is exactly what
+// the fuzz harness needs.
+pub struct FSEDecoderImpl<'table, E: FseEntry> {
     /// An FSE state value represents an index in the FSE table.
     pub state: E,
     /// A reference to the table used for decoding.
