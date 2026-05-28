@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779949141154,
+  "lastUpdate": 1779994253611,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -50510,6 +50510,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8065eb2c62cdcb0c4adf7b12841d9035561276e9",
+          "message": "perf(decode): straight-loop short path + donor-gated lookahead ring + SeqSymbol repack (#289)\n\n* refactor(fse): add SeqSymbol (8B) + FseEntry trait\n\nLays the type-level foundation for splitting the FSE decoding table\ninto a 12-byte HUF-grade `Entry` variant (keeps `symbol` for\nhuff0) and an 8-byte sequence-section `SeqSymbol` variant\n(matches donor `ZSTD_seqSymbol` exactly, drops `symbol`).\n\nPure additive change: trait + new struct + `impl Default for Entry`.\nNo callsite touches. `FSETable` / `FSEDecoder` stay non-generic for\nthis commit; the generic refactor lands next.\n\n647/647 tests pass.\n\n* refactor(fse): generic FSETableImpl<E> / FSEDecoderImpl<'t, E>\n\nParameterize the decoder table and decoder over the entry type via\nthe new `FseEntry` trait (`num_bits()`, `new_state()`, `from_raw()`).\n\nType aliases preserve every existing callsite:\n\n  pub type FSETable     = FSETableImpl<Entry>;       // HUF default\n  pub type SeqFSETable  = FSETableImpl<SeqSymbol>;   // sequence section\n  pub type FSEDecoder   = FSEDecoderImpl<'_, Entry>;\n\nHUF-only methods (`decode_symbol`, `enrich_with_packed_seq_meta`,\n`enrich_for_offsets`) live on `impl FSETableImpl<Entry>` /\n`impl FSEDecoderImpl<'_, Entry>` blocks. State transitions go through\nthe trait, so the same hot path serves both entry shapes.\n\n`SeqFSETable` is declared but not yet wired into FSEScratch — that\nlanding requires the build-time meta-population pass, which lands\nnext.\n\n647/647 tests pass. Clippy clean.\n\n* refactor(fse): migrate sequence-section LL/ML/OF to SeqFSETable (8B entries)\n\nSwitch `FSEScratch.literal_lengths` / `match_lengths` / `offsets` and\nthe predefined-table cache to `SeqFSETable` (= FSETableImpl<SeqSymbol>).\nLL / ML / OF entries shrink from 12 bytes (`Entry`) to 8 bytes\n(`SeqSymbol`), matching donor `ZSTD_seqSymbol` exactly.\n\nMechanical scope:\n- `AlignedFSETable` wraps `SeqFSETable`.\n- `SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol>` for all\n  per-sequence callsites (`run_pipelined_sequence_loop`,\n  `decode_one_sequence_inline`, x86-kernel macro).\n- `enrich_with_packed_seq_meta` / `enrich_for_offsets` move to\n  `impl FSETableImpl<SeqSymbol>`, reading the source byte from the\n  persisted `symbol_spread_buffer` (`SeqSymbol` has no `symbol`).\n- `reinit_from` now copies the spread buffer (was only reserving\n  capacity) so post-`reinit_from` enrich calls observe a valid\n  per-slot source byte.\n- `compute_offsets_long_share` reads `entry.num_additional_bits`\n  (== offset code for code < 32 after `enrich_for_offsets`) instead\n  of the dropped `entry.symbol`.\n- `decode_sequences_with_rle` no longer calls `decode_symbol()` —\n  the source byte is unused in the FSE-mode branch; RLE-mode reads\n  ll_rle / ml_rle / of_rle directly and OF computes `1 << of_rle`\n  inline.\n- Drop Entry-side `enrich_*` (HUF tables never enrich).\n\nHUF (`huff0_decoder`) continues to use `FSETable` (= 12-byte Entry,\nkeeps `symbol` for the per-state byte lookup).\n\n647/647 tests pass. Clippy clean.\n\n* perf(decode): align steady-state seq loop entry to 64-byte DSB window\n\nInsert explicit `.p2align 6 / nop / .p2align 5 / nop / .p2align 3`\nasm directives directly before the pipelined seq-decoder steady-state\nloop in `run_pipelined_sequence_loop`. Mirrors donor's\n`ZSTD_decompressSequences_body_bmi2_noExt_rawLit` (zstd-pure-rs\nzstd_decompress_block.rs:2282-2290).\n\nTargets the Skylake-X DSB pressure diagnosed earlier (hot loop ~3000\nµops exceeds the 1536-µop DSB capacity, 40% of µops were arriving via\nthe legacy MITE decoder with measurable DSB2MITE switch cost).\n\n647/647 tests pass. Single-asm, no mem/reg clobbers.\n\n* perf(decode): replace pipelined lookahead ring with donor straight loop\n\nStrip the 8-deep `ExecSeq` ring, `shadow_hist`, `prefetch_pos`\narithmetic, and `prefetch_lookahead_match_source` issuing inside the\npipelined seq decoder. The new body is donor `_noExt_rawLit` shape:\ndecode one sequence, resolve its offset, execute immediately, advance\nstate, next. Zero per-iteration ring bookkeeping; hardware prefetcher\nhandles short-distance matches on hot-cache corpora (z000033 fixture).\n\nApplied to both the K-agnostic safe `run_pipelined_sequence_loop` and\nthe per-tier x86 macro `define_x86_seq_decoder_tier!`'s `$loop_fn`.\nDSB align asm padding from R10-A retained ahead of the loop entry.\n\nOutside-of-hot-loop callsites that referenced `ExecSeq`,\n`execute_one_sequence_pipelined_resolved`, `ADVANCE_MASK`, and the\nlookahead-prefetch surface remain compiled (warnings only); future\ncleanup commit can drop them once the architecture is bench-validated.\n\n647/647 tests pass on aarch64.\n\n* fix(decode): drop stale shadow_hist commit in tier macro tail\n\n* perf(decode): restore lookahead-ring \\$loop_fn for use_long_pipeline arm\n\nR10-C straight-loop replaced \\$loop_fn body entirely with donor\n\\`_noExt_rawLit\\` shape, but \\$loop_fn is the long-pipeline arm: the\n\\`use_long_pipeline = ddict_is_cold || offsets_long_share >= 7\\`\ngate routes ONLY cold-dict / long-offset frames here. Donor parity\ndemands the lookahead ring with \\`prefetch_lookahead_match_source\\`\nin that arm (donor \\`ZSTD_decompressSequencesLong_body_bmi2_impl\\`),\nnot the straight loop.\n\nRestore the original 8-deep ExecSeq ring + shadow_hist +\nprefetch_pos arithmetic inside \\$loop_fn. The else-arm (short-block\niterative fallback) keeps its current straight single-pass-fused\nshape — that's where the common warm/short-offset case lands and\nwhere the R10-C win actually came from on z000033.\n\nDSB align asm padding kept ahead of the long-pipeline steady-state\nloop entry (R10-A carry-over). Tests 647/647 on aarch64.\n\n* perf(decode): gate lookahead-ring on totalHistorySize > 16 MB (donor parity)\n\nDonor `usePrefetchDecoder` (zstd_decompress_block.rs:3231-3238)\nengages the prefetch decoder ONLY when total history size exceeds\n16 MB (\\`> 1<<24\\`). Smaller frames have history that fits in\nL2/L3, hardware prefetch handles short/medium offsets, and the\nin-loop \\`prefetch_lookahead_match_source\\` issue is pure overhead.\n\nOur previous gate \\`ddict_is_cold || offsets_long_share >= 7\\` was\ntoo aggressive — engaged the ring on 1 MB frames like z000033\nwhere donor takes the straight-loop path. Adding the donor's\n\\`total_history > 1<<24\\` predicate to the long-offset arm.\n\n\\`ddict_is_cold\\` is preserved as an unconditional gate (first\nblock of a freshly-attached dict frame benefits from prefetch\nregardless of size — that's the cold-dict DRAM-hiding scenario\nthe ring was originally for).\n\nTests 647/647 on aarch64.\n\n* fix(decode): gate MIN_LONG_OFFSET_SHARE / HISTORY_THRESHOLD for i686 build\n\n- MIN_LONG_OFFSET_SHARE: gate the 64-bit value under cfg\n  (target_pointer_width = \"64\") so it isn't doubly-defined alongside\n  the not-64-bit override.\n- HISTORY_THRESHOLD_FOR_PREFETCH: define unconditionally so the\n  use_long_pipeline predicate compiles on 32-bit. 16 MB literal fits\n  in usize on both pointer widths.\n- SeqFSETable rustdoc clarified: from_raw zero-inits meta fields;\n  LL / ML / OF enrich pass populates them post-build via\n  enrich_with_packed_seq_meta / enrich_for_offsets.\n- enrich_with_packed_seq_meta rustdoc: dropped stale link to the\n  deleted Entry-side helper.\n- scratch.rs comment: Vec<Entry> -> Vec<SeqSymbol>.\n- Tier-macro \\$loop_fn doc: full gate documented (cold_dict OR\n  hist > 16MB AND long_share >= MIN_LONG_OFFSET_SHARE).\n\n* perf(fse): drop dead spread-buffer copy from reinit_from\n\nPredefined-cache reinit_from + dict-init reinit_from feed a source\ntable whose decode[] is already enriched. The post-reinit decoder\nnever re-reads symbol_spread_buffer (build-time scratch + enrich\nsource only). Revert to reserve-capacity-only so dict-init and\nPredefined paths skip the unconditional bytes copy that was added\nwhen SeqSymbol enrich gained spread-buffer dependency.\n\n* refactor(fse,decode): tighten FSE internals visibility + dedup long-pipeline gate\n\n- FSEDecoderImpl, FseEntry trait -> pub(crate). Not reachable through any\n  public type chain; were leaking through `pub use fse_decoder::*` without\n  being part of the intended public surface.\n- FSETableImpl, SeqSymbol stay pub but #[doc(hidden)] — they're reachable\n  through the public Deref impl on AlignedFSETable (AlignedFSETable ->\n  SeqFSETable = FSETableImpl<SeqSymbol>) which the public Dictionary type\n  exposes via its FSEScratch field.\n- Extract compute_use_long_pipeline() helper in sequence_section_decoder\n  as the single source of truth for the MIN_LONG_OFFSET_SHARE / 16-MB\n  history / num_sequences gate. Both the K-generic dispatcher and the\n  per-tier x86 macro now call into it, eliminating the duplicate\n  definitions and preventing future drift between scalar and SIMD\n  dispatch.\n\n* perf(fse): reuse symbol_probabilities buffer in build_from_probabilities\n\nReplace `self.symbol_probabilities = probs.to_vec()` with\nclear() + extend_from_slice(). Avoids fresh heap allocation on\nevery call and preserves Vec capacity (with_capacity(256) in\nthe constructor was being thrown away).\n\n* fix(fse): widen FSEDecoderImpl visibility to match pub type aliases\n\nThe `pub(crate) struct FSEDecoderImpl` was re-exported via two\n`pub type` aliases (`FSEDecoder` for HUF weight-stream callers,\n`SeqFSEDecoder` for the sequence decoder). Under\n`feature = \"fuzz_exports\"` the `crate::fse` module becomes\n`pub mod fse`, so the public aliases would name a more-private\nstruct — the compiler emits `type FSEDecoderImpl... is more\nprivate than the item FSEDecoder` (`private_interfaces` lint).\n\nMake the struct itself `pub`. External reachability is still\ngated by `crate::fse` module visibility:\n- default build: `pub(crate) mod fse` keeps everything\n  crate-internal regardless of the inner `pub`\n- `fuzz_exports`: `pub mod fse` exposes the struct, which is\n  exactly what the fuzz harness needs\n\nNo behavioural change; warning-only fix on the fuzz_exports build.\n\n* perf(decode): R12 monolithic per-kernel decoder foundation (#291)\n\n* refactor(decode): AVX2-tier monolithic sequence decoder\n\nReplaces the macro-generated three-function tier (decode_fn / loop_fn /\ndecode_one_fn) for the AVX2 path with one self-contained\n`#[target_feature(enable = \"bmi2,avx2\")]` function. The body inlines the\nentire decode + execute pipeline: outer init, RLE dispatch, FSE state\ninit, both pipeline arms (8-deep lookahead ring for cold-dict / >16 MB\ntotal-history, straight short-block loop otherwise), per-sequence\ndecode (peek_bits_triple_bmi2 with `_pext_u64` inline at call site),\nper-sequence execute (32-byte AVX2 ymm wildcopy via\nexec_sequence_inline_avx2), and post-loop bitstream-tail validation.\n\nTwo internal helpers (decode_one_avx2, execute_one_avx2) carry the same\ntarget_feature scope and are `#[inline]` — LLVM collapses them into the\ncaller in release mode since both are single-callsite hot-path functions\ninside the matching target_feature.\n\nCompanion monoliths for BMI2 / VBMI2 / Scalar in follow-up commits. The\nK-generic dispatcher in sequence_section_decoder still selects the tier\nonce per call via cached detect_cpu_kernel.\n\n* refactor(decode): BMI2-tier monolithic sequence decoder\n\nSame shape as the AVX2 monolith but pinned to `Bmi2Kernel` and using\nthe SSE2 16-byte `exec_sequence_inline` for match copy (no AVX2 ymm\nwidening at this tier). Outer init + RLE dispatch + FSE state init +\nboth pipeline arms + decode_one + execute_one all inlined into one\n`#[target_feature(enable = \"bmi2\")]` function.\n\nTriple-bit extract goes through `peek_bits_triple_bmi2` (_pext_u64\ninline) gated by the cached vendor policy — same as AVX2.\n\n* refactor(decode): VBMI2-tier monolithic sequence decoder\n\nSame shape as the AVX2 monolith but pinned to `Vbmi2Kernel` and\ncarrying the full VBMI2 + AVX-512 + AVX2 + BMI2 target_feature scope.\nMatch copy uses `exec_sequence_inline_avx2` since VBMI2 always implies\nAVX2+BMI2; zmm 64-byte wildcopy + VPSHUFB short-offset shortcut wait\nuntil WILDCOPY_OVERLENGTH grows to 64.\n\n* refactor(decode): Scalar monolith + drop x86 macro + one-time dispatch\n\nAdds `seq_decoder_scalar.rs` as the Scalar-tier monolith (same shape\nas the AVX2 / BMI2 / VBMI2 monoliths, pinned to `ScalarKernel`, no\ntarget_feature). Dispatcher in\n`sequence_section_decoder::decode_and_execute_sequences` now routes\nthe Scalar arm into the new monolith too.\n\nDeletes `seq_decoder_x86_kernel.rs` entirely — the\n`define_x86_seq_decoder_tier!` macro is no longer referenced by any\ntier file. Each tier (Scalar / BMI2 / AVX2 / VBMI2) is now a fully\nself-contained function with the whole decode + execute pipeline\ninlined in one place, selected ONCE per call via cached\n`detect_cpu_kernel`.\n\naarch64 NEON / SVE still go through the K-generic\n`decode_and_execute_sequences_impl` shared body until their own\nmonoliths land in a follow-up.\n\n* perf(decode): macro-expand decode_one + execute_one inside each kernel monolith\n\nReplaces the per-tier `#[inline]` helper functions (`decode_one_avx2`,\n`execute_one_avx2`, BMI2/VBMI2/Scalar equivalents) with `macro_rules!`\nblocks that expand textually at every callsite inside the monolithic\nouter function. This bypasses the LLVM inline cost-model entirely:\nmacros expand BEFORE LLVM sees the code, so the resulting compiled\nfunction has NO inner CALL boundary regardless of cost-model decisions.\n\nWhy this matters: `#[inline]` is a hint, not a command. With\n`target_feature` scopes, `Result<>` panic landings, multiple callsites,\nand generic `B: BufferBackend` parameterisation, LLVM's heuristic\ndeclines to inline — leaving CALL boundaries that fragment register\nallocation and break the µop-cache window on Skylake-X\n(DSB ≤ 1536 µops). Combined with the Rust limit that forbids\n`#[inline(always)]` + `#[target_feature]` together (rust-lang/rust#145574),\nmacros are the only mechanism that guarantees the textual inline donor C\nachieves via single-source monoliths.\n\nMacro shape: two `macro_rules!` per tier — `decode_one_body!`\n(state read + triple-bit extract + advance) and `execute_one_body!`\n(literal slice + offset gates + match copy + cold fallback). The execute\nbody uses labeled-block early-exit (`break 'exec_inner Err(...)`),\nstable since 1.65, instead of closure or `?` — closures and `?` recreate\nfunction boundaries.\n\nAffects all four monoliths: Scalar / BMI2 / AVX2 / VBMI2.\n\n* perf(huff0): drop Vec<Entry> table, unify on packed u16 (donor HUF_DEltX1) (#292)\n\nThe HUF decode table was held in two parallel representations:\n- `decode: Vec<Entry { symbol: u8, num_bits: u8 }>` for scalar /\n  weight-stream / single-symbol fallback readers\n- `packed_decode: Vec<u16>` (donor `HUF_DEltX1` format: low byte =\n  symbol, high byte = num_bits) for the hot 4-stream burst path\n\n`build_table_from_weights` filled both with `Vec::fill(value)` over\nthe same index range — two `__memset_avx2`-driven passes per rank\ngroup. On the z000033 decode flamegraph the HUF table build is\n12.53% of self-time, with `build_table_from_weights` 5.02% (largest\nsingle setup cost on a workload with many small blocks).\n\nDrop the `Entry` Vec entirely. Every reader switches to inline\nunpack of the packed u16: `packed as u8` for symbol, `(packed >> 8)\nas u8` for num_bits. Single AND/SHR on registers — same cost as the\nstruct-field reads being replaced. Donor `huf_decompress.c` reads\nthe `HUF_DEltX1` byte-wise from a single u16-wide table, so this is\nstructural parity rather than a representation invention.\n\n`Entry` struct dropped as unused; no external re-export.\n\n* fix(decode): saturating_add for total_history to prevent 32-bit usize wrap\n\n`buffer.window_size + buffer.dict_content.len()` is plain `usize +\nusize`. On 32-bit targets (i686, wasm32) a pathological frame\ncombining a large window with a non-trivial dict could wrap the\nsum past `usize::MAX`, silently flipping the\n`compute_use_long_pipeline` gate around `HISTORY_THRESHOLD_FOR_PREFETCH`\n(16 MiB) in the wrong direction.\n\nReplace with `.saturating_add()` at all 5 sites where\n`total_history` feeds into the long-pipeline gate:\n- `sequence_section_decoder.rs:366` (K-generic dispatcher)\n- `seq_decoder_avx2.rs:258`\n- `seq_decoder_bmi2.rs:230`\n- `seq_decoder_vbmi2.rs:226`\n- `seq_decoder_scalar.rs:176`\n\nSaturation pins overflow to `usize::MAX`, which is comfortably\nabove the 16 MiB threshold — the gate engages, matching the\nnon-wrapped intent (large total history → long pipeline pays off).\n\nVerified: `cargo check --target i686-unknown-linux-gnu` clean,\n647/647 tests pass on x86_64.\n\n* test(decode): add boundary unit tests for compute_use_long_pipeline\n\nCover the four-dimensional gate logic:\n- num_sequences threshold (ADVANCE*2 = 16)\n- ddict_is_cold override (forces engage independent of history/share)\n- history threshold (1 << 24 = 16 MiB, `>` not `>=`)\n- per-target-pointer-width MIN_LONG_OFFSET_SHARE (7 on 64-bit, 20 on 32-bit)\n\nSix tests covering the boundary cases that would silently regress\nif the heuristic is re-tuned without re-reading the spec:\n- below 2x ADVANCE never engages\n- cold dict at min seq count overrides everything\n- history exactly at threshold does NOT engage (strict inequality)\n- history one above threshold + share at min DOES engage\n- share below min blocks even with large history\n- saturating-history fallback (usize::MAX) engages cleanly\n\n* test(decode): move MIN_SHARE > 0 invariant into const assertion\n\n`assert!(MIN_SHARE > 0, ...)` at runtime was flagged by\n`clippy::assertions_on_constants`. Both `MIN_SHARE` values (7 on\n64-bit, 20 on 32-bit) are compile-time constants, so the check\nbelongs in a `const _: () = assert!(...)` block — caught at\ncompile time, no runtime cost.\n\n* docs(decode): clarify why shared helpers are not dead on x86_64\n\nExpand the comment on the per-kernel sequence-decoder dispatcher to\nexplicitly document that the shared K-generic helpers\n(`decode_and_execute_sequences_impl`, `run_pipelined_sequence_loop`,\n`decode_one_sequence_inline`, `execute_one_sequence_pipelined*`)\nremain reachable on x86_64 builds even though the per-kernel\nmonoliths bypass them — aarch64 production + on-target tests are\nthe live callers. Prevents future review rounds from flagging the\nhelpers as orphaned.\n\nStrict-warnings build status documented inline so the next reader\ndoesn't need to re-run cargo to verify.\n\n* fix(decode): allow(dead_code) on shared seq helpers orphaned on x86_64\n\n11 helpers in `sequence_section_decoder.rs` trigger dead_code under\n`-D warnings` on x86_64 because the per-kernel monoliths\n(`seq_decoder_{bmi2,avx2,vbmi2}`) bypass them entirely:\n\n- `decode_and_execute_sequences_impl`, `run_pipelined_sequence_loop`,\n  `decode_one_sequence_inline`, `execute_one_sequence_pipelined`,\n  `execute_one_sequence_pipelined_resolved` — still live on aarch64\n  (Neon/Sve dispatch arms) and in tests, orphan on x86_64 production.\n- `execute_one_sequence_pipelined_{bmi2,avx2,vbmi2}` and\n  `execute_one_sequence_pipelined_resolved_{bmi2,avx2,vbmi2}` —\n  vestigial pre-R12 macro-dispatch helpers with no remaining\n  callers; deletion deferred to a follow-up.\n\nApply `#[allow(dead_code)]` per-function. Cross-arch helpers keep\ntheir definitions intact for aarch64 + tests; x86_64 build no longer\nwarns. Updated the dispatch comment in `mod.rs` to describe the\nactual status.",
+          "timestamp": "2026-05-28T20:42:11+03:00",
+          "tree_id": "f598d53c903fe5acad3e278fb1062f362afdff52",
+          "url": "https://github.com/structured-world/structured-zstd/commit/8065eb2c62cdcb0c4adf7b12841d9035561276e9"
+        },
+        "date": 1779994248807,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.147,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 309.012,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 252.556,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.539,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.364,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.827,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.044,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.713,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.986,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.731,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.702,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.044,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.248,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.075,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.222,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.222,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.199,
             "unit": "ms"
           }
         ]
