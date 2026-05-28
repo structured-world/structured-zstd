@@ -363,7 +363,14 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // threshold is higher because the prefetch pipeline needs a
     // stronger long-offset signal to outpace the narrower load
     // window on those targets.
-    let total_history = buffer.window_size + buffer.dict_content.len();
+    // `saturating_add` to defuse the 32-bit `usize` overflow path: a
+    // pathological frame header could combine a 4 GiB-class window_size
+    // with a non-trivial dict to wrap on i686, silently flipping the
+    // long-pipeline gate around `HISTORY_THRESHOLD_FOR_PREFETCH`. The
+    // saturating variant pins the wrap result at `usize::MAX`, which
+    // crosses the 16 MiB threshold cleanly — gate decision matches the
+    // real (non-wrapped) value's intent.
+    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
     let use_long_pipeline = compute_use_long_pipeline(
         num_sequences,
         ddict_is_cold,

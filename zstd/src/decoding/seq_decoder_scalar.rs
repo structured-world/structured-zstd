@@ -173,7 +173,10 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
     let saved_offset_hist = *offset_hist;
     let num_sequences = section.num_sequences as usize;
 
-    let total_history = buffer.window_size + buffer.dict_content.len();
+    // `saturating_add` defuses 32-bit `usize` wrap (see
+    // `sequence_section_decoder::compute_use_long_pipeline` for the
+    // gate semantics this feeds into).
+    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
     let use_long_pipeline = compute_use_long_pipeline(
         num_sequences,
         ddict_is_cold,
