@@ -564,62 +564,10 @@ fn run_pipelined_sequence_loop<
     max_update_bits: u8,
     seq_sum: &mut u32,
 ) -> Result<(), DecompressBlockError> {
-    // `prefetch_pos` is the logical buffer index (same frame as
-    // `buffer.len()`) at which the NEXT not-yet-decoded sequence
-    // will start pushing literals. We pre-decode `ADVANCE` ahead,
-    // accumulating (ll + ml) per decoded seq to keep this position
-    // synchronised with where execute will eventually be.
-    let mut prefetch_pos: usize = old_buffer_size;
-    let mut shadow_hist: [u32; 3] = *offset_hist;
-    // ExecSeq is the post-resolve shape (ll, ml, actual_offset). The raw
-    // `Sequence.of` (offset_code) is dead after the pre-resolve step
-    // below — execute_one_sequence_pipelined uses only the actual
-    // offset. Store ExecSeq directly so each slot is 12 bytes instead
-    // of `(Sequence, u32) = 16` bytes (= 4 bytes per slot of dead data,
-    // 32 bytes saved across the 8-deep ring).
-    let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
-        ll: 0,
-        ml: 0,
-        actual_offset: 0,
-    }; ADVANCE];
+    let _ = old_buffer_size;
 
-    // Pre-fill the ring. Outer `num_sequences >= ADVANCE * 2` gate
-    // guarantees `num_sequences > ADVANCE`, so the FSE state update
-    // is needed after every prefill decode.
-    for slot in ring.iter_mut() {
-        let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-        // wrapping_add: bitstream-derived values can overflow on
-        // malformed frames; `prefetch_lookahead_match_source` bound-
-        // checks against `buffer.len()` and drops wrap-derived
-        // indices, so the wrap is harmless while keeping the decoder
-        // fuzz-stable.
-        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-        let source_idx = match_start.wrapping_sub(actual_offset as usize);
-        buffer.prefetch_lookahead_match_source(source_idx);
-        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-        *slot = ExecSeq {
-            ll: seq.ll,
-            ml: seq.ml,
-            actual_offset,
-        };
-        br.ensure_bits(max_update_bits);
-        ll_dec.update_state_fast(br);
-        ml_dec.update_state_fast(br);
-        of_dec.update_state_fast(br);
-    }
-
-    // Force the steady-state loop's entry onto a 64-byte boundary so
-    // the body fits cleanly into the Skylake-X µop (DSB) cache window.
-    // Mirrors donor `ZSTD_decompressSequences_body_bmi2_noExt_rawLit`
-    // (zstd-pure-rs zstd_decompress_block.rs:2282-2290 / libzstd
-    // ZSTD_decompressSequences_internal): explicit `.p2align 6 / nop /
-    // .p2align 5 / nop / .p2align 3` triplet ahead of the hot loop.
-    // We diagnosed the underlying DSB2MITE penalty: hot loop is
-    // ~3000 µops vs the 1536-µop DSB capacity, and 40% of µops were
-    // arriving via the legacy MITE decoder. Aligning the loop entry
-    // gives the DSB the contiguous 32-byte fetch windows it needs to
-    // hold the body resident.
+    // Force the loop entry onto a 64-byte boundary so the body fits
+    // cleanly into the Skylake-X DSB µop cache window.
     #[cfg(target_arch = "x86_64")]
     // SAFETY: alignment-only asm, no memory or register clobbers.
     unsafe {
@@ -632,30 +580,25 @@ fn run_pipelined_sequence_loop<
             options(nomem, nostack, preserves_flags)
         );
     }
-    for i in ADVANCE..num_sequences {
+
+    // Donor-shape straight loop: decode one sequence, execute it
+    // immediately, advance state, next. No lookahead ring, no
+    // shadow_hist, no prefetch_pos arithmetic — mirrors
+    // `ZSTD_decompressSequences_body_bmi2_noExt_rawLit`
+    // (zstd-pure-rs zstd_decompress_block.rs:2291-2344).
+    for i in 0..num_sequences {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-        let source_idx = match_start.wrapping_sub(actual_offset as usize);
-        buffer.prefetch_lookahead_match_source(source_idx);
-        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+        let resolved_offset = do_offset_history(seq.of, seq.ll, offset_hist);
 
-        let slot = i & ADVANCE_MASK;
-        let exec_seq = ring[slot];
-        ring[slot] = ExecSeq {
-            ll: seq.ll,
-            ml: seq.ml,
-            actual_offset,
-        };
-
-        execute_one_sequence_pipelined_resolved(
+        execute_one_sequence_pipelined(
             buffer,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
-            exec_seq,
+            seq,
+            resolved_offset,
         )?;
-        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+        *seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
 
         if i + 1 < num_sequences {
             br.ensure_bits(max_update_bits);
@@ -664,28 +607,6 @@ fn run_pipelined_sequence_loop<
             of_dec.update_state_fast(br);
         }
     }
-
-    // Drain: execute remaining ADVANCE sequences with their
-    // pre-resolved offsets. Iteration order matches the ring slot
-    // they occupy from the steady-state loop's final write.
-    for k in 0..ADVANCE {
-        let slot = (num_sequences + k) & ADVANCE_MASK;
-        let exec_seq = ring[slot];
-        execute_one_sequence_pipelined_resolved(
-            buffer,
-            literals_buffer,
-            lit_cur,
-            literals_buffer_len,
-            exec_seq,
-        )?;
-        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-    }
-
-    // Single committing point for real offset history on the
-    // pipelined success path. Shadow walked every queued sequence;
-    // copy that state back so the next block sees the post-block
-    // repcodes. Caller rolls back on Err.
-    *offset_hist = shadow_hist;
     Ok(())
 }
 
