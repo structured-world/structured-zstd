@@ -2017,7 +2017,7 @@ mod compute_use_long_pipeline_tests {
     #[test]
     fn share_below_min_blocks_engagement_even_with_large_history() {
         // Even with the share one below the per-target minimum, no engage.
-        assert!(MIN_SHARE > 0, "test invariant: MIN_SHARE > 0 required");
+        const _: () = assert!(MIN_SHARE > 0, "test invariant: MIN_SHARE > 0 required");
         assert!(!compute_use_long_pipeline(
             ADVANCE * 2,
             false,
