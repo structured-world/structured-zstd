@@ -265,12 +265,18 @@ impl<E: FseEntry> FSETableImpl<E> {
     }
 
     /// Reset `self` and update `self`'s state to mirror the provided table.
+    /// `symbol_spread_buffer` is build-time scratch + enrich source; every
+    /// call site that uses `reinit_from` (predefined-cache copy + dict
+    /// scratch init) feeds a SOURCE table whose `decode[]` is ALREADY
+    /// enriched, so the spread buffer is dead on the post-reinit path.
+    /// Reserve capacity to keep the next `build_decoder` allocation-free,
+    /// but skip the bytes copy.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.symbol_probabilities
             .extend_from_slice(&other.symbol_probabilities);
         self.symbol_spread_buffer
-            .extend_from_slice(&other.symbol_spread_buffer);
+            .reserve(other.symbol_spread_buffer.len());
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
     }
