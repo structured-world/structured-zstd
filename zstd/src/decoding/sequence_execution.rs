@@ -84,17 +84,23 @@ pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [
     do_offset_history_repcode(offset_value, lit_len, scratch)
 }
 
-// `#[cold]` keeps the body out of caller hot layout and biases icache
-// against pulling it unless hit. Earlier the helper was also
-// `#[inline(never)]`; round-1 findings on issue #279 (branch-mispredict
-// diagnostic) attributed 15.42% of decoder mispredicts to this function,
-// with 27.80% landing on the `pushq %rax` fn entry — call/ret BTB
-// pressure from the never-inlined boundary. Dropping `#[inline(never)]`
-// while keeping `#[cold]` lets LLVM inline at hot call sites where the
-// boundary cost outweighs body duplication; cold paths (low-entropy
-// blocks where the previous "drop both" variant regressed +15.9% on
-// L14) keep the out-of-line shape via the cold attribute.
-#[cold]
+// Previously `#[cold]+#[inline(never)]`; round-1 findings on issue
+// #279 attributed 15.42% of decoder mispredicts to this function with
+// 27.80% on the `pushq %rax` fn entry — call/ret BTB pressure from
+// the never-inlined boundary. `#[inline(never)]` was dropped first,
+// keeping `#[cold]` to preserve out-of-line layout for low-entropy
+// blocks (the prior «drop both» variant regressed +15.9% on L14).
+//
+// For high-repcode workloads (z000033 L-5, decode_all flamegraph
+// surfaces this helper at 1.93% self-time despite the `#[cold]`
+// label), the cold-bias attribute itself blocks LLVM from inlining
+// even at the hot call sites where the call/ret + BTB cost still
+// dominates the body work. Drop `#[cold]` and let the inline
+// cost-model see the full picture — body is small enough (RULES
+// lookup + 6 branchless cmov), so duplication into hot callers is
+// affordable, and cold callers don't pay anything they weren't
+// paying before (their cost was already dominated by the surrounding
+// rare-path work, not this helper).
 fn do_offset_history_repcode(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     #[derive(Copy, Clone)]
     struct Rule {
