@@ -12,7 +12,7 @@
 
 use std::env;
 
-use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -38,7 +38,13 @@ fn main() {
 
     let mut sink: usize = 0;
     for _ in 0..iters {
-        let out = compress_to_vec(src.as_slice(), CompressionLevel::Level(level));
+        // `compress_slice_to_vec` (NOT `compress_to_vec`): the input is
+        // already a contiguous `&[u8]`. `compress_to_vec` takes `impl
+        // Read` and re-buffers via `read_to_end` into a fresh `Vec`
+        // every iteration — that per-iter input allocation + copy would
+        // pollute the encoder flamegraph with `memmove` / alloc traffic
+        // that isn't part of the encode hot path.
+        let out = compress_slice_to_vec(src.as_slice(), CompressionLevel::Level(level));
         // Defeat dead-code elimination of the compress call.
         sink = sink.wrapping_add(out.len());
         core::hint::black_box(&out);
