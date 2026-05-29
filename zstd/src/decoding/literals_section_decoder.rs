@@ -755,13 +755,31 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         // cheap overall) fall through to the dynamic loop.
         match symbols_per_burst {
             5 => unsafe {
-                burst_decode_symbols::<5>(&mut bits, &mut *cursors, target_ptr, packed, table_shift);
+                burst_decode_symbols::<5>(
+                    &mut bits,
+                    &mut *cursors,
+                    target_ptr,
+                    packed,
+                    table_shift,
+                );
             },
             6 => unsafe {
-                burst_decode_symbols::<6>(&mut bits, &mut *cursors, target_ptr, packed, table_shift);
+                burst_decode_symbols::<6>(
+                    &mut bits,
+                    &mut *cursors,
+                    target_ptr,
+                    packed,
+                    table_shift,
+                );
             },
             7 => unsafe {
-                burst_decode_symbols::<7>(&mut bits, &mut *cursors, target_ptr, packed, table_shift);
+                burst_decode_symbols::<7>(
+                    &mut bits,
+                    &mut *cursors,
+                    target_ptr,
+                    packed,
+                    table_shift,
+                );
             },
             _ => {
                 for _ in 0..symbols_per_burst {
