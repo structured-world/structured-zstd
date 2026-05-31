@@ -65,18 +65,17 @@ impl FlatBuf {
 
 impl BufferBackend for FlatBuf {
     /// FlatBuf opts into the donor-shape inline `exec_sequence_inline`
-    /// path on x86_64 (same gate as `UserSliceBackend`). FlatBuf is
-    /// selected for single-segment frames (frame_content_size known
-    /// up-front, single block of literals+matches). Its
-    /// `with_capacity(cap + WILDCOPY_OVERLENGTH)` reserve already
-    /// carries the 32-byte SIMD overshoot slack the inline path
-    /// requires. Issue #279 round 4 track 1c (renamed track 5a):
-    /// opting FlatBuf in unlocks the AVX2 32-byte ymm match-copy
-    /// fast path for single-segment frames (decodecorpus-z000033 et
-    /// al), which previously fell through to the layered
-    /// `repeat_lookahead_prefetched` chain via the trait-method CALL
-    /// boundary.
-    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = cfg!(target_arch = "x86_64");
+    /// path on every target: x86_64 via the SSE2
+    /// `exec_sequence_inline::x86` module, all other ISAs via the
+    /// architecture-agnostic `portable` module (the `cfg(not(x86_64))`
+    /// arm below). FlatBuf is selected for single-segment frames
+    /// (frame_content_size known up-front, single block of
+    /// literals+matches). Its `with_capacity(cap + WILDCOPY_OVERLENGTH)`
+    /// reserve already carries the SIMD overshoot slack the inline path
+    /// requires. Both arms are gated on this const, which is
+    /// unconditionally `true` because FlatBuf provides an override for
+    /// every target.
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
@@ -160,6 +159,96 @@ impl BufferBackend for FlatBuf {
             }
 
             // Bump len. Capacity asserted above; this is safe.
+            self.buf.set_len(buf_len + total);
+        }
+        Ok(())
+    }
+
+    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical donor
+    /// `ZSTD_execSequence` shape, but the wildcopy helpers come from the
+    /// portable module (16-byte `u128` / 8-byte `u64` unaligned moves,
+    /// lowered to NEON `ldr q`/`str q` on aarch64 and the widest store
+    /// available elsewhere). Without this arm the non-x86 decode path
+    /// fell through to the slow `try_push` + `repeat` trait chain; the
+    /// inline form cuts the match-copy cost that dominates match-heavy
+    /// decode.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
+        use super::exec_sequence_inline::portable::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        // Fallible capacity check mirrors the x86 arm: the 16-byte
+        // wildcopy overshoots up to 15 bytes past `tail + total`, which
+        // `with_capacity(... + WILDCOPY_OVERLENGTH)` covers for
+        // well-formed frames; malformed input surfaces as
+        // `OutputBufferOverflow` instead of a write past capacity.
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.buf.capacity();
+        let buf_len = self.buf.len();
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = buf_len
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        match cap_required {
+            Some(v) if v <= cap => {}
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: buf_len,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        }
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        let live_len = buf_len - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "FlatBuf::exec_sequence_inline: offset {offset} exceeds live window",
+        );
+
+        // SAFETY: capacity check above guarantees writes (plus the
+        // ≤ 15-byte wildcopy overshoot) stay within `buf.capacity()`;
+        // `live_len + lit_length >= offset` keeps the match source
+        // in-bounds. Same invariants the x86 arm relies on.
+        unsafe {
+            let base_mut = self.buf.as_mut_ptr();
+
+            let op_lit = base_mut.add(buf_len);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            let op_match = base_mut.add(buf_len + lit_length);
+            let match_src = base_mut.cast_const().add(buf_len + lit_length - offset);
+
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+
             self.buf.set_len(buf_len + total);
         }
         Ok(())

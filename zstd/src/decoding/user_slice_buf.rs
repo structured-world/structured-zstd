@@ -146,17 +146,17 @@ impl<'a> UserSliceBackend<'a> {
 }
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
-    /// Donor-shape inline `ZSTD_execSequence` is available on
-    /// `x86_64`, where SSE2 is the architectural baseline and the
-    /// helpers in [`super::exec_sequence_inline::x86`] emit
-    /// `_mm_loadu_si128` / `_mm_storeu_si128` without needing a
-    /// `#[target_feature]` gate. 32-bit `x86` is excluded — its
-    /// pre-SSE2 baseline (i386 / i486 / i586) would SIGILL on the
-    /// SSE2 intrinsics. aarch64 NEON, riscv etc. fall back to the
-    /// existing `extend` + `repeat` chain — those paths already
-    /// emit the architecture's best-available SIMD via
-    /// `copy_bytes_overshooting`'s runtime detect.
-    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = cfg!(target_arch = "x86_64");
+    /// Donor-shape inline `ZSTD_execSequence` on every target: x86_64
+    /// via the SSE2 [`super::exec_sequence_inline::x86`] module
+    /// (`_mm_loadu_si128` / `_mm_storeu_si128`, SSE2 is the x86_64
+    /// baseline so no `#[target_feature]` gate), all other ISAs via the
+    /// architecture-agnostic [`super::exec_sequence_inline::portable`]
+    /// module (unaligned u128/u64 moves lowered to NEON `ldr q`/`str q`
+    /// on aarch64 and the widest available store elsewhere). Both arms
+    /// are gated on this const, unconditionally `true` because an
+    /// override exists for every target. Previously non-x86 fell back to
+    /// the slow `extend` + `repeat` chain.
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
     /// Donor `ZSTD_execSequence` body — see trait doc for
     /// preconditions / contract.
@@ -280,6 +280,96 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 wildcopy_no_overlap(op_match, match_src, match_length);
             } else {
                 // overlap_copy8 + wildcopy(overlap) tail.
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+        }
+        self.tail = new_tail;
+        Ok(())
+    }
+
+    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical donor
+    /// `ZSTD_execSequence` shape through the portable wildcopy helpers
+    /// (unaligned u128/u64 moves; NEON `ldr q`/`str q` on aarch64).
+    /// Mirrors the x86 arm's capacity / offset safety checks exactly.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::errors::ExecuteSequencesError;
+        use super::exec_sequence_inline::portable::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.slice.len();
+        let total = match lit_length.checked_add(match_length) {
+            Some(v) => v,
+            None => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: usize::MAX,
+                    capacity: cap,
+                });
+            }
+        };
+        let cap_required = self
+            .tail
+            .checked_add(total)
+            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
+        match cap_required {
+            Some(v) if v <= cap => {}
+            _ => {
+                return Err(ExecuteSequencesError::OutputBufferOverflow {
+                    tail: self.tail,
+                    requested: total,
+                    capacity: cap,
+                });
+            }
+        }
+        let new_tail = self.tail + total;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        let live_len = self.tail - self.head;
+        debug_assert!(
+            live_len
+                .checked_add(lit_length)
+                .is_some_and(|end| offset <= end),
+            "exec_sequence_inline: offset ({}) exceeds live window (len={} + lit={}, head={}, tail={})",
+            offset,
+            live_len,
+            lit_length,
+            self.head,
+            self.tail,
+        );
+
+        // SAFETY: identical invariants to the x86 arm — the capacity
+        // check bounds every write (plus the ≤ 15-byte wildcopy
+        // overshoot) inside `self.slice`; `offset <= tail + lit_length`
+        // keeps the match source in-bounds; `lit_src` carries the parent
+        // literals buffer's provenance (dispatch-site `inline_path_safe`
+        // gate guarantees the unconditional 16-byte literal read stays
+        // valid).
+        unsafe {
+            let base = self.slice.as_mut_ptr();
+            let op_lit = base.add(self.tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+
+            let op_match = base.add(self.tail + lit_length);
+            let match_src = base.cast_const().add(self.tail + lit_length - offset);
+
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
                 let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
                 if match_length > 8 {
                     wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
