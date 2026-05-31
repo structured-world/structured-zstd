@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.27](https://github.com/structured-world/structured-zstd/compare/v0.0.26...v0.0.27) - 2026-05-31
+
+### Performance
+
+- *(decode)* expand overlapping matches by doubling, not offset chunks ([#300](https://github.com/structured-world/structured-zstd/pull/300))
+- *(decode)* inline donor match-copy on all targets via portable wildcopy ([#299](https://github.com/structured-world/structured-zstd/pull/299))
+- *(decode)* unroll HUF 4-stream burst inner loop via const-generic ([#296](https://github.com/structured-world/structured-zstd/pull/296))
+- *(decode)* skip zero-init of literals target — HUF overwrites everything ([#295](https://github.com/structured-world/structured-zstd/pull/295))
+- *(fse)* kill iterator overhead in build_decoding_table, write decode via set_len ([#293](https://github.com/structured-world/structured-zstd/pull/293))
+- *(decode)* straight-loop short path + donor-gated lookahead ring + SeqSymbol repack ([#289](https://github.com/structured-world/structured-zstd/pull/289))
+- *(decode)* skip post-decode XXH64 when content_checksum_flag is 0 ([#287](https://github.com/structured-world/structured-zstd/pull/287))
+- *(decode)* per-tier x86 kernel split + AVX2 32-byte match-copy (#279 Phase 3+4) ([#285](https://github.com/structured-world/structured-zstd/pull/285))
+- *(decode)* lazy ring-buffer allocation for direct-eligible frames ([#282](https://github.com/structured-world/structured-zstd/pull/282))
+- *(decode)* drop dead seq.of from pipelined ring slots ([#283](https://github.com/structured-world/structured-zstd/pull/283))
+
+### Testing
+
+- *(bench)* add encode_loop_z000033 example for clean encoder profiles ([#297](https://github.com/structured-world/structured-zstd/pull/297))
+- *(decode)* decode_loop binary — add --mode ffi and --corpus path ([#288](https://github.com/structured-world/structured-zstd/pull/288))
+
 ## [0.0.26](https://github.com/structured-world/structured-zstd/compare/v0.0.25...v0.0.26) - 2026-05-27
 
 ### Added
