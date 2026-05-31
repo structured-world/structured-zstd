@@ -16,6 +16,145 @@ use std::sync::OnceLock;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 
+/// Diagnostic-only copy-shape histogram. Compiled out unless the
+/// `copy_shape_stats` feature is on, so production / bench builds carry
+/// zero cost. Buckets mirror the dispatch thresholds in
+/// [`copy_bytes_overshooting`] so the captured distribution lines up with
+/// which code path each call took. Counts are deterministic from the
+/// compressed input (same on every CPU tier); only per-call timing is
+/// architecture-specific.
+#[cfg(feature = "copy_shape_stats")]
+pub mod shape_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS_LE8: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS_9_16: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS_17_32: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS_GT32: AtomicU64 = AtomicU64::new(0);
+    /// Sum of `copy_at_least` over the `>32` bucket (bytes the caller asked for).
+    pub static REQ_BYTES_GT32: AtomicU64 = AtomicU64::new(0);
+    /// Sum of `copy_at_least.next_multiple_of(32)` over the `>32` bucket
+    /// (bytes the chunk kernel actually writes — request + overshoot).
+    pub static WRITTEN_BYTES_GT32: AtomicU64 = AtomicU64::new(0);
+    /// Largest single `copy_at_least` seen (peak match/literal copy length).
+    pub static MAX_LEN: AtomicU64 = AtomicU64::new(0);
+
+    // ── Match-repeat shape (recorded in `DecodeBuffer::repeat_inner`) ──
+    // Counts the match-copy calls (NOT literal pushes) by offset bucket,
+    // splitting overlapping (offset < match_length) from non-overlapping.
+    // The overlapping buckets are the ones C single-passes via
+    // `ZSTD_wildcopy` (WILDCOPY_VECLEN=16) but we chunk by `offset` in
+    // `repeat_in_chunks`.
+    pub static MATCH_NONOVERLAP: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_NONOVERLAP_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Overlapping matches, offset < 8 (period-tiled `repeat_short_offset`).
+    pub static MATCH_OVL_LT8: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_OVL_LT8_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Overlapping, 8 <= offset < 16 (chunked, sse2-safe single-pass).
+    pub static MATCH_OVL_8_15: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_OVL_8_15_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Overlapping, 16 <= offset < 32 (chunked; C single-passes at VECLEN 16).
+    pub static MATCH_OVL_16_31: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_OVL_16_31_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Overlapping, 32 <= offset < 64 (chunked; 32B-vector single-pass safe).
+    pub static MATCH_OVL_32_63: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_OVL_32_63_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Overlapping, offset >= 64 (chunked; 64B-unroll single-pass safe).
+    pub static MATCH_OVL_GE64: AtomicU64 = AtomicU64::new(0);
+    pub static MATCH_OVL_GE64_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one match-repeat call: `offset`, `match_length`, and whether
+    /// the copy region overlaps the source (`offset < match_length`).
+    #[inline]
+    pub fn record_repeat(offset: usize, match_length: usize, overlapping: bool) {
+        let mlen = match_length as u64;
+        if !overlapping {
+            MATCH_NONOVERLAP.fetch_add(1, Ordering::Relaxed);
+            MATCH_NONOVERLAP_BYTES.fetch_add(mlen, Ordering::Relaxed);
+            return;
+        }
+        let (n, b) = if offset < 8 {
+            (&MATCH_OVL_LT8, &MATCH_OVL_LT8_BYTES)
+        } else if offset < 16 {
+            (&MATCH_OVL_8_15, &MATCH_OVL_8_15_BYTES)
+        } else if offset < 32 {
+            (&MATCH_OVL_16_31, &MATCH_OVL_16_31_BYTES)
+        } else if offset < 64 {
+            (&MATCH_OVL_32_63, &MATCH_OVL_32_63_BYTES)
+        } else {
+            (&MATCH_OVL_GE64, &MATCH_OVL_GE64_BYTES)
+        };
+        n.fetch_add(1, Ordering::Relaxed);
+        b.fetch_add(mlen, Ordering::Relaxed);
+    }
+
+    /// Snapshot + reset the match-repeat buckets, returning pairs of
+    /// `(count, bytes)` in order: nonoverlap, ovl<8, ovl8-15, ovl16-31,
+    /// ovl32-63, ovl>=64.
+    pub fn take_repeat() -> [(u64, u64); 6] {
+        [
+            (
+                MATCH_NONOVERLAP.swap(0, Ordering::Relaxed),
+                MATCH_NONOVERLAP_BYTES.swap(0, Ordering::Relaxed),
+            ),
+            (
+                MATCH_OVL_LT8.swap(0, Ordering::Relaxed),
+                MATCH_OVL_LT8_BYTES.swap(0, Ordering::Relaxed),
+            ),
+            (
+                MATCH_OVL_8_15.swap(0, Ordering::Relaxed),
+                MATCH_OVL_8_15_BYTES.swap(0, Ordering::Relaxed),
+            ),
+            (
+                MATCH_OVL_16_31.swap(0, Ordering::Relaxed),
+                MATCH_OVL_16_31_BYTES.swap(0, Ordering::Relaxed),
+            ),
+            (
+                MATCH_OVL_32_63.swap(0, Ordering::Relaxed),
+                MATCH_OVL_32_63_BYTES.swap(0, Ordering::Relaxed),
+            ),
+            (
+                MATCH_OVL_GE64.swap(0, Ordering::Relaxed),
+                MATCH_OVL_GE64_BYTES.swap(0, Ordering::Relaxed),
+            ),
+        ]
+    }
+
+    #[inline]
+    pub(super) fn record(copy_at_least: usize) {
+        let n = copy_at_least as u64;
+        if copy_at_least <= 8 {
+            CALLS_LE8.fetch_add(1, Ordering::Relaxed);
+        } else if copy_at_least <= 16 {
+            CALLS_9_16.fetch_add(1, Ordering::Relaxed);
+        } else if copy_at_least <= 32 {
+            CALLS_17_32.fetch_add(1, Ordering::Relaxed);
+        } else {
+            CALLS_GT32.fetch_add(1, Ordering::Relaxed);
+            REQ_BYTES_GT32.fetch_add(n, Ordering::Relaxed);
+            WRITTEN_BYTES_GT32.fetch_add(
+                (copy_at_least.next_multiple_of(32)) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        MAX_LEN.fetch_max(n, Ordering::Relaxed);
+    }
+
+    /// Snapshot + reset all counters, returning `(le8, 9_16, 17_32, gt32,
+    /// req_gt32, written_gt32, max_len)`.
+    pub fn take() -> [u64; 7] {
+        [
+            CALLS_LE8.swap(0, Ordering::Relaxed),
+            CALLS_9_16.swap(0, Ordering::Relaxed),
+            CALLS_17_32.swap(0, Ordering::Relaxed),
+            CALLS_GT32.swap(0, Ordering::Relaxed),
+            REQ_BYTES_GT32.swap(0, Ordering::Relaxed),
+            WRITTEN_BYTES_GT32.swap(0, Ordering::Relaxed),
+            MAX_LEN.swap(0, Ordering::Relaxed),
+        ]
+    }
+}
+
 /// Copies at least `copy_at_least` bytes from `src` to `dst`.
 ///
 /// This helper may over-copy up to the chunk size of the chosen SIMD/scalar
@@ -41,6 +180,9 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     if copy_at_least == 0 {
         return;
     }
+
+    #[cfg(feature = "copy_shape_stats")]
+    shape_stats::record(copy_at_least);
 
     let min_buffer_size = core::cmp::min(src.1, dst.1);
 

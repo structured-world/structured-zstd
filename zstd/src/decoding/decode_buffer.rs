@@ -346,6 +346,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
+            #[cfg(feature = "copy_shape_stats")]
+            crate::decoding::simd_copy::shape_stats::record_repeat(
+                offset,
+                match_length,
+                end_idx > buf_len,
+            );
+
             // Reserve unconditionally — `extend_from_within_unchecked*`
             // assumes the required free capacity exists; skipping it
             // would turn a malformed block (match_length past the
@@ -401,6 +408,25 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Materialise an overlapping match (`offset < match_length`) by
+    /// exponential doubling rather than fixed `offset`-sized chunks.
+    ///
+    /// The period occupies `[start_idx, start_idx + offset)` and the output
+    /// grows from the current tail. Each step copies the *entire* contiguous
+    /// run already materialised from the period base — length `buffer.len() -
+    /// start_idx` — and appends it directly after itself: src = `[start_idx,
+    /// start_idx + n)`, dst = the tail, with `n <= buffer.len() - start_idx`
+    /// so `start_idx + n <= tail`. Every copy is therefore a clean
+    /// *non-overlapping adjacent* block that satisfies
+    /// `extend_from_within_unchecked`'s contract, and `start_idx` never moves.
+    ///
+    /// Because the materialised run doubles after each step, this emits
+    /// `O(log2(match_length / offset))` copies — each as large as the run so
+    /// far — instead of `match_length / offset` offset-sized ones. Fewer call
+    /// boundaries and larger contiguous copies (better for the hardware
+    /// prefetcher / store streaming) while the bytes produced are identical:
+    /// the output is periodic with period `offset`, and copying any prefix of
+    /// that period onto its own tail preserves the periodicity.
     #[inline(always)]
     fn repeat_in_chunks(
         &mut self,
@@ -409,24 +435,30 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         start_idx: usize,
         use_branchless_copy: bool,
     ) {
-        let mut start_idx = start_idx;
-        let mut copied_counter_left = match_length;
-        while copied_counter_left > 0 {
-            let chunksize = usize::min(offset, copied_counter_left);
+        debug_assert!(offset >= 8, "doubling path expects offset >= 8");
+        let mut remaining = match_length;
+        while remaining > 0 {
+            // Contiguous, already-correct run from the period base. Since
+            // `extend_from_within` keeps `start_idx` fixed and appends at the
+            // tail, the run length is exactly `tail - start_idx`; it starts at
+            // `offset` and doubles each iteration until capped by `remaining`.
+            let run = self.buffer.len() - start_idx;
+            let n = usize::min(run, remaining);
 
-            // SAFETY: chunksize <= offset keeps each single copy in the currently readable
-            // source range, and repeat() reserved enough destination capacity.
+            // SAFETY: `n <= run = buffer.len() - start_idx` gives
+            // `start_idx + n <= buffer.len()` (the tail / dst start), so the
+            // source `[start_idx, start_idx + n)` and the destination at the
+            // tail are adjacent and non-overlapping. `repeat()` reserved
+            // `match_length` destination capacity up front.
             unsafe {
                 if use_branchless_copy {
                     self.buffer
-                        .extend_from_within_unchecked_branchless(start_idx, chunksize);
+                        .extend_from_within_unchecked_branchless(start_idx, n);
                 } else {
-                    self.buffer
-                        .extend_from_within_unchecked(start_idx, chunksize);
+                    self.buffer.extend_from_within_unchecked(start_idx, n);
                 }
             };
-            copied_counter_left -= chunksize;
-            start_idx += chunksize;
+            remaining -= n;
         }
     }
 
@@ -921,6 +953,49 @@ mod tests {
 
         buf.push(b"ok");
         assert_eq!(buf.drain(), b"ok");
+    }
+
+    #[test]
+    fn test_repeat_doubling_matches_reference_across_offsets() {
+        // Naive reference: dst[i] = dst[i - offset]. The exponential-doubling
+        // `repeat_in_chunks` must produce byte-identical output for every
+        // offset/length, including lengths that straddle the 32-byte SIMD
+        // overshoot boundary and large lengths that force many doublings.
+        fn reference_repeat(prefix: &[u8], offset: usize, match_length: usize) -> Vec<u8> {
+            let mut out = prefix.to_vec();
+            for _ in 0..match_length {
+                let src = out.len() - offset;
+                out.push(out[src]);
+            }
+            out
+        }
+
+        let prefix: Vec<u8> = (0..200u32)
+            .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+            .collect();
+        // Offsets cover every `repeat_overlapping` arm: <8 period-tiled,
+        // 8..15 and >=16 doubling, exact powers of two, and the
+        // non-overlapping `offset == match_length` edge.
+        let offsets = [1usize, 2, 3, 5, 7, 8, 13, 16, 31, 32, 63, 64, 100, 200];
+        let lengths = [
+            1usize, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 200, 511, 1000, 5000,
+        ];
+        for &offset in &offsets {
+            for &match_length in &lengths {
+                let prefix_slice = &prefix[..offset.max(1)];
+                let mut buffer = DecodeBuffer::<RingBuffer>::new(usize::MAX);
+                buffer.push(prefix_slice);
+                buffer.repeat(offset, match_length).unwrap();
+                let expected = reference_repeat(prefix_slice, offset, match_length);
+                let mut got: Vec<u8> = Vec::new();
+                buffer.drain_to_writer(&mut got).unwrap();
+                assert_eq!(
+                    got.as_slice(),
+                    expected.as_slice(),
+                    "mismatch at offset={offset} match_length={match_length}",
+                );
+            }
+        }
     }
 
     #[test]

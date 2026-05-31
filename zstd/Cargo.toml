@@ -70,6 +70,13 @@ critical-section = ["dep:critical-section"]
 bench_internals = []
 fuzz_exports = []
 std = []
+# Diagnostic-only: atomic histograms of the match/literal copy shape on the
+# decode path (call counts + size buckets + requested-vs-overshoot byte
+# totals). Off in every shipping / bench build (zero codegen impact). Enabled
+# by the `copy_shape` example to capture the copy-call distribution, which is
+# deterministic from the compressed input and therefore architecture-
+# independent (only the per-call timing is CPU-tier specific).
+copy_shape_stats = ["std"]
 # Diagnostic tracing of the Fast kernel's inner loop — per-iteration state
 # dumps gated at compile time so production builds carry zero cost. Runtime
 # activation via `STRUCTURED_ZSTD_KERNEL_TRACE=1` env var. Used by the
@@ -94,6 +101,13 @@ lsm = []
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
 rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
+
+# Diagnostic example: only buildable with the copy-shape counters compiled
+# in, so `--all-targets` on the default feature set skips it (the
+# `shape_stats` re-export is feature-gated).
+[[example]]
+name = "copy_shape"
+required-features = ["copy_shape_stats", "dict_builder"]
 
 [[bench]]
 name = "decode_all"
