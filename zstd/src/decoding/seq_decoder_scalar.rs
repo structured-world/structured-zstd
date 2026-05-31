@@ -48,11 +48,18 @@ macro_rules! decode_one_body {
     }};
 }
 
-/// Scalar-tier execute body. No backend-specific inline-exec path;
-/// always routes through `try_push` + `repeat_lookahead_prefetched`
-/// (the backend may or may not have an SSE2 inline path, but on the
-/// Scalar dispatch arm we don't gate on it — keep the body simple and
-/// portable).
+/// Scalar-tier execute body. Routes through the shared
+/// `execute_one_sequence_pipelined`, which uses the donor inline
+/// literal+match wildcopy on backends that opt into
+/// `SUPPORTS_INLINE_SEQUENCE_EXEC` (FlatBuf / UserSliceBackend, on every
+/// target) and falls back to `try_push` + `repeat_lookahead_prefetched`
+/// otherwise (RingBuffer, or when the per-sequence literal-slack /
+/// prefix-resident gate fails). The Scalar tier is the production
+/// dispatch target on non-x86 ISAs (i686 / riscv / wasm resolve to
+/// `CpuKernelTag::Scalar`), so routing here is what makes those targets
+/// actually reach the inline path — not just the aarch64 pipelined tier.
+/// Sharing the executor keeps the literal-slack / offset gating in one
+/// place rather than duplicating it per tier.
 macro_rules! execute_one_body {
     (
         $buffer:expr,
@@ -63,43 +70,23 @@ macro_rules! execute_one_body {
         $seq_ml:expr,
         $resolved_offset:expr
     ) => {{
-        let _result: Result<(), DecompressBlockError> = 'exec_inner: {
-            let seq_ll_v: u32 = $seq_ll;
-            let seq_ml_v: u32 = $seq_ml;
-            let resolved_offset_v: u32 = $resolved_offset;
-            let literals_buffer_len_v: usize = $literals_buffer_len;
-            let lit_cur_before = *$lit_cur;
-            let high = match lit_cur_before
-                .checked_add(seq_ll_v as usize)
-                .filter(|&h| h <= literals_buffer_len_v)
-            {
-                Some(h) => h,
-                None => {
-                    break 'exec_inner Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                        wanted: lit_cur_before.saturating_add(seq_ll_v as usize),
-                        have: literals_buffer_len_v,
-                    }
-                    .into());
-                }
-            };
-            // SAFETY: high <= literals_buffer_len_v, lit_cur_before <= high.
-            let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
-            *$lit_cur = high;
-
-            if resolved_offset_v == 0 {
-                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
-            }
-
-            if let Err(e) = $buffer.try_push(lits) {
-                break 'exec_inner Err(ExecuteSequencesError::from(e).into());
-            }
-            match $buffer.repeat_lookahead_prefetched(resolved_offset_v as usize, seq_ml_v as usize)
-            {
-                Ok(()) => Ok(()),
-                Err(e) => Err(ExecuteSequencesError::from(e).into()),
-            }
+        let resolved_offset_v: u32 = $resolved_offset;
+        // `of` is unused by the executor (it consumes the separately
+        // resolved `resolved_offset_v`); set it to the resolved value so
+        // the field carries a meaningful number rather than a sentinel.
+        let seq = Sequence {
+            ll: $seq_ll,
+            ml: $seq_ml,
+            of: resolved_offset_v,
         };
-        _result
+        super::sequence_section_decoder::execute_one_sequence_pipelined(
+            $buffer,
+            $literals_buffer,
+            $lit_cur,
+            $literals_buffer_len,
+            seq,
+            resolved_offset_v,
+        )
     }};
 }
 
