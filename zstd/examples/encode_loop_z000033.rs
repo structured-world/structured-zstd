@@ -55,14 +55,16 @@ fn main() {
     // well under src * 1.125) — so no iteration ever reallocates. We
     // can't call the crate-internal `compress_bound` from an example, so
     // this closed-form bound stands in for it.
-    // `saturating_add` so a multi-GB corpus can't wrap `usize` into an
-    // undersized capacity (debug panic / release OOB on the drain). The
-    // bound is approximate anyway; saturating to `usize::MAX` would just
-    // make `with_capacity` fail loudly instead of silently undersizing.
+    // `checked_add` (not `saturating_add`): a corpus large enough to
+    // overflow the `usize` bound is operator error for a profiling
+    // example, so fail loudly with a clear message rather than saturate
+    // to `usize::MAX` and OOM in `with_capacity`, or wrap to a too-small
+    // capacity that silently defeats the no-realloc goal.
     let cap = src
         .len()
-        .saturating_add(src.len() >> 3)
-        .saturating_add(4096);
+        .checked_add(src.len() >> 3)
+        .and_then(|v| v.checked_add(4096))
+        .expect("corpus too large: output-capacity bound overflows usize");
     let mut out: Vec<u8> = Vec::with_capacity(cap);
 
     let mut sink: usize = 0;
