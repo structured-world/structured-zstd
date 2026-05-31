@@ -87,6 +87,10 @@ pub(crate) mod seq_decoder_vbmi2;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
+/// Diagnostic-only re-export of the copy-shape histogram counters. Public
+/// only when the `copy_shape_stats` feature is on (off in shipping builds).
+#[cfg(feature = "copy_shape_stats")]
+pub use simd_copy::shape_stats;
 // `UserSliceBackend` is the compile-time-monomorphised backend that
 // writes directly into the caller's `&mut [u8]` output slice, used
 // by the `FrameDecoder::decode_all` direct-decode path. It
