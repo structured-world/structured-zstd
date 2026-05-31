@@ -645,7 +645,6 @@ mod tests {
     /// offsets across the SSE2/AVX2 threshold boundary
     /// (offset 20 routes to SSE2 16-byte path, offset 32 to AVX2
     /// 32-byte ymm path, offset 64 to deep AVX2 path).
-    #[cfg(target_arch = "x86_64")]
     // AVX2 override is x86_64-only; this test calls it directly.
     #[cfg(target_arch = "x86_64")]
     #[test]

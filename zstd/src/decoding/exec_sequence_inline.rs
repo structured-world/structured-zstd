@@ -1,7 +1,7 @@
 //! Verbatim port of donor zstd's `ZSTD_execSequence` body
-//! (lib/decompress/zstd_decompress_block.c:1008-1105) for the
-//! `UserSliceBackend` direct-write decode path. Bypasses the
-//! `DecodeBuffer::push` + `repeat` abstraction chain in favour of
+//! (lib/decompress/zstd_decompress_block.c:1008-1105) for the inline
+//! direct-write decode path (`UserSliceBackend` and `FlatBuf`). Bypasses
+//! the `DecodeBuffer::push` + `repeat` abstraction chain in favour of
 //! donor's straight-line shape:
 //!
 //! 1. Literal copy: unconditional 16-byte SIMD store + wildcopy tail
@@ -14,12 +14,17 @@
 //!    (`overlap_src_before_dst`, 8-byte loop while diff < 16,
 //!    16-byte once diff catches up).
 //!
-//! Helpers are private SSE2-baseline x86_64 ops (all supported
-//! x86_64 targets carry SSE2). Non-x86 paths fall back through the
-//! existing `BufferBackend::extend` + `DecodeBuffer::repeat` chain
-//! (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC` returns `false`
-//! on those targets, so the dispatch site dead-eliminates this code
-//! at compile time per backend monomorphisation).
+//! Two helper implementations with an identical byte-level contract:
+//! [`x86`] uses SSE2 intrinsics (`_mm_loadu/storeu_si128`, the x86_64
+//! baseline); [`portable`] uses unaligned `u128`/`u64` moves that the
+//! backend lowers to its widest store (NEON `ldr q`/`str q` on aarch64,
+//! plain movs on i686/riscv/wasm). The backend's `exec_sequence_inline`
+//! arm picks one by `cfg(target_arch)`. Backends gate the whole path on
+//! `SUPPORTS_INLINE_SEQUENCE_EXEC` (`true` for `UserSliceBackend` /
+//! `FlatBuf` on every target, `false` for `RingBuffer`, which stays on
+//! the `extend` + `repeat` fallback for wrap-aware multi-segment frames).
+//! See the [`portable`] module doc for how the inline path is reached
+//! per target.
 
 // x86_64 only: SSE2 is the architectural baseline there (every x86_64
 // CPU has SSE2 by definition). 32-bit `x86` is excluded because the
