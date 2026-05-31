@@ -346,13 +346,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             let start_idx = buf_len - offset;
             let end_idx = start_idx + match_length;
 
-            #[cfg(feature = "copy_shape_stats")]
-            crate::decoding::simd_copy::shape_stats::record_repeat(
-                offset,
-                match_length,
-                end_idx > buf_len,
-            );
-
             // Reserve unconditionally — `extend_from_within_unchecked*`
             // assumes the required free capacity exists; skipping it
             // would turn a malformed block (match_length past the
@@ -370,6 +363,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                     capacity: o.capacity,
                 }
             })?;
+
+            // Record the copy-shape histogram only after the reserve
+            // succeeds: on `OutputBufferOverflow` the repeat never runs, so
+            // counting it here would inflate the diagnostic with match
+            // traffic that was never materialised.
+            #[cfg(feature = "copy_shape_stats")]
+            crate::decoding::simd_copy::shape_stats::record_repeat(
+                offset,
+                match_length,
+                end_idx > buf_len,
+            );
+
             if !SKIP_PREFETCH {
                 self.prefetch_match_source(start_idx, match_length);
             }
