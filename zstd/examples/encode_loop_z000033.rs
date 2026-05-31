@@ -29,7 +29,7 @@ use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let corpus_path: Option<&str> = args.get(3).map(|s| s.as_str());
 
@@ -67,6 +67,17 @@ fn main() {
         .expect("corpus too large: output-capacity bound overflows usize");
     let mut out: Vec<u8> = Vec::with_capacity(cap);
 
+    // `from_level` is the canonical constructor: it maps 0 and 3 to
+    // `Default`, 1/7/11 to their named variants, and everything else to
+    // `Level(n)`. Constructing `Level(level)` directly would bypass that
+    // — most visibly for `level == 0`, which the documented C-zstd
+    // semantics treat as the default (3) but a raw `Level(0)` resolves
+    // to a literal 0. Use the canonical path so the example profiles the
+    // same encoder configuration a real caller's numeric level selects.
+    // Resolved once here, outside the loop, so the per-iteration profile
+    // measures only the encoder, not the constant level-to-config mapping.
+    let compressor_level = CompressionLevel::from_level(level);
+
     let mut sink: usize = 0;
     for _ in 0..iters {
         // Reuse the buffer: `clear()` resets len to 0 but keeps the
@@ -76,14 +87,7 @@ fn main() {
         // which takes `impl Read` and re-buffers via `read_to_end` into
         // a fresh `Vec` every iteration.
         out.clear();
-        // `from_level` is the canonical constructor: it maps 0 and 3 to
-        // `Default`, 1/7/11 to their named variants, and everything else to
-        // `Level(n)`. Constructing `Level(level)` directly would bypass that
-        // — most visibly for `level == 0`, which the documented C-zstd
-        // semantics treat as the default (3) but a raw `Level(0)` resolves
-        // to a literal 0. Use the canonical path so the example profiles the
-        // same encoder configuration a real caller's numeric level selects.
-        let mut frame_enc = FrameCompressor::new(CompressionLevel::from_level(level));
+        let mut frame_enc = FrameCompressor::new(compressor_level);
         frame_enc.set_source_size_hint(src.len() as u64);
         frame_enc.set_source(src.as_slice());
         frame_enc.set_drain(&mut out);
