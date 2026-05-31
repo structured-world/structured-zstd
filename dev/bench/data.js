@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780045253505,
+  "lastUpdate": 1780254176624,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -51122,6 +51122,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "78e70d066c322428e132201204b050ed013a4138",
+          "message": "perf(decode): inline donor match-copy on all targets via portable wildcopy (#299)\n\n* perf(decode): inline donor match-copy on all targets via portable wildcopy\n\nGeneralise the donor ZSTD_execSequence inline match-copy from x86-only to\nevery target. The straight-line literal+match wildcopy (ZSTD_copy16 +\nwildcopy, ZSTD_overlapCopy8 for short offsets) previously lived only\nbehind cfg(target_arch = x86_64) in exec_sequence_inline::x86 (SSE2). On\naarch64/i686/riscv/wasm the decode path fell through to the slow\ntry_push + repeat chain (byte-by-byte overlapping copy, per-call libc\nmemcpy for short matches).\n\nNew architecture-agnostic exec_sequence_inline::portable module (unaligned\nu128/u64 moves the backend lowers to its widest store: NEON ldr q/str q on\naarch64, plain movs elsewhere). Both inline-exec backends (FlatBuf,\nUserSliceBackend) grow a cfg(not(x86_64)) arm built on it and set\nSUPPORTS_INLINE_SEQUENCE_EXEC = true unconditionally.\n\nThe const may be true ONLY for a backend that actually overrides\nexec_sequence_inline, otherwise the dispatch reaches the unreachable!()\ntrait default. RingBuffer keeps the default (false, no override):\nmulti-segment frames stay on the wrap-aware chain. The win flows through\nthe pipelined/NEON path (decode_and_execute_sequences_impl ->\nexecute_one_sequence_pipelined), which gates the inline call on the const\nand otherwise falls back to the legacy chain, so RingBuffer is never sent\nto the inline path. The hand-written Scalar-tier monolith\n(seq_decoder_scalar) is unaffected: it keeps the try_push + repeat body.\n\nx86_64 keeps the SSE2 x86 module and AVX2 override unchanged.\n\nPortable helpers get parallel cfg(not(x86_64)) tests mirroring the SSE2\nhelper tests plus a scalar-reference cross-check (runs in the i686 CI\ntest job).\n\n634 lib tests pass (incl. decode_all_multi_segment_frame and\ndecode_all_propagates_checksum); clippy clean on aarch64, i686, x86_64.\nM1 decode_loop match-heavy ratio vs C ffi ~1.2x (was 1.44x); literal-heavy\n0.94x (already ahead of C).\n\n* test(decode): run portable wildcopy tests on x86_64 too\n\nThe portable helper tests were gated cfg(all(test, not(x86_64))), so the\narchitecture-independent portable copy16/wildcopy/overlap_copy8 paths ran\nonly on the i686 CI shard — a regression in them would hide from the main\nx86 lane. Compile the portable module under cfg(any(not(x86_64), test))\nso it also exists on x86_64 in test builds, and drop the not(x86_64) gate\non the test module so it runs on every target. On x86_64 non-test builds\nthe module stays absent (the inline-exec arms there use the SSE2 module),\nso no dead code. clippy --lib --tests clean on aarch64, i686, x86_64;\n7 portable tests pass.\n\n* perf(decode): route scalar-tier execute through the shared inline executor\n\nThe scalar-tier execute body hardcoded try_push + repeat_lookahead_prefetched\nand never consulted SUPPORTS_INLINE_SEQUENCE_EXEC, so on i686/riscv/wasm\n(where detect_cpu_kernel resolves to CpuKernelTag::Scalar) the donor inline\nliteral+match wildcopy was never reached in production dispatch — only the\naarch64 pipelined tier hit it, leaving the portable backend arms dead on\nthose targets.\n\nRoute execute_one_body! through the shared execute_one_sequence_pipelined,\nthe same function the pipelined tier uses. It gates the inline call on the\nbackend const and falls back to try_push + repeat when the backend opts out\n(RingBuffer) or the per-sequence literal-slack / prefix-resident gate fails,\nso multi-segment decode is unchanged and the literal/offset gating lives in\none place. The scalar tier now reaches the inline path on every target whose\nbackend supports it.\n\nThe executor consumes seq.ll/seq.ml plus the separately-resolved offset and\nnever reads seq.of, so the resolved offset is passed through both fields\nsafely.\n\n* test(decode): run direct backend inline-exec tests on non-x86 too\n\nThe direct exec_sequence_inline tests for FlatBuf and UserSliceBackend\nwere gated to x86_64, so the portable backend arms (capacity checks,\nset_len/tail update, offset handling, helper wiring) were only indirectly\nexercised by the helper tests on non-x86 targets. Drop the x86_64 gate on\nthose direct tests: on x86_64 they hit the SSE2 arm, on other ISAs the\nportable arm (both cfg-selected exec_sequence_inline overrides), so the\nnon-x86 backend method gets the same direct assertions. The AVX2-specific\ntests stay x86_64-gated since they call exec_sequence_inline_avx2.\n\nAlso rewrite the portable-module doc to describe how the inline path is\nactually reached per target (aarch64 via the Neon pipelined tier;\ni686/riscv/wasm via the scalar tier, which now routes through the shared\nexecutor) instead of the earlier vague \"live on i686/riscv/wasm\".\n\n* fix(decode): un-gate Vec import for non-x86 inline-exec test\n\nUn-gating exec_sequence_inline_long_literal_uses_wildcopy_tail (so it\nruns on non-x86 targets against the portable arm) left the test using\n`Vec` while its import stayed `#[cfg(target_arch = \"x86_64\")]`. On\nx86_64 the import was unused after the test switched to a\nfully-qualified path, failing the lib-test build under -D warnings. Drop\nthe cfg gate on the import and use bare `Vec` so the test compiles on\nevery target.\n\n* docs(decode): refresh inline-exec module header, drop duplicate cfg gate\n\nTwo review cleanups on the all-targets inline match-copy work:\n\n- exec_sequence_inline module header still claimed the helpers were\n  x86_64-only with non-x86 falling back through extend + repeat. That is\n  stale since the portable module + non-x86 backend arms landed. Rewrite\n  the header to describe both helper impls (SSE2 x86 / portable), the\n  per-backend SUPPORTS_INLINE_SEQUENCE_EXEC gate, and point at the\n  portable module doc for how the inline path is reached per target.\n- flat_buf avx2 boundary test carried two identical\n  #[cfg(target_arch = \"x86_64\")] attributes (a batched-edit leftover).\n  Drop the duplicate.",
+          "timestamp": "2026-05-31T21:07:10+03:00",
+          "tree_id": "6bae67c4da04d1e3ed653d80944cb1b349ba4e79",
+          "url": "https://github.com/structured-world/structured-zstd/commit/78e70d066c322428e132201204b050ed013a4138"
+        },
+        "date": 1780254171194,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.146,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 303.747,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 255.954,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.352,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.409,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.727,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.615,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.972,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.276,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.329,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.782,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.355,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.75,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.06,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.83,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.102,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
