@@ -956,7 +956,6 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::vec;
-    #[cfg(target_arch = "x86_64")]
     use alloc::vec::Vec;
 
     #[test]
@@ -1238,7 +1237,7 @@ mod tests {
         // 40-byte literals (forces wildcopy tail) — needs 40-byte
         // source buffer with extra read slack for the final
         // 16-byte load.
-        let lits: alloc::vec::Vec<u8> = (0..40u8 + 16).map(|i| 0x80 + i).collect();
+        let lits: Vec<u8> = (0..40u8 + 16).map(|i| 0x80 + i).collect();
         unsafe {
             b.exec_sequence_inline(lits.as_ptr(), 40, 16, 8).unwrap();
         }
