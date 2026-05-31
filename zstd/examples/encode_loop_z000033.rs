@@ -14,10 +14,10 @@
 //! API; the matcher-table init is inherent encode cost, unlike the
 //! pure-noise output realloc).
 //!
-//! Build: cargo build --profile flamegraph -p structured-zstd \
-//!          --example encode_loop_z000033 --features dict_builder
-//! Run:   cargo flamegraph --example encode_loop_z000033 --features dict_builder \
-//!          --profile flamegraph -- <level> <iters> <corpus_path>
+//! Build: `cargo build --profile flamegraph -p structured-zstd
+//!          --example encode_loop_z000033 --features dict_builder`
+//! Run:   `cargo flamegraph --example encode_loop_z000033 --features dict_builder
+//!          --profile flamegraph -- <level> <iters> <corpus_path>`
 
 use std::env;
 
