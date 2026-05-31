@@ -76,7 +76,14 @@ fn main() {
         // which takes `impl Read` and re-buffers via `read_to_end` into
         // a fresh `Vec` every iteration.
         out.clear();
-        let mut frame_enc = FrameCompressor::new(CompressionLevel::Level(level));
+        // `from_level` is the canonical constructor: it maps 0 and 3 to
+        // `Default`, 1/7/11 to their named variants, and everything else to
+        // `Level(n)`. Constructing `Level(level)` directly would bypass that
+        // — most visibly for `level == 0`, which the documented C-zstd
+        // semantics treat as the default (3) but a raw `Level(0)` resolves
+        // to a literal 0. Use the canonical path so the example profiles the
+        // same encoder configuration a real caller's numeric level selects.
+        let mut frame_enc = FrameCompressor::new(CompressionLevel::from_level(level));
         frame_enc.set_source_size_hint(src.len() as u64);
         frame_enc.set_source(src.as_slice());
         frame_enc.set_drain(&mut out);
