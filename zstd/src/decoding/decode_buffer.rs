@@ -427,7 +427,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// prefetcher / store streaming) while the bytes produced are identical:
     /// the output is periodic with period `offset`, and copying any prefix of
     /// that period onto its own tail preserves the periodicity.
-    #[inline(always)]
+    ///
+    /// `#[inline]` (hint, not force): this is the overlapping-match cold-ish
+    /// arm of `repeat_inner`. Forcing it inline bloats the hot fully-inlined
+    /// sequence executor and measurably shifts codegen of the common
+    /// non-overlapping path (a small-match regression on realistic corpora);
+    /// the doubling win comes from issuing fewer/larger copies, not from
+    /// inlining, so the per-call boundary here is irrelevant next to the
+    /// copy work it dispatches.
+    #[inline]
     fn repeat_in_chunks(
         &mut self,
         offset: usize,
