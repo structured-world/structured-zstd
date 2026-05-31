@@ -10,9 +10,13 @@
 //! iteration, so steady-state iters do zero output-buffer allocation —
 //! the flamegraph stays on the encoder hot path instead of per-iter
 //! `Vec` growth + first-touch page faults. A fresh `FrameCompressor` per
-//! iter mirrors a real per-frame encode (there is no compressor-reset
-//! API; the matcher-table init is inherent encode cost, unlike the
-//! pure-noise output realloc).
+//! iter mirrors a real per-frame encode: each frame in production is
+//! compressed by its own `FrameCompressor`, and the matcher-table
+//! allocation that `new()` performs is part of that real per-frame cost.
+//! `FrameCompressor::compress()` does reset the matcher + offset history
+//! per call, so a single instance could be reused; this binary keeps the
+//! fresh-per-iter shape on purpose so the profile includes the matcher
+//! allocation, unlike the pure-noise output realloc which we elide.
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
 //!          --example encode_loop_z000033 --features dict_builder`
