@@ -597,11 +597,13 @@ mod tests {
         assert_eq!(f.tail(), 0);
     }
 
-    /// SSE2 inline executor — verify match-copy correctness against a
+    /// Inline executor — verify match-copy correctness against a
     /// byte-by-byte reference. Exercises the non-overlap path
     /// (offset >= 16), short-offset overlapCopy8 path (offset < 16),
-    /// and the literal copy16 + wildcopy tail.
-    #[cfg(target_arch = "x86_64")]
+    /// and the literal copy16 + wildcopy tail. Runs on every target: on
+    /// x86_64 it drives the SSE2 `exec_sequence_inline` arm, elsewhere
+    /// the portable arm (both `cfg`-selected), giving the non-x86
+    /// backend method direct coverage.
     #[test]
     fn exec_sequence_inline_match_copy_correctness() {
         for offset in [4usize, 8, 12, 20, 48, 96] {
@@ -643,6 +645,8 @@ mod tests {
     /// offsets across the SSE2/AVX2 threshold boundary
     /// (offset 20 routes to SSE2 16-byte path, offset 32 to AVX2
     /// 32-byte ymm path, offset 64 to deep AVX2 path).
+    #[cfg(target_arch = "x86_64")]
+    // AVX2 override is x86_64-only; this test calls it directly.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn exec_sequence_inline_avx2_offset_boundary_correctness() {

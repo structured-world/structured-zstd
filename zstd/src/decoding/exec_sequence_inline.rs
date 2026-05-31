@@ -193,24 +193,30 @@ pub(crate) mod x86 {
 
 /// Portable (non-x86) wildcopy helpers: identical byte-level contract
 /// to [`x86`], expressed with `read_unaligned`/`write_unaligned` so any
-/// target can use them. On aarch64 LLVM lowers the 16-byte
-/// `u128` load/store to a single NEON `ldr q`/`str q`; on other targets
-/// it picks the widest available move. Used by the aarch64 (and any
-/// `BufferBackend::exec_sequence_inline` arm to get the same donor
-/// `ZSTD_execSequence` shape the x86 path already has, instead of
-/// falling through to the slow `try_push` + `repeat` chain.
+/// target can use them. On aarch64 LLVM lowers the 16-byte `u128`
+/// load/store to a single NEON `ldr q`/`str q`; elsewhere it picks the
+/// widest available move. The `cfg(not(x86_64))` arms of
+/// `FlatBuf`/`UserSliceBackend::exec_sequence_inline` use these to get
+/// the donor `ZSTD_execSequence` shape the x86 path already has, instead
+/// of the slow `try_push` + `repeat` chain.
 ///
-/// Available on every non-x86 target: both inline-exec backends
-/// (`FlatBuf`, `UserSliceBackend`) set `SUPPORTS_INLINE_SEQUENCE_EXEC =
-/// true` everywhere and carry a `cfg(not(x86_64))` arm built on these
-/// helpers, so they are live on aarch64, i686, riscv, wasm, etc. x86_64
-/// uses the SSE2 [`x86`] module instead, so this is gated out there to
-/// avoid two definitions.
-// Compiled on every non-x86 target (where the inline-exec arms use it)
-// AND on x86_64 under `cfg(test)` so the portable helpers get exercised
-// on the main x86 CI lane too, not only the i686 job — the impl is
-// architecture-independent (`read_unaligned`/`write_unaligned`), so a
-// regression in it would otherwise hide until the i686 shard ran.
+/// How the inline path is reached per target:
+/// - aarch64: `detect_cpu_kernel` -> `Neon` -> the generic pipelined
+///   executor (`execute_one_sequence_pipelined`), which calls
+///   `exec_sequence_inline` when the backend opts in.
+/// - i686 / riscv / wasm: `detect_cpu_kernel` -> `Scalar` ->
+///   `seq_decoder_scalar`, whose execute body routes through that same
+///   `execute_one_sequence_pipelined`, so the inline path is reached in
+///   scalar-tier production dispatch too.
+///
+/// Both `FlatBuf` and `UserSliceBackend` set
+/// `SUPPORTS_INLINE_SEQUENCE_EXEC = true` on every target; `RingBuffer`
+/// keeps it `false` and stays on the wrap-aware fallback. x86_64 uses
+/// the SSE2 [`x86`] module for production, so this module is gated out
+/// there in non-test builds to avoid two definitions; it is still
+/// compiled under `cfg(test)` on x86_64 so the architecture-independent
+/// helpers are exercised on the main x86 CI lane, not only the i686
+/// shard.
 #[cfg(any(not(target_arch = "x86_64"), test))]
 pub(crate) mod portable {
     /// Donor `ZSTD_copy16`: one unaligned 16-byte move.

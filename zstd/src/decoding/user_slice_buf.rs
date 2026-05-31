@@ -1188,7 +1188,6 @@ mod tests {
     /// callee. Tests cover: short-literal + short-match, long
     /// literal (wildcopy tail), short-offset match (overlapCopy8 +
     /// 8-byte stride), long-offset match (wildcopy_no_overlap).
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn exec_sequence_inline_short_literal_plus_long_offset_match() {
         // Layout: pre-fill `tail = 8` with a "history" region so
@@ -1224,7 +1223,6 @@ mod tests {
         assert_eq!(&buf[40..48], &[24u8, 25, 26, 27, 28, 29, 30, 31]);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn exec_sequence_inline_long_literal_uses_wildcopy_tail() {
         // litLength > 16 path: unconditional copy16 + wildcopy tail
@@ -1240,7 +1238,7 @@ mod tests {
         // 40-byte literals (forces wildcopy tail) — needs 40-byte
         // source buffer with extra read slack for the final
         // 16-byte load.
-        let lits: Vec<u8> = (0..40 + 16).map(|i| 0x80 + i as u8).collect();
+        let lits: alloc::vec::Vec<u8> = (0..40u8 + 16).map(|i| 0x80 + i).collect();
         unsafe {
             b.exec_sequence_inline(lits.as_ptr(), 40, 16, 8).unwrap();
         }
@@ -1251,7 +1249,6 @@ mod tests {
         assert_eq!(&buf[72..80], &lits[24..32]);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn exec_sequence_inline_short_offset_match_uses_overlap_copy() {
         // offset < 16 takes the overlapCopy8 + 8-byte stride path
