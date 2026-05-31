@@ -206,7 +206,12 @@ pub(crate) mod x86 {
 /// helpers, so they are live on aarch64, i686, riscv, wasm, etc. x86_64
 /// uses the SSE2 [`x86`] module instead, so this is gated out there to
 /// avoid two definitions.
-#[cfg(not(target_arch = "x86_64"))]
+// Compiled on every non-x86 target (where the inline-exec arms use it)
+// AND on x86_64 under `cfg(test)` so the portable helpers get exercised
+// on the main x86 CI lane too, not only the i686 job — the impl is
+// architecture-independent (`read_unaligned`/`write_unaligned`), so a
+// regression in it would otherwise hide until the i686 shard ran.
+#[cfg(any(not(target_arch = "x86_64"), test))]
 pub(crate) mod portable {
     /// Donor `ZSTD_copy16`: one unaligned 16-byte move.
     ///
@@ -409,7 +414,10 @@ mod inline_helper_tests {
 // so it must carry the same exact-copy / overshoot / short-offset-spread
 // assertions as the SSE2 helpers it byte-for-byte mirrors. On the host
 // CI matrix this runs under the i686-unknown-linux-gnu test job.
-#[cfg(all(test, not(target_arch = "x86_64")))]
+// Runs on ALL targets (the `portable` module is compiled under
+// `cfg(test)` on x86_64 too), so the architecture-independent helpers are
+// covered on the main x86 CI lane as well as the i686 job.
+#[cfg(test)]
 mod portable_helper_tests {
     use super::portable::{
         copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
