@@ -87,7 +87,7 @@ mod levels;
 #[cfg(feature = "bench_internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
-pub use frame_compressor::FrameCompressor;
+pub use frame_compressor::{EncoderDictionary, FrameCompressor};
 #[cfg(feature = "lsm")]
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
 pub use match_generator::MatchGeneratorDriver;

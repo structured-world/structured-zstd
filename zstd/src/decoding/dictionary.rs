@@ -101,10 +101,11 @@ impl Dictionary {
     /// Crate-internal: the returned [`Dictionary`] deliberately has no
     /// decode lookup tables (`packed_decode` / FSE `decode`), so it is
     /// NOT safe to feed into a [`FrameDecoder`](crate::decoding::FrameDecoder)
-    /// — Huffman decode would index an empty `packed_decode`. The encoder
-    /// (`FrameCompressor::set_dictionary_from_bytes`) is the only caller and
-    /// only reads the entropy ENCODER tables, so keeping this `pub(crate)`
-    /// avoids exposing a decode footgun on the public `Dictionary` type.
+    /// — Huffman decode would index an empty `packed_decode`. The only caller
+    /// is `EncoderDictionary::from_bytes`, which wraps the result in the
+    /// encoder-only `EncoderDictionary` type (no decode path), so this
+    /// incomplete dictionary can never escape to the decode side. Keeping
+    /// this `pub(crate)` keeps it off the public `Dictionary` API entirely.
     pub(crate) fn decode_dict_for_encoding(
         raw: &[u8],
     ) -> Result<Dictionary, DictionaryDecodeError> {

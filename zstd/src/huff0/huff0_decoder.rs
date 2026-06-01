@@ -416,7 +416,11 @@ impl HuffmanTable {
     /// stepping a cursor over packed tables advances identically. Used by
     /// the encoder dictionary load: [`Self::to_encoder_table`] reads only
     /// `bits` + `max_num_bits`, so filling `packed_decode` is pure waste.
-    pub fn build_weights_only(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
+    ///
+    /// Crate-internal: the table it produces is intentionally non-decodable
+    /// (empty `packed_decode`); only `decode_dict_for_encoding` calls it, and
+    /// its result is wrapped in an `EncoderDictionary` that has no decode path.
+    pub(crate) fn build_weights_only(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
         self.packed_decode.clear();
 
         let bytes_used = self.read_weights(source)?;
