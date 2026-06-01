@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780333609471,
+  "lastUpdate": 1780346029424,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -53162,6 +53162,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "81266a342515c63c36a0cac6812debebf6a9ba54",
+          "message": "feat(decode): kernel_* cargo features for per-tier CPU kernel selection (#307)\n\n* perf(decode): add Sse2 kernel tier to the CpuKernel taxonomy\n\nSSE2 is ABI-guaranteed on every x86_64 target, so it is the effective\nkernel floor there; the Scalar kernel is only reached off-x86_64 (or on a\npre-SSE2 x86 build). The copy dispatcher already keys a distinct 16-byte\nSSE2 copy body off SSE2 availability, but did so through its own separate\nfeature-detection path rather than the unified CpuKernel tag.\n\nAdd CpuKernelTag::Sse2 + Sse2Kernel between Scalar and Bmi2 in the ladder\n(Scalar < Sse2 < Bmi2 < Avx2 < Vbmi2). mask_lower_bits is identical to\nScalar (SSE2 has no bit-extract); the tier exists to carry the 128-bit\ncopy choice once the copy dispatcher is folded into the unified tag in a\nfollow-up. select_x86_kernel gains an sse2 rung; the sequence dispatch\ngains an Sse2 arm routing to the scalar FSE walk (SSE2 does not change the\nsequence hot path), and the literals dispatch already covers it via its\nscalar fallthrough.\n\nPart of #247 (Part 2 copy-dispatch unification).\n\n* perf(decode): derive SIMD-copy caps from the unified CpuKernel tag\n\nThe chunked wildcopy dispatcher detected AVX-512/AVX2/SSE2 through its own\nOnceLock-cached query, independent of the CpuKernel tag that drives the\nentropy + sequence hot paths. That left two CPU-capability sources of truth\nthat could in principle disagree, and duplicated the detection.\n\nOn x86_64, derive the copy caps from detect_cpu_kernel() instead, so a single\nCPUID query (cached in the kernel tag) feeds both the entropy/sequence\ndispatch and the copy dispatch. The mapping follows the kernel ladder\n(Vbmi2 -> 64/32/16, Avx2 -> 32/16, Bmi2/Sse2 -> 16, Scalar -> none). On an\navx512f-but-not-VBMI2 part (Skylake-X) this picks the 32-byte copy_avx2\nchunk rather than the 64-byte copy_avx512 — negligible on the short match\ncopies that dominate, and modern AVX-512 parts carry VBMI2 and still reach\ncopy_avx512.\n\n32-bit x86 keeps its own runtime detection: the kernel tag carries no SIMD\ntiers there (x86_64-gated), so routing through it would drop the SSE2/AVX2\ncopy path on i686. Verified with cargo check --target i686-unknown-linux-gnu.\n\nSelection on AVX2 hardware (no AVX-512) is byte-identical to before, so this\nis perf-neutral on the common path. 646/646 lib tests pass.\n\nPart of #247 (Part 2 copy-dispatch unification).\n\n* refactor(decode): drop the unused Sse2Kernel ZST\n\nThe Sse2Kernel struct + CpuKernel impl were added alongside the Sse2 tag\nbut never instantiated: the only trait method (mask_lower_bits) has no\nSSE2-specific form, so the Sse2 tag routes through the scalar bodies for\nthe FSE/HUF paths, and the 128-bit copy choice the tier represents is\ncarried by CpuKernelTag::Sse2 in the copy dispatch, not by the ZST. Remove\nthe dead struct and leave a note; a dedicated Sse2Kernel returns when\ncopy_chunk moves onto the trait.\n\n* feat(decode): gate CpuKernel tiers behind kernel_* cargo features\n\nAdd per-tier cargo features (kernel_scalar/sse2/bmi2/avx2/vbmi2 on x86,\nkernel_neon/sve on aarch64) with the real ISA implication chain (avx2->bmi2\n->sse2, sve->neon). The default build enables every tier and\ndetect_cpu_kernel() picks the best at runtime (unchanged universal-binary\nbehaviour); constrained targets can trim the SIMD trampolines + their\ndispatch arms by disabling tiers they don't need. The scalar kernel is\nalways compiled, so the lowest enabled tier always has a fallback.\n\nGates the full cascade so every feature combination compiles: the\nCpuKernelTag variants, the per-tier kernel ZSTs + the shared bmi2 mask\nhelper, the select_x86_kernel precedence rungs, the runtime/compile-time\ndetect arms, the literals + sequence dispatch arms and their per-tier\ntrampolines, the seq_decoder_{bmi2,avx2,vbmi2} modules, the SIMD-copy\ncap-derivation match, and the BMI2 pext bit-reader helpers.\n\nVerified clean (lib check) across: x86_64 default / kernel_avx2-only /\nkernel_scalar-only; aarch64 default / kernel_scalar-only; i686 default. A\nkernel_scalar-only build drops all SIMD trampolines for a smaller binary on\nconstrained targets. 646/646 default lib tests pass, clippy + fmt clean.\n\nPart of #247.\n\n* ci: clippy-check the kernel_scalar embedded trim builds\n\nAdd two steps to the no-std lint job that build with only the scalar kernel\nenabled (--no-default-features --features kernel_scalar[,std],hash), so the\nkernel_* feature gating can't silently break the trimmed embedded build —\nthe SIMD tiers and their dispatch trampolines are compiled out there.\n\nPart of #247.\n\n* docs: document the kernel_* CPU-tier cargo features\n\nExplain the per-CPU-tier kernel feature axis in the crate preamble and the\nREADME: all tiers on by default (runtime-selected universal binary), the\nISA implication chain, the always-present scalar fallback, and the\nscalar-only trim for constrained targets.\n\nPart of #247.\n\n* feat(decode): document kernel_scalar as a marker, gate the select tests\n\n- kernel_scalar gates no code (the scalar kernel is the mandatory, always-\n  compiled fallback). Document it as an explicit marker in Cargo.toml + the\n  README so the feature surface isn't misleading; a scalar-only build is\n  --no-default-features with the SIMD tiers off.\n- Gate the select_x86_kernel_* unit tests on their kernel_* features so a\n  trimmed build (SIMD tiers disabled) still compiles the test target — they\n  reference the Sse2/Avx2/Vbmi2 variants that those features gate.\n\nPart of #247.\n\n* feat(decode): complete the kernel_* trim — gate PEXT + no_std SIMD copy\n\nThe kernel-feature trim was incomplete on two paths that still selected SIMD\nfrom target_feature directly, so a kernel-trimmed build still carried the\ncode:\n\n- bit_reader_reverse.rs: the shared BMI2 PEXT triple-extract path\n  (TripleExtractDispatch + cache + extract_triple_pext + the use_pext_triple\n  field, its new() init, the peek_bits_triple branch, BIT_MASK, the OnceLock\n  import, and the pext unit tests) is now gated on kernel_bmi2. A\n  non-kernel_bmi2 build uses the scalar triple-extract.\n- simd_copy.rs: the no_std x86 chunk dispatch (avx512/avx2/sse2) and the\n  aarch64 NEON chunk now gate on kernel_vbmi2/avx2/sse2/neon; copy_neon and\n  the try_chunk_kernel macro pick up matching gates so a scalar-only trim\n  drops them cleanly. (The std x86_64 dispatch already derives its caps from\n  the kernel tag.)\n\nVerified across default / kernel_avx2 / kernel_scalar (std + no_std) on\nx86_64, i686, and aarch64: a kernel_scalar build compiles out the BMI2 +\nSIMD-copy code. 646/646 default lib tests, clippy + fmt clean.\n\nPart of #247.\n\n* feat(decode): skip disabled-tier CPU probes; clarify the trim docs\n\n- detect_cpu_kernel_uncached now guards each is_x86_feature_detected! probe\n  with cfg!(feature = \"kernel_*\") &&, so a trimmed build (e.g. kernel_sse2\n  only) const-folds away the runtime CPUID probes for tiers it disabled —\n  the matching select_x86_kernel rungs are #[cfg]-ed out anyway.\n- Reword the lib.rs preamble + README: a kernel_scalar build compiles out the\n  per-tier SIMD kernel dispatch and its BMI2/AVX2/VBMI2/NEON trampolines, but\n  baseline SIMD the target ABI guarantees (SSE2 on x86_64, NEON on aarch64,\n  used by the small fixed-size copy primitives) is not a tier and may still be\n  emitted. The old 'drops every SIMD trampoline' wording overclaimed.\n\nPart of #247.\n\n* test(cpu_kernel): gate avx2 mask test on kernel_avx2 feature\n\navx2_mask_lower_bits_matches_scalar_on_bmi2_hw constructs Avx2Kernel,\nwhich is #[cfg(feature = \"kernel_avx2\")]. The test was gated only on\n`std`, so a std build with kernel_avx2 disabled\n(--no-default-features --features std,kernel_scalar,hash) failed to\ncompile against the undefined type. Add feature = \"kernel_avx2\" to the\ngate, matching the kernel-tag tests below it.\n\nPart of #247.\n\n* docs(lib): correct kernel-detection timing wording\n\ndetect_cpu_kernel() is OnceLock-cached on first use, not run at process\nstartup. Reword the kernel-features preamble so readers reasoning about\ninitialization cost aren't misled.\n\nPart of #247.\n\n* fix(decode): gate no_std 64B AVX-512 copy on avx512vbmi2\n\nThe no_std copy dispatcher selected the 64-byte copy_avx512 chunk on\nbare target_feature = \"avx512f\", but the std path derives caps from the\nCpuKernelTag ladder where the 64B copy is the Vbmi2 tier — an\navx512f-but-not-VBMI2 CPU (e.g. -C target-cpu=skylake-avx512) is tagged\nAvx2 and uses the 32B chunk. So no_std emitted 64B copies where std\nemits 32B on the same CPU. Gate the no_std 64B path on\ntarget_feature = \"avx512vbmi2\" to match the std tag ladder (vbmi2\nimplies avx512f, so copy_avx512 stays callable).\n\nPart of #247.\n\n* docs(kernel): clarify runtime vs compile-time tier selection\n\nCPU-tier kernel selection is runtime (CPU-feature detection, cached)\nonly with std; no_std builds select at compile time from\ncfg(target_feature). Update lib.rs preamble, README, and the Cargo.toml\nfeature docs so no_std/embedded users aren't misled. Also reword the\ntry_chunk_kernel #[allow(unused_macros)] rationale: the macro is unused\non non-x86/non-aarch64 targets (no arch sites) as well as on trimmed\nSIMD-tier builds.\n\nPart of #247.\n\n* fix(decode): gate single_op_copy_16 SIMD on kernel_* features\n\nThe <=16-byte fast copy still took the aarch64 NEON arm and the no_std\nx86 SSE2 arm based only on target_feature, so a kernel_scalar-only\nbuild still compiled + executed explicit SIMD there — incomplete vs the\nper-tier feature contract the chunked dispatch already follows.\n\nGate the NEON arm on feature = \"kernel_neon\" and the no_std SSE2 arm on\nfeature = \"kernel_sse2\"; a trimmed build falls through to the portable\noverlapping-u64 path. The std x86 arm stays runtime-gated via\ndetect_x86_caps (Scalar tag => sse2=false => portable). Also gate the\nNEON intrinsic import to match, and mark copy_sse2 #[allow(dead_code)]\n(now callerless on a kernel_scalar no_std x86 build, like copy_avx2).\n\nPart of #247.\n\n* docs(cargo): fix misleading 'universal binary' wording for no_std\n\nThe kernel-feature comment attached '(universal binary)' to the no_std\ncompile-time selection, but a compile-time-fixed tier is the opposite of\nuniversal — it bakes the chosen ISA into the build. Reword so 'universal\nbinary' describes the std runtime-detection default, and no_std is\nclearly the compile-time-fixed case.\n\nPart of #247.\n\n* fix(simd_copy): gate i686 caps + test-helper chunk size on kernel_* tiers\n\ndetect_x86_caps's 32-bit x86 branch reported AVX2/SSE2/AVX-512 purely\nfrom is_x86_feature_detected!, ignoring the kernel_* tier features that\ngate the x86_64 branch. A tier-trimmed build (e.g. kernel_scalar only)\ncould therefore still execute SIMD chunk copies on i686, contradicting\nthe per-tier feature contract. Gate each tier on both its kernel_*\nfeature and runtime detection, and key the top tier on avx512vbmi2 (not\nbare avx512f) to match the x86_64 Vbmi2-tag ladder exactly.\n\nactive_chunk_size_for_tests had the same gap on its no-std arms: it\nkeyed off target_feature alone (and avx512f), so tier-trimmed test\nbuilds sized scenarios for a chunk the dispatcher can never select.\nMirror the dispatcher gating (target_feature + kernel_*, avx512vbmi2 for\n64B) and add the kernel_neon gate on the aarch64 arm.\n\nPart of #247.\n\n* refactor(simd_copy): gate SIMD helper defs + support infra on kernel_* tiers\n\nThe x86 SIMD helpers (copy_sse2/copy_avx2/copy_avx512) were defined under\nonly target_arch + target_feature + #[allow(dead_code)], so a tier-trimmed\nbuild still compiled the whole SIMD tier even though the production call\nsites were already feature-gated. Gate the helper defs, their std/no-std\ndispatch call sites, single_op_copy_16, copy_bytes_overshooting_avx2, and\nthe direct-helper unit tests on the matching kernel_sse2 / kernel_avx2 /\nkernel_vbmi2 feature so a kernel_scalar trim truly prunes the SIMD tier.\n\nCascade: the supporting infra (per-tier intrinsic imports, X86Caps,\ndetect_x86_caps, the OnceLock/is_x86_feature_detected imports, and the\nactive_chunk_size_for_tests std path) is gated on kernel_sse2 — the lowest\nx86 SIMD tier, implied by every higher one — so a scalar trim drops it too\nwithout dead-code warnings. active_chunk_size_for_tests now mirrors the\ndispatcher's per-tier feature gating so a tier-trimmed build reports the\nchunk size the dispatcher can actually select.\n\nAlso gates single_op_copy_16's NEON arm + copy_neon on kernel_neon,\nfixing a latent build break: the NEON intrinsic import was kernel_neon-\ngated but those use sites were not, so an aarch64+neon build without\nkernel_neon failed to compile.\n\nPart of #247.\n\n* docs(kernel): correct scalar-trim SIMD claim for gated copy primitives\n\nThe lib.rs + README kernel-feature docs claimed a scalar-only trim could\nstill emit baseline SSE2/NEON via the small fixed-size copy primitives.\nThose primitives' explicit intrinsics are now gated on kernel_sse2 /\nkernel_neon, so a scalar-only trim emits none of the crate's explicit\nSIMD. Reword to: kernel_* features gate the crate's own explicit SIMD\n(dispatch, trampolines, and the fixed-size copy primitives); only the\ncompiler's autovectorizer may still emit vector instructions, independent\nof these features.\n\nPart of #247.",
+          "timestamp": "2026-06-01T22:40:07+03:00",
+          "tree_id": "9a946a9da8677197acc1b51cb1e661a0a56ceeaa",
+          "url": "https://github.com/structured-world/structured-zstd/commit/81266a342515c63c36a0cac6812debebf6a9ba54"
+        },
+        "date": 1780346021114,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 270.37,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.467,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.342,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.673,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.577,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.971,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.051,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.819,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.688,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.333,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.684,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.767,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
             "unit": "ms"
           }
         ]
