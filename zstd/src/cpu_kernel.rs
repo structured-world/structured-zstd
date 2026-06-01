@@ -303,14 +303,18 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::is_x86_feature_detected;
+        // Gate each probe on its tier feature: `cfg!(...)` const-folds, so the
+        // `&&` short-circuits away the runtime `is_x86_feature_detected!` call
+        // (and its CPUID/cache traffic) for tiers the build disabled — the
+        // matching `select_x86_kernel` rung is `#[cfg]`-ed out anyway.
         return select_x86_kernel(
-            is_x86_feature_detected!("avx512vbmi2"),
-            is_x86_feature_detected!("avx512f"),
-            is_x86_feature_detected!("avx512vl"),
-            is_x86_feature_detected!("avx512bw"),
-            is_x86_feature_detected!("bmi2"),
-            is_x86_feature_detected!("avx2"),
-            is_x86_feature_detected!("sse2"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512f"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vl"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512bw"),
+            cfg!(feature = "kernel_bmi2") && is_x86_feature_detected!("bmi2"),
+            cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
+            cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]

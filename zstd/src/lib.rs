@@ -25,8 +25,12 @@
 //! `kernel_sve` implies `kernel_neon`). The scalar kernel is always compiled,
 //! so any subset is valid; a flag is inert on architectures it doesn't apply
 //! to. Constrained targets can shrink the binary by trimming tiers, e.g.
-//! `--no-default-features --features kernel_scalar` for a scalar-only build
-//! with every SIMD trampoline compiled out.
+//! `--no-default-features --features kernel_scalar` compiles out the per-tier
+//! SIMD kernel dispatch and its BMI2/AVX2/VBMI2/NEON trampolines. Baseline
+//! SIMD that the target ABI guarantees (e.g. SSE2 on x86_64, NEON on aarch64,
+//! used by the small fixed-size copy primitives) is not a tier and may still
+//! be emitted — disabling the tiers removes the dispatch, not every vector
+//! instruction.
 //!
 //! The packaged README is included below for the docs.rs landing page; the
 //! API anchors above link straight into the per-module documentation.

@@ -32,7 +32,10 @@ The decoder ships per-CPU-tier SIMD kernels, each behind a cargo feature
 mandatory fallback), so `kernel_scalar` is a marker that gates no code;
 disabling the SIMD tiers is what trims the binary. A scalar-only build —
 `--no-default-features` (or, equivalently, naming the marker explicitly) —
-drops every SIMD trampoline:
+compiles out the per-tier SIMD kernel dispatch and its BMI2/AVX2/VBMI2/NEON
+trampolines. Baseline SIMD the target ABI guarantees (SSE2 on x86_64, NEON on
+aarch64, used by the small fixed-size copy primitives) is not a tier and may
+still be emitted:
 
 ```bash
 cargo add structured-zstd --no-default-features --features kernel_scalar
