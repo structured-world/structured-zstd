@@ -247,7 +247,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// PEXT. Vendor-specific microcode regression remains a
     /// build-time concern there — pin a known-good target with
     /// `RUSTFLAGS="-C target-cpu=..."`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[inline(always)]
     pub(crate) fn use_pext_triple_fast(&self) -> bool {
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
@@ -497,7 +497,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// # Safety
     /// Caller MUST ensure BMI2 is available AND the running CPU
     /// benefits from `_pext_u64` (i.e. not Zen1/Zen2).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[target_feature(enable = "bmi2")]
     #[inline]
     pub(crate) unsafe fn peek_bits_triple_bmi2(

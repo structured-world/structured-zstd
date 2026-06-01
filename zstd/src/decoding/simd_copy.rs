@@ -609,17 +609,26 @@ fn detect_x86_caps() -> X86Caps {
         {
             use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
             match detect_cpu_kernel() {
+                #[cfg(feature = "kernel_vbmi2")]
                 CpuKernelTag::Vbmi2 => X86Caps {
                     avx512f: true,
                     avx2: true,
                     sse2: true,
                 },
+                #[cfg(feature = "kernel_avx2")]
                 CpuKernelTag::Avx2 => X86Caps {
                     avx512f: false,
                     avx2: true,
                     sse2: true,
                 },
-                CpuKernelTag::Bmi2 | CpuKernelTag::Sse2 => X86Caps {
+                #[cfg(feature = "kernel_bmi2")]
+                CpuKernelTag::Bmi2 => X86Caps {
+                    avx512f: false,
+                    avx2: false,
+                    sse2: true,
+                },
+                #[cfg(feature = "kernel_sse2")]
+                CpuKernelTag::Sse2 => X86Caps {
                     avx512f: false,
                     avx2: false,
                     sse2: true,

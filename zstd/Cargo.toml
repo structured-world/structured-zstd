@@ -60,7 +60,33 @@ rand = "0.10"
 zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
 
 [features]
-default = ["hash", "std"]
+default = [
+    "hash",
+    "std",
+    "kernel_scalar",
+    "kernel_sse2",
+    "kernel_bmi2",
+    "kernel_avx2",
+    "kernel_vbmi2",
+    "kernel_neon",
+    "kernel_sve",
+]
+# Per-CPU-tier decode kernel selection. The default build enables every
+# kernel and `detect_cpu_kernel()` picks the best at runtime (universal
+# binary). Constrained targets can trim the SIMD trampolines + their
+# dispatch arms by disabling the tiers they don't need; the scalar kernel
+# is always compiled as the fallback, so the lowest enabled tier always has
+# a backstop. Each feature only affects builds for its architecture (a
+# `kernel_avx2` flag is inert on aarch64, `kernel_neon` inert on x86), so
+# the all-on default is safe everywhere. The implication chain mirrors the
+# real ISA dependency: AVX2 implies BMI2 implies SSE2; SVE implies NEON.
+kernel_scalar = []
+kernel_sse2 = []
+kernel_bmi2 = ["kernel_sse2"]
+kernel_avx2 = ["kernel_bmi2"]
+kernel_vbmi2 = ["kernel_avx2"]
+kernel_neon = []
+kernel_sve = ["kernel_neon"]
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
 # Opt-in cache for FSE default tables on no-atomic targets. See
