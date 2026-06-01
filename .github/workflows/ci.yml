@@ -203,6 +203,15 @@ jobs:
       - name: Clippy (no_std + hash)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features hash -- -D warnings
+      # Embedded-minimal kernel trim: scalar kernel only, all SIMD tiers and
+      # their dispatch trampolines compiled out. Guards the kernel_* feature
+      # gating so a future change can't silently break the trimmed build.
+      - name: Clippy (embedded — kernel_scalar only)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,hash -- -D warnings
+      - name: Clippy (embedded_minimal — kernel_scalar + std)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,std,hash -- -D warnings
 
   codecov:
     needs: lint

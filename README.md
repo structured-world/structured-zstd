@@ -25,6 +25,24 @@ For `no_std` builds disable the default features:
 cargo add structured-zstd --no-default-features
 ```
 
+The decoder ships per-CPU-tier SIMD kernels, each behind a cargo feature
+(all on by default; the tier is picked at runtime with `std`, or at compile
+time from `target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
+`kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and `kernel_neon`,
+`kernel_sve` (aarch64). The scalar kernel is always compiled (it is the
+mandatory fallback), so `kernel_scalar` is a marker that gates no code;
+disabling the SIMD tiers is what trims the binary. A scalar-only build —
+`--no-default-features` (or, equivalently, naming the marker explicitly) —
+compiles out the per-tier SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON
+trampolines, and the explicit SSE2/NEON intrinsics in the small fixed-size
+copy primitives — all gated on the matching `kernel_*` feature. These features
+control the crate's own explicit SIMD only; the compiler's autovectorizer may
+still emit vector instructions from ordinary scalar code regardless:
+
+```bash
+cargo add structured-zstd --no-default-features --features kernel_scalar
+```
+
 Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com/structured-world/structured-zstd/blob/main/zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
 
 ## Status

@@ -1,7 +1,7 @@
 use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 use core::convert::TryInto;
 use core::marker::PhantomData;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 use std::sync::OnceLock;
 
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 /// by the BMI2 PEXT triple-extract path on x86-64 (where the mask is
 /// constructed once per call and then fed to `_pext_u64`), and by the
 /// tests that verify mask values directly.
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, all(target_arch = "x86_64", feature = "kernel_bmi2")))]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
@@ -80,28 +80,28 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[derive(Copy, Clone)]
 struct TripleExtractDispatch {
     use_pext: bool,
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 static TRIPLE_EXTRACT_DISPATCH: OnceLock<TripleExtractDispatch> = OnceLock::new();
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[inline(always)]
 fn should_use_pext(vendor: [u8; 12], family: u32) -> bool {
     vendor != *b"AuthenticAMD" || family != 0x17
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[inline(always)]
 fn triple_extract_dispatch() -> &'static TripleExtractDispatch {
     TRIPLE_EXTRACT_DISPATCH.get_or_init(detect_triple_extract_dispatch)
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
     use core::arch::x86_64::__cpuid;
     use std::arch::is_x86_feature_detected;
@@ -137,7 +137,7 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
 // `extract_triple_pext` directly via that path. Gating with
 // `#[cfg(test)]` keeps the helper available for the tests while
 // avoiding a `dead_code` warning under `-D warnings`.
-#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+#[cfg(all(test, feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[inline(always)]
 fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
     if !triple_extract_dispatch().use_pext {
@@ -147,7 +147,7 @@ fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Optio
     Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
     use core::arch::x86_64::_pext_u64;
@@ -224,7 +224,7 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     /// every sequence decode (thousands per block × many blocks per
     /// frame). One bool per `BitReaderReversed` lifetime, amortised
     /// across every `peek_bits_triple` in the same decode pass.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     pub(crate) use_pext_triple: bool,
 }
 
@@ -247,10 +247,10 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// PEXT. Vendor-specific microcode regression remains a
     /// build-time concern there — pin a known-good target with
     /// `RUSTFLAGS="-C target-cpu=..."`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[inline(always)]
     pub(crate) fn use_pext_triple_fast(&self) -> bool {
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
         {
             self.use_pext_triple
         }
@@ -268,7 +268,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
             bit_container: 0,
             extra_bits: 0,
             _kernel: PhantomData,
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
             use_pext_triple: triple_extract_dispatch().use_pext,
         }
     }
@@ -438,7 +438,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
         if self.use_pext_triple {
             // SAFETY: `use_pext_triple` was set in `new()` from
             // `triple_extract_dispatch().use_pext`, which only returns
@@ -497,7 +497,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// # Safety
     /// Caller MUST ensure BMI2 is available AND the running CPU
     /// benefits from `_pext_u64` (i.e. not Zen1/Zen2).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[target_feature(enable = "bmi2")]
     #[inline]
     pub(crate) unsafe fn peek_bits_triple_bmi2(
@@ -561,10 +561,10 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
 
 #[cfg(test)]
 mod test {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     use std::arch::is_x86_feature_detected;
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[inline]
     fn scalar_extract_triple(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
         let val3 = all_three & super::BIT_MASK[n3 as usize];
@@ -574,7 +574,7 @@ mod test {
         (val1, val2, val3)
     }
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[inline]
     fn next_test_value(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -766,7 +766,7 @@ mod test {
     /// `peek_bits_bmi2` MUST produce the same value as scalar `peek_bits`
     /// on every BMI2-capable CPU. Without parity the bmi2 fast-path
     /// chain (when wired) would silently corrupt FSE state.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[test]
     fn peek_bits_bmi2_matches_scalar() {
         if !is_x86_feature_detected!("bmi2") {
@@ -793,7 +793,7 @@ mod test {
     /// `peek_bits_triple_bmi2` MUST produce the same triple as the
     /// scalar variant for every width combination the FSE/HUF decoders
     /// can reach.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[test]
     fn peek_bits_triple_bmi2_matches_scalar() {
         if !is_x86_feature_detected!("bmi2") {
@@ -826,7 +826,7 @@ mod test {
         }
     }
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[test]
     fn should_use_pext_policy_table() {
         let cases = [
@@ -840,7 +840,7 @@ mod test {
         }
     }
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
     #[test]
     fn bmi2_triple_extract_matches_scalar_reference() {
         if !is_x86_feature_detected!("bmi2") {
