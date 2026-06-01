@@ -399,13 +399,15 @@ mod tests {
         );
     }
 
-    // Whole test gated on `std`: the `is_x86_feature_detected!`
+    // Gated on `std` AND `kernel_avx2`: the `is_x86_feature_detected!`
     // guard below is a no-op under `--no-default-features` (no std,
     // no runtime feature detection), so the test body would call
     // `Avx2Kernel::mask_lower_bits` unconditionally and SIGILL on any
-    // non-BMI2 CPU. Gating the test itself with `cfg(feature = "std")`
-    // ensures the runtime check is always live when the test compiles.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    // non-BMI2 CPU — hence `feature = "std"`. `Avx2Kernel` itself is
+    // `#[cfg(feature = "kernel_avx2")]`, so the test must also require
+    // that feature or a `std`-only trimmed build (`kernel_avx2` off)
+    // fails to compile against the undefined type.
+    #[cfg(all(target_arch = "x86_64", feature = "std", feature = "kernel_avx2"))]
     #[test]
     fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
         // Only run when BMI2 actually available — otherwise constructing
