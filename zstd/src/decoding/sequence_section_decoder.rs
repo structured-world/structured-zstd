@@ -126,6 +126,23 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             )
         }
         #[cfg(target_arch = "x86_64")]
+        CpuKernelTag::Sse2 => {
+            // SSE2 has no FSE-relevant divergence (no `_bzhi_u64`); the
+            // mask_lower_bits hot op is identical to Scalar. SSE2's only
+            // distinct body is match-copy (gated per-backend via
+            // SUPPORTS_INLINE_SEQUENCE_EXEC), not the sequence FSE walk,
+            // so route to the portable scalar sequence decoder.
+            super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+                section,
+                source,
+                fse,
+                buffer,
+                offset_hist,
+                literals_buffer,
+                rle_fallback_sequences,
+            )
+        }
+        #[cfg(target_arch = "x86_64")]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
             // `is_x86_feature_detected!("bmi2")` confirmed BMI2 is
