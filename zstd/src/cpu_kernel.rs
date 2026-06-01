@@ -83,9 +83,16 @@ impl CpuKernel for ScalarKernel {
     }
 }
 
+// The SSE2 tier exists in `CpuKernelTag` (it carries the 128-bit copy-chunk
+// choice for the unified copy dispatch) but needs no `CpuKernel` ZST yet: the
+// only trait method, `mask_lower_bits`, has no SSE2-specific form (SSE2 has no
+// bit-extract), so the Sse2 tag routes through the scalar bodies for the
+// FSE/HUF paths. A dedicated `Sse2Kernel` lands when `copy_chunk` moves onto
+// the trait.
+
 /// x86_64 BMI2-only kernel: `_bzhi_u64` for mask_lower_bits. Selected
 /// when the CPU has BMI2 but not the AVX2 SIMD width to upgrade to
-/// the Avx2 kernel. Treated as a stepping stone between Scalar and
+/// the Avx2 kernel. Treated as a stepping stone between Sse2 and
 /// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
 /// matches donor's gating).
 #[cfg(target_arch = "x86_64")]
@@ -221,6 +228,7 @@ const fn select_x86_kernel(
     has_avx512bw: bool,
     has_bmi2: bool,
     has_avx2: bool,
+    has_sse2: bool,
 ) -> CpuKernelTag {
     if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 && has_avx2 {
         return CpuKernelTag::Vbmi2;
@@ -230,6 +238,9 @@ const fn select_x86_kernel(
     }
     if has_bmi2 {
         return CpuKernelTag::Bmi2;
+    }
+    if has_sse2 {
+        return CpuKernelTag::Sse2;
     }
     CpuKernelTag::Scalar
 }
@@ -245,6 +256,8 @@ const fn select_x86_kernel(
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Sse2,
     #[cfg(target_arch = "x86_64")]
     Bmi2,
     #[cfg(target_arch = "x86_64")]
@@ -284,6 +297,7 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
             is_x86_feature_detected!("avx512bw"),
             is_x86_feature_detected!("bmi2"),
             is_x86_feature_detected!("avx2"),
+            is_x86_feature_detected!("sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]
@@ -320,6 +334,7 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
             cfg!(target_feature = "avx512bw"),
             cfg!(target_feature = "bmi2"),
             cfg!(target_feature = "avx2"),
+            cfg!(target_feature = "sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]
@@ -400,6 +415,7 @@ mod tests {
         let tag = select_x86_kernel(
             /* avx512vbmi2 */ true, /* avx512f */ true, /* avx512vl */ true,
             /* avx512bw */ true, /* bmi2 */ true, /* avx2 */ false,
+            /* sse2 */ true,
         );
         assert_ne!(
             tag,
@@ -412,7 +428,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
-        let tag = select_x86_kernel(true, true, true, true, true, true);
+        let tag = select_x86_kernel(true, true, true, true, true, true, true);
         assert_eq!(tag, CpuKernelTag::Vbmi2);
     }
 
@@ -420,8 +436,24 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn select_x86_kernel_avx2_baseline_picks_avx2() {
-        let tag = select_x86_kernel(false, false, false, false, true, true);
+        let tag = select_x86_kernel(false, false, false, false, true, true, true);
         assert_eq!(tag, CpuKernelTag::Avx2);
+    }
+
+    /// SSE2-only (no BMI2/AVX2) → Sse2, the x86_64 floor above Scalar.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_sse2_only_picks_sse2() {
+        let tag = select_x86_kernel(false, false, false, false, false, false, true);
+        assert_eq!(tag, CpuKernelTag::Sse2);
+    }
+
+    /// No SIMD flags at all → Scalar (off-x86_64 / pre-SSE2 x86).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn select_x86_kernel_no_features_picks_scalar() {
+        let tag = select_x86_kernel(false, false, false, false, false, false, false);
+        assert_eq!(tag, CpuKernelTag::Scalar);
     }
 
     #[test]

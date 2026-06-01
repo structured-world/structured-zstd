@@ -8,7 +8,9 @@ use core::arch::x86_64::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
 };
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+// Only the 32-bit x86 `detect_x86_caps` body queries CPU features at
+// runtime; the x86_64 body derives them from `detect_cpu_kernel()`.
+#[cfg(all(feature = "std", target_arch = "x86"))]
 use std::arch::is_x86_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::sync::OnceLock;
@@ -581,14 +583,62 @@ struct X86Caps {
     sse2: bool,
 }
 
+/// SIMD-copy capability flags for the chunked wildcopy dispatcher.
+///
+/// On `x86_64` these are DERIVED from the unified `detect_cpu_kernel()`
+/// tag rather than detected independently, so the whole crate has a
+/// single CPU-capability source of truth (the copy path can never
+/// disagree with the entropy/sequence path about the running CPU). The
+/// mapping follows the kernel ladder: Vbmi2 → 64/32/16-byte copies,
+/// Avx2 → 32/16, Bmi2 / Sse2 → 16, Scalar → none. One subtle
+/// consequence: an `avx512f`-but-not-VBMI2 CPU (e.g. Skylake-X) is
+/// tagged `Avx2`, so it uses the 32-byte `copy_avx2` chunk instead of
+/// the 64-byte `copy_avx512`. That is a negligible difference on match
+/// copies (which are short) and keeps the taxonomy single-axis; modern
+/// AVX-512 parts (Ice Lake+) carry VBMI2 and still reach `copy_avx512`.
+///
+/// On 32-bit `x86` the kernel tag carries no SIMD tiers (those are
+/// `x86_64`-gated), so this keeps its own runtime detection to preserve
+/// the SSE2 / AVX2 copy path there.
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline(always)]
 fn detect_x86_caps() -> X86Caps {
     static CAPS: OnceLock<X86Caps> = OnceLock::new();
-    *CAPS.get_or_init(|| X86Caps {
-        avx512f: is_x86_feature_detected!("avx512f"),
-        avx2: is_x86_feature_detected!("avx2"),
-        sse2: is_x86_feature_detected!("sse2"),
+    *CAPS.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
+            match detect_cpu_kernel() {
+                CpuKernelTag::Vbmi2 => X86Caps {
+                    avx512f: true,
+                    avx2: true,
+                    sse2: true,
+                },
+                CpuKernelTag::Avx2 => X86Caps {
+                    avx512f: false,
+                    avx2: true,
+                    sse2: true,
+                },
+                CpuKernelTag::Bmi2 | CpuKernelTag::Sse2 => X86Caps {
+                    avx512f: false,
+                    avx2: false,
+                    sse2: true,
+                },
+                CpuKernelTag::Scalar => X86Caps {
+                    avx512f: false,
+                    avx2: false,
+                    sse2: false,
+                },
+            }
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            X86Caps {
+                avx512f: is_x86_feature_detected!("avx512f"),
+                avx2: is_x86_feature_detected!("avx2"),
+                sse2: is_x86_feature_detected!("sse2"),
+            }
+        }
     })
 }
 
