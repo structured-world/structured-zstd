@@ -8491,14 +8491,16 @@ fn lazy_band_target_len_matches_donor_default_table() {
     }
 }
 
-/// Levels 13-15 mirror the reference btlazy2 search budget: `search_depth`
-/// equals `1 << cParams.searchLog` (16 / 32 / 64). We run them on the
+/// Levels 13-15 mirror the reference btlazy2 window/hash/chain/search
+/// budget from `clevels.h` table[0]: `search_depth == 1 << cParams.searchLog`
+/// (16 / 32 / 64) plus `window_log` / `hash_log` / `chain_log` equal to the
+/// reference `windowLog` / `hashLog` / `chainLog`. We run them on the
 /// hash-chain Lazy parser rather than a binary-tree finder, so they do not
 /// re-establish a strict ratio ladder above L12 on window-fitting inputs;
-/// keeping the table aligned holds speed near the reference and is the
-/// regression guard against re-inflating the budget.
+/// asserting the full row (not just `search_depth`) keeps the whole budget
+/// aligned and guards every field against silent drift.
 #[test]
-fn upper_lazy_band_search_depth_matches_donor_search_log() {
+fn upper_lazy_band_params_match_donor_default_table() {
     use zstd::zstd_safe::zstd_sys;
 
     for level in 13..=15i32 {
@@ -8512,6 +8514,21 @@ fn upper_lazy_band_search_depth_matches_donor_search_log() {
             "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
             params.hc.search_depth,
             1u32 << donor.searchLog
+        );
+        assert_eq!(
+            params.window_log as u32, donor.windowLog,
+            "L{level}: window_log ({}) must equal cParams.windowLog ({})",
+            params.window_log, donor.windowLog
+        );
+        assert_eq!(
+            params.hc.hash_log as u32, donor.hashLog,
+            "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
+            params.hc.hash_log, donor.hashLog
+        );
+        assert_eq!(
+            params.hc.chain_log as u32, donor.chainLog,
+            "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
+            params.hc.chain_log, donor.chainLog
         );
     }
 }
