@@ -174,20 +174,6 @@ const HC_CONFIG: HcConfig = HcConfig {
     target_len: HC_TARGET_LEN,
 };
 
-const BTOPT_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 23,
-    chain_log: 22,
-    search_depth: 32,
-    target_len: 256,
-};
-
-const BTULTRA_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 23,
-    chain_log: 23,
-    search_depth: 32,
-    target_len: 256,
-};
-
 const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     hash_log: 24,
     chain_log: 24,
@@ -280,7 +266,8 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 ///
 /// Each entry maps a zstd compression level to the best-available matcher
 /// backend and tuning knobs. High levels map to dedicated parse modes:
-/// btopt (16-17), btultra (18-19), btultra2 (20-22).
+/// btopt (16-17), btultra (18), btultra2 (19-22) — matching donor
+/// `clevels.h` (level 19 is `ZSTD_btultra2`, not plain btultra).
 ///
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
@@ -317,11 +304,11 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
     /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
     /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }, row: ROW_CONFIG },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }, row: ROW_CONFIG },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
     /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
@@ -2998,13 +2985,12 @@ impl HcMatchGenerator {
         &self,
         current_len: usize,
     ) -> bool {
-        // Donor `initStats_ultra` (the seed pass) is the BtUltra2-only
-        // first-pass dynamic stats refinement. With `S` plumbed in,
-        // every non-BtUltra2 monomorphisation drops both this call
-        // and the seed-pass body at codegen time — the const below
-        // resolves to `false` for Fast / Dfast / Greedy / Lazy /
-        // BtOpt / BtUltra and short-circuits the entire predicate.
-        if !(S::OPT_LEVEL == 2 && S::USE_HASH3) {
+        // The in-block two-pass dynamic-stats seed (`initStats_ultra`)
+        // is btultra2-only. `TWO_PASS_SEED` is `false` for every other
+        // strategy — including btultra, which now shares the hash3
+        // short-match probe but stays single-pass — so the seed call and
+        // its body drop at codegen time for all non-btultra2 kernels.
+        if !S::TWO_PASS_SEED {
             return false;
         }
         let HcBackend::Bt(bt) = &self.backend else {
@@ -3048,7 +3034,12 @@ impl HcMatchGenerator {
             tag,
             StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
         );
-        let next_hash3_log = if is_btultra2 {
+        // btultra and btultra2 both run the mls=3 hash3 short-match probe
+        // (clevels.h minMatch 3). The `is_btultra2` flag below stays
+        // exclusive to btultra2 because it tweaks the BT rebase boundary,
+        // not match finding.
+        let wants_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
+        let next_hash3_log = if wants_hash3 {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0
@@ -4622,14 +4613,18 @@ fn level_16_17_map_to_btopt_strategy() {
 }
 
 #[test]
-fn level_18_19_map_to_btultra_strategy() {
+fn level_18_maps_to_btultra_level_19_to_btultra2_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
+    // Donor `clevels.h` (srcSize > 256 KiB tier): level 18 = `ZSTD_btultra`,
+    // level 19 = `ZSTD_btultra2`. Level 19 was previously mapped to plain
+    // btultra, which under-searched (searchLog 6 vs 7) and lost ~3.7% ratio
+    // on the repo corpus.
     let p18 = resolve_level_params(CompressionLevel::Level(18), None);
     let p19 = resolve_level_params(CompressionLevel::Level(19), None);
     assert_eq!(p18.backend(), BackendTag::HashChain);
     assert_eq!(p19.backend(), BackendTag::HashChain);
     assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
-    assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
+    assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra2);
 }
 
 #[test]
@@ -4650,6 +4645,33 @@ fn level22_uses_donor_target_length_and_large_input_tables() {
     assert_eq!(params.hc.chain_log, 27);
     assert_eq!(params.hc.search_depth, 1 << 9);
     assert_eq!(params.hc.target_len, 999);
+}
+
+#[test]
+fn bt_levels_16_to_21_pin_clevels_params() {
+    // Pins the BT-level (window_log, hash_log, chain_log, search_depth,
+    // target_len) tuples so the clevels.h alignment cannot silently drift.
+    // Levels 16-20 mirror upstream `clevels.h` (srcSize > 256 KiB tier,
+    // search_depth = 1 << searchLog); level 21 intentionally keeps a deeper
+    // search_depth (512 vs upstream's 128) — it beats C on ratio there and
+    // the deeper walk is a deliberate ratio-positive divergence.
+    let expected = [
+        // (level, window_log, hash_log, chain_log, search_depth, target_len)
+        (16u8, 22u8, 22usize, 22usize, 32usize, 48usize),
+        (17, 23, 22, 23, 32, 64),
+        (18, 23, 22, 23, 64, 64),
+        (19, 23, 22, 24, 128, 256),
+        (20, 25, 23, 25, 128, 256),
+        (21, 26, 24, 24, 512, 256),
+    ];
+    for (level, wlog, hlog, clog, sd, tl) in expected {
+        let p = resolve_level_params(CompressionLevel::Level(level as i32), None);
+        assert_eq!(p.window_log, wlog, "level {level} window_log");
+        assert_eq!(p.hc.hash_log, hlog, "level {level} hash_log");
+        assert_eq!(p.hc.chain_log, clog, "level {level} chain_log");
+        assert_eq!(p.hc.search_depth, sd, "level {level} search_depth");
+        assert_eq!(p.hc.target_len, tl, "level {level} target_len");
+    }
 }
 
 #[test]
@@ -4753,8 +4775,8 @@ fn btultra2_profile_disables_small_offset_handicap() {
 fn btultra_profile_keeps_donor_search_depth_budget() {
     let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra>();
     assert_eq!(
-        p.max_chain_depth, 32,
-        "btultra should not cap chain depth below donor opt2 search budget"
+        p.max_chain_depth, 64,
+        "btultra chain-depth budget must match clevels.h level 18 searchLog 6 (1 << 6 = 64)"
     );
 }
 

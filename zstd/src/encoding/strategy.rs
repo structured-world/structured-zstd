@@ -61,7 +61,13 @@ pub(crate) trait Strategy: Copy + 'static {
     /// Match-finder backend this strategy runs on.
     const BACKEND: BackendTag;
 
-    /// Minimum match length the parser will produce.
+    /// Nominal minimum match length for this strategy, mirroring the
+    /// upstream `clevels.h` `searchLength` column (3 for btultra/btultra2,
+    /// where the mls=3 hash3 probe is active). Descriptive: the optimal
+    /// parser's actual acceptance floor is the crate-wide
+    /// `HC_OPT_MIN_MATCH_LEN` (= 3) and the row matcher uses
+    /// `ROW_MIN_MATCH_LEN`; this const documents the strategy's intent and
+    /// is not read on the hot path.
     const MIN_MATCH: usize;
 
     /// `accurate` flag for [`crate::encoding::cost_model::HcOptimalCostProfile`]
@@ -73,10 +79,17 @@ pub(crate) trait Strategy: Copy + 'static {
     /// favour decompression speed; disabled for BtUltra / BtUltra2.
     const FAVOR_SMALL_OFFSETS: bool;
 
-    /// Compile-time gate for the donor `static (mls==3)` short-match
-    /// probe inside `ZSTD_insertBtAndGetAllMatches`. Only BtUltra2
-    /// drives the hash3 table today.
+    /// Compile-time gate for the `static (mls==3)` short-match probe.
+    /// Both btultra and btultra2 search the hash3 table (their
+    /// `clevels.h` minMatch is 3); btopt does not (minMatch >= 4).
     const USE_HASH3: bool;
+
+    /// Whether the optimal parser runs the in-block two-pass dynamic
+    /// statistics seed (upstream `ZSTD_initStats_ultra`). Only btultra2
+    /// does this; btultra is single-pass even though it now shares the
+    /// hash3 short-match probe. Defaults to `false` so every other
+    /// strategy drops the seed-pass body at codegen time.
+    const TWO_PASS_SEED: bool = false;
 
     /// Whether the optimal parser walks the BT — `false` for Lazy2,
     /// `true` for BtOpt / BtUltra / BtUltra2.
@@ -202,34 +215,42 @@ impl Strategy for BtOpt {
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Levels 18-19 — donor `ZSTD_btultra`. BT + opt with refined price
-/// tables and no small-offset bias.
+/// Level 18 — upstream `ZSTD_btultra`. BT + opt with refined price
+/// tables and no small-offset bias; shares the mls=3 hash3 short-match
+/// probe but stays single-pass (no two-pass dynamic-stats seed).
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra;
 
 impl Strategy for BtUltra {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 4;
+    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
-    const USE_HASH3: bool = false;
+    // clevels.h level 18 minMatch = 3 → the hash3 short-match probe is
+    // active, same as btultra2. The two-pass seed stays btultra2-only
+    // (TWO_PASS_SEED defaults to false here).
+    const USE_HASH3: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    const MAX_CHAIN_DEPTH: usize = 32;
+    // 1 << searchLog for level 18 (clevels.h searchLog = 6). The BT walk
+    // caps compares at min(MAX_CHAIN_DEPTH, hc.search_depth); both must be
+    // >= 64 for level 18 to reach upstream search depth.
+    const MAX_CHAIN_DEPTH: usize = 64;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Levels 20-22 — donor `ZSTD_btultra2`. BT + opt with the two-pass
+/// Levels 19-22 — upstream `ZSTD_btultra2`. BT + opt with the two-pass
 /// dynamic-statistics seed and the hash3 short-match table.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra2;
 
 impl Strategy for BtUltra2 {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 4;
+    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
     const USE_HASH3: bool = true;
+    const TWO_PASS_SEED: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
     const MAX_CHAIN_DEPTH: usize = 512;
@@ -267,8 +288,8 @@ impl StrategyTag {
     ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
     ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
     /// * 16-17 → `BtOpt`
-    /// * 18-19 → `BtUltra`
-    /// * 20-22 → `BtUltra2`
+    /// * 18 → `BtUltra`
+    /// * 19-22 → `BtUltra2`
     pub(crate) const fn for_level(level: u8) -> Self {
         match level {
             1 | 2 => Self::Fast,
@@ -276,7 +297,8 @@ impl StrategyTag {
             5 => Self::Greedy,
             6..=15 => Self::Lazy,
             16 | 17 => Self::BtOpt,
-            18 | 19 => Self::BtUltra,
+            18 => Self::BtUltra,
+            19 => Self::BtUltra2,
             _ => Self::BtUltra2,
         }
     }
@@ -381,7 +403,9 @@ mod tests {
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
-        assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
+        // Donor `clevels.h` level 19 uses `ZSTD_btultra2` (searchLog 7,
+        // two-pass dynamic stats + hash3), not plain btultra.
+        assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra2);
         assert_eq!(StrategyTag::for_level(20), StrategyTag::BtUltra2);
         assert_eq!(StrategyTag::for_level(22), StrategyTag::BtUltra2);
     }
@@ -405,16 +429,20 @@ mod tests {
         assert!(BtUltra2::USE_BT);
     };
 
-    // `use_hash3_only_set_for_btultra2`: hash3 is exclusively a
-    // BtUltra2 feature (donor parity).
+    // hash3 short-match probe: active for btultra + btultra2 (clevels.h
+    // minMatch 3); btopt and below do not search it. The in-block
+    // two-pass dynamic-stats seed is btultra2-only.
     const _USE_HASH3_LAYOUT: () = {
         assert!(!Fast::USE_HASH3);
         assert!(!Dfast::USE_HASH3);
         assert!(!Greedy::USE_HASH3);
         assert!(!Lazy::USE_HASH3);
         assert!(!BtOpt::USE_HASH3);
-        assert!(!BtUltra::USE_HASH3);
+        assert!(BtUltra::USE_HASH3);
         assert!(BtUltra2::USE_HASH3);
+        assert!(!BtOpt::TWO_PASS_SEED);
+        assert!(!BtUltra::TWO_PASS_SEED);
+        assert!(BtUltra2::TWO_PASS_SEED);
     };
 
     // Mirror the per-strategy fields the optimal-parser cost profile
@@ -427,7 +455,8 @@ mod tests {
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
         assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
-        assert!(BtUltra::MAX_CHAIN_DEPTH == 32);
+        // 1 << searchLog for clevels.h level 18 (searchLog = 6).
+        assert!(BtUltra::MAX_CHAIN_DEPTH == 64);
         assert!(BtUltra2::MAX_CHAIN_DEPTH == 512);
         assert!(BtOpt::SUFFICIENT_MATCH_LEN == usize::MAX);
         assert!(BtUltra::SUFFICIENT_MATCH_LEN == usize::MAX);

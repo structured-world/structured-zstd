@@ -147,12 +147,16 @@ fn strategy_suffix(level: i32) -> &'static str {
              reaches this helper. Resolve to the canonical numeric level \
              before calling."
         ),
-        1 => "fast",
-        2 | 3 => "dfast",
-        4 => "greedy",
-        5..=15 => "lazy",
+        // Names mirror the encoder's actual per-level strategy
+        // (`StrategyTag::for_level`, itself a port of donor `clevels.h`
+        // for the srcSize > 256 KiB tier): 1-2 fast, 3-4 dfast, 5 greedy,
+        // 6-15 lazy, 16-17 btopt, 18 btultra, 19-22 btultra2.
+        1 | 2 => "fast",
+        3 | 4 => "dfast",
+        5 => "greedy",
+        6..=15 => "lazy",
         16 | 17 => "btopt",
-        18 | 19 => "btultra",
+        18 => "btultra",
         _ => "btultra2",
     }
 }
