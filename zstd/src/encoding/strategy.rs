@@ -270,8 +270,8 @@ impl StrategyTag {
     ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
     ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
     /// * 16-17 → `BtOpt`
-    /// * 18-19 → `BtUltra`
-    /// * 20-22 → `BtUltra2`
+    /// * 18 → `BtUltra`
+    /// * 19-22 → `BtUltra2`
     pub(crate) const fn for_level(level: u8) -> Self {
         match level {
             1 | 2 => Self::Fast,
