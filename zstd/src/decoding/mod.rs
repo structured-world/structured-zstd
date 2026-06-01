@@ -77,12 +77,12 @@ pub(crate) mod scratch;
 // helpers with no remaining callers; they should be cleaned up in
 // a follow-up PR once the per-kernel monolithic shape is fully
 // settled.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
 pub(crate) mod seq_decoder_avx2;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 pub(crate) mod seq_decoder_bmi2;
 pub(crate) mod seq_decoder_scalar;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
 pub(crate) mod seq_decoder_vbmi2;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;

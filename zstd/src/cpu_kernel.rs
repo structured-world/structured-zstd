@@ -95,11 +95,11 @@ impl CpuKernel for ScalarKernel {
 /// the Avx2 kernel. Treated as a stepping stone between Sse2 and
 /// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
 /// matches donor's gating).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Bmi2Kernel;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 impl CpuKernel for Bmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -116,11 +116,11 @@ impl CpuKernel for Bmi2Kernel {
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
 /// Uses `_bzhi_u64` for mask ops; future trait methods will use AVX2
 /// 256-bit moves for `copy_chunk` and pext for HUF burst.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Avx2Kernel;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
 impl CpuKernel for Avx2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -134,11 +134,11 @@ impl CpuKernel for Avx2Kernel {
 /// has the AVX-512 VBMI2 family available — VBMI2 unlocks a faster
 /// HUF burst inner loop (VPSHUFB-based table lookup); BMI2 mask_lower
 /// bits stays identical to Avx2 kernel.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Vbmi2Kernel;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
 impl CpuKernel for Vbmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -156,12 +156,12 @@ impl CpuKernel for Vbmi2Kernel {
 /// The struct + trait impl land first so the dispatch wiring can be
 /// added incrementally without churning the CpuKernel surface; until
 /// the dispatch arm uses it the type is reachable only as a phantom.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct NeonKernel;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
 impl CpuKernel for NeonKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -178,12 +178,12 @@ impl CpuKernel for NeonKernel {
 /// support. Mask op identical to NEON / Scalar.
 ///
 /// `#[allow(dead_code)]`: same scaffolding rationale as `NeonKernel`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "kernel_sve"))]
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct SveKernel;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "kernel_sve"))]
 impl CpuKernel for SveKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -197,7 +197,7 @@ impl CpuKernel for SveKernel {
 /// same shared body. With `#[inline]` LLVM inlines the call into
 /// any caller that itself has BMI2 in scope; outside that scope the
 /// target_feature boundary is preserved.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[target_feature(enable = "bmi2")]
 #[inline]
 unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
@@ -221,6 +221,11 @@ unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
 /// Likewise the Avx2 tier requires both AVX2 and BMI2.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+// Params go unused when the matching `kernel_*` feature is disabled (the
+// rung that consumes them is `#[cfg]`-ed out); they are still passed by the
+// detect callers. Silence the conditional unused-variable warning rather
+// than thread per-feature `_`-prefixes through the signature.
+#[allow(unused_variables)]
 const fn select_x86_kernel(
     has_avx512vbmi2: bool,
     has_avx512f: bool,
@@ -230,15 +235,19 @@ const fn select_x86_kernel(
     has_avx2: bool,
     has_sse2: bool,
 ) -> CpuKernelTag {
+    #[cfg(feature = "kernel_vbmi2")]
     if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 && has_avx2 {
         return CpuKernelTag::Vbmi2;
     }
+    #[cfg(feature = "kernel_avx2")]
     if has_avx2 && has_bmi2 {
         return CpuKernelTag::Avx2;
     }
+    #[cfg(feature = "kernel_bmi2")]
     if has_bmi2 {
         return CpuKernelTag::Bmi2;
     }
+    #[cfg(feature = "kernel_sse2")]
     if has_sse2 {
         return CpuKernelTag::Sse2;
     }
@@ -256,22 +265,26 @@ const fn select_x86_kernel(
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
     Sse2,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     Bmi2,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
     Avx2,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
     Vbmi2,
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
     Neon,
     // Both constructors of `Sve` need a reachable feature: runtime
     // detection via `std::arch::is_aarch64_feature_detected!` (so
     // `feature = "std"`) or compile-time `target_feature = "sve"` in
     // RUSTFLAGS. Without either, the variant is unreachable and a
     // `match` arm referencing it warns as dead.
-    #[cfg(all(target_arch = "aarch64", any(feature = "std", target_feature = "sve"),))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        feature = "kernel_sve",
+        any(feature = "std", target_feature = "sve"),
+    ))]
     Sve,
 }
 
@@ -290,22 +303,29 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::is_x86_feature_detected;
+        // Gate each probe on its tier feature: `cfg!(...)` const-folds, so the
+        // `&&` short-circuits away the runtime `is_x86_feature_detected!` call
+        // (and its CPUID/cache traffic) for tiers the build disabled — the
+        // matching `select_x86_kernel` rung is `#[cfg]`-ed out anyway.
         return select_x86_kernel(
-            is_x86_feature_detected!("avx512vbmi2"),
-            is_x86_feature_detected!("avx512f"),
-            is_x86_feature_detected!("avx512vl"),
-            is_x86_feature_detected!("avx512bw"),
-            is_x86_feature_detected!("bmi2"),
-            is_x86_feature_detected!("avx2"),
-            is_x86_feature_detected!("sse2"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512f"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vl"),
+            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512bw"),
+            cfg!(feature = "kernel_bmi2") && is_x86_feature_detected!("bmi2"),
+            cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
+            cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]
     {
+        #[cfg(any(feature = "kernel_sve", feature = "kernel_neon"))]
         use std::arch::is_aarch64_feature_detected;
+        #[cfg(feature = "kernel_sve")]
         if is_aarch64_feature_detected!("sve") {
             return CpuKernelTag::Sve;
         }
+        #[cfg(feature = "kernel_neon")]
         if is_aarch64_feature_detected!("neon") {
             return CpuKernelTag::Neon;
         }
@@ -339,11 +359,11 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "kernel_sve", target_feature = "sve"))]
         {
             return CpuKernelTag::Sve;
         }
-        #[cfg(target_feature = "neon")]
+        #[cfg(all(feature = "kernel_neon", target_feature = "neon"))]
         {
             return CpuKernelTag::Neon;
         }
@@ -379,13 +399,15 @@ mod tests {
         );
     }
 
-    // Whole test gated on `std`: the `is_x86_feature_detected!`
+    // Gated on `std` AND `kernel_avx2`: the `is_x86_feature_detected!`
     // guard below is a no-op under `--no-default-features` (no std,
     // no runtime feature detection), so the test body would call
     // `Avx2Kernel::mask_lower_bits` unconditionally and SIGILL on any
-    // non-BMI2 CPU. Gating the test itself with `cfg(feature = "std")`
-    // ensures the runtime check is always live when the test compiles.
-    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    // non-BMI2 CPU — hence `feature = "std"`. `Avx2Kernel` itself is
+    // `#[cfg(feature = "kernel_avx2")]`, so the test must also require
+    // that feature or a `std`-only trimmed build (`kernel_avx2` off)
+    // fails to compile against the undefined type.
+    #[cfg(all(target_arch = "x86_64", feature = "std", feature = "kernel_avx2"))]
     #[test]
     fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
         // Only run when BMI2 actually available — otherwise constructing
@@ -409,7 +431,7 @@ mod tests {
     /// previously selected as `Vbmi2`, which would SIGILL on the
     /// first AVX2-mixed VBMI2 kernel invocation. The selection must
     /// fall through to Scalar (or a non-AVX tier) in that case.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
     #[test]
     fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
         let tag = select_x86_kernel(
@@ -425,7 +447,7 @@ mod tests {
     }
 
     /// Sanity: when every flag is present the selector returns Vbmi2.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
     #[test]
     fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
         let tag = select_x86_kernel(true, true, true, true, true, true, true);
@@ -433,7 +455,7 @@ mod tests {
     }
 
     /// Sanity: AVX2 + BMI2 without AVX-512 → Avx2.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
     #[test]
     fn select_x86_kernel_avx2_baseline_picks_avx2() {
         let tag = select_x86_kernel(false, false, false, false, true, true, true);
@@ -441,7 +463,7 @@ mod tests {
     }
 
     /// SSE2-only (no BMI2/AVX2) → Sse2, the x86_64 floor above Scalar.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
     #[test]
     fn select_x86_kernel_sse2_only_picks_sse2() {
         let tag = select_x86_kernel(false, false, false, false, false, false, true);

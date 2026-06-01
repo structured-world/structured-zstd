@@ -14,6 +14,27 @@
 //! No FFI, no cmake, no system zstd. `no_std` builds are supported by
 //! disabling the default `std` feature.
 //!
+//! # CPU kernel features
+//!
+//! The decode hot paths ship per-CPU-tier SIMD kernels. With `std` the tier
+//! is chosen at runtime (CPU-feature detection, cached on first use); on
+//! `no_std` it is chosen at compile time from `cfg(target_feature)`.
+//! Each tier is gated by a cargo feature, all enabled by default (a universal
+//! binary that picks the best available tier per the above): `kernel_scalar`,
+//! `kernel_sse2`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
+//! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
+//! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse2`;
+//! `kernel_sve` implies `kernel_neon`). The scalar kernel is always compiled,
+//! so any subset is valid; a flag is inert on architectures it doesn't apply
+//! to. Constrained targets can shrink the binary by trimming tiers, e.g.
+//! `--no-default-features --features kernel_scalar` compiles out the per-tier
+//! SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON trampolines, and the
+//! explicit SSE2/NEON intrinsics in the small fixed-size copy primitives —
+//! all of which are gated on the matching `kernel_*` feature. The `kernel_*`
+//! features control the crate's own explicit SIMD; they do not constrain the
+//! compiler's autovectorizer, which may still emit vector instructions from
+//! ordinary scalar code regardless of the enabled tiers.
+//!
 //! The packaged README is included below for the docs.rs landing page; the
 //! API anchors above link straight into the per-module documentation.
 //!
