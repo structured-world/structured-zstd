@@ -17,25 +17,6 @@ use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, defa
 
 use crate::io::{Read, Write};
 
-/// An interface for compressing arbitrary data with the ZStandard compression algorithm.
-///
-/// `FrameCompressor` will generally be used by:
-/// 1. Initializing a compressor by providing a buffer of data using `FrameCompressor::new()`
-/// 2. Starting compression and writing that compression into a vec using `FrameCompressor::begin`
-///
-/// # Examples
-/// ```
-/// use structured_zstd::encoding::{FrameCompressor, CompressionLevel};
-/// let mock_data: &[_] = &[0x1, 0x2, 0x3, 0x4];
-/// let mut output = std::vec::Vec::new();
-/// // Initialize a compressor.
-/// let mut compressor = FrameCompressor::new(CompressionLevel::Uncompressed);
-/// compressor.set_source(mock_data);
-/// compressor.set_drain(&mut output);
-///
-/// // `compress` writes the compressed output into the provided buffer.
-/// compressor.compress();
-/// ```
 /// A dictionary prepared for the ENCODER side, analogous to zstd's `CDict`
 /// (vs the decoder's [`Dictionary`](crate::decoding::Dictionary) / `DDict`).
 ///
@@ -78,6 +59,25 @@ impl EncoderDictionary {
     }
 }
 
+/// An interface for compressing arbitrary data with the ZStandard compression algorithm.
+///
+/// `FrameCompressor` will generally be used by:
+/// 1. Initializing a compressor by providing a buffer of data using `FrameCompressor::new()`
+/// 2. Starting compression and writing that compression into a vec using `FrameCompressor::begin`
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::{FrameCompressor, CompressionLevel};
+/// let mock_data: &[_] = &[0x1, 0x2, 0x3, 0x4];
+/// let mut output = std::vec::Vec::new();
+/// // Initialize a compressor.
+/// let mut compressor = FrameCompressor::new(CompressionLevel::Uncompressed);
+/// compressor.set_source(mock_data);
+/// compressor.set_drain(&mut output);
+///
+/// // `compress` writes the compressed output into the provided buffer.
+/// compressor.compress();
+/// ```
 pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
