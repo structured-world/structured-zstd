@@ -40,6 +40,11 @@ enum RowTagKernel {
     Sse2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2,
+    // Little-endian only: the movemask packing reinterprets the lanes
+    // through u16/u32/u64, which groups bytes by native order — correct only
+    // on little-endian. Big-endian aarch64 falls back to the scalar kernel.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    Neon,
 }
 
 impl RowTagKernel {
@@ -71,6 +76,21 @@ impl RowTagKernel {
         {
             return RowTagKernel::Sse2;
         }
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return RowTagKernel::Neon;
+            }
+        }
+        #[cfg(all(
+            not(feature = "std"),
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon"
+        ))]
+        {
+            return RowTagKernel::Neon;
+        }
         RowTagKernel::Scalar
     }
 
@@ -87,6 +107,9 @@ impl RowTagKernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: SSE2 confirmed by `detect()` (always true on x86_64).
             RowTagKernel::Sse2 => unsafe { row_tag_match_mask_sse2(tags, tag) },
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            // SAFETY: NEON confirmed by `detect()` (baseline on aarch64).
+            RowTagKernel::Neon => unsafe { row_tag_match_mask_neon(tags, tag) },
             RowTagKernel::Scalar => row_tag_match_mask_scalar(tags, tag),
         }
     }
@@ -174,6 +197,48 @@ unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
         let eq = _mm_cmpeq_epi8(v, needle16);
         let bits = _mm_movemask_epi8(eq) as u16 as u64;
         mask |= bits << off;
+    }
+    mask
+}
+
+/// NEON tag-match mask: `vceqq_u8` against the broadcast tag, then a
+/// 16-byte-to-16-bit movemask (NEON has no direct equivalent, so pack the
+/// per-lane high bits with the progressive shift-right-accumulate sequence).
+/// `tags.len()` is a multiple of 16.
+///
+/// # Safety
+/// Caller must ensure NEON is available (baseline on aarch64; checked by
+/// `RowTagKernel::detect`).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
+    use core::arch::aarch64::{
+        vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vreinterpretq_u8_u64, vreinterpretq_u16_u8,
+        vreinterpretq_u32_u16, vreinterpretq_u64_u32, vshrq_n_u8, vsraq_n_u16, vsraq_n_u32,
+        vsraq_n_u64,
+    };
+
+    let needle = vdupq_n_u8(tag);
+    let mut mask = 0u64;
+    let mut off = 0;
+    while off + 16 <= tags.len() {
+        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte load is in bounds.
+        let v = unsafe { vld1q_u8(tags.as_ptr().add(off)) };
+        let eq = vceqq_u8(v, needle); // 0xFF per lane where equal, else 0x00.
+        // Collapse the 16 lanes' high bits into a 16-bit movemask, matching
+        // `_mm_movemask_epi8` lane order. Each `vsra` shifts a lane right and
+        // adds it into its neighbour, halving the live-lane count each step.
+        let high = vshrq_n_u8(eq, 7); // lane -> 1 if matched, else 0.
+        let paired16 = vreinterpretq_u32_u16(vsraq_n_u16(
+            vreinterpretq_u16_u8(high),
+            vreinterpretq_u16_u8(high),
+            7,
+        ));
+        let paired32 = vreinterpretq_u64_u32(vsraq_n_u32(paired16, paired16, 14));
+        let paired64 = vreinterpretq_u8_u64(vsraq_n_u64(paired32, paired32, 28));
+        let bits = (vgetq_lane_u8(paired64, 0) as u64) | ((vgetq_lane_u8(paired64, 8) as u64) << 8);
+        mask |= bits << off;
+        off += 16;
     }
     mask
 }
@@ -929,6 +994,39 @@ mod tag_mask_tests {
                         let got = unsafe { row_tag_match_mask_avx2(&tags, tag) };
                         assert_eq!(got, expected, "avx2 width={width} tag={tag}");
                     }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+mod neon_tag_mask_tests {
+    use super::{row_tag_match_mask_neon, row_tag_match_mask_scalar};
+
+    fn fill(buf: &mut [u8], mut state: u64) {
+        for b in buf.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 56) as u8;
+        }
+    }
+
+    /// The NEON kernel must produce byte-identical masks to the scalar
+    /// reference for every supported row width (16 / 32 / 64) and tag, so
+    /// match selection (and the compressed output) is unchanged on aarch64.
+    #[test]
+    fn neon_tag_mask_matches_scalar() {
+        for &width in &[16usize, 32, 64] {
+            let mut tags = alloc::vec![0u8; width];
+            for seed in 0..32u64 {
+                fill(&mut tags, 0x9e3779b97f4a7c15u64.wrapping_add(seed));
+                for tag in [tags[seed as usize % width], 0u8, 0xFF, (seed as u8)] {
+                    let expected = row_tag_match_mask_scalar(&tags, tag);
+                    // SAFETY: NEON is baseline on aarch64.
+                    let got = unsafe { row_tag_match_mask_neon(&tags, tag) };
+                    assert_eq!(got, expected, "neon width={width} tag={tag}");
                 }
             }
         }
