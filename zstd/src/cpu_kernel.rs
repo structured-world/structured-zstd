@@ -83,26 +83,12 @@ impl CpuKernel for ScalarKernel {
     }
 }
 
-/// x86_64 SSE2 baseline kernel. SSE2 is ABI-guaranteed on every
-/// x86_64 target, so this is the effective floor on x86_64 — the
-/// Scalar kernel is reached only off-x86_64 (or on the rare x86
-/// build without SSE2). SSE2 has no `_bzhi_u64`, so `mask_lower_bits`
-/// is identical to Scalar; the kernel's value is the 128-bit SIMD
-/// `copy_chunk` body (a 16-byte chunked copy) that diverges from the
-/// scalar 8-byte loop. Sits below Bmi2 in the kernel ladder.
-#[cfg(target_arch = "x86_64")]
-#[derive(Copy, Clone, Default)]
-pub(crate) struct Sse2Kernel;
-
-#[cfg(target_arch = "x86_64")]
-impl CpuKernel for Sse2Kernel {
-    #[inline(always)]
-    fn mask_lower_bits(value: u64, n: u8) -> u64 {
-        // SSE2 has no bit-extract instruction; the scalar shift-mask
-        // sequence is the best codegen here. Identical to ScalarKernel.
-        ScalarKernel::mask_lower_bits(value, n)
-    }
-}
+// The SSE2 tier exists in `CpuKernelTag` (it carries the 128-bit copy-chunk
+// choice for the unified copy dispatch) but needs no `CpuKernel` ZST yet: the
+// only trait method, `mask_lower_bits`, has no SSE2-specific form (SSE2 has no
+// bit-extract), so the Sse2 tag routes through the scalar bodies for the
+// FSE/HUF paths. A dedicated `Sse2Kernel` lands when `copy_chunk` moves onto
+// the trait.
 
 /// x86_64 BMI2-only kernel: `_bzhi_u64` for mask_lower_bits. Selected
 /// when the CPU has BMI2 but not the AVX2 SIMD width to upgrade to
