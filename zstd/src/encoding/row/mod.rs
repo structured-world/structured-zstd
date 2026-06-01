@@ -517,7 +517,7 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Donor-parity greedy parse for `lazy_depth == 0` (level 4).
+    /// Donor-parity greedy parse for `lazy_depth == 0` (level 5).
     ///
     /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
     /// `depth == 0`, `dictMode == ZSTD_noDict`. The structural features
@@ -544,10 +544,13 @@ impl RowMatchGenerator {
     ///    iteration, and the longer match wins (ties go to rep for
     ///    cheaper encoding via [`best_len_offset_candidate`]). Donor
     ///    can afford pure commit-on-first-rep because it recovers any
-    ///    ratio loss via `minMatch = 5` and superblock-level entropy
-    ///    sharing; we don't replicate those yet, so the hybrid form
-    ///    avoids a measured ~3pp ratio cliff on decodecorpus while
-    ///    still skipping the donor `lazy_depth == 1` lookahead probe
+    ///    ratio loss via superblock-level entropy sharing, which we
+    ///    don't replicate yet, so the hybrid form avoids a measured
+    ///    ratio cliff on decodecorpus. (The row accept floor itself now
+    ///    matches donor's `minMatch = 5` via `ROW_MIN_MATCH_LEN`; the
+    ///    remaining un-replicated piece is the cross-block entropy
+    ///    sharing, not the match-length threshold.) The hybrid form
+    ///    still skips the donor `lazy_depth == 1` lookahead probe
     ///    that [`start_matching`] above runs unconditionally — the
     ///    speed shape stays donor-like.
     ///
@@ -593,18 +596,18 @@ impl RowMatchGenerator {
 
         // Donor mls for repcode probes is 4 (`MEM_read32` compare on
         // `ip+1` against `ip+1-offset_1`, length extended by
-        // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 6`
+        // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 5`
         // gates the *regular* search via the row-table layout; rep
         // probes are independent of the row table and benefit from
-        // the lower donor threshold (a 4-5 byte rep is cheap to
+        // the lower donor threshold (a 4-byte rep is cheap to
         // encode and frequently outperforms emitting the bytes as
         // literals).
         const REP_MIN_MATCH_LEN: usize = 4;
         // Outer-loop lookahead floor: at least `REP_MIN_MATCH_LEN + 1`
-        // bytes left so the `abs_pos + 1` repcode probe can succeed
-        // even in the block tail. Gating the loop on the stricter
-        // `ROW_MIN_MATCH_LEN` (6) would miss the last 5-byte rep-only
-        // case and let those bytes fall through as literals.
+        // bytes left so the `abs_pos + 1` repcode probe can succeed even
+        // in the block tail (the rep probe needs `REP_MIN_MATCH_LEN`
+        // bytes one position ahead). This keeps the tail 4-byte rep-only
+        // case from falling through as literals.
         const GREEDY_MIN_LOOKAHEAD: usize = REP_MIN_MATCH_LEN + 1;
 
         let mut pos = 0usize;
