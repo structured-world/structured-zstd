@@ -321,6 +321,26 @@ impl<E: FseEntry> FSETableImpl<E> {
         Ok(bytes_read)
     }
 
+    /// Parse the table description into `symbol_probabilities` +
+    /// `accuracy_log` WITHOUT building the decoding table.
+    ///
+    /// Returns the same byte count as [`Self::build_decoder`] (the table
+    /// description length), so a caller stepping a cursor over a packed
+    /// stream of tables advances identically. Used by the encoder
+    /// dictionary load: [`Self::to_encoder_table`] reads only the
+    /// probabilities + accuracy log, so building the decode table (and
+    /// the `enrich_*` post-passes, which touch only decode entries) is
+    /// pure waste there.
+    pub fn read_table_probabilities(
+        &mut self,
+        source: &[u8],
+        max_log: u8,
+    ) -> Result<usize, FSETableError> {
+        let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
+        self.accuracy_log = 0;
+        self.read_probabilities(source, max_log)
+    }
+
     /// Given the provided accuracy log, build a decoding table from that log.
     pub fn build_from_probabilities(
         &mut self,

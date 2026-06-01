@@ -85,6 +85,30 @@ impl Dictionary {
     /// and returns a fully constructed [`Dictionary`] whose `id` can be
     /// checked against the frame's `dict_id`.
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        Self::decode_dict_inner(raw, true)
+    }
+
+    /// Parse a dictionary for ENCODER use: builds the entropy
+    /// probabilities/weights needed by `to_encoder_table` but skips the
+    /// FSE *decoding* tables and their `enrich_*` post-passes, which the
+    /// encoder never reads. Produces a [`Dictionary`] whose
+    /// `symbol_probabilities` / `accuracy_log` (and HUF weights) match
+    /// `decode_dict` exactly, so the encoder entropy tables — and thus
+    /// the emitted frame — are byte-identical; only the wasted decode
+    /// table build is dropped. Offset history + content are parsed the
+    /// same way.
+    pub fn decode_dict_for_encoding(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        Self::decode_dict_inner(raw, false)
+    }
+
+    /// Shared dictionary parser. `build_decode_tables` selects whether the
+    /// FSE tables get their full decoding table + `enrich_*` passes (decoder
+    /// path) or only the probability parse (encoder path — see
+    /// [`Self::decode_dict_for_encoding`]).
+    fn decode_dict_inner(
+        raw: &[u8],
+        build_decode_tables: bool,
+    ) -> Result<Dictionary, DictionaryDecodeError> {
         const MIN_MAGIC_AND_ID_LEN: usize = 8;
         const OFFSET_HISTORY_LEN: usize = 12;
 
@@ -120,31 +144,55 @@ impl Dictionary {
         let huf_size = new_dict.huf.table.build_decoder(raw_tables)?;
         let raw_tables = &raw_tables[huf_size as usize..];
 
-        let of_size = new_dict.fse.offsets.build_decoder(
-            raw_tables,
-            crate::decoding::sequence_section_decoder::OF_MAX_LOG,
-        )?;
-        new_dict.fse.offsets.enrich_for_offsets();
+        let of_size = if build_decode_tables {
+            let n = new_dict.fse.offsets.build_decoder(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::OF_MAX_LOG,
+            )?;
+            new_dict.fse.offsets.enrich_for_offsets();
+            n
+        } else {
+            new_dict.fse.offsets.read_table_probabilities(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::OF_MAX_LOG,
+            )?
+        };
         let raw_tables = &raw_tables[of_size..];
 
-        let ml_size = new_dict.fse.match_lengths.build_decoder(
-            raw_tables,
-            crate::decoding::sequence_section_decoder::ML_MAX_LOG,
-        )?;
-        new_dict
-            .fse
-            .match_lengths
-            .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::ML_META);
+        let ml_size = if build_decode_tables {
+            let n = new_dict.fse.match_lengths.build_decoder(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::ML_MAX_LOG,
+            )?;
+            new_dict
+                .fse
+                .match_lengths
+                .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::ML_META);
+            n
+        } else {
+            new_dict.fse.match_lengths.read_table_probabilities(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::ML_MAX_LOG,
+            )?
+        };
         let raw_tables = &raw_tables[ml_size..];
 
-        let ll_size = new_dict.fse.literal_lengths.build_decoder(
-            raw_tables,
-            crate::decoding::sequence_section_decoder::LL_MAX_LOG,
-        )?;
-        new_dict
-            .fse
-            .literal_lengths
-            .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::LL_META);
+        let ll_size = if build_decode_tables {
+            let n = new_dict.fse.literal_lengths.build_decoder(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::LL_MAX_LOG,
+            )?;
+            new_dict
+                .fse
+                .literal_lengths
+                .enrich_with_packed_seq_meta(&crate::decoding::sequence_section_decoder::LL_META);
+            n
+        } else {
+            new_dict.fse.literal_lengths.read_table_probabilities(
+                raw_tables,
+                crate::decoding::sequence_section_decoder::LL_MAX_LOG,
+            )?
+        };
         let raw_tables = &raw_tables[ll_size..];
 
         if raw_tables.len() < OFFSET_HISTORY_LEN {

@@ -1153,7 +1153,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         raw_dictionary: &[u8],
     ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
     {
-        let dictionary = crate::decoding::Dictionary::decode_dict(raw_dictionary)?;
+        // Encoder-only parse: skips the FSE decoding-table build + enrich
+        // passes the encoder never reads (see `decode_dict_for_encoding`).
+        // The probabilities/weights feeding `to_encoder_table` are identical
+        // to `decode_dict`, so the emitted frame is byte-for-byte unchanged.
+        let dictionary = crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?;
         self.set_dictionary(dictionary)
     }
 
