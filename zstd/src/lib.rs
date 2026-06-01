@@ -28,11 +28,12 @@
 //! so any subset is valid; a flag is inert on architectures it doesn't apply
 //! to. Constrained targets can shrink the binary by trimming tiers, e.g.
 //! `--no-default-features --features kernel_scalar` compiles out the per-tier
-//! SIMD kernel dispatch and its BMI2/AVX2/VBMI2/NEON trampolines. Baseline
-//! SIMD that the target ABI guarantees (e.g. SSE2 on x86_64, NEON on aarch64,
-//! used by the small fixed-size copy primitives) is not a tier and may still
-//! be emitted — disabling the tiers removes the dispatch, not every vector
-//! instruction.
+//! SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON trampolines, and the
+//! explicit SSE2/NEON intrinsics in the small fixed-size copy primitives —
+//! all of which are gated on the matching `kernel_*` feature. The `kernel_*`
+//! features control the crate's own explicit SIMD; they do not constrain the
+//! compiler's autovectorizer, which may still emit vector instructions from
+//! ordinary scalar code regardless of the enabled tiers.
 //!
 //! The packaged README is included below for the docs.rs landing page; the
 //! API anchors above link straight into the per-module documentation.

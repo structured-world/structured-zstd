@@ -33,10 +33,11 @@ time from `target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
 mandatory fallback), so `kernel_scalar` is a marker that gates no code;
 disabling the SIMD tiers is what trims the binary. A scalar-only build —
 `--no-default-features` (or, equivalently, naming the marker explicitly) —
-compiles out the per-tier SIMD kernel dispatch and its BMI2/AVX2/VBMI2/NEON
-trampolines. Baseline SIMD the target ABI guarantees (SSE2 on x86_64, NEON on
-aarch64, used by the small fixed-size copy primitives) is not a tier and may
-still be emitted:
+compiles out the per-tier SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON
+trampolines, and the explicit SSE2/NEON intrinsics in the small fixed-size
+copy primitives — all gated on the matching `kernel_*` feature. These features
+control the crate's own explicit SIMD only; the compiler's autovectorizer may
+still emit vector instructions from ordinary scalar code regardless:
 
 ```bash
 cargo add structured-zstd --no-default-features --features kernel_scalar
