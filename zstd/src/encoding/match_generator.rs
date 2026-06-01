@@ -1309,11 +1309,21 @@ impl Matcher for MatchGeneratorDriver {
                 });
             }
             MatcherStorage::HashChain(m) => {
+                // MatchTable::add_data now recycles the *incoming* buffer
+                // through `reuse_space` (its bytes are copied into the
+                // contiguous `history` mirror), so the callback no longer
+                // reports evicted chunks. Derive the eviction delta from
+                // `window_size` before/after, exactly like the Simple arm:
+                // `evicted = pre + space_len - post`.
+                let pre = m.table.window_size;
+                let space_len = space.len();
                 m.table.add_data(space, |mut data| {
-                    evicted_bytes += data.len();
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
+                evicted_bytes += pre
+                    .saturating_add(space_len)
+                    .saturating_sub(m.table.window_size);
             }
         }
         // Gate the second backend trim pass on actual budget
@@ -7296,6 +7306,39 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         driver.hc_matcher().table.max_window_size,
         base_window,
         "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn hc_commit_without_eviction_retires_no_dictionary_budget() {
+    // Regression: after the window<->history dedup, MatchTable::add_data
+    // invokes its reuse_space callback for the *input* buffer (recycle),
+    // not for evicted chunks. The HC arm of commit_space must therefore
+    // derive eviction bytes from the window_size delta — counting the
+    // callback argument as evicted would charge the whole committed block
+    // as "evicted" and prematurely retire dictionary budget even when the
+    // window is nowhere near full.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Better);
+    // A large live window so a small committed block evicts nothing.
+    driver.hc_matcher_mut().table.max_window_size = 1 << 20;
+    driver.reported_window_size = 1 << 20;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    let budget_after_prime = driver.dictionary_retained_budget;
+    assert!(
+        budget_after_prime > 0,
+        "priming must retain a non-zero dictionary budget"
+    );
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"AAAAAAAA");
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+
+    assert_eq!(
+        driver.dictionary_retained_budget, budget_after_prime,
+        "a commit that evicts nothing must retire no dictionary budget"
     );
 }
 

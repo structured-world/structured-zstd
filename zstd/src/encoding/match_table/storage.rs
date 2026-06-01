@@ -468,14 +468,14 @@ impl MatchTable {
         };
     }
 
-    /// Append a freshly committed buffer to the rolling window. Evicts
-    /// the oldest slices until the new total fits inside
-    /// `max_window_size`, hands them back through `reuse_space` for
-    /// pool reuse, then extends the contiguous `history` mirror.
-    ///
-    /// History duplicates window data for O(1) contiguous access during
-    /// match finding (`common_prefix_len`, `extend_backwards`). Peak:
-    /// ~2x window size for data buffers + 6 MB tables.
+    /// Append a freshly committed buffer to the rolling window. Drops
+    /// chunk-length entries for the oldest slices until the new total
+    /// fits inside `max_window_size`, extends the contiguous `history`
+    /// mirror with the new bytes, then hands the *input* buffer back
+    /// through `reuse_space` for pool reuse — `history` now owns the
+    /// bytes, so the input buffer carries no live data. (Callers must
+    /// therefore treat the callback as recycle-only, not as an eviction
+    /// report; eviction bytes come from the `window_size` delta.)
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
@@ -644,8 +644,10 @@ impl MatchTable {
     /// hash3 tables themselves are zeroed in place (via
     /// `Vec::fill(HC_EMPTY)`) if they're already sized; otherwise
     /// they're left empty so the next `ensure_tables()` call resizes
-    /// them. Window buffers are drained through `reuse_space` so the
-    /// driver can recycle them across frames.
+    /// them. The window is now just `chunk_lens` (the bytes live in
+    /// `history`, cleared above), so there are no per-block buffers to
+    /// drain; `_reuse_space` is retained only for caller signature
+    /// compatibility and is intentionally unused.
     pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
         self.chunk_lens.clear();
