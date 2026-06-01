@@ -887,7 +887,14 @@ impl RowMatchGenerator {
     }
 }
 
-#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+// Gated on `feature = "std"` because the runtime feature probe
+// (`std::arch::is_x86_feature_detected!`) used to skip kernels the host CPU
+// lacks is std-only, matching how `RowTagKernel::detect` gates the same probe.
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 mod tag_mask_tests {
     use super::{row_tag_match_mask_avx2, row_tag_match_mask_scalar, row_tag_match_mask_sse2};
 
