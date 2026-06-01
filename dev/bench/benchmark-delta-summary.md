@@ -2,6 +2,6 @@
 
 Canonical rows merged across benchmark targets.
 
-- `i686-gnu`: 810 delta rows, 1685 relative rows
-- `x86_64-gnu`: 810 delta rows, 1685 relative rows
-- `x86_64-musl`: 810 delta rows, 1685 relative rows
+- `i686-gnu`: 801 delta rows, 1685 relative rows
+- `x86_64-gnu`: 801 delta rows, 1685 relative rows
+- `x86_64-musl`: 801 delta rows, 1685 relative rows
