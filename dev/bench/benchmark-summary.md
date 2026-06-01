@@ -6,6 +6,6 @@ Generated from CI benchmark matrix artifacts.
 
 | Target | Relative rows | Delta rows |
 | --- | ---: | ---: |
-| `i686-gnu` | 1598 | 810 |
-| `x86_64-gnu` | 1598 | 810 |
-| `x86_64-musl` | 1598 | 810 |
+| `i686-gnu` | 1685 | 810 |
+| `x86_64-gnu` | 1685 | 810 |
+| `x86_64-musl` | 1685 | 810 |
