@@ -321,7 +321,13 @@ pub(crate) unsafe fn copy_bytes_overshooting(
 
     #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        #[cfg(all(target_feature = "avx512f", feature = "kernel_vbmi2"))]
+        // Gate the 64-byte copy on `avx512vbmi2`, not bare `avx512f`, to
+        // match the std tag ladder: `detect_x86_caps` sets `avx512f` (→ 64B)
+        // only for the `Vbmi2` tag, so an `avx512f`-but-not-VBMI2 target
+        // (e.g. `-C target-cpu=skylake-avx512`) is the `Avx2` tier and uses
+        // the 32B copy. Using bare `avx512f` here would diverge — no_std
+        // would emit 64B copies where std emits 32B on the same CPU.
+        #[cfg(all(target_feature = "avx512vbmi2", feature = "kernel_vbmi2"))]
         try_chunk_kernel!(64, copy_avx512);
         #[cfg(all(target_feature = "avx2", feature = "kernel_avx2"))]
         try_chunk_kernel!(32, copy_avx2);
