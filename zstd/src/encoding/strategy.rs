@@ -52,6 +52,20 @@ pub(crate) enum BackendTag {
     HashChain,
 }
 
+/// Which parse loop a [`Strategy`] runs. Decouples the match-finder
+/// (hash chain / row / binary tree) from the parser cadence so a
+/// BT-backed strategy can run either the lazy commit loop (`BtLazy`)
+/// or the optimal cost parser (`Optimal`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParseMode {
+    /// Hash-chain / row lazy or greedy commit loop (Fast/Dfast/Greedy/Lazy).
+    Lazy,
+    /// Lazy commit loop over the binary-tree finder (BtLazy2).
+    BtLazy,
+    /// Optimal cost-model parser over the binary tree (BtOpt/BtUltra/BtUltra2).
+    Optimal,
+}
+
 /// Compile-time encoder strategy. Each concrete implementor is a ZST
 /// whose associated `const`s tell the optimal parser / match finder
 /// which donor-equivalent path to execute. Hot entry points are
@@ -78,9 +92,19 @@ pub(crate) trait Strategy: Copy + 'static {
     /// drives the hash3 table today.
     const USE_HASH3: bool;
 
-    /// Whether the optimal parser walks the BT — `false` for Lazy2,
-    /// `true` for BtOpt / BtUltra / BtUltra2.
+    /// Whether the binary tree is maintained as the match-finder.
+    /// `false` for Fast/Dfast/Greedy/Lazy (hash chain / row), `true`
+    /// for BtLazy2 (lazy parse + BT finder) and BtOpt/BtUltra/BtUltra2
+    /// (optimal parser + BT finder). Distinguish the two BT flavours via
+    /// [`Strategy::PARSE_MODE`].
     const USE_BT: bool;
+
+    /// Which parse loop drives this strategy. Decouples "BT tree is
+    /// live" (`USE_BT`) from "optimal cost parser runs": BtLazy2 has
+    /// `USE_BT == true` but `PARSE_MODE == ParseMode::BtLazy`, so it
+    /// runs the lazy commit loop over the BT finder, never the optimal
+    /// parser.
+    const PARSE_MODE: ParseMode;
 
     /// Donor `optLevel` (0 = btopt, 2 = btultra / btultra2). Drives the
     /// `opt_level >= 2` price-table refinement in
@@ -108,6 +132,7 @@ impl Strategy for Fast {
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
+    const PARSE_MODE: ParseMode = ParseMode::Lazy;
     const OPT_LEVEL: u8 = 0;
     // `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are placeholder
     // values for non-BT strategies — the trait associated consts
@@ -135,6 +160,7 @@ impl Strategy for Dfast {
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
+    const PARSE_MODE: ParseMode = ParseMode::Lazy;
     const OPT_LEVEL: u8 = 0;
     // Placeholder optimal-parser consts; see `Fast` for the
     // unreachable-by-design contract.
@@ -153,6 +179,7 @@ impl Strategy for Greedy {
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
+    const PARSE_MODE: ParseMode = ParseMode::Lazy;
     const OPT_LEVEL: u8 = 0;
     // Placeholder optimal-parser consts; see `Fast` for the
     // unreachable-by-design contract.
@@ -174,6 +201,7 @@ impl Strategy for Lazy {
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
+    const PARSE_MODE: ParseMode = ParseMode::Lazy;
     const OPT_LEVEL: u8 = 0;
     // Lazy is HashChain-backed but `USE_BT == false`, so the optimal
     // parser entry point is unreachable for this strategy. These
@@ -197,6 +225,7 @@ impl Strategy for BtOpt {
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = true;
+    const PARSE_MODE: ParseMode = ParseMode::Optimal;
     const OPT_LEVEL: u8 = 0;
     const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
@@ -214,6 +243,7 @@ impl Strategy for BtUltra {
     const FAVOR_SMALL_OFFSETS: bool = false;
     const USE_HASH3: bool = false;
     const USE_BT: bool = true;
+    const PARSE_MODE: ParseMode = ParseMode::Optimal;
     const OPT_LEVEL: u8 = 2;
     const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
@@ -231,8 +261,38 @@ impl Strategy for BtUltra2 {
     const FAVOR_SMALL_OFFSETS: bool = false;
     const USE_HASH3: bool = true;
     const USE_BT: bool = true;
+    const PARSE_MODE: ParseMode = ParseMode::Optimal;
     const OPT_LEVEL: u8 = 2;
     const MAX_CHAIN_DEPTH: usize = 512;
+    const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
+}
+
+/// Levels 13-15 — donor `ZSTD_btlazy2`. The lazy parse (depth 2) but
+/// the per-position finder is the binary tree instead of the hash
+/// chain (donor `ZSTD_compressBlock_lazy_generic(search_binaryTree,
+/// depth=2)`). Unlike `BtOpt`/`BtUltra*`, this is NOT the optimal
+/// cost-model parser — it is the same greedy/lazy commit loop as
+/// `Lazy`, only the match-finder differs. So `USE_BT` is true (the BT
+/// tree is maintained) but `OPT_LEVEL` semantics do not apply; the
+/// `PARSE_MODE` discriminator routes it to the BT-lazy parse, not the
+/// optimal parser.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct BtLazy2;
+
+impl Strategy for BtLazy2 {
+    const BACKEND: BackendTag = BackendTag::HashChain;
+    const MIN_MATCH: usize = 4;
+    const ACCURATE_PRICE: bool = false;
+    const FAVOR_SMALL_OFFSETS: bool = true;
+    const USE_HASH3: bool = false;
+    const USE_BT: bool = true;
+    const PARSE_MODE: ParseMode = ParseMode::BtLazy;
+    const OPT_LEVEL: u8 = 0;
+    // BT-lazy maintains the tree but runs the lazy commit loop, not the
+    // optimal parser, so the optimal-only cost consts are placeholders
+    // (same unreachable-by-design contract as the non-optimal strategies
+    // above — the optimal parser never runs for BtLazy2).
+    const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
@@ -247,6 +307,7 @@ pub(crate) enum StrategyTag {
     Dfast,
     Greedy,
     Lazy,
+    BtLazy2,
     BtOpt,
     BtUltra,
     BtUltra2,
@@ -315,7 +376,9 @@ impl StrategyTag {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
             Self::Greedy => BackendTag::Row,
-            Self::Lazy | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
+            Self::Lazy | Self::BtLazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
+                BackendTag::HashChain
+            }
         }
     }
 }

@@ -43,7 +43,11 @@ fn min_literals_to_compress(
         return 6;
     }
     let shift: u32 = match strategy {
-        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => 3,
+        StrategyTag::Fast
+        | StrategyTag::Dfast
+        | StrategyTag::Greedy
+        | StrategyTag::Lazy
+        | StrategyTag::BtLazy2 => 3,
         StrategyTag::BtOpt => 2,
         StrategyTag::BtUltra => 1,
         StrategyTag::BtUltra2 => 0,

@@ -1351,6 +1351,7 @@ impl Matcher for MatchGeneratorDriver {
             StrategyTag::Dfast => self.compress_block::<strategy::Dfast>(&mut handle_sequence),
             StrategyTag::Greedy => self.compress_block::<strategy::Greedy>(&mut handle_sequence),
             StrategyTag::Lazy => self.compress_block::<strategy::Lazy>(&mut handle_sequence),
+            StrategyTag::BtLazy2 => self.compress_block::<strategy::BtLazy2>(&mut handle_sequence),
             StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
             StrategyTag::BtUltra => self.compress_block::<strategy::BtUltra>(&mut handle_sequence),
             StrategyTag::BtUltra2 => {
@@ -3125,6 +3126,7 @@ impl HcMatchGenerator {
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
                 self.start_matching_lazy(&mut handle_sequence)
             }
+            StrategyTag::BtLazy2 => self.start_matching_btlazy(&mut handle_sequence),
             StrategyTag::BtOpt => {
                 self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
             }
@@ -3151,15 +3153,20 @@ impl HcMatchGenerator {
         &mut self,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
+        use super::strategy::ParseMode;
         debug_assert_eq!(
             self.table.uses_bt,
             S::USE_BT,
             "Strategy::USE_BT disagrees with runtime table.uses_bt at HC dispatch"
         );
-        if S::USE_BT {
-            self.start_matching_optimal::<S>(handle_sequence)
-        } else {
-            self.start_matching_lazy(handle_sequence)
+        match S::PARSE_MODE {
+            // Hash-chain lazy / lazy2 commit loop.
+            ParseMode::Lazy => self.start_matching_lazy(handle_sequence),
+            // Lazy commit loop, but the finder is the binary tree
+            // (donor btlazy2 = lazy_generic(search_binaryTree, depth=2)).
+            ParseMode::BtLazy => self.start_matching_btlazy(handle_sequence),
+            // Optimal cost-model parser over the binary tree.
+            ParseMode::Optimal => self.start_matching_optimal::<S>(handle_sequence),
         }
     }
 
@@ -3220,6 +3227,25 @@ impl HcMatchGenerator {
                 literals: &current[literals_start..],
             });
         }
+    }
+
+    /// Lazy commit loop over the binary-tree finder — the parse for
+    /// `StrategyTag::BtLazy2` (reference `ZSTD_compressBlock_lazy_generic`
+    /// with `search_binaryTree`, depth 2). Same commit cadence as
+    /// [`Self::start_matching_lazy`], but the per-position match finder
+    /// is the binary tree instead of the hash chain.
+    ///
+    /// SCAFFOLD: currently delegates to the hash-chain lazy parse so the
+    /// strategy is wired end-to-end and produces correct output while the
+    /// dedicated BT single-best finder is built (the collect path that
+    /// `collect_optimal_candidates` exposes for `<BtLazy2, false>` walks
+    /// the BT, but driving it in the lazy cadence needs the tree-update /
+    /// skip-window handling threaded through — landing next). `for_level`
+    /// does NOT route any level here yet, so this path is currently
+    /// unreached in production; the delegation guarantees correctness if a
+    /// test constructs BtLazy2 directly.
+    fn start_matching_btlazy(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        self.start_matching_lazy(handle_sequence);
     }
 
     fn start_matching_optimal<S: super::strategy::Strategy>(
@@ -3696,6 +3722,14 @@ impl HcMatchGenerator {
                 ),
             StrategyTag::BtOpt => self
                 .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
+            StrategyTag::BtLazy2 => self
+                .collect_optimal_candidates_initialized::<strategy::BtLazy2, false>(
                     abs_pos,
                     current_abs_end,
                     profile,
