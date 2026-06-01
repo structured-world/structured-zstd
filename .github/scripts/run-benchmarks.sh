@@ -139,6 +139,28 @@ bench_target_label = os.environ.get("BENCH_TARGET_LABEL", "host")
 bench_target_triple = os.environ.get("BENCH_TARGET_TRIPLE", "")
 bench_target_id = os.environ.get("BENCH_TARGET_ID", bench_target_label)
 commit_sha = os.environ.get("GITHUB_SHA")
+# Commit subject for the dashboard snapshot selector — picking a run by
+# date alone is hard, so each record carries the one-line message too.
+# Prefer an explicit env override; otherwise read the subject from git
+# (CI checks out the repo, so this resolves in the benchmark job).
+commit_message = os.environ.get("STRUCTURED_ZSTD_BENCH_COMMIT_MESSAGE")
+if not commit_message:
+    import subprocess
+
+    try:
+        commit_message = subprocess.run(
+            ["git", "log", "-1", "--format=%s", commit_sha or "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        commit_message = None
+# Normalize to a single trimmed line. An env override may carry trailing
+# newlines / surrounding whitespace from CI step output, and a stray
+# newline flowing into the JSON would break the dashboard option layout.
+commit_message = commit_message.strip() if commit_message else ""
+commit_message = commit_message.splitlines()[0].strip() if commit_message else None
 generated_at = os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT") or datetime.now(timezone.utc).isoformat()
 timing_point_count = 0
 
@@ -631,6 +653,7 @@ for key in all_keys:
                 "target_label": bench_target_label,
                 "target_triple": bench_target_triple or None,
                 "commit_sha": commit_sha,
+                "commit_message": commit_message,
                 "generated_at": generated_at,
             },
         }
@@ -650,6 +673,7 @@ for row in delta_rows:
         "source": params["source"],
         "key": row["key"],
         "commit_sha": row["meta"]["commit_sha"],
+        "commit_message": row["meta"].get("commit_message"),
         "generated_at": row["meta"]["generated_at"],
     }
 
@@ -728,6 +752,7 @@ for row in memory_rows:
             "source": source,
             "key": canonical_key(stage, row["scenario"], row["level"], source),
             "commit_sha": commit_sha,
+            "commit_message": commit_message,
             "generated_at": generated_at,
             # Both sides feed the SAME pair of atomic counters in
             # `compare_ffi_memory`: Rust-side via the
@@ -774,6 +799,7 @@ for row in dictionary_rows:
             "source": None,
             "key": canonical_key("compress-dict", row["scenario"], row["level"], None),
             "commit_sha": commit_sha,
+            "commit_message": commit_message,
             "generated_at": generated_at,
             "metric": "compression_ratio",
             "rust_value": rust_ratio,
@@ -797,6 +823,7 @@ relative_payload = {
         "delta_high": DELTA_HIGH,
     },
     "commit_sha": commit_sha,
+    "commit_message": commit_message,
     "generated_at": generated_at,
     "records": relative_rows,
 }
