@@ -1201,8 +1201,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Validate `enc`, build the encoder entropy cache from it, store it, and
-    /// return the previously-attached dictionary. Shared by `set_dictionary`
-    /// and `set_dictionary_from_bytes`.
+    /// return the previously-attached dictionary. Shared by every public
+    /// attach entry point: `set_dictionary`, `set_dictionary_from_bytes`, and
+    /// `set_encoder_dictionary`.
     fn attach_dictionary(
         &mut self,
         enc: EncoderDictionary,
