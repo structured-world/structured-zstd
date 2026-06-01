@@ -156,7 +156,11 @@ if not commit_message:
         ).stdout.strip()
     except Exception:
         commit_message = None
-commit_message = commit_message or None
+# Normalize to a single trimmed line. An env override may carry trailing
+# newlines / surrounding whitespace from CI step output, and a stray
+# newline flowing into the JSON would break the dashboard option layout.
+commit_message = commit_message.strip() if commit_message else ""
+commit_message = commit_message.splitlines()[0].strip() if commit_message else None
 generated_at = os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT") or datetime.now(timezone.utc).isoformat()
 timing_point_count = 0
 

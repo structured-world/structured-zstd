@@ -1721,6 +1721,14 @@
         return row.generated_at || row.commit_sha || "local-run";
       }
 
+      // Single-line, length-capped commit subject for display. Guards the
+      // layout against stray newlines (first line only) and very long
+      // subjects (72-char clip) wherever a commit message is shown.
+      function clipSubject(msg) {
+        const firstLine = String(msg).split("\n", 1)[0].trim();
+        return firstLine.length > 72 ? `${firstLine.slice(0, 71)}…` : firstLine;
+      }
+
       // Decorate a snapshot stamp with its commit subject for display in the
       // selectors. The option `value` stays the raw stamp (filters match on
       // it); only the visible text gains the message. Long subjects are
@@ -1728,8 +1736,7 @@
       function snapshotOptionText(stamp) {
         const msg = state.snapshotMessages && state.snapshotMessages.get(stamp);
         if (!msg) return stamp;
-        const trimmed = msg.length > 72 ? `${msg.slice(0, 71)}…` : msg;
-        return `${stamp} · ${trimmed}`;
+        return `${stamp} · ${clipSubject(msg)}`;
       }
 
       function repopulateSnapshotOptions() {
@@ -1922,7 +1929,7 @@
         }
         const latestSha = (latest.commit_sha || "local-run").slice(0, 12);
         el("stat-commit").textContent = latest.commit_message
-          ? `${latestSha} · ${latest.commit_message}`
+          ? `${latestSha} · ${clipSubject(latest.commit_message)}`
           : latestSha;
         el("stat-snapshot").textContent = latest.generated_at || "n/a";
 
