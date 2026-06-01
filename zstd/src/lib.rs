@@ -18,7 +18,7 @@
 //!
 //! The decode hot paths ship per-CPU-tier SIMD kernels selected at runtime.
 //! Each tier is gated by a cargo feature, all enabled by default (a universal
-//! binary that detects the best kernel at startup): `kernel_scalar`,
+//! binary that detects the best kernel once on first use, cached): `kernel_scalar`,
 //! `kernel_sse2`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
 //! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
 //! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse2`;
