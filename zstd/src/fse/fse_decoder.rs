@@ -338,7 +338,11 @@ impl<E: FseEntry> FSETableImpl<E> {
     /// otherwise pass whenever the old `decode.len()` still equalled
     /// `1 << accuracy_log`). After this call the table is intentionally
     /// non-decodable until `build_decoding_table` runs.
-    pub fn read_table_probabilities(
+    // `pub(crate)`: this leaves the table in an intentionally non-decodable
+    // partial-init state, so it must not be reachable from the public API
+    // (the module is re-exported with `pub use`). Only the crate-internal
+    // encoder-dictionary parse calls it.
+    pub(crate) fn read_table_probabilities(
         &mut self,
         source: &[u8],
         max_log: u8,
