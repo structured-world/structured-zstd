@@ -8481,12 +8481,12 @@ fn lazy_band_target_len_matches_donor_default_table() {
     for level in 5..=15i32 {
         // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
         // call with any (level, srcSize, dictSize) combination.
-        let donor = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         assert_eq!(
-            params.hc.target_len as u32, donor.targetLength,
+            params.hc.target_len as u32, reference.targetLength,
             "L{level}: hc.target_len ({}) must match reference cParams.targetLength ({})",
-            params.hc.target_len, donor.targetLength
+            params.hc.target_len, reference.targetLength
         );
     }
 }
@@ -8506,29 +8506,29 @@ fn upper_lazy_band_params_match_donor_default_table() {
     for level in 13..=15i32 {
         // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
         // call with any (level, srcSize, dictSize) combination.
-        let donor = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         assert_eq!(
             params.hc.search_depth as u32,
-            1u32 << donor.searchLog,
+            1u32 << reference.searchLog,
             "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
             params.hc.search_depth,
-            1u32 << donor.searchLog
+            1u32 << reference.searchLog
         );
         assert_eq!(
-            params.window_log as u32, donor.windowLog,
+            params.window_log as u32, reference.windowLog,
             "L{level}: window_log ({}) must equal cParams.windowLog ({})",
-            params.window_log, donor.windowLog
+            params.window_log, reference.windowLog
         );
         assert_eq!(
-            params.hc.hash_log as u32, donor.hashLog,
+            params.hc.hash_log as u32, reference.hashLog,
             "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
-            params.hc.hash_log, donor.hashLog
+            params.hc.hash_log, reference.hashLog
         );
         assert_eq!(
-            params.hc.chain_log as u32, donor.chainLog,
+            params.hc.chain_log as u32, reference.chainLog,
             "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
-            params.hc.chain_log, donor.chainLog
+            params.hc.chain_log, reference.chainLog
         );
     }
 }
