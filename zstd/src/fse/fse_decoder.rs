@@ -331,6 +331,13 @@ impl<E: FseEntry> FSETableImpl<E> {
     /// probabilities + accuracy log, so building the decode table (and
     /// the `enrich_*` post-passes, which touch only decode entries) is
     /// pure waste there.
+    ///
+    /// The existing `decode` table is cleared so a reused `FSETableImpl`
+    /// can't silently keep decoding against a stale table that no longer
+    /// matches the just-parsed probabilities (`init_state` would
+    /// otherwise pass whenever the old `decode.len()` still equalled
+    /// `1 << accuracy_log`). After this call the table is intentionally
+    /// non-decodable until `build_decoding_table` runs.
     pub fn read_table_probabilities(
         &mut self,
         source: &[u8],
@@ -338,6 +345,7 @@ impl<E: FseEntry> FSETableImpl<E> {
     ) -> Result<usize, FSETableError> {
         let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
         self.accuracy_log = 0;
+        self.decode.clear();
         self.read_probabilities(source, max_log)
     }
 
