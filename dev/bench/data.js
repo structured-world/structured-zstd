@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780317665387,
+  "lastUpdate": 1780321272739,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -52346,6 +52346,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df2388776ef65d43fee4efc4fffe29956b5f1395",
+          "message": "perf(encode): align levels 13-15 to reference search budget (#302)\n\n* perf(encode): restore monotonic level ladder for hash-chain levels 13-15\n\nLevels 13-15 ran the hash-chain Lazy parser with search_depth=32 /\ntarget_len=32 — identical to level 12 — so L12-15 produced byte-identical\noutput on inputs that fit the window (e.g. the 1 MiB decode corpus). The\nlevel ladder collapsed: asking for level 15 gave exactly level 12's\nresult.\n\nThe reference uses btlazy2 (a binary-tree finder) at 13-15, where a small\nsearchLog is offset by the tree; on our hash-chain parser the per-level\nbudget must instead grow. Set search_depth/target_len to 64/48, 128/64,\n256/128 for L13/14/15 so each level searches strictly harder than the one\nbelow. On decodecorpus-z000033 the ratio ladder is now monotonic\n(L13 477280 > L14 476826 > L15 476529, was a flat 477966) and still beats\nthe reference output size.\n\nAdd lazy_upper_band_ladder_is_monotonic to guard the invariant, and narrow\nlazy_band_target_len_matches_donor_default_table to 5-12 (13-15 now\ndeliberately diverge from the reference targetLength because they use a\ndifferent finder).\n\nPart of #247.\n\n* perf(encode): align levels 13-15 to reference search budget\n\nThe prior approach inflated search_depth to 64/128/256 to force a strictly\nmonotonic ratio ladder on the hash-chain Lazy parser. That made levels 13-15\n3-4x slower than the C path while only the reference's binary-tree finder\ncan turn a small searchLog into longer matches cheaply.\n\nMirror the reference table instead: search_depth = 1<<searchLog (16/32/64),\ntarget_len = 32, with the reference window/hash/chain logs. Levels 13-15 no\nlonger re-establish a strict ratio ladder above L12 on window-fitting inputs\n(the hash-chain finder cannot, without the tree), but they run close to the\nreference speed and keep the table aligned so per-level perf divergences are\ndirectly comparable. A true binary-tree finder for these levels is tracked\nseparately.\n\nExtend lazy_band_target_len_matches_donor_default_table to 5-15 (all now\nmatch the reference targetLength) and replace the monotonic-ladder test with\nupper_lazy_band_search_depth_matches_donor_search_log guarding the aligned\nsearch budget.\n\nPart of #247.\n\n* test(encode): assert full L13-15 budget against reference cParams\n\nThe level-ladder regression guard only checked search_depth, but the\nreference-aligned L13-15 rows also pin window_log / hash_log / chain_log to\nthe reference clevels.h values. Assert those three fields against\nZSTD_getCParams too (renaming the test to reflect it now covers the whole\nrow), so any field drifting away from the reference is caught, not just the\nsearch budget.\n\n* test(encode): annotate the search-budget shift with an explicit u32\n\nThe L13-15 budget assertion left `1 << donor.searchLog` to infer its type\nfrom the assert_eq! context. Spell it `1u32 << donor.searchLog` (matching\nthe message arm just below) so the shift's type is explicit and can't\nsilently change if the surrounding comparison is refactored.\n\n* test(encode): rename the cParams local to reference, not donor\n\nThe two lazy-band level-table tests stored the ZSTD_getCParams result in a\nlocal named donor while their doc comments and assertion messages call it\nthe reference. Rename the local to reference so the terminology is\nconsistent within each test and failure messages read cleanly. Names\nshould describe the value, not its origin.",
+          "timestamp": "2026-06-01T15:23:57+03:00",
+          "tree_id": "434327d23ea27896a0b94ca436634b6426b7355b",
+          "url": "https://github.com/structured-world/structured-zstd/commit/df2388776ef65d43fee4efc4fffe29956b5f1395"
+        },
+        "date": 1780321266700,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 316.44,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 269.039,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.552,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.571,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.739,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.041,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.618,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.98,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 14.824,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.745,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.67,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.285,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.679,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.763,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
