@@ -15,7 +15,11 @@ use std::arch::is_x86_feature_detected;
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::sync::OnceLock;
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    feature = "kernel_neon"
+))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 
 /// Diagnostic-only copy-shape histogram. Compiled out unless the
@@ -472,7 +476,11 @@ pub(crate) unsafe fn copy_bytes_overshooting_avx2(
 #[inline(always)]
 unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len <= 16);
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel_neon"
+    ))]
     unsafe {
         let v: uint8x16_t = vld1q_u8(src);
         vst1q_u8(dst, v);
@@ -488,7 +496,8 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2"
+        target_feature = "sse2",
+        feature = "kernel_sse2"
     ))]
     unsafe {
         copy_sse2(src, dst, 16);
@@ -500,12 +509,16 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     //
     // Reachability matrix (kept here so any future arch arm slotted
     // between the existing arms knows it must terminate with `return`
-    // or its code will be silently dead):
-    //   • aarch64+neon                                 → arm above returns
-    //   • std + x86/x86_64 + runtime-SSE2              → arm above returns
-    //   • std + x86/x86_64 + NO runtime-SSE2           → reaches here
-    //   • no-std + x86/x86_64 + target_feature=sse2    → arm above returns
-    //   • no-std + x86/x86_64 + NO target_feature=sse2 → reaches here
+    // or its code will be silently dead). The explicit-SIMD arms are
+    // gated on the matching `kernel_*` feature so a `kernel_scalar` trim
+    // falls through to the portable path (matching the chunked-copy
+    // dispatch above):
+    //   • aarch64+neon + kernel_neon                   → arm above returns
+    //   • aarch64+neon, NO kernel_neon                 → reaches here
+    //   • std + x86/x86_64 + runtime-SSE2 tag          → arm above returns
+    //   • std + x86/x86_64 + Scalar tag (no SSE2)      → reaches here
+    //   • no-std + x86 + target_feature sse2+kernel_sse2 → arm above returns
+    //   • no-std + x86, kernel_sse2 off (or no sse2)   → reaches here
     //   • any other arch (riscv64, wasm32, …)          → reaches here
     // Anything new MUST `return` from its own arm before this comment.
     #[allow(unreachable_code)]
@@ -691,8 +704,13 @@ fn detect_x86_caps() -> X86Caps {
     })
 }
 
+// `#[allow(dead_code)]`: every call site (the chunked dispatch + the
+// `single_op_copy_16` fast path) is gated on `feature = "kernel_sse2"` in
+// no-std builds, so a `kernel_scalar`-only trim leaves this with no callers.
+// The `std` path reaches it via the runtime `detect_x86_caps` dispatch.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
