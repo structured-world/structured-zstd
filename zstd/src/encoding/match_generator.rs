@@ -8510,7 +8510,7 @@ fn upper_lazy_band_params_match_donor_default_table() {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         assert_eq!(
             params.hc.search_depth as u32,
-            1 << donor.searchLog,
+            1u32 << donor.searchLog,
             "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
             params.hc.search_depth,
             1u32 << donor.searchLog
