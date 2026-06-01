@@ -276,7 +276,8 @@ impl StrategyTag {
             5 => Self::Greedy,
             6..=15 => Self::Lazy,
             16 | 17 => Self::BtOpt,
-            18 | 19 => Self::BtUltra,
+            18 => Self::BtUltra,
+            19 => Self::BtUltra2,
             _ => Self::BtUltra2,
         }
     }
@@ -381,7 +382,9 @@ mod tests {
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
-        assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
+        // Donor `clevels.h` level 19 uses `ZSTD_btultra2` (searchLog 7,
+        // two-pass dynamic stats + hash3), not plain btultra.
+        assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra2);
         assert_eq!(StrategyTag::for_level(20), StrategyTag::BtUltra2);
         assert_eq!(StrategyTag::for_level(22), StrategyTag::BtUltra2);
     }

@@ -280,7 +280,8 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 ///
 /// Each entry maps a zstd compression level to the best-available matcher
 /// backend and tuning knobs. High levels map to dedicated parse modes:
-/// btopt (16-17), btultra (18-19), btultra2 (20-22).
+/// btopt (16-17), btultra (18), btultra2 (19-22) — matching donor
+/// `clevels.h` (level 19 is `ZSTD_btultra2`, not plain btultra).
 ///
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
@@ -320,7 +321,7 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
     /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
     /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
@@ -4622,14 +4623,18 @@ fn level_16_17_map_to_btopt_strategy() {
 }
 
 #[test]
-fn level_18_19_map_to_btultra_strategy() {
+fn level_18_maps_to_btultra_level_19_to_btultra2_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
+    // Donor `clevels.h` (srcSize > 256 KiB tier): level 18 = `ZSTD_btultra`,
+    // level 19 = `ZSTD_btultra2`. Level 19 was previously mapped to plain
+    // btultra, which under-searched (searchLog 6 vs 7) and lost ~3.7% ratio
+    // on the repo corpus.
     let p18 = resolve_level_params(CompressionLevel::Level(18), None);
     let p19 = resolve_level_params(CompressionLevel::Level(19), None);
     assert_eq!(p18.backend(), BackendTag::HashChain);
     assert_eq!(p19.backend(), BackendTag::HashChain);
     assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
-    assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra);
+    assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra2);
 }
 
 #[test]
