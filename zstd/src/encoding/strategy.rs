@@ -324,9 +324,11 @@ impl StrategyTag {
     /// * 1-2 → `Fast`
     /// * 3-4 → `Dfast`
     /// * 5 → `Greedy`
-    /// * 6-15 → `Lazy` (donor splits 6/7=lazy, 8-12=lazy2,
-    ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
-    ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
+    /// * 6-12 → `Lazy` (reference splits 6/7=lazy, 8-12=lazy2; we
+    ///   collapse both onto `Lazy` and carry the lazy_depth variance
+    ///   via `LevelParams.lazy_depth`)
+    /// * 13-15 → `BtLazy2` (reference `btlazy2`: lazy parse over the
+    ///   binary-tree finder)
     /// * 16-17 → `BtOpt`
     /// * 18-19 → `BtUltra`
     /// * 20-22 → `BtUltra2`
@@ -335,7 +337,8 @@ impl StrategyTag {
             1 | 2 => Self::Fast,
             3 | 4 => Self::Dfast,
             5 => Self::Greedy,
-            6..=15 => Self::Lazy,
+            6..=12 => Self::Lazy,
+            13..=15 => Self::BtLazy2,
             16 | 17 => Self::BtOpt,
             18 | 19 => Self::BtUltra,
             _ => Self::BtUltra2,
@@ -440,7 +443,9 @@ mod tests {
         assert_eq!(StrategyTag::for_level(4), StrategyTag::Dfast);
         assert_eq!(StrategyTag::for_level(5), StrategyTag::Greedy);
         assert_eq!(StrategyTag::for_level(9), StrategyTag::Lazy);
-        assert_eq!(StrategyTag::for_level(15), StrategyTag::Lazy);
+        assert_eq!(StrategyTag::for_level(12), StrategyTag::Lazy);
+        assert_eq!(StrategyTag::for_level(13), StrategyTag::BtLazy2);
+        assert_eq!(StrategyTag::for_level(15), StrategyTag::BtLazy2);
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
@@ -454,18 +459,32 @@ mod tests {
     // `clippy::assertions_on_constants` requires this form for
     // const-only inputs.
 
-    // `use_bt_aligns_with_parse_mode`: Lazy2 strategies must not walk
-    // the BT; BtOpt / BtUltra / BtUltra2 must. Invariant that lets
-    // the inner optimal parser drop the `if self.parse_mode == Lazy2
-    // …` branch in favour of `if !S::USE_BT`.
+    // `use_bt_aligns_with_parse_mode`: hash-chain / row strategies must
+    // not walk the BT; the three BT-finder strategies must. BtLazy2 also
+    // walks the BT (USE_BT) but runs the lazy commit loop, not the
+    // optimal parser — the `PARSE_MODE` discriminator separates it from
+    // BtOpt/BtUltra*. The matching `_PARSE_MODE_LAYOUT` block below pins
+    // that split.
     const _USE_BT_LAYOUT: () = {
         assert!(!Fast::USE_BT);
         assert!(!Dfast::USE_BT);
         assert!(!Greedy::USE_BT);
         assert!(!Lazy::USE_BT);
+        assert!(BtLazy2::USE_BT);
         assert!(BtOpt::USE_BT);
         assert!(BtUltra::USE_BT);
         assert!(BtUltra2::USE_BT);
+    };
+
+    // `parse_mode_layout`: BtLazy2 is the only USE_BT strategy that runs
+    // the lazy commit loop (`ParseMode::BtLazy`); the optimal-parser
+    // strategies are `ParseMode::Optimal`; the hash-chain/row ones are
+    // `ParseMode::Lazy`.
+    const _PARSE_MODE_LAYOUT: () = {
+        assert!(matches!(Lazy::PARSE_MODE, ParseMode::Lazy));
+        assert!(matches!(BtLazy2::PARSE_MODE, ParseMode::BtLazy));
+        assert!(matches!(BtOpt::PARSE_MODE, ParseMode::Optimal));
+        assert!(matches!(BtUltra2::PARSE_MODE, ParseMode::Optimal));
     };
 
     // `use_hash3_only_set_for_btultra2`: hash3 is exclusively a

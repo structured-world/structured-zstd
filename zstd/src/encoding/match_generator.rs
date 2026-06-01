@@ -306,9 +306,9 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
     /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
     /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtLazy2, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtLazy2, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtLazy2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
     /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
@@ -3039,7 +3039,10 @@ impl HcMatchGenerator {
         let is_btultra2 = tag == StrategyTag::BtUltra2;
         let uses_bt = matches!(
             tag,
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+            StrategyTag::BtLazy2
+                | StrategyTag::BtOpt
+                | StrategyTag::BtUltra
+                | StrategyTag::BtUltra2
         );
         let next_hash3_log = if is_btultra2 {
             HC3_HASH_LOG.min(window_log as usize)
@@ -3235,17 +3238,164 @@ impl HcMatchGenerator {
     /// [`Self::start_matching_lazy`], but the per-position match finder
     /// is the binary tree instead of the hash chain.
     ///
-    /// SCAFFOLD: currently delegates to the hash-chain lazy parse so the
-    /// strategy is wired end-to-end and produces correct output while the
-    /// dedicated BT single-best finder is built (the collect path that
-    /// `collect_optimal_candidates` exposes for `<BtLazy2, false>` walks
-    /// the BT, but driving it in the lazy cadence needs the tree-update /
-    /// skip-window handling threaded through — landing next). `for_level`
-    /// does NOT route any level here yet, so this path is currently
-    /// unreached in production; the delegation guarantees correctness if a
-    /// test constructs BtLazy2 directly.
-    fn start_matching_btlazy(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        self.start_matching_lazy(handle_sequence);
+    /// Single best match from the binary-tree finder at `abs_pos`,
+    /// including the rep-code probe. Collects the candidate ladder via
+    /// the `<BtLazy2, false>` BT path (which also advances the tree's
+    /// `next_to_update` up to `abs_pos`) and returns the longest match,
+    /// ties broken toward the smaller offset — the same preference the
+    /// hash-chain `better_candidate` applies.
+    fn bt_find_best_match(
+        &mut self,
+        abs_pos: usize,
+        lit_len: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        scratch: &mut Vec<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        scratch.clear();
+        let query = HcCandidateQuery {
+            reps: self.table.offset_hist,
+            lit_len,
+            ldm_candidate: None,
+        };
+        self.collect_optimal_candidates_initialized::<super::strategy::BtLazy2, false>(
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            scratch,
+        );
+        scratch.iter().copied().reduce(|best, c| {
+            if c.match_len > best.match_len
+                || (c.match_len == best.match_len && c.offset < best.offset)
+            {
+                c
+            } else {
+                best
+            }
+        })
+    }
+
+    /// Lazy commit loop over the binary-tree finder — the parse for
+    /// `StrategyTag::BtLazy2` (reference `ZSTD_compressBlock_lazy_generic`
+    /// with `search_binaryTree`, depth 2). Same commit cadence as
+    /// [`Self::start_matching_lazy`], but the per-position match finder
+    /// is the binary tree instead of the hash chain. The tree is
+    /// maintained by `collect_optimal_candidates` itself (its `bt_update`
+    /// advances `next_to_update` to the queried position), so committed-
+    /// match interior positions are inserted lazily on the next probe —
+    /// the same lazy tree-update cadence the reference uses.
+    fn start_matching_btlazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        self.table.ensure_tables();
+
+        let current_len = self.table.window.back().unwrap().len();
+        if current_len == 0 {
+            return;
+        }
+
+        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        self.table
+            .backfill_boundary_positions(current_abs_start, current_abs_end);
+
+        // BT search budget + nice-match threshold come from the level's
+        // runtime knobs (set by `configure()` from the level params); the
+        // optimal-only price flags are unused on this path.
+        let profile = HcOptimalCostProfile {
+            max_chain_depth: self.hc.search_depth,
+            sufficient_match_len: self.hc.target_len,
+            accurate: false,
+            favor_small_offsets: true,
+        };
+        let lazy_depth = self.hc.lazy_depth;
+        let target_len = self.hc.target_len;
+        let mut scratch: Vec<MatchCandidate> = Vec::new();
+
+        let mut pos = 0usize;
+        let mut literals_start = 0usize;
+        while pos + HC_MIN_MATCH_LEN <= current_len {
+            let abs_pos = current_abs_start + pos;
+            let lit_len = pos - literals_start;
+
+            let best =
+                self.bt_find_best_match(abs_pos, lit_len, current_abs_end, profile, &mut scratch);
+
+            // Lazy lookahead: defer the current match if a strictly
+            // better one starts one (or, at depth 2, two) bytes later.
+            // Mirrors `HcMatcher::pick_lazy_match` but over the BT finder.
+            let committed = if let Some(best) = best {
+                let mut take = best;
+                if best.match_len < target_len && abs_pos + 1 + HC_MIN_MATCH_LEN <= current_abs_end
+                {
+                    let current_gain =
+                        super::hc::HcMatcher::match_gain(best.match_len, best.offset) + 4;
+                    let next = self.bt_find_best_match(
+                        abs_pos + 1,
+                        lit_len + 1,
+                        current_abs_end,
+                        profile,
+                        &mut scratch,
+                    );
+                    let next_wins = next.is_some_and(|n| {
+                        super::hc::HcMatcher::match_gain(n.match_len, n.offset) > current_gain
+                    });
+                    let next2_wins =
+                        lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= current_abs_end && {
+                            let next2 = self.bt_find_best_match(
+                                abs_pos + 2,
+                                lit_len + 2,
+                                current_abs_end,
+                                profile,
+                                &mut scratch,
+                            );
+                            next2.is_some_and(|n| {
+                                super::hc::HcMatcher::match_gain(n.match_len, n.offset)
+                                    > current_gain + 4
+                            })
+                        };
+                    if next_wins || next2_wins {
+                        // Defer: emit one literal and re-probe at pos+1.
+                        take.match_len = 0;
+                    }
+                }
+                if take.match_len >= HC_MIN_MATCH_LEN {
+                    Some(take)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(candidate) = committed {
+                let current = self.table.window.back().unwrap().as_slice();
+                let start = candidate.start - current_abs_start;
+                let literals = &current[literals_start..start];
+                handle_sequence(Sequence::Triple {
+                    literals,
+                    offset: candidate.offset,
+                    match_len: candidate.match_len,
+                });
+                let _ = encode_offset_with_history(
+                    candidate.offset as u32,
+                    literals.len() as u32,
+                    &mut self.table.offset_hist,
+                );
+                pos = start + candidate.match_len;
+                literals_start = pos;
+            } else {
+                // Miss / deferred: the probe already advanced the tree to
+                // `abs_pos`, so just step forward one byte.
+                pos += 1;
+            }
+        }
+
+        if literals_start < current_len {
+            let current = self.table.window.back().unwrap().as_slice();
+            handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
     }
 
     fn start_matching_optimal<S: super::strategy::Strategy>(
@@ -4626,7 +4776,9 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     check(CompressionLevel::Level(4), StrategyTag::Dfast);
     check(CompressionLevel::Level(5), StrategyTag::Greedy);
     check(CompressionLevel::Level(7), StrategyTag::Lazy);
-    check(CompressionLevel::Level(15), StrategyTag::Lazy);
+    check(CompressionLevel::Level(12), StrategyTag::Lazy);
+    check(CompressionLevel::Level(13), StrategyTag::BtLazy2);
+    check(CompressionLevel::Level(15), StrategyTag::BtLazy2);
     check(CompressionLevel::Level(16), StrategyTag::BtOpt);
     check(CompressionLevel::Level(18), StrategyTag::BtUltra);
     check(CompressionLevel::Level(22), StrategyTag::BtUltra2);
