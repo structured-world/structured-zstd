@@ -561,13 +561,15 @@
         select.replaceChildren(fragment);
       }
 
+      // Snapshot range selectors (From / To). Values are `generated_at`
+      // stamps; the visible text is decorated with the commit subject.
       function renderPointOptions(select, values) {
         const fragment = document.createDocumentFragment();
         for (const value of values) {
           const option = document.createElement("option");
           const text = String(value);
           option.value = text;
-          option.textContent = text;
+          option.textContent = snapshotOptionText(text);
           fragment.appendChild(option);
         }
         select.replaceChildren(fragment);
@@ -1719,6 +1721,24 @@
         return row.generated_at || row.commit_sha || "local-run";
       }
 
+      // Single-line, length-capped commit subject for display. Guards the
+      // layout against stray newlines (first line only) and very long
+      // subjects (72-char clip) wherever a commit message is shown.
+      function clipSubject(msg) {
+        const firstLine = String(msg).split("\n", 1)[0].trim();
+        return firstLine.length > 72 ? `${firstLine.slice(0, 71)}…` : firstLine;
+      }
+
+      // Decorate a snapshot stamp with its commit subject for display in the
+      // selectors. The option `value` stays the raw stamp (filters match on
+      // it); only the visible text gains the message. Long subjects are
+      // clipped so the dropdown stays scannable.
+      function snapshotOptionText(stamp) {
+        const msg = state.snapshotMessages && state.snapshotMessages.get(stamp);
+        if (!msg) return stamp;
+        return `${stamp} · ${clipSubject(msg)}`;
+      }
+
       function repopulateSnapshotOptions() {
         const target = selectors.target.value;
         const scenario = selectors.scenario.value;
@@ -1753,7 +1773,7 @@
         for (const label of labels) {
           const opt = document.createElement("option");
           opt.value = String(label);
-          opt.textContent = String(label);
+          opt.textContent = snapshotOptionText(String(label));
           fragment.appendChild(opt);
         }
         profileSelectors.snapshot.replaceChildren(fragment);
@@ -1840,6 +1860,14 @@
           const code = document.createElement("code");
           code.textContent = commit;
           commitCell.appendChild(code);
+          // github-action-benchmark stores the full commit object; show the
+          // subject (first line) next to the hash so the row is searchable
+          // by what changed, not just the SHA.
+          const commitMessage = latest?.commit?.message;
+          if (commitMessage) {
+            const subject = commitMessage.split("\n", 1)[0];
+            commitCell.appendChild(document.createTextNode(` ${subject}`));
+          }
           row.appendChild(commitCell);
 
           const benchCell = document.createElement("td");
@@ -1874,6 +1902,18 @@
         state.records = payload.records || [];
         if (!state.records.length) throw new Error("benchmark-relative.json has no records");
 
+        // Map each snapshot (its `generated_at` key) to the commit subject,
+        // so the snapshot selectors + history table show WHAT changed, not
+        // just when — picking a run by timestamp alone is hard. Every record
+        // from one run carries the same message; first non-empty wins.
+        state.snapshotMessages = new Map();
+        for (const r of state.records) {
+          const key = snapshotLabel(r);
+          if (r.commit_message && !state.snapshotMessages.has(key)) {
+            state.snapshotMessages.set(key, r.commit_message);
+          }
+        }
+
         const targets = uniq(state.records.map((r) => r.target));
         const latest = latestRecord(state.records);
         if (!latest) throw new Error("Unable to determine latest benchmark snapshot");
@@ -1887,7 +1927,10 @@
           chip.textContent = target;
           targetsContainer.appendChild(chip);
         }
-        el("stat-commit").textContent = (latest.commit_sha || "local-run").slice(0, 12);
+        const latestSha = (latest.commit_sha || "local-run").slice(0, 12);
+        el("stat-commit").textContent = latest.commit_message
+          ? `${latestSha} · ${clipSubject(latest.commit_message)}`
+          : latestSha;
         el("stat-snapshot").textContent = latest.generated_at || "n/a";
 
         renderOptions(selectors.target, targets);
