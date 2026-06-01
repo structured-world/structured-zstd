@@ -578,6 +578,27 @@ fn bench_dictionary(c: &mut Criterion) {
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
+
+            // Rust dict-compressed output size, for the compress-dict
+            // compression-ratio report (rust vs FFI). Only computable when the
+            // dictionary parsed into a Rust handle; mirrors the gate the
+            // `pure_rust_with_dict` timing arm uses below. Reused as the
+            // timing-loop preallocation hint so we compress once, not twice.
+            let rust_with_dict_len: Option<usize> = if rust_dict_handle.is_some() {
+                let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                warmup_compressor
+                    .set_dictionary_from_bytes(&ffi_dictionary)
+                    .expect("dictionary should attach");
+                warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                warmup_compressor.set_source(scenario.bytes.as_slice());
+                let mut warmup_output = Vec::new();
+                warmup_compressor.set_drain(&mut warmup_output);
+                warmup_compressor.compress();
+                Some(warmup_output.len())
+            } else {
+                None
+            };
+
             if emit_reports {
                 emit_dictionary_report(
                     scenario,
@@ -586,6 +607,9 @@ fn bench_dictionary(c: &mut Criterion) {
                     ffi_train_ms,
                     &no_dict_bytes,
                     &with_dict_bytes,
+                    // When the Rust dict path is unavailable, report 0 (the
+                    // CI parser treats a 0 rust size as "no rust dict ratio").
+                    rust_with_dict_len.unwrap_or(0),
                 );
             }
 
@@ -641,29 +665,15 @@ fn bench_dictionary(c: &mut Criterion) {
             // routes through the same Dictionary::decode_dict and
             // would fail identically. An `.expect()` panic inside
             // b.iter would abort the whole bench suite.
-            if rust_dict_handle.is_some() {
-                // One-time pre-compress (outside b.iter) to learn the
-                // Rust encoder's actual output size at this (scenario,
-                // level, dict). Using `with_dict_bytes.len()` here —
-                // the FFI-side compressed size — would under-allocate
-                // when Rust emits a slightly larger frame, forcing
-                // `Vec` reallocations inside the timing loop and
-                // skewing the measurement vs FFI (which always
-                // allocates exact output size internally). Doing one
-                // setup compress matches `Compressor::compress`'s
-                // up-front allocation shape on both sides.
-                let preallocated_capacity = {
-                    let mut warmup_compressor = FrameCompressor::new(level.rust_level);
-                    warmup_compressor
-                        .set_dictionary_from_bytes(&ffi_dictionary)
-                        .expect("dictionary should attach");
-                    warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
-                    warmup_compressor.set_source(scenario.bytes.as_slice());
-                    let mut warmup_output = Vec::new();
-                    warmup_compressor.set_drain(&mut warmup_output);
-                    warmup_compressor.compress();
-                    warmup_output.len()
-                };
+            if let Some(preallocated_capacity) = rust_with_dict_len {
+                // `rust_with_dict_len` above already did the one-time
+                // pre-compress that learns the Rust encoder's actual output
+                // size at this (scenario, level, dict) — reuse it as the
+                // timing-loop preallocation hint. Using `with_dict_bytes.len()`
+                // (the FFI-side size) would under-allocate when Rust emits a
+                // slightly larger frame, forcing `Vec` reallocations inside the
+                // timing loop and skewing the measurement vs FFI (which always
+                // allocates exact output size internally).
                 group.bench_function("pure_rust_with_dict", |b| {
                     b.iter(|| {
                         let mut compressor = FrameCompressor::new(level.rust_level);
@@ -962,19 +972,25 @@ fn emit_dictionary_report(
     train_ms: f64,
     no_dict_bytes: &[u8],
     with_dict_bytes: &[u8],
+    rust_with_dict_len: usize,
 ) {
     let input_len = scenario.len() as f64;
     let escaped_label = escape_report_label(&scenario.label);
-    let (no_dict_ratio, with_dict_ratio) = if input_len > 0.0 {
+    let (no_dict_ratio, with_dict_ratio, rust_with_dict_ratio) = if input_len > 0.0 {
         (
             no_dict_bytes.len() as f64 / input_len,
             with_dict_bytes.len() as f64 / input_len,
+            rust_with_dict_len as f64 / input_len,
         )
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0, 0.0)
     };
+    // `rust_with_dict_bytes` / `rust_with_dict_ratio` are appended after the
+    // FFI fields so existing parsers that only read the leading columns keep
+    // working; the CI report parser's REPORT_DICT regex captures the two new
+    // trailing fields to emit a compress-dict compression-ratio series.
     println!(
-        "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6}",
+        "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6} rust_with_dict_bytes={} rust_with_dict_ratio={:.6}",
         scenario.id,
         escaped_label,
         level.name,
@@ -983,7 +999,9 @@ fn emit_dictionary_report(
         no_dict_bytes.len(),
         with_dict_bytes.len(),
         no_dict_ratio,
-        with_dict_ratio
+        with_dict_ratio,
+        rust_with_dict_len,
+        rust_with_dict_ratio
     );
 }
 
