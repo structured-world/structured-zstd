@@ -209,8 +209,9 @@ impl Strategy for BtOpt {
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Levels 18-19 — donor `ZSTD_btultra`. BT + opt with refined price
-/// tables and no small-offset bias.
+/// Level 18 — upstream `ZSTD_btultra`. BT + opt with refined price
+/// tables and no small-offset bias; shares the mls=3 hash3 short-match
+/// probe but stays single-pass (no two-pass dynamic-stats seed).
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra;
 
@@ -232,7 +233,7 @@ impl Strategy for BtUltra {
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Levels 20-22 — donor `ZSTD_btultra2`. BT + opt with the two-pass
+/// Levels 19-22 — upstream `ZSTD_btultra2`. BT + opt with the two-pass
 /// dynamic-statistics seed and the hash3 short-match table.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra2;
