@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780346029424,
+  "lastUpdate": 1780349318130,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -53366,6 +53366,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "164d14a6a45af4446519827168946e5888abfe8e",
+          "message": "perf(encode): skip decoder-table build when loading a dict for encoding (#314)\n\n* perf(encode): skip decoder-table build when loading a dict for encoding\n\nset_dictionary_from_bytes ran the full decoder dictionary parse\n(Dictionary::decode_dict) on every compress, building FSE *decoding*\ntables + their enrich passes — then immediately converting to encoder\ntables via to_encoder_table, which reads only the symbol probabilities\nthe decoder build doesn't need. On a tiny payload that wasted work\ndominates the call (i9 perf: FSE build_decoding_table 8.5% + enrich\n2.9% of the per-call cost, all thrown away).\n\nAdd Dictionary::decode_dict_for_encoding: a shared parser that parses\nthe FSE probabilities (new FSETableImpl::read_table_probabilities,\nreturning the same byte count as build_decoder so the cursor advances\nidentically) without building the decode table or running enrich_*\n(which only touch decode-table entries, never symbol_probabilities).\nset_dictionary_from_bytes uses it. The encoder entropy tables — and\nthus the emitted frame — are byte-identical, since to_encoder_table\nconsumes only the probabilities/accuracy-log that read_probabilities\nsets the same way on both paths.\n\nHUF stays on the full decoder build for now (to_encoder_table needs\nbits/max_num_bits, which the decode-table build computes); a follow-up\ncan split that the same way.\n\nPart of #111.\n\n* perf(encode): skip HUF decode-table fill on encoder dict load too\n\nFollow-up to the FSE skip in this PR: the HUF table build also did\ndecoder-only work (packed_decode lookup fill) that to_encoder_table\nnever reads — it consumes only bits + max_num_bits.\n\nSplit build_table_from_weights: extract compute_huffman_bits (per-symbol\ncode lengths + max_num_bits, the part to_encoder_table needs) from the\ndecode lookup-table fill (bit_ranks / packed_decode / rank_indexes).\nbuild_decoder still does both (decoder path unchanged); the new\nbuild_weights_only does read_weights + compute_huffman_bits only,\nreturning the same byte count so the cursor advances identically.\ndecode_dict_for_encoding routes HUF through build_weights_only.\n\nByte-identical: both paths compute bits/max_num_bits via the same\ncompute_huffman_bits, and to_encoder_table reads only those. 648 lib\ntests incl. dict round-trips pass.\n\nPart of #111.\n\n* fix(fse): clear decode table in read_table_probabilities\n\nread_table_probabilities parsed new probabilities + accuracy_log but\nleft any previously-built decode table intact. On a reused FSETableImpl\nthat left a stale decode table that no longer matches the new\nprobabilities, and init_state would still pass whenever the old\ndecode.len() happened to equal 1 << accuracy_log — silently decoding\nagainst the wrong table. Clear decode so the table is unambiguously\nnon-decodable until build_decoding_table runs.\n\nNo behaviour change on the live caller (encoder dict load uses a fresh\nFSEScratch whose decode is already empty, and never decodes through it);\nthis hardens the public method against future reuse.\n\nPart of #111.\n\n* refactor(decode): make decode_dict_for_encoding crate-internal\n\nThe returned Dictionary deliberately omits decode lookup tables\n(packed_decode / FSE decode), so feeding it to a FrameDecoder would\nindex an empty packed_decode and panic. The encoder is the only caller\nand reads just the entropy encoder tables, so drop the public\nvisibility (pub -> pub(crate)) to keep that decode footgun off the\npublic Dictionary API. Doc note added.\n\nPart of #111.\n\n* refactor(encode): encoder-only dictionary type (CDict-style split)\n\nThe encoder dict-load skip leaves a Dictionary with no decode lookup\ntables. Storing that in FrameCompressor and returning it from\nset_dictionary / clear_dictionary let a non-decodable Dictionary escape\nto callers, who could panic feeding it to a FrameDecoder.\n\nIntroduce EncoderDictionary (encoding::EncoderDictionary), analogous to\nzstd's CDict vs the decoder's DDict: a distinct type wrapping the\nparsed dictionary with NO decode path (no into_handle / decode). The\ncompress-only state can no longer reach the decode side — the footgun\nis closed by the type system, matching upstream's CDict/DDict split.\n\n- FrameCompressor stores Option<EncoderDictionary>; set_dictionary,\n  set_dictionary_from_bytes, and clear_dictionary now take/return it.\n  Both setters funnel through a shared attach_dictionary.\n- EncoderDictionary::from_bytes is the sole caller of the encoder-only\n  Dictionary::decode_dict_for_encoding; build_weights_only is now\n  pub(crate) (its non-decodable output can't reach a public API).\n\nEncoder output is byte-identical (same parsed entropy, just type-wrapped).\n\nPart of #111.\n\n* docs(encode): keep FrameCompressor rustdoc attached to its struct\n\nInserting EncoderDictionary between the FrameCompressor doc block and\nthe struct re-attached that doc (with the usage example) to\nEncoderDictionary, leaving FrameCompressor undocumented. Move the\nEncoderDictionary definition above the FrameCompressor doc so each\nitem keeps its own rustdoc.\n\nPart of #111.\n\n* docs(huff0): drop stale compute_huffman_bits table-build wording\n\nThe doc above compute_huffman_bits still opened with the old\nbuild_table_from_weights description (\"decode the weights into a table\",\n\"populates the rest of the table\"), contradicting the accurate summary\nbelow it — the function only computes bits/max_num_bits and builds no\ndecode table. Remove the stale lead-in.\n\nPart of #313.\n\n* feat(encoder): add set_encoder_dictionary to reattach prepared dicts\n\nset_dictionary*/clear_dictionary returned an EncoderDictionary, and\nEncoderDictionary::from_bytes builds one, but nothing accepted one back\n— so a prepared or cleared dictionary could not be reattached or reused\nacross compressions without reparsing the raw blob each time. Add\nset_encoder_dictionary(EncoderDictionary), funnelling through the shared\nattach_dictionary path, so a dictionary built once (or handed back by\nclear_dictionary) can be reattached without re-running the parse.\n\nPart of #313.\n\n* refactor(encoder-dict): tighten read_table_probabilities visibility + id() doc\n\n- read_table_probabilities leaves the FSE table in a non-decodable\n  partial-init state and is only used by the crate-internal encoder-dict\n  parse, but it was pub on a pub-use-re-exported type. Make it pub(crate)\n  so the partial-init state can't be reached through the public API.\n- EncoderDictionary::id() doc claimed the id is always > 0, but\n  from_dictionary wraps an arbitrary Dictionary (the non-zero invariant is\n  enforced at attach time, not construction). Soften the doc to match.\n\nPart of #313.\n\n* docs(encoder-dict): note set_encoder_dictionary shares attach_dictionary\n\nThe attach_dictionary doc listed only set_dictionary and\nset_dictionary_from_bytes as callers; set_encoder_dictionary also funnels\nthrough it. List all three so the coupling is clear.\n\nPart of #313.\n\n* test(encode): pin encoder-only dict parse == full decode output\n\nAssert set_dictionary_from_bytes (encoder-only parse that skips the\nFSE/HUF decoder-table build) produces byte-identical compressed output\nto the full Dictionary::decode_dict path for the same payload + level.\n\nGuards the load-bearing equivalence: the encoder entropy tables come\npurely from the symbol probabilities / Huffman weights, so a future\nFSE/HUF parsing refactor that still round-trips but silently diverges\non those values now fails loudly instead of emitting a different frame.",
+          "timestamp": "2026-06-01T23:20:45+03:00",
+          "tree_id": "502109f7612d97bf355d12f5a9f807f214aec239",
+          "url": "https://github.com/structured-world/structured-zstd/commit/164d14a6a45af4446519827168946e5888abfe8e"
+        },
+        "date": 1780349310782,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 351.129,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 244.236,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.482,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.591,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.954,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.081,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.825,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.011,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.246,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.372,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.769,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.356,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.737,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.062,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.82,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
