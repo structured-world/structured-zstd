@@ -458,7 +458,7 @@ if not benchmark_results:
         # and `level_22_btultra2` (the ALERT_LEVELS) ever fire
         # github-action-benchmark regressions. Falling back to
         # unfiltered `timings` here would reintroduce non-canonical
-        # shard siblings (e.g. level_2_dfast on the `dfast` shard) and
+        # shard siblings (e.g. level_4_dfast on the `fast-dfast` shard) and
         # they'd trip alerts they were explicitly excluded from.
         benchmark_results = [
             {

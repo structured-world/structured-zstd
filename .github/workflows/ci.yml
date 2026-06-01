@@ -413,36 +413,24 @@ jobs:
               "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast"
             },
             {
-              "id": "fast-pos",
-              "levels": "level_-2_fast,level_-1_fast,level_1_fast"
-            },
-            {
-              "id": "dfast",
-              "levels": "level_2_dfast,level_3_dfast"
-            },
-            {
-              "id": "greedy",
-              "levels": "level_4_greedy"
+              "id": "fast-dfast",
+              "levels": "level_-2_fast,level_-1_fast,level_1_fast,level_2_fast,level_3_dfast,level_4_dfast,level_5_greedy"
             },
             {
               "id": "lazy-lower",
-              "levels": "level_5_lazy,level_6_lazy,level_7_lazy,level_8_lazy,level_9_lazy"
+              "levels": "level_6_lazy,level_7_lazy,level_8_lazy,level_9_lazy,level_10_lazy"
             },
             {
               "id": "lazy-upper",
-              "levels": "level_10_lazy,level_11_lazy,level_12_lazy,level_13_lazy,level_14_lazy,level_15_lazy"
+              "levels": "level_11_lazy,level_12_lazy,level_13_lazy,level_14_lazy,level_15_lazy"
             },
             {
               "id": "btopt",
               "levels": "level_16_btopt,level_17_btopt"
             },
             {
-              "id": "btultra",
-              "levels": "level_18_btultra,level_19_btultra"
-            },
-            {
               "id": "btultra2",
-              "levels": "level_20_btultra2,level_21_btultra2,level_22_btultra2"
+              "levels": "level_18_btultra,level_19_btultra2,level_20_btultra2,level_21_btultra2,level_22_btultra2"
             }
           ]
           EOF
