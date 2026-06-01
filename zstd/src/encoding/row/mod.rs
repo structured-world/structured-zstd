@@ -864,23 +864,33 @@ impl RowMatchGenerator {
         let head = self.row_heads[row] as usize;
         let max_walk = self.search_depth.min(row_entries);
 
-        // Compare all `row_entries` tags against `tag` in one pass, producing a
-        // bitmask whose bit `j` is set iff `row_tags[row_base + j] == tag`. The
-        // walk below then tests a single bit per slot instead of re-reading the
-        // tag byte, which isolates the tag comparison into a form a SIMD kernel
-        // can compute with one vector compare + movemask. `row_entries <= 64`
-        // (row_log clamps to 4..=6) so the mask fits in a `u64`.
-        let tag_match = self
-            .tag_kernel
-            .match_mask(&self.row_tags[row_base..row_base + row_entries], tag);
+        // The SIMD kernels compare all `row_entries` tags in one vector op, so
+        // building a full match bitmask up front is free and lets the walk test
+        // a single bit per slot. The scalar kernel has no such win: scanning all
+        // `row_entries` would do more byte-compares than the `max_walk` slots
+        // actually walked when `search_depth < row_entries`, so it keeps the
+        // on-the-fly `row_tags[idx] == tag` check instead. `row_entries <= 64`
+        // (row_log clamps to 4..=6) so the mask fits a `u64`.
+        let use_mask = self.tag_kernel != RowTagKernel::Scalar;
+        let tag_match = if use_mask {
+            self.tag_kernel
+                .match_mask(&self.row_tags[row_base..row_base + row_entries], tag)
+        } else {
+            0
+        };
 
         let mut best = None;
         for i in 0..max_walk {
             let slot = (head + i) & row_mask;
-            if (tag_match >> slot) & 1 == 0 {
+            let idx = row_base + slot;
+            let matched = if use_mask {
+                (tag_match >> slot) & 1 != 0
+            } else {
+                self.row_tags[idx] == tag
+            };
+            if !matched {
                 continue;
             }
-            let idx = row_base + slot;
             let candidate_pos = self.row_positions[idx];
             if candidate_pos == ROW_EMPTY_SLOT
                 || candidate_pos < self.history_abs_start
