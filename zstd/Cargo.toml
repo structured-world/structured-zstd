@@ -80,6 +80,11 @@ default = [
 # `kernel_avx2` flag is inert on aarch64, `kernel_neon` inert on x86), so
 # the all-on default is safe everywhere. The implication chain mirrors the
 # real ISA dependency: AVX2 implies BMI2 implies SSE2; SVE implies NEON.
+# `kernel_scalar` is a marker only: the scalar kernel is compiled
+# unconditionally (it is the mandatory fallback), so this flag gates no code.
+# It exists so the scalar tier can be named explicitly in a feature set; a
+# scalar-only build is equivalently `--no-default-features` (no SIMD tier
+# enabled) or `--no-default-features --features kernel_scalar`.
 kernel_scalar = []
 kernel_sse2 = []
 kernel_bmi2 = ["kernel_sse2"]

@@ -425,7 +425,7 @@ mod tests {
     /// previously selected as `Vbmi2`, which would SIGILL on the
     /// first AVX2-mixed VBMI2 kernel invocation. The selection must
     /// fall through to Scalar (or a non-AVX tier) in that case.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
     #[test]
     fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
         let tag = select_x86_kernel(
@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// Sanity: when every flag is present the selector returns Vbmi2.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
     #[test]
     fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
         let tag = select_x86_kernel(true, true, true, true, true, true, true);
@@ -449,7 +449,7 @@ mod tests {
     }
 
     /// Sanity: AVX2 + BMI2 without AVX-512 → Avx2.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
     #[test]
     fn select_x86_kernel_avx2_baseline_picks_avx2() {
         let tag = select_x86_kernel(false, false, false, false, true, true, true);
@@ -457,7 +457,7 @@ mod tests {
     }
 
     /// SSE2-only (no BMI2/AVX2) → Sse2, the x86_64 floor above Scalar.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
     #[test]
     fn select_x86_kernel_sse2_only_picks_sse2() {
         let tag = select_x86_kernel(false, false, false, false, false, false, true);
