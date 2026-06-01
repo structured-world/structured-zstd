@@ -67,7 +67,10 @@ impl RowTagKernel {
         // x86_64 / aarch64, so a `#[cfg]`-gated unconditional `return` there
         // makes the scalar fallback `unreachable_code` and leaves `Avx2`
         // dead-code under `-D warnings`. `cfg!` const-folds to the same
-        // codegen without those lints.
+        // codegen while keeping every variant constructed; the
+        // `#[allow(unreachable_code)]` on the fallback below guards the case
+        // where `cfg!` folds the baseline-feature `if` to an unconditional
+        // `return` (mirrors `cpu_kernel::detect_cpu_kernel`).
         #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
         {
             if cfg!(target_feature = "avx2") {
@@ -93,6 +96,7 @@ impl RowTagKernel {
                 return RowTagKernel::Neon;
             }
         }
+        #[allow(unreachable_code)]
         RowTagKernel::Scalar
     }
 
