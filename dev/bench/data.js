@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780349318130,
+  "lastUpdate": 1780356276125,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -53570,6 +53570,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ec0e1505c38888382736b128748e1978563f1918",
+          "message": "perf(encode): map level 19 to btultra2 + align bench labels to clevels.h (#315)\n\n* perf(encode): map level 19 to btultra2 (donor clevels.h parity)\n\nDonor clevels.h (srcSize > 256 KiB tier) uses ZSTD_btultra2 for level\n19, not plain btultra: only level 18 is btultra. We mapped both 18 and\n19 to BtUltra, so level 19 ran the shallower btultra search (searchLog\n6 -> 64 compares) instead of btultra2 (searchLog 7 -> 128) plus the\ntwo-pass dynamic-stats seed and hash3 short-match table.\n\nLevel 19 now uses BtUltra2 + BTULTRA2_HC_CONFIG. On the repo decode\ncorpus (z000033, ~1 MB) level 19 compressed size drops 443196 -> 426751\nbytes: was 15650 B WORSE than C (ffi 427546), now 795 B SMALLER. Large\nstructured stream also improves (8948 < 8957); random/small inputs tie;\nsynthetic low-entropy is +3 B (noise). The bt-strategy split now matches\ndonor exactly: 16-17 btopt, 18 btultra, 19-22 btultra2.\n\nRatio measured deterministically; encode throughput delta deferred to\nthe benchmark host.\n\n* ci(bench): align level labels to actual strategy + regroup shards\n\nstrategy_suffix mislabelled levels: it called level 2 dfast (it is\nfast), level 4 greedy (it is dfast), and level 5 lazy (it is greedy).\nNames now mirror the encoder per-level strategy: 1-2 fast, 3-4 dfast,\n5 greedy, 6-15 lazy, 16-17 btopt, 18 btultra, 19-22 btultra2.\n\nRegroup the main-push bench matrix from 9 shards to 6, grouped by\nactual strategy and balanced by wall-clock:\n  fast-neg    -7..-3\n  fast-dfast  -2,-1,1,2 + 3,4 + 5\n  lazy-lower  6..10\n  lazy-upper  11..15\n  btopt       16,17\n  btultra2    18..22\nThe canonical alert levels (level_3_dfast, level_22_btultra2) keep\ntheir names, so benchmark alerts are unaffected.\n\n* perf(encode): align bt-level params (16-21) to clevels.h\n\nPer-level btopt/btultra/btultra2 configs now mirror upstream clevels.h\n(srcSize > 256 KiB tier) window_log + hash_log + chain_log +\nsearch_depth (1 << searchLog) + target_len, replacing the three shared\nBTOPT/BTULTRA/BTULTRA2 configs:\n  16  W22 H22 C22 sd32  TL48\n  17  W23 H22 C23 sd32  TL64\n  18  W23 H22 C23 sd64  TL64   (BtUltra MAX_CHAIN_DEPTH 32 -> 64)\n  19  W23 H22 C24 sd128 TL256\n  20  W25 H23 C25 sd128 TL256\nLevel 21-22 keep the deeper search_depth=512 config: they already beat\nC on ratio and the deeper walk is a deliberate ratio-positive choice.\n\nRatio (z000033, deterministic): 19 426489 < ffi 427546 and 20 426489 <\n427546 (the shallower donor depth compresses better than the previous\nsd512 here, and runs less BT work); 16/17 stay well under C; large-log\nand small inputs unchanged or tie. Level 18 still trails C on ratio\n(443217 vs 428025): that gap is the btultra match-finder algorithm\n(upstream level 18 uses minMatch 3 + hash3, our BtUltra does neither),\nfixed separately without touching btultra2.\n\n* docs(encode): sync for_level doc to 18 btultra / 19-22 btultra2\n\n* perf(encode): enable hash3 short-match probe for btultra (level 18)\n\nLevel 18 (btultra) trailed C by 3.5% on the repo corpus because our\nbtultra match finder never searched the hash3 table: it was gated on\nthe runtime btultra2 tag, and Strategy::USE_HASH3 was false for BtUltra,\nso the 3-byte-match collect block was compiled out. clevels.h gives\nlevel 18 minMatch 3, and our optimal parser already accepts 3-byte\nmatches (HC_OPT_MIN_MATCH_LEN = 3) — it just could not find them.\n\nEnable hash3 for btultra: BtUltra::USE_HASH3 = true and the configure()\nhash3-table gate now fires for BtUltra as well as BtUltra2. The in-block\ntwo-pass dynamic-stats seed stays btultra2-only via a new dedicated\nStrategy::TWO_PASS_SEED const (defaults false; true only for BtUltra2),\nreplacing the OPT_LEVEL/USE_HASH3 gate that would otherwise have pulled\nbtultra into the two-pass path. The btultra2 rebase flag table.is_btultra2\nis untouched, so btultra2 behaviour is unchanged.\n\nRatio (z000033, deterministic): level 18 426896 < ffi 428025 — was\n15192 B WORSE, now 1129 B SMALLER. All bt levels now beat C on the\ncorpus; large-log and small inputs unchanged or tie. 704 tests\n(roundtrip + cross-validation) green.\n\n* docs(encode): sync btultra/btultra2 struct docs to level 18 / 19-22\n\n* perf(encode): set btultra/btultra2 nominal MIN_MATCH to 3 + pin bt params\n\nclevels.h gives levels 18-22 minMatch 3, and the mls=3 hash3 probe is\nnow active for both btultra and btultra2, so their Strategy::MIN_MATCH\nof 4 contradicted the contract. Set it to 3. The const is descriptive\nonly (the optimal parser's real floor is HC_OPT_MIN_MATCH_LEN = 3, the\nrow matcher uses ROW_MIN_MATCH_LEN); documented that on the trait so the\nvalue is not mistaken for a hot-path input.\n\nAdd bt_levels_16_to_21_pin_clevels_params pinning the (window_log,\nhash_log, chain_log, search_depth, target_len) tuples for levels 16-21\nso the clevels.h alignment cannot silently drift. Levels 16-20 mirror\nupstream; level 21 keeps the deeper search_depth 512 (deliberate\nratio-positive divergence, flagged in the test).",
+          "timestamp": "2026-06-02T01:21:42+03:00",
+          "tree_id": "436b3e846d57c3296abf0ee2c7be144f9857c1f4",
+          "url": "https://github.com/structured-world/structured-zstd/commit/ec0e1505c38888382736b128748e1978563f1918"
+        },
+        "date": 1780356266768,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.146,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 302.512,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 237.016,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.403,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.285,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.708,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.613,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.977,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.033,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.732,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.633,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.332,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.667,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.749,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
