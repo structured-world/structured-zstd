@@ -40,7 +40,10 @@ enum RowTagKernel {
     Sse2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2,
-    #[cfg(target_arch = "aarch64")]
+    // Little-endian only: the movemask packing reinterprets the lanes
+    // through u16/u32/u64, which groups bytes by native order — correct only
+    // on little-endian. Big-endian aarch64 falls back to the scalar kernel.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Neon,
 }
 
@@ -73,13 +76,18 @@ impl RowTagKernel {
         {
             return RowTagKernel::Sse2;
         }
-        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
         {
             if std::arch::is_aarch64_feature_detected!("neon") {
                 return RowTagKernel::Neon;
             }
         }
-        #[cfg(all(not(feature = "std"), target_arch = "aarch64", target_feature = "neon"))]
+        #[cfg(all(
+            not(feature = "std"),
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon"
+        ))]
         {
             return RowTagKernel::Neon;
         }
@@ -99,7 +107,7 @@ impl RowTagKernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: SSE2 confirmed by `detect()` (always true on x86_64).
             RowTagKernel::Sse2 => unsafe { row_tag_match_mask_sse2(tags, tag) },
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             // SAFETY: NEON confirmed by `detect()` (baseline on aarch64).
             RowTagKernel::Neon => unsafe { row_tag_match_mask_neon(tags, tag) },
             RowTagKernel::Scalar => row_tag_match_mask_scalar(tags, tag),
@@ -201,7 +209,7 @@ unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
 /// # Safety
 /// Caller must ensure NEON is available (baseline on aarch64; checked by
 /// `RowTagKernel::detect`).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
     use core::arch::aarch64::{
@@ -985,7 +993,7 @@ mod tag_mask_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
 mod neon_tag_mask_tests {
     use super::{row_tag_match_mask_neon, row_tag_match_mask_scalar};
 
