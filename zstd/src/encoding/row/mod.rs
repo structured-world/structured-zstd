@@ -27,6 +27,22 @@ use super::match_table::helpers::{
 };
 use super::opt::types::MatchCandidate;
 
+/// Bitmask of row slots whose tag byte equals `tag`: bit `j` is set iff
+/// `tags[j] == tag`. `tags.len()` is the row width (16 / 32 / 64), so the
+/// result fits in a `u64`. Scalar reference implementation; a SIMD kernel
+/// computes the same mask with one vector compare + movemask (the donor
+/// `ZSTD_row_getMatchMask` shape).
+#[inline]
+fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
+    let mut mask = 0u64;
+    for (j, &t) in tags.iter().enumerate() {
+        if t == tag {
+            mask |= 1u64 << j;
+        }
+    }
+    mask
+}
+
 pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
     pub(crate) window: VecDeque<Vec<u8>>,
@@ -629,13 +645,22 @@ impl RowMatchGenerator {
         let head = self.row_heads[row] as usize;
         let max_walk = self.search_depth.min(row_entries);
 
+        // Compare all `row_entries` tags against `tag` in one pass, producing a
+        // bitmask whose bit `j` is set iff `row_tags[row_base + j] == tag`. The
+        // walk below then tests a single bit per slot instead of re-reading the
+        // tag byte, which isolates the tag comparison into a form a SIMD kernel
+        // can compute with one vector compare + movemask. `row_entries <= 64`
+        // (row_log clamps to 4..=6) so the mask fits in a `u64`.
+        let tag_match =
+            row_tag_match_mask_scalar(&self.row_tags[row_base..row_base + row_entries], tag);
+
         let mut best = None;
         for i in 0..max_walk {
             let slot = (head + i) & row_mask;
-            let idx = row_base + slot;
-            if self.row_tags[idx] != tag {
+            if (tag_match >> slot) & 1 == 0 {
                 continue;
             }
+            let idx = row_base + slot;
             let candidate_pos = self.row_positions[idx];
             if candidate_pos == ROW_EMPTY_SLOT
                 || candidate_pos < self.history_abs_start
