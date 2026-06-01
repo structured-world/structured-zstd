@@ -2074,6 +2074,53 @@ mod tests {
     }
 
     #[test]
+    fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
+        // The encoder-only dict parse (`decode_dict_for_encoding`, used by
+        // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
+        // the enrich passes. The encoder entropy tables are derived purely from
+        // the symbol probabilities / Huffman weights, so the compressed output
+        // MUST be byte-identical to the full-decode path. This pins the
+        // load-bearing equivalence so a future FSE/HUF parsing refactor that
+        // still round-trips but silently diverges on the probabilities/weights
+        // fails loudly here instead of producing a different (but valid) frame.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+
+        // Path A: encoder-only parse straight from the raw blob.
+        let mut from_bytes_out = Vec::new();
+        {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            compressor
+                .set_dictionary_from_bytes(dict_raw)
+                .expect("dictionary bytes should parse");
+            compressor.set_source(payload.as_slice());
+            compressor.set_drain(&mut from_bytes_out);
+            compressor.compress();
+        }
+
+        // Path B: full decode (builds the decoder tables too), then attach for
+        // encoding via the `Dictionary` setter.
+        let full_decode = crate::decoding::Dictionary::decode_dict(dict_raw)
+            .expect("dictionary bytes should fully decode");
+        let mut full_decode_out = Vec::new();
+        {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            compressor
+                .set_dictionary(full_decode)
+                .expect("full-decode dictionary should attach");
+            compressor.set_source(payload.as_slice());
+            compressor.set_drain(&mut full_decode_out);
+            compressor.compress();
+        }
+
+        assert_eq!(
+            from_bytes_out, full_decode_out,
+            "encoder-only dict parse must produce byte-identical output to the full decode"
+        );
+    }
+
+    #[test]
     fn set_dictionary_rejects_zero_dictionary_id() {
         let invalid = crate::decoding::Dictionary {
             id: 0,
