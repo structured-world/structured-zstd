@@ -4648,6 +4648,33 @@ fn level22_uses_donor_target_length_and_large_input_tables() {
 }
 
 #[test]
+fn bt_levels_16_to_21_pin_clevels_params() {
+    // Pins the BT-level (window_log, hash_log, chain_log, search_depth,
+    // target_len) tuples so the clevels.h alignment cannot silently drift.
+    // Levels 16-20 mirror upstream `clevels.h` (srcSize > 256 KiB tier,
+    // search_depth = 1 << searchLog); level 21 intentionally keeps a deeper
+    // search_depth (512 vs upstream's 128) — it beats C on ratio there and
+    // the deeper walk is a deliberate ratio-positive divergence.
+    let expected = [
+        // (level, window_log, hash_log, chain_log, search_depth, target_len)
+        (16u8, 22u8, 22usize, 22usize, 32usize, 48usize),
+        (17, 23, 22, 23, 32, 64),
+        (18, 23, 22, 23, 64, 64),
+        (19, 23, 22, 24, 128, 256),
+        (20, 25, 23, 25, 128, 256),
+        (21, 26, 24, 24, 512, 256),
+    ];
+    for (level, wlog, hlog, clog, sd, tl) in expected {
+        let p = resolve_level_params(CompressionLevel::Level(level as i32), None);
+        assert_eq!(p.window_log, wlog, "level {level} window_log");
+        assert_eq!(p.hc.hash_log, hlog, "level {level} hash_log");
+        assert_eq!(p.hc.chain_log, clog, "level {level} chain_log");
+        assert_eq!(p.hc.search_depth, sd, "level {level} search_depth");
+        assert_eq!(p.hc.target_len, tl, "level {level} target_len");
+    }
+}
+
+#[test]
 fn level22_source_size_hint_uses_donor_btultra2_tiers() {
     let p16k = resolve_level_params(CompressionLevel::Level(22), Some(16 * 1024));
     assert_eq!(p16k.window_log, 14);

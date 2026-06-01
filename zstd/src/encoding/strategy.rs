@@ -61,7 +61,13 @@ pub(crate) trait Strategy: Copy + 'static {
     /// Match-finder backend this strategy runs on.
     const BACKEND: BackendTag;
 
-    /// Minimum match length the parser will produce.
+    /// Nominal minimum match length for this strategy, mirroring the
+    /// upstream `clevels.h` `searchLength` column (3 for btultra/btultra2,
+    /// where the mls=3 hash3 probe is active). Descriptive: the optimal
+    /// parser's actual acceptance floor is the crate-wide
+    /// `HC_OPT_MIN_MATCH_LEN` (= 3) and the row matcher uses
+    /// `ROW_MIN_MATCH_LEN`; this const documents the strategy's intent and
+    /// is not read on the hot path.
     const MIN_MATCH: usize;
 
     /// `accurate` flag for [`crate::encoding::cost_model::HcOptimalCostProfile`]
@@ -217,7 +223,7 @@ pub(crate) struct BtUltra;
 
 impl Strategy for BtUltra {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 4;
+    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
     // clevels.h level 18 minMatch = 3 → the hash3 short-match probe is
@@ -240,7 +246,7 @@ pub(crate) struct BtUltra2;
 
 impl Strategy for BtUltra2 {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 4;
+    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
     const USE_HASH3: bool = true;
