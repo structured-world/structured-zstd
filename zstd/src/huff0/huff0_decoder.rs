@@ -410,6 +410,20 @@ impl HuffmanTable {
         Ok(bytes_used)
     }
 
+    /// Parse the weight header into `bits` + `max_num_bits` WITHOUT building
+    /// the decode lookup table. Returns the same byte count as
+    /// [`Self::build_decoder`] (the weight-header length), so a caller
+    /// stepping a cursor over packed tables advances identically. Used by
+    /// the encoder dictionary load: [`Self::to_encoder_table`] reads only
+    /// `bits` + `max_num_bits`, so filling `packed_decode` is pure waste.
+    pub fn build_weights_only(&mut self, source: &[u8]) -> Result<u32, HuffmanTableError> {
+        self.packed_decode.clear();
+
+        let bytes_used = self.read_weights(source)?;
+        self.compute_huffman_bits()?;
+        Ok(bytes_used)
+    }
+
     /// Read weights from the provided source.
     ///
     /// The huffman table is represented in the input data as a list of weights.
@@ -570,7 +584,13 @@ impl HuffmanTable {
     /// into a table, and use that table to decode the actual compressed data.
     ///
     /// This function populates the rest of the table from the series of weights.
-    fn build_table_from_weights(&mut self) -> Result<(), HuffmanTableError> {
+    /// Compute per-symbol code lengths (`bits`) + `max_num_bits` from the
+    /// parsed `weights`, returning `max_bits`. This is the slice of the
+    /// table build the ENCODER side needs: [`Self::to_encoder_table`] reads
+    /// only `bits` + `max_num_bits`. The decode lookup-table fill
+    /// (`bit_ranks` / `packed_decode` / `rank_indexes`) is decoder-only and
+    /// lives in [`Self::build_table_from_weights`].
+    fn compute_huffman_bits(&mut self) -> Result<u8, HuffmanTableError> {
         use HuffmanTableError as err;
 
         self.bits.clear();
@@ -614,6 +634,12 @@ impl HuffmanTable {
         if max_bits > MAX_MAX_NUM_BITS {
             return Err(err::MaxBitsTooHigh { got: max_bits });
         }
+
+        Ok(max_bits)
+    }
+
+    fn build_table_from_weights(&mut self) -> Result<(), HuffmanTableError> {
+        let max_bits = self.compute_huffman_bits()?;
 
         self.bit_ranks.clear();
         self.bit_ranks.resize((max_bits + 1) as usize, 0);

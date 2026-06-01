@@ -90,20 +90,22 @@ impl Dictionary {
 
     /// Parse a dictionary for ENCODER use: builds the entropy
     /// probabilities/weights needed by `to_encoder_table` but skips the
-    /// FSE *decoding* tables and their `enrich_*` post-passes, which the
-    /// encoder never reads. Produces a [`Dictionary`] whose
-    /// `symbol_probabilities` / `accuracy_log` (and HUF weights) match
-    /// `decode_dict` exactly, so the encoder entropy tables — and thus
-    /// the emitted frame — are byte-identical; only the wasted decode
-    /// table build is dropped. Offset history + content are parsed the
-    /// same way.
+    /// decode-only work the encoder never reads — the FSE *decoding*
+    /// tables + their `enrich_*` post-passes, and the HUF decode lookup
+    /// table (`packed_decode`). Produces a [`Dictionary`] whose FSE
+    /// `symbol_probabilities` / `accuracy_log` and HUF `bits` /
+    /// `max_num_bits` match `decode_dict` exactly, so the encoder entropy
+    /// tables — and thus the emitted frame — are byte-identical; only the
+    /// wasted decode-table builds are dropped. Offset history + content
+    /// are parsed the same way.
     pub fn decode_dict_for_encoding(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
         Self::decode_dict_inner(raw, false)
     }
 
     /// Shared dictionary parser. `build_decode_tables` selects whether the
-    /// FSE tables get their full decoding table + `enrich_*` passes (decoder
-    /// path) or only the probability parse (encoder path — see
+    /// FSE/HUF tables get their full decoding tables (FSE decode table +
+    /// `enrich_*`, HUF `packed_decode`; decoder path) or only the
+    /// probability/weight parse (encoder path — see
     /// [`Self::decode_dict_for_encoding`]).
     fn decode_dict_inner(
         raw: &[u8],
@@ -141,7 +143,11 @@ impl Dictionary {
 
         let raw_tables = &raw[8..];
 
-        let huf_size = new_dict.huf.table.build_decoder(raw_tables)?;
+        let huf_size = if build_decode_tables {
+            new_dict.huf.table.build_decoder(raw_tables)?
+        } else {
+            new_dict.huf.table.build_weights_only(raw_tables)?
+        };
         let raw_tables = &raw_tables[huf_size as usize..];
 
         let of_size = if build_decode_tables {
