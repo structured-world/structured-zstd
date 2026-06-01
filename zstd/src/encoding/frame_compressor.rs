@@ -1172,6 +1172,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.attach_dictionary(EncoderDictionary::from_bytes(raw_dictionary)?)
     }
 
+    /// Attach an already-parsed [`EncoderDictionary`] without reparsing a raw
+    /// blob.
+    ///
+    /// Accepts an `EncoderDictionary` produced once via
+    /// [`EncoderDictionary::from_bytes`] / [`EncoderDictionary::from_dictionary`]
+    /// or handed back by [`Self::clear_dictionary`] / the `set_dictionary*`
+    /// return value, so callers can reattach or reuse a prepared dictionary
+    /// across compressions without re-running the dictionary parse each time.
+    /// Returns the previously-attached dictionary, if any.
+    pub fn set_encoder_dictionary(
+        &mut self,
+        dictionary: EncoderDictionary,
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        self.attach_dictionary(dictionary)
+    }
+
     /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
     pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
         self.dictionary_entropy_cache = None;
@@ -1990,6 +2006,63 @@ mod tests {
         assert!(
             compressor.state.fse_tables.of_previous.is_some(),
             "dictionary entropy should seed previous of table before first block"
+        );
+    }
+
+    #[test]
+    fn set_encoder_dictionary_reattaches_prepared_dict_without_reparse() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+
+        // Prepare the EncoderDictionary once, then attach it via the prepared-
+        // dictionary API (no raw-blob reparse at attach time).
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+
+        let mut with_dict = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let previous = compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+        assert!(previous.is_none());
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut with_dict);
+        compressor.compress();
+        // clear_dictionary hands the prepared dictionary back (last use of
+        // `compressor`, so its `&mut with_dict` drain borrow ends here).
+        let returned = compressor
+            .clear_dictionary()
+            .expect("dictionary was attached");
+        assert_eq!(returned.id(), dict_id);
+
+        // The reattached dictionary drives the frame: its id is advertised and
+        // the stream round-trips through a decoder primed with the same dict.
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(with_dict.as_slice())
+            .expect("encoded stream should have a frame header");
+        assert_eq!(frame_header.dictionary_id(), Some(dict_id));
+        let decoder_dict = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(decoder_dict).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
+        assert_eq!(decoded.as_slice(), payload.as_slice());
+
+        // The dictionary handed back by clear_dictionary reattaches to another
+        // compressor without touching the raw bytes again, producing an
+        // identical frame.
+        let mut with_dict2 = Vec::new();
+        let mut compressor2 = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor2
+            .set_encoder_dictionary(returned)
+            .expect("returned dictionary should reattach");
+        compressor2.set_source(payload.as_slice());
+        compressor2.set_drain(&mut with_dict2);
+        compressor2.compress();
+        assert_eq!(
+            with_dict2, with_dict,
+            "reattached prepared dict must produce an identical frame"
         );
     }
 
