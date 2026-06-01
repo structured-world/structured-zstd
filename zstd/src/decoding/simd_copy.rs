@@ -263,6 +263,10 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // appropriate feature-detection mechanism (cached runtime detect under
     // std, compile-time target_feature otherwise) and falls through on miss
     // so a single dispatcher covers every arch + feature combination.
+    // Unused when every SIMD tier is feature-gated out (scalar-only trim):
+    // all invocation sites are behind `kernel_*` cfgs, so the macro itself
+    // can have no callers there.
+    #[allow(unused_macros)]
     macro_rules! try_chunk_kernel {
         ($chunk:expr, $kernel:ident) => {{
             if copy_at_least >= $chunk {
@@ -292,15 +296,19 @@ pub(crate) unsafe fn copy_bytes_overshooting(
 
     #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        #[cfg(target_feature = "avx512f")]
+        #[cfg(all(target_feature = "avx512f", feature = "kernel_vbmi2"))]
         try_chunk_kernel!(64, copy_avx512);
-        #[cfg(target_feature = "avx2")]
+        #[cfg(all(target_feature = "avx2", feature = "kernel_avx2"))]
         try_chunk_kernel!(32, copy_avx2);
-        #[cfg(target_feature = "sse2")]
+        #[cfg(all(target_feature = "sse2", feature = "kernel_sse2"))]
         try_chunk_kernel!(16, copy_sse2);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel_neon"
+    ))]
     try_chunk_kernel!(16, copy_neon);
 
     // Final fallback: scalar 8-byte chunk loop if alignment permits, else
@@ -729,7 +737,11 @@ unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    feature = "kernel_neon"
+))]
 #[inline(always)]
 unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
