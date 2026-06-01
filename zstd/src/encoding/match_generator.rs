@@ -820,15 +820,14 @@ impl MatchGeneratorDriver {
                     }
                 }
                 super::strategy::BackendTag::HashChain => {
-                    let mut retired = Vec::new();
-                    self.hc_matcher_mut().table.trim_to_window(|data| {
-                        evicted_bytes += data.len();
-                        retired.push(data);
-                    });
-                    for mut data in retired {
-                        data.resize(data.capacity(), 0);
-                        self.vec_pool.push(data);
-                    }
+                    // HC keeps bytes only in the contiguous `history` mirror
+                    // (no per-block Vecs to recycle since the window<->history
+                    // dedup), so derive the eviction count from the
+                    // `window_size` delta, mirroring the Dfast arm above.
+                    let table = &mut self.hc_matcher_mut().table;
+                    let pre = table.window_size;
+                    table.trim_to_window();
+                    evicted_bytes += pre - table.window_size;
                 }
             }
             if evicted_bytes == 0 {
@@ -3002,7 +3001,7 @@ impl HcMatchGenerator {
             && bt.ldm_sequences.is_empty()
             && self.table.window_size == current_len
             && self.table.history_abs_start == 0
-            && self.table.window.len() == 1
+            && self.table.chunk_lens.len() == 1
             && current_len > HC_PREDEF_THRESHOLD
     }
 
@@ -3165,10 +3164,17 @@ impl HcMatchGenerator {
     fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.table.ensure_tables();
 
-        let current_len = self.table.window.back().unwrap().len();
+        let current_len = *self.table.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
+        // The current block is the tail of `history`. Hoist it as a raw
+        // slice (like `start_matching_optimal`): the routine mutates the
+        // hash/chain tables + `offset_hist` but never reallocates
+        // `history`, so the slice stays valid and we avoid re-borrowing
+        // `self.table` (which would conflict with the `offset_hist` write).
+        let current_ptr = self.table.get_last_space().as_ptr();
+        let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
         let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
@@ -3185,7 +3191,6 @@ impl HcMatchGenerator {
             if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
                 self.table
                     .insert_positions(abs_pos, candidate.start + candidate.match_len);
-                let current = self.table.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
                 handle_sequence(Sequence::Triple {
@@ -3214,7 +3219,6 @@ impl HcMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.table.window.back().unwrap().as_slice();
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -3226,14 +3230,14 @@ impl HcMatchGenerator {
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
         self.table.ensure_tables();
-        let current_len = self.table.window.back().unwrap().len();
+        let current_len = *self.table.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
-        let current_ptr = self.table.window.back().unwrap().as_ptr();
+        let current_ptr = self.table.get_last_space().as_ptr();
         // `start_matching_optimal()` mutates tables/state but never mutates or
-        // reorders `self.table.window`, so this block slice remains valid for the
-        // duration of the routine and avoids cloning the full block.
+        // reallocates `self.table.history`, so this tail slice remains valid for
+        // the duration of the routine and avoids cloning the full block.
         let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
         let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
@@ -5008,7 +5012,7 @@ fn btultra2_seed_pass_disabled_when_prefix_history_exists() {
         26,
     );
     hc.table.history_abs_start = 17;
-    hc.table.window.push_back(b"abcdefghijklmnop".to_vec());
+    hc.table.push_test_chunk(b"abcdefghijklmnop".to_vec());
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 9),
         "btultra2 warmup must be first-block only (no prefix history)"
@@ -5055,9 +5059,9 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
     // Simulate non-first block state: current block has no prefix in deque,
     // but total produced window already includes prior output.
     hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
-    hc.table
-        .window
-        .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 32]);
+    // window_size set manually above to simulate prior output; record the
+    // current block as one live chunk (seed-pass check reads lengths, not bytes).
+    hc.table.chunk_lens.push_back(HC_PREDEF_THRESHOLD + 32);
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 32),
         "btultra2 warmup must not run after frame start"
@@ -5073,9 +5077,7 @@ fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
         26,
     );
     hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
-    hc.table
-        .window
-        .push_back(alloc::vec![b'A'; HC_PREDEF_THRESHOLD + 64]);
+    hc.table.chunk_lens.push_back(HC_PREDEF_THRESHOLD + 64);
     hc.backend.bt_mut().ldm_sequences.push(HcRawSeq {
         lit_length: 8,
         offset: 16,
