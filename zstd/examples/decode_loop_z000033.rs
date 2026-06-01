@@ -20,6 +20,10 @@ fn main() {
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50_000);
     let mode: &str = args.get(3).map(|s| s.as_str()).unwrap_or("rust");
     let corpus_path: Option<&str> = args.get(4).map(|s| s.as_str());
+    // 6th arg: "checksum" → encode with content_checksum_flag = 1 so the
+    // decode loop exercises the post-decode XXH64 verify pass. Lets us
+    // isolate the checksum cost (flag-on vs flag-off) in one harness.
+    let checksum: bool = args.get(5).map(|s| s == "checksum").unwrap_or(false);
 
     // Source: either a file from disk, or a deterministic 1MB LCG synthetic.
     let src: Vec<u8> = if let Some(path) = corpus_path {
@@ -41,14 +45,43 @@ fn main() {
     // FFI encode once at requested level.
     let dst_cap = unsafe { zstd_sys::ZSTD_compressBound(src.len()) };
     let mut compressed: Vec<u8> = vec![0u8; dst_cap];
-    let written = unsafe {
-        zstd_sys::ZSTD_compress(
-            compressed.as_mut_ptr() as *mut core::ffi::c_void,
-            dst_cap,
-            src.as_ptr() as *const core::ffi::c_void,
-            src.len(),
-            level,
-        )
+    let written = if checksum {
+        // ZSTD_compress2 honours CCtx params, including the checksum flag.
+        let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
+        assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
+        unsafe {
+            zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
+                level,
+            );
+            zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_checksumFlag,
+                1,
+            );
+        }
+        let w = unsafe {
+            zstd_sys::ZSTD_compress2(
+                cctx,
+                compressed.as_mut_ptr() as *mut core::ffi::c_void,
+                dst_cap,
+                src.as_ptr() as *const core::ffi::c_void,
+                src.len(),
+            )
+        };
+        unsafe { zstd_sys::ZSTD_freeCCtx(cctx) };
+        w
+    } else {
+        unsafe {
+            zstd_sys::ZSTD_compress(
+                compressed.as_mut_ptr() as *mut core::ffi::c_void,
+                dst_cap,
+                src.as_ptr() as *const core::ffi::c_void,
+                src.len(),
+                level,
+            )
+        }
     };
     assert_eq!(
         unsafe { zstd_sys::ZSTD_isError(written) },

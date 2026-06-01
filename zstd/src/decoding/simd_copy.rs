@@ -157,6 +157,14 @@ pub mod shape_stats {
     }
 }
 
+/// Copy length at or above which [`copy_bytes_overshooting`] hands off to
+/// `memcpy` (ERMS `rep movsb` on x86) instead of its chunked SIMD loop.
+/// Below this the inline SIMD / overlapping-u64 paths win; above it the
+/// copy is bandwidth-bound and `memcpy`'s microcoded bulk store is faster.
+/// Picked to sit well above hot literal pushes (1..=32 B) and typical
+/// match copies, squarely in raw-block / long-match territory.
+const BULK_MEMCPY_THRESHOLD: usize = 2048;
+
 /// Copies at least `copy_at_least` bytes from `src` to `dst`.
 ///
 /// This helper may over-copy up to the chunk size of the chosen SIMD/scalar
@@ -255,6 +263,23 @@ pub(crate) unsafe fn copy_bytes_overshooting(
                     .write_unaligned(tail_hi);
             }
         }
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
+    }
+
+    // Bulk-copy path: large non-overlapping copies (raw-block payloads,
+    // long non-overlapping matches) are bandwidth-bound, and on modern
+    // x86 the microcoded `rep movsb` (ERMS) that `memcpy` lowers to beats
+    // a hand-rolled 2×32B ymm loop — it issues wider internal stores with
+    // no per-iteration loop overhead and better hardware prefetch. The
+    // chunked-SIMD kernels below win only in the small/medium range where
+    // the `memcpy` call + ERMS startup cost would dominate the few bytes
+    // actually moved. Above this threshold, hand off to `memcpy`.
+    if copy_at_least >= BULK_MEMCPY_THRESHOLD {
+        // SAFETY: by contract `copy_at_least <= min(src.1, dst.1)`, and
+        // the regions do not overlap, so this reads/writes exactly
+        // `copy_at_least` bytes within both reported spans (no overshoot).
+        unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
         debug_assert_eq_copy(src, dst, copy_at_least);
         return;
     }
