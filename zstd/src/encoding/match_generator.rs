@@ -55,7 +55,7 @@ use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
-pub(crate) const ROW_MIN_MATCH_LEN: usize = 6;
+pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 pub(crate) const DFAST_TARGET_LEN: usize = 48;
 // Donor `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
@@ -5689,6 +5689,11 @@ fn row_pick_lazy_returns_best_when_lookahead_is_out_of_bounds() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
     matcher.add_data(b"abcabc".to_vec(), |_| {});
+    // Build the row tables before probing: the lookahead path reaches
+    // `row_candidate` -> `row_heads[..]` once the accept floor is small
+    // enough to pass the length gate, so the tables must be allocated
+    // (production always calls this before any candidate probe).
+    matcher.ensure_tables();
 
     let best = MatchCandidate {
         start: 0,
@@ -6481,7 +6486,9 @@ fn row_pick_lazy_depth2_returns_none_when_next2_significantly_better() {
         .best_match(abs_pos, 0)
         .expect("expected baseline repcode match");
     assert_eq!(best.offset, 9);
-    assert_eq!(best.match_len, ROW_MIN_MATCH_LEN);
+    // Baseline match length is fixed by the fixture data (the offset-9
+    // rep run is 6 bytes long), independent of the accept threshold.
+    assert_eq!(best.match_len, 6);
 
     if let Some(next) = matcher.best_match(abs_pos + 1, 1) {
         assert!(next.match_len <= best.match_len);
@@ -6518,7 +6525,9 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
         .best_match(abs_pos, 0)
         .expect("expected baseline repcode match");
     assert_eq!(best.offset, 9);
-    assert_eq!(best.match_len, ROW_MIN_MATCH_LEN);
+    // Baseline match length is fixed by the fixture data (the offset-9
+    // rep run is 6 bytes long), independent of the accept threshold.
+    assert_eq!(best.match_len, 6);
 
     let next2 = matcher
         .best_match(abs_pos + 2, 2)
@@ -6668,7 +6677,11 @@ fn btultra2_main_hash_uses_donor_hash4_formula() {
 fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.history = b"abcde".to_vec();
+    // One byte short of the accept floor: from abs_pos 0 there are fewer
+    // than `ROW_MIN_MATCH_LEN` bytes left, so the length gate in
+    // `row_candidate` must short-circuit to `None` before touching the
+    // (here unbuilt) row tables.
+    matcher.history = alloc::vec![b'a'; ROW_MIN_MATCH_LEN - 1];
     matcher.history_start = 0;
     matcher.history_abs_start = 0;
 
