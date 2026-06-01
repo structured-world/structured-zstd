@@ -584,10 +584,6 @@ impl HuffmanTable {
         Ok(bytes_read as u32)
     }
 
-    /// Once the weights have been read from the data, you can decode the weights
-    /// into a table, and use that table to decode the actual compressed data.
-    ///
-    /// This function populates the rest of the table from the series of weights.
     /// Compute per-symbol code lengths (`bits`) + `max_num_bits` from the
     /// parsed `weights`, returning `max_bits`. This is the slice of the
     /// table build the ENCODER side needs: [`Self::to_encoder_table`] reads
