@@ -60,21 +60,22 @@ impl RowTagKernel {
                 return RowTagKernel::Sse2;
             }
         }
-        #[cfg(all(
-            not(feature = "std"),
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "avx2"
-        ))]
+        // no_std: resolve from compile-time `target_feature` flags. Use
+        // `if cfg!(...)` (not `#[cfg]`-gated `return` blocks) so the trailing
+        // `RowTagKernel::Scalar` stays reachable and every variant is
+        // "constructed" — `target_feature = "sse2"` / `"neon"` are baseline on
+        // x86_64 / aarch64, so a `#[cfg]`-gated unconditional `return` there
+        // makes the scalar fallback `unreachable_code` and leaves `Avx2`
+        // dead-code under `-D warnings`. `cfg!` const-folds to the same
+        // codegen without those lints.
+        #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
         {
-            return RowTagKernel::Avx2;
-        }
-        #[cfg(all(
-            not(feature = "std"),
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse2"
-        ))]
-        {
-            return RowTagKernel::Sse2;
+            if cfg!(target_feature = "avx2") {
+                return RowTagKernel::Avx2;
+            }
+            if cfg!(target_feature = "sse2") {
+                return RowTagKernel::Sse2;
+            }
         }
         #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
         {
@@ -85,11 +86,12 @@ impl RowTagKernel {
         #[cfg(all(
             not(feature = "std"),
             target_arch = "aarch64",
-            target_endian = "little",
-            target_feature = "neon"
+            target_endian = "little"
         ))]
         {
-            return RowTagKernel::Neon;
+            if cfg!(target_feature = "neon") {
+                return RowTagKernel::Neon;
+            }
         }
         RowTagKernel::Scalar
     }
@@ -99,6 +101,15 @@ impl RowTagKernel {
     /// multiples of 16) so the result fits in a `u64`.
     #[inline]
     fn match_mask(self, tags: &[u8], tag: u8) -> u64 {
+        // Row width is `1 << row_log` with `row_log` clamped to 4..=6, so the
+        // slice is always 16 / 32 / 64 bytes — the widths the SIMD kernels and
+        // the u64 mask assume. Guard it so a future row-width change can't
+        // silently truncate the mask (>64 slots) or drop SIMD tail bytes.
+        debug_assert!(
+            matches!(tags.len(), 16 | 32 | 64),
+            "row tag kernel expects widths 16/32/64, got {}",
+            tags.len()
+        );
         match self {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: this variant is only produced by `detect()` after
