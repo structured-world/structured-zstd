@@ -288,9 +288,10 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // appropriate feature-detection mechanism (cached runtime detect under
     // std, compile-time target_feature otherwise) and falls through on miss
     // so a single dispatcher covers every arch + feature combination.
-    // Unused when every SIMD tier is feature-gated out (scalar-only trim):
-    // all invocation sites are behind `kernel_*` cfgs, so the macro itself
-    // can have no callers there.
+    // May have no callers in some builds: every invocation site is behind an
+    // arch + `kernel_*` cfg, so the macro is unused on non-x86/non-aarch64
+    // targets (no arch-specific sites compile) and on x86/aarch64 builds that
+    // trim the SIMD tiers (e.g. scalar-only). Hence `allow(unused_macros)`.
     #[allow(unused_macros)]
     macro_rules! try_chunk_kernel {
         ($chunk:expr, $kernel:ident) => {{

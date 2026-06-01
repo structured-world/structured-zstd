@@ -26,7 +26,8 @@ cargo add structured-zstd --no-default-features
 ```
 
 The decoder ships per-CPU-tier SIMD kernels, each behind a cargo feature
-(all on by default, picked at runtime): `kernel_scalar`, `kernel_sse2`,
+(all on by default; the tier is picked at runtime with `std`, or at compile
+time from `target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
 `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and `kernel_neon`,
 `kernel_sve` (aarch64). The scalar kernel is always compiled (it is the
 mandatory fallback), so `kernel_scalar` is a marker that gates no code;
