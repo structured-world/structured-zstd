@@ -73,10 +73,17 @@ pub(crate) trait Strategy: Copy + 'static {
     /// favour decompression speed; disabled for BtUltra / BtUltra2.
     const FAVOR_SMALL_OFFSETS: bool;
 
-    /// Compile-time gate for the donor `static (mls==3)` short-match
-    /// probe inside `ZSTD_insertBtAndGetAllMatches`. Only BtUltra2
-    /// drives the hash3 table today.
+    /// Compile-time gate for the `static (mls==3)` short-match probe.
+    /// Both btultra and btultra2 search the hash3 table (their
+    /// `clevels.h` minMatch is 3); btopt does not (minMatch >= 4).
     const USE_HASH3: bool;
+
+    /// Whether the optimal parser runs the in-block two-pass dynamic
+    /// statistics seed (upstream `ZSTD_initStats_ultra`). Only btultra2
+    /// does this; btultra is single-pass even though it now shares the
+    /// hash3 short-match probe. Defaults to `false` so every other
+    /// strategy drops the seed-pass body at codegen time.
+    const TWO_PASS_SEED: bool = false;
 
     /// Whether the optimal parser walks the BT — `false` for Lazy2,
     /// `true` for BtOpt / BtUltra / BtUltra2.
@@ -212,7 +219,10 @@ impl Strategy for BtUltra {
     const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
-    const USE_HASH3: bool = false;
+    // clevels.h level 18 minMatch = 3 → the hash3 short-match probe is
+    // active, same as btultra2. The two-pass seed stays btultra2-only
+    // (TWO_PASS_SEED defaults to false here).
+    const USE_HASH3: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
     // 1 << searchLog for level 18 (clevels.h searchLog = 6). The BT walk
@@ -233,6 +243,7 @@ impl Strategy for BtUltra2 {
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
     const USE_HASH3: bool = true;
+    const TWO_PASS_SEED: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
     const MAX_CHAIN_DEPTH: usize = 512;
@@ -411,16 +422,20 @@ mod tests {
         assert!(BtUltra2::USE_BT);
     };
 
-    // `use_hash3_only_set_for_btultra2`: hash3 is exclusively a
-    // BtUltra2 feature (donor parity).
+    // hash3 short-match probe: active for btultra + btultra2 (clevels.h
+    // minMatch 3); btopt and below do not search it. The in-block
+    // two-pass dynamic-stats seed is btultra2-only.
     const _USE_HASH3_LAYOUT: () = {
         assert!(!Fast::USE_HASH3);
         assert!(!Dfast::USE_HASH3);
         assert!(!Greedy::USE_HASH3);
         assert!(!Lazy::USE_HASH3);
         assert!(!BtOpt::USE_HASH3);
-        assert!(!BtUltra::USE_HASH3);
+        assert!(BtUltra::USE_HASH3);
         assert!(BtUltra2::USE_HASH3);
+        assert!(!BtOpt::TWO_PASS_SEED);
+        assert!(!BtUltra::TWO_PASS_SEED);
+        assert!(BtUltra2::TWO_PASS_SEED);
     };
 
     // Mirror the per-strategy fields the optimal-parser cost profile

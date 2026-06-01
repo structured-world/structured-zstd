@@ -2985,13 +2985,12 @@ impl HcMatchGenerator {
         &self,
         current_len: usize,
     ) -> bool {
-        // Donor `initStats_ultra` (the seed pass) is the BtUltra2-only
-        // first-pass dynamic stats refinement. With `S` plumbed in,
-        // every non-BtUltra2 monomorphisation drops both this call
-        // and the seed-pass body at codegen time — the const below
-        // resolves to `false` for Fast / Dfast / Greedy / Lazy /
-        // BtOpt / BtUltra and short-circuits the entire predicate.
-        if !(S::OPT_LEVEL == 2 && S::USE_HASH3) {
+        // The in-block two-pass dynamic-stats seed (`initStats_ultra`)
+        // is btultra2-only. `TWO_PASS_SEED` is `false` for every other
+        // strategy — including btultra, which now shares the hash3
+        // short-match probe but stays single-pass — so the seed call and
+        // its body drop at codegen time for all non-btultra2 kernels.
+        if !S::TWO_PASS_SEED {
             return false;
         }
         let HcBackend::Bt(bt) = &self.backend else {
@@ -3035,7 +3034,12 @@ impl HcMatchGenerator {
             tag,
             StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
         );
-        let next_hash3_log = if is_btultra2 {
+        // btultra and btultra2 both run the mls=3 hash3 short-match probe
+        // (clevels.h minMatch 3). The `is_btultra2` flag below stays
+        // exclusive to btultra2 because it tweaks the BT rebase boundary,
+        // not match finding.
+        let wants_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
+        let next_hash3_log = if wants_hash3 {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0
