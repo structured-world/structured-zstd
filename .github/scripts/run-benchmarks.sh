@@ -91,7 +91,8 @@ MEM_RE = re.compile(
     r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
-    r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)$'
+    r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)'
+    r'(?: rust_with_dict_bytes=(\d+) rust_with_dict_ratio=([0-9.]+))?$'
 )
 DICT_TRAIN_RE = re.compile(
     r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
@@ -334,8 +335,20 @@ with open(raw_path) as f:
                 ffi_with_dict_bytes,
                 ffi_no_dict_ratio,
                 ffi_with_dict_ratio,
+                rust_with_dict_bytes,
+                rust_with_dict_ratio,
             ) = dict_match.groups()
             label = unescape_report_label(label)
+            # rust_with_dict_* are optional trailing fields (older bench logs
+            # omit them). A reported 0 means the Rust dict path was
+            # unavailable for this (scenario, level) — treat as "no rust dict
+            # ratio" so no misleading compress-dict ratio series is emitted.
+            rust_with_dict_bytes_val = (
+                int(rust_with_dict_bytes) if rust_with_dict_bytes is not None else 0
+            )
+            rust_with_dict_ratio_val = (
+                float(rust_with_dict_ratio) if rust_with_dict_ratio is not None else 0.0
+            )
             dictionary_rows.append({
                 "scenario": scenario,
                 "label": label,
@@ -346,6 +359,8 @@ with open(raw_path) as f:
                 "ffi_with_dict_bytes": int(ffi_with_dict_bytes),
                 "ffi_no_dict_ratio": float(ffi_no_dict_ratio),
                 "ffi_with_dict_ratio": float(ffi_with_dict_ratio),
+                "rust_with_dict_bytes": rust_with_dict_bytes_val,
+                "rust_with_dict_ratio": rust_with_dict_ratio_val,
             })
             continue
 
@@ -731,6 +746,42 @@ for row in memory_rows:
             "delta_percent": delta_percent,
             "status_band": "n/a",
             "interpretation": "delta>1 means Rust allocates more peak memory than FFI",
+        }
+    )
+
+# compress-dict compression-ratio rows. The dict path emits REPORT_DICT
+# (not REPORT), so its ratio data lives in `dictionary_rows`, separate from
+# the non-dict `ratios`/`delta_rows`. Surface a `compression_ratio` relative
+# row for the `compress-dict` stage so the dashboard's existing ratio series
+# renders it (previously compress-dict had a timing series but no ratio
+# graph). rust_value/ffi_value are the dict-compressed-size ratios
+# (compressed / input); delta = rust/ffi, >1 meaning Rust's dict output is
+# larger than FFI's (a ratio regression, same direction as the non-dict
+# compression_ratio metric). Skip rows where the Rust dict size is 0 (the
+# bench could not run the Rust dict path for that scenario/level).
+for row in dictionary_rows:
+    rust_ratio = row.get("rust_with_dict_ratio", 0.0)
+    ffi_ratio = row["ffi_with_dict_ratio"]
+    if rust_ratio <= 0.0 or ffi_ratio <= 0.0:
+        continue
+    delta_ratio = rust_ratio / ffi_ratio
+    relative_rows.append(
+        {
+            "target": bench_target_id,
+            "stage": "compress-dict",
+            "scenario": row["scenario"],
+            "level": row["level"],
+            "source": None,
+            "key": canonical_key("compress-dict", row["scenario"], row["level"], None),
+            "commit_sha": commit_sha,
+            "generated_at": generated_at,
+            "metric": "compression_ratio",
+            "rust_value": rust_ratio,
+            "ffi_value": ffi_ratio,
+            "delta_ratio": delta_ratio,
+            "delta_percent": (delta_ratio - 1.0) * 100.0,
+            "status_band": classify_ratio_delta(delta_ratio),
+            "interpretation": "delta>1 means Rust dict-compressed output is larger than FFI",
         }
     )
 
