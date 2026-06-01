@@ -321,6 +321,38 @@ impl<E: FseEntry> FSETableImpl<E> {
         Ok(bytes_read)
     }
 
+    /// Parse the table description into `symbol_probabilities` +
+    /// `accuracy_log` WITHOUT building the decoding table.
+    ///
+    /// Returns the same byte count as [`Self::build_decoder`] (the table
+    /// description length), so a caller stepping a cursor over a packed
+    /// stream of tables advances identically. Used by the encoder
+    /// dictionary load: [`Self::to_encoder_table`] reads only the
+    /// probabilities + accuracy log, so building the decode table (and
+    /// the `enrich_*` post-passes, which touch only decode entries) is
+    /// pure waste there.
+    ///
+    /// The existing `decode` table is cleared so a reused `FSETableImpl`
+    /// can't silently keep decoding against a stale table that no longer
+    /// matches the just-parsed probabilities (`init_state` would
+    /// otherwise pass whenever the old `decode.len()` still equalled
+    /// `1 << accuracy_log`). After this call the table is intentionally
+    /// non-decodable until `build_decoding_table` runs.
+    // `pub(crate)`: this leaves the table in an intentionally non-decodable
+    // partial-init state, so it must not be reachable from the public API
+    // (the module is re-exported with `pub use`). Only the crate-internal
+    // encoder-dictionary parse calls it.
+    pub(crate) fn read_table_probabilities(
+        &mut self,
+        source: &[u8],
+        max_log: u8,
+    ) -> Result<usize, FSETableError> {
+        let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
+        self.accuracy_log = 0;
+        self.decode.clear();
+        self.read_probabilities(source, max_log)
+    }
+
     /// Given the provided accuracy log, build a decoding table from that log.
     pub fn build_from_probabilities(
         &mut self,

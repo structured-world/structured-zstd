@@ -17,6 +17,54 @@ use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, defa
 
 use crate::io::{Read, Write};
 
+/// A dictionary prepared for the ENCODER side, analogous to zstd's `CDict`
+/// (vs the decoder's [`Dictionary`](crate::decoding::Dictionary) / `DDict`).
+///
+/// It carries the entropy tables, content, and repeat-offset history the
+/// compressor needs, but is a distinct type with **no decode path**: there is
+/// no way to turn it into a [`DictionaryHandle`](crate::decoding::DictionaryHandle)
+/// or feed it to a [`FrameDecoder`](crate::decoding::FrameDecoder). That keeps
+/// the compress-only state (which may have been parsed without building the
+/// decode lookup tables, see
+/// [`set_dictionary_from_bytes`](FrameCompressor::set_dictionary_from_bytes))
+/// from ever reaching the decode side — the encoder/decoder dictionary split
+/// mirrors C zstd's `CDict` / `DDict`.
+pub struct EncoderDictionary {
+    pub(crate) inner: crate::decoding::Dictionary,
+}
+
+impl EncoderDictionary {
+    /// Wrap an already-parsed [`Dictionary`](crate::decoding::Dictionary) for
+    /// encoder use. A fully-decoded dictionary is valid here; only the encoder
+    /// entropy tables, content, and offset history are read.
+    pub fn from_dictionary(dictionary: crate::decoding::Dictionary) -> Self {
+        Self { inner: dictionary }
+    }
+
+    /// Parse a serialized dictionary blob for encoder use, skipping the decode
+    /// lookup-table build the encoder never reads (see
+    /// `Dictionary::decode_dict_for_encoding`). The encoder entropy tables — and
+    /// thus the emitted frame — are identical to a full parse.
+    pub fn from_bytes(
+        raw_dictionary: &[u8],
+    ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        Ok(Self {
+            inner: crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+        })
+    }
+
+    /// The dictionary id.
+    ///
+    /// A dictionary attached for encoding always has a non-zero id (the
+    /// `set_dictionary*` / `set_encoder_dictionary` attach path rejects a
+    /// zero id). This getter, however, reflects the wrapped dictionary as-is:
+    /// an `EncoderDictionary` built via [`Self::from_dictionary`] from a raw
+    /// `Dictionary` with `id == 0` reports `0` here until it is attached.
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+}
+
 /// An interface for compressing arbitrary data with the ZStandard compression algorithm.
 ///
 /// `FrameCompressor` will generally be used by:
@@ -40,7 +88,7 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
-    dictionary: Option<crate::decoding::Dictionary>,
+    dictionary: Option<EncoderDictionary>,
     dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     source_size_hint: Option<u64>,
     state: CompressState<M>,
@@ -630,10 +678,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
-            self.state.offset_hist = dict.offset_hist;
+            self.state.offset_hist = dict.inner.offset_hist;
             self.state
                 .matcher
-                .prime_with_dictionary(dict.dict_content.as_slice(), dict.offset_hist);
+                .prime_with_dictionary(dict.inner.dict_content.as_slice(), dict.inner.offset_hist);
         }
         if let Some(cache) = cached_entropy {
             self.state.last_huff_table.clone_from(&cache.huff);
@@ -865,7 +913,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             single_segment,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: if use_dictionary_state {
-                self.dictionary.as_ref().map(|dict| dict.id as u64)
+                self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
             } else {
                 None
             },
@@ -1114,8 +1162,53 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn set_dictionary(
         &mut self,
         dictionary: crate::decoding::Dictionary,
-    ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
-    {
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        self.attach_dictionary(EncoderDictionary::from_dictionary(dictionary))
+    }
+
+    /// Parse and attach a serialized dictionary blob.
+    ///
+    /// Parses with the encoder-only path (skips the FSE/HUF decode lookup-table
+    /// build the encoder never reads); the entropy ENCODER tables — and thus
+    /// the emitted frame — are identical to a full parse.
+    pub fn set_dictionary_from_bytes(
+        &mut self,
+        raw_dictionary: &[u8],
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        self.attach_dictionary(EncoderDictionary::from_bytes(raw_dictionary)?)
+    }
+
+    /// Attach an already-parsed [`EncoderDictionary`] without reparsing a raw
+    /// blob.
+    ///
+    /// Accepts an `EncoderDictionary` produced once via
+    /// [`EncoderDictionary::from_bytes`] / [`EncoderDictionary::from_dictionary`]
+    /// or handed back by [`Self::clear_dictionary`] / the `set_dictionary*`
+    /// return value, so callers can reattach or reuse a prepared dictionary
+    /// across compressions without re-running the dictionary parse each time.
+    /// Returns the previously-attached dictionary, if any.
+    pub fn set_encoder_dictionary(
+        &mut self,
+        dictionary: EncoderDictionary,
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        self.attach_dictionary(dictionary)
+    }
+
+    /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
+    pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
+        self.dictionary_entropy_cache = None;
+        self.dictionary.take()
+    }
+
+    /// Validate `enc`, build the encoder entropy cache from it, store it, and
+    /// return the previously-attached dictionary. Shared by every public
+    /// attach entry point: `set_dictionary`, `set_dictionary_from_bytes`, and
+    /// `set_encoder_dictionary`.
+    fn attach_dictionary(
+        &mut self,
+        enc: EncoderDictionary,
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        let dictionary = &enc.inner;
         if dictionary.id == 0 {
             return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
         }
@@ -1144,23 +1237,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .to_encoder_table()
                 .map(|table| PreviousFseTable::Custom(Box::new(table))),
         });
-        Ok(self.dictionary.replace(dictionary))
-    }
-
-    /// Parse and attach a serialized dictionary blob.
-    pub fn set_dictionary_from_bytes(
-        &mut self,
-        raw_dictionary: &[u8],
-    ) -> Result<Option<crate::decoding::Dictionary>, crate::decoding::errors::DictionaryDecodeError>
-    {
-        let dictionary = crate::decoding::Dictionary::decode_dict(raw_dictionary)?;
-        self.set_dictionary(dictionary)
-    }
-
-    /// Remove the attached dictionary.
-    pub fn clear_dictionary(&mut self) -> Option<crate::decoding::Dictionary> {
-        self.dictionary_entropy_cache = None;
-        self.dictionary.take()
+        Ok(self.dictionary.replace(enc))
     }
 }
 
@@ -1797,7 +1874,7 @@ mod tests {
                 .set_dictionary(dict_for_encoder)
                 .expect("valid dictionary should attach")
                 .expect("set_dictionary_from_bytes inserted previous dictionary")
-                .id,
+                .id(),
             dict_for_decoder.id
         );
         compressor.set_source(data.as_slice());
@@ -1936,6 +2013,110 @@ mod tests {
         assert!(
             compressor.state.fse_tables.of_previous.is_some(),
             "dictionary entropy should seed previous of table before first block"
+        );
+    }
+
+    #[test]
+    fn set_encoder_dictionary_reattaches_prepared_dict_without_reparse() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+
+        // Prepare the EncoderDictionary once, then attach it via the prepared-
+        // dictionary API (no raw-blob reparse at attach time).
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+
+        let mut with_dict = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        let previous = compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+        assert!(previous.is_none());
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut with_dict);
+        compressor.compress();
+        // clear_dictionary hands the prepared dictionary back (last use of
+        // `compressor`, so its `&mut with_dict` drain borrow ends here).
+        let returned = compressor
+            .clear_dictionary()
+            .expect("dictionary was attached");
+        assert_eq!(returned.id(), dict_id);
+
+        // The reattached dictionary drives the frame: its id is advertised and
+        // the stream round-trips through a decoder primed with the same dict.
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(with_dict.as_slice())
+            .expect("encoded stream should have a frame header");
+        assert_eq!(frame_header.dictionary_id(), Some(dict_id));
+        let decoder_dict = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(decoder_dict).unwrap();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
+        assert_eq!(decoded.as_slice(), payload.as_slice());
+
+        // The dictionary handed back by clear_dictionary reattaches to another
+        // compressor without touching the raw bytes again, producing an
+        // identical frame.
+        let mut with_dict2 = Vec::new();
+        let mut compressor2 = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor2
+            .set_encoder_dictionary(returned)
+            .expect("returned dictionary should reattach");
+        compressor2.set_source(payload.as_slice());
+        compressor2.set_drain(&mut with_dict2);
+        compressor2.compress();
+        assert_eq!(
+            with_dict2, with_dict,
+            "reattached prepared dict must produce an identical frame"
+        );
+    }
+
+    #[test]
+    fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
+        // The encoder-only dict parse (`decode_dict_for_encoding`, used by
+        // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
+        // the enrich passes. The encoder entropy tables are derived purely from
+        // the symbol probabilities / Huffman weights, so the compressed output
+        // MUST be byte-identical to the full-decode path. This pins the
+        // load-bearing equivalence so a future FSE/HUF parsing refactor that
+        // still round-trips but silently diverges on the probabilities/weights
+        // fails loudly here instead of producing a different (but valid) frame.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+
+        // Path A: encoder-only parse straight from the raw blob.
+        let mut from_bytes_out = Vec::new();
+        {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            compressor
+                .set_dictionary_from_bytes(dict_raw)
+                .expect("dictionary bytes should parse");
+            compressor.set_source(payload.as_slice());
+            compressor.set_drain(&mut from_bytes_out);
+            compressor.compress();
+        }
+
+        // Path B: full decode (builds the decoder tables too), then attach for
+        // encoding via the `Dictionary` setter.
+        let full_decode = crate::decoding::Dictionary::decode_dict(dict_raw)
+            .expect("dictionary bytes should fully decode");
+        let mut full_decode_out = Vec::new();
+        {
+            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            compressor
+                .set_dictionary(full_decode)
+                .expect("full-decode dictionary should attach");
+            compressor.set_source(payload.as_slice());
+            compressor.set_drain(&mut full_decode_out);
+            compressor.compress();
+        }
+
+        assert_eq!(
+            from_bytes_out, full_decode_out,
+            "encoder-only dict parse must produce byte-identical output to the full decode"
         );
     }
 
