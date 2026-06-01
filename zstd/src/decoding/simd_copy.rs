@@ -581,10 +581,17 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
             return 16;
         }
     }
+    // The no-std arms must mirror the dispatcher's compile-time chunk
+    // selection EXACTLY (both `target_feature` AND the matching `kernel_*`
+    // gate), otherwise a tier-trimmed build would size test scenarios for a
+    // chunk the dispatcher can never select — masking tier-gating
+    // regressions. The 64B arm keys off `avx512vbmi2` (not bare `avx512f`),
+    // matching the dispatcher's `kernel_vbmi2` 64B copy.
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx512f"
+        target_feature = "avx512vbmi2",
+        feature = "kernel_vbmi2"
     ))]
     {
         return 64;
@@ -592,7 +599,8 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx2"
+        target_feature = "avx2",
+        feature = "kernel_avx2"
     ))]
     {
         return 32;
@@ -600,12 +608,17 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2"
+        target_feature = "sse2",
+        feature = "kernel_sse2"
     ))]
     {
         return 16;
     }
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel_neon"
+    ))]
     {
         return 16;
     }
@@ -695,10 +708,17 @@ fn detect_x86_caps() -> X86Caps {
         }
         #[cfg(target_arch = "x86")]
         {
+            // Mirror the x86_64 tag ladder above: each tier is reported only
+            // when BOTH its `kernel_*` feature is enabled AND the CPU exposes
+            // it at runtime, so a tier-trimmed build (e.g.
+            // `--features kernel_scalar`) never selects a SIMD chunk on 32-bit
+            // x86. `avx512f` follows the `Vbmi2` tag exactly — it is set on
+            // `avx512vbmi2` (not bare `avx512f`), matching the rule that an
+            // AVX-512F-but-not-VBMI2 CPU stays on the 32B (AVX2) copy.
             X86Caps {
-                avx512f: is_x86_feature_detected!("avx512f"),
-                avx2: is_x86_feature_detected!("avx2"),
-                sse2: is_x86_feature_detected!("sse2"),
+                avx512f: cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
+                avx2: cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
+                sse2: cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
             }
         }
     })
