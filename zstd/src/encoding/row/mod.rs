@@ -27,10 +27,73 @@ use super::match_table::helpers::{
 };
 use super::opt::types::MatchCandidate;
 
-/// Bitmask of row slots whose tag byte equals `tag`: bit `j` is set iff
-/// `tags[j] == tag`. `tags.len()` is the row width (16 / 32 / 64), so the
-/// result fits in a `u64`. Scalar reference implementation; a SIMD kernel
-/// computes the same mask with one vector compare + movemask (the donor
+/// Which kernel computes the row tag-match mask. Resolved once per
+/// `RowMatchGenerator` (CPU features don't change mid-process) and stored
+/// so the per-position `row_candidate` hot path avoids a repeated runtime
+/// feature query. `Sse2` covers the SSE2 baseline (always present on
+/// x86_64); `Avx2` is used when the CPU has AVX2; everything else (other
+/// architectures, x86 without SSE2) uses the scalar reference.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum RowTagKernel {
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Sse2,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx2,
+}
+
+impl RowTagKernel {
+    /// Resolve the best available tag-match kernel for this build/CPU.
+    fn detect() -> Self {
+        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            use std::arch::is_x86_feature_detected;
+            if is_x86_feature_detected!("avx2") {
+                return RowTagKernel::Avx2;
+            }
+            if is_x86_feature_detected!("sse2") {
+                return RowTagKernel::Sse2;
+            }
+        }
+        #[cfg(all(
+            not(feature = "std"),
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "avx2"
+        ))]
+        {
+            return RowTagKernel::Avx2;
+        }
+        #[cfg(all(
+            not(feature = "std"),
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2"
+        ))]
+        {
+            return RowTagKernel::Sse2;
+        }
+        RowTagKernel::Scalar
+    }
+
+    /// Bitmask of row slots whose tag byte equals `tag` (bit `j` set iff
+    /// `tags[j] == tag`). `tags.len()` is the row width (16 / 32 / 64, all
+    /// multiples of 16) so the result fits in a `u64`.
+    #[inline]
+    fn match_mask(self, tags: &[u8], tag: u8) -> u64 {
+        match self {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: this variant is only produced by `detect()` after
+            // confirming AVX2 (runtime) or `target_feature = "avx2"`.
+            RowTagKernel::Avx2 => unsafe { row_tag_match_mask_avx2(tags, tag) },
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: SSE2 confirmed by `detect()` (always true on x86_64).
+            RowTagKernel::Sse2 => unsafe { row_tag_match_mask_sse2(tags, tag) },
+            RowTagKernel::Scalar => row_tag_match_mask_scalar(tags, tag),
+        }
+    }
+}
+
+/// Scalar reference: one byte compare per slot. SIMD kernels below compute
+/// the identical mask with a vector compare + movemask (donor
 /// `ZSTD_row_getMatchMask` shape).
 #[inline]
 fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
@@ -39,6 +102,78 @@ fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
         if t == tag {
             mask |= 1u64 << j;
         }
+    }
+    mask
+}
+
+/// SSE2 tag-match mask: `_mm_cmpeq_epi8` + `_mm_movemask_epi8` over each
+/// 16-byte chunk of the row. `tags.len()` is a multiple of 16, so no scalar
+/// tail is needed.
+///
+/// # Safety
+/// Caller must ensure SSE2 is available (always true on x86_64; checked by
+/// `RowTagKernel::detect`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+
+    let needle = _mm_set1_epi8(tag as i8);
+    let mut mask = 0u64;
+    let mut off = 0;
+    while off + 16 <= tags.len() {
+        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte unaligned load is
+        // in bounds.
+        let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
+        let eq = _mm_cmpeq_epi8(v, needle);
+        let bits = _mm_movemask_epi8(eq) as u16 as u64;
+        mask |= bits << off;
+        off += 16;
+    }
+    mask
+}
+
+/// AVX2 tag-match mask: `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8` over
+/// each 32-byte chunk, falling back to a 16-byte SSE2 chunk for a 16-wide
+/// row. `tags.len()` is 16 / 32 / 64.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (checked by `RowTagKernel::detect`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+
+    let needle = _mm256_set1_epi8(tag as i8);
+    let mut mask = 0u64;
+    let mut off = 0;
+    while off + 32 <= tags.len() {
+        // SAFETY: `off + 32 <= tags.len()`, so the 32-byte load is in bounds.
+        let v = unsafe { _mm256_loadu_si256(tags.as_ptr().add(off) as *const _) };
+        let eq = _mm256_cmpeq_epi8(v, needle);
+        let bits = _mm256_movemask_epi8(eq) as u32 as u64;
+        mask |= bits << off;
+        off += 32;
+    }
+    if off + 16 <= tags.len() {
+        let needle16 = _mm_set1_epi8(tag as i8);
+        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte load is in bounds.
+        let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
+        let eq = _mm_cmpeq_epi8(v, needle16);
+        let bits = _mm_movemask_epi8(eq) as u16 as u64;
+        mask |= bits << off;
     }
     mask
 }
@@ -61,6 +196,9 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_heads: Vec<u8>,
     pub(crate) row_positions: Vec<usize>,
     pub(crate) row_tags: Vec<u8>,
+    /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
+    /// resolve once instead of querying per `row_candidate` call.
+    tag_kernel: RowTagKernel,
 }
 
 impl RowMatchGenerator {
@@ -82,6 +220,7 @@ impl RowMatchGenerator {
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
+            tag_kernel: RowTagKernel::detect(),
         }
     }
 
@@ -651,8 +790,9 @@ impl RowMatchGenerator {
         // tag byte, which isolates the tag comparison into a form a SIMD kernel
         // can compute with one vector compare + movemask. `row_entries <= 64`
         // (row_log clamps to 4..=6) so the mask fits in a `u64`.
-        let tag_match =
-            row_tag_match_mask_scalar(&self.row_tags[row_base..row_base + row_entries], tag);
+        let tag_match = self
+            .tag_kernel
+            .match_mask(&self.row_tags[row_base..row_base + row_entries], tag);
 
         let mut best = None;
         for i in 0..max_walk {
@@ -743,6 +883,47 @@ impl RowMatchGenerator {
             *self.row_heads.get_unchecked_mut(row) = next as u8;
             *self.row_tags.get_unchecked_mut(row_base + next) = tag;
             *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos;
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod tag_mask_tests {
+    use super::{row_tag_match_mask_avx2, row_tag_match_mask_scalar, row_tag_match_mask_sse2};
+
+    /// Deterministic LCG fill so the test exercises a realistic spread of
+    /// matching / non-matching tag bytes without a RNG dependency.
+    fn fill(buf: &mut [u8], mut state: u64) {
+        for b in buf.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 56) as u8;
+        }
+    }
+
+    /// The SIMD kernels must produce byte-identical masks to the scalar
+    /// reference for every supported row width (16 / 32 / 64) and tag, or
+    /// the match selection diverges and the compressed output changes.
+    #[test]
+    fn simd_tag_mask_matches_scalar() {
+        for &width in &[16usize, 32, 64] {
+            let mut tags = alloc::vec![0u8; width];
+            for seed in 0..32u64 {
+                fill(&mut tags, 0x9e3779b97f4a7c15u64.wrapping_add(seed));
+                // Cover both a tag that occurs in the row and arbitrary tags.
+                for tag in [tags[seed as usize % width], 0u8, 0xFF, (seed as u8)] {
+                    let expected = row_tag_match_mask_scalar(&tags, tag);
+                    if std::arch::is_x86_feature_detected!("sse2") {
+                        let got = unsafe { row_tag_match_mask_sse2(&tags, tag) };
+                        assert_eq!(got, expected, "sse2 width={width} tag={tag}");
+                    }
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        let got = unsafe { row_tag_match_mask_avx2(&tags, tag) };
+                        assert_eq!(got, expected, "avx2 width={width} tag={tag}");
+                    }
+                }
+            }
         }
     }
 }
