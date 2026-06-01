@@ -215,7 +215,10 @@ impl Strategy for BtUltra {
     const USE_HASH3: bool = false;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    const MAX_CHAIN_DEPTH: usize = 32;
+    // 1 << searchLog for level 18 (clevels.h searchLog = 6). The BT walk
+    // caps compares at min(MAX_CHAIN_DEPTH, hc.search_depth); both must be
+    // >= 64 for level 18 to reach upstream search depth.
+    const MAX_CHAIN_DEPTH: usize = 64;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
@@ -430,7 +433,8 @@ mod tests {
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
         assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
-        assert!(BtUltra::MAX_CHAIN_DEPTH == 32);
+        // 1 << searchLog for clevels.h level 18 (searchLog = 6).
+        assert!(BtUltra::MAX_CHAIN_DEPTH == 64);
         assert!(BtUltra2::MAX_CHAIN_DEPTH == 512);
         assert!(BtOpt::SUFFICIENT_MATCH_LEN == usize::MAX);
         assert!(BtUltra::SUFFICIENT_MATCH_LEN == usize::MAX);

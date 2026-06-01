@@ -174,20 +174,6 @@ const HC_CONFIG: HcConfig = HcConfig {
     target_len: HC_TARGET_LEN,
 };
 
-const BTOPT_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 23,
-    chain_log: 22,
-    search_depth: 32,
-    target_len: 256,
-};
-
-const BTULTRA_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 23,
-    chain_log: 23,
-    search_depth: 32,
-    target_len: 256,
-};
-
 const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     hash_log: 24,
     chain_log: 24,
@@ -318,11 +304,11 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
     /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
     /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }, row: ROW_CONFIG },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }, row: ROW_CONFIG },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
     /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
@@ -4758,8 +4744,8 @@ fn btultra2_profile_disables_small_offset_handicap() {
 fn btultra_profile_keeps_donor_search_depth_budget() {
     let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra>();
     assert_eq!(
-        p.max_chain_depth, 32,
-        "btultra should not cap chain depth below donor opt2 search budget"
+        p.max_chain_depth, 64,
+        "btultra chain-depth budget must match clevels.h level 18 searchLog 6 (1 << 6 = 64)"
     );
 }
 
