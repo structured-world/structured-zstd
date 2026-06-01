@@ -306,9 +306,17 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
     /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
     /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
+    // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
+    // parser here, so we mirror the reference search budget rather than inflate
+    // it: matching the table keeps speed near the reference and makes per-level
+    // perf divergences comparable. The binary-tree finder that would let a
+    // smaller searchLog find longer matches (and re-establish a strict ratio
+    // ladder above L12) is tracked separately; until it lands these levels sit
+    // close to L12 on hash-chain inputs by design.
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
     /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTOPT_HC_CONFIG, row: ROW_CONFIG },
     /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA_HC_CONFIG, row: ROW_CONFIG },
@@ -8454,17 +8462,18 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
     }
 }
 
-/// Pins lazy-band `hc.target_len` to donor `cParams.targetLength` from
-/// `clevels.h` table[0] (default — `srcSize > 256 KB`). Donor's lazy
-/// outer loop treats `targetLength` as `sufficient_len` — the
-/// "nice match" threshold that breaks the chain walk as soon as a
-/// candidate reaches that length. Inflating it above donor forces the
-/// chain walk to complete `search_depth` iterations on inputs that
-/// would have committed early under donor — the dominant cost in
-/// the L5..=L15 speed regression vs FFI tracked at the parent issue.
+/// Pins `hc.target_len` to the reference `cParams.targetLength` from
+/// `clevels.h` table[0] (default — `srcSize > 256 KB`) across levels
+/// 5-15. The reference's lazy outer loop treats `targetLength` as
+/// `sufficient_len` — the "nice match" threshold that breaks the chain
+/// walk as soon as a candidate reaches that length.
 ///
-/// Test queries donor via `ZSTD_getCParams(level, 0, 0)` so any future
-/// donor-table tweak in upstream zstd is reflected automatically.
+/// Levels 13-15 run btlazy2 in the reference and the hash-chain Lazy
+/// parser here, but the reference `targetLength` (32) is the same nice-match
+/// threshold for both finders, so we mirror it directly.
+///
+/// Test queries the reference via `ZSTD_getCParams(level, 0, 0)` so any
+/// future table tweak upstream is reflected automatically.
 #[test]
 fn lazy_band_target_len_matches_donor_default_table() {
     use zstd::zstd_safe::zstd_sys;
@@ -8472,12 +8481,54 @@ fn lazy_band_target_len_matches_donor_default_table() {
     for level in 5..=15i32 {
         // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
         // call with any (level, srcSize, dictSize) combination.
-        let donor = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         assert_eq!(
-            params.hc.target_len as u32, donor.targetLength,
-            "L{level}: hc.target_len ({}) must match donor cParams.targetLength ({})",
-            params.hc.target_len, donor.targetLength
+            params.hc.target_len as u32, reference.targetLength,
+            "L{level}: hc.target_len ({}) must match reference cParams.targetLength ({})",
+            params.hc.target_len, reference.targetLength
+        );
+    }
+}
+
+/// Levels 13-15 mirror the reference btlazy2 window/hash/chain/search
+/// budget from `clevels.h` table[0]: `search_depth == 1 << cParams.searchLog`
+/// (16 / 32 / 64) plus `window_log` / `hash_log` / `chain_log` equal to the
+/// reference `windowLog` / `hashLog` / `chainLog`. We run them on the
+/// hash-chain Lazy parser rather than a binary-tree finder, so they do not
+/// re-establish a strict ratio ladder above L12 on window-fitting inputs;
+/// asserting the full row (not just `search_depth`) keeps the whole budget
+/// aligned and guards every field against silent drift.
+#[test]
+fn upper_lazy_band_params_match_donor_default_table() {
+    use zstd::zstd_safe::zstd_sys;
+
+    for level in 13..=15i32 {
+        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
+        // call with any (level, srcSize, dictSize) combination.
+        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+        let params = resolve_level_params(CompressionLevel::Level(level), None);
+        assert_eq!(
+            params.hc.search_depth as u32,
+            1u32 << reference.searchLog,
+            "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
+            params.hc.search_depth,
+            1u32 << reference.searchLog
+        );
+        assert_eq!(
+            params.window_log as u32, reference.windowLog,
+            "L{level}: window_log ({}) must equal cParams.windowLog ({})",
+            params.window_log, reference.windowLog
+        );
+        assert_eq!(
+            params.hc.hash_log as u32, reference.hashLog,
+            "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
+            params.hc.hash_log, reference.hashLog
+        );
+        assert_eq!(
+            params.hc.chain_log as u32, reference.chainLog,
+            "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
+            params.hc.chain_log, reference.chainLog
         );
     }
 }
