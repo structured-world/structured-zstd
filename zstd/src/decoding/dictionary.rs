@@ -98,7 +98,16 @@ impl Dictionary {
     /// tables — and thus the emitted frame — are byte-identical; only the
     /// wasted decode-table builds are dropped. Offset history + content
     /// are parsed the same way.
-    pub fn decode_dict_for_encoding(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+    /// Crate-internal: the returned [`Dictionary`] deliberately has no
+    /// decode lookup tables (`packed_decode` / FSE `decode`), so it is
+    /// NOT safe to feed into a [`FrameDecoder`](crate::decoding::FrameDecoder)
+    /// — Huffman decode would index an empty `packed_decode`. The encoder
+    /// (`FrameCompressor::set_dictionary_from_bytes`) is the only caller and
+    /// only reads the entropy ENCODER tables, so keeping this `pub(crate)`
+    /// avoids exposing a decode footgun on the public `Dictionary` type.
+    pub(crate) fn decode_dict_for_encoding(
+        raw: &[u8],
+    ) -> Result<Dictionary, DictionaryDecodeError> {
         Self::decode_dict_inner(raw, false)
     }
 
