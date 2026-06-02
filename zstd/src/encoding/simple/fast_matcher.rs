@@ -677,7 +677,6 @@ impl FastKernelMatcher {
             prefix_start_index,
             window_low,
             &mut self.hash_table,
-            &mut self.offset_hist,
             rep_in,
             self.step_size,
             mls,
@@ -738,7 +737,6 @@ impl FastKernelMatcher {
             prefix_start_index,
             window_low,
             &mut self.hash_table,
-            &mut self.offset_hist,
             rep_in,
             self.step_size,
             mls,
@@ -898,17 +896,22 @@ impl FastKernelMatcher {
 }
 
 /// Run the Fast kernel over `history[..]` for the block starting at
-/// `block_start`, streaming `Triple` emissions (with wire offset-history
-/// updates) to `handle_sequence` and emitting any terminal tail
-/// literals. Returns the kernel's two-deep `rep` state for the caller to
-/// persist.
+/// `block_start`, streaming emissions straight to `handle_sequence` and
+/// emitting any terminal tail literals. Returns the kernel's two-deep
+/// `rep` state for the caller to persist.
+///
+/// The Fast backend does NOT mutate the matcher's `offset_hist`: repcode
+/// probes run off `rep`, and the wire-offset repcode coding is done
+/// downstream by `encode_raw_sequences_into` against the encode
+/// pipeline's own offset history. So emissions are forwarded verbatim,
+/// with no per-match offset-history rotation here.
 ///
 /// A free function (not a method) so the owned and borrowed
 /// `start_matching` paths share one copy of the `(mls, use_cmov)`
-/// dispatch: passing the disjoint `&mut` borrows of `hash_table` and
-/// `offset_hist` as explicit parameters sidesteps the `&self`-vs-`&mut
-/// self.hash_table` conflict a `&self` accessor would create, the same
-/// reason the window slice is selected by the caller and handed in.
+/// dispatch: passing the disjoint `&mut` borrow of `hash_table` as an
+/// explicit parameter sidesteps the `&self`-vs-`&mut self.hash_table`
+/// conflict a `&self` accessor would create, the same reason the window
+/// slice is selected by the caller and handed in.
 #[allow(clippy::too_many_arguments)]
 fn run_fast_kernel_block(
     history: &[u8],
@@ -916,7 +919,6 @@ fn run_fast_kernel_block(
     prefix_start_index: u32,
     window_low: u32,
     hash_table: &mut FastHashTable,
-    offset_hist: &mut [u32; 3],
     rep_in: [u32; 2],
     step_size: usize,
     mls: u32,
@@ -924,28 +926,6 @@ fn run_fast_kernel_block(
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> [u32; 2] {
     use super::fast_kernel::kernel::PrefixBounds;
-
-    // Forward Triple emissions to the caller, updating the wire
-    // encoder's 3-deep offset history per match (so dictionary-prime
-    // inspection sees the expected state). `rep` and `offset_hist` track
-    // different state and may diverge on lit_len == 0 emits.
-    let mut wrap_emit = |seq: Sequence<'_>| {
-        if let Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } = seq
-        {
-            let _ = encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
-            handle_sequence(Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            });
-        } else {
-            handle_sequence(seq);
-        }
-    };
 
     let bounds = PrefixBounds {
         prefix_start_index,
@@ -962,7 +942,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (4, true) => compress_block_fast::<4, true>(
             history,
@@ -971,7 +951,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (5, false) => compress_block_fast::<5, false>(
             history,
@@ -980,7 +960,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (5, true) => compress_block_fast::<5, true>(
             history,
@@ -989,7 +969,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (6, false) => compress_block_fast::<6, false>(
             history,
@@ -998,7 +978,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (6, true) => compress_block_fast::<6, true>(
             history,
@@ -1007,7 +987,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (7, false) => compress_block_fast::<7, false>(
             history,
@@ -1016,7 +996,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (7, true) => compress_block_fast::<7, true>(
             history,
@@ -1025,7 +1005,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (8, false) => compress_block_fast::<8, false>(
             history,
@@ -1034,7 +1014,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         (8, true) => compress_block_fast::<8, true>(
             history,
@@ -1043,7 +1023,7 @@ fn run_fast_kernel_block(
             hash_table,
             rep_in,
             step_size,
-            &mut wrap_emit,
+            &mut handle_sequence,
         ),
         _ => unreachable!(
             "FastHashTable construction rejects mls outside 4..=8 — \
