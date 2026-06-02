@@ -1,5 +1,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
+// `std::collections::HashMap` is fine here: the whole `dictionary` module
+// is gated behind the `dict_builder` feature, which itself requires `std`
+// (training reads files / uses the system RNG), so this code never
+// compiles into a no_std build. It also matches the existing
+// `std::collections::HashSet` already used by `coverage_score` below.
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
