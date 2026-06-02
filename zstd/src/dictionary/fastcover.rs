@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FastCoverParams {
@@ -64,18 +65,6 @@ fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u
     table
 }
 
-fn score_segment(segment: &[u8], d: usize, mask: usize, table: &[u32]) -> usize {
-    if segment.len() < d || d == 0 {
-        return 0;
-    }
-    let mut score = 0usize;
-    for i in 0..=(segment.len() - d) {
-        let slot = (hash_dmer(&segment[i..i + d]) as usize) & mask;
-        score += table[slot] as usize;
-    }
-    score
-}
-
 fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
     if sample.is_empty() || dict_size == 0 {
         return Vec::new();
@@ -84,26 +73,83 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     let params = normalize_fastcover_params(params);
     let k = params.k;
     let d = params.d;
-    let table = build_frequency_table(sample, d, params.f, params.accel);
-    let mask = table.len().saturating_sub(1);
+    let mut active = build_frequency_table(sample, d, params.f, params.accel);
+    let mask = active.len().saturating_sub(1);
 
-    let mut segments: Vec<(usize, &[u8])> = sample
-        .chunks(k)
-        .filter(|seg| seg.len() >= d)
-        .map(|seg| (score_segment(seg, d, mask, &table), seg))
-        .collect();
-    segments.sort_by_key(|segment| core::cmp::Reverse(segment.0));
-
+    let segments: Vec<&[u8]> = sample.chunks(k).filter(|seg| seg.len() >= d).collect();
+    let n = segments.len();
     let mut out = Vec::with_capacity(dict_size);
-    for (_, seg) in segments {
-        if out.len() >= dict_size {
-            break;
+    if n == 0 {
+        return out;
+    }
+
+    // Greedy set-cover selection. The plain top-frequency selection picks
+    // several high-frequency segments that cover the SAME d-mers (redundant
+    // coverage), wasting the dictionary budget. Greedy instead picks, each
+    // round, the segment whose STILL-UNCOVERED d-mers score highest, then
+    // marks those d-mers covered so later rounds value only NEW coverage —
+    // diverse coverage in fewer bytes.
+    //
+    // To keep this affordable at any corpus size (no per-size special-
+    // casing), scores are cached and updated incrementally: an inverted
+    // index `slot -> [(segment, count)]` lets "covering" a chosen segment's
+    // d-mers decrement the score of every other segment containing them in
+    // O(shared occurrences), instead of re-scoring all segments each round.
+    let mut scores = vec![0usize; n];
+    let mut inverted: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let mut local: HashMap<usize, u32> = HashMap::new();
+        for w in seg.windows(d) {
+            *local.entry((hash_dmer(w) as usize) & mask).or_insert(0) += 1;
         }
-        let remaining = dict_size - out.len();
-        if seg.len() <= remaining {
-            out.extend_from_slice(seg);
-        } else {
-            out.extend_from_slice(&seg[..remaining]);
+        for (slot, cnt) in local {
+            scores[i] += cnt as usize * active[slot] as usize;
+            inverted.entry(slot).or_default().push((i as u32, cnt));
+        }
+    }
+
+    let mut used = vec![false; n];
+    while out.len() < dict_size {
+        let mut best: Option<(usize, usize)> = None; // (score, index)
+        for (i, &score) in scores.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            if best.is_none_or(|(bs, _)| score > bs) {
+                best = Some((score, i));
+            }
+        }
+        // No remaining segment covers any still-active d-mer — every
+        // distinct pattern is already represented, so adding more (now
+        // redundant) segments would only waste budget. Stop early; the
+        // dict may be < dict_size (a compact dict, like the reference's).
+        let Some((_, idx)) = best.filter(|&(s, _)| s > 0) else {
+            break;
+        };
+        used[idx] = true;
+        let seg = segments[idx];
+        let take = seg.len().min(dict_size - out.len());
+        out.extend_from_slice(&seg[..take]);
+        // Cover this segment's d-mers: zero their remaining frequency and
+        // decrement the cached score of every segment that shared them.
+        // The chosen segment's d-mers are recomputed here (this runs only
+        // once per selected segment, far cheaper than keeping a per-segment
+        // slot list resident for the whole corpus). A d-mer that recurs
+        // within this segment is already zeroed on its first occurrence, so
+        // the `freq == 0` guard makes the repeat a no-op (correct dedup).
+        for w in seg.windows(d) {
+            let slot = (hash_dmer(w) as usize) & mask;
+            let freq = active[slot];
+            if freq == 0 {
+                continue;
+            }
+            active[slot] = 0;
+            if let Some(list) = inverted.get(&slot) {
+                for &(j, cnt) in list {
+                    scores[j as usize] =
+                        scores[j as usize].saturating_sub(cnt as usize * freq as usize);
+                }
+            }
         }
     }
     out
