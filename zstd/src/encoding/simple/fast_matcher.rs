@@ -424,6 +424,16 @@ impl FastKernelMatcher {
     /// (`accept_data`, `extend_history_with_pending`, drain, prime) must
     /// not run while a borrowed window is active.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        // A staged owned `pending` block would make `last_committed_space`
+        // return the pending buffer (it checks `pending` first) instead of
+        // the borrowed range, breaking the borrowed/owned equivalence the
+        // emit path relies on. The borrowed one-shot caller resets before
+        // registering (so `pending` is None), but this is an unsafe mode
+        // switch — make the precondition explicit and loud.
+        assert!(
+            self.pending.is_none(),
+            "set_borrowed_window requires no staged owned block; reset before switching to a borrowed window",
+        );
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
         // Any hash-table entries left from a prior window are absolute
