@@ -532,6 +532,33 @@ struct FramePrep {
     initial_size_hint: Option<u64>,
 }
 
+/// Initial capacity for the `all_blocks` accumulator, by source-size hint.
+/// The frame header is written only after all input is read (so
+/// Frame_Content_Size is known), so compressed blocks accumulate in memory
+/// first. Seed-size tiers (mirrors donor `ZSTD_CStreamOutSize` naming):
+/// - tiny (`<= 4 KiB` hint): payload-bound seed, `>=` anything a tiny input's
+///   compressed output could need.
+/// - small (`<= 64 KiB` hint): absorbs one or two `Vec::extend` doublings
+///   without over-allocating.
+/// - default (one donor block, `130 KiB`): the value the rest of the encoder
+///   is sized around; larger inputs amortise the first doublings cheaply and
+///   the residue is dominated by internal `compress_block_encoded` buffers.
+///
+/// Shared by the owned (`run_owned_block_loop`) and borrowed
+/// (`run_borrowed_block_loop`) paths so the tier table can't drift between them.
+fn initial_all_blocks_cap(initial_size_hint: Option<u64>) -> usize {
+    const TINY_THRESHOLD: u64 = 4 * 1024;
+    const SMALL_THRESHOLD: u64 = 64 * 1024;
+    const TINY_CAP: usize = 4 * 1024;
+    const SMALL_CAP: usize = 16 * 1024;
+    const DEFAULT_CAP: usize = 130 * 1024;
+    match initial_size_hint {
+        Some(h) if h <= TINY_THRESHOLD => TINY_CAP,
+        Some(h) if h <= SMALL_THRESHOLD => SMALL_CAP,
+        _ => DEFAULT_CAP,
+    }
+}
+
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Create a new `FrameCompressor`
     pub fn new(compression_level: CompressionLevel) -> Self {
@@ -628,17 +655,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         input: &[u8],
         initial_size_hint: Option<u64>,
     ) -> (Vec<u8>, u64) {
-        const ALL_BLOCKS_TINY_THRESHOLD: u64 = 4 * 1024;
-        const ALL_BLOCKS_SMALL_THRESHOLD: u64 = 64 * 1024;
-        const ALL_BLOCKS_TINY_CAP: usize = 4 * 1024;
-        const ALL_BLOCKS_SMALL_CAP: usize = 16 * 1024;
-        const ALL_BLOCKS_DEFAULT_CAP: usize = 130 * 1024;
-        let initial_all_blocks_cap = match initial_size_hint {
-            Some(h) if h <= ALL_BLOCKS_TINY_THRESHOLD => ALL_BLOCKS_TINY_CAP,
-            Some(h) if h <= ALL_BLOCKS_SMALL_THRESHOLD => ALL_BLOCKS_SMALL_CAP,
-            _ => ALL_BLOCKS_DEFAULT_CAP,
-        };
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap);
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap(initial_size_hint));
         let total_uncompressed = input.len() as u64;
         // Empty input: emit a single empty last Raw block (mirrors the
         // owned loop's empty-file special case).
@@ -911,35 +928,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     fn run_owned_block_loop(&mut self, initial_size_hint: Option<u64>) -> (Vec<u8>, u64) {
         let source = self.uncompressed_data.as_mut().unwrap();
         // Accumulate all compressed blocks; the frame header is written
-        // after all input has been read so that Frame_Content_Size is
-        // known. The default seed is one donor block; smaller seeds for
-        // small payloads avoid pinning a full block worth of bytes when
-        // the compressed output fits in a few hundred bytes. For larger
-        // inputs the default seed amortises the first few `Vec::extend`
-        // doublings cheaply and the `peak - default_seed` residue is
-        // dominated by internal `compress_block_encoded` buffers anyway,
-        // so changing it produces no measurable savings.
-        //
-        // Seed-size tiers (mirrors donor `ZSTD_CStreamOutSize` naming):
-        //
-        // * `ALL_BLOCKS_TINY_CAP` — payload ≤ this size, seed equals
-        //   payload bound; ≥ everything compressed output could need
-        //   for a tiny input.
-        // * `ALL_BLOCKS_SMALL_CAP` — small-input seed picked to absorb
-        //   one or two doublings without over-allocating.
-        // * `ALL_BLOCKS_DEFAULT_CAP` — one donor block; the value the
-        //   rest of the encoder is sized around.
-        const ALL_BLOCKS_TINY_THRESHOLD: u64 = 4 * 1024;
-        const ALL_BLOCKS_SMALL_THRESHOLD: u64 = 64 * 1024;
-        const ALL_BLOCKS_TINY_CAP: usize = 4 * 1024;
-        const ALL_BLOCKS_SMALL_CAP: usize = 16 * 1024;
-        const ALL_BLOCKS_DEFAULT_CAP: usize = 130 * 1024;
-        let initial_all_blocks_cap = match initial_size_hint {
-            Some(h) if h <= ALL_BLOCKS_TINY_THRESHOLD => ALL_BLOCKS_TINY_CAP,
-            Some(h) if h <= ALL_BLOCKS_SMALL_THRESHOLD => ALL_BLOCKS_SMALL_CAP,
-            _ => ALL_BLOCKS_DEFAULT_CAP,
-        };
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap);
+        // after all input has been read so Frame_Content_Size is known.
+        // Seed capacity by source-size hint — see `initial_all_blocks_cap`.
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap(initial_size_hint));
         let mut total_uncompressed: u64 = 0;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
