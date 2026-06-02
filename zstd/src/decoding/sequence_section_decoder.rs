@@ -1531,7 +1531,11 @@ pub(crate) fn maybe_update_fse_tables(
             if source[0] > MAX_LITERAL_LENGTH_CODE {
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
-            scratch.ll_rle = Some(source[0]);
+            scratch.literal_lengths.build_rle(source[0]);
+            scratch
+                .literal_lengths
+                .enrich_with_packed_seq_meta(&LL_META);
+            scratch.ll_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
@@ -1579,7 +1583,12 @@ pub(crate) fn maybe_update_fse_tables(
             if of_source[0] > MAX_OFFSET_CODE {
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
-            scratch.of_rle = Some(of_source[0]);
+            // Build a degenerate 1-state table so the fused decode path
+            // handles this axis uniformly (no separate RLE fallback).
+            scratch.offsets.build_rle(of_source[0]);
+            scratch.offsets.enrich_for_offsets();
+            scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+            scratch.of_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
@@ -1626,7 +1635,9 @@ pub(crate) fn maybe_update_fse_tables(
             if ml_source[0] > MAX_MATCH_LENGTH_CODE {
                 return Err(DecodeSequenceError::MissingByteForRleMlTable);
             }
-            scratch.ml_rle = Some(ml_source[0]);
+            scratch.match_lengths.build_rle(ml_source[0]);
+            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            scratch.ml_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
