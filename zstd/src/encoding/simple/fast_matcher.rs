@@ -38,21 +38,23 @@
 //!   unmatchable — small ratio cost, accepted for sentinel safety.
 //! - `history.len()` is bounded by `2 × max_window_size` post-append.
 //!   See [`FastKernelMatcher::extend_history_with_pending`].
-//! - `rep[0..2]` tracks the kernel's two-deep repcode state
-//!   (overwritten from `FastBlockResult.rep` after every
-//!   `start_matching`). `offset_hist[0..3]` tracks the wire
-//!   encoder's three-deep history (rotated per Triple via
-//!   `encode_offset_with_history`). They reflect DIFFERENT state
-//!   and may diverge — e.g. on lit_len == 0 emits the kernel's
-//!   `rep` stays put while `offset_hist` rotates per RFC 8878
-//!   §3.1.2.5. Both halves are self-consistent within their own
-//!   domain (kernel uses `rep` for next-block repcode probes,
-//!   downstream wire encoder uses its own offset_hist).
+//! - `rep[0..2]` is the functional repcode state: the kernel's
+//!   two-deep stack, overwritten from `FastBlockResult.rep` after every
+//!   `start_matching`, and what the NEXT block's kernel probes against.
+//!   `offset_hist[0..3]` is NOT mutated by matching — the Fast backend
+//!   drives repcodes off `rep`, and the wire-offset repcode coding is
+//!   done downstream by `encode_raw_sequences_into` against the encode
+//!   pipeline's OWN offset history, so a per-match
+//!   `encode_offset_with_history` on the matcher would be redundant.
+//!   `offset_hist` is therefore only seeded by `prime_offset_history`
+//!   (which also sets `rep`) and otherwise stays at its `reset` default.
+//!   Do NOT reintroduce per-match `offset_hist` rotation here: it is
+//!   pure overhead on this backend (it was removed because the coded
+//!   offset it produced was discarded).
 
 use alloc::vec::Vec;
 
 use crate::encoding::Sequence;
-use crate::encoding::blocks::encode_offset_with_history;
 
 use super::fast_kernel::hash_table::FastHashTable;
 use super::fast_kernel::kernel::compress_block_fast;
@@ -585,54 +587,25 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
-        // Split borrow: `data` reads from history immutably, kernel
-        // takes hash_table mutably. The two fields don't alias, so the
-        // borrow checker is satisfied via field-by-field projection
-        // (no `&mut self` re-borrow). We also need a mutable borrow on
-        // `self.offset_hist` inside the per-Triple wire-history update,
-        // but that runs synchronously inside this method without
-        // overlapping the kernel call.
+        // Split borrow: `history` reads the buffer immutably while the
+        // kernel takes `hash_table` mutably. The two fields don't alias,
+        // so the borrow checker is satisfied via field-by-field
+        // projection (no `&mut self` re-borrow). `offset_hist` is NOT
+        // borrowed here — Fast matching does not mutate it (see below).
         let history: &[u8] = &self.history;
         let hash_table = &mut self.hash_table;
 
-        // Kernel inner closure: forward Triple emissions to user,
-        // updating the matcher's 3-deep wire-encoding history via
-        // `encode_offset_with_history` for every match (so the
-        // dictionary-prime tests that inspect `offset_hist` after a
-        // run-through still see the donor-equivalent state).
-        //
-        // The closure captures `&mut offset_hist` AS WELL AS the
-        // user's `handle_sequence` — splitting the borrow on `self`
-        // before the kernel call lets both run from the kernel's
-        // single emission stream.
-        let offset_hist = &mut self.offset_hist;
-        let mut wrap_emit = |seq: Sequence<'_>| {
-            if let Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } = seq
-            {
-                // Track wire encoder's offset_hist unconditionally —
-                // matches what Dfast/Row/HashChain matchers do.
-                // `matcher.offset_hist` and `matcher.rep` track
-                // DIFFERENT state (wire encoder vs kernel); they're
-                // not meant to stay in lockstep on lit_len == 0 emits.
-                let _ =
-                    encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset,
-                    match_len,
-                });
-            } else {
-                // The kernel's contract states it emits ONLY Triple
-                // mid-block (terminal Literals lives in
-                // `tail_literals_len`). Forward defensively in case
-                // that contract loosens later.
-                handle_sequence(seq);
-            }
-        };
+        // The kernel emits each match straight to the caller's
+        // `handle_sequence`. It does NOT update `self.offset_hist`: the
+        // Fast backend's kernel drives repcode probes off `self.rep`
+        // (set from the kernel result each block), and the actual
+        // wire-offset repcode coding is done downstream by
+        // `encode_raw_sequences_into` against the encode pipeline's own
+        // offset history. The matcher's `offset_hist` is only seeded by
+        // `prime_offset_history` (which also sets `rep`) and is never
+        // read on the Fast encode path, so per-match
+        // `encode_offset_with_history` here was pure redundant work
+        // (the coded offset it produced was discarded).
 
         // Dispatch on (mls, use_cmov) — donor's 8 specialised
         // `ZSTD_GEN_FAST_FN` expansions (we also cover mls=8 for
@@ -656,7 +629,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (4, true) => compress_block_fast::<4, true>(
                 history,
@@ -668,7 +641,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (5, false) => compress_block_fast::<5, false>(
                 history,
@@ -680,7 +653,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (5, true) => compress_block_fast::<5, true>(
                 history,
@@ -692,7 +665,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (6, false) => compress_block_fast::<6, false>(
                 history,
@@ -704,7 +677,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (6, true) => compress_block_fast::<6, true>(
                 history,
@@ -716,7 +689,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (7, false) => compress_block_fast::<7, false>(
                 history,
@@ -728,7 +701,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (7, true) => compress_block_fast::<7, true>(
                 history,
@@ -740,7 +713,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (8, false) => compress_block_fast::<8, false>(
                 history,
@@ -752,7 +725,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             (8, true) => compress_block_fast::<8, true>(
                 history,
@@ -764,7 +737,7 @@ impl FastKernelMatcher {
                 hash_table,
                 rep_in,
                 self.step_size,
-                &mut wrap_emit,
+                &mut handle_sequence,
             ),
             _ => unreachable!(
                 "FastHashTable construction rejects mls outside 4..=8 — \
@@ -1377,16 +1350,17 @@ mod tests {
         assert_eq!(m.history.len(), 4 + HISTORY_DRAIN_BASE);
     }
 
-    /// rep ↔ offset_hist consistency: after a single block emits
-    /// matches, the matcher's `rep[0]` (kernel's `rep_offset1` post-
-    /// block) must equal `offset_hist[0]` (wire encoder's most
-    /// recently emitted explicit offset). They're updated by
-    /// different mechanisms (kernel internal state vs
-    /// encode_offset_with_history) but should converge on the same
-    /// value as long as every emitted Triple is a fresh (non-repcode)
-    /// offset.
+    /// After a single block emits matches, the matcher's `rep[0]`
+    /// (kernel's `rep_offset1` post-block) must reflect the last emitted
+    /// explicit offset — that is the state the next block's kernel probes
+    /// against. The matcher's `offset_hist` is NOT updated by matching:
+    /// the Fast backend drives repcode probes off `rep`, and the wire
+    /// offset coding is done downstream against the encode pipeline's own
+    /// offset history, so per-match `encode_offset_with_history` on the
+    /// matcher would be redundant work. `offset_hist` therefore stays at
+    /// whatever `reset` / `prime_offset_history` set it to.
     #[test]
-    fn rep_and_offset_hist_track_emitted_explicit_offsets_in_lockstep() {
+    fn rep_tracks_last_explicit_offset_and_offset_hist_is_not_matched() {
         // Engineer a single block that produces a deterministic
         // explicit match. 96 bytes: 48-byte distinct-window
         // preamble + 48-byte verbatim copy of bytes [0..48].
@@ -1410,26 +1384,24 @@ mod tests {
             }
         });
 
-        // For at least one emitted explicit-offset match, the
-        // matcher's `rep[0]` (post-block) must equal that offset,
-        // AND `offset_hist[0]` must equal that offset. Both are
-        // computed independently — matching values mean the two
-        // tracks stayed in sync across the block.
         assert!(
             !emitted_offsets.is_empty(),
-            "test setup must produce at least one explicit match \
-             (otherwise this isn't testing the rep/offset_hist sync)",
+            "test setup must produce at least one explicit match",
         );
         let last_explicit = emitted_offsets[emitted_offsets.len() - 1];
+        // rep[0] is the functional state: the kernel updates it from its
+        // own result each block and the NEXT block probes against it.
         assert_eq!(
             m.rep[0] as usize, last_explicit,
-            "kernel's rep[0] must reflect the last emitted explicit \
-             offset (sync with wire encoder)",
+            "kernel's rep[0] must reflect the last emitted explicit offset",
         );
+        // offset_hist is NOT touched by matching on the Fast backend — it
+        // stays at the construction default (FAST_INITIAL_OFFSET_HIST).
         assert_eq!(
-            m.offset_hist[0] as usize, last_explicit,
-            "offset_hist[0] (encode_offset_with_history-tracked) must \
-             match rep[0] (kernel-tracked) after a clean block",
+            m.offset_hist, FAST_INITIAL_OFFSET_HIST,
+            "Fast matching must not mutate offset_hist (it is seeded only \
+             by reset / prime_offset_history; the wire offset coding runs \
+             downstream against the encode pipeline's own history)",
         );
     }
 
