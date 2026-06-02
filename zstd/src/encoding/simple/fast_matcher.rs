@@ -351,6 +351,20 @@ impl FastKernelMatcher {
         1u64 << self.window_log
     }
 
+    /// Flat byte view of the match window the kernel scans against.
+    ///
+    /// Single read accessor for the window storage so the storage
+    /// representation can change (owned buffer today; a borrowed
+    /// one-shot view later) without touching every call site. All
+    /// hot-path reads — the kernel's history slice, the `window_low`
+    /// length math, the tail-literal slice, the last-committed-block
+    /// peek — route through this. Owned-only mutation paths (append,
+    /// drain, rehash) keep accessing the backing buffer directly.
+    #[inline(always)]
+    fn history_bytes(&self) -> &[u8] {
+        &self.history
+    }
+
     /// Read-only view of the most recently committed block — donor /
     /// legacy MatchGenerator's `window.last().data` equivalent.
     ///
@@ -364,7 +378,7 @@ impl FastKernelMatcher {
     pub(crate) fn last_committed_space(&self) -> &[u8] {
         match self.pending.as_deref() {
             Some(slice) => slice,
-            None => &self.history[self.last_block_start..],
+            None => &self.history_bytes()[self.last_block_start..],
         }
     }
 
@@ -570,7 +584,7 @@ impl FastKernelMatcher {
         // extension `match_pos > window_low` bound — both paths that
         // donor expresses against `prefixStart` directly (NOT against
         // a sentinel-1 floor).
-        let window_low = self.history.len().saturating_sub(advertised_window) as u32;
+        let window_low = self.history_bytes().len().saturating_sub(advertised_window) as u32;
         // Sentinel-aware prefix for the hash-table filter — match_idx
         // == 0 (an uninitialized FastHashTable slot) must be rejected
         // by `match_found`, so we floor at `INITIAL_PREFIX_START_INDEX
@@ -750,9 +764,10 @@ impl FastKernelMatcher {
 
         // Emit terminal literals if the kernel left a tail.
         if result.tail_literals_len > 0 {
-            let tail_start = self.history.len() - result.tail_literals_len;
+            let history = self.history_bytes();
+            let tail_start = history.len() - result.tail_literals_len;
             handle_sequence(Sequence::Literals {
-                literals: &self.history[tail_start..],
+                literals: &history[tail_start..],
             });
         }
     }
