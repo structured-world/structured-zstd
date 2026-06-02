@@ -417,6 +417,9 @@ fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
             let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
             let mut result = Vec::new();
             decoder.read_to_end(&mut result).unwrap();
+            // `assert_eq!(*data, result, ...)` borrows both operands
+            // (`match (&*data, &result)`), so dereferencing the
+            // `&Vec<u8>` from `inputs.iter()` does not move out of it.
             assert_eq!(
                 *data, result,
                 "RLE-mode ffi→rust decode mismatch (input {idx}, level {level})",

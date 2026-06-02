@@ -246,8 +246,8 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // sequence-section dispatch decision; if the early-return paths
     // left the flag set, a later block's gate would mis-apply the
     // cold-dict signal that no longer holds (FSE/HUF tables are now
-    // warm regardless of whether the previous block decoded
-    // sequences or fell back to RLE).
+    // warm regardless of how the previous block decoded its sequences,
+    // including RLE-mode axes handled in-line via the fused table).
     let ddict_is_cold = fse.ddict_is_cold;
     fse.ddict_is_cold = false;
 
