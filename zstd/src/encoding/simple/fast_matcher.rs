@@ -374,12 +374,16 @@ impl FastKernelMatcher {
     /// Flat byte view of the match window the kernel scans against.
     ///
     /// Single read accessor for the window storage so the storage
-    /// representation can change (owned buffer today; a borrowed
-    /// one-shot view later) without touching every call site. All
-    /// hot-path reads — the kernel's history slice, the `window_low`
-    /// length math, the tail-literal slice, the last-committed-block
-    /// peek — route through this. Owned-only mutation paths (append,
-    /// drain, rehash) keep accessing the backing buffer directly.
+    /// representation (owned buffer or borrowed one-shot view) is
+    /// resolved in one place. The `window_low` length math, the
+    /// tail-literal slice, and the last-committed-block peek call this.
+    /// The kernel match-slice in `start_matching` does NOT call this — it
+    /// inlines the identical owned/borrowed selection so the immutable
+    /// window borrow stays a disjoint field projection alongside the
+    /// `&mut self.hash_table` borrow (a `&self` accessor call would
+    /// borrow all of `self` and collide). Owned-only mutation paths
+    /// (append, drain, rehash) keep accessing the backing buffer
+    /// directly.
     #[inline(always)]
     fn history_bytes(&self) -> &[u8] {
         match self.borrowed {
