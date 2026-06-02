@@ -597,8 +597,17 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             ktrace!("PUT hash0={} pos={} (iter-start)", hash0, ip0);
             unsafe { hash_table.put(hash0, ip0 as u32) };
 
-            // Repcode-at-ip2 check.
-            if rep_offset1 > 0 && unsafe { read32(base.add(ip2)) } == rval {
+            // Repcode-at-ip2 check. Bitwise `&` (not short-circuit `&&`)
+            // so both operands evaluate unconditionally — the
+            // `read32(ip2)` load is always safe (`ip2 < ilimit` by the
+            // loop invariant `ip3 <= ilimit` with `ip2 < ip3`, and
+            // `ilimit = iend - HASH_READ_SIZE = iend - 8`, so
+            // `ip2 + 4 < iend`) and `rval` is already loaded above, so
+            // dropping the branch on `rep_offset1 > 0` lets the optimizer
+            // fold the combined predicate into a branchless compare (the
+            // donor/reference shape) instead of a short-circuit branch
+            // before the load.
+            if (rep_offset1 > 0) & (unsafe { read32(base.add(ip2)) } == rval) {
                 // Repcode match. ip0 fast-forwards to ip2; backward-
                 // extend by 1 if the byte before ip2 also matches.
                 // Donor's `mLength = ip0[-1] == match0[-1]` is a
