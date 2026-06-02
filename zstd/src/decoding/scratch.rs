@@ -1,6 +1,5 @@
 //! Structures that wrap around various decoders to make decoding easier.
 
-use super::super::blocks::sequence_section::Sequence;
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::ringbuffer::RingBuffer;
@@ -30,7 +29,6 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     pub offset_hist: [u32; 3],
 
     pub literals_buffer: Vec<u8>,
-    pub sequences: Vec<Sequence>,
     pub block_content_buffer: Vec<u8>,
 }
 
@@ -52,7 +50,6 @@ pub struct WorkspaceRef<'a, B: BufferBackend> {
     pub buffer: &'a mut DecodeBuffer<B>,
     pub offset_hist: &'a mut [u32; 3],
     pub literals_buffer: &'a mut Vec<u8>,
-    pub sequences: &'a mut Vec<Sequence>,
     pub block_content_buffer: &'a mut Vec<u8>,
 }
 
@@ -83,7 +80,6 @@ impl<B: BufferBackend> Workspace for DecoderScratch<B> {
             buffer: &mut self.buffer,
             offset_hist: &mut self.offset_hist,
             literals_buffer: &mut self.literals_buffer,
-            sequences: &mut self.sequences,
             block_content_buffer: &mut self.block_content_buffer,
         }
     }
@@ -115,7 +111,6 @@ pub struct DirectScratch<'o, 'p> {
     pub buffer: DecodeBuffer<super::user_slice_buf::UserSliceBackend<'o>>,
     pub offset_hist: &'p mut [u32; 3],
     pub literals_buffer: &'p mut Vec<u8>,
-    pub sequences: &'p mut Vec<Sequence>,
     pub block_content_buffer: &'p mut Vec<u8>,
 }
 
@@ -133,7 +128,6 @@ impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
             buffer: &mut self.buffer,
             offset_hist: &mut *self.offset_hist,
             literals_buffer: &mut *self.literals_buffer,
-            sequences: &mut *self.sequences,
             block_content_buffer: &mut *self.block_content_buffer,
         }
     }
@@ -147,11 +141,8 @@ impl<B: BufferBackend> DecoderScratch<B> {
             },
             fse: FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
-                of_rle: None,
                 literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
-                ll_rle: None,
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
-                ml_rle: None,
                 offsets_long_share: 0,
                 ddict_is_cold: false,
             },
@@ -160,14 +151,12 @@ impl<B: BufferBackend> DecoderScratch<B> {
 
             block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
-            sequences: Vec::new(),
         }
     }
 
     pub fn reset(&mut self, window_size: usize) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.sequences.clear();
         self.block_content_buffer.clear();
 
         // Pre-allocate the per-block scratch Vecs to `min(window_size,
@@ -214,9 +203,6 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.fse.literal_lengths.reset();
         self.fse.match_lengths.reset();
         self.fse.offsets.reset();
-        self.fse.ll_rle = None;
-        self.fse.ml_rle = None;
-        self.fse.of_rle = None;
         // Reset the cached pipeline-gate signal alongside the FSE
         // table reset — otherwise scratch reuse across frames could
         // engage the long pipeline on a new frame's Repeat-mode
@@ -274,11 +260,8 @@ impl Default for HuffmanScratch {
 
 pub struct FSEScratch {
     pub offsets: AlignedFSETable,
-    pub of_rle: Option<u8>,
     pub literal_lengths: AlignedFSETable,
-    pub ll_rle: Option<u8>,
     pub match_lengths: AlignedFSETable,
-    pub ml_rle: Option<u8>,
     /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
     /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to donor's
     /// `OffFSELog = 8` (256-entry reference).
@@ -308,11 +291,8 @@ impl FSEScratch {
     pub fn new() -> FSEScratch {
         FSEScratch {
             offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
-            of_rle: None,
             literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
-            ll_rle: None,
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
-            ml_rle: None,
             offsets_long_share: 0,
             ddict_is_cold: false,
         }
@@ -322,9 +302,6 @@ impl FSEScratch {
         self.offsets.reinit_from(&other.offsets);
         self.literal_lengths.reinit_from(&other.literal_lengths);
         self.match_lengths.reinit_from(&other.match_lengths);
-        self.of_rle = other.of_rle;
-        self.ll_rle = other.ll_rle;
-        self.ml_rle = other.ml_rle;
         // Recompute the share from the just-copied offsets table
         // rather than trusting `other.offsets_long_share`. Two source
         // shapes produce a populated `offsets` table but a still-zero

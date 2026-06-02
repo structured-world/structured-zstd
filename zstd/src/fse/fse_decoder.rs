@@ -47,7 +47,13 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
         &mut self,
         bits: &mut BitReaderReversed<'_, K>,
     ) -> Result<(), FSEDecoderError> {
-        if self.table.accuracy_log == 0 {
+        // Uninitialised = no decode entries. (Previously this checked
+        // `accuracy_log == 0`, but a valid RLE table has accuracy_log 0
+        // with a single entry — donor's RLE DTable. An empty `decode`
+        // vec is the real "never built" signal; the `InvalidTableShape`
+        // check below still enforces `decode.len() == 1 << accuracy_log`,
+        // which holds for the 1-entry RLE table since `1 << 0 == 1`.)
+        if self.table.decode.is_empty() {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
         // Defense-in-depth internal-invariant guard: in normal builds
@@ -787,6 +793,35 @@ impl FSETableImpl<SeqSymbol> {
                 entry.num_additional_bits = code;
             }
         }
+    }
+
+    /// Build a degenerate single-state RLE table for a sequence axis
+    /// whose Compression_Mode is RLE: exactly one symbol, decoded every
+    /// sequence with no FSE state-transition bits. Mirrors the donor
+    /// RLE DTable (`accuracy_log = 0`, one entry, `new_state = 0`,
+    /// `num_bits = 0`). The caller runs the usual `enrich_with_packed_seq_meta`
+    /// (LL/ML) or `enrich_for_offsets` (OF) pass afterward to fill
+    /// `base_value` / `num_additional_bits` from `symbol`, so the fused
+    /// per-sequence loop reads this axis uniformly with the FSE axes
+    /// (init reads 0 state bits, every `update_state` keeps state 0).
+    pub(crate) fn build_rle(&mut self, symbol: u8) {
+        self.reset();
+        // NB: do NOT shrink `max_symbol` to `symbol` — the scratch table
+        // is reused across blocks, and a later FSE-mode block's
+        // `build_decoder` validates its symbol count against `max_symbol`.
+        // Setting it to the single RLE symbol would reject any subsequent
+        // table with more symbols (`TooManySymbols`). `reset` leaves
+        // `max_symbol` at the axis maximum, which is correct here.
+        // Spread buffer drives the enrich pass (symbol per slot); one slot.
+        self.symbol_spread_buffer.push(symbol);
+        self.decode.push(SeqSymbol {
+            new_state: 0,
+            num_bits: 0,
+            num_additional_bits: 0,
+            base_value: 0,
+        });
+        // accuracy_log stays 0 (donor RLE DTable tableLog); init_state
+        // reads 0 state bits and update_state keeps the single state.
     }
 }
 

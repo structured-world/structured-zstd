@@ -951,15 +951,28 @@ pub enum DecodeSequenceError {
     GetBitsError(GetBitsError),
     FSEDecoderError(FSEDecoderError),
     FSETableError(FSETableError),
-    ExtraPadding { skipped_bits: i32 },
-    UnsupportedOffset { offset_code: u8 },
+    ExtraPadding {
+        skipped_bits: i32,
+    },
+    UnsupportedOffset {
+        offset_code: u8,
+    },
     ZeroOffset,
     NotEnoughBytesForNumSequences,
-    ExtraBits { bits_remaining: isize },
+    ExtraBits {
+        bits_remaining: isize,
+    },
     MissingCompressionMode,
     MissingByteForRleLlTable,
     MissingByteForRleOfTable,
     MissingByteForRleMlTable,
+    /// An RLE-mode sequence table's single symbol code is out of range
+    /// for its axis (LL/ML/OF). `axis` names the axis; `code` is the
+    /// offending value read from the stream.
+    InvalidRleCode {
+        axis: &'static str,
+        code: u8,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -1013,6 +1026,9 @@ impl core::fmt::Display for DecodeSequenceError {
             }
             DecodeSequenceError::MissingByteForRleMlTable => {
                 write!(f, "Need a byte to read for RLE ml table")
+            }
+            DecodeSequenceError::InvalidRleCode { axis, code } => {
+                write!(f, "RLE {axis} table code {code} is out of range")
             }
         }
     }
