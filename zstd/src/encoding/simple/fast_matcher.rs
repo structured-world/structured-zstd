@@ -622,6 +622,18 @@ impl FastKernelMatcher {
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        // Owned scan path. A borrowed one-shot window (set via
+        // `set_borrowed_window`) is mutually exclusive with this path:
+        // `extend_history_with_pending` appends into `self.history` and
+        // `block_start` indexes that owned buffer, so matching against a
+        // borrowed window here would index it with an owned-history
+        // offset (wrong indexing, potential OOB in the kernel). The
+        // borrowed window is scanned by `start_matching_borrowed`
+        // instead. Fail fast if the contract is violated.
+        debug_assert!(
+            self.borrowed.is_none(),
+            "start_matching is the owned path; clear the borrowed window first (use start_matching_borrowed)",
+        );
         let block_start = self.extend_history_with_pending();
         // Compute the EFFECTIVE prefix floor for this scan against
         // the ADVERTISED frame window (`1 << window_log`), NOT
@@ -659,18 +671,12 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
-        // Select the window slice here (not via `history_bytes`) so the
-        // immutable window borrow stays a disjoint field projection
-        // alongside the `&mut self.hash_table` borrow handed to
-        // `run_fast_kernel_block`. `self.borrowed` is `Copy`, so reading
-        // it holds no borrow; the `None` arm borrows only the `history`
-        // field.
-        let history: &[u8] = match self.borrowed {
-            // SAFETY: see `history_bytes` — the (ptr, len) pair upholds
-            // the `set_borrowed_window` liveness contract.
-            Some((ptr, len)) => unsafe { core::slice::from_raw_parts(ptr, len) },
-            None => &self.history,
-        };
+        // Owned scan reads `self.history` directly (the guard above
+        // guarantees no borrowed window is active). Borrowing only the
+        // `history` field keeps it a disjoint projection alongside the
+        // `&mut self.hash_table` borrow handed to `run_fast_kernel_block`
+        // (a `&self` accessor would borrow all of `self` and collide).
+        let history: &[u8] = &self.history;
         let rep_out = run_fast_kernel_block(
             history,
             block_start,
@@ -711,7 +717,12 @@ impl FastKernelMatcher {
         let (ptr, total_len) = self
             .borrowed
             .expect("start_matching_borrowed requires a registered borrowed window");
-        debug_assert!(
+        // Always-on (not debug_assert): the bounds feed the unsafe
+        // `from_raw_parts` below, so they must be validated even in
+        // release / `cargo test --release` where debug_assert is
+        // compiled out — otherwise an out-of-range block_end would build
+        // a slice past the borrowed allocation (immediate UB).
+        assert!(
             block_start <= block_end && block_end <= total_len,
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
