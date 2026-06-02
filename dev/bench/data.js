@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780439220794,
+  "lastUpdate": 1780442932685,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -55202,6 +55202,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.2,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4dc1e34aee1e54ee0bb982d7b0e3e9a6983de89d",
+          "message": "perf(dict): greedy set-cover segment selection in fastcover trainer (#324)\n\n* perf(dict): greedy set-cover segment selection in fastcover trainer\n\nThe segment selector picked the top-frequency non-overlapping k-chunks\nand concatenated them, so several chosen chunks indexed the SAME d-mers\n(redundant), wasting the dictionary budget on small corpora with few\ndistinct patterns. Replace it with greedy set-cover: each round pick the\nsegment whose still-uncovered d-mers score highest, append it, then zero\nthose d-mers so later rounds value only fresh patterns. Scores are cached\nand updated through an inverted index (slot to segments) so a chosen\nsegment's d-mer removal decrements affected segment scores in O(shared\noccurrences) — affordable at any corpus size, no per-size special-casing.\n\nDictionary quality (FFI encoder, our dict vs the C-trained dict, output\nbytes, lower is better):\n- small-4k-log-lines L1/4/6/19: 71/63/61/66 to 59/47/46/52 (beats C at L4)\n- small-10k-random: now beats the C-trained dict at every level\n- decodecorpus-z000033 (large): unchanged within 0.01%\n\nByte-deterministic; 711 lib tests incl dict round-trips + cross-validation.\n\n* fix(dict): exact u64 score arithmetic in fastcover set-cover\n\nThe greedy set-cover score accounting multiplied two u32 factors\n(count * frequency) and accumulated in usize, which wraps on 32-bit\ntargets (i686). The decrement used saturating_sub, but the wrapping\nmultiplication happened BEFORE the saturation, so it masked nothing.\n\nAccumulate scores in u64: u32*u32 fits u64 exactly, no wrap on any\ntarget. The decrement is now plain subtraction guarded by a\ndebug_assert: each segment's score added count(slot)*freq for a given\nslot with the build-time frequency, and that slot is zeroed exactly\nonce, so subtracting the same product is exact and cannot underflow —\nthe saturating clamp is removed (it only hid bookkeeping bugs).\n\nAlso cover only the d-mers of the bytes actually appended (seg[..take],\nnot the full segment) so a truncated final segment does not mark\nunappended d-mers as covered.\n\n* docs(dict): note std-gated rationale for HashMap in fastcover\n\n* fix(dict): cap fastcover segment count to keep u32 index lossless\n\nSegment indices are stored as u32 in the inverted index; cap the segment\nlist at u32::MAX via take() so the i as u32 cast can never truncate (which\nwould corrupt the index and could trip the score-underflow debug_assert).\nNo-op for any realistic corpus; only an unreachable multi-TB input would\nhit the cap.\n\n* fix(encode): search the dictionary on incompressible-looking blocks (#325)\n\n* fix(encode): search the dictionary on incompressible-looking blocks\n\nThe raw-fast-path emitted a block raw (skipping match-finding) whenever\nblock_looks_incompressible returned true, without checking for a primed\ndictionary. A high-entropy block can still match dictionary content (e.g.\na dict segment embedded in random input), so skipping the scan left the\ndictionary unsearched and the block stored raw — zero dictionary benefit.\n\nGate the raw-fast-path on !dict_active (threaded from the frame\ncompressor's attached-dictionary state) so a primed dictionary forces the\nfull compress path, and add a post-compress raw fallback\n(compressed >= block_size) under dict_active so a block that stays\nincompressible even with the dict is still emitted raw without expansion.\nThe no-dictionary wire output is byte-identical (gate and fallback both\nsit behind dict_active).\n\nsmall-10k-random level_19 compress-dict: rust 10259 -> 9217 (now below\nthe C FFI 9226; was zero dict benefit). 712 lib tests incl a new\nregression test and the cross-validation round-trips.\n\n* fix(encode): gate dict_active on matcher priming support\n\ndict_active was derived from self.dictionary.is_some() alone, but a\ndictionary is only actually primed (and thus matchable) when the matcher\nsupports priming — mirror prepare_frame's use_dictionary_state by also\nrequiring supports_dictionary_priming(). A non-priming matcher ignores\nan attached dictionary, so the raw-fast-path must stay enabled for it.\n\nAlso assert the regression-test payload satisfies block_looks_incompressible\nup front, so the test cannot pass vacuously if the heuristic changes and\nthe payload stops triggering the raw-fast-path it is meant to exercise.\n\n* refactor(dict): use alloc collections in fastcover trainer\n\nReplace `std::collections::{HashMap, HashSet}` with\n`alloc::collections::{BTreeMap, BTreeSet}` in the fastcover set-cover\ntrainer. Keeps the module free of std-only collections (the crate is\nno_std-first) and drops SipHash overhead on large corpora. The\ninverted-index scoring is order-independent, so the switch is\nbehaviour-preserving; ordered iteration is a determinism bonus.",
+          "timestamp": "2026-06-03T00:27:40+03:00",
+          "tree_id": "020eb090e14a24493557441518910e1aef02cd77",
+          "url": "https://github.com/structured-world/structured-zstd/commit/4dc1e34aee1e54ee0bb982d7b0e3e9a6983de89d"
+        },
+        "date": 1780442923267,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.133,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 325.633,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 221.024,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.675,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.821,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.433,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.007,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.96,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.042,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.758,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.661,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.297,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.645,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.091,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.727,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
