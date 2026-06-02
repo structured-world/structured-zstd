@@ -688,6 +688,66 @@ impl FastKernelMatcher {
         self.rep = rep_out;
     }
 
+    /// Borrowed-window equivalent of [`Self::start_matching`]: scan the
+    /// block spanning `[block_start, block_end)` of the registered
+    /// borrowed window in place, without appending to or evicting from
+    /// the owned `history`. Requires [`Self::set_borrowed_window`] to
+    /// have registered the buffer; the caller supplies absolute block
+    /// bounds (the one-shot frame path tracks them as it walks the
+    /// input). `block_start <= block_end` and `block_end` <= the
+    /// registered buffer length.
+    ///
+    /// Produces a byte-identical sequence stream to the owned path: a
+    /// one-shot frame's blocks lie back-to-back in the input buffer
+    /// exactly as the owned `history` accumulates them, and the one-shot
+    /// caller is gated so the whole input fits the window (no eviction),
+    /// so absolute positions and hash-table state evolve identically.
+    #[cfg(test)]
+    pub(crate) fn start_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        let (ptr, total_len) = self
+            .borrowed
+            .expect("start_matching_borrowed requires a registered borrowed window");
+        debug_assert!(
+            block_start <= block_end && block_end <= total_len,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
+        );
+        // Same window math as the owned path, but against the absolute
+        // block end in the borrowed buffer rather than the accumulated
+        // history length.
+        let advertised_window = 1usize << self.window_log;
+        let window_low = block_end.saturating_sub(advertised_window) as u32;
+        let prefix_start_index = window_low.max(self.prefix_start_index);
+        let rep_in = self.rep;
+        let mls = self.hash_table.mls();
+        // SAFETY: `block_end <= total_len` (the registered buffer length)
+        // by the caller contract + debug_assert, so the slice stays
+        // within the borrowed allocation; `set_borrowed_window`'s
+        // liveness contract guarantees the buffer is still live. `ptr` is
+        // copied out of the `Copy` `borrowed` field, so `history` is not
+        // tied to `&self` and stays disjoint from the `&mut` field
+        // borrows passed to the kernel runner.
+        let history: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
+        let rep_out = run_fast_kernel_block(
+            history,
+            block_start,
+            prefix_start_index,
+            window_low,
+            &mut self.hash_table,
+            &mut self.offset_hist,
+            rep_in,
+            self.step_size,
+            mls,
+            self.use_cmov,
+            handle_sequence,
+        );
+        self.rep = rep_out;
+    }
+
     /// Donor's `skipMatching` equivalent: append the pending block to
     /// history without running the kernel.
     ///
@@ -1066,6 +1126,95 @@ mod tests {
         // (now empty) owned buffer, never the dangling external range.
         assert!(m.borrowed.is_none());
         assert_eq!(m.history_bytes().len(), HISTORY_DRAIN_BASE);
+    }
+
+    /// The borrowed one-shot scan must emit the EXACT same sequence
+    /// stream (and end with the same rep / offset_hist state) as the
+    /// owned block-by-block path. This is the load-bearing correctness
+    /// check for the borrowed window: the one-shot frame path relies on
+    /// it producing identical output without the per-block history copy.
+    #[test]
+    fn borrowed_window_matches_owned_sequence_stream() {
+        #[derive(PartialEq, Debug)]
+        enum Seq {
+            Triple(alloc::vec::Vec<u8>, usize, usize),
+            Lits(alloc::vec::Vec<u8>),
+        }
+
+        // Repeating pattern so the matcher emits real matches, split into
+        // two blocks. Window (1 << 15 = 32 KiB) far exceeds the input, so
+        // the owned path never evicts — its accumulated `history` is
+        // byte-identical to the borrowed buffer, the precondition for
+        // stream equality.
+        let mut whole = alloc::vec::Vec::with_capacity(320);
+        for i in 0..320usize {
+            whole.push((i % 64) as u8);
+        }
+        let split = 192usize;
+
+        // Owned path: commit each block, then scan.
+        let mut owned = FastKernelMatcher::with_params(15, 12, 5, 2);
+        let mut owned_seqs: alloc::vec::Vec<Seq> = alloc::vec::Vec::new();
+        owned.accept_data(whole[..split].to_vec());
+        owned.start_matching(|seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => owned_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => owned_seqs.push(Seq::Lits(literals.to_vec())),
+        });
+        owned.accept_data(whole[split..].to_vec());
+        owned.start_matching(|seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => owned_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => owned_seqs.push(Seq::Lits(literals.to_vec())),
+        });
+
+        // Borrowed path: same bytes, scanned in place by block range.
+        let mut borrowed = FastKernelMatcher::with_params(15, 12, 5, 2);
+        let mut borrowed_seqs: alloc::vec::Vec<Seq> = alloc::vec::Vec::new();
+        // SAFETY: `whole` outlives both scans below; `borrowed` is dropped
+        // at end of scope before `whole`, so the window never dangles.
+        unsafe { borrowed.set_borrowed_window(&whole) };
+        borrowed.start_matching_borrowed(0, split, |seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => borrowed_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => borrowed_seqs.push(Seq::Lits(literals.to_vec())),
+        });
+        borrowed.start_matching_borrowed(split, whole.len(), |seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => borrowed_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => borrowed_seqs.push(Seq::Lits(literals.to_vec())),
+        });
+
+        assert_eq!(
+            owned_seqs, borrowed_seqs,
+            "borrowed window must emit the identical sequence stream as the owned path",
+        );
+        assert_eq!(
+            owned.rep, borrowed.rep,
+            "rep state must match after both scans"
+        );
+        assert_eq!(
+            owned.offset_hist, borrowed.offset_hist,
+            "offset_hist must match after both scans",
+        );
+        // The borrowed path must have produced at least one match (else
+        // the test would trivially pass on an all-literals stream).
+        assert!(
+            borrowed_seqs.iter().any(|s| matches!(s, Seq::Triple(..))),
+            "pattern must yield at least one match to make the check meaningful",
+        );
     }
 
     #[test]
