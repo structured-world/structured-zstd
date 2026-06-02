@@ -795,6 +795,18 @@ impl FastKernelMatcher {
     /// stages the range; `start_matching_borrowed` / `skip_matching_borrowed`
     /// re-record the same value idempotently.
     pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        let (_ptr, total_len) = self
+            .borrowed
+            .expect("stage_borrowed_block requires a registered borrowed window");
+        // Always-on (not debug_assert): the staged range is later sliced by
+        // `last_committed_space` as `history_bytes()[start..end]`, so an
+        // out-of-range or inverted range would panic deep in the emit path
+        // instead of at the staging call site. Validate here to match
+        // `start_matching_borrowed` / `skip_matching_borrowed`.
+        assert!(
+            block_start <= block_end && block_end <= total_len,
+            "staged borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
+        );
         self.last_borrowed_block = Some((block_start, block_end));
     }
 
