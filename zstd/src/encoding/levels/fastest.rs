@@ -10,6 +10,7 @@ use crate::{
             block_looks_incompressible, block_looks_incompressible_strict,
             compression_level_allows_raw_fast_path,
         },
+        match_generator::MatchGeneratorDriver,
     },
 };
 use alloc::vec::Vec;
@@ -143,6 +144,111 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
                 block_size: compressed.len() as u32,
             };
             // Write the header, then the block
+            header.serialize(output);
+            output.extend(compressed);
+            BlockType::Compressed
+        }
+    }
+}
+
+/// Borrowed one-shot variant of [`compress_block_encoded`] for the Fast
+/// (Simple) backend: the block bytes live at `[block_start, block_end)`
+/// of the matcher's registered borrowed window (`set_borrowed_window`),
+/// so there is no owned block `Vec` to `commit_space`. Instead the range
+/// is staged via `set_borrowed_block`, which routes the subsequent
+/// `start_matching` / `skip_matching_with_hint` to the borrowed scan.
+///
+/// Mirrors `compress_block_encoded`'s RLE / raw-fast-path / compressed
+/// branch selection and shares the heavy `compress_block` machinery; the
+/// only differences are how the block is acquired (borrowed slice, no
+/// copy) and that raw/RLE bodies are emitted straight from `block`. The
+/// `Level(16..=22)` post-split branch is unreachable here (the borrowed
+/// path is gated to Fast levels), so it is omitted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_encoded_borrowed(
+    state: &mut CompressState<MatchGeneratorDriver>,
+    compression_level: CompressionLevel,
+    last_block: bool,
+    block: &[u8],
+    block_start: usize,
+    block_end: usize,
+    output: &mut Vec<u8>,
+    #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
+) -> BlockType {
+    let block_size = block.len() as u32;
+    if !block.is_empty() && block.iter().all(|x| block[0].eq(x)) {
+        let rle_byte = block[0];
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
+        }
+        state.matcher.set_borrowed_block(block_start, block_end);
+        state.matcher.skip_matching_with_hint(Some(false));
+        let header = BlockHeader {
+            last_block,
+            block_type: BlockType::RLE,
+            block_size,
+        };
+        header.serialize(output);
+        output.push(rle_byte);
+        BlockType::RLE
+    } else if should_emit_raw_fast_path(compression_level, state.matcher.window_size(), block) {
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
+        }
+        state.matcher.set_borrowed_block(block_start, block_end);
+        state.matcher.skip_matching_with_hint(Some(true));
+        let header = BlockHeader {
+            last_block,
+            block_type: BlockType::Raw,
+            block_size,
+        };
+        header.serialize(output);
+        output.extend_from_slice(block);
+        BlockType::Raw
+    } else {
+        debug_assert!(
+            !matches!(compression_level, CompressionLevel::Level(16..=22)),
+            "borrowed one-shot path is gated to Fast levels; post-split is unreachable",
+        );
+        let mut compressed = Vec::new();
+        // Stage the borrowed range so `compress_block`'s internal
+        // `start_matching` scans it in place (no `commit_space` copy).
+        state.matcher.set_borrowed_block(block_start, block_end);
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            // Hash the block bytes directly: the staged borrowed range is
+            // consumed by the `start_matching` inside `compress_block`
+            // below, so hashing `block` is both correct and order-safe.
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
+        }
+        let saved_offset_hist = state.offset_hist;
+        let saved_huff_table = state.last_huff_table.clone();
+        let saved_ll_previous = state.fse_tables.ll_previous.clone();
+        let saved_ml_previous = state.fse_tables.ml_previous.clone();
+        let saved_of_previous = state.fse_tables.of_previous.clone();
+        compress_block(state, &mut compressed);
+        if compressed.len() >= MAX_BLOCK_SIZE as usize {
+            state.offset_hist = saved_offset_hist;
+            state.last_huff_table = saved_huff_table;
+            state.fse_tables.ll_previous = saved_ll_previous;
+            state.fse_tables.ml_previous = saved_ml_previous;
+            state.fse_tables.of_previous = saved_of_previous;
+            let header = BlockHeader {
+                last_block,
+                block_type: BlockType::Raw,
+                block_size,
+            };
+            header.serialize(output);
+            output.extend_from_slice(block);
+            BlockType::Raw
+        } else {
+            let header = BlockHeader {
+                last_block,
+                block_type: BlockType::Compressed,
+                block_size: compressed.len() as u32,
+            };
             header.serialize(output);
             output.extend(compressed);
             BlockType::Compressed

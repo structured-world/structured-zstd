@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
+use crate::encoding::{CompressionLevel, FrameCompressor, compress_slice_to_vec, compress_to_vec};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -909,5 +909,46 @@ fn all_levels_tiny_input_with_hint() {
             data, result,
             "Tiny input with hint failed for Level({level})"
         );
+    }
+}
+
+/// The borrowed one-shot path (`compress_slice_to_vec`) must produce a
+/// frame byte-identical to the owned streaming path (`compress_to_vec`)
+/// for Fast-backend levels whose input fits the window, and round-trip
+/// exactly. Covers compressible and random inputs across one and
+/// multiple blocks. Non-eligible cases fall back to the owned loop, so
+/// the equality holds there too.
+#[test]
+fn borrowed_oneshot_matches_owned_and_roundtrips() {
+    let cases: [(u64, usize); 5] = [
+        (1, 200_000),
+        (7, 293_000),
+        (42, 50_000),
+        (3, 4096),
+        (5, 700_000),
+    ];
+    for level in [
+        CompressionLevel::Fastest,
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(2),
+        CompressionLevel::Level(-6),
+    ] {
+        for &(seed, len) in &cases {
+            for data in [generate_compressible(seed, len), generate_data(seed, len)] {
+                let borrowed = compress_slice_to_vec(&data, level);
+                let owned = compress_to_vec(data.as_slice(), level);
+                assert_eq!(
+                    borrowed, owned,
+                    "borrowed one-shot frame differs from owned at {level:?} seed={seed} len={len}",
+                );
+                let mut decoder = StreamingDecoder::new(borrowed.as_slice()).unwrap();
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result).unwrap();
+                assert_eq!(
+                    result, data,
+                    "borrowed one-shot roundtrip mismatch at {level:?}"
+                );
+            }
+        }
     }
 }

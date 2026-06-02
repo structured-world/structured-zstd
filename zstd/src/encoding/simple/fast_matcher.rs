@@ -223,6 +223,14 @@ pub(crate) struct FastKernelMatcher {
     /// the window is set, and the window must be cleared before the
     /// buffer is dropped or the matcher is reused for another frame.
     borrowed: Option<(*const u8, usize)>,
+    /// Absolute `[start, end)` range of the block most recently scanned
+    /// by [`Self::start_matching_borrowed`], in the borrowed window's
+    /// coordinate space. `Some` only while a borrowed window is active
+    /// and at least one borrowed block has been scanned; lets
+    /// [`Self::last_committed_space`] return that block's bytes
+    /// (`borrowed[start..end]`, zero-copy) for the emit path — the
+    /// borrowed analogue of `last_block_start` on the owned path.
+    last_borrowed_block: Option<(usize, usize)>,
 }
 
 impl FastKernelMatcher {
@@ -309,6 +317,7 @@ impl FastKernelMatcher {
             step_size,
             pending: None,
             borrowed: None,
+            last_borrowed_block: None,
         }
     }
 
@@ -357,6 +366,7 @@ impl FastKernelMatcher {
         // Drop any borrowed window: the next frame's input buffer is a
         // different allocation, so a stale (ptr, len) would dangle.
         self.borrowed = None;
+        self.last_borrowed_block = None;
     }
 
     /// Reported decoder-side window size (bytes) — test-only.
@@ -411,16 +421,16 @@ impl FastKernelMatcher {
     /// reused for a different frame. The owned-buffer mutation paths
     /// (`accept_data`, `extend_history_with_pending`, drain, prime) must
     /// not run while a borrowed window is active.
-    #[cfg(test)]
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
+        self.last_borrowed_block = None;
     }
 
     /// Clear a borrowed window set by [`Self::set_borrowed_window`],
     /// returning the matcher to the owned `history` path.
-    #[cfg(test)]
     pub(crate) fn clear_borrowed_window(&mut self) {
         self.borrowed = None;
+        self.last_borrowed_block = None;
     }
 
     /// Read-only view of the most recently committed block — donor /
@@ -434,10 +444,16 @@ impl FastKernelMatcher {
     /// - Post-processing: `history` slice of the just-processed
     ///   block — frame compressor's raw-block emission reads this.
     pub(crate) fn last_committed_space(&self) -> &[u8] {
-        match self.pending.as_deref() {
-            Some(slice) => slice,
-            None => &self.history_bytes()[self.last_block_start..],
+        if let Some(slice) = self.pending.as_deref() {
+            return slice;
         }
+        // Borrowed one-shot path: the just-scanned block lives at
+        // `[start, end)` of the borrowed window, which `history_bytes()`
+        // views in place — return it zero-copy for the emit path.
+        if let Some((start, end)) = self.last_borrowed_block {
+            return &self.history_bytes()[start..end];
+        }
+        &self.history_bytes()[self.last_block_start..]
     }
 
     /// Accept a freshly-committed block from the driver.
@@ -707,7 +723,6 @@ impl FastKernelMatcher {
     /// exactly as the owned `history` accumulates them, and the one-shot
     /// caller is gated so the whole input fits the window (no eviction),
     /// so absolute positions and hash-table state evolve identically.
-    #[cfg(test)]
     pub(crate) fn start_matching_borrowed(
         &mut self,
         block_start: usize,
@@ -755,6 +770,9 @@ impl FastKernelMatcher {
             handle_sequence,
         );
         self.rep = rep_out;
+        // Record the scanned range so `last_committed_space` can return
+        // this block's bytes (`borrowed[start..end]`) for the emit path.
+        self.last_borrowed_block = Some((block_start, block_end));
     }
 
     /// Donor's `skipMatching` equivalent: append the pending block to
@@ -800,6 +818,54 @@ impl FastKernelMatcher {
         // very small).
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
+        }
+    }
+
+    /// Borrowed-window equivalent of [`Self::skip_matching_with_hint`]:
+    /// the block `[block_start, block_end)` is emitted as RLE / raw
+    /// without running the kernel, but its bytes are already resident in
+    /// the borrowed window (no `history` append needed). Records the
+    /// range for [`Self::last_committed_space`]; on the dict-priming hint
+    /// (`Some(false)`) populates the hash table for the range so a later
+    /// block can match into this skipped-but-compressible region, exactly
+    /// as the owned path does.
+    pub(crate) fn skip_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        incompressible_hint: Option<bool>,
+    ) {
+        self.last_borrowed_block = Some((block_start, block_end));
+        if incompressible_hint == Some(false) {
+            self.prime_hash_table_for_range_borrowed(block_start, block_end);
+        }
+    }
+
+    /// Borrowed-window analogue of [`Self::prime_hash_table_for_range`].
+    /// Hashes every position in `[range_start, block_end - HASH_READ_SIZE]`
+    /// reading from the borrowed input buffer. Bounded by `block_end`
+    /// (not the full buffer) so only the just-committed block's positions
+    /// are indexed — future blocks aren't matchable yet, mirroring the
+    /// owned path where `history` ends at `block_end`.
+    fn prime_hash_table_for_range_borrowed(&mut self, range_start: usize, block_end: usize) {
+        const HASH_READ_SIZE: usize = 8;
+        if block_end < HASH_READ_SIZE {
+            return;
+        }
+        let last_hashable = block_end - HASH_READ_SIZE;
+        if range_start > last_hashable {
+            return;
+        }
+        let (base, _len) = self
+            .borrowed
+            .expect("skip_matching_borrowed requires a registered borrowed window");
+        match self.hash_table.mls() {
+            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
+            _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
 
@@ -877,20 +943,28 @@ impl FastKernelMatcher {
             return;
         }
 
+        let base = self.history.as_ptr();
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(range_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(range_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(range_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(range_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(range_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
 
-    /// Monomorphised per-MLS loop body called by
-    /// [`Self::prime_hash_table_for_range`] after the outer dispatch.
-    fn prime_hash_table_impl<const MLS: u32>(&mut self, range_start: usize, last_hashable: usize) {
-        let base = self.history.as_ptr();
+    /// Monomorphised per-MLS loop body shared by the owned
+    /// [`Self::prime_hash_table_for_range`] and the borrowed
+    /// [`Self::skip_matching_borrowed`] dict-priming paths. `base` is the
+    /// window base pointer (owned `history` or the borrowed input
+    /// buffer); positions are absolute window offsets in both.
+    fn prime_hash_table_impl<const MLS: u32>(
+        &mut self,
+        base: *const u8,
+        range_start: usize,
+        last_hashable: usize,
+    ) {
         for pos in range_start..=last_hashable {
             // SAFETY: pos < history_len (by loop bound), and the load
             // width HASH_READ_SIZE is the kernel's contractually

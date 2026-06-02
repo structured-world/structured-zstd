@@ -521,6 +521,17 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
 }
 
+/// Per-frame setup resolved once by [`FrameCompressor::prepare_frame`] and
+/// consumed by the block loop + [`FrameCompressor::finish_frame`]. Lets the
+/// owned `compress()` and the borrowed one-shot path share identical
+/// reset / dict-prime / entropy-seed setup and frame-tail emission.
+struct FramePrep {
+    window_size: u64,
+    use_dictionary_state: bool,
+    source_size_hint_known: bool,
+    initial_size_hint: Option<u64>,
+}
+
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Create a new `FrameCompressor`
     pub fn new(compression_level: CompressionLevel) -> Self {
@@ -551,6 +562,102 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
         }
+    }
+
+    /// One-shot compress of a contiguous `&[u8]` input. When the Fast
+    /// (Simple) backend is selected, no dictionary is active, and the
+    /// whole input fits the resolved window (so no eviction can occur),
+    /// the matcher references the input in place as a borrowed window —
+    /// skipping the per-block copy into the owned `history` that the
+    /// streaming path performs (the dominant peak-allocation cost on Fast
+    /// one-shot compress). Every other case falls back to the owned
+    /// streaming loop, producing identical output.
+    ///
+    /// The owned fallback reads from the source set via [`Self::set_source`],
+    /// so the caller must `set_source(input)` before calling this.
+    pub fn compress_oneshot_borrowed(&mut self, input: &[u8]) {
+        use crate::encoding::strategy::StrategyTag;
+        let prep = self.prepare_frame();
+        let borrowed_eligible = !prep.use_dictionary_state
+            && self.state.strategy_tag == StrategyTag::Fast
+            && (input.len() as u64) <= prep.window_size;
+        let (all_blocks, total_uncompressed) = if borrowed_eligible {
+            self.run_borrowed_block_loop(input, prep.initial_size_hint)
+        } else {
+            self.run_owned_block_loop(prep.initial_size_hint)
+        };
+        self.finish_frame(all_blocks, total_uncompressed, &prep);
+    }
+
+    /// Borrowed one-shot block loop: walks `input` in `MAX_BLOCK_SIZE`
+    /// strides (the Fast backend never pre-splits, so boundaries match the
+    /// owned loop), scanning each block range in place against the
+    /// borrowed window via `compress_block_encoded_borrowed` — no
+    /// per-block `commit_space` copy. Returns `(all_blocks,
+    /// total_uncompressed)`. Caller guarantees Fast backend + no
+    /// dictionary + `input` fits the window.
+    fn run_borrowed_block_loop(
+        &mut self,
+        input: &[u8],
+        initial_size_hint: Option<u64>,
+    ) -> (Vec<u8>, u64) {
+        const ALL_BLOCKS_TINY_THRESHOLD: u64 = 4 * 1024;
+        const ALL_BLOCKS_SMALL_THRESHOLD: u64 = 64 * 1024;
+        const ALL_BLOCKS_TINY_CAP: usize = 4 * 1024;
+        const ALL_BLOCKS_SMALL_CAP: usize = 16 * 1024;
+        const ALL_BLOCKS_DEFAULT_CAP: usize = 130 * 1024;
+        let initial_all_blocks_cap = match initial_size_hint {
+            Some(h) if h <= ALL_BLOCKS_TINY_THRESHOLD => ALL_BLOCKS_TINY_CAP,
+            Some(h) if h <= ALL_BLOCKS_SMALL_THRESHOLD => ALL_BLOCKS_SMALL_CAP,
+            _ => ALL_BLOCKS_DEFAULT_CAP,
+        };
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap);
+        let total_uncompressed = input.len() as u64;
+        // Empty input: emit a single empty last Raw block (mirrors the
+        // owned loop's empty-file special case).
+        if input.is_empty() {
+            let header = BlockHeader {
+                last_block: true,
+                block_type: crate::blocks::block::BlockType::Raw,
+                block_size: 0,
+            };
+            header.serialize(&mut all_blocks);
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if let Some(checksums) = self.block_checksums.as_mut() {
+                checksums.push(xxh64_block_low32(&[]));
+            }
+            return (all_blocks, total_uncompressed);
+        }
+        // SAFETY: `input` outlives this call (held by the caller across
+        // the call) and is not mutated; the borrowed window is cleared
+        // before return. Only the Simple backend is active (gated by
+        // `compress_oneshot_borrowed`).
+        unsafe {
+            self.state.matcher.set_borrowed_window(input);
+        }
+        let block_capacity = MAX_BLOCK_SIZE as usize;
+        let mut start = 0usize;
+        while start < input.len() {
+            let end = (start + block_capacity).min(input.len());
+            let block = &input[start..end];
+            let last_block = end == input.len();
+            #[cfg(feature = "hash")]
+            self.hasher.write(block);
+            crate::encoding::levels::compress_block_encoded_borrowed(
+                &mut self.state,
+                self.compression_level,
+                last_block,
+                block,
+                start,
+                end,
+                &mut all_blocks,
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                self.block_checksums.as_mut(),
+            );
+            start = end;
+        }
+        self.state.matcher.clear_borrowed_window();
+        (all_blocks, total_uncompressed)
     }
 }
 
@@ -633,7 +740,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ///
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
+    /// Per-frame setup values resolved by [`Self::prepare_frame`] and
+    /// consumed by the block loop + [`Self::finish_frame`]. Lets the
+    /// owned `compress()` and the borrowed one-shot path share the exact
+    /// same reset / dict-prime / entropy-seed setup and frame tail.
     pub fn compress(&mut self) {
+        let prep = self.prepare_frame();
+        let (all_blocks, total_uncompressed) = self.run_owned_block_loop(prep.initial_size_hint);
+        self.finish_frame(all_blocks, total_uncompressed, &prep);
+    }
+
+    fn prepare_frame(&mut self) -> FramePrep {
         // Reset per-frame introspection state so a re-used compressor
         // doesn't carry over the previous frame's layout/checksums.
         #[cfg(feature = "lsm")]
@@ -730,13 +847,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         {
             self.hasher = XxHash64::with_seed(0);
         }
-        let source = self.uncompressed_data.as_mut().unwrap();
-        let drain = self.compressed_data.as_mut().unwrap();
         let window_size = self.state.matcher.window_size();
         assert!(
             window_size != 0,
             "matcher reported window_size == 0, which is invalid"
         );
+        FramePrep {
+            window_size,
+            use_dictionary_state,
+            source_size_hint_known,
+            initial_size_hint,
+        }
+    }
+
+    /// Owned streaming block loop: reads blocks from the source `Read`,
+    /// optionally pre-splits, hashes for the content checksum, and emits
+    /// each block via `compress_block_encoded`, accumulating the block
+    /// bytes. Returns `(all_blocks, total_uncompressed)`. Shared by
+    /// `compress` and the borrowed one-shot path's fallback.
+    fn run_owned_block_loop(&mut self, initial_size_hint: Option<u64>) -> (Vec<u8>, u64) {
+        let source = self.uncompressed_data.as_mut().unwrap();
         // Accumulate all compressed blocks; the frame header is written
         // after all input has been read so that Frame_Content_Size is
         // known. The default seed is one donor block; smaller seeds for
@@ -900,7 +1030,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 break;
             }
         }
+        (all_blocks, total_uncompressed)
+    }
 
+    /// Write the frame header (with now-known FCS / single_segment), the
+    /// accumulated block bytes, and the optional trailing content
+    /// checksum; populate `frame_emit_info` (lsm). Shared by `compress`
+    /// and the borrowed one-shot path.
+    fn finish_frame(&mut self, all_blocks: Vec<u8>, total_uncompressed: u64, prep: &FramePrep) {
+        let window_size = prep.window_size;
+        let use_dictionary_state = prep.use_dictionary_state;
+        let source_size_hint_known = prep.source_size_hint_known;
+        let drain = self.compressed_data.as_mut().unwrap();
         // Now that total_uncompressed is known, write the frame header with FCS.
         // Match the donor framing policy for pledged one-shot inputs: use a
         // single-segment frame whenever the source fits the active window.
