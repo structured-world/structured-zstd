@@ -1627,14 +1627,13 @@ impl FrameDecoder {
         // fields; only `buffer` differs and we don't use that here.
         // Macro-style binding avoids the closure / generic
         // gymnastics of returning multiple `&mut` from a match arm.
-        let (huf, fse, offset_hist, literals_buffer, sequences, block_content_buffer, window_size) =
+        let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => (
                     &mut s.huf,
                     &mut s.fse,
                     &mut s.offset_hist,
                     &mut s.literals_buffer,
-                    &mut s.sequences,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
                 ),
@@ -1643,7 +1642,6 @@ impl FrameDecoder {
                     &mut s.fse,
                     &mut s.offset_hist,
                     &mut s.literals_buffer,
-                    &mut s.sequences,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
                 ),
@@ -1655,7 +1653,6 @@ impl FrameDecoder {
             fse,
             offset_hist,
             literals_buffer,
-            sequences,
             block_content_buffer,
             buffer,
         };

@@ -360,3 +360,70 @@ fn level22_stays_within_ffi_level22_on_corpus_proxy() {
         ffi_level22.len()
     );
 }
+
+/// RLE-mode sequence tables: C zstd emits Compression_Mode = RLE for an
+/// LL/ML/OF axis when a block's sequences all share one code (uniform /
+/// highly-repetitive data). This exercises the fused RLE decode path —
+/// the degenerate 1-state FSE table built by `FSETableImpl::build_rle`.
+/// All-same-byte input is the canonical RLE producer: C encodes it as a
+/// single long match, so every sequence axis has exactly one code and
+/// C switches the table to RLE mode. A wrong RLE table build or a wrong
+/// 1-state decode would corrupt the output here.
+#[test]
+fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
+    let mut period4: Vec<u8> = Vec::with_capacity(8192);
+    while period4.len() < 8192 {
+        period4.extend_from_slice(b"abcd");
+    }
+    let mut two_runs: Vec<u8> = vec![0x11u8; 4096];
+    two_runs.extend_from_slice(&[0x22u8; 4096]);
+
+    // Periodic unit = a fixed 15-byte pattern that matches the previous
+    // unit (offset 16) + one varying literal byte. Every unit yields the
+    // SAME (lit_len, match_len, offset) sequence, so the block has many
+    // sequences all sharing one code per axis → RLE-mode sequence tables
+    // with MULTI-sequence blocks (exercises update_state transitions on
+    // the 1-state table, unlike the single-match inputs above).
+    // 9000 units * 16 B = 144 KiB → spans more than one 128 KiB block,
+    // every block RLE-mode.
+    let mut periodic: Vec<u8> = Vec::with_capacity(16 * 9000);
+    for i in 0..9000u32 {
+        periodic.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        periodic.push((i & 0xFF) as u8);
+    }
+    // RLE blocks followed by FSE blocks in ONE frame: the scratch FSE
+    // tables are reused across blocks, so a stale RLE-table field leaking
+    // into the next FSE-mode block's build is caught here (regression for
+    // the max_symbol-clobber bug).
+    let mut mixed: Vec<u8> = periodic.clone();
+    mixed.extend_from_slice(include_bytes!("../decodecorpus_files/z000033"));
+
+    let inputs: Vec<Vec<u8>> = vec![
+        periodic.clone(),   // periodic units → multi-sequence RLE tables
+        mixed,              // RLE blocks → FSE blocks in one frame
+        vec![0x5Au8; 4096], // all-same byte → single long match → RLE axes
+        vec![0u8; 70_000],  // multi-block uniform
+        period4,            // period-4 repeat
+        two_runs,           // two long single-byte runs
+        // Decode corpus at negative/low levels produces MULTI-sequence
+        // RLE blocks (many sequences sharing one code), so the 1-state
+        // table's `update_state` IS exercised between sequences — the
+        // single-sequence inputs above leave that transition untested.
+        include_bytes!("../decodecorpus_files/z000033").to_vec(),
+    ];
+    for level in [-6i32, -1, 1, 3, 9, 19] {
+        for (idx, data) in inputs.iter().enumerate() {
+            let compressed = zstd::encode_all(&data[..], level).unwrap();
+            let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+            let mut result = Vec::new();
+            decoder.read_to_end(&mut result).unwrap();
+            // `assert_eq!(*data, result, ...)` borrows both operands
+            // (`match (&*data, &result)`), so dereferencing the
+            // `&Vec<u8>` from `inputs.iter()` does not move out of it.
+            assert_eq!(
+                *data, result,
+                "RLE-mode ffi→rust decode mismatch (input {idx}, level {level})",
+            );
+        }
+    }
+}
