@@ -615,9 +615,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // the sentinel-aware `prefix_start_index` so the
                 // backward step can reach position 1 (impossible
                 // under the sentinel) at block 0.
+                // SAFETY: `new_ip > anchor >= 0` ⇒ `new_ip >= 1` and
+                // `new_ip - 1 <= ip2 < data.len()`; `match0 > window_low
+                // >= 0` ⇒ `match0 >= 1` and `match0 - 1 < new_ip <
+                // data.len()`. Both indices are in bounds, so the raw
+                // single-byte loads replace bounds-checked indexing on
+                // the hot backward-extension path. `base == data.as_ptr()`.
                 if new_ip > anchor
                     && match0 > window_low as usize
-                    && data[new_ip - 1] == data[match0 - 1]
+                    && unsafe { *base.add(new_ip - 1) == *base.add(match0 - 1) }
                 {
                     new_ip -= 1;
                     match0 -= 1;
@@ -809,9 +815,16 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         // which is sentinel-floored at 1 for hash-filter purposes
         // only).
         if !is_rep {
+            // SAFETY: each iteration's guard `match_ip > anchor >= 0` and
+            // `match_pos > window_low >= 0` give `match_ip >= 1`,
+            // `match_pos >= 1`; `match_ip - 1 < match_ip <= ip0 <
+            // data.len()` and `match_pos - 1 < match_pos < match_ip`, so
+            // both single-byte loads are in bounds. Raw loads replace
+            // bounds-checked indexing on the hot backward-extension loop.
+            // `base == data.as_ptr()`.
             while match_ip > anchor
                 && match_pos > window_low as usize
-                && data[match_ip - 1] == data[match_pos - 1]
+                && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
             {
                 match_ip -= 1;
                 match_pos -= 1;
@@ -832,7 +845,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         m_len += forward;
 
         // Emit.
-        let literals = &data[anchor..match_ip];
+        // SAFETY: the backward-extension loop above stops at
+        // `match_ip == anchor` (or a byte mismatch), so `anchor <=
+        // match_ip`; `match_ip <= ip0 < data.len()`. The range is valid,
+        // so the unchecked slice avoids the bounds pair on the per-match
+        // literal gather.
+        let literals = unsafe { data.get_unchecked(anchor..match_ip) };
         handle_sequence(Sequence::Triple {
             literals,
             offset,
@@ -911,8 +929,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 unsafe { hash_table.put(h_at, ip0 as u32) };
 
                 // Emit lit_len=0 rep1 sequence.
+                // SAFETY: this immediate-rep2 branch runs with `anchor ==
+                // ip0` before the match (lit_len 0), so `anchor <= ip0`
+                // and `ip0 < data.len()`; the unchecked slice avoids the
+                // bounds pair on the per-match literal gather.
                 handle_sequence(Sequence::Triple {
-                    literals: &data[anchor..ip0],
+                    literals: unsafe { data.get_unchecked(anchor..ip0) },
                     offset: r_off,
                     match_len: r_len,
                 });
