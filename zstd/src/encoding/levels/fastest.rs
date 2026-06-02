@@ -36,6 +36,12 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     last_block: bool,
     uncompressed_data: Vec<u8>,
     output: &mut Vec<u8>,
+    // When a dictionary is primed, an "incompressible-looking" block can
+    // still compress well by matching the dictionary content, so the
+    // raw-fast-path (which SKIPS matching) must NOT fire — otherwise the
+    // dictionary is never searched and the block is emitted raw. C always
+    // searches and only falls back to raw post-hoc; we mirror that here.
+    dict_active: bool,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
     let block_size = uncompressed_data.len() as u32;
@@ -59,11 +65,13 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if should_emit_raw_fast_path(
-        compression_level,
-        state.matcher.window_size(),
-        &uncompressed_data,
-    ) {
+    } else if !dict_active
+        && should_emit_raw_fast_path(
+            compression_level,
+            state.matcher.window_size(),
+            &uncompressed_data,
+        )
+    {
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
@@ -120,9 +128,18 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
         compress_block(state, &mut compressed);
-        // If the compressed data is larger than the maximum
-        // allowable block size, instead store uncompressed
-        if compressed.len() >= MAX_BLOCK_SIZE as usize {
+        // If the compressed data is larger than the maximum allowable
+        // block size, store uncompressed. When a dictionary is active we
+        // ALSO fall back to raw whenever compression did not actually
+        // shrink the block (`compressed >= block_size`): the raw-fast-path
+        // was bypassed to give dictionary matching a chance, so a block
+        // that turns out incompressible-even-with-the-dict must still be
+        // emitted raw instead of as a (larger) compressed block. Mirrors
+        // the reference's post-hoc raw fallback; gated on `dict_active` so
+        // the non-dictionary wire output is byte-identical to before.
+        if compressed.len() >= MAX_BLOCK_SIZE as usize
+            || (dict_active && compressed.len() >= block_size as usize)
+        {
             state.offset_hist = saved_offset_hist;
             state.last_huff_table = saved_huff_table;
             state.fse_tables.ll_previous = saved_ll_previous;
@@ -332,6 +349,7 @@ mod tests {
             true,
             vec![0xAB; 1024],
             &mut output,
+            false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
@@ -375,6 +393,7 @@ mod tests {
             true,
             block.clone(),
             &mut output,
+            false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
