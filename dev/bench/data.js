@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780394550028,
+  "lastUpdate": 1780403638393,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -54182,6 +54182,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "756dfd5068e49776d9f18b36ea1be0458bd3744c",
+          "message": "perf(decode): route RLE-mode sequence tables through the fused path (#320)\n\n* perf(decode): route RLE-mode sequence tables through the fused path\n\nRLE-mode LL/ML/OF tables previously fell back to a two-pass decode +\nexecute pipeline (decode_sequences_with_rle + execute_sequences_fields),\nwhich on low-ratio / log-like data (where RLE-mode is common, not rare)\nran ~55-61% of decode self-time and bypassed the optimised fused\nseq-loop entirely.\n\nBuild a degenerate single-state FSE table for RLE axes (build_rle:\naccuracy_log 0, one entry, new_state 0, num_bits 0, enriched like a real\ntable) so the fused decode_and_execute path handles them uniformly with\nthe FSE axes. init_state now treats an empty decode vec — not\naccuracy_log 0 — as uninitialised, so the valid 1-state RLE table is\naccepted; the InvalidTableShape check still enforces\ndecode.len() == 1 << accuracy_log (1 == 1 << 0). The three RLE arms in\nmaybe_update_fse_tables build + enrich the table and clear the *_rle\nflags, so the legacy fallback is no longer taken.\n\nA new cross-validation test compresses periodic data via FFI (which\nemits multi-sequence RLE-mode tables) and rust-decodes it; it was\nverified to actually exercise build_rle and to fail if the 1-state\ntable's transition bits are wrong.\n\n* fix(decode): keep axis max_symbol when building RLE table\n\nbuild_rle clobbered the scratch table's max_symbol with the single RLE\nsymbol. Because the scratch FSE tables are reused across blocks, a later\nFSE-mode block's build_decoder validated its symbol count against that\nshrunken max_symbol and rejected any table with more symbols\n(TooManySymbols). Leave max_symbol at the axis maximum (reset does not\ntouch it).\n\nStrengthen the RLE cross-validation test: a periodic input now spans\nmultiple RLE blocks (exercises the 1-state update_state transition) and\na periodic+corpus input drives RLE blocks followed by FSE blocks in one\nframe (regression for the max_symbol clobber). Both halves were verified\nto fail before this fix.\n\n* fix(decode): return InvalidRleCode for out-of-range RLE codes\n\nThe LL/OF/ML RLE arms returned MissingByteForRleMlTable when the single\nRLE symbol code exceeded its axis maximum — misleading (not a missing\nbyte, and not the ML table for LL/OF). Add a dedicated\nInvalidRleCode { axis, code } variant and return it from all three\nout-of-range checks.\n\n* refactor(decode): drop dead two-pass RLE sequence fallback\n\nThe fused decode+execute path now handles RLE-mode LL/ML/OF axes via a\ndegenerate single-state FSE table built in maybe_update_fse_tables, so\nthe legacy two-pass fallback (decode_sequences_with_rle +\nexecute_sequences_fields) is unreachable on every kernel tier.\n\nRemove it end to end:\n- the per-tier RLE-fallback branch + rle_fallback_sequences param in the\n  scalar/bmi2/avx2/vbmi2 monoliths\n- execute_sequences_fields and the predefined lookup_ll_code /\n  lookup_ml_code / unpack_code_meta helpers it relied on\n- the vestigial sequences: Vec<Sequence> scratch field across\n  DecoderScratch / WorkspaceRef / DirectScratch and all construction\n  sites (block_decoder, frame_decoder, tests)\n\nNo behaviour change: RLE blocks already routed through the fused table\nsince the build_rle path landed. 707 lib tests pass incl. the\ncross-FFI RLE-mode-table roundtrip.\n\n* docs(decode): correct stale RLE-fallback wording in ddict_is_cold note\n\nThe cold-dict flag comment referenced an RLE-mode fallback that no\nlonger exists; reword to say the flag clears regardless of how the\nprevious block decoded its sequences (RLE-mode axes are now handled\nin-line via the fused table). Also note that the cross-FFI RLE test's\nassert_eq borrows its operands (no move out of the iterated &Vec).",
+          "timestamp": "2026-06-02T14:31:08+03:00",
+          "tree_id": "22aba125c3983cc8eba90d84620648df56e43425",
+          "url": "https://github.com/structured-world/structured-zstd/commit/756dfd5068e49776d9f18b36ea1be0458bd3744c"
+        },
+        "date": 1780403632256,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 296.256,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 199.93,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.315,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.501,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.819,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.08,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.697,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.019,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.031,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.209,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.401,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.774,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.317,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.684,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.088,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.769,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.118,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.118,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
