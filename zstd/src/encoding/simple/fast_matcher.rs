@@ -587,13 +587,11 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
-        // Split borrow: `data` reads from history immutably, kernel
-        // takes hash_table mutably. The two fields don't alias, so the
-        // borrow checker is satisfied via field-by-field projection
-        // (no `&mut self` re-borrow). We also need a mutable borrow on
-        // `self.offset_hist` inside the per-Triple wire-history update,
-        // but that runs synchronously inside this method without
-        // overlapping the kernel call.
+        // Split borrow: `history` reads the buffer immutably while the
+        // kernel takes `hash_table` mutably. The two fields don't alias,
+        // so the borrow checker is satisfied via field-by-field
+        // projection (no `&mut self` re-borrow). `offset_hist` is NOT
+        // borrowed here — Fast matching does not mutate it (see below).
         let history: &[u8] = &self.history;
         let hash_table = &mut self.hash_table;
 
