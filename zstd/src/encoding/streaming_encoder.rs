@@ -428,6 +428,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         last_block,
                         block,
                         &mut encoded,
+                        // The streaming encoder has no dictionary state, so the
+                        // raw-fast-path stays enabled (no dict to match against).
+                        false,
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         None,
                     );

@@ -1057,12 +1057,23 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Level(_) => {
                     let before_len = all_blocks.len();
                     let block_len = uncompressed_data.len();
+                    // A primed dictionary makes "incompressible-looking"
+                    // blocks matchable against the dict, so the raw-fast-
+                    // path inside must be bypassed (it skips matching).
+                    // Mirror prepare_frame's `use_dictionary_state`: a dict
+                    // is only PRIMED (and thus matchable) when the matcher
+                    // supports priming — a non-priming matcher ignores an
+                    // attached dictionary, so the raw-fast-path must stay
+                    // enabled for it. (This arm is already non-Uncompressed.)
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         uncompressed_data,
                         &mut all_blocks,
+                        dict_active,
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         self.block_checksums.as_mut(),
                     );
@@ -2497,6 +2508,98 @@ mod tests {
             .decode_all_to_vec(&hinted_output, &mut decoded)
             .unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    /// A dictionary segment embedded ONCE in otherwise-incompressible
+    /// input must be matched against the dictionary. Before the fix the
+    /// raw-fast-path (which skips matching) fired on the
+    /// incompressible-looking block and the dictionary was never searched,
+    /// so `with_dict` came out the same size as `no_dict` (the embedded
+    /// match was lost). Now the block compresses against the dict.
+    #[test]
+    fn dictionary_segment_in_incompressible_input_is_matched() {
+        // Deterministic LCG bytes: high-entropy, so the only compressible
+        // content is the embedded dictionary segment.
+        fn lcg(seed: u64, n: usize) -> alloc::vec::Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 56) as u8
+                })
+                .collect()
+        }
+        let dict_id = 0x00DC_7777;
+        let r = lcg(1, 512); // the dictionary content
+        let mut payload = lcg(2, 2000); // incompressible filler before
+        payload.extend_from_slice(&r); // the single dict-matchable segment
+        payload.extend_from_slice(&lcg(3, 1500)); // filler after
+
+        // Precondition: the payload must actually look incompressible so
+        // that the raw-fast-path WOULD fire (and skip matching) without
+        // the fix. If the heuristic ever changes and this no longer holds,
+        // the test below would pass vacuously — assert it up front.
+        assert!(
+            crate::encoding::incompressible::block_looks_incompressible(&payload),
+            "test payload must look incompressible to exercise the raw-fast-path",
+        );
+
+        let compress =
+            |level: super::CompressionLevel, dict: Option<&[u8]>| -> alloc::vec::Vec<u8> {
+                let mut out = alloc::vec::Vec::new();
+                let mut c = FrameCompressor::new(level);
+                if let Some(d) = dict {
+                    c.set_dictionary(
+                        crate::decoding::Dictionary::from_raw_content(dict_id, d.to_vec()).unwrap(),
+                    )
+                    .unwrap();
+                }
+                c.set_source(payload.as_slice());
+                c.set_drain(&mut out);
+                c.compress();
+                out
+            };
+
+        for lvl in [
+            super::CompressionLevel::Level(2),
+            super::CompressionLevel::Level(6),
+            super::CompressionLevel::Level(19),
+        ] {
+            let with_dict = compress(lvl, Some(&r));
+            let no_dict = compress(lvl, None);
+            // The 512-byte dict segment should be matched, saving most of
+            // its length (generous slack for sequence/header coding).
+            assert!(
+                with_dict.len() + 300 < no_dict.len(),
+                "{lvl:?}: dict segment not matched (with_dict={}, no_dict={})",
+                with_dict.len(),
+                no_dict.len(),
+            );
+            // The dict-compressed frame must round-trip through the decoder.
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(
+                    crate::decoding::Dictionary::from_raw_content(dict_id, r.clone()).unwrap(),
+                )
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
+            assert_eq!(decoded, payload, "{lvl:?}: dict round-trip mismatch");
+
+            // A dictionary that does NOT appear in the input must not make
+            // the output larger than the no-dict (raw) encoding: the
+            // post-compress raw fallback covers incompressible-with-dict.
+            let unrelated = lcg(99, 512);
+            let with_bad_dict = compress(lvl, Some(&unrelated));
+            assert!(
+                with_bad_dict.len() <= no_dict.len() + 16,
+                "{lvl:?}: unhelpful dict expanded output (with={}, no_dict={})",
+                with_bad_dict.len(),
+                no_dict.len(),
+            );
+        }
     }
 
     #[test]
