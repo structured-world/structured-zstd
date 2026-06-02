@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780426607410,
+  "lastUpdate": 1780428320073,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -54789,6 +54789,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2668f2c5c6065f30b9d7b2c7689b591b4cfbbe37",
+          "message": "perf(encode): borrow one-shot input as Fast match window (#318)\n\n* refactor(encode): route Fast matcher window reads through accessor\n\nIntroduce a single history_bytes() read accessor for the Fast\nstrategy match window and route the hot-path reads (window_low\nlength, tail-literal slice, last-committed-block peek) through it.\nByte-identical: the accessor returns the owned buffer today, but\nisolating reads behind it lets the window storage switch to a\nborrowed one-shot view without touching every call site.\n\nThe kernel match-slice keeps a direct field projection so the\nsplit borrow against the mutable hash table still type-checks.\n\nPart of #316\n\n* feat(encode): add borrowed one-shot window to Fast matcher\n\nAdd an optional (ptr, len) borrowed window to the Fast matcher: when\nset, window reads view a caller-owned input buffer in place instead of\nthe owned history mirror, so a one-shot compress can skip copying every\nblock into history. A raw pointer is used rather than a borrow because\nthe matcher is a persistent driver field and a lifetime would cascade\nthrough the driver and frame compressor.\n\nThe accessor and the kernel match-slice both honour the borrowed range;\nthe kernel keeps an inlined field-disjoint match so the immutable window\nborrow and the mutable hash-table borrow still type-check. The setter is\nunsafe with a documented liveness contract; reset() drops the window so\na stale pointer never carries into the next frame.\n\nProduction still always selects the owned path (the borrowed window is\nnot wired into the frame compressor yet) so this is behaviourally inert;\ntwo unit tests cover borrowed-vs-owned read equivalence and the reset\nclear.\n\nPart of #316\n\n* docs(encode): note kernel slice inlines window selection\n\nThe history_bytes doc claimed the kernel match-slice routes through the\naccessor, but it inlines the same owned/borrowed selection to keep the\nwindow borrow disjoint from the mutable hash-table borrow. State that\nexplicitly so a later change does not try to funnel the kernel read\nthrough the accessor and reintroduce the borrow conflict.\n\nPart of #316\n\n* refactor(encode): extract Fast kernel dispatch into a free fn\n\nMove the (mls, use_cmov) kernel dispatch, the wire offset-history\nwrapper, and the tail-literal emission out of start_matching into a\nfree run_fast_kernel_block function that takes the window slice and the\ndisjoint hash-table / offset-history borrows as explicit parameters.\n\nThis removes the duplication barrier for a borrowed-window scan path:\na future start_matching_borrowed can reuse the same dispatch instead of\ncopying the ten match arms, and passing the field borrows explicitly\nsidesteps the borrow conflict a &self accessor would create. Pure code\nmovement, byte-identical; existing roundtrip and cross-validation tests\ncover it.\n\nPart of #316\n\n* feat(encode): borrowed-window scan path for Fast matcher\n\nAdd start_matching_borrowed(block_start, block_end): scans a block range\nof the registered borrowed window in place via run_fast_kernel_block,\nwith no history append or eviction. Window math mirrors the owned path\nbut keys off the absolute block end in the borrowed buffer.\n\nAn equivalence test drives the same multi-block input through both the\nowned (commit + scan) and borrowed (scan-in-place) paths and asserts an\nidentical sequence stream plus matching rep / offset_hist state. This\nholds by construction: a one-shot frame's blocks lie back-to-back in the\ninput exactly as the owned history accumulates them, and the path is\ngated so the whole input fits the window (no eviction).\n\nStill test-only / inert in production until the one-shot frame path\nwires it in.\n\nPart of #316\n\n* refactor(encode): drop per-match offset coding from extracted kernel fn\n\nThe Fast kernel dispatch was hoisted into the free fn run_fast_kernel_block\nwhile main independently removed the redundant per-match\nencode_offset_with_history call from the inline dispatch. Re-apply that\nremoval to the extracted location: the Fast backend never reads the\nmatcher's offset_hist (repcode probes run off rep; wire-offset coding is\ndone downstream in encode_raw_sequences_into), so the per-Triple history\nrotation was pure discarded work.\n\nDrop the offset_hist parameter and the wrap_emit closure; emissions now\nforward straight to handle_sequence on both the owned and borrowed\nstart_matching paths.\n\n* fix(encode): always-on bounds + owned-path guard in Fast matcher\n\nTwo safety hardenings on the borrowed-window paths:\n\n- start_matching_borrowed validated block bounds with debug_assert\n  before an unsafe from_raw_parts. debug_assert is compiled out in\n  release builds, so an out-of-range block_end would build a slice\n  past the borrowed allocation (UB). Promote to assert!.\n\n- start_matching is the owned scan path: it appends to self.history and\n  indexes it with block_start, so running it while a borrowed window is\n  registered would index the borrowed buffer with an owned-history\n  offset. Add a fail-fast guard asserting no borrowed window is active\n  and read self.history directly (the borrowed branch was dead on this\n  path; start_matching_borrowed handles the borrowed window).\n\n* perf(encode): borrowed one-shot window for Fast compress\n\nWire the borrowed-window foundation into a production one-shot path so\nthe Fast (Simple) backend references the caller's input in place instead\nof copying every block into the matcher's owned history Vec.\n\ncompress_slice_to_vec now drives compress_oneshot_borrowed: when the\nbackend resolves to Fast, no dictionary is active, and the whole input\nfits the resolved window (no eviction), the input is registered as a\nborrowed window and each block is scanned by range via\nstart_matching_borrowed / skip_matching_borrowed instead of\nget_next_space + commit_space + start_matching. Every other case falls\nback to the owned streaming loop.\n\nTo keep the emit pipeline shared and avoid a parallel copy:\n- FastKernelMatcher: last_committed_space returns the borrowed block\n  range (zero-copy), skip_matching_borrowed records the range and primes\n  hashes on the dict-priming hint via a base-ptr-parameterised\n  prime_hash_table_impl shared with the owned prime path; borrowed APIs\n  un-cfg(test)'d.\n- MatchGeneratorDriver: set_borrowed_block stages a range that routes the\n  next start_matching / skip_matching_with_hint to the borrowed scan.\n- compress() is factored into prepare_frame / run_owned_block_loop /\n  finish_frame so the owned and borrowed paths share identical setup and\n  frame-tail emission; compress_block_encoded_borrowed mirrors the\n  owned block emit reading the block from the borrowed slice.\n\nByte-identical to the owned path by construction: same MAX_BLOCK_SIZE\nboundaries (Fast never pre-splits), same matcher state under no-eviction,\nsame emit. New roundtrip test asserts borrowed == owned frames and exact\nround-trip across Fast levels (incl negative), compressible/random,\nsingle/multi-block, and the oversize fallback. 710 lib tests pass.\n\n* fix(encode): always-on assert for Fast matcher owned-path borrowed guard\n\n- start_matching owned-path guard promoted debug_assert -> assert!: a\n  leftover borrowed window would make the kernel read self.history at\n  hash indices populated against the borrowed window (OOB/UB), so the\n  guard must hold in release too.\n- start_matching_borrowed SAFETY note now cites the always-on assert\n  that validates the slice bounds.\n- history_bytes doc no longer lists tail-literal emission as a caller\n  (it runs inside run_fast_kernel_block against the passed-in slice).\n\n* fix(encode): harden borrowed one-shot path bounds and gating\n\n- compress_oneshot_borrowed excludes CompressionLevel::Uncompressed\n  (it resolves to StrategyTag::Fast but must emit stored Raw blocks the\n  borrowed loop does not produce) and seeds the size hint from input.len()\n  so a stale hint on a reused compressor can't change frame sizing.\n- skip_matching_borrowed now validates block_start <= block_end <=\n  registered window length with an always-on assert before recording the\n  range or priming hashes (the priming path does unsafe pointer reads to\n  block_end - 8; an out-of-range end would be UB in release).\n- set_borrowed_block asserts the Simple backend and start <= end;\n  driver reset clears borrowed_pending so frame-local staging cannot leak.\n- compress_block_encoded_borrowed Level(16..=22) guard promoted to assert!.\n- roundtrip equivalence test adds a non-Fast level (Default).\n\n* perf(encode): extend borrowed one-shot path to over-window inputs\n\nDrop the input-fits-window eligibility gate: the borrowed Fast path now\nhandles inputs larger than the window too. The owned path bounds matches\nto the last advertised_window bytes via window_low and evicts/rehashes\nhistory; the borrowed scan computes the identical window_low = block_end\n- advertised_window and the kernel rejects any hash candidate below it,\nwhile the per-position put during the scan keeps in-window slots current.\nThat makes the borrowed output byte-identical to the owned (evicting)\npath without ever copying the input into history — so over-window\none-shot Fast compresses (the common case for 1 MiB+ payloads at the\n512 KiB-window negative/L1 levels) now also avoid the history copy.\n\nEquivalence test extended with a 3 MiB over-window case (forces eviction\nin the owned path) across all Fast levels; borrowed == owned holds.\n\n* fix(encode): make borrowed one-shot crate-internal and panic-safe\n\n- compress_oneshot_borrowed downgraded pub -> pub(crate): its contract\n  (input must equal the configured source; a source must be set for the\n  owned fallback) is a footgun for external callers. The sole caller,\n  compress_slice_to_vec, passes the same slice to set_source and here.\n- run_borrowed_block_loop now clears the borrowed (ptr, len) via a Drop\n  guard instead of an explicit call, so an unwind from an assert inside\n  the block loop can't leave a dangling window in a reused compressor.\n\n* docs(encode): correct borrowed one-shot over-window wording\n\n- start_matching_borrowed doc no longer claims the caller is gated to\n  fits-window inputs; it now states over-window is supported and how\n  window_low + per-position put keep match decisions identical to the\n  owned evicting path.\n- borrowed_oneshot_matches_owned_and_roundtrips doc lists the 3 MiB\n  over-window case and that equality holds over-window.\n- prime_hash_table_for_range_borrowed expect message now names its own\n  function instead of the copy/pasted skip_matching_borrowed.\n\n* refactor(encode): extract all_blocks seed-cap tier selection to a helper\n\nThe ALL_BLOCKS_* threshold/cap constants and the size-hint tier match were\nduplicated verbatim in run_owned_block_loop and run_borrowed_block_loop.\nHoist them into a module-level initial_all_blocks_cap(initial_size_hint)\nso the tier table lives in one place and can't drift between the owned\nand borrowed paths. No behaviour change.\n\n* fix(encode): gate borrowed one-shot to <=4GiB; force owned baseline in test\n\n- compress_oneshot_borrowed now also requires input.len() <= u32::MAX:\n  the Fast kernel stores absolute positions in a u32 hash table and the\n  borrowed scan walks absolute input offsets up to input.len(), which\n  truncate/overflow past 4 GiB (the owned evicting path keeps positions\n  bounded, so >4 GiB falls back to it). No test: a >4 GiB input is not\n  allocatable in the unit harness.\n- borrowed_oneshot_matches_owned_and_roundtrips drove the owned baseline\n  via compress_to_vec, but that routes through compress_slice_to_vec and\n  takes the SAME borrowed path, making the borrowed==owned assertion\n  vacuous. Force the owned block loop by driving FrameCompressor::compress\n  directly. The assertion still passes (borrowed IS byte-identical to the\n  owned evicting path) — now genuinely validated.\n\n* test(encode): cover empty input in borrowed-vs-owned parity matrix\n\nAdd a (0,0) case so the borrowed-vs-owned byte-identity check exercises\nthe dedicated empty-input branch of the borrowed loop (single empty Raw\nlast block). The existing empty-input roundtrip tests only prove\nvalidity, not byte-identical framing vs the owned path.\n\n* fix(encode): stage borrowed block range visible to get_last_space immediately\n\ncollect_block_parts reads get_last_space().len() before start_matching to\nsize the literal-buffer reservation. set_borrowed_block only set\nborrowed_pending, so on the first borrowed block last_committed_space\nfell back to history_bytes()[0..] = the whole borrowed window, making the\nreservation the full input size instead of one block and undercutting the\npeak-allocation win. set_borrowed_block now also stages last_borrowed_block\non the Simple matcher (via stage_borrowed_block) so get_last_space reports\nthe staged block immediately; start_matching_borrowed/skip_matching_borrowed\nre-record the same range idempotently. Output byte-identical; 711 tests pass.\n\n* fix(encode): validate borrowed window in stage_borrowed_block\n\nstage_borrowed_block stored the staged range without checking that a\nborrowed window is registered or that the range is in bounds, unlike\nits sibling borrowed methods. last_committed_space slices\nhistory_bytes()[start..end] from the staged range, so an unregistered\nwindow or inverted/out-of-range range would panic deep in the emit\npath instead of at the staging call site. Add the same always-on guard\nthe other borrowed methods carry.\n\n* fix(encode): restore owned-path invariants in clear_borrowed_window\n\nclear_borrowed_window dropped the borrowed window pointer but left the\nhash table populated with absolute positions into the now-detached\nborrowed buffer. The docstring promises a return to the owned history\npath, but an owned-path scan would read those stale indices as offsets\ninto self.history (out of bounds once the borrowed buffer is gone).\nEvery frame currently begins with reset (which clears the table), so the\nstale entries are never observed in practice, but restore the invariant\nhere too instead of relying on the caller: clear the table and re-floor\nprefix_start_index at the sentinel-0 baseline, mirroring reset.\n\n* perf(encode): branchless repcode probe in Fast kernel (#322)\n\n* perf(encode): branchless repcode probe in Fast kernel\n\nUse bitwise & instead of short-circuit && for the repcode-at-ip2 check.\nBoth operands are always safe to evaluate (read32(ip2) is in bounds by\nthe loop's ip3<=ilimit invariant, rval is already loaded), so dropping\nthe short-circuit branch on rep_offset1>0 lets the optimizer fold the\ncombined predicate into a branchless compare instead of branching before\nthe candidate load. Output byte-identical (logic unchanged).\n\n* docs(encode): correct read32(ip2) safety justification\n\nThe bound that makes the unconditional read32(ip2) load safe is the\nloop invariant ip2 < ilimit (from ip3 <= ilimit, ip2 < ip3) with\nilimit = iend - 8, giving ip2 + 4 < iend. The earlier note said\nip2 + 4 <= ilimit, which does not generally hold.\n\n* fix(encode): clear match state when registering borrowed window\n\nset_borrowed_window switched the window backing to the caller buffer but\nleft the hash table populated with absolute positions into the previously\nactive window; a start_matching_borrowed scan would read them as indices\ninto the new buffer (out of bounds, memory-unsafe). The caller resets\nfirst today, but make borrowed-window registration self-contained: clear\nthe table and re-floor prefix_start_index, symmetric with the clearing\nclear_borrowed_window already does.\n\n* fix(encode): assert no pending owned block in set_borrowed_window\n\nlast_committed_space checks self.pending before the borrowed range, so a\nstaged owned block left in pending would shadow the borrowed window and\nfeed the emit path the wrong bytes, breaking borrowed/owned equivalence.\nThe one-shot caller resets first, but assert pending.is_none() to make\nthe unsafe mode-switch precondition explicit.",
+          "timestamp": "2026-06-02T19:43:18+03:00",
+          "tree_id": "6bd8a2ac2a8c45bf321ea116168cec781d948b2e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/2668f2c5c6065f30b9d7b2c7689b591b4cfbbe37"
+        },
+        "date": 1780428312049,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.146,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 300.692,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 246.853,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.292,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.416,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.639,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.032,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.534,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.973,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.031,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.432,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.311,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.772,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.675,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.069,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.765,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
             "unit": "ms"
           },
           {
