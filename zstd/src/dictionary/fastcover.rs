@@ -1,11 +1,6 @@
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
-// `std::collections::HashMap` is fine here: the whole `dictionary` module
-// is gated behind the `dict_builder` feature, which itself requires `std`
-// (training reads files / uses the system RNG), so this code never
-// compiles into a no_std build. It also matches the existing
-// `std::collections::HashSet` already used by `coverage_score` below.
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FastCoverParams {
@@ -114,9 +109,9 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     // accumulate in u64 so the arithmetic is exact on 32-bit targets
     // (i686) too, where `usize` would wrap.
     let mut scores = vec![0u64; n];
-    let mut inverted: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
+    let mut inverted: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for (i, seg) in segments.iter().enumerate() {
-        let mut local: HashMap<usize, u32> = HashMap::new();
+        let mut local: BTreeMap<usize, u32> = BTreeMap::new();
         for w in seg.windows(d) {
             *local.entry((hash_dmer(w) as usize) & mask).or_insert(0) += 1;
         }
@@ -190,7 +185,7 @@ fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
     if dict.len() < d || eval.len() < d || d == 0 {
         return 0;
     }
-    let mut seen = std::collections::HashSet::with_capacity(dict.len() / d + 1);
+    let mut seen = BTreeSet::new();
     for i in 0..=(dict.len() - d) {
         seen.insert(hash_dmer(&dict[i..i + d]));
     }
