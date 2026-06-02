@@ -621,7 +621,7 @@ impl FastKernelMatcher {
     /// `_ =>` arm is unreachable because `validate_params` in
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         let block_start = self.extend_history_with_pending();
         // Compute the EFFECTIVE prefix floor for this scan against
         // the ADVERTISED frame window (`1 << window_log`), NOT
@@ -659,188 +659,33 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
 
-        // Split borrow: `history` reads the buffer immutably while the
-        // kernel takes `hash_table` mutably. The two fields don't alias,
-        // so the borrow checker is satisfied via field-by-field
-        // projection (no `&mut self` re-borrow). `offset_hist` is NOT
-        // borrowed here — Fast matching does not mutate it (see below).
-        //
-        // Window selection is inlined here (rather than calling the
-        // `history_bytes` accessor) so the immutable window borrow and
-        // the mutable `hash_table` borrow stay disjoint field
-        // projections — a `&self` accessor call would borrow all of
-        // `self` and collide with `&mut self.hash_table`. `self.borrowed`
-        // is `Copy`, so reading it holds no borrow; the `None` arm
-        // borrows only the `history` field.
+        // Select the window slice here (not via `history_bytes`) so the
+        // immutable window borrow stays a disjoint field projection
+        // alongside the `&mut self.hash_table` borrow handed to
+        // `run_fast_kernel_block`. `self.borrowed` is `Copy`, so reading
+        // it holds no borrow; the `None` arm borrows only the `history`
+        // field.
         let history: &[u8] = match self.borrowed {
             // SAFETY: see `history_bytes` — the (ptr, len) pair upholds
             // the `set_borrowed_window` liveness contract.
             Some((ptr, len)) => unsafe { core::slice::from_raw_parts(ptr, len) },
             None => &self.history,
         };
-        let hash_table = &mut self.hash_table;
-
-        // The kernel emits each match straight to the caller's
-        // `handle_sequence`. It does NOT update `self.offset_hist`: the
-        // Fast backend's kernel drives repcode probes off `self.rep`
-        // (set from the kernel result each block), and the actual
-        // wire-offset repcode coding is done downstream by
-        // `encode_raw_sequences_into` against the encode pipeline's own
-        // offset history. The matcher's `offset_hist` is only seeded by
-        // `prime_offset_history` (which also sets `rep`) and is never
-        // read on the Fast encode path, so per-match
-        // `encode_offset_with_history` here was pure redundant work
-        // (the coded offset it produced was discarded).
-
-        // Dispatch on (mls, use_cmov) — donor's 8 specialised
-        // `ZSTD_GEN_FAST_FN` expansions (we also cover mls=8 for
-        // future use). Each (mls, cmov) pair monomorphises the
-        // kernel hot loop independently.
-        //
-        // The 10 arms are intentionally expanded inline rather
-        // than wrapped in a macro: the kernel signature is short
-        // enough that the duplication doesn't obscure intent, and
-        // an explicit match makes it obvious which monomorphisations
-        // exist. If the kernel ever grows additional const-generic
-        // parameters (e.g. per-level `hash_fill_step`), revisit.
-        let result = match (mls, self.use_cmov) {
-            (4, false) => compress_block_fast::<4, false>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (4, true) => compress_block_fast::<4, true>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (5, false) => compress_block_fast::<5, false>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (5, true) => compress_block_fast::<5, true>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (6, false) => compress_block_fast::<6, false>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (6, true) => compress_block_fast::<6, true>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (7, false) => compress_block_fast::<7, false>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (7, true) => compress_block_fast::<7, true>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (8, false) => compress_block_fast::<8, false>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            (8, true) => compress_block_fast::<8, true>(
-                history,
-                block_start,
-                super::fast_kernel::kernel::PrefixBounds {
-                    prefix_start_index,
-                    window_low,
-                },
-                hash_table,
-                rep_in,
-                self.step_size,
-                &mut handle_sequence,
-            ),
-            _ => unreachable!(
-                "FastHashTable construction rejects mls outside 4..=8 — \
-                 got mls={mls} which means the table was bypassed",
-            ),
-        };
-
+        let rep_out = run_fast_kernel_block(
+            history,
+            block_start,
+            prefix_start_index,
+            window_low,
+            &mut self.hash_table,
+            &mut self.offset_hist,
+            rep_in,
+            self.step_size,
+            mls,
+            self.use_cmov,
+            handle_sequence,
+        );
         // Persist the kernel's rep state for the next block.
-        self.rep = result.rep;
-
-        // Emit terminal literals if the kernel left a tail.
-        if result.tail_literals_len > 0 {
-            let history = self.history_bytes();
-            let tail_start = history.len() - result.tail_literals_len;
-            handle_sequence(Sequence::Literals {
-                literals: &history[tail_start..],
-            });
-        }
+        self.rep = rep_out;
     }
 
     /// Donor's `skipMatching` equivalent: append the pending block to
@@ -990,6 +835,173 @@ impl FastKernelMatcher {
             unsafe { self.hash_table.put(hash, pos as u32) };
         }
     }
+}
+
+/// Run the Fast kernel over `history[..]` for the block starting at
+/// `block_start`, streaming `Triple` emissions (with wire offset-history
+/// updates) to `handle_sequence` and emitting any terminal tail
+/// literals. Returns the kernel's two-deep `rep` state for the caller to
+/// persist.
+///
+/// A free function (not a method) so the owned and borrowed
+/// `start_matching` paths share one copy of the `(mls, use_cmov)`
+/// dispatch: passing the disjoint `&mut` borrows of `hash_table` and
+/// `offset_hist` as explicit parameters sidesteps the `&self`-vs-`&mut
+/// self.hash_table` conflict a `&self` accessor would create, the same
+/// reason the window slice is selected by the caller and handed in.
+#[allow(clippy::too_many_arguments)]
+fn run_fast_kernel_block(
+    history: &[u8],
+    block_start: usize,
+    prefix_start_index: u32,
+    window_low: u32,
+    hash_table: &mut FastHashTable,
+    offset_hist: &mut [u32; 3],
+    rep_in: [u32; 2],
+    step_size: usize,
+    mls: u32,
+    use_cmov: bool,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+) -> [u32; 2] {
+    use super::fast_kernel::kernel::PrefixBounds;
+
+    // Forward Triple emissions to the caller, updating the wire
+    // encoder's 3-deep offset history per match (so dictionary-prime
+    // inspection sees the expected state). `rep` and `offset_hist` track
+    // different state and may diverge on lit_len == 0 emits.
+    let mut wrap_emit = |seq: Sequence<'_>| {
+        if let Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } = seq
+        {
+            let _ = encode_offset_with_history(offset as u32, literals.len() as u32, offset_hist);
+            handle_sequence(Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            });
+        } else {
+            handle_sequence(seq);
+        }
+    };
+
+    let bounds = PrefixBounds {
+        prefix_start_index,
+        window_low,
+    };
+    // Dispatch on (mls, use_cmov) — each pair monomorphises the kernel
+    // hot loop independently. `_` is unreachable: `FastHashTable::new`
+    // rejects mls outside 4..=8 at construction.
+    let result = match (mls, use_cmov) {
+        (4, false) => compress_block_fast::<4, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (4, true) => compress_block_fast::<4, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (5, false) => compress_block_fast::<5, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (5, true) => compress_block_fast::<5, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (6, false) => compress_block_fast::<6, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (6, true) => compress_block_fast::<6, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (7, false) => compress_block_fast::<7, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (7, true) => compress_block_fast::<7, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (8, false) => compress_block_fast::<8, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        (8, true) => compress_block_fast::<8, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut wrap_emit,
+        ),
+        _ => unreachable!(
+            "FastHashTable construction rejects mls outside 4..=8 — \
+             got mls={mls} which means the table was bypassed",
+        ),
+    };
+
+    // Emit terminal literals if the kernel left a tail. `wrap_emit`'s
+    // borrow of `handle_sequence` has ended (no use past the match), so
+    // calling it directly here is allowed.
+    if result.tail_literals_len > 0 {
+        let tail_start = history.len() - result.tail_literals_len;
+        handle_sequence(Sequence::Literals {
+            literals: &history[tail_start..],
+        });
+    }
+
+    result.rep
 }
 
 #[cfg(test)]
