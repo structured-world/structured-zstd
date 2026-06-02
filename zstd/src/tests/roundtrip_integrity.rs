@@ -944,7 +944,19 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         for &(seed, len) in &cases {
             for data in [generate_compressible(seed, len), generate_data(seed, len)] {
                 let borrowed = compress_slice_to_vec(&data, level);
-                let owned = compress_to_vec(data.as_slice(), level);
+                // Force the OWNED block loop for the baseline: drive
+                // FrameCompressor::compress() directly. `compress_to_vec`
+                // would route through compress_slice_to_vec and take the
+                // SAME borrowed path, making the comparison vacuous.
+                let owned = {
+                    let mut out = Vec::new();
+                    let mut fc = FrameCompressor::new(level);
+                    fc.set_source_size_hint(data.len() as u64);
+                    fc.set_source(data.as_slice());
+                    fc.set_drain(&mut out);
+                    fc.compress();
+                    out
+                };
                 assert_eq!(
                     borrowed, owned,
                     "borrowed one-shot frame differs from owned at {level:?} seed={seed} len={len}",

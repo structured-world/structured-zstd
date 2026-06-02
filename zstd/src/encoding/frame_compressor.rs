@@ -631,9 +631,18 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // in-window slots current — so it produces byte-identical output
         // to the owned (evicting) path without ever copying the input
         // into `history`, even when the input far exceeds the window.
+        //
+        // BUT gate on `input.len() <= u32::MAX`: the Fast kernel stores
+        // ABSOLUTE positions in a `u32` hash table, and the borrowed scan
+        // walks absolute input offsets up to `block_end == input.len()`.
+        // Past 4 GiB those offsets truncate / overflow the `u32` position
+        // math (`base_off + ip0 as u32`, `window_low`), panicking or
+        // corrupting. The owned/evicting path keeps the scanned window
+        // bounded (positions stay small), so >4 GiB inputs fall back to it.
         let borrowed_eligible = !prep.use_dictionary_state
             && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-            && self.state.strategy_tag == StrategyTag::Fast;
+            && self.state.strategy_tag == StrategyTag::Fast
+            && input.len() <= u32::MAX as usize;
         let (all_blocks, total_uncompressed) = if borrowed_eligible {
             self.run_borrowed_block_loop(input, prep.initial_size_hint)
         } else {
