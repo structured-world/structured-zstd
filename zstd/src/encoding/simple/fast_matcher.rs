@@ -38,16 +38,19 @@
 //!   unmatchable — small ratio cost, accepted for sentinel safety.
 //! - `history.len()` is bounded by `2 × max_window_size` post-append.
 //!   See [`FastKernelMatcher::extend_history_with_pending`].
-//! - `rep[0..2]` tracks the kernel's two-deep repcode state
-//!   (overwritten from `FastBlockResult.rep` after every
-//!   `start_matching`). `offset_hist[0..3]` tracks the wire
-//!   encoder's three-deep history (rotated per Triple via
-//!   `encode_offset_with_history`). They reflect DIFFERENT state
-//!   and may diverge — e.g. on lit_len == 0 emits the kernel's
-//!   `rep` stays put while `offset_hist` rotates per RFC 8878
-//!   §3.1.2.5. Both halves are self-consistent within their own
-//!   domain (kernel uses `rep` for next-block repcode probes,
-//!   downstream wire encoder uses its own offset_hist).
+//! - `rep[0..2]` is the functional repcode state: the kernel's
+//!   two-deep stack, overwritten from `FastBlockResult.rep` after every
+//!   `start_matching`, and what the NEXT block's kernel probes against.
+//!   `offset_hist[0..3]` is NOT mutated by matching — the Fast backend
+//!   drives repcodes off `rep`, and the wire-offset repcode coding is
+//!   done downstream by `encode_raw_sequences_into` against the encode
+//!   pipeline's OWN offset history, so a per-match
+//!   `encode_offset_with_history` on the matcher would be redundant.
+//!   `offset_hist` is therefore only seeded by `prime_offset_history`
+//!   (which also sets `rep`) and otherwise stays at its `reset` default.
+//!   Do NOT reintroduce per-match `offset_hist` rotation here: it is
+//!   pure overhead on this backend (it was removed because the coded
+//!   offset it produced was discarded).
 
 use alloc::vec::Vec;
 
