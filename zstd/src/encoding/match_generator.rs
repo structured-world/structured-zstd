@@ -1295,8 +1295,14 @@ impl Matcher for MatchGeneratorDriver {
                 // so `evicted = pre + space_len - post`.
                 let pre = m.window_size;
                 let space_len = space.len();
-                m.add_data(space, |mut data| {
-                    data.resize(data.capacity(), 0);
+                m.add_data(space, |data| {
+                    // Same per-block recycle as the HashChain arm: push
+                    // the spent input buffer back as-is rather than
+                    // zero-filling to capacity. `add_data` mirrors the
+                    // bytes into `history` and calls this every block, so
+                    // capacity-wide zeroing would be hot-path waste;
+                    // `get_next_space` zeroes at most `slice_size` bytes
+                    // when it later reuses the buffer.
                     vec_pool.push(data);
                 });
                 evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
@@ -1317,8 +1323,16 @@ impl Matcher for MatchGeneratorDriver {
                 // `evicted = pre + space_len - post`.
                 let pre = m.table.window_size;
                 let space_len = space.len();
-                m.table.add_data(space, |mut data| {
-                    data.resize(data.capacity(), 0);
+                m.table.add_data(space, |data| {
+                    // Recycle the spent input buffer to the pool as-is.
+                    // `add_data` runs this callback for every committed
+                    // block (the bytes are mirrored into `history`), so
+                    // growing the buffer to its full capacity here would
+                    // zero the whole allocation on the hot path.
+                    // `get_next_space` resizes a popped buffer to
+                    // `slice_size` on demand, touching at most
+                    // `slice_size` bytes — never the larger capacity the
+                    // pool retains.
                     vec_pool.push(data);
                 });
                 evicted_bytes += pre
