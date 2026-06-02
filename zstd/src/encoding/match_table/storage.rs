@@ -645,9 +645,9 @@ impl MatchTable {
     /// `Vec::fill(HC_EMPTY)`) if they're already sized; otherwise
     /// they're left empty so the next `ensure_tables()` call resizes
     /// them. The window is now just `chunk_lens` (the bytes live in
-    /// `history`, cleared above), so there are no per-block buffers to
-    /// drain; `_reuse_space` is retained only for caller signature
-    /// compatibility and is intentionally unused.
+    /// `history`, which this method clears below), so there are no
+    /// per-block buffers to drain; `_reuse_space` is retained only for
+    /// caller signature compatibility and is intentionally unused.
     pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
         self.chunk_lens.clear();
