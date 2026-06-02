@@ -712,7 +712,8 @@ mod hc_tests {
         t.chain_log = 8;
         t.hash3_log = 0;
         t.ensure_tables();
-        t.window.push_back(buf.to_vec());
+        // `history` is set directly above; record one live chunk.
+        t.chunk_lens.push_back(buf.len());
         t
     }
 
@@ -841,7 +842,7 @@ mod hc_tests {
         t.chain_log = 8;
         t.hash3_log = 0;
         t.ensure_tables();
-        t.window.push_back(t.history.clone());
+        t.chunk_lens.push_back(t.history.len());
         t.insert_positions(0, 24);
 
         let hc = HcMatcher::new(2, 16, 64);
@@ -945,7 +946,7 @@ mod hc_tests {
         t.chain_log = 8;
         t.hash3_log = 0;
         t.ensure_tables();
-        t.window.push_back(t.history.clone());
+        t.chunk_lens.push_back(t.history.len());
 
         // The probe is at abs_pos 27 (start of the fourth
         // "abcdefgh" chunk). Hand-wire the chain so the walker

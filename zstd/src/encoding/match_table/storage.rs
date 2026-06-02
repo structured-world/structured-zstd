@@ -199,7 +199,12 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 /// lives in the matcher modules.
 pub(crate) struct MatchTable {
     pub(crate) max_window_size: usize,
-    pub(crate) window: VecDeque<Vec<u8>>,
+    /// Per-chunk lengths of the live window, in add order. The bytes
+    /// themselves live only in `history` (the contiguous mirror); this
+    /// deque tracks chunk boundaries for eviction and locates the
+    /// current block (the back chunk) as a tail slice of `history`,
+    /// so the live region is never duplicated.
+    pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
@@ -238,7 +243,7 @@ impl MatchTable {
     pub(crate) fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
-            window: VecDeque::new(),
+            chunk_lens: VecDeque::new(),
             window_size: 0,
             history: Vec::new(),
             history_start: 0,
@@ -463,40 +468,43 @@ impl MatchTable {
         };
     }
 
-    /// Append a freshly committed buffer to the rolling window. Evicts
-    /// the oldest slices until the new total fits inside
-    /// `max_window_size`, hands them back through `reuse_space` for
-    /// pool reuse, then extends the contiguous `history` mirror.
-    ///
-    /// History duplicates window data for O(1) contiguous access during
-    /// match finding (`common_prefix_len`, `extend_backwards`). Peak:
-    /// ~2x window size for data buffers + 6 MB tables.
+    /// Append a freshly committed buffer to the rolling window. Drops
+    /// chunk-length entries for the oldest slices until the new total
+    /// fits inside `max_window_size`, extends the contiguous `history`
+    /// mirror with the new bytes, then hands the *input* buffer back
+    /// through `reuse_space` for pool reuse — `history` now owns the
+    /// bytes, so the input buffer carries no live data. (Callers must
+    /// therefore treat the callback as recycle-only, not as an eviction
+    /// report; eviction bytes come from the `window_size` delta.)
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
         while self.window_size + data.len() > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         self.compact_history();
+        let added = data.len();
         self.history.extend_from_slice(&data);
         self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
-        self.window_size += data.len();
-        self.window.push_back(data);
+        self.window_size += added;
+        self.chunk_lens.push_back(added);
+        // The input buffer's bytes now live in `history`; hand the buffer
+        // straight back to the caller's pool instead of holding a second
+        // copy in the window (the source of the per-compress duplicate).
+        reuse_space(data);
     }
 
     /// Drop window slices that have rolled past `max_window_size`.
     /// Used after `max_window_size` shrinks (dictionary release path).
-    pub(crate) fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
     }
 
@@ -531,7 +539,19 @@ impl MatchTable {
     /// the most recent buffer in the rolling window — panics if no
     /// data has been committed yet.
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        self.window.back().unwrap().as_slice()
+        let last = *self.chunk_lens.back().unwrap();
+        &self.history[self.history.len() - last..]
+    }
+
+    /// Test-only: append a chunk to the live window without eviction /
+    /// compaction, mirroring the storage side of [`add_data`]. Replaces
+    /// the old `window.push_back(vec)` setup now that chunk bytes live
+    /// only in `history`.
+    #[cfg(test)]
+    pub(crate) fn push_test_chunk(&mut self, data: Vec<u8>) {
+        self.history.extend_from_slice(&data);
+        self.window_size += data.len();
+        self.chunk_lens.push_back(data.len());
     }
 
     /// Convert an absolute position into the (relative_pos + 1) form
@@ -624,10 +644,13 @@ impl MatchTable {
     /// hash3 tables themselves are zeroed in place (via
     /// `Vec::fill(HC_EMPTY)`) if they're already sized; otherwise
     /// they're left empty so the next `ensure_tables()` call resizes
-    /// them. Window buffers are drained through `reuse_space` so the
-    /// driver can recycle them across frames.
-    pub(crate) fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    /// them. The window is now just `chunk_lens` (the bytes live in
+    /// `history`, which this method clears below), so there are no
+    /// per-block buffers to drain; `_reuse_space` is retained only for
+    /// caller signature compatibility and is intentionally unused.
+    pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
+        self.chunk_lens.clear();
         self.history.clear();
         self.history_start = 0;
         self.history_abs_start = 0;
@@ -647,10 +670,6 @@ impl MatchTable {
         self.hash_table.fill(HC_EMPTY);
         self.hash3_table.fill(HC_EMPTY);
         self.chain_table.fill(HC_EMPTY);
-        for mut data in self.window.drain(..) {
-            data.resize(data.capacity(), 0);
-            reuse_space(data);
-        }
     }
 
     /// Donor parity: `ZSTD_compressBlock_btopt_generic` starts its main
@@ -1326,7 +1345,7 @@ impl MatchTable {
     /// `incompressible_hint`). BT and HC modes branch via `uses_bt`.
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
@@ -1515,7 +1534,10 @@ impl MatchTable {
         plan: &[HcOptimalSequence],
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        let current = self.window.back().unwrap().as_slice();
+        // Direct field borrow of `history` (not `get_last_space()`, which
+        // borrows all of `self`) so the per-sequence `&mut self.offset_hist`
+        // write below stays a disjoint-field borrow.
+        let current = &self.history[self.history.len() - current_len..];
         if plan.is_empty() {
             handle_sequence(Sequence::Literals { literals: current });
             return;
@@ -1572,7 +1594,8 @@ mod storage_tests {
 
     fn new_table(window: usize) -> MatchTable {
         let mut t = MatchTable::new(window);
-        t.window_size = window;
+        // window_size is driven by `push_test_chunk` (= sum of live chunk
+        // lengths), so it is not preset here.
         t.hash_log = 8;
         t.chain_log = 8;
         t.hash3_log = 0;
@@ -1599,7 +1622,7 @@ mod storage_tests {
     #[test]
     fn skip_matching_bt_incompressible_routes_through_sparse_block() {
         let mut t = new_table(32);
-        t.window.push_back(vec![0u8; 32]);
+        t.push_test_chunk(vec![0u8; 32]);
         t.ensure_tables();
         t.uses_bt = true;
         t.is_btultra2 = false;
@@ -1616,7 +1639,7 @@ mod storage_tests {
     #[test]
     fn skip_matching_bt_dense_routes_through_bt_update_tree() {
         let mut t = new_table(32);
-        t.window.push_back(vec![1u8; 32]);
+        t.push_test_chunk(vec![1u8; 32]);
         t.ensure_tables();
         t.uses_bt = true;
         t.is_btultra2 = false;
@@ -1689,7 +1712,8 @@ mod storage_tests {
         t.history_start = 0;
         t.history_abs_start = 0;
         t.window_size = t.history.len();
-        t.window.push_back(t.history.clone());
+        // `history` is set directly above; just record it as one live chunk.
+        t.chunk_lens.push_back(t.history.len());
         t.hash_log = 8;
         t.chain_log = 8;
         // btultra2-style: HC3 side table allocated.
@@ -1719,7 +1743,7 @@ mod storage_tests {
     fn insert_positions_with_step_zero_step_is_noop() {
         let mut t = new_table(32);
         t.history = vec![0u8; 32];
-        t.window.push_back(vec![0u8; 32]);
+        t.push_test_chunk(vec![0u8; 32]);
         t.ensure_tables();
         let next_to_update3_before = t.next_to_update3;
         // step=0 must early-return without touching anything.
@@ -1735,7 +1759,7 @@ mod storage_tests {
         // guard breaks out of the loop after one insert.
         let mut t = new_table(32);
         t.history = vec![1u8; 32];
-        t.window.push_back(vec![1u8; 32]);
+        t.push_test_chunk(vec![1u8; 32]);
         t.ensure_tables();
         t.insert_positions_with_step(0, 16, usize::MAX);
         // Exactly one position should have been inserted before the
@@ -1787,7 +1811,7 @@ mod storage_tests {
     #[test]
     fn emit_optimal_plan_empty_plan_emits_full_literals() {
         let mut t = new_table(8);
-        t.window.push_back(b"abcdefgh".to_vec());
+        t.push_test_chunk(b"abcdefgh".to_vec());
         let mut emitted: Vec<u8> = Vec::new();
         t.emit_optimal_plan(8, &[], &mut |seq| {
             if let Sequence::Literals { literals } = seq {
@@ -1800,7 +1824,7 @@ mod storage_tests {
     #[test]
     fn emit_optimal_plan_skips_oversized_plan_item_and_emits_trailing_literals() {
         let mut t = new_table(8);
-        t.window.push_back(b"abcdefgh".to_vec());
+        t.push_test_chunk(b"abcdefgh".to_vec());
         // Plan item asks for `start + match_len > current_len` → skip.
         // The function must still emit the trailing literals at the end.
         let plan = [HcOptimalSequence {
