@@ -932,6 +932,9 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         CompressionLevel::Level(1),
         CompressionLevel::Level(2),
         CompressionLevel::Level(-6),
+        // Non-Fast: pins the owned-fallback branch that
+        // compress_oneshot_borrowed takes for every non-Fast caller.
+        CompressionLevel::Default,
     ] {
         for &(seed, len) in &cases {
             for data in [generate_compressible(seed, len), generate_data(seed, len)] {

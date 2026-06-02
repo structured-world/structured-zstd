@@ -731,6 +731,15 @@ impl MatchGeneratorDriver {
     /// block. See [`Matcher::start_matching`] /
     /// [`Matcher::skip_matching_with_hint`] on this type.
     pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        assert_eq!(
+            self.active_backend(),
+            super::strategy::BackendTag::Simple,
+            "borrowed block staging is only valid for the Simple (Fast) backend",
+        );
+        assert!(
+            block_start <= block_end,
+            "borrowed block range must satisfy start <= end (start={block_start} end={block_end})",
+        );
         self.borrowed_pending = Some((block_start, block_end));
     }
 
@@ -923,6 +932,9 @@ impl Matcher for MatchGeneratorDriver {
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
+        // Drop any frame-local borrowed staging so it can't leak across a
+        // reset and misroute the next start/skip into borrowed dispatch.
+        self.borrowed_pending = None;
         if self.active_backend() != next_backend {
             // Drain the outgoing backend's allocations into the shared
             // pool. The `match &mut self.storage { ... }` block runs to

@@ -577,8 +577,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// so the caller must `set_source(input)` before calling this.
     pub fn compress_oneshot_borrowed(&mut self, input: &[u8]) {
         use crate::encoding::strategy::StrategyTag;
+        // Derive frame sizing from the actual payload, not whatever hint a
+        // previous call on a reused compressor left behind — a stale hint
+        // would change the resolved window/header and could even flip
+        // `borrowed_eligible` for this slice.
+        self.source_size_hint = Some(input.len() as u64);
         let prep = self.prepare_frame();
+        // `Uncompressed` resolves to `StrategyTag::Fast` but must emit
+        // stored Raw blocks, which the borrowed loop's
+        // `compress_block_encoded_borrowed` (RLE/raw-fast/compressed)
+        // does NOT do — exclude it so it takes the owned path's dedicated
+        // Uncompressed arm.
         let borrowed_eligible = !prep.use_dictionary_state
+            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
             && self.state.strategy_tag == StrategyTag::Fast
             && (input.len() as u64) <= prep.window_size;
         let (all_blocks, total_uncompressed) = if borrowed_eligible {

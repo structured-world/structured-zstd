@@ -208,7 +208,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         output.extend_from_slice(block);
         BlockType::Raw
     } else {
-        debug_assert!(
+        assert!(
             !matches!(compression_level, CompressionLevel::Level(16..=22)),
             "borrowed one-shot path is gated to Fast levels; post-split is unreachable",
         );

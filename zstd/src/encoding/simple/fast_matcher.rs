@@ -841,6 +841,19 @@ impl FastKernelMatcher {
         block_end: usize,
         incompressible_hint: Option<bool>,
     ) {
+        let (_ptr, total_len) = self
+            .borrowed
+            .expect("skip_matching_borrowed requires a registered borrowed window");
+        // Always-on (not debug_assert): the recorded range is later sliced
+        // by `last_committed_space` for the emit path, and the priming
+        // path below does unsafe pointer reads up to `block_end - 8`. An
+        // out-of-range `block_end` would be immediate UB even in release,
+        // so validate it before storing the range or touching the table —
+        // mirrors `start_matching_borrowed`.
+        assert!(
+            block_start <= block_end && block_end <= total_len,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
+        );
         self.last_borrowed_block = Some((block_start, block_end));
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range_borrowed(block_start, block_end);
