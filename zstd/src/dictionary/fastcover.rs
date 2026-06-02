@@ -81,7 +81,16 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     let mut active = build_frequency_table(sample, d, params.f, params.accel);
     let mask = active.len().saturating_sub(1);
 
-    let segments: Vec<&[u8]> = sample.chunks(k).filter(|seg| seg.len() >= d).collect();
+    // Segment indices are stored as `u32` in the inverted index, so cap
+    // the segment count at `u32::MAX` to keep the `i as u32` cast lossless.
+    // A corpus large enough to hit this (> u32::MAX segments, multiple TB)
+    // is far outside dictionary-training territory; the `take` is a no-op
+    // for any realistic input and only drops the unreachable tail otherwise.
+    let segments: Vec<&[u8]> = sample
+        .chunks(k)
+        .filter(|seg| seg.len() >= d)
+        .take(u32::MAX as usize)
+        .collect();
     let n = segments.len();
     let mut out = Vec::with_capacity(dict_size);
     if n == 0 {
