@@ -726,9 +726,13 @@ impl FastKernelMatcher {
     ///
     /// Produces a byte-identical sequence stream to the owned path: a
     /// one-shot frame's blocks lie back-to-back in the input buffer
-    /// exactly as the owned `history` accumulates them, and the one-shot
-    /// caller is gated so the whole input fits the window (no eviction),
-    /// so absolute positions and hash-table state evolve identically.
+    /// exactly as the owned `history` accumulates them. Over-window inputs
+    /// are supported: matches are bounded by `window_low = block_end -
+    /// advertised_window` (the same bound the owned evicting path applies),
+    /// and the per-position `put` during the scan keeps in-window hash
+    /// slots current — so an out-of-window stale slot is rejected exactly
+    /// where the owned rehash would have left the slot empty, giving
+    /// identical match decisions with or without eviction.
     pub(crate) fn start_matching_borrowed(
         &mut self,
         block_start: usize,
@@ -877,7 +881,7 @@ impl FastKernelMatcher {
         }
         let (base, _len) = self
             .borrowed
-            .expect("skip_matching_borrowed requires a registered borrowed window");
+            .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
         match self.hash_table.mls() {
             4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
             5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),

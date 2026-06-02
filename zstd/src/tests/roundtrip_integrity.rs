@@ -914,10 +914,12 @@ fn all_levels_tiny_input_with_hint() {
 
 /// The borrowed one-shot path (`compress_slice_to_vec`) must produce a
 /// frame byte-identical to the owned streaming path (`compress_to_vec`)
-/// for Fast-backend levels whose input fits the window, and round-trip
-/// exactly. Covers compressible and random inputs across one and
-/// multiple blocks. Non-eligible cases fall back to the owned loop, so
-/// the equality holds there too.
+/// for Fast-backend levels and round-trip exactly. Covers compressible
+/// and random inputs across one, multiple, and over-window (3 MiB, forces
+/// eviction in the owned path) block counts — the borrowed path bounds
+/// matches with `window_low` exactly as the owned evicting path, so the
+/// equality holds over-window too. Non-Fast levels fall back to the owned
+/// loop, so the equality holds there as well.
 #[test]
 fn borrowed_oneshot_matches_owned_and_roundtrips() {
     let cases: [(u64, usize); 6] = [
