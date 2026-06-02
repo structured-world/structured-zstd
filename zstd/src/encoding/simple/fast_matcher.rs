@@ -426,6 +426,16 @@ impl FastKernelMatcher {
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
+        // Any hash-table entries left from a prior window are absolute
+        // positions into THAT buffer; once we switch the window backing
+        // to `buffer`, a `start_matching_borrowed` scan would read them
+        // as indices into the new buffer — out of bounds / memory-unsafe.
+        // Today the caller (`compress_oneshot_borrowed`) always resets
+        // first, but make the borrowed-window registration self-contained:
+        // clear the table and re-floor `prefix_start_index` so the window
+        // starts from a clean match state regardless of prior history.
+        self.hash_table.clear();
+        self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
     /// Clear a borrowed window set by [`Self::set_borrowed_window`],
