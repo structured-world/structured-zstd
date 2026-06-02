@@ -8,8 +8,9 @@ use crate::blocks::sequence_section::{
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
-use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
+use crate::decoding::sequence_execution::do_offset_history;
 use crate::fse::SeqFSEDecoder;
+#[cfg(test)]
 use alloc::vec::Vec;
 
 // 8-slot software pipeline mirroring donor
@@ -105,7 +106,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
     #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
     use crate::cpu_kernel::NeonKernel;
@@ -126,7 +126,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                 buffer,
                 offset_hist,
                 literals_buffer,
-                rle_fallback_sequences,
             )
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
@@ -143,7 +142,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                 buffer,
                 offset_hist,
                 literals_buffer,
-                rle_fallback_sequences,
             )
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
@@ -162,7 +160,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
-                    rle_fallback_sequences,
                 )
             }
         }
@@ -177,7 +174,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
-                    rle_fallback_sequences,
                 )
             }
         }
@@ -193,7 +189,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
-                    rle_fallback_sequences,
                 )
             }
         }
@@ -205,7 +200,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             buffer,
             offset_hist,
             literals_buffer,
-            rle_fallback_sequences,
         ),
         #[cfg(all(
             target_arch = "aarch64",
@@ -219,7 +213,6 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             buffer,
             offset_hist,
             literals_buffer,
-            rle_fallback_sequences,
         ),
     }
 }
@@ -245,17 +238,10 @@ pub(crate) fn decode_and_execute_sequences_impl<
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
-    // Reset the fallback sequences vec on entry. The non-RLE fast path
-    // never writes to it, so without this clear it would carry whatever
-    // entries the previous block left behind — a stale-data hazard for
-    // any external caller that inspects scratch.sequences after decode.
-    rle_fallback_sequences.clear();
-
     // Consume the one-shot `ddict_is_cold` flag at function entry,
-    // BEFORE any early returns (RLE-mode fallback below, padding-bit
-    // validation). Donor `ZSTD_decompressBlock_internal` clears
+    // BEFORE any early returns (padding-bit validation).
+    // Donor `ZSTD_decompressBlock_internal` clears
     // `dctx->ddictIsCold = 0` unconditionally after the
     // sequence-section dispatch decision; if the early-return paths
     // left the flag set, a later block's gate would mis-apply the
@@ -285,23 +271,9 @@ pub(crate) fn decode_and_execute_sequences_impl<
         return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
     }
 
-    // RLE-mode blocks: fall back to the legacy two-pass pipeline. These
-    // are uncommon in real-world corpora; fusing them too would double
-    // the source maintenance for zero observed wins.
-    if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
-        // `execute_sequences_fields` routes literal-pushes through
-        // `DecodeBuffer::try_push` (and match-repeats through
-        // `BufferBackend::try_reserve` inside `repeat_inner`), so a
-        // malformed RLE-driven sequence stream whose literal or match
-        // length overshoots a fixed-capacity backend (UserSliceBackend)
-        // surfaces as `ExecuteSequencesError::OutputBufferOverflow`
-        // rather than panicking via UserSliceBackend::extend's
-        // release-mode `assert!`.
-        execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
-        return Ok(());
-    }
-
+    // RLE-mode axes are handled uniformly: `maybe_update_fse_tables`
+    // builds a degenerate single-state table for them, so the fused
+    // decode below reads every axis the same way (no separate fallback).
     let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
     let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
     let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
@@ -1238,116 +1210,6 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     }
 }
 
-pub(crate) fn decode_sequences_with_rle<K: crate::cpu_kernel::CpuKernel>(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_, K>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = SeqFSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = SeqFSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = SeqFSEDecoder::new(&scratch.offsets);
-
-    if scratch.ll_rle.is_none() {
-        ll_dec.init_state(br)?;
-    }
-    if scratch.of_rle.is_none() {
-        of_dec.init_state(br)?;
-    }
-    if scratch.ml_rle.is_none() {
-        ml_dec.init_state(br)?;
-    }
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    // Only non-RLE decoders need state updates; compute their combined worst-case.
-    let max_update_bits = if scratch.ll_rle.is_none() {
-        scratch.literal_lengths.accuracy_log
-    } else {
-        0
-    } + if scratch.ml_rle.is_none() {
-        scratch.match_lengths.accuracy_log
-    } else {
-        0
-    } + if scratch.of_rle.is_none() {
-        scratch.offsets.accuracy_log
-    } else {
-        0
-    };
-    debug_assert!(
-        max_update_bits <= 56,
-        "sequence section update bits exceed 56-bit budget"
-    );
-
-    for _seq_idx in 0..section.num_sequences {
-        // RLE-mode tables don't carry an enriched FSE state — fall
-        // back to `lookup_ll_code` / `lookup_ml_code` on the RLE byte
-        // for LL / ML, and the closed-form `(1 << code, code)` shape
-        // for OF. FSE-mode tables read base / extra-bits directly
-        // off the active state's enriched `SeqSymbol`. `SeqSymbol`
-        // has no `symbol` byte; OF code is recoverable from
-        // `num_additional_bits` (== code for code < 32) but the hot
-        // path uses `base_value` / `num_additional_bits` directly.
-        let (ll_value, ll_num_bits) = if let Some(ll_rle) = scratch.ll_rle {
-            lookup_ll_code(ll_rle)
-        } else {
-            (ll_dec.state.base_value, ll_dec.state.num_additional_bits)
-        };
-        let (ml_value, ml_num_bits) = if let Some(ml_rle) = scratch.ml_rle {
-            lookup_ml_code(ml_rle)
-        } else {
-            (ml_dec.state.base_value, ml_dec.state.num_additional_bits)
-        };
-        let (of_value, of_num_bits) = if let Some(of_rle) = scratch.of_rle {
-            (1u32 << of_rle, of_rle)
-        } else {
-            (of_dec.state.base_value, of_dec.state.num_additional_bits)
-        };
-
-        debug_assert!(of_num_bits <= MAX_OFFSET_CODE);
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_num_bits, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + of_value;
-
-        debug_assert_ne!(offset, 0);
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            // One refill check for all non-RLE state updates (batched fast path).
-            if max_update_bits > 0 {
-                br.ensure_bits(max_update_bits);
-            }
-            if scratch.ll_rle.is_none() {
-                ll_dec.update_state_fast(br);
-            }
-            if scratch.ml_rle.is_none() {
-                ml_dec.update_state_fast(br);
-            }
-            if scratch.of_rle.is_none() {
-                of_dec.update_state_fast(br);
-            }
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 /// Packed (baseline, extra_bits) pairs for literal-length codes.
 /// Donor parity: `LL_base` + `LL_bits` from the zstd reference
 /// (`zstd_compress_internal.h`). Per Zstandard format §3.1.1.3.2.1.1.1,
@@ -1412,55 +1274,6 @@ const fn pack_code_meta<const N: usize>(bases: &[u32; N], extra_bits: &[u8; N]) 
     out
 }
 
-/// Unpack the (baseline, extra_bits) tuple from a packed [`LL_META`] /
-/// [`ML_META`] entry. Inlined so the shift+mask collapses to ALU ops
-/// with no cross-function call overhead on the hot path.
-#[inline(always)]
-const fn unpack_code_meta(meta: u32) -> (u32, u8) {
-    (meta & 0x00FF_FFFF, (meta >> 24) as u8)
-}
-
-/// Look up the provided state value from a literal length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-#[inline(always)]
-fn lookup_ll_code(code: u8) -> (u32, u8) {
-    // The FSE LL table is constructed with `max_symbol =
-    // MAX_LITERAL_LENGTH_CODE` (35); `build_decoding_table` returns
-    // `FSETableError::TooManySymbols` if `read_probabilities` produces
-    // more entries than that, and the RLE byte path is range-checked
-    // in `maybe_update_fse_tables`. So a `code` reaching this lookup
-    // is invariant 0..=35. Keep the `debug_assert` as a tripwire in
-    // case a future caller forgets one of those validations; drop the
-    // release-mode `assert!` so the hot path takes a single
-    // `get_unchecked` instead of a bounds-checked indexed load.
-    let idx = code as usize;
-    debug_assert!(
-        idx < LL_META.len(),
-        "Illegal literal length code was: {code}"
-    );
-    // SAFETY: idx < LL_META.len() == 36 per the FSE table
-    // construction invariant documented above.
-    unpack_code_meta(unsafe { *LL_META.get_unchecked(idx) })
-}
-
-/// Look up the provided state value from a match length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-#[inline(always)]
-fn lookup_ml_code(code: u8) -> (u32, u8) {
-    // Same invariant as `lookup_ll_code`: the ML FSE table is built
-    // with `max_symbol = MAX_MATCH_LENGTH_CODE` (52) and the RLE byte
-    // is range-checked, so `code` reaching this lookup is 0..=52.
-    let idx = code as usize;
-    debug_assert!(idx < ML_META.len(), "Illegal match length code was: {code}");
-    // SAFETY: idx < ML_META.len() == 53 per the FSE table
-    // construction invariant.
-    unpack_code_meta(unsafe { *ML_META.get_unchecked(idx) })
-}
-
 // This info is buried in the symbol compression mode table
 /// "The maximum allowed accuracy log for literals length and match length tables is 9"
 pub const LL_MAX_LOG: u8 = 9;
@@ -1520,7 +1333,6 @@ pub(crate) fn maybe_update_fse_tables(
 
             vprintln!("Updating ll table");
             vprintln!("Used bytes: {}", bytes);
-            scratch.ll_rle = None;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ll table");
@@ -1538,7 +1350,6 @@ pub(crate) fn maybe_update_fse_tables(
             scratch
                 .literal_lengths
                 .enrich_with_packed_seq_meta(&LL_META);
-            scratch.ll_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
@@ -1557,7 +1368,6 @@ pub(crate) fn maybe_update_fse_tables(
                     .literal_lengths
                     .enrich_with_packed_seq_meta(&LL_META);
             }
-            scratch.ll_rle = None;
         }
         ModeType::Repeat => {
             vprintln!("Repeat ll table");
@@ -1574,7 +1384,6 @@ pub(crate) fn maybe_update_fse_tables(
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
-            scratch.of_rle = None;
             scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
         }
         ModeType::RLE => {
@@ -1594,7 +1403,6 @@ pub(crate) fn maybe_update_fse_tables(
             scratch.offsets.build_rle(of_source[0]);
             scratch.offsets.enrich_for_offsets();
             scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
-            scratch.of_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
@@ -1613,7 +1421,6 @@ pub(crate) fn maybe_update_fse_tables(
                 scratch.offsets.enrich_for_offsets();
                 scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
             }
-            scratch.of_rle = None;
         }
         ModeType::Repeat => {
             vprintln!("Repeat of table");
@@ -1630,7 +1437,6 @@ pub(crate) fn maybe_update_fse_tables(
             bytes_read += bytes;
             vprintln!("Updating ml table");
             vprintln!("Used bytes: {}", bytes);
-            scratch.ml_rle = None;
         }
         ModeType::RLE => {
             vprintln!("Use RLE ml table");
@@ -1646,7 +1452,6 @@ pub(crate) fn maybe_update_fse_tables(
             }
             scratch.match_lengths.build_rle(ml_source[0]);
             scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
-            scratch.ml_rle = None;
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
@@ -1663,7 +1468,6 @@ pub(crate) fn maybe_update_fse_tables(
                 )?;
                 scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
             }
-            scratch.ml_rle = None;
         }
         ModeType::Repeat => {
             vprintln!("Repeat ml table");

@@ -11,17 +11,15 @@ use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
-    ADVANCE, ADVANCE_MASK, ExecSeq, compute_use_long_pipeline, decode_sequences_with_rle,
-    maybe_update_fse_tables,
+    ADVANCE, ADVANCE_MASK, ExecSeq, compute_use_long_pipeline, maybe_update_fse_tables,
 };
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader};
 use crate::common::MAX_BLOCK_SIZE;
 use crate::cpu_kernel::Vbmi2Kernel;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
-use crate::decoding::sequence_execution::{do_offset_history, execute_sequences_fields};
+use crate::decoding::sequence_execution::do_offset_history;
 use crate::fse::SeqFSEDecoder;
-use alloc::vec::Vec;
 
 macro_rules! decode_one_body {
     ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr) => {{
@@ -162,10 +160,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<B: BufferBackend>(
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
-    rle_fallback_sequences: &mut Vec<Sequence>,
 ) -> Result<(), DecompressBlockError> {
-    rle_fallback_sequences.clear();
-
     let ddict_is_cold = fse.ddict_is_cold;
     fse.ddict_is_cold = false;
 
@@ -183,12 +178,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<B: BufferBackend>(
     }
     if skipped_bits > 8 {
         return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
-    }
-
-    if fse.ll_rle.is_some() || fse.ml_rle.is_some() || fse.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, fse, rle_fallback_sequences)?;
-        execute_sequences_fields(buffer, literals_buffer, offset_hist, rle_fallback_sequences)?;
-        return Ok(());
     }
 
     let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
