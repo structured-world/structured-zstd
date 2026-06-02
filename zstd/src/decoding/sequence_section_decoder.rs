@@ -1529,7 +1529,10 @@ pub(crate) fn maybe_update_fse_tables(
             }
             bytes_read += 1;
             if source[0] > MAX_LITERAL_LENGTH_CODE {
-                return Err(DecodeSequenceError::MissingByteForRleMlTable);
+                return Err(DecodeSequenceError::InvalidRleCode {
+                    axis: "LL",
+                    code: source[0],
+                });
             }
             scratch.literal_lengths.build_rle(source[0]);
             scratch
@@ -1581,7 +1584,10 @@ pub(crate) fn maybe_update_fse_tables(
             }
             bytes_read += 1;
             if of_source[0] > MAX_OFFSET_CODE {
-                return Err(DecodeSequenceError::MissingByteForRleMlTable);
+                return Err(DecodeSequenceError::InvalidRleCode {
+                    axis: "OF",
+                    code: of_source[0],
+                });
             }
             // Build a degenerate 1-state table so the fused decode path
             // handles this axis uniformly (no separate RLE fallback).
@@ -1633,7 +1639,10 @@ pub(crate) fn maybe_update_fse_tables(
             }
             bytes_read += 1;
             if ml_source[0] > MAX_MATCH_LENGTH_CODE {
-                return Err(DecodeSequenceError::MissingByteForRleMlTable);
+                return Err(DecodeSequenceError::InvalidRleCode {
+                    axis: "ML",
+                    code: ml_source[0],
+                });
             }
             scratch.match_lengths.build_rle(ml_source[0]);
             scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
