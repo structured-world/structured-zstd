@@ -385,8 +385,10 @@ impl FastKernelMatcher {
     ///
     /// Single read accessor for the window storage so the storage
     /// representation (owned buffer or borrowed one-shot view) is
-    /// resolved in one place. The `window_low` length math, the
-    /// tail-literal slice, and the last-committed-block peek call this.
+    /// resolved in one place. The owned `window_low` length math and the
+    /// last-committed-block peek (`last_committed_space`) call this.
+    /// Tail-literal emission is NOT a caller — it happens inside
+    /// `run_fast_kernel_block` against the `history` slice handed to it.
     /// The kernel match-slice in `start_matching` does NOT call this — it
     /// inlines the identical owned/borrowed selection so the immutable
     /// window borrow stays a disjoint field projection alongside the
@@ -643,10 +645,14 @@ impl FastKernelMatcher {
         // `extend_history_with_pending` appends into `self.history` and
         // `block_start` indexes that owned buffer, so matching against a
         // borrowed window here would index it with an owned-history
-        // offset (wrong indexing, potential OOB in the kernel). The
-        // borrowed window is scanned by `start_matching_borrowed`
-        // instead. Fail fast if the contract is violated.
-        debug_assert!(
+        // offset, and the kernel would read `self.history` at hash-table
+        // indices that were populated against the (possibly larger)
+        // borrowed window — out-of-bounds / UB. Always-on (not
+        // debug_assert): the guard must hold in release / `cargo test
+        // --release` too, since the failure mode is memory-unsafe, not
+        // merely wrong output. The borrowed window is scanned by
+        // `start_matching_borrowed` instead.
+        assert!(
             self.borrowed.is_none(),
             "start_matching is the owned path; clear the borrowed window first (use start_matching_borrowed)",
         );
@@ -750,7 +756,7 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
         // SAFETY: `block_end <= total_len` (the registered buffer length)
-        // by the caller contract + debug_assert, so the slice stays
+        // by the caller contract + the always-on `assert!` above, so the slice stays
         // within the borrowed allocation; `set_borrowed_window`'s
         // liveness contract guarantees the buffer is still live. `ptr` is
         // copied out of the `Copy` `borrowed` field, so `history` is not
