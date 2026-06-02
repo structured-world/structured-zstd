@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.28](https://github.com/structured-world/structured-zstd/compare/v0.0.27...v0.0.28) - 2026-06-02
+
+### Added
+
+- *(decode)* kernel_* cargo features for per-tier CPU kernel selection ([#307](https://github.com/structured-world/structured-zstd/pull/307))
+
+### Performance
+
+- *(encode)* borrow one-shot input as Fast match window ([#318](https://github.com/structured-world/structured-zstd/pull/318))
+- *(encode)* raw-pointer reads in Fast kernel backward extension ([#321](https://github.com/structured-world/structured-zstd/pull/321))
+- *(decode)* route RLE-mode sequence tables through the fused path ([#320](https://github.com/structured-world/structured-zstd/pull/320))
+- *(encode)* drop redundant per-match offset coding in Fast matcher ([#319](https://github.com/structured-world/structured-zstd/pull/319))
+- *(encode)* dedup window<->history live-region storage ([#317](https://github.com/structured-world/structured-zstd/pull/317))
+- *(encode)* map level 19 to btultra2 + align bench labels to clevels.h ([#315](https://github.com/structured-world/structured-zstd/pull/315))
+- *(encode)* skip decoder-table build when loading a dict for encoding ([#314](https://github.com/structured-world/structured-zstd/pull/314))
+- *(decode)* route bulk non-overlapping copies through memcpy (ERMS) ([#309](https://github.com/structured-world/structured-zstd/pull/309))
+- *(encode)* vectorize the Row match-finder tag scan ([#305](https://github.com/structured-world/structured-zstd/pull/305))
+- *(encode)* lower row-matcher min match to 5 (donor parity) ([#310](https://github.com/structured-world/structured-zstd/pull/310))
+- *(encode)* align levels 13-15 to reference search budget ([#302](https://github.com/structured-world/structured-zstd/pull/302))
+- *(decode)* unify SIMD-copy capability detection under the CpuKernel tag ([#304](https://github.com/structured-world/structured-zstd/pull/304))
+
+### Bench
+
+- *(dict)* report Rust dict-compressed size + emit compress-dict ratio ([#301](https://github.com/structured-world/structured-zstd/pull/301))
+
 ## [0.0.27](https://github.com/structured-world/structured-zstd/compare/v0.0.26...v0.0.27) - 2026-05-31
 
 ### Performance
