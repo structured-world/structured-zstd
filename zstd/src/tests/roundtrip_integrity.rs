@@ -922,7 +922,12 @@ fn all_levels_tiny_input_with_hint() {
 /// loop, so the equality holds there as well.
 #[test]
 fn borrowed_oneshot_matches_owned_and_roundtrips() {
-    let cases: [(u64, usize); 6] = [
+    let cases: [(u64, usize); 7] = [
+        // Empty input: exercises the dedicated empty-input branch of the
+        // borrowed loop (single empty Raw last block) — the existing
+        // empty roundtrip checks prove validity, not byte-identical
+        // framing vs the owned path.
+        (0, 0),
         (1, 200_000),
         (7, 293_000),
         (42, 50_000),
