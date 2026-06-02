@@ -207,6 +207,22 @@ pub(crate) struct FastKernelMatcher {
     /// to its `vec_pool` — avoiding a fresh allocation per block on
     /// the hot path.
     recycled_space: Option<Vec<u8>>,
+    /// One-shot borrowed match window: `(ptr, len)` into a caller-owned
+    /// input buffer that holds the entire frame. When `Some`, all window
+    /// *reads* ([`Self::history_bytes`] and the kernel match-slice) view
+    /// this range instead of the owned `history` buffer, so the matcher
+    /// never copies the input into `history`. `None` selects the owned
+    /// streaming path (the default; the borrowed path is opt-in via
+    /// [`Self::set_borrowed_window`]).
+    ///
+    /// A raw pointer (not a borrow) is required because this matcher is
+    /// a persistent field of the driver / frame compressor; a borrowed
+    /// lifetime would tie those structs to the input buffer. SAFETY
+    /// contract (enforced by the caller, see `set_borrowed_window`): the
+    /// pointed-to buffer must stay live and unmodified for as long as
+    /// the window is set, and the window must be cleared before the
+    /// buffer is dropped or the matcher is reused for another frame.
+    borrowed: Option<(*const u8, usize)>,
 }
 
 impl FastKernelMatcher {
@@ -292,6 +308,7 @@ impl FastKernelMatcher {
             use_cmov: window_log < 19,
             step_size,
             pending: None,
+            borrowed: None,
         }
     }
 
@@ -337,6 +354,9 @@ impl FastKernelMatcher {
         self.pending = None;
         self.last_block_start = HISTORY_DRAIN_BASE;
         self.recycled_space = None;
+        // Drop any borrowed window: the next frame's input buffer is a
+        // different allocation, so a stale (ptr, len) would dangle.
+        self.borrowed = None;
     }
 
     /// Reported decoder-side window size (bytes) — test-only.
@@ -362,7 +382,41 @@ impl FastKernelMatcher {
     /// drain, rehash) keep accessing the backing buffer directly.
     #[inline(always)]
     fn history_bytes(&self) -> &[u8] {
-        &self.history
+        match self.borrowed {
+            // SAFETY: the (ptr, len) pair was registered via
+            // `set_borrowed_window`, whose contract guarantees the
+            // buffer stays live and unmodified until the window is
+            // cleared (and the window is cleared on `reset` / before the
+            // buffer drops). `len` is the exact length passed in, so the
+            // reconstructed slice never exceeds the original allocation.
+            Some((ptr, len)) => unsafe { core::slice::from_raw_parts(ptr, len) },
+            None => &self.history,
+        }
+    }
+
+    /// Point the match window at a caller-owned input buffer instead of
+    /// the owned `history` mirror, so the matcher reads the input in
+    /// place without copying it block-by-block.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that `buffer` stays live and is not
+    /// moved or mutated for as long as the window is set, and that the
+    /// window is cleared (via [`Self::clear_borrowed_window`] or
+    /// [`Self::reset`]) before `buffer` is dropped or the matcher is
+    /// reused for a different frame. The owned-buffer mutation paths
+    /// (`accept_data`, `extend_history_with_pending`, drain, prime) must
+    /// not run while a borrowed window is active.
+    #[cfg(test)]
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        self.borrowed = Some((buffer.as_ptr(), buffer.len()));
+    }
+
+    /// Clear a borrowed window set by [`Self::set_borrowed_window`],
+    /// returning the matcher to the owned `history` path.
+    #[cfg(test)]
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.borrowed = None;
     }
 
     /// Read-only view of the most recently committed block — donor /
@@ -606,7 +660,20 @@ impl FastKernelMatcher {
         // so the borrow checker is satisfied via field-by-field
         // projection (no `&mut self` re-borrow). `offset_hist` is NOT
         // borrowed here — Fast matching does not mutate it (see below).
-        let history: &[u8] = &self.history;
+        //
+        // Window selection is inlined here (rather than calling the
+        // `history_bytes` accessor) so the immutable window borrow and
+        // the mutable `hash_table` borrow stay disjoint field
+        // projections — a `&self` accessor call would borrow all of
+        // `self` and collide with `&mut self.hash_table`. `self.borrowed`
+        // is `Copy`, so reading it holds no borrow; the `None` arm
+        // borrows only the `history` field.
+        let history: &[u8] = match self.borrowed {
+            // SAFETY: see `history_bytes` — the (ptr, len) pair upholds
+            // the `set_borrowed_window` liveness contract.
+            Some((ptr, len)) => unsafe { core::slice::from_raw_parts(ptr, len) },
+            None => &self.history,
+        };
         let hash_table = &mut self.hash_table;
 
         // The kernel emits each match straight to the caller's
@@ -944,6 +1011,45 @@ mod tests {
         // with a real match.
         assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
         assert!(m.pending.is_none());
+    }
+
+    #[test]
+    fn borrowed_window_reads_match_owned_then_restores() {
+        let mut m = FastKernelMatcher::new();
+        // Owned path: history_bytes mirrors the owned buffer.
+        m.history = b"owned-history-bytes".to_vec();
+        assert_eq!(m.history_bytes(), b"owned-history-bytes");
+
+        // Borrowed path: history_bytes views the caller's buffer, not
+        // the owned one, and the owned buffer is left untouched.
+        let external = b"a-different-borrowed-window".to_vec();
+        // SAFETY: `external` outlives every history_bytes() call below
+        // and is cleared before it drops at end of scope.
+        unsafe { m.set_borrowed_window(&external) };
+        assert_eq!(m.history_bytes(), &external[..]);
+        assert_eq!(m.history, b"owned-history-bytes");
+
+        // Clearing returns to the owned path with the original bytes.
+        m.clear_borrowed_window();
+        assert_eq!(m.history_bytes(), b"owned-history-bytes");
+    }
+
+    #[test]
+    fn reset_clears_borrowed_window() {
+        let mut m = FastKernelMatcher::new();
+        let external = b"borrowed".to_vec();
+        // SAFETY: `external` outlives the reset call below.
+        unsafe { m.set_borrowed_window(&external) };
+        m.reset(
+            FAST_LEVEL_1_WINDOW_LOG,
+            FAST_LEVEL_1_HASH_LOG,
+            FAST_LEVEL_1_MLS,
+            2,
+        );
+        // After reset the borrowed window is dropped — back to the
+        // (now empty) owned buffer, never the dangling external range.
+        assert!(m.borrowed.is_none());
+        assert_eq!(m.history_bytes().len(), HISTORY_DRAIN_BASE);
     }
 
     #[test]
