@@ -575,9 +575,13 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// byte-identical output without ever copying the input. Non-Fast /
     /// dictionary / `Uncompressed` cases fall back to the owned loop.
     ///
-    /// The owned fallback reads from the source set via [`Self::set_source`],
-    /// so the caller must `set_source(input)` before calling this.
-    pub fn compress_oneshot_borrowed(&mut self, input: &[u8]) {
+    /// Crate-internal: the only caller is [`crate::encoding::compress_slice_to_vec`],
+    /// which passes the SAME slice to both [`Self::set_source`] (for the
+    /// owned fallback) and this method. Not `pub` because the contract —
+    /// `input` must equal the configured source, and a source must be set
+    /// for the fallback — is a footgun for external callers who could pass
+    /// a mismatched slice and silently compress the wrong data.
+    pub(crate) fn compress_oneshot_borrowed(&mut self, input: &[u8]) {
         use crate::encoding::strategy::StrategyTag;
         // Derive frame sizing from the actual payload, not whatever hint a
         // previous call on a reused compressor left behind — a stale hint
@@ -652,12 +656,28 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             return (all_blocks, total_uncompressed);
         }
         // SAFETY: `input` outlives this call (held by the caller across
-        // the call) and is not mutated; the borrowed window is cleared
-        // before return. Only the Simple backend is active (gated by
-        // `compress_oneshot_borrowed`).
+        // the call) and is not mutated. Only the Simple backend is active
+        // (gated by `compress_oneshot_borrowed`).
         unsafe {
             self.state.matcher.set_borrowed_window(input);
         }
+        // Panic-safety: clear the borrowed `(ptr, len)` on EVERY exit,
+        // including an unwind from an `assert!` inside the block loop, so
+        // a caught-and-reused compressor never retains a dangling window.
+        // (The next frame's `reset()` also clears it before any read, but
+        // this guard makes the invariant local and unwind-proof.)
+        struct ClearBorrowedOnDrop(*mut MatchGeneratorDriver);
+        impl Drop for ClearBorrowedOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: at drop (normal return or unwind) the loop's
+                // borrows of the matcher have ended, so this is the only
+                // access. `addr_of_mut!` produced this pointer without an
+                // intermediate `&mut`, so the interleaved `&mut` uses in
+                // the loop did not invalidate it.
+                unsafe { (*self.0).clear_borrowed_window() };
+            }
+        }
+        let _clear_guard = ClearBorrowedOnDrop(core::ptr::addr_of_mut!(self.state.matcher));
         let block_capacity = MAX_BLOCK_SIZE as usize;
         let mut start = 0usize;
         while start < input.len() {
@@ -679,7 +699,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             );
             start = end;
         }
-        self.state.matcher.clear_borrowed_window();
+        // `_clear_guard` drops here, clearing the borrowed window.
         (all_blocks, total_uncompressed)
     }
 }
