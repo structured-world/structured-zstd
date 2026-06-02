@@ -1,3 +1,4 @@
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -64,18 +65,6 @@ fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u
     table
 }
 
-fn score_segment(segment: &[u8], d: usize, mask: usize, table: &[u32]) -> usize {
-    if segment.len() < d || d == 0 {
-        return 0;
-    }
-    let mut score = 0usize;
-    for i in 0..=(segment.len() - d) {
-        let slot = (hash_dmer(&segment[i..i + d]) as usize) & mask;
-        score += table[slot] as usize;
-    }
-    score
-}
-
 fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
     if sample.is_empty() || dict_size == 0 {
         return Vec::new();
@@ -84,26 +73,109 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     let params = normalize_fastcover_params(params);
     let k = params.k;
     let d = params.d;
-    let table = build_frequency_table(sample, d, params.f, params.accel);
-    let mask = table.len().saturating_sub(1);
+    let mut active = build_frequency_table(sample, d, params.f, params.accel);
+    let mask = active.len().saturating_sub(1);
 
-    let mut segments: Vec<(usize, &[u8])> = sample
+    // Segment indices are stored as `u32` in the inverted index, so cap
+    // the segment count at `u32::MAX` to keep the `i as u32` cast lossless.
+    // A corpus large enough to hit this (> u32::MAX segments, multiple TB)
+    // is far outside dictionary-training territory; the `take` is a no-op
+    // for any realistic input and only drops the unreachable tail otherwise.
+    let segments: Vec<&[u8]> = sample
         .chunks(k)
         .filter(|seg| seg.len() >= d)
-        .map(|seg| (score_segment(seg, d, mask, &table), seg))
+        .take(u32::MAX as usize)
         .collect();
-    segments.sort_by_key(|segment| core::cmp::Reverse(segment.0));
-
+    let n = segments.len();
     let mut out = Vec::with_capacity(dict_size);
-    for (_, seg) in segments {
-        if out.len() >= dict_size {
-            break;
+    if n == 0 {
+        return out;
+    }
+
+    // Greedy set-cover selection. The plain top-frequency selection picks
+    // several high-frequency segments that cover the SAME d-mers (redundant
+    // coverage), wasting the dictionary budget. Greedy instead picks, each
+    // round, the segment whose STILL-UNCOVERED d-mers score highest, then
+    // marks those d-mers covered so later rounds value only NEW coverage —
+    // diverse coverage in fewer bytes.
+    //
+    // To keep this affordable at any corpus size (no per-size special-
+    // casing), scores are cached and updated incrementally: an inverted
+    // index `slot -> [(segment, count)]` lets "covering" a chosen segment's
+    // d-mers decrement the score of every other segment containing them in
+    // O(shared occurrences), instead of re-scoring all segments each round.
+    // Scores accumulate `count * frequency` products. Both factors are
+    // u32, so the product can reach ~2^64 and a running sum exceeds it —
+    // accumulate in u64 so the arithmetic is exact on 32-bit targets
+    // (i686) too, where `usize` would wrap.
+    let mut scores = vec![0u64; n];
+    let mut inverted: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let mut local: BTreeMap<usize, u32> = BTreeMap::new();
+        for w in seg.windows(d) {
+            *local.entry((hash_dmer(w) as usize) & mask).or_insert(0) += 1;
         }
-        let remaining = dict_size - out.len();
-        if seg.len() <= remaining {
-            out.extend_from_slice(seg);
-        } else {
-            out.extend_from_slice(&seg[..remaining]);
+        for (slot, cnt) in local {
+            scores[i] += u64::from(cnt) * u64::from(active[slot]);
+            inverted.entry(slot).or_default().push((i as u32, cnt));
+        }
+    }
+
+    let mut used = vec![false; n];
+    while out.len() < dict_size {
+        let mut best: Option<(u64, usize)> = None; // (score, index)
+        for (i, &score) in scores.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            if best.is_none_or(|(bs, _)| score > bs) {
+                best = Some((score, i));
+            }
+        }
+        // No remaining segment covers any still-active d-mer — every
+        // distinct pattern is already represented, so adding more (now
+        // redundant) segments would only waste budget. Stop early; the
+        // dict may be < dict_size (a compact dict, like the reference's).
+        let Some((_, idx)) = best.filter(|&(s, _)| s > 0) else {
+            break;
+        };
+        used[idx] = true;
+        let seg = segments[idx];
+        let take = seg.len().min(dict_size - out.len());
+        out.extend_from_slice(&seg[..take]);
+        // Cover the d-mers of the bytes we ACTUALLY appended (`seg[..take]`,
+        // not the full segment): zero their remaining frequency and decrement
+        // the cached score of every segment that shared them. The d-mers are
+        // recomputed here (runs once per selected segment, far cheaper than
+        // keeping a per-segment slot list resident for the whole corpus). A
+        // d-mer that recurs within this segment is already zeroed on its
+        // first occurrence, so the `freq == 0` guard makes the repeat a
+        // no-op (correct dedup).
+        for w in seg[..take].windows(d) {
+            let slot = (hash_dmer(w) as usize) & mask;
+            let freq = active[slot];
+            if freq == 0 {
+                continue;
+            }
+            active[slot] = 0;
+            // Each segment's initial score added `count(slot) * freq` for
+            // this exact `slot` (with `freq` = the build-time frequency,
+            // unchanged until this single zeroing), so subtracting it now is
+            // exact and can never underflow — plain subtraction (no
+            // saturating mask, no overflow: u32*u32 fits u64). The
+            // debug_assert documents the invariant; a violation is a
+            // bookkeeping bug, surfaced loudly rather than silently clamped.
+            let contribution = u64::from(freq);
+            if let Some(list) = inverted.get(&slot) {
+                for &(j, cnt) in list {
+                    let delta = u64::from(cnt) * contribution;
+                    debug_assert!(
+                        scores[j as usize] >= delta,
+                        "fastcover score underflow: bookkeeping invariant violated",
+                    );
+                    scores[j as usize] -= delta;
+                }
+            }
         }
     }
     out
@@ -113,7 +185,7 @@ fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
     if dict.len() < d || eval.len() < d || d == 0 {
         return 0;
     }
-    let mut seen = std::collections::HashSet::with_capacity(dict.len() / d + 1);
+    let mut seen = BTreeSet::new();
     for i in 0..=(dict.len() - d) {
         seen.insert(hash_dmer(&dict[i..i + d]));
     }
