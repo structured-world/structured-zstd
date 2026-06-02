@@ -286,9 +286,12 @@ pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> 
     let mut vec = Vec::with_capacity(cap);
     let mut frame_enc = FrameCompressor::new(level);
     frame_enc.set_source_size_hint(source.len() as u64);
+    // `set_source` feeds the owned-streaming fallback inside
+    // `compress_oneshot_borrowed`; the eligible borrowed path reads the
+    // `source` slice in place instead (no per-block history copy).
     frame_enc.set_source(source);
     frame_enc.set_drain(&mut vec);
-    frame_enc.compress();
+    frame_enc.compress_oneshot_borrowed(source);
     vec
 }
 

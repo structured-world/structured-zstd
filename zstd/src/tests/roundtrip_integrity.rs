@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
+use crate::encoding::{CompressionLevel, FrameCompressor, compress_slice_to_vec, compress_to_vec};
 use crate::io::Read;
 
 /// Generate deterministic pseudo-random data using a simple LCG.
@@ -909,5 +909,71 @@ fn all_levels_tiny_input_with_hint() {
             data, result,
             "Tiny input with hint failed for Level({level})"
         );
+    }
+}
+
+/// The borrowed one-shot path (`compress_slice_to_vec`) must produce a
+/// frame byte-identical to the owned streaming path (`compress_to_vec`)
+/// for Fast-backend levels and round-trip exactly. Covers compressible
+/// and random inputs across one, multiple, and over-window (3 MiB, forces
+/// eviction in the owned path) block counts — the borrowed path bounds
+/// matches with `window_low` exactly as the owned evicting path, so the
+/// equality holds over-window too. Non-Fast levels fall back to the owned
+/// loop, so the equality holds there as well.
+#[test]
+fn borrowed_oneshot_matches_owned_and_roundtrips() {
+    let cases: [(u64, usize); 7] = [
+        // Empty input: exercises the dedicated empty-input branch of the
+        // borrowed loop (single empty Raw last block) — the existing
+        // empty roundtrip checks prove validity, not byte-identical
+        // framing vs the owned path.
+        (0, 0),
+        (1, 200_000),
+        (7, 293_000),
+        (42, 50_000),
+        (3, 4096),
+        (5, 700_000),
+        // Over-window for every Fast level (max ~1 MiB window): forces
+        // eviction in the owned path; the borrowed path must still match.
+        (9, 3_000_000),
+    ];
+    for level in [
+        CompressionLevel::Fastest,
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(2),
+        CompressionLevel::Level(-6),
+        // Non-Fast: pins the owned-fallback branch that
+        // compress_oneshot_borrowed takes for every non-Fast caller.
+        CompressionLevel::Default,
+    ] {
+        for &(seed, len) in &cases {
+            for data in [generate_compressible(seed, len), generate_data(seed, len)] {
+                let borrowed = compress_slice_to_vec(&data, level);
+                // Force the OWNED block loop for the baseline: drive
+                // FrameCompressor::compress() directly. `compress_to_vec`
+                // would route through compress_slice_to_vec and take the
+                // SAME borrowed path, making the comparison vacuous.
+                let owned = {
+                    let mut out = Vec::new();
+                    let mut fc = FrameCompressor::new(level);
+                    fc.set_source_size_hint(data.len() as u64);
+                    fc.set_source(data.as_slice());
+                    fc.set_drain(&mut out);
+                    fc.compress();
+                    out
+                };
+                assert_eq!(
+                    borrowed, owned,
+                    "borrowed one-shot frame differs from owned at {level:?} seed={seed} len={len}",
+                );
+                let mut decoder = StreamingDecoder::new(borrowed.as_slice()).unwrap();
+                let mut result = Vec::new();
+                decoder.read_to_end(&mut result).unwrap();
+                assert_eq!(
+                    result, data,
+                    "borrowed one-shot roundtrip mismatch at {level:?}"
+                );
+            }
+        }
     }
 }

@@ -568,6 +568,13 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
+    // One-shot borrowed block range `[start, end)` staged by the borrowed
+    // Fast frame path (`set_borrowed_block`) for the NEXT
+    // `start_matching` / `skip_matching_with_hint`. `Some` routes that
+    // call to the Simple backend's borrowed scan instead of the owned
+    // committed-block path; consumed (reset to `None`) by the routed
+    // call. Always `None` on the owned streaming path.
+    borrowed_pending: Option<(usize, usize)>,
 }
 
 impl MatchGeneratorDriver {
@@ -644,6 +651,7 @@ impl MatchGeneratorDriver {
             reported_window_size: next_pow2,
             dictionary_retained_budget: 0,
             source_size_hint: None,
+            borrowed_pending: None,
         }
     }
 
@@ -692,6 +700,54 @@ impl MatchGeneratorDriver {
             // is meant to deliver.
             self.vec_pool.push(space);
         }
+    }
+
+    /// Register a caller-owned input buffer as the Simple backend's
+    /// borrowed one-shot match window. Only valid on the Simple (Fast)
+    /// backend; the one-shot frame path gates on that before calling.
+    ///
+    /// # Safety
+    /// Same contract as [`FastKernelMatcher::set_borrowed_window`]: the
+    /// buffer must stay live and unmodified until the window is cleared,
+    /// and must be cleared before the buffer is dropped or the matcher is
+    /// reused for another frame.
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        // SAFETY: forwarded contract — caller upholds liveness/clear.
+        unsafe { self.simple_mut().set_borrowed_window(buffer) };
+    }
+
+    /// Clear the borrowed one-shot window, returning the Simple backend
+    /// to the owned `history` path.
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.simple_mut().clear_borrowed_window();
+        self.borrowed_pending = None;
+    }
+
+    /// Stage the borrowed block range `[block_start, block_end)` for the
+    /// NEXT `start_matching` / `skip_matching_with_hint`, which the
+    /// borrowed Fast frame path uses in place of `commit_space`. While
+    /// staged, those trait calls route to the Simple backend's borrowed
+    /// scan/skip (consuming the stage) instead of the owned committed
+    /// block. See [`Matcher::start_matching`] /
+    /// [`Matcher::skip_matching_with_hint`] on this type.
+    pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        assert_eq!(
+            self.active_backend(),
+            super::strategy::BackendTag::Simple,
+            "borrowed block staging is only valid for the Simple (Fast) backend",
+        );
+        assert!(
+            block_start <= block_end,
+            "borrowed block range must satisfy start <= end (start={block_start} end={block_end})",
+        );
+        self.borrowed_pending = Some((block_start, block_end));
+        // Make the range visible to `get_last_space()` immediately: the
+        // emit pipeline reads `get_last_space().len()` in
+        // `collect_block_parts` BEFORE `start_matching` consumes the
+        // stage, so the staged block (not the whole borrowed window) must
+        // be reported now to keep the literal-buffer reservation right.
+        self.simple_mut()
+            .stage_borrowed_block(block_start, block_end);
     }
 
     #[cfg(test)]
@@ -883,6 +939,9 @@ impl Matcher for MatchGeneratorDriver {
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
+        // Drop any frame-local borrowed staging so it can't leak across a
+        // reset and misroute the next start/skip into borrowed dispatch.
+        self.borrowed_pending = None;
         if self.active_backend() != next_backend {
             // Drain the outgoing backend's allocations into the shared
             // pool. The `match &mut self.storage { ... }` block runs to
@@ -1356,6 +1415,16 @@ impl Matcher for MatchGeneratorDriver {
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         use super::strategy::{self, StrategyTag};
+        // Borrowed one-shot Fast path: if the frame driver staged a
+        // block range via `set_borrowed_block`, scan it in place against
+        // the borrowed window instead of the owned committed block. Only
+        // the Simple backend is instrumented (the gate guarantees it),
+        // and the stage is consumed so the next block re-stages.
+        if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            self.simple_mut()
+                .start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+            return;
+        }
         // 7-arm match over the compile-time strategy tag fires once
         // per block and hands off to a monomorphised
         // `compress_block::<S>` that the optimiser specialises per
@@ -1382,6 +1451,15 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
+        // Borrowed one-shot Fast path: a staged block range routes to the
+        // borrowed skip (records the range for `get_last_space`, primes
+        // hashes on the dict-priming hint) with no owned-history append
+        // and nothing to recycle. Stage is consumed.
+        if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            self.simple_mut()
+                .skip_matching_borrowed(block_start, block_end, incompressible_hint);
+            return;
+        }
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 self.simple_mut()
