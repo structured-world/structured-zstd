@@ -95,7 +95,11 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     // index `slot -> [(segment, count)]` lets "covering" a chosen segment's
     // d-mers decrement the score of every other segment containing them in
     // O(shared occurrences), instead of re-scoring all segments each round.
-    let mut scores = vec![0usize; n];
+    // Scores accumulate `count * frequency` products. Both factors are
+    // u32, so the product can reach ~2^64 and a running sum exceeds it —
+    // accumulate in u64 so the arithmetic is exact on 32-bit targets
+    // (i686) too, where `usize` would wrap.
+    let mut scores = vec![0u64; n];
     let mut inverted: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
     for (i, seg) in segments.iter().enumerate() {
         let mut local: HashMap<usize, u32> = HashMap::new();
@@ -103,14 +107,14 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
             *local.entry((hash_dmer(w) as usize) & mask).or_insert(0) += 1;
         }
         for (slot, cnt) in local {
-            scores[i] += cnt as usize * active[slot] as usize;
+            scores[i] += u64::from(cnt) * u64::from(active[slot]);
             inverted.entry(slot).or_default().push((i as u32, cnt));
         }
     }
 
     let mut used = vec![false; n];
     while out.len() < dict_size {
-        let mut best: Option<(usize, usize)> = None; // (score, index)
+        let mut best: Option<(u64, usize)> = None; // (score, index)
         for (i, &score) in scores.iter().enumerate() {
             if used[i] {
                 continue;
@@ -130,24 +134,37 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         let seg = segments[idx];
         let take = seg.len().min(dict_size - out.len());
         out.extend_from_slice(&seg[..take]);
-        // Cover this segment's d-mers: zero their remaining frequency and
-        // decrement the cached score of every segment that shared them.
-        // The chosen segment's d-mers are recomputed here (this runs only
-        // once per selected segment, far cheaper than keeping a per-segment
-        // slot list resident for the whole corpus). A d-mer that recurs
-        // within this segment is already zeroed on its first occurrence, so
-        // the `freq == 0` guard makes the repeat a no-op (correct dedup).
-        for w in seg.windows(d) {
+        // Cover the d-mers of the bytes we ACTUALLY appended (`seg[..take]`,
+        // not the full segment): zero their remaining frequency and decrement
+        // the cached score of every segment that shared them. The d-mers are
+        // recomputed here (runs once per selected segment, far cheaper than
+        // keeping a per-segment slot list resident for the whole corpus). A
+        // d-mer that recurs within this segment is already zeroed on its
+        // first occurrence, so the `freq == 0` guard makes the repeat a
+        // no-op (correct dedup).
+        for w in seg[..take].windows(d) {
             let slot = (hash_dmer(w) as usize) & mask;
             let freq = active[slot];
             if freq == 0 {
                 continue;
             }
             active[slot] = 0;
+            // Each segment's initial score added `count(slot) * freq` for
+            // this exact `slot` (with `freq` = the build-time frequency,
+            // unchanged until this single zeroing), so subtracting it now is
+            // exact and can never underflow — plain subtraction (no
+            // saturating mask, no overflow: u32*u32 fits u64). The
+            // debug_assert documents the invariant; a violation is a
+            // bookkeeping bug, surfaced loudly rather than silently clamped.
+            let contribution = u64::from(freq);
             if let Some(list) = inverted.get(&slot) {
                 for &(j, cnt) in list {
-                    scores[j as usize] =
-                        scores[j as usize].saturating_sub(cnt as usize * freq as usize);
+                    let delta = u64::from(cnt) * contribution;
+                    debug_assert!(
+                        scores[j as usize] >= delta,
+                        "fastcover score underflow: bookkeeping invariant violated",
+                    );
+                    scores[j as usize] -= delta;
                 }
             }
         }
