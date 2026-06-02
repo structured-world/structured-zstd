@@ -384,14 +384,23 @@ fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
     // sequences all sharing one code per axis → RLE-mode sequence tables
     // with MULTI-sequence blocks (exercises update_state transitions on
     // the 1-state table, unlike the single-match inputs above).
-    let mut periodic: Vec<u8> = Vec::with_capacity(16 * 5000);
-    for i in 0..5000u32 {
+    // 9000 units * 16 B = 144 KiB → spans more than one 128 KiB block,
+    // every block RLE-mode.
+    let mut periodic: Vec<u8> = Vec::with_capacity(16 * 9000);
+    for i in 0..9000u32 {
         periodic.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         periodic.push((i & 0xFF) as u8);
     }
+    // RLE blocks followed by FSE blocks in ONE frame: the scratch FSE
+    // tables are reused across blocks, so a stale RLE-table field leaking
+    // into the next FSE-mode block's build is caught here (regression for
+    // the max_symbol-clobber bug).
+    let mut mixed: Vec<u8> = periodic.clone();
+    mixed.extend_from_slice(include_bytes!("../decodecorpus_files/z000033"));
 
     let inputs: Vec<Vec<u8>> = vec![
-        periodic,           // periodic units → multi-sequence RLE tables
+        periodic.clone(),   // periodic units → multi-sequence RLE tables
+        mixed,              // RLE blocks → FSE blocks in one frame
         vec![0x5Au8; 4096], // all-same byte → single long match → RLE axes
         vec![0u8; 70_000],  // multi-block uniform
         period4,            // period-4 repeat

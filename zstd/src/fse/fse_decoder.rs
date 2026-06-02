@@ -806,7 +806,12 @@ impl FSETableImpl<SeqSymbol> {
     /// (init reads 0 state bits, every `update_state` keeps state 0).
     pub(crate) fn build_rle(&mut self, symbol: u8) {
         self.reset();
-        self.max_symbol = symbol;
+        // NB: do NOT shrink `max_symbol` to `symbol` — the scratch table
+        // is reused across blocks, and a later FSE-mode block's
+        // `build_decoder` validates its symbol count against `max_symbol`.
+        // Setting it to the single RLE symbol would reject any subsequent
+        // table with more symbols (`TooManySymbols`). `reset` leaves
+        // `max_symbol` at the axis maximum, which is correct here.
         // Spread buffer drives the enrich pass (symbol per slot); one slot.
         self.symbol_spread_buffer.push(symbol);
         self.decode.push(SeqSymbol {
