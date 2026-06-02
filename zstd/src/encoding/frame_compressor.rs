@@ -1060,7 +1060,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     // A primed dictionary makes "incompressible-looking"
                     // blocks matchable against the dict, so the raw-fast-
                     // path inside must be bypassed (it skips matching).
-                    let dict_active = self.dictionary.is_some();
+                    // Mirror prepare_frame's `use_dictionary_state`: a dict
+                    // is only PRIMED (and thus matchable) when the matcher
+                    // supports priming — a non-priming matcher ignores an
+                    // attached dictionary, so the raw-fast-path must stay
+                    // enabled for it. (This arm is already non-Uncompressed.)
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
@@ -2530,6 +2536,15 @@ mod tests {
         let mut payload = lcg(2, 2000); // incompressible filler before
         payload.extend_from_slice(&r); // the single dict-matchable segment
         payload.extend_from_slice(&lcg(3, 1500)); // filler after
+
+        // Precondition: the payload must actually look incompressible so
+        // that the raw-fast-path WOULD fire (and skip matching) without
+        // the fix. If the heuristic ever changes and this no longer holds,
+        // the test below would pass vacuously — assert it up front.
+        assert!(
+            crate::encoding::incompressible::block_looks_incompressible(&payload),
+            "test payload must look incompressible to exercise the raw-fast-path",
+        );
 
         let compress =
             |level: super::CompressionLevel, dict: Option<&[u8]>| -> alloc::vec::Vec<u8> {
