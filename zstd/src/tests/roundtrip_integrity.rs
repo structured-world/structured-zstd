@@ -920,12 +920,15 @@ fn all_levels_tiny_input_with_hint() {
 /// the equality holds there too.
 #[test]
 fn borrowed_oneshot_matches_owned_and_roundtrips() {
-    let cases: [(u64, usize); 5] = [
+    let cases: [(u64, usize); 6] = [
         (1, 200_000),
         (7, 293_000),
         (42, 50_000),
         (3, 4096),
         (5, 700_000),
+        // Over-window for every Fast level (max ~1 MiB window): forces
+        // eviction in the owned path; the borrowed path must still match.
+        (9, 3_000_000),
     ];
     for level in [
         CompressionLevel::Fastest,

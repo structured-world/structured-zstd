@@ -565,13 +565,15 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     }
 
     /// One-shot compress of a contiguous `&[u8]` input. When the Fast
-    /// (Simple) backend is selected, no dictionary is active, and the
-    /// whole input fits the resolved window (so no eviction can occur),
-    /// the matcher references the input in place as a borrowed window —
+    /// (Simple) backend is selected and no dictionary is active, the
+    /// matcher references the input in place as a borrowed window —
     /// skipping the per-block copy into the owned `history` that the
     /// streaming path performs (the dominant peak-allocation cost on Fast
-    /// one-shot compress). Every other case falls back to the owned
-    /// streaming loop, producing identical output.
+    /// one-shot compress). Over-window inputs are included: the borrowed
+    /// scan bounds matches with the same `window_low = block_end -
+    /// advertised_window` the owned (evicting) path uses, so it produces
+    /// byte-identical output without ever copying the input. Non-Fast /
+    /// dictionary / `Uncompressed` cases fall back to the owned loop.
     ///
     /// The owned fallback reads from the source set via [`Self::set_source`],
     /// so the caller must `set_source(input)` before calling this.
@@ -588,10 +590,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // `compress_block_encoded_borrowed` (RLE/raw-fast/compressed)
         // does NOT do — exclude it so it takes the owned path's dedicated
         // Uncompressed arm.
+        //
+        // No window-size gate: over-window inputs are handled too. The
+        // owned path bounds matches to the last `advertised_window` bytes
+        // via `window_low` and evicts/rehashes its history; the borrowed
+        // path computes the identical `window_low = block_end -
+        // advertised_window` and the kernel rejects any hash candidate
+        // below it, while the per-position `put` during the scan keeps
+        // in-window slots current — so it produces byte-identical output
+        // to the owned (evicting) path without ever copying the input
+        // into `history`, even when the input far exceeds the window.
         let borrowed_eligible = !prep.use_dictionary_state
             && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-            && self.state.strategy_tag == StrategyTag::Fast
-            && (input.len() as u64) <= prep.window_size;
+            && self.state.strategy_tag == StrategyTag::Fast;
         let (all_blocks, total_uncompressed) = if borrowed_eligible {
             self.run_borrowed_block_loop(input, prep.initial_size_hint)
         } else {
@@ -606,7 +617,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// borrowed window via `compress_block_encoded_borrowed` — no
     /// per-block `commit_space` copy. Returns `(all_blocks,
     /// total_uncompressed)`. Caller guarantees Fast backend + no
-    /// dictionary + `input` fits the window.
+    /// dictionary; over-window inputs are fine (matches are bounded by
+    /// `window_low` exactly as the owned evicting path).
     fn run_borrowed_block_loop(
         &mut self,
         input: &[u8],
