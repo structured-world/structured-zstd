@@ -237,7 +237,6 @@ impl BlockDecoder {
             parts.buffer,
             parts.offset_hist,
             parts.literals_buffer,
-            parts.sequences,
             raw,
         )
     }
@@ -276,7 +275,6 @@ impl BlockDecoder {
             parts.buffer,
             parts.offset_hist,
             parts.literals_buffer,
-            parts.sequences,
             raw,
         )
     }
@@ -298,7 +296,6 @@ impl BlockDecoder {
         buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
         offset_hist: &mut [u32; 3],
         literals_buffer: &mut alloc::vec::Vec<u8>,
-        sequences: &mut alloc::vec::Vec<crate::blocks::sequence_section::Sequence>,
         raw: &[u8],
     ) -> Result<(), DecompressBlockError> {
         let mut section = LiteralsSection::new();
@@ -374,9 +371,10 @@ impl BlockDecoder {
         if seq_section.num_sequences != 0 {
             // Fused decode + execute: avoids the Vec<Sequence> round-trip
             // and inlines the per-iter execute_one_sequence work next to
-            // the FSE state advance. Falls back to the legacy two-pass
-            // pipeline internally when any of LL/ML/OF is in RLE mode.
-            // Pass field-level borrows from the WorkspaceRef so `raw`
+            // the FSE state advance. RLE-mode axes are handled in the same
+            // fused loop via a degenerate single-state FSE table built by
+            // `maybe_update_fse_tables`, so there is no separate two-pass
+            // path. Pass field-level borrows from the WorkspaceRef so `raw`
             // (immutable view into block_content_buffer) can coexist
             // with the mutable borrows on the FSE / decode-buffer /
             // offset-hist fields.
@@ -387,7 +385,6 @@ impl BlockDecoder {
                 buffer,
                 offset_hist,
                 literals_view,
-                sequences,
             )?;
         } else {
             if !raw.is_empty() {
@@ -398,7 +395,6 @@ impl BlockDecoder {
                 ));
             }
             buffer.push(literals_view);
-            sequences.clear();
         }
 
         Ok(())
@@ -638,14 +634,12 @@ mod tests {
         let mut fse = FSEScratch::new();
         let mut offset_hist = [1u32, 4, 8];
         let mut literals_buffer = alloc::vec::Vec::new();
-        let mut sequences = alloc::vec::Vec::new();
         let mut block_content_buffer = alloc::vec::Vec::new();
         let mut direct = DirectScratch {
             huf: &mut huf,
             fse: &mut fse,
             offset_hist: &mut offset_hist,
             literals_buffer: &mut literals_buffer,
-            sequences: &mut sequences,
             block_content_buffer: &mut block_content_buffer,
             buffer,
         };
@@ -686,14 +680,12 @@ mod tests {
         let mut fse = FSEScratch::new();
         let mut offset_hist = [1u32, 4, 8];
         let mut literals_buffer = alloc::vec::Vec::new();
-        let mut sequences = alloc::vec::Vec::new();
         let mut block_content_buffer = alloc::vec::Vec::new();
         let mut direct = DirectScratch {
             huf: &mut huf,
             fse: &mut fse,
             offset_hist: &mut offset_hist,
             literals_buffer: &mut literals_buffer,
-            sequences: &mut sequences,
             block_content_buffer: &mut block_content_buffer,
             buffer,
         };
