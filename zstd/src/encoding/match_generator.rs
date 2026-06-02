@@ -741,6 +741,13 @@ impl MatchGeneratorDriver {
             "borrowed block range must satisfy start <= end (start={block_start} end={block_end})",
         );
         self.borrowed_pending = Some((block_start, block_end));
+        // Make the range visible to `get_last_space()` immediately: the
+        // emit pipeline reads `get_last_space().len()` in
+        // `collect_block_parts` BEFORE `start_matching` consumes the
+        // stage, so the staged block (not the whole borrowed window) must
+        // be reported now to keep the literal-buffer reservation right.
+        self.simple_mut()
+            .stage_borrowed_block(block_start, block_end);
     }
 
     #[cfg(test)]

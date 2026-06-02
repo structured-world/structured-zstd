@@ -785,6 +785,19 @@ impl FastKernelMatcher {
         self.last_borrowed_block = Some((block_start, block_end));
     }
 
+    /// Make `[block_start, block_end)` the block `last_committed_space`
+    /// reports BEFORE the scan runs. The emit pipeline reads
+    /// `get_last_space().len()` in `collect_block_parts` *before* calling
+    /// `start_matching`, so without this the first borrowed block would
+    /// report the whole borrowed window (`last_borrowed_block` still
+    /// `None` → `history_bytes()[0..]`), over-reserving the literal buffer
+    /// and undercutting the peak-alloc win. Called by the driver when it
+    /// stages the range; `start_matching_borrowed` / `skip_matching_borrowed`
+    /// re-record the same value idempotently.
+    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        self.last_borrowed_block = Some((block_start, block_end));
+    }
+
     /// Donor's `skipMatching` equivalent: append the pending block to
     /// history without running the kernel.
     ///
