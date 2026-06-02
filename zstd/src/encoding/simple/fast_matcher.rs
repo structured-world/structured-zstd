@@ -433,6 +433,19 @@ impl FastKernelMatcher {
     pub(crate) fn clear_borrowed_window(&mut self) {
         self.borrowed = None;
         self.last_borrowed_block = None;
+        // The hash table still holds absolute positions into the
+        // now-detached borrowed buffer. An owned-path scan would read
+        // them as offsets into `self.history` — out of bounds once the
+        // borrowed buffer is gone (memory-unsafe). Today every frame
+        // begins with `reset` (which clears the table), so an owned
+        // scan never observes the stale entries; but the docstring
+        // promises a return to the owned path, so restore that
+        // invariant here too rather than relying on the caller always
+        // resetting first. Mirrors `reset` / `drain_real_prefix`:
+        // clear the table and re-floor `prefix_start_index` at the
+        // sentinel-0 baseline.
+        self.hash_table.clear();
+        self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
     /// Read-only view of the most recently committed block — donor /
