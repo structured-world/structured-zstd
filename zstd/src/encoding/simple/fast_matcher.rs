@@ -1979,6 +1979,73 @@ mod tests {
         assert_eq!(m.history.len(), 4 + HISTORY_DRAIN_BASE);
     }
 
+    /// Regression: priming a dictionary in two chunks must hash the
+    /// positions straddling the chunk seam. The second chunk's prime
+    /// starts at `range_start = end-of-first-chunk`, but a hash read at
+    /// any of the preceding `HASH_READ_SIZE - 1` positions spans the
+    /// seam into the second chunk — those positions belong to neither
+    /// chunk's `[range_start ..= last_hashable]` window unless the second
+    /// prime backfills them. Without the backfill a dictionary fed in
+    /// `slice_size` chunks silently drops every seam-spanning match.
+    #[test]
+    fn dict_prime_indexes_positions_across_chunk_seam() {
+        // hash_log=20 (1 Mi slots) makes a hash collision among ~32
+        // primed positions negligible, so `get(hash(p)) == p` is a
+        // deterministic assertion on this fixed input.
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let chunk1: alloc::vec::Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        m.accept_data(chunk1);
+        m.skip_matching_for_dict_prime();
+        let seam = m.history.len(); // end of first chunk
+        let chunk2: alloc::vec::Vec<u8> = (16..32u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        m.accept_data(chunk2);
+        m.skip_matching_for_dict_prime();
+
+        // A position in the (HASH_READ_SIZE - 1)-byte gap just below the
+        // seam: its 8-byte hash read straddles the chunk boundary.
+        let p = seam - 4;
+        let dt = m.dict_table.as_ref().expect("dict table primed");
+        let h = unsafe { dt.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        assert_eq!(
+            unsafe { dt.get(h) },
+            p as u32,
+            "seam-spanning position {p} must be indexed in the dict table",
+        );
+    }
+
+    /// Regression: same seam-gap defect for the MAIN hash table, primed
+    /// per slice via `skip_matching_with_hint(Some(false))` (the dict
+    /// COPY path and multi-slice history priming). Cross-slice matches
+    /// at the seam are dropped unless the second prime backfills the
+    /// trailing `HASH_READ_SIZE - 1` positions.
+    #[test]
+    fn main_table_prime_indexes_positions_across_slice_seam() {
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let chunk1: alloc::vec::Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        m.accept_data(chunk1);
+        m.skip_matching_with_hint(Some(false));
+        let seam = m.history.len();
+        let chunk2: alloc::vec::Vec<u8> = (16..32u8)
+            .map(|i| i.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        m.accept_data(chunk2);
+        m.skip_matching_with_hint(Some(false));
+
+        let p = seam - 4;
+        let h = unsafe { m.hash_table.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        assert_eq!(
+            unsafe { m.hash_table.get(h) },
+            p as u32,
+            "seam-spanning position {p} must be indexed in the main table",
+        );
+    }
+
     /// After a single block emits matches, the matcher's `rep[0]`
     /// (kernel's `rep_offset1` post-block) must reflect the last emitted
     /// explicit offset — that is the state the next block's kernel probes
