@@ -461,11 +461,19 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 let clamped = n.max(CompressionLevel::MIN_LEVEL);
                 let target_length = (-clamped) as usize;
                 let step_size = target_length + 1;
+                // Donor row-0 ("base for negative", clevels.h srcSize>256KB):
+                // hashLog=13, minMatch=7. The 32 KiB hash table (2^13 * 4B)
+                // is L1d-resident on contemporary cores, so every probe is an
+                // L1 hit; hashLog=14 (64 KiB) overflows a 32 KiB L1d and turns
+                // each probe into an L2 access. minMatch=7 (vs 6) skips
+                // short-distance 6-byte matches: fewer sequences, less
+                // extension/emit work, and parity with the donor's negative
+                // ladder on both ratio and throughput.
                 LevelParams {
                     strategy_tag: super::strategy::StrategyTag::Fast,
                     window_log: 19,
-                    fast_hash_log: 14,
-                    fast_mls: 6,
+                    fast_hash_log: 13,
+                    fast_mls: 7,
                     fast_step_size: step_size,
                     lazy_depth: 0,
                     hc: HC_CONFIG,
@@ -1037,11 +1045,10 @@ impl Matcher for MatchGeneratorDriver {
             self.storage = match next_backend {
                 super::strategy::BackendTag::Simple => {
                     // Per-level Fast cParams from resolve_level_params:
-                    // Level(1) gets (hash_log=14, mls=7); Fastest /
-                    // Uncompressed / Level(-7..=-1) get (hash_log=14,
-                    // mls=6) — beyond-donor on hash_log (donor's row
-                    // is hash_log=13, see resolve_level_params for
-                    // rationale).
+                    // Level(1) gets (hash_log=14, mls=7); Level(-7..=-1)
+                    // get donor row-0 (hash_log=13, mls=7); Fastest /
+                    // Uncompressed keep (hash_log=14, mls=6). See
+                    // resolve_level_params for rationale.
                     MatcherStorage::Simple(FastKernelMatcher::with_params(
                         params.window_log,
                         params.fast_hash_log,
@@ -8555,22 +8562,23 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     assert_eq!(p1.fast_mls, 7);
     assert_eq!(p1.fast_step_size, 2);
 
-    // Negative levels — beyond-donor tuning: donor's "base for
-    // negative" row is (hash_log=13, mls=6); we use hash_log=14
-    // (+32 KB memory, 2× fewer collisions on structured corpora)
-    // while keeping mls=6 for fast-path speed on random data.
+    // Negative levels — donor row-0 ("base for negative"):
+    // hash_log=13, mls=7. The 32 KiB table is L1d-resident (every
+    // probe an L1 hit, vs an L2 access for a 64 KiB hash_log=14
+    // table), and minMatch=7 drops short-distance 6-byte matches —
+    // donor parity on both ratio and throughput.
     // step_size follows donor's formula: targetLength = -level,
     // step_size = (-level) + 1, giving 2..8 for L-1..L-7.
     for n in -7..=-1 {
         let p = resolve_level_params(CompressionLevel::Level(n), None);
-        assert_eq!(p.fast_hash_log, 14, "Level({n}) fast_hash_log");
-        assert_eq!(p.fast_mls, 6, "Level({n}) fast_mls");
+        assert_eq!(p.fast_hash_log, 13, "Level({n}) fast_hash_log");
+        assert_eq!(p.fast_mls, 7, "Level({n}) fast_mls");
         let expected_step = ((-n) as usize) + 1;
         assert_eq!(p.fast_step_size, expected_step, "Level({n}) fast_step_size");
     }
 
-    // Fastest + Uncompressed share the negative-base tuning
-    // (window_log=19, hash_log=14 [beyond-donor], mls=6).
+    // Fastest + Uncompressed keep hash_log=14 / mls=6 (their own
+    // tuning; not part of the negative-level donor ladder).
     let pf = resolve_level_params(CompressionLevel::Fastest, None);
     assert_eq!(
         (
