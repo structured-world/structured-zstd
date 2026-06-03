@@ -482,7 +482,7 @@ impl RowMatchGenerator {
 
             let best = self.best_match(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
-                self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+                self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let current = self.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
@@ -703,7 +703,7 @@ impl RowMatchGenerator {
             // `candidate.start` lower bound regresses `rust_bytes` by
             // ~+447 over `abs_pos` (537897 -> 538344), so the
             // narrower range is intentional.
-            self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+            self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
             let current = self.window.back().unwrap().as_slice();
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
@@ -930,6 +930,28 @@ impl RowMatchGenerator {
     fn insert_positions(&mut self, start: usize, end: usize) {
         for pos in start..end {
             self.insert_position(pos);
+        }
+    }
+
+    /// Index a just-emitted match span, mirroring the donor
+    /// `ZSTD_row_update_internal` skip-threshold (`zstd_lazy.c:922-940`):
+    /// when the span exceeds `SKIP_THRESHOLD` positions, only the first
+    /// `MAX_START` and last `MAX_END` are indexed and the interior is
+    /// skipped. Indexing every interior byte of a long match is
+    /// O(matchlen) and dominates encode time on periodic inputs (e.g.
+    /// repeated log lines), where a single greedy/lazy match can span an
+    /// entire block: that O(matchlen) fill, not the search, is what left
+    /// the row backend ~11x slower than FFI on those streams. The donor
+    /// caps the fill at 96 + 32 positions regardless of match length.
+    fn insert_match_span(&mut self, start: usize, end: usize) {
+        const SKIP_THRESHOLD: usize = 384;
+        const MAX_START: usize = 96;
+        const MAX_END: usize = 32;
+        if end.saturating_sub(start) > SKIP_THRESHOLD {
+            self.insert_positions(start, start + MAX_START);
+            self.insert_positions(end - MAX_END, end);
+        } else {
+            self.insert_positions(start, end);
         }
     }
 
