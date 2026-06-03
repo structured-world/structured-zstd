@@ -653,24 +653,20 @@ impl RowMatchGenerator {
             //     ties / near-ties the rep wins by being cheaper to
             //     encode (single-digit-bit offset code vs 9-13 bits for
             //     a regular offset).
-            let regular_match = self.row_candidate(abs_pos, lit_len);
-            let chosen = match (rep_match, regular_match) {
-                (Some(rep), Some(reg)) => {
-                    // Prefer the longer; tie-break to rep for cheaper
-                    // encoding. `best_len_offset_candidate` ties on
-                    // shorter offset which is the wrong direction for
-                    // rep-vs-regular (regular offsets are always bigger
-                    // than the corresponding rep, so it would always
-                    // pick rep on ties — that's the right choice here
-                    // but we want strict length preference too).
-                    if reg.match_len > rep.match_len {
-                        Some(reg)
-                    } else {
-                        Some(rep)
-                    }
-                }
-                (Some(rep), None) => Some(rep),
-                (None, reg) => reg,
+            // Donor greedy (depth 0): a repcode hit commits immediately and
+            // SKIPS the regular row search (`zstd_lazy.c:2039`,
+            // `if (depth==0) goto _storeSequence`). The regular
+            // `row_candidate` (SIMD row scan + match extension) is the
+            // dominant per-position cost; running it on every rep hit made
+            // rep-dense inputs (repetitive logs) up to ~11x slower than the
+            // donor, which short-circuits. So only run the regular search
+            // when there is no rep to take. `row_candidate` is `&self` (a
+            // pure search, no table mutation), so skipping it drops no hash
+            // insert — the post-emit `insert_positions(abs_pos, ..)` still
+            // indexes the committed span.
+            let chosen = match rep_match {
+                Some(rep) => Some(rep),
+                None => self.row_candidate(abs_pos, lit_len),
             };
 
             let Some(candidate) = chosen else {
