@@ -79,6 +79,16 @@ const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 /// boundary check.
 const HASH_READ_SIZE: usize = 8;
 
+/// Minimum length a DICTIONARY match must reach to be committed by the
+/// dict-aware (attach-mode) Fast kernel [`compress_block_fast_dict`]. Dict
+/// matches are inherently far (they reach back across the whole input into the
+/// dictionary region), so a short one inflates the offset-FSE alphabet for
+/// little payload gain; below this floor the kernel skips the dict match and
+/// lets the parse find a near (small-offset / repcode) match instead. Only
+/// applies to dict matches — main-table and repcode matches keep the 4-byte
+/// minimum.
+const MIN_DICT_MATCH_LEN: usize = 8;
+
 /// Donor's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
 /// used by the raw match probe on the hot path. The result is only
 /// ever compared for equality against another `read32` of the same
@@ -989,6 +999,261 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
     FastBlockResult {
         rep: final_rep,
+        tail_literals_len: data.len() - anchor,
+    }
+}
+
+/// Attach-mode dict Fast kernel — flat-buffer port of donor
+/// `ZSTD_compressBlock_fast_dictMatchState_generic` (`zstd_fast.c:483-678`),
+/// the 2-cursor dict-aware search C uses for small / unknown-size inputs
+/// (`ZSTD_shouldAttachDict`: `pledgedSrcSize <= 8 KB` for the Fast strategy, or
+/// size unknown). The caller routes large known-size inputs through the plain
+/// 4-cursor [`compress_block_fast`] with the dictionary copied into the window
+/// instead (donor's "copy" mode) — that path already matches/beats the donor on
+/// large corpora, so this attach path exists ONLY to win the small/unknown case
+/// the 4-cursor parse-order misses.
+///
+/// Flat-model adaptations vs the donor: the dictionary occupies `data[1..
+/// dict_end]` immediately before the frame input (mirroring the decoder's
+/// `[dict][output]` window), so a dict-match offset is `ip - dict_pos` like any
+/// in-window match and match counts cross the dict→input boundary freely (no
+/// `ZSTD_count_2segments`, no `dictBase`/`dictIndexDelta`). `dict_table` stores
+/// plain positions (no donor short-cache tags); `main_table` holds ONLY frame-
+/// input positions. Search order mirrors the donor: rep@ip0+1 → dict (only when
+/// the main candidate is invalid) → main. Correctness is independent of table
+/// contents (every match byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN`
+/// gates short far dict matches that would fragment the offset-FSE alphabet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
+    data: &[u8],
+    block_start: usize,
+    bounds: PrefixBounds,
+    main_table: &mut FastHashTable,
+    dict_table: &FastHashTable,
+    dict_end: u32,
+    rep: [u32; 2],
+    step_size: usize,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+) -> FastBlockResult {
+    assert!(
+        block_start <= data.len(),
+        "block_start ({block_start}) must not exceed data.len() ({})",
+        data.len(),
+    );
+    assert!(
+        data.len() <= u32::MAX as usize,
+        "FastKernel does not support data.len() ({}) > u32::MAX",
+        data.len(),
+    );
+    debug_assert_eq!(MLS, main_table.mls());
+    debug_assert_eq!(MLS, dict_table.mls());
+    debug_assert_eq!(main_table.hash_log(), dict_table.hash_log());
+
+    let prefix_start_index = bounds.prefix_start_index;
+    let window_low = bounds.window_low as usize;
+    let dict_end = dict_end as usize;
+
+    if data.len() < block_start + HASH_READ_SIZE {
+        return FastBlockResult {
+            rep,
+            tail_literals_len: data.len() - block_start,
+        };
+    }
+
+    let base = data.as_ptr();
+    let iend_addr = data.len();
+    let ilimit = iend_addr - HASH_READ_SIZE;
+
+    let mut anchor: usize = block_start;
+    let mut ip0: usize = block_start;
+    if ip0 == 0 {
+        ip0 = 1;
+    }
+    let mut ip1 = ip0 + step_size;
+
+    let mut offset_1: u32 = rep[0];
+    let mut offset_2: u32 = rep[1];
+
+    // Inner-loop result: literals end (where the match copy begins), the raw
+    // match offset, the match length, and the donor `curr` (probe position,
+    // for the post-match `curr + 2` fill). `None` → drain to cleanup.
+    struct DictMatch {
+        lit_end: usize,
+        offset: usize,
+        m_len: usize,
+        curr: usize,
+    }
+
+    'outer: while ip1 <= ilimit {
+        // SAFETY: ip0 < ip1 <= ilimit = iend - 8 ⇒ ≥ 8 readable bytes at ip0.
+        let mut hash0 = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0)) };
+        let mut main_idx = unsafe { main_table.get(hash0) };
+        let mut dict_idx = unsafe { dict_table.get(hash0) };
+        let mut curr = ip0;
+
+        let found: Option<DictMatch> = loop {
+            // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
+            let hash1 = unsafe { main_table.hash_ptr::<MLS>(base.add(ip1)) };
+            // Insert current position into the MAIN table (donor line 565).
+            unsafe { main_table.put(hash0, curr as u32) };
+
+            // Repcode probe for a match starting at ip0 + 1 (donor 559-574).
+            if offset_1 > 0 && curr + 1 >= offset_1 as usize + window_low {
+                let rep_index = curr + 1 - offset_1 as usize;
+                // SAFETY: ip0+1+4 <= ilimit+5 < iend; rep_index < ip0+1 so
+                // rep_index+4 < iend. Both 4-byte reads in bounds.
+                if unsafe { read32(base.add(ip0 + 1)) == read32(base.add(rep_index)) } {
+                    let m_len = 4 + unsafe {
+                        count_forward(
+                            base.add(ip0 + 1 + 4),
+                            base.add(rep_index + 4),
+                            base.add(iend_addr),
+                        )
+                    };
+                    break Some(DictMatch {
+                        lit_end: ip0 + 1,
+                        offset: offset_1 as usize,
+                        m_len,
+                        curr,
+                    });
+                }
+            }
+
+            // Dictionary match — taken ONLY when the main candidate is invalid
+            // (donor gate `matchIndex <= prefixStartIndex`, lines 582-583), so
+            // recent-input matches from the main table always win.
+            if main_idx <= prefix_start_index {
+                let dpos = dict_idx as usize;
+                if dict_idx >= 1
+                    && dpos < dict_end
+                    && dpos >= window_low
+                    && unsafe { read32(base.add(ip0)) == read32(base.add(dpos)) }
+                {
+                    let mut match_ip = ip0;
+                    let mut match_pos = dpos;
+                    let mut m_len = 4 + unsafe {
+                        count_forward(base.add(ip0 + 4), base.add(dpos + 4), base.add(iend_addr))
+                    };
+                    // Catch-up backward extension into the dict (donor 586-591).
+                    while match_ip > anchor
+                        && match_pos > window_low
+                        && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
+                    {
+                        match_ip -= 1;
+                        match_pos -= 1;
+                        m_len += 1;
+                    }
+                    if m_len >= MIN_DICT_MATCH_LEN {
+                        let offset = match_ip - match_pos;
+                        offset_2 = offset_1;
+                        offset_1 = offset as u32;
+                        break Some(DictMatch {
+                            lit_end: match_ip,
+                            offset,
+                            m_len,
+                            curr,
+                        });
+                    }
+                }
+            }
+
+            // Main match (recent input) — donor line 600.
+            if unsafe { match_found::<USE_CMOV>(base.add(ip0), base, main_idx, prefix_start_index) }
+            {
+                let mut match_ip = ip0;
+                let mut match_pos = main_idx as usize;
+                let mut m_len = 4 + unsafe {
+                    count_forward(
+                        base.add(ip0 + 4),
+                        base.add(match_pos + 4),
+                        base.add(iend_addr),
+                    )
+                };
+                while match_ip > anchor
+                    && match_pos > window_low
+                    && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
+                {
+                    match_ip -= 1;
+                    match_pos -= 1;
+                    m_len += 1;
+                }
+                let offset = match_ip - match_pos;
+                offset_2 = offset_1;
+                offset_1 = offset as u32;
+                break Some(DictMatch {
+                    lit_end: match_ip,
+                    offset,
+                    m_len,
+                    curr,
+                });
+            }
+
+            // Prepare next iteration (donor 616-630).
+            dict_idx = unsafe { dict_table.get(hash1) };
+            main_idx = unsafe { main_table.get(hash1) };
+            ip0 = ip1;
+            ip1 += step_size;
+            if ip1 > ilimit {
+                break None;
+            }
+            curr = ip0;
+            hash0 = hash1;
+        };
+
+        let Some(m) = found else {
+            break 'outer;
+        };
+
+        handle_sequence(Sequence::Triple {
+            literals: &data[anchor..m.lit_end],
+            offset: m.offset,
+            match_len: m.m_len,
+        });
+        ip0 = m.lit_end + m.m_len;
+        anchor = ip0;
+
+        if ip0 <= ilimit {
+            // Post-match dense fills (donor 641-642).
+            if m.curr + 2 + HASH_READ_SIZE <= iend_addr {
+                let h = unsafe { main_table.hash_ptr::<MLS>(base.add(m.curr + 2)) };
+                unsafe { main_table.put(h, (m.curr + 2) as u32) };
+            }
+            if ip0 >= 2 {
+                let h = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0 - 2)) };
+                unsafe { main_table.put(h, (ip0 - 2) as u32) };
+            }
+            // Immediate repcode-2 loop (donor 644-663).
+            while ip0 <= ilimit
+                && offset_2 > 0
+                && ip0 >= offset_2 as usize + window_low
+                && unsafe { read32(base.add(ip0)) == read32(base.add(ip0 - offset_2 as usize)) }
+            {
+                let r_off = offset_2 as usize;
+                let r_len = 4 + unsafe {
+                    count_forward(
+                        base.add(ip0 + 4),
+                        base.add(ip0 + 4 - r_off),
+                        base.add(iend_addr),
+                    )
+                };
+                core::mem::swap(&mut offset_1, &mut offset_2);
+                let h = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0)) };
+                unsafe { main_table.put(h, ip0 as u32) };
+                handle_sequence(Sequence::Triple {
+                    literals: &data[anchor..ip0],
+                    offset: r_off,
+                    match_len: r_len,
+                });
+                ip0 += r_len;
+                anchor = ip0;
+            }
+        }
+
+        ip1 = ip0 + step_size;
+    }
+
+    FastBlockResult {
+        rep: [offset_1, offset_2],
         tail_literals_len: data.len() - anchor,
     }
 }
