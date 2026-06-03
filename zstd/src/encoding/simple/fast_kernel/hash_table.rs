@@ -202,48 +202,21 @@ impl FastHashTable {
     #[inline(always)]
     pub(crate) unsafe fn hash_ptr<const MLS: u32>(&self, ptr: *const u8) -> u32 {
         debug_assert_eq!(MLS, self.mls, "monomorphised MLS must match table mls");
-        match MLS {
-            4 => {
-                // SAFETY: caller guarantees ≥4 readable bytes at ptr.
-                let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) }.to_le();
-                u.wrapping_mul(PRIME_4_BYTES) >> (32 - self.hash_log)
-            }
-            5 => {
-                // SAFETY: caller guarantees ≥8 readable bytes per the
-                // method-level doc — every MLS≥5 path performs a
-                // wide u64 load and shifts off the unused top bits;
-                // a 5-byte promise would leave 3 bytes of the load
-                // past the caller's range.
-                let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-                ((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES) >> (64 - self.hash_log)) as u32
-            }
-            6 => {
-                // SAFETY: caller guarantees ≥8 readable bytes (u64
-                // load — only the bottom 48 bits feed the hash, but
-                // the LOAD is still 8 bytes wide).
-                let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-                ((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES) >> (64 - self.hash_log)) as u32
-            }
-            7 => {
-                // SAFETY: caller guarantees ≥8 readable bytes (u64
-                // load — bottom 56 bits feed the hash; LOAD is 8).
-                let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-                ((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES) >> (64 - self.hash_log)) as u32
-            }
-            8 => {
-                // SAFETY: caller guarantees ≥8 readable bytes — the
-                // donor reads the full u64 unchanged for mls=8.
-                let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-                (u.wrapping_mul(PRIME_8_BYTES) >> (64 - self.hash_log)) as u32
-            }
-            _ => {
-                // Compile-time unreachable for monomorphised callers;
-                // emitting an `unreachable_unchecked()` here would be
-                // UB in debug builds if anyone instantiates a bad MLS.
-                debug_assert!(false, "unsupported MLS {MLS}");
-                0
-            }
-        }
+        // SAFETY: forwarded — caller upholds `hash_ptr`'s readable-bytes
+        // contract; `self.hash_log` is the table's own log.
+        unsafe { hash_ptr_raw::<MLS>(ptr, self.hash_log) }
+    }
+
+    /// Hoist the table's backing slice + `hash_log` into locals for a hot
+    /// loop. Binding `&mut [u32]` to a local caches the `(ptr, len)` once, so
+    /// per-position `get_unchecked` / `get_unchecked_mut` don't reload the
+    /// `Vec` header on every access — the optimiser otherwise conservatively
+    /// re-reads it through `&mut FastHashTable` after each interior write
+    /// (the "chases the Vec" reload). Pair with [`hash_ptr_raw`] so the loop
+    /// never touches `self` and stays reload-free.
+    #[inline(always)]
+    pub(crate) fn hot_state(&mut self) -> (&mut [u32], u32) {
+        (self.table.as_mut_slice(), self.hash_log)
     }
 
     /// Direct table access — `table[hash]`. Bounds-check at index time
@@ -276,6 +249,50 @@ impl FastHashTable {
         // SAFETY: see method-level doc.
         unsafe {
             *self.table.get_unchecked_mut(hash as usize) = pos;
+        }
+    }
+}
+
+/// Free-function form of [`FastHashTable::hash_ptr`] taking `hash_log`
+/// explicitly so a hot loop can hoist it into a register once (via
+/// [`FastHashTable::hot_state`]) instead of re-reading `self.hash_log` per
+/// hash. Bit-for-bit identical to the method.
+///
+/// # Safety
+/// Same readable-bytes contract as [`FastHashTable::hash_ptr`]: `MLS == 4`
+/// needs ≥4 readable bytes at `ptr`, `MLS >= 5` needs ≥8. `hash_log` must be
+/// in `1..=30` (the constructor's accepted band) so the shift is well-defined.
+#[inline(always)]
+pub(crate) unsafe fn hash_ptr_raw<const MLS: u32>(ptr: *const u8, hash_log: u32) -> u32 {
+    match MLS {
+        4 => {
+            // SAFETY: caller guarantees ≥4 readable bytes at ptr.
+            let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) }.to_le();
+            u.wrapping_mul(PRIME_4_BYTES) >> (32 - hash_log)
+        }
+        5 => {
+            // SAFETY: caller guarantees ≥8 readable bytes (wide u64 load).
+            let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
+            ((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES) >> (64 - hash_log)) as u32
+        }
+        6 => {
+            // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
+            let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
+            ((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES) >> (64 - hash_log)) as u32
+        }
+        7 => {
+            // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
+            let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
+            ((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES) >> (64 - hash_log)) as u32
+        }
+        8 => {
+            // SAFETY: caller guarantees ≥8 readable bytes (full u64).
+            let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
+            (u.wrapping_mul(PRIME_8_BYTES) >> (64 - hash_log)) as u32
+        }
+        _ => {
+            debug_assert!(false, "unsupported MLS {MLS}");
+            0
         }
     }
 }

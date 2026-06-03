@@ -9,7 +9,7 @@
 //! per-call via the `USE_CMOV` const generic.
 
 use super::count::count_forward;
-use super::hash_table::FastHashTable;
+use super::hash_table::{FastHashTable, hash_ptr_raw};
 use crate::encoding::Sequence;
 
 /// Per-iteration diagnostic tracing of the Fast kernel inner loop.
@@ -513,6 +513,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         step_size,
         MLS,
     );
+    // Hoist the hash table's backing slice + hash_log into locals so the hot
+    // loop's `get`/`put`/hash compute don't re-read the `Vec` header / the
+    // `hash_log` field through `&mut FastHashTable` on every access (see
+    // `FastHashTable::hot_state`). The table is fixed-size for the frame, so
+    // the slice ptr stays valid for the whole loop.
+    let (table, hlog) = hash_table.hot_state();
     'restart: while ip0 < ilimit {
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
@@ -537,9 +543,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         // SAFETY: ip0, ip1 < ilimit = iend - 8, so ≥ 8 readable
         // bytes at each `base + ip*`. MLS ≤ 8 matches hash_ptr's
         // contract.
-        let mut hash0 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip0)) };
-        let mut hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip1)) };
-        let mut match_idx = unsafe { hash_table.get(hash0) };
+        let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
+        let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip1), hlog) };
+        let mut match_idx = unsafe { *table.get_unchecked(hash0 as usize) };
         ktrace!(
             "OUTER ip0={} ip1={} ip2={} ip3={} step={} hash0={} hash1={} match_idx={} rep1={} rep2={}",
             ip0,
@@ -605,7 +611,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // SAFETY: hash0 from hash_ptr ⇒ in-bounds; ip0 ≤ u32::MAX
             // by the entry-point cap.
             ktrace!("PUT hash0={} pos={} (iter-start)", hash0, ip0);
-            unsafe { hash_table.put(hash0, ip0 as u32) };
+            unsafe { *table.get_unchecked_mut(hash0 as usize) = ip0 as u32 };
 
             // Repcode-at-ip2 check. Bitwise `&` (not short-circuit `&&`)
             // so both operands evaluate unconditionally — the
@@ -652,7 +658,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // match site), so its position won't conflict with
                 // the match's forward extension. Donor lines 286-287.
                 ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
-                unsafe { hash_table.put(hash1, ip1 as u32) };
+                unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
                 ktrace!(
                     "MATCH rep new_ip={} match0={} m_len={} offset={}",
                     new_ip,
@@ -678,7 +684,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
                 // search resumption). Donor line 296.
                 ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
-                unsafe { hash_table.put(hash1, ip1 as u32) };
+                unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
                 ktrace!(
                     "MATCH explicit1 ip0={} match_idx={} offset={}",
                     ip0,
@@ -697,16 +703,16 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // the CURRENT ip2 (before the cursor shift below), which
             // becomes the new ip1 — so post-shift `hash1` matches
             // the new `ip1`, NOT the new `ip2`.
-            match_idx = unsafe { hash_table.get(hash1) };
+            match_idx = unsafe { *table.get_unchecked(hash1 as usize) };
             hash0 = hash1;
-            hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip2)) };
+            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
 
             // Writeback for new ip0. Donor lines 314-315.
             ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
-            unsafe { hash_table.put(hash0, ip0 as u32) };
+            unsafe { *table.get_unchecked_mut(hash0 as usize) = ip0 as u32 };
 
             // Second explicit-match probe at the shifted ip0
             // (donor line 317).
@@ -719,7 +725,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // past the match start when we resume scanning.
                 if step <= 4 {
                     ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
-                    unsafe { hash_table.put(hash1, ip1 as u32) };
+                    unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
                 }
                 ktrace!(
                     "MATCH explicit2 ip0={} match_idx={} offset={}",
@@ -738,9 +744,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // shift is the one that advances ip2/ip3 by `step`
             // rather than by 1; this is where the step-skip kicks
             // in. Donor lines 329-339.
-            match_idx = unsafe { hash_table.get(hash1) };
+            match_idx = unsafe { *table.get_unchecked(hash1 as usize) };
             hash0 = hash1;
-            hash1 = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip2)) };
+            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
             ip0 = ip1;
             ip1 = ip2;
             // Same overflow defence as the loop-head setup: a wild
@@ -912,12 +918,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // guarantees `current0 + 2 + HASH_READ_SIZE` fits in
                 // `usize`, so the `+ 2` cannot wrap.
                 let current0_plus_2 = current0 + 2;
-                let h_fwd = unsafe { hash_table.hash_ptr::<MLS>(base.add(current0_plus_2)) };
-                unsafe { hash_table.put(h_fwd, current0_plus_2 as u32) };
+                let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.add(current0_plus_2), hlog) };
+                unsafe { *table.get_unchecked_mut(h_fwd as usize) = current0_plus_2 as u32 };
             }
             if ip0 >= 2 {
-                let h_back = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip0 - 2)) };
-                unsafe { hash_table.put(h_back, (ip0 - 2) as u32) };
+                let h_back = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), hlog) };
+                unsafe { *table.get_unchecked_mut(h_back as usize) = (ip0 - 2) as u32 };
             }
 
             // Repcode-2 inner loop. Donor swaps rep1 / rep2 on each
@@ -944,8 +950,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 core::mem::swap(&mut rep_offset1, &mut rep_offset2);
 
                 // Hash refill at ip0 (donor line 415).
-                let h_at = unsafe { hash_table.hash_ptr::<MLS>(base.add(ip0)) };
-                unsafe { hash_table.put(h_at, ip0 as u32) };
+                let h_at = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
+                unsafe { *table.get_unchecked_mut(h_at as usize) = ip0 as u32 };
 
                 // Emit lit_len=0 rep1 sequence.
                 // SAFETY: this immediate-rep2 branch runs with `anchor ==
