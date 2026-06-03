@@ -413,25 +413,6 @@ pub trait Matcher {
     }
     /// Process the data in the last committed space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
-    /// Like [`start_matching`](Self::start_matching) but writes matches
-    /// directly into a typed [`SeqSink`] instead of constructing a
-    /// [`Sequence`] enum per event and dispatching through a closure.
-    ///
-    /// The default bridges to `start_matching` so custom matchers and the
-    /// non-Fast backends keep working unchanged; the Fast backend overrides
-    /// this to push `(literals, offset, match_len)` straight from its hot loop
-    /// into the sink, eliminating the per-sequence enum + closure boundary
-    /// (donor `ZSTD_storeSeq` is inlined into the matcher loop the same way).
-    fn start_matching_into<S: SeqSink>(&mut self, sink: &mut S) {
-        self.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => sink.push_seq(literals, offset as u32, match_len as u32),
-            Sequence::Literals { literals } => sink.push_tail(literals),
-        });
-    }
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
     /// Provide a hint about the total uncompressed size for the next frame.
@@ -491,17 +472,4 @@ pub enum Sequence<'data> {
     ///
     /// These literals will just be copied at the end of the sequence execution by the decoder
     Literals { literals: &'data [u8] },
-}
-
-/// Typed match sink for [`Matcher::start_matching_into`]. The matcher pushes
-/// `(literals, offset, match_len)` triples and a trailing literal run directly,
-/// avoiding a [`Sequence`] enum allocation + closure dispatch per match on the
-/// hot path. Implemented by the production block collector over its flat
-/// `literals` / `sequences` buffers.
-pub trait SeqSink {
-    /// Append a match: `literals` (the run preceding the copy), the byte
-    /// `offset` to copy from, and the `match_len` bytes to copy.
-    fn push_seq(&mut self, literals: &[u8], offset: u32, match_len: u32);
-    /// Append the block's trailing literal run (no following match).
-    fn push_tail(&mut self, literals: &[u8]);
 }

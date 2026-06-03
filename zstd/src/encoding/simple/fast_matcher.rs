@@ -57,6 +57,7 @@ use alloc::vec::Vec;
 use crate::encoding::Sequence;
 
 use super::fast_kernel::hash_table::FastHashTable;
+use super::fast_kernel::kernel::compress_block_fast;
 
 /// Donor `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
@@ -704,21 +705,7 @@ impl FastKernelMatcher {
     /// `_ =>` arm is unreachable because `validate_params` in
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
-    /// Closure entry point (capture path + tests): wraps the closure in a
-    /// [`ClosureSink`] and runs the shared sink-based owned scan.
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        self.run_into(&mut super::fast_kernel::kernel::ClosureSink(
-            handle_sequence,
-        ));
-    }
-
-    /// Direct sink entry point (production hot path): the kernel pushes matches
-    /// straight into `sink` with no `Sequence` enum / closure boundary.
-    pub(crate) fn start_matching_into<S: crate::encoding::SeqSink>(&mut self, sink: &mut S) {
-        self.run_into(sink);
-    }
-
-    fn run_into<S: crate::encoding::SeqSink>(&mut self, sink: &mut S) {
         // Owned scan path. A borrowed one-shot window (set via
         // `set_borrowed_window`) is mutually exclusive with this path:
         // `extend_history_with_pending` appends into `self.history` and
@@ -807,7 +794,7 @@ impl FastKernelMatcher {
                 step_size,
                 mls,
                 use_cmov,
-                sink,
+                handle_sequence,
             )
         } else {
             // Owned scan reads `self.history` directly (the guard above
@@ -825,7 +812,7 @@ impl FastKernelMatcher {
                 step_size,
                 mls,
                 use_cmov,
-                sink,
+                handle_sequence,
             )
         };
         // Persist the kernel's rep state for the next block.
@@ -894,7 +881,7 @@ impl FastKernelMatcher {
             self.step_size,
             mls,
             self.use_cmov,
-            &mut super::fast_kernel::kernel::ClosureSink(handle_sequence),
+            handle_sequence,
         );
         self.rep = rep_out;
         // Record the scanned range so `last_committed_space` can return
@@ -1230,7 +1217,7 @@ impl FastKernelMatcher {
 /// conflict a `&self` accessor would create, the same reason the window
 /// slice is selected by the caller and handed in.
 #[allow(clippy::too_many_arguments)]
-fn run_fast_kernel_block<S: crate::encoding::SeqSink>(
+fn run_fast_kernel_block(
     history: &[u8],
     block_start: usize,
     prefix_start_index: u32,
@@ -1240,51 +1227,122 @@ fn run_fast_kernel_block<S: crate::encoding::SeqSink>(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    sink: &mut S,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> [u32; 2] {
-    use super::fast_kernel::kernel::{PrefixBounds, compress_block_fast_into};
+    use super::fast_kernel::kernel::PrefixBounds;
 
     let bounds = PrefixBounds {
         prefix_start_index,
         window_low,
     };
-    macro_rules! run {
-        ($mls:literal, $cmov:literal) => {
-            compress_block_fast_into::<$mls, $cmov, S>(
-                history,
-                block_start,
-                bounds,
-                hash_table,
-                rep_in,
-                step_size,
-                sink,
-            )
-        };
-    }
-    // Dispatch on (mls, use_cmov) — each pair monomorphises the kernel hot
-    // loop independently. `_` is unreachable: FastHashTable rejects mls
-    // outside 4..=8 at construction.
+    // Dispatch on (mls, use_cmov) — each pair monomorphises the kernel
+    // hot loop independently. `_` is unreachable: `FastHashTable::new`
+    // rejects mls outside 4..=8 at construction.
     let result = match (mls, use_cmov) {
-        (4, false) => run!(4, false),
-        (4, true) => run!(4, true),
-        (5, false) => run!(5, false),
-        (5, true) => run!(5, true),
-        (6, false) => run!(6, false),
-        (6, true) => run!(6, true),
-        (7, false) => run!(7, false),
-        (7, true) => run!(7, true),
-        (8, false) => run!(8, false),
-        (8, true) => run!(8, true),
+        (4, false) => compress_block_fast::<4, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (4, true) => compress_block_fast::<4, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (5, false) => compress_block_fast::<5, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (5, true) => compress_block_fast::<5, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (6, false) => compress_block_fast::<6, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (6, true) => compress_block_fast::<6, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (7, false) => compress_block_fast::<7, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (7, true) => compress_block_fast::<7, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (8, false) => compress_block_fast::<8, false>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
+        (8, true) => compress_block_fast::<8, true>(
+            history,
+            block_start,
+            bounds,
+            hash_table,
+            rep_in,
+            step_size,
+            &mut handle_sequence,
+        ),
         _ => unreachable!(
             "FastHashTable construction rejects mls outside 4..=8 — \
              got mls={mls} which means the table was bypassed",
         ),
     };
 
-    // Emit terminal literals if the kernel left a tail.
+    // Emit terminal literals if the kernel left a tail. `wrap_emit`'s
+    // borrow of `handle_sequence` has ended (no use past the match), so
+    // calling it directly here is allowed.
     if result.tail_literals_len > 0 {
         let tail_start = history.len() - result.tail_literals_len;
-        sink.push_tail(&history[tail_start..]);
+        handle_sequence(Sequence::Literals {
+            literals: &history[tail_start..],
+        });
     }
 
     result.rep
@@ -1295,7 +1353,7 @@ fn run_fast_kernel_block<S: crate::encoding::SeqSink>(
 /// immutable `dict_table` alongside the main table. Emits any terminal tail
 /// literals exactly as the no-dict helper does.
 #[allow(clippy::too_many_arguments)]
-fn run_fast_kernel_block_dict<S: crate::encoding::SeqSink>(
+fn run_fast_kernel_block_dict(
     history: &[u8],
     block_start: usize,
     bounds: super::fast_kernel::kernel::PrefixBounds,
@@ -1306,13 +1364,13 @@ fn run_fast_kernel_block_dict<S: crate::encoding::SeqSink>(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    sink: &mut S,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> [u32; 2] {
-    use super::fast_kernel::kernel::compress_block_fast_dict_into;
+    use super::fast_kernel::kernel::compress_block_fast_dict;
 
     macro_rules! run {
         ($mls:literal, $cmov:literal) => {
-            compress_block_fast_dict_into::<$mls, $cmov, S>(
+            compress_block_fast_dict::<$mls, $cmov>(
                 history,
                 block_start,
                 bounds,
@@ -1321,7 +1379,7 @@ fn run_fast_kernel_block_dict<S: crate::encoding::SeqSink>(
                 dict_end,
                 rep_in,
                 step_size,
-                sink,
+                &mut handle_sequence,
             )
         };
     }
@@ -1341,7 +1399,9 @@ fn run_fast_kernel_block_dict<S: crate::encoding::SeqSink>(
 
     if result.tail_literals_len > 0 {
         let tail_start = history.len() - result.tail_literals_len;
-        sink.push_tail(&history[tail_start..]);
+        handle_sequence(Sequence::Literals {
+            literals: &history[tail_start..],
+        });
     }
 
     result.rep

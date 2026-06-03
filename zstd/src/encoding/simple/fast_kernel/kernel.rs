@@ -10,30 +10,7 @@
 
 use super::count::count_forward;
 use super::hash_table::FastHashTable;
-use crate::encoding::{SeqSink, Sequence};
-
-/// [`SeqSink`] adapter that re-wraps the kernel's direct `(literals, offset,
-/// match_len)` pushes back into the [`Sequence`] enum + a closure. Used by the
-/// closure-based entry points ([`compress_block_fast`] / the capture path /
-/// unit tests) so the kernel core can be a single sink-based implementation
-/// while those callers keep the ergonomic `FnMut(Sequence)` API. The hot
-/// production path uses a direct sink (no enum), bypassing this adapter.
-pub(crate) struct ClosureSink<F>(pub(crate) F);
-
-impl<F: for<'a> FnMut(Sequence<'a>)> SeqSink for ClosureSink<F> {
-    #[inline(always)]
-    fn push_seq(&mut self, literals: &[u8], offset: u32, match_len: u32) {
-        (self.0)(Sequence::Triple {
-            literals,
-            offset: offset as usize,
-            match_len: match_len as usize,
-        });
-    }
-    #[inline(always)]
-    fn push_tail(&mut self, literals: &[u8]) {
-        (self.0)(Sequence::Literals { literals });
-    }
-}
+use crate::encoding::Sequence;
 
 /// Per-iteration diagnostic tracing of the Fast kernel inner loop.
 ///
@@ -372,9 +349,6 @@ pub(crate) struct PrefixBounds {
     pub window_low: u32,
 }
 
-/// Closure-based entry point — wraps the sink-based core
-/// [`compress_block_fast_into`] in a [`ClosureSink`]. Kept for the capture
-/// path and unit tests; the production hot path uses the sink core directly.
 #[inline(always)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
@@ -383,32 +357,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
-    handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-) -> FastBlockResult {
-    compress_block_fast_into::<MLS, USE_CMOV, _>(
-        data,
-        block_start,
-        bounds,
-        hash_table,
-        rep,
-        step_size,
-        &mut ClosureSink(handle_sequence),
-    )
-}
-
-/// Sink-based Fast kernel core: pushes each match's `(literals, offset,
-/// match_len)` straight into `sink` (no [`Sequence`] enum, no closure
-/// dispatch). The trailing literal run is emitted by the caller
-/// ([`run_fast_kernel_block`] / `_into`) via [`SeqSink::push_tail`].
-#[inline(always)]
-pub(crate) fn compress_block_fast_into<const MLS: u32, const USE_CMOV: bool, S: SeqSink>(
-    data: &[u8],
-    block_start: usize,
-    bounds: PrefixBounds,
-    hash_table: &mut FastHashTable,
-    rep: [u32; 2],
-    step_size: usize,
-    sink: &mut S,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
     let prefix_start_index = bounds.prefix_start_index;
     let window_low = bounds.window_low;
@@ -921,7 +870,11 @@ pub(crate) fn compress_block_fast_into<const MLS: u32, const USE_CMOV: bool, S: 
         // so the unchecked slice avoids the bounds pair on the per-match
         // literal gather.
         let literals = unsafe { data.get_unchecked(anchor..match_ip) };
-        sink.push_seq(literals, offset as u32, m_len as u32);
+        handle_sequence(Sequence::Triple {
+            literals,
+            offset,
+            match_len: m_len,
+        });
 
         ip0 = match_ip + m_len;
         anchor = ip0;
@@ -999,11 +952,11 @@ pub(crate) fn compress_block_fast_into<const MLS: u32, const USE_CMOV: bool, S: 
                 // ip0` before the match (lit_len 0), so `anchor <= ip0`
                 // and `ip0 < data.len()`; the unchecked slice avoids the
                 // bounds pair on the per-match literal gather.
-                sink.push_seq(
-                    unsafe { data.get_unchecked(anchor..ip0) },
-                    r_off as u32,
-                    r_len as u32,
-                );
+                handle_sequence(Sequence::Triple {
+                    literals: unsafe { data.get_unchecked(anchor..ip0) },
+                    offset: r_off,
+                    match_len: r_len,
+                });
 
                 ip0 += r_len;
                 anchor = ip0;
@@ -1070,9 +1023,6 @@ pub(crate) fn compress_block_fast_into<const MLS: u32, const USE_CMOV: bool, S: 
 /// the main candidate is invalid) → main. Correctness is independent of table
 /// contents (every match byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN`
 /// gates short far dict matches that would fragment the offset-FSE alphabet.
-/// Closure-based entry point for the attach-mode dict kernel — wraps the
-/// sink-based core [`compress_block_fast_dict_into`] in a [`ClosureSink`].
-#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
@@ -1083,35 +1033,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     dict_end: u32,
     rep: [u32; 2],
     step_size: usize,
-    handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-) -> FastBlockResult {
-    compress_block_fast_dict_into::<MLS, USE_CMOV, _>(
-        data,
-        block_start,
-        bounds,
-        main_table,
-        dict_table,
-        dict_end,
-        rep,
-        step_size,
-        &mut ClosureSink(handle_sequence),
-    )
-}
-
-/// Sink-based core of the attach-mode dict kernel (see
-/// [`compress_block_fast_dict`] for the algorithm). Pushes matches straight
-/// into `sink`; the trailing literal run is emitted by the caller.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compress_block_fast_dict_into<const MLS: u32, const USE_CMOV: bool, S: SeqSink>(
-    data: &[u8],
-    block_start: usize,
-    bounds: PrefixBounds,
-    main_table: &mut FastHashTable,
-    dict_table: &FastHashTable,
-    dict_end: u32,
-    rep: [u32; 2],
-    step_size: usize,
-    sink: &mut S,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
 ) -> FastBlockResult {
     assert!(
         block_start <= data.len(),
@@ -1282,7 +1204,11 @@ pub(crate) fn compress_block_fast_dict_into<const MLS: u32, const USE_CMOV: bool
             break 'outer;
         };
 
-        sink.push_seq(&data[anchor..m.lit_end], m.offset as u32, m.m_len as u32);
+        handle_sequence(Sequence::Triple {
+            literals: &data[anchor..m.lit_end],
+            offset: m.offset,
+            match_len: m.m_len,
+        });
         ip0 = m.lit_end + m.m_len;
         anchor = ip0;
 
@@ -1313,7 +1239,11 @@ pub(crate) fn compress_block_fast_dict_into<const MLS: u32, const USE_CMOV: bool
                 core::mem::swap(&mut offset_1, &mut offset_2);
                 let h = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0)) };
                 unsafe { main_table.put(h, ip0 as u32) };
-                sink.push_seq(&data[anchor..ip0], r_off as u32, r_len as u32);
+                handle_sequence(Sequence::Triple {
+                    literals: &data[anchor..ip0],
+                    offset: r_off,
+                    match_len: r_len,
+                });
                 ip0 += r_len;
                 anchor = ip0;
             }

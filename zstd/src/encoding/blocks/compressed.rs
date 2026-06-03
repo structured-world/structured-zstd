@@ -195,32 +195,6 @@ struct RawSequence {
     offset: u32,
 }
 
-/// [`SeqSink`] over a block's flat literal + sequence buffers. Lets the Fast
-/// matcher push matches straight from its hot loop (no `Sequence` enum, no
-/// closure dispatch) — the production consumer of
-/// [`Matcher::start_matching_into`].
-struct BlockPartsSink<'a> {
-    literals: &'a mut Vec<u8>,
-    sequences: &'a mut Vec<RawSequence>,
-}
-
-impl crate::encoding::SeqSink for BlockPartsSink<'_> {
-    #[inline(always)]
-    fn push_seq(&mut self, literals: &[u8], offset: u32, match_len: u32) {
-        let ll = literals.len() as u32;
-        append_literals(self.literals, literals);
-        self.sequences.push(RawSequence {
-            ll,
-            ml: match_len,
-            offset,
-        });
-    }
-    #[inline(always)]
-    fn push_tail(&mut self, literals: &[u8]) {
-        append_literals(self.literals, literals);
-    }
-}
-
 struct EntropyOnlyMatcher;
 
 enum HuffmanTableUpdate {
@@ -465,11 +439,22 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             .sequences
             .reserve_exact(sequence_capacity - parts.sequences.len());
     }
-    let mut sink = BlockPartsSink {
-        literals: &mut parts.literals,
-        sequences: &mut parts.sequences,
-    };
-    state.matcher.start_matching_into(&mut sink);
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            let ll = literals.len() as u32;
+            append_literals(&mut parts.literals, literals);
+            parts.sequences.push(RawSequence {
+                ll,
+                ml: match_len as u32,
+                offset: offset as u32,
+            });
+        }
+    });
 }
 
 fn encode_block_parts_with_sequence_scratch<M: Matcher>(

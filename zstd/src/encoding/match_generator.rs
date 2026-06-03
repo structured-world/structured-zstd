@@ -1476,28 +1476,6 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn start_matching_into<S: super::SeqSink>(&mut self, sink: &mut S) {
-        use super::strategy::StrategyTag;
-        // Fast OWNED path: the kernel pushes matches straight into `sink`,
-        // skipping the `Sequence` enum + closure boundary that the generic
-        // path pays per match. The borrowed one-shot Fast path and every
-        // non-Fast backend bridge through the closure path instead (same
-        // result, just without the direct-sink fast path).
-        if self.borrowed_pending.is_none() && self.strategy_tag == StrategyTag::Fast {
-            self.simple_mut().start_matching_into(sink);
-            self.recycle_simple_space();
-            return;
-        }
-        self.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => sink.push_seq(literals, offset as u32, match_len as u32),
-            Sequence::Literals { literals } => sink.push_tail(literals),
-        });
-    }
-
     fn skip_matching(&mut self) {
         self.skip_matching_with_hint(None);
     }
