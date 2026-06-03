@@ -410,11 +410,11 @@ jobs:
           [
             {
               "id": "fast-neg",
-              "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast"
+              "levels": "level_-7_fast,level_-6_fast,level_-5_fast,level_-4_fast,level_-3_fast,level_-2_fast"
             },
             {
               "id": "fast-dfast",
-              "levels": "level_-2_fast,level_-1_fast,level_1_fast,level_2_fast,level_3_dfast,level_4_dfast,level_5_greedy"
+              "levels": "level_-1_fast,level_1_fast,level_2_fast,level_3_dfast,level_4_dfast,level_5_greedy"
             },
             {
               "id": "lazy-lower",
