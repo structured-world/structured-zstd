@@ -902,7 +902,15 @@ impl RowMatchGenerator {
             if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= self.target_len) {
+                // Donor `ZSTD_RowFindBestMatch` walks every probed slot and
+                // keeps the longest; its only early break is "best possible"
+                // (the match already reaches the block end, so no later slot
+                // can beat it). cParams.targetLength is the LAZY outer loop's
+                // nice-match threshold, NOT a row-search cutoff — gating the
+                // row walk on it (target_len=2 at level 5) returned the first
+                // most-recent slot instead of the longest, inflating sequence
+                // count and losing ratio. Keep only the best-possible break.
+                if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
                     return best;
                 }
             }
