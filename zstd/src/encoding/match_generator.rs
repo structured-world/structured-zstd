@@ -216,6 +216,26 @@ const ROW_CONFIG: RowConfig = RowConfig {
     target_len: ROW_TARGET_LEN,
 };
 
+// Level-5 greedy is the ONLY strategy routed to the Row backend
+// (`StrategyTag::backend`: greedy -> Row; lazy / btopt / btultra* ->
+// HashChain), so it is the only level whose `row:` field is read. The donor
+// `clevels.h` default row (srcSize > 256 KB) for level 5 is searchLog=3,
+// targetLength=2, from which the row matcher derives:
+//   rowLog       = clamp(searchLog, 4, 6) = 4
+//   search_depth = 1 << min(searchLog, rowLog) = 8   (= nbAttempts)
+//   target_len   = targetLength = 2                  (nice-match early-out)
+// The shared `ROW_CONFIG` (row_log=5, search_depth=16, target_len=48) ran a
+// level-12-grade search here: 16 slots per row, never early-exiting until a
+// 48-byte match. That exhaustive walk was the dominant cost in greedy L5's
+// encode-speed regression vs FFI. `hash_bits` stays at the `ROW_HASH_BITS`
+// cap (the row table size is a separate budget).
+const ROW_L5: RowConfig = RowConfig {
+    hash_bits: ROW_HASH_BITS,
+    row_log: 4,
+    search_depth: 8,
+    target_len: 2,
+};
+
 /// Resolved tuning parameters for a compression level. The
 /// [`StrategyTag`] is the single source of truth for the backend
 /// family and the compile-time strategy consts; the runtime
@@ -285,7 +305,7 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // search_depth iterations instead of breaking on the first
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_L5 },
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
     /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
     /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
@@ -5747,7 +5767,9 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
     let full_rows = driver.row_matcher().row_heads.len();
-    assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_LOG));
+    // Level 5 uses the donor row_log (clamp(searchLog=3, 4, 6) = 4), not the
+    // shared ROW_LOG, so the row count is 1 << (hash_bits - ROW_L5.row_log).
+    assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_L5.row_log));
 
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(5));
@@ -5761,7 +5783,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(
         hinted_rows,
-        1 << ((MIN_HINTED_WINDOW_LOG as usize) - ROW_LOG)
+        1 << ((MIN_HINTED_WINDOW_LOG as usize) - ROW_L5.row_log)
     );
     assert!(
         hinted_rows < full_rows,
