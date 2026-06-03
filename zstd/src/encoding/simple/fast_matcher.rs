@@ -1005,18 +1005,23 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = block_end - HASH_READ_SIZE;
-        if range_start > last_hashable {
+        // Backfill the (HASH_READ_SIZE - 1) seam positions below
+        // `range_start` (see `prime_hash_table_for_range`): the prior
+        // block's trailing positions read across the block boundary, so
+        // skipping them drops seam-spanning matches between blocks.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
             return;
         }
         let (base, _len) = self
             .borrowed
             .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1091,17 +1096,23 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        if range_start > last_hashable {
+        // Backfill the (HASH_READ_SIZE - 1) positions below `range_start`:
+        // their 8-byte hash read straddles the seam into this slice, so
+        // without re-hashing them a multi-slice history drops every
+        // seam-spanning match. `saturating_sub` floors at HISTORY_DRAIN_BASE
+        // (0); re-hashing already-indexed tail positions is idempotent.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
             return;
         }
 
         let base = self.history.as_ptr();
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1157,7 +1168,12 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        if range_start > last_hashable {
+        // Backfill the (HASH_READ_SIZE - 1) seam positions below
+        // `range_start` (see `prime_hash_table_for_range`): a dictionary
+        // fed in slice_size chunks otherwise drops every match that
+        // straddles a chunk boundary.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
             return;
         }
         if self.dict_table.is_none() {
@@ -1167,11 +1183,11 @@ impl FastKernelMatcher {
         }
         let base = self.history.as_ptr();
         match self.hash_table.mls() {
-            4 => self.prime_dict_table_impl::<4>(base, range_start, last_hashable),
-            5 => self.prime_dict_table_impl::<5>(base, range_start, last_hashable),
-            6 => self.prime_dict_table_impl::<6>(base, range_start, last_hashable),
-            7 => self.prime_dict_table_impl::<7>(base, range_start, last_hashable),
-            8 => self.prime_dict_table_impl::<8>(base, range_start, last_hashable),
+            4 => self.prime_dict_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_dict_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_dict_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_dict_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_dict_table_impl::<8>(base, backfill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
