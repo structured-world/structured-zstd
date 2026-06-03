@@ -1125,10 +1125,16 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                 }
             }
 
-            // Dictionary match — taken ONLY when the main candidate is invalid
-            // (donor gate `matchIndex <= prefixStartIndex`, lines 582-583), so
-            // recent-input matches from the main table always win.
-            if main_idx <= prefix_start_index {
+            // Dictionary match — taken ONLY when the main candidate is below
+            // the window floor, i.e. exactly the indices `match_found` rejects
+            // (`match_idx >= prefix_start_index` is in-window). The floor-
+            // aligned case `main_idx == prefix_start_index` is a VALID recent
+            // candidate, so it must fall through to the main-match probe below
+            // rather than the dict path — keeping "recent input wins, dict is
+            // the fallback". (Donor's `matchIndex <= prefixStartIndex` gate is
+            // an if/else-if with no main fallthrough; our two-`if` structure
+            // needs `<` here to stay consistent with `match_found`'s floor.)
+            if main_idx < prefix_start_index {
                 let dpos = dict_idx as usize;
                 if dict_idx >= 1
                     && dpos < dict_end
