@@ -568,6 +568,13 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
+    // Snapshot of the frame's source-size hint captured at `reset` (where
+    // `source_size_hint` is consumed). Read by `prime_with_dictionary` to pick
+    // the donor `ZSTD_shouldAttachDict` dict mode for the Simple/Fast backend:
+    // `None` (unknown) or `<= FAST_ATTACH_DICT_CUTOFF` → attach (separate dict
+    // table, 2-cursor `compress_block_fast_dict`); larger → copy (dictionary
+    // primed into the live table, 4-cursor `compress_block_fast`).
+    reset_source_size: Option<u64>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -649,6 +656,7 @@ impl MatchGeneratorDriver {
             // the first `reset()` overwrites both sides from the
             // resolved LevelParams.
             reported_window_size: next_pow2,
+            reset_source_size: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
             borrowed_pending: None,
@@ -909,7 +917,26 @@ impl MatchGeneratorDriver {
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                self.simple_mut().skip_matching_with_hint(Some(false));
+                // Donor `ZSTD_shouldAttachDict` mode selection for the Fast
+                // strategy (cutoff 8 KB): small / unknown-size inputs ATTACH
+                // (index dict positions into a SEPARATE immutable table; the
+                // dual-probe 2-cursor `compress_block_fast_dict` then prefers
+                // recent-input matches and falls back to the dict — the path
+                // that wins small/unknown). Large known-size inputs COPY (prime
+                // dict into the live table; the 4-cursor `compress_block_fast`
+                // matches against it as window history — the path that already
+                // matches/beats the donor on large corpora). The dispatch in
+                // `start_matching` keys off `dict_table.is_some()`, which only
+                // the attach path populates.
+                const FAST_ATTACH_DICT_CUTOFF: u64 = 8 * 1024;
+                let attach = self
+                    .reset_source_size
+                    .is_none_or(|n| n <= FAST_ATTACH_DICT_CUTOFF);
+                if attach {
+                    self.simple_mut().skip_matching_for_dict_prime();
+                } else {
+                    self.simple_mut().skip_matching_with_hint(Some(false));
+                }
                 self.recycle_simple_space();
             }
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
@@ -934,6 +961,9 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
+        // Snapshot for prime_with_dictionary's attach/copy mode decision (the
+        // hint is consumed here, but priming happens just after reset).
+        self.reset_source_size = hint;
         let hinted = hint.is_some();
         let params = Self::level_params(level, hint);
         let next_backend = params.backend();

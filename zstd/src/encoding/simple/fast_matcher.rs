@@ -231,6 +231,23 @@ pub(crate) struct FastKernelMatcher {
     /// (`borrowed[start..end]`, zero-copy) for the emit path — the
     /// borrowed analogue of `last_block_start` on the owned path.
     last_borrowed_block: Option<(usize, usize)>,
+    /// Immutable dictionary hash table for the donor `dictMatchState`
+    /// Fast path. Built once during `prime_with_dictionary` over the
+    /// dictionary region at the front of `history` (positions
+    /// `[1, dict_region_len)`), using the same `(hash_log, mls)` as
+    /// [`Self::hash_table`] so a single hash keys both tables. `Some`
+    /// activates the dual-probe [`compress_block_fast_dict`] kernel;
+    /// invalidated to `None` on any history eviction (the absolute dict
+    /// positions would otherwise go stale) so the no-dict kernel takes
+    /// over — correctness-safe, only the dict ratio benefit is lost on
+    /// inputs large enough to slide the dictionary out of the window.
+    dict_table: Option<FastHashTable>,
+    /// Number of dictionary bytes at the front of `history` (one past the
+    /// last valid dict position). The boundary between the dict region and
+    /// the frame input; doubles as the `input_floor` / `dict_end` the
+    /// dict kernel uses to separate main-table (input) from dict-table
+    /// matches. `0` when no dictionary is primed.
+    dict_region_len: usize,
 }
 
 impl FastKernelMatcher {
@@ -318,6 +335,8 @@ impl FastKernelMatcher {
             pending: None,
             borrowed: None,
             last_borrowed_block: None,
+            dict_table: None,
+            dict_region_len: 0,
         }
     }
 
@@ -367,6 +386,11 @@ impl FastKernelMatcher {
         // different allocation, so a stale (ptr, len) would dangle.
         self.borrowed = None;
         self.last_borrowed_block = None;
+        // Drop any primed dictionary state: the next frame re-primes (or
+        // not) from scratch, and stale absolute dict positions must not
+        // leak across frames.
+        self.dict_table = None;
+        self.dict_region_len = 0;
     }
 
     /// Reported decoder-side window size (bytes) — test-only.
@@ -596,6 +620,15 @@ impl FastKernelMatcher {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
+        // Any drain rebases the retained tail to position 0, invalidating
+        // the immutable dict table's absolute positions (and likely
+        // sliding the dictionary out of the live window entirely). Drop it
+        // so subsequent blocks fall back to the no-dict kernel — the only
+        // cost is the dict ratio benefit on inputs large enough to evict
+        // the dictionary, which is exactly when the dict is no longer
+        // reachable anyway.
+        self.dict_table = None;
+        self.dict_region_len = 0;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         // Skip position 0 — `prefix_start_index = 1` means the kernel
@@ -725,25 +758,63 @@ impl FastKernelMatcher {
         let prefix_start_index = window_low.max(self.prefix_start_index);
         let rep_in = self.rep;
         let mls = self.hash_table.mls();
+        let step_size = self.step_size;
+        let use_cmov = self.use_cmov;
 
-        // Owned scan reads `self.history` directly (the guard above
-        // guarantees no borrowed window is active). Borrowing only the
-        // `history` field keeps it a disjoint projection alongside the
-        // `&mut self.hash_table` borrow handed to `run_fast_kernel_block`
-        // (a `&self` accessor would borrow all of `self` and collide).
+        // Donor `dictMatchState` Fast path, active whenever a dictionary is
+        // primed (and not yet evicted — `drain_real_prefix` drops the table).
+        // The 4-cursor search and its `prefix_start_index` / `window_low`
+        // bounds are shared with the no-dict kernel (main matches are input
+        // positions, all `>= dict_end >= prefix_start_index`); the dict probe
+        // additionally requires `pos >= window_low` and `pos < dict_end` so
+        // emitted offsets (`ip0 - pos`) stay within the advertised window,
+        // including the pre-drain 1x..2x-window band where `window_low > 0`.
+        let use_dict = self.dict_table.is_some();
         let history: &[u8] = &self.history;
-        let rep_out = run_fast_kernel_block(
-            history,
-            block_start,
-            prefix_start_index,
-            window_low,
-            &mut self.hash_table,
-            rep_in,
-            self.step_size,
-            mls,
-            self.use_cmov,
-            handle_sequence,
-        );
+        let rep_out = if use_dict {
+            use super::fast_kernel::kernel::PrefixBounds;
+            let dict_end = self.dict_region_len as u32;
+            let bounds = PrefixBounds {
+                prefix_start_index,
+                window_low,
+            };
+            let main_table = &mut self.hash_table;
+            let dict_table = self
+                .dict_table
+                .as_ref()
+                .expect("use_dict implies dict_table is Some");
+            run_fast_kernel_block_dict(
+                history,
+                block_start,
+                bounds,
+                dict_end,
+                main_table,
+                dict_table,
+                rep_in,
+                step_size,
+                mls,
+                use_cmov,
+                handle_sequence,
+            )
+        } else {
+            // Owned scan reads `self.history` directly (the guard above
+            // guarantees no borrowed window is active). Borrowing only the
+            // `history` field keeps it a disjoint projection alongside the
+            // `&mut self.hash_table` borrow handed to `run_fast_kernel_block`
+            // (a `&self` accessor would borrow all of `self` and collide).
+            run_fast_kernel_block(
+                history,
+                block_start,
+                prefix_start_index,
+                window_low,
+                &mut self.hash_table,
+                rep_in,
+                step_size,
+                mls,
+                use_cmov,
+                handle_sequence,
+            )
+        };
         // Persist the kernel's rep state for the next block.
         self.rep = rep_out;
     }
@@ -934,18 +1005,23 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = block_end - HASH_READ_SIZE;
-        if range_start > last_hashable {
+        // Backfill the (HASH_READ_SIZE - 1) seam positions below
+        // `range_start` (see `prime_hash_table_for_range`): the prior
+        // block's trailing positions read across the block boundary, so
+        // skipping them drops seam-spanning matches between blocks.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
             return;
         }
         let (base, _len) = self
             .borrowed
             .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1020,17 +1096,23 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        if range_start > last_hashable {
+        // Backfill the (HASH_READ_SIZE - 1) positions below `range_start`:
+        // their 8-byte hash read straddles the seam into this slice, so
+        // without re-hashing them a multi-slice history drops every
+        // seam-spanning match. `saturating_sub` floors at HISTORY_DRAIN_BASE
+        // (0); re-hashing already-indexed tail positions is idempotent.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
             return;
         }
 
         let base = self.history.as_ptr();
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, range_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, range_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, range_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, range_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, range_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1057,6 +1139,78 @@ impl FastKernelMatcher {
             let ptr = unsafe { base.add(pos) };
             let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
             unsafe { self.hash_table.put(hash, pos as u32) };
+        }
+    }
+
+    /// Dictionary-priming entry for the donor `dictMatchState` Fast path.
+    /// Appends the pending dict slice to `history` and indexes its positions
+    /// into the SEPARATE immutable [`Self::dict_table`] — NOT the main hash
+    /// table. Keeping dict positions out of the main table is what lets the
+    /// dual-probe kernel prefer recent-input matches (main) over dictionary
+    /// matches (dict fallback), matching the donor's `prefixStart`/dict split.
+    /// Replaces the [`Self::skip_matching_with_hint`]`(Some(false))` call the
+    /// driver used to make for Fast-backend priming.
+    pub(crate) fn skip_matching_for_dict_prime(&mut self) {
+        let block_start = self.extend_history_with_pending();
+        self.prime_dict_table_for_range(block_start);
+    }
+
+    /// Build (or extend) [`Self::dict_table`] over `history[range_start..]`,
+    /// the freshly-appended dictionary bytes. Lazily allocates the dict table
+    /// at the same `(hash_log, mls)` as the main table so one hash keys both.
+    fn prime_dict_table_for_range(&mut self, range_start: usize) {
+        const HASH_READ_SIZE: usize = 8;
+        let history_len = self.history.len();
+        // Record the dict/input boundary regardless of whether any position
+        // is hashable (a sub-8-byte dict still bounds the input floor).
+        self.dict_region_len = history_len;
+        if history_len < HASH_READ_SIZE {
+            return;
+        }
+        let last_hashable = history_len - HASH_READ_SIZE;
+        // Backfill the (HASH_READ_SIZE - 1) seam positions below
+        // `range_start` (see `prime_hash_table_for_range`): a dictionary
+        // fed in slice_size chunks otherwise drops every match that
+        // straddles a chunk boundary.
+        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
+        if backfill_start > last_hashable {
+            return;
+        }
+        if self.dict_table.is_none() {
+            let hash_log = self.hash_table.hash_log();
+            let mls = self.hash_table.mls();
+            self.dict_table = Some(FastHashTable::new(hash_log, mls));
+        }
+        let base = self.history.as_ptr();
+        match self.hash_table.mls() {
+            4 => self.prime_dict_table_impl::<4>(base, backfill_start, last_hashable),
+            5 => self.prime_dict_table_impl::<5>(base, backfill_start, last_hashable),
+            6 => self.prime_dict_table_impl::<6>(base, backfill_start, last_hashable),
+            7 => self.prime_dict_table_impl::<7>(base, backfill_start, last_hashable),
+            8 => self.prime_dict_table_impl::<8>(base, backfill_start, last_hashable),
+            _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
+        }
+    }
+
+    /// Monomorphised per-MLS dict-table fill. `base` is a raw pointer into
+    /// `self.history` (no borrow held), so mutating `self.dict_table` in the
+    /// loop is sound — the loop never touches `history`, which stays put.
+    fn prime_dict_table_impl<const MLS: u32>(
+        &mut self,
+        base: *const u8,
+        range_start: usize,
+        last_hashable: usize,
+    ) {
+        let dict_table = self
+            .dict_table
+            .as_mut()
+            .expect("prime_dict_table_for_range creates the table before this call");
+        for pos in range_start..=last_hashable {
+            // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
+            // covers >= 8 readable bytes; MLS matches the table's mls.
+            let ptr = unsafe { base.add(pos) };
+            let hash = unsafe { dict_table.hash_ptr::<MLS>(ptr) };
+            unsafe { dict_table.put(hash, pos as u32) };
         }
     }
 }
@@ -1200,6 +1354,65 @@ fn run_fast_kernel_block(
     // Emit terminal literals if the kernel left a tail. `wrap_emit`'s
     // borrow of `handle_sequence` has ended (no use past the match), so
     // calling it directly here is allowed.
+    if result.tail_literals_len > 0 {
+        let tail_start = history.len() - result.tail_literals_len;
+        handle_sequence(Sequence::Literals {
+            literals: &history[tail_start..],
+        });
+    }
+
+    result.rep
+}
+
+/// Dictionary-primed counterpart of [`run_fast_kernel_block`]: dispatches the
+/// `(mls, use_cmov)` pair to [`compress_block_fast_dict`], threading the
+/// immutable `dict_table` alongside the main table. Emits any terminal tail
+/// literals exactly as the no-dict helper does.
+#[allow(clippy::too_many_arguments)]
+fn run_fast_kernel_block_dict(
+    history: &[u8],
+    block_start: usize,
+    bounds: super::fast_kernel::kernel::PrefixBounds,
+    dict_end: u32,
+    main_table: &mut FastHashTable,
+    dict_table: &FastHashTable,
+    rep_in: [u32; 2],
+    step_size: usize,
+    mls: u32,
+    use_cmov: bool,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+) -> [u32; 2] {
+    use super::fast_kernel::kernel::compress_block_fast_dict;
+
+    macro_rules! run {
+        ($mls:literal, $cmov:literal) => {
+            compress_block_fast_dict::<$mls, $cmov>(
+                history,
+                block_start,
+                bounds,
+                main_table,
+                dict_table,
+                dict_end,
+                rep_in,
+                step_size,
+                &mut handle_sequence,
+            )
+        };
+    }
+    let result = match (mls, use_cmov) {
+        (4, false) => run!(4, false),
+        (4, true) => run!(4, true),
+        (5, false) => run!(5, false),
+        (5, true) => run!(5, true),
+        (6, false) => run!(6, false),
+        (6, true) => run!(6, true),
+        (7, false) => run!(7, false),
+        (7, true) => run!(7, true),
+        (8, false) => run!(8, false),
+        (8, true) => run!(8, true),
+        _ => unreachable!("FastHashTable construction rejects mls outside 4..=8 — got mls={mls}",),
+    };
+
     if result.tail_literals_len > 0 {
         let tail_start = history.len() - result.tail_literals_len;
         handle_sequence(Sequence::Literals {
@@ -1780,6 +1993,73 @@ mod tests {
         // `history_len < HASH_READ_SIZE` guard.
         m.skip_matching_with_hint(Some(false));
         assert_eq!(m.history.len(), 4 + HISTORY_DRAIN_BASE);
+    }
+
+    /// Regression: priming a dictionary in two chunks must hash the
+    /// positions straddling the chunk seam. The second chunk's prime
+    /// starts at `range_start = end-of-first-chunk`, but a hash read at
+    /// any of the preceding `HASH_READ_SIZE - 1` positions spans the
+    /// seam into the second chunk — those positions belong to neither
+    /// chunk's `[range_start ..= last_hashable]` window unless the second
+    /// prime backfills them. Without the backfill a dictionary fed in
+    /// `slice_size` chunks silently drops every seam-spanning match.
+    #[test]
+    fn dict_prime_indexes_positions_across_chunk_seam() {
+        // hash_log=20 (1 Mi slots) makes a hash collision among ~32
+        // primed positions negligible, so `get(hash(p)) == p` is a
+        // deterministic assertion on this fixed input.
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let chunk1: alloc::vec::Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        m.accept_data(chunk1);
+        m.skip_matching_for_dict_prime();
+        let seam = m.history.len(); // end of first chunk
+        let chunk2: alloc::vec::Vec<u8> = (16..32u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        m.accept_data(chunk2);
+        m.skip_matching_for_dict_prime();
+
+        // A position in the (HASH_READ_SIZE - 1)-byte gap just below the
+        // seam: its 8-byte hash read straddles the chunk boundary.
+        let p = seam - 4;
+        let dt = m.dict_table.as_ref().expect("dict table primed");
+        let h = unsafe { dt.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        assert_eq!(
+            unsafe { dt.get(h) },
+            p as u32,
+            "seam-spanning position {p} must be indexed in the dict table",
+        );
+    }
+
+    /// Regression: same seam-gap defect for the MAIN hash table, primed
+    /// per slice via `skip_matching_with_hint(Some(false))` (the dict
+    /// COPY path and multi-slice history priming). Cross-slice matches
+    /// at the seam are dropped unless the second prime backfills the
+    /// trailing `HASH_READ_SIZE - 1` positions.
+    #[test]
+    fn main_table_prime_indexes_positions_across_slice_seam() {
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let chunk1: alloc::vec::Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        m.accept_data(chunk1);
+        m.skip_matching_with_hint(Some(false));
+        let seam = m.history.len();
+        let chunk2: alloc::vec::Vec<u8> = (16..32u8)
+            .map(|i| i.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        m.accept_data(chunk2);
+        m.skip_matching_with_hint(Some(false));
+
+        let p = seam - 4;
+        let h = unsafe { m.hash_table.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        assert_eq!(
+            unsafe { m.hash_table.get(h) },
+            p as u32,
+            "seam-spanning position {p} must be indexed in the main table",
+        );
     }
 
     /// After a single block emits matches, the matcher's `rep[0]`

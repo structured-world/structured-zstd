@@ -244,6 +244,44 @@ impl Matcher for CapturingMatcher {
 /// see a hard failure instead of a misleading capture
 /// (PR #149 review #25).
 pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> SequenceCapture {
+    compress_and_collect_sequences_impl(input, level, None, None)
+}
+
+/// Raw-content dictionary variant: attaches `raw_content` via
+/// [`crate::decoding::Dictionary::from_raw_content`] + `set_dictionary`, the
+/// exact path the `dict_builder` raw-dict tests use. Lets the dict-ratio audit
+/// reproduce a raw-content (non-serialized) dictionary scenario.
+pub fn compress_and_collect_sequences_with_raw_content(
+    input: &[u8],
+    level: CompressionLevel,
+    raw_content: &[u8],
+) -> SequenceCapture {
+    compress_and_collect_sequences_impl(input, level, None, Some(raw_content))
+}
+
+/// Dictionary-primed variant of [`compress_and_collect_sequences`].
+///
+/// Attaches the serialized `dict` blob via
+/// [`FrameCompressor::set_dictionary_from_bytes`] before compressing, so the
+/// captured stream reflects dictionary priming (matcher hash-table prime +
+/// offset-history seed + entropy-table seed) exactly as the production
+/// dict-compress path would. Used by the dict-ratio audit to diff the Fast
+/// backend's dict-primed sequence stream against the dfast backend's (which
+/// reaches donor parity) on the same `(input, dict)` pair.
+pub fn compress_and_collect_sequences_with_dict(
+    input: &[u8],
+    level: CompressionLevel,
+    dict: &[u8],
+) -> SequenceCapture {
+    compress_and_collect_sequences_impl(input, level, Some(dict), None)
+}
+
+fn compress_and_collect_sequences_impl(
+    input: &[u8],
+    level: CompressionLevel,
+    dict: Option<&[u8]>,
+    raw_content: Option<&[u8]>,
+) -> SequenceCapture {
     // Empty input bypasses the matcher entirely: `FrameCompressor`
     // emits a zero-length raw block without calling any `Matcher`
     // method. The reconstruction invariant `Σ(ll+ml)+Σ(tails) ==
@@ -329,6 +367,18 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
     let mut output: Vec<u8> = Vec::new();
     let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, CapturingMatcher> =
         FrameCompressor::new_with_matcher(matcher, level);
+    if let Some(dict) = dict {
+        compressor
+            .set_dictionary_from_bytes(dict)
+            .expect("dictionary should attach for sequence capture");
+    }
+    if let Some(raw) = raw_content {
+        let d = crate::decoding::Dictionary::from_raw_content(0xD1C7_0008, raw.to_vec())
+            .expect("raw-content dictionary should build for sequence capture");
+        compressor
+            .set_dictionary(d)
+            .expect("raw-content dictionary should attach for sequence capture");
+    }
     compressor.set_source(input);
     compressor.set_drain(&mut output);
     // Hint the exact input size so the matcher picks the same
