@@ -349,7 +349,14 @@ pub(crate) struct PrefixBounds {
     pub window_low: u32,
 }
 
-#[inline(always)]
+// `inline(never)`: this is the big 4-cursor kernel. Inlining it into the
+// `run_fast_kernel_block` → `start_matching` → `collect_block_parts` chain
+// bloats that chain and raises register pressure, hurting codegen on the hot
+// loop. Keeping each `(MLS, USE_CMOV)` monomorphisation a tight standalone
+// function (the shape the reference pure-Rust port uses, and consistent with
+// the earlier finding that `inline(always)` on a large kernel regressed)
+// lets the optimiser allocate registers for the loop in isolation.
+#[inline(never)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
     block_start: usize,
